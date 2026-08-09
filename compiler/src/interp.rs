@@ -21,6 +21,10 @@ pub enum RtVal {
     Bool(bool),
     Arr(Rc<RefCell<Vec<i128>>>),
     Opt(Option<i128>),
+    Obj {
+        class: usize,
+        fields: Rc<RefCell<HashMap<String, RtVal>>>,
+    },
     Unit,
 }
 
@@ -45,6 +49,7 @@ pub fn run_tests(program: &Program, source: &str, path: &str) -> Vec<TestReport>
     let lines = LineMap::new(source);
     let ghosts = GhostDefs::from_items(&program.ghosts);
     let fns: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
+    let classes = &program.classes;
 
     program
         .fns
@@ -53,6 +58,7 @@ pub fn run_tests(program: &Program, source: &str, path: &str) -> Vec<TestReport>
         .map(|test| {
             let mut interp = Interp {
                 fns: &fns,
+                classes,
                 ghosts: &ghosts,
                 source,
                 fuel: FUEL,
@@ -78,6 +84,7 @@ enum Flow {
 
 struct Interp<'a> {
     fns: &'a HashMap<&'a str, &'a Fn>,
+    classes: &'a [ClassDecl],
     ghosts: &'a GhostDefs,
     source: &'a str,
     fuel: u64,
@@ -87,9 +94,12 @@ struct Interp<'a> {
 struct Frame {
     vars: HashMap<String, RtVal>,
     /// Entry-state scalar params (post clauses mean entry values for
-    /// by-value params) and entry snapshots of &mut arrays (`old a`).
+    /// by-value params) and entry snapshots of &mut state (`old a`,
+    /// `old self`).
     entry_scalars: HashMap<String, RtVal>,
-    old_arrays: HashMap<String, Vec<i128>>,
+    olds: HashMap<String, SpecVal>,
+    /// Member context: the class index and its field storage.
+    self_ctx: Option<(usize, Rc<RefCell<HashMap<String, RtVal>>>)>,
 }
 
 impl<'a> Interp<'a> {
@@ -97,12 +107,15 @@ impl<'a> Interp<'a> {
         let mut frame = Frame {
             vars: HashMap::new(),
             entry_scalars: HashMap::new(),
-            old_arrays: HashMap::new(),
+            olds: HashMap::new(),
+            self_ctx: None,
         };
         for (p, v) in f.params.iter().zip(args) {
             if let RtVal::Arr(a) = &v {
                 if matches!(p.ty, Ty::Array(_, Mutability::Mut)) {
-                    frame.old_arrays.insert(p.name.clone(), a.borrow().clone());
+                    frame
+                        .olds
+                        .insert(p.name.clone(), SpecVal::Arr(a.borrow().clone()));
                 }
             } else {
                 frame.entry_scalars.insert(p.name.clone(), v.clone());
@@ -151,6 +164,20 @@ impl<'a> Interp<'a> {
                 vars.insert(name.clone(), sv);
             }
         }
+        if let Some((class, fields)) = &frame.self_ctx {
+            let obj = RtVal::Obj {
+                class: *class,
+                fields: fields.clone(),
+            };
+            if let Some(sv) = spec_of(&obj) {
+                vars.insert("self".into(), sv);
+            }
+            for (k, v) in fields.borrow().iter() {
+                if let Some(sv) = spec_of(v) {
+                    vars.insert(k.clone(), sv);
+                }
+            }
+        }
         if let Some(r) = result {
             if let Some(sv) = spec_of(r) {
                 vars.insert("result".into(), sv);
@@ -158,7 +185,7 @@ impl<'a> Interp<'a> {
         }
         let env = SpecEnv {
             vars,
-            olds: frame.old_arrays.clone(),
+            olds: frame.olds.clone(),
             ghosts: self.ghosts,
         };
         match speceval::eval_clause(&clause.text, &env) {
@@ -189,9 +216,23 @@ impl<'a> Interp<'a> {
                 vars.insert(name.clone(), sv);
             }
         }
+        if let Some((class, fields)) = &frame.self_ctx {
+            let obj = RtVal::Obj {
+                class: *class,
+                fields: fields.clone(),
+            };
+            if let Some(sv) = spec_of(&obj) {
+                vars.insert("self".into(), sv);
+            }
+            for (k, v) in fields.borrow().iter() {
+                if let Some(sv) = spec_of(v) {
+                    vars.insert(k.clone(), sv);
+                }
+            }
+        }
         let env = SpecEnv {
             vars,
-            olds: frame.old_arrays.clone(),
+            olds: frame.olds.clone(),
             ghosts: self.ghosts,
         };
         match speceval::eval_clause(&clause.text, &env) {
@@ -209,13 +250,75 @@ impl<'a> Interp<'a> {
     }
 
     fn exec_block(&mut self, stmts: &[Stmt], frame: &mut Frame) -> IResult<Flow> {
+        let mut class_locals: Vec<String> = Vec::new();
+        let mut out = Flow::Normal;
         for stmt in stmts {
+            if let Stmt::VarDecl { name, .. } = stmt {
+                class_locals.push(name.clone());
+            }
             match self.exec_stmt(stmt, frame)? {
                 Flow::Normal => {}
-                ret => return Ok(ret),
+                ret => {
+                    out = ret;
+                    break;
+                }
             }
         }
-        Ok(Flow::Normal)
+        // RAII: drop block-local class values in reverse declaration
+        // order; the class invariant is assumed at deinit entry
+        // (design §7) — check it dynamically here.
+        for name in class_locals.iter().rev() {
+            if let Some(RtVal::Obj { class, fields }) = frame.vars.get(name).cloned() {
+                self.check_invariants_at(&self.classes[class].clone(), &fields, name)?;
+                frame.vars.remove(name);
+            }
+        }
+        Ok(out)
+    }
+
+    fn check_invariants_at(
+        &mut self,
+        class: &ClassDecl,
+        fields: &Rc<RefCell<HashMap<String, RtVal>>>,
+        what: &str,
+    ) -> IResult<()> {
+        let mut vars: HashMap<String, SpecVal> = HashMap::new();
+        let obj = RtVal::Obj {
+            class: 0,
+            fields: fields.clone(),
+        };
+        if let Some(sv) = spec_of(&obj) {
+            vars.insert("self".into(), sv);
+        }
+        for (k, v) in fields.borrow().iter() {
+            if let Some(sv) = spec_of(v) {
+                vars.insert(k.clone(), sv);
+            }
+        }
+        let env = SpecEnv {
+            vars,
+            olds: HashMap::new(),
+            ghosts: self.ghosts,
+        };
+        for inv in &class.invariants {
+            match speceval::eval_clause(&inv.text, &env) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Trap {
+                        message: format!(
+                            "class invariant of `{}` violated at `{what}`: {}",
+                            class.name,
+                            inv.text.replace('\n', " ")
+                        ),
+                        span: inv.span,
+                    })
+                }
+                Err(um) => {
+                    self.skipped.push((inv.text.replace('\n', " "), um.0));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, frame: &mut Frame) -> IResult<Flow> {
@@ -235,6 +338,42 @@ impl<'a> Interp<'a> {
             }
             Stmt::ExprStmt(e) => {
                 self.eval(e, frame)?;
+                Ok(Flow::Normal)
+            }
+            Stmt::VarDecl { name, init, .. } => {
+                let v = self.eval(init, frame)?;
+                frame.vars.insert(name.clone(), v);
+                Ok(Flow::Normal)
+            }
+            Stmt::FieldAssign { field, value, .. } => {
+                let v = self.eval(value, frame)?;
+                let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
+                fields.borrow_mut().insert(field.clone(), v);
+                Ok(Flow::Normal)
+            }
+            Stmt::FieldStore {
+                field,
+                field_span,
+                index,
+                value,
+            } => {
+                let idx = self.eval_int(index, frame)?;
+                let val = self.eval_int(value, frame)?;
+                let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
+                let arr = match fields.borrow().get(field.as_str()) {
+                    Some(RtVal::Arr(a)) => a.clone(),
+                    _ => unreachable!("checked: array field initialized"),
+                };
+                let len = arr.borrow().len() as i128;
+                if idx < 0 || idx >= len {
+                    return Err(Trap {
+                        message: format!(
+                            "store index out of bounds: index {idx}, length {len}"
+                        ),
+                        span: *field_span,
+                    });
+                }
+                arr.borrow_mut()[idx as usize] = val;
                 Ok(Flow::Normal)
             }
             Stmt::Store {
@@ -342,7 +481,7 @@ impl<'a> Interp<'a> {
         }
         let env = SpecEnv {
             vars,
-            olds: frame.old_arrays.clone(),
+            olds: frame.olds.clone(),
             ghosts: self.ghosts,
         };
         match speceval::eval_int_expr(&clause.text, &env) {
@@ -353,6 +492,109 @@ impl<'a> Interp<'a> {
                 None
             }
         }
+    }
+
+    fn construct(
+        &mut self,
+        ci: usize,
+        init_name: &str,
+        args: Vec<RtVal>,
+        span: crate::span::Span,
+    ) -> IResult<RtVal> {
+        self.burn(span)?;
+        let class = self.classes[ci].clone();
+        let ifn = class
+            .inits
+            .iter()
+            .find(|i| i.name == init_name)
+            .expect("checked: init exists")
+            .clone();
+        let fields = Rc::new(RefCell::new(HashMap::new()));
+        let mut frame = Frame {
+            vars: HashMap::new(),
+            entry_scalars: HashMap::new(),
+            olds: HashMap::new(),
+            self_ctx: Some((ci, fields.clone())),
+        };
+        for (p, v) in ifn.params.iter().zip(args) {
+            frame.entry_scalars.insert(p.name.clone(), v.clone());
+            frame.vars.insert(p.name.clone(), v);
+        }
+        for pre in &ifn.pres {
+            self.check_clause(&frame, pre, None, &format!("pre of `{}::{}`", class.name, ifn.name))?;
+        }
+        self.exec_block(&ifn.body, &mut frame)?;
+        for post in &ifn.posts {
+            self.check_clause(
+                &frame,
+                post,
+                None,
+                &format!("post of `{}::{}`", class.name, ifn.name),
+            )?;
+        }
+        self.check_invariants_at(&class, &fields, &format!("{}::{} exit", class.name, ifn.name))?;
+        Ok(RtVal::Obj { class: ci, fields })
+    }
+
+    fn invoke(
+        &mut self,
+        ci: usize,
+        method: &str,
+        fields: Rc<RefCell<HashMap<String, RtVal>>>,
+        args: Vec<RtVal>,
+    ) -> IResult<RtVal> {
+        let class = self.classes[ci].clone();
+        let m = class
+            .methods
+            .iter()
+            .find(|m| m.f.name == method)
+            .expect("checked: method exists")
+            .clone();
+        let mut frame = Frame {
+            vars: HashMap::new(),
+            entry_scalars: HashMap::new(),
+            olds: HashMap::new(),
+            self_ctx: Some((ci, fields.clone())),
+        };
+        // Entry snapshot for `old self` (and post-checking of by-value
+        // params).
+        let entry_obj = RtVal::Obj {
+            class: ci,
+            fields: Rc::new(RefCell::new(
+                fields
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), deep_copy(v)))
+                    .collect(),
+            )),
+        };
+        if let Some(sv) = spec_of(&entry_obj) {
+            frame.olds.insert("self".into(), sv);
+        }
+        for (p, v) in m.f.params.iter().zip(args) {
+            frame.entry_scalars.insert(p.name.clone(), v.clone());
+            frame.vars.insert(p.name.clone(), v);
+        }
+        for pre in &m.f.pres {
+            self.check_clause(&frame, pre, None, &format!("pre of `{}::{method}`", class.name))?;
+        }
+        let flow = self.exec_block(&m.f.body, &mut frame)?;
+        let result = match flow {
+            Flow::Return(v) => v,
+            Flow::Normal => RtVal::Unit,
+        };
+        if m.self_kind == SelfKind::Mut {
+            self.check_invariants_at(&class, &fields, &format!("{}::{method} exit", class.name))?;
+        }
+        for post in &m.f.posts {
+            self.check_clause(
+                &frame,
+                post,
+                Some(&result),
+                &format!("post of `{}::{method}`", class.name),
+            )?;
+        }
+        Ok(result)
     }
 
     fn eval_int(&mut self, e: &Expr, frame: &mut Frame) -> IResult<i128> {
@@ -412,6 +654,81 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Arr(Rc::new(RefCell::new(v))))
             }
             ExprKind::Borrow { array, .. } => Ok(frame.vars[array.as_str()].clone()),
+            ExprKind::AllocArray { len, init, .. } => {
+                let n = self.eval_int(len, frame)?;
+                let v0 = self.eval_int(init, frame)?;
+                // Defined allocation-failure behavior: the named OOM trap.
+                if n < 0 || n > 50_000_000 {
+                    return Err(Trap {
+                        message: format!("OOM trap: alloc_array of length {n}"),
+                        span: e.span,
+                    });
+                }
+                Ok(RtVal::Arr(Rc::new(RefCell::new(vec![v0; n as usize]))))
+            }
+            ExprKind::SelfField { field } => {
+                let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
+                let v = fields
+                    .borrow()
+                    .get(field.as_str())
+                    .cloned()
+                    .expect("checked: field initialized");
+                Ok(v)
+            }
+            ExprKind::SelfFieldLen { field } => {
+                let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
+                let arr = match fields.borrow().get(field.as_str()) {
+                    Some(RtVal::Arr(a)) => a.clone(),
+                    _ => unreachable!("checked: array field"),
+                };
+                let n = arr.borrow().len() as i128;
+                Ok(RtVal::Int(n))
+            }
+            ExprKind::SelfFieldIndex { field, index } => {
+                let idx = self.eval_int(index, frame)?;
+                let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
+                let arr = match fields.borrow().get(field.as_str()) {
+                    Some(RtVal::Arr(a)) => a.clone(),
+                    _ => unreachable!("checked: array field"),
+                };
+                let len = arr.borrow().len() as i128;
+                if idx < 0 || idx >= len {
+                    return Err(Trap {
+                        message: format!(
+                            "index out of bounds: index {idx}, length {len}"
+                        ),
+                        span: e.span,
+                    });
+                }
+                let v = arr.borrow()[idx as usize];
+                Ok(RtVal::Int(v))
+            }
+            ExprKind::CtorCall {
+                class, init, args, ..
+            } => {
+                let ci = self
+                    .classes
+                    .iter()
+                    .position(|c| c.name == *class)
+                    .expect("checked: class exists");
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(self.eval(a, frame)?);
+                }
+                self.construct(ci, init, vals, e.span)
+            }
+            ExprKind::MethodCall {
+                recv, method, args, ..
+            } => {
+                let RtVal::Obj { class, fields } = frame.vars[recv.as_str()].clone() else {
+                    unreachable!("checked: class receiver")
+                };
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(self.eval(a, frame)?);
+                }
+                self.invoke(class, method, fields, vals)
+            }
             ExprKind::Unary { op, operand } => match op {
                 UnOp::Not => {
                     let b = self.eval_bool(operand, frame)?;
@@ -525,12 +842,36 @@ impl<'a> Interp<'a> {
     }
 }
 
+fn deep_copy(v: &RtVal) -> RtVal {
+    match v {
+        RtVal::Arr(a) => RtVal::Arr(Rc::new(RefCell::new(a.borrow().clone()))),
+        RtVal::Obj { class, fields } => RtVal::Obj {
+            class: *class,
+            fields: Rc::new(RefCell::new(
+                fields
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), deep_copy(v)))
+                    .collect(),
+            )),
+        },
+        other => other.clone(),
+    }
+}
+
 fn spec_of(v: &RtVal) -> Option<SpecVal> {
     Some(match v {
         RtVal::Int(n) => SpecVal::Int(*n),
         RtVal::Bool(b) => SpecVal::Bool(*b),
         RtVal::Arr(a) => SpecVal::Arr(a.borrow().clone()),
         RtVal::Opt(o) => SpecVal::Opt(*o),
+        RtVal::Obj { fields, .. } => SpecVal::Obj(
+            fields
+                .borrow()
+                .iter()
+                .filter_map(|(k, v)| spec_of(v).map(|sv| (k.clone(), sv)))
+                .collect(),
+        ),
         RtVal::Unit => return None,
     })
 }
@@ -543,5 +884,8 @@ fn stmt_span(stmt: &Stmt) -> crate::span::Span {
         Stmt::Return { span, .. } => *span,
         Stmt::Store { array_span, .. } => *array_span,
         Stmt::ExprStmt(e) => e.span,
+        Stmt::VarDecl { name_span, .. } => *name_span,
+        Stmt::FieldAssign { field_span, .. } => *field_span,
+        Stmt::FieldStore { field_span, .. } => *field_span,
     }
 }

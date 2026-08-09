@@ -55,9 +55,19 @@ Deviations/simplifications recorded: escape hatches are name-based module-level 
 
 Known simplifications: single-diagnostic parsing (no multi-error recovery yet); full verification blocks the server loop for its ~2s (fine single-user; async later); hover resolves by name only (no scope analysis).
 
-### M5 — classes/RAII and the rest of Tier 0
+### M5 — classes with invariants and RAII *(complete, 2026-08-09)*
 
-`class`, invariants, `init`/`deinit`, borrow checking beyond call-site borrows. Exit: `BoundedStack` from the design doc, then merge/quicksort and the codec benchmarks.
+Classes per design §7: fields (ints, owned arrays), the class invariant as an interface block (obligation at the exit of every `init` and `&mut self` method, assumption at every entry, not in force mid-method), named constructors, `&self`/`&mut self` methods, empty `deinit` with RAII drop order, `alloc_array<T>(n, v)` with OOM-trap semantics, `var` bindings, method calls, bool-valued functions (`result` is Prop in the logic).
+
+Encoding (probe-validated in `docs/notes/class-encoding-probe.lean` before implementation): a Lean `structure` per class; methods bind the entry state as `_old_self` and track the current state as an update-chain (`{ s with f := v }`); inits track fields individually and exit through a record literal; callers get fresh post-state binders carrying the invariant plus the member's posts. Bare field names in invariant clauses substitute onto the state (`len ≤ buf.len` works as the design doc writes it).
+
+Exit met: **`BoundedStack` (design §7, near-verbatim) verifies — 23/23 obligations automatic on the first run**, including the structure-equality post `¬result → self = old self` and `old self.len`. Dynamic side: the interpreter constructs objects, checks the invariant at init/method exits *and at RAII drop*, and the stack posts (including structure equality and option results) are fully monitorable — zero skips.
+
+Known M5 simplifications: class values are locals only (no params/returns/moves/copies); one class per value chain (no class-typed fields); `deinit` bodies must be empty; init/method params are ints; methods cannot call sibling methods through `self`; field names must not collide with parameter names in clauses (token substitution).
+
+### M6 — the rest of Tier 0
+
+Merge/quicksort on the sorting infrastructure; the round-trip codec benchmarks (Base64/hex/varint); `partial fn`; whatever the codecs force (`narrow<T>`, byte types in earnest).
 
 ## Parallel track (low intensity)
 

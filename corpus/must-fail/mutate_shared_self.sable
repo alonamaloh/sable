@@ -1,0 +1,19 @@
+// expect-error: type.mutate_shared_self
+// A &self method cannot write fields.
+
+class Counter {
+    u64 n;
+
+    init zero() {
+        self.n = 0;
+    }
+
+    fn peek(&self) -> u64 {
+        self.n = self.n + 1;
+        return self.n;
+    }
+}
+
+fn demo() -> u64 {
+    return 0;
+}

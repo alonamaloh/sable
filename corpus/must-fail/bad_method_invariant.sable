@@ -1,0 +1,25 @@
+// expect-error: Counter::bump.inv_exit
+// The method can break the invariant (no capacity check).
+
+class Counter {
+    u64 n;
+    u64 cap;
+
+    /// invariant n ≤ cap
+    /// invariant cap ≤ 1000
+
+    /// pre c ≥ 1
+    /// pre c ≤ 1000
+    init fresh(u64 c) {
+        self.cap = c;
+        self.n = 0;
+    }
+
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+}
+
+fn demo() -> u64 {
+    return 0;
+}

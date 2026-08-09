@@ -62,6 +62,23 @@ pub fn emit(
     e.push("set_option linter.unusedVariables false");
     e.push("");
 
+    for c in &vc.classes {
+        let first = e.line + 1;
+        e.push(&format!("structure {} where", c.name));
+        for (fname, fty) in &c.fields {
+            e.push(&format!("  {fname} : {fty}"));
+        }
+        e.push("");
+        map.push(MapEntry {
+            first_line: first,
+            last_line: e.line,
+            target: MapTarget::Clause {
+                span: c.span,
+                desc: "class declaration".into(),
+            },
+        });
+    }
+
     for g in &vc.ghosts {
         let first = e.line + 1;
         // Non-recursive ghost defs get @[simp] so contracts naming them

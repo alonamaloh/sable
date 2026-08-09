@@ -1,0 +1,18 @@
+// expect-error: Counter::fresh.inv_exit
+// The init leaves the invariant broken.
+
+class Counter {
+    u64 n;
+    u64 cap;
+
+    /// invariant n ≤ cap
+
+    init fresh(u64 c) {
+        self.cap = c;
+        self.n = 1;
+    }
+}
+
+fn demo() -> u64 {
+    return 0;
+}

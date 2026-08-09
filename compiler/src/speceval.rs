@@ -19,6 +19,8 @@ pub enum SpecVal {
     Bool(bool),
     Arr(Vec<i128>),
     Opt(Option<i128>),
+    /// A class value: field name → value.
+    Obj(HashMap<String, SpecVal>),
 }
 
 /// Why a clause could not be checked dynamically.
@@ -252,6 +254,7 @@ enum S {
     ConstBound(i128),
     Len(Box<S>),
     Get(Box<S>, Box<S>),
+    Field(Box<S>, String),
     Neg(Box<S>),
     Bin(Op, Box<S>, Box<S>),
     Not(Box<S>),
@@ -260,6 +263,8 @@ enum S {
         vars: Vec<String>,
         body: Box<S>,
     },
+    SomeLit(Box<S>),
+    NoneLit,
     App(String, Vec<S>),
     MatchOpt {
         scrutinee: Box<S>,
@@ -439,11 +444,15 @@ impl P {
             _ => return Err(Unmonitorable("higher-order application".into())),
         };
         // `old a` normalizes here.
+        if name == "some" {
+            if args.len() == 1 {
+                return Ok(S::SomeLit(Box::new(args.into_iter().next().unwrap())));
+            }
+            return Err(Unmonitorable("`some` takes one value".into()));
+        }
         if name == "old" {
             if args.len() == 1 {
-                if let S::Var(a) = &args[0] {
-                    return Ok(S::Old(a.clone()));
-                }
+                return oldify(args.into_iter().next().unwrap());
             }
             return Err(Unmonitorable("`old` applies to one variable".into()));
         }
@@ -466,6 +475,7 @@ impl P {
             T::Ident(name) => match name.as_str() {
                 "True" => S::True,
                 "False" => S::False,
+                "none" => S::NoneLit,
                 "match" => return self.match_opt(),
                 _ => ident_to_expr(&name)?,
             },
@@ -542,7 +552,8 @@ impl P {
     }
 }
 
-/// Dotted identifiers: `a.len`, `a.get`, `iN.max`, `Sable.Seq.perm`.
+/// Dotted identifiers: `a.len`, `a.get`, `self.buf.get`, `iN.max`,
+/// `Sable.Seq.perm`, and general field paths on class values.
 fn ident_to_expr(name: &str) -> EResult<S> {
     if let Some((head, field)) = name.rsplit_once('.') {
         return match field {
@@ -554,12 +565,22 @@ fn ident_to_expr(name: &str) -> EResult<S> {
                 Ok(S::ConstBound(if field == "min" { it.min() } else { it.max() }))
             }
             "perm" => Ok(S::App("perm".to_string(), vec![])),
-            _ => Err(Unmonitorable(format!(
-                "`{name}` is outside the monitorable fragment"
-            ))),
+            _ => Ok(S::Field(Box::new(ident_to_expr(head)?), field.to_string())),
         };
     }
     Ok(S::Var(name.to_string()))
+}
+
+/// Rewrite the base variable of a path to its entry-state lookup:
+/// `old self.len` means the entry value of `self.len`.
+fn oldify(s: S) -> EResult<S> {
+    Ok(match s {
+        S::Var(v) => S::Old(v),
+        S::Len(x) => S::Len(Box::new(oldify(*x)?)),
+        S::Field(x, f) => S::Field(Box::new(oldify(*x)?), f),
+        S::Get(x, i) => S::Get(Box::new(oldify(*x)?), i),
+        _ => return Err(Unmonitorable("`old` applies to a variable or path".into())),
+    })
 }
 
 // ---------------------------------------------------------------- ghosts
@@ -613,7 +634,7 @@ fn parse_ghost_def(text: &str) -> Option<(Vec<String>, String, S)> {
 
 pub struct SpecEnv<'a> {
     pub vars: HashMap<String, SpecVal>,
-    pub olds: HashMap<String, Vec<i128>>,
+    pub olds: HashMap<String, SpecVal>,
     pub ghosts: &'a GhostDefs,
 }
 
@@ -662,11 +683,22 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             .olds
             .get(v)
             .cloned()
-            .map(SpecVal::Arr)
             .ok_or_else(|| Unmonitorable(format!("no entry snapshot for `{v}`"))),
         S::Len(a) => match eval(a, env, depth + 1)? {
             SpecVal::Arr(v) => Ok(SpecVal::Int(v.len() as i128)),
+            // A class field that happens to be named `len`.
+            SpecVal::Obj(fields) => fields
+                .get("len")
+                .cloned()
+                .ok_or_else(|| Unmonitorable("no field `len`".into())),
             _ => Err(Unmonitorable("`.len` on a non-array".into())),
+        },
+        S::Field(recv, field) => match eval(recv, env, depth + 1)? {
+            SpecVal::Obj(fields) => fields
+                .get(field)
+                .cloned()
+                .ok_or_else(|| Unmonitorable(format!("no field `{field}`"))),
+            _ => Err(Unmonitorable(format!("`.{field}` on a non-class value"))),
         },
         S::Get(a, i) => {
             let arr = match eval(a, env, depth + 1)? {
@@ -733,6 +765,11 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             })
         }
         S::Quant { forall, vars, body } => eval_quant(*forall, vars, body, env, depth),
+        S::NoneLit => Ok(SpecVal::Opt(None)),
+        S::SomeLit(inner) => {
+            let v = int(eval(inner, env, depth + 1)?)?;
+            Ok(SpecVal::Opt(Some(v)))
+        }
         S::App(name, args) => {
             if name == "perm" || name.ends_with(".perm") {
                 if args.len() != 2 {
@@ -935,6 +972,7 @@ fn spec_eq(a: &SpecVal, b: &SpecVal) -> Option<bool> {
         (SpecVal::Opt(x), SpecVal::Opt(y)) => Some(x == y),
         (SpecVal::Arr(x), SpecVal::Arr(y)) => Some(x == y),
         (SpecVal::Bool(x), SpecVal::Bool(y)) => Some(x == y),
+        (SpecVal::Obj(x), SpecVal::Obj(y)) => Some(x == y),
         _ => None,
     }
 }
