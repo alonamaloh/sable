@@ -65,10 +65,10 @@ Every partial operation emits a verification condition (VC):
 |---|---|
 | `a + b`, `a - b`, `a * b` | result representable in the operand type |
 | `a / b`, `a % b` | `b ≠ 0`; for signed `/`, additionally not `MIN / -1` |
-
-Division is **Euclidean**, not C-truncating: `a = b*(a/b) + a%b` with `0 ≤ a%b < |b|` — the remainder is never negative, and `/`/`%` coincide exactly with the proof language's (Lean core's) integer division (ADR 0004).
 | `a[i]` | `0 ≤ i < a.len` |
 | `narrow<u8>(x)` | value fits in the target type |
+
+Division is **Euclidean**, not C-truncating: `a = b*(a/b) + a%b` with `0 ≤ a%b < |b|` — the remainder is never negative, and `/`/`%` coincide exactly with the proof language's (Lean core's) integer division (ADR 0004).
 
 Total operators exist for when modular or saturating behavior is *intended*; they emit no VC:
 
