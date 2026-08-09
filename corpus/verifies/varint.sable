@@ -1,0 +1,114 @@
+// LEB128-style varint codec for a single u64 (M6 codec track).
+//
+// No `narrow<T>` exists yet, so the byte buffer is a [u64] whose elements
+// the contracts keep in byte range (< 256); see the report note.
+//
+// The interesting proof is the byte-count bound: result ≤ 10. With no
+// `pow` in the spec vocabulary, the invariant `v ≤ u64.max / 128^i` is
+// unrolled into a 10-way disjunction over concrete constants
+// (2^(64-7i) - 1); omega closes every step because division is by the
+// constant 128.
+
+/// pre  out.len >= 10
+/// post 1 <= result ∧ result <= 10
+/// post ∀ k, 0 <= k → k < result - 1 → 128 <= out.get k ∧ out.get k < 256
+/// post 0 <= out.get (result - 1) ∧ out.get (result - 1) < 128
+/// post x < 128 → result = 1 ∧ out.get 0 = x
+/// post 128 <= x → 2 <= result
+fn varint_encode(&mut [u64] out, u64 x) -> u64 {
+    u64 v = x;
+    u64 i = 0;
+    u64 more = 1;
+    /// invariant more = 0 ∨ more = 1
+    /// invariant i <= 10
+    /// invariant more = 1 → ((i = 0 ∧ v = x) ∨ (i = 1 ∧ v <= 144115188075855871) ∨ (i = 2 ∧ v <= 1125899906842623) ∨ (i = 3 ∧ v <= 8796093022207) ∨ (i = 4 ∧ v <= 68719476735) ∨ (i = 5 ∧ v <= 536870911) ∨ (i = 6 ∧ v <= 4194303) ∨ (i = 7 ∧ v <= 32767) ∨ (i = 8 ∧ v <= 255) ∨ (i = 9 ∧ v <= 1))
+    /// invariant more = 1 → ∀ k, 0 <= k → k < i → 128 <= out.get k ∧ out.get k < 256
+    /// invariant more = 1 → 1 <= i → 128 <= x
+    /// invariant more = 0 → 1 <= i ∧ (∀ k, 0 <= k → k < i - 1 → 128 <= out.get k ∧ out.get k < 256) ∧ 0 <= out.get (i - 1) ∧ out.get (i - 1) < 128
+    /// invariant more = 0 → x < 128 → i = 1 ∧ out.get 0 = x
+    /// invariant more = 0 → 128 <= x → 2 <= i
+    /// variant   v + more
+    while (more == 1) {
+        if (v >= 128) {
+            out[i] = v % 128 + 128;
+            v = v / 128;
+            i = i + 1;
+        } else {
+            out[i] = v;
+            i = i + 1;
+            more = 0;
+        }
+    }
+    return i;
+}
+
+// Decode reads the n bytes src[0..n) most-significant-first (index n-1
+// down to 0), so the accumulator step is `value * 128 + digit` —
+// multiplication by a constant, which omega handles — instead of a
+// running power-of-128 multiplier, which it does not. Malformed input
+// (an element ≥ 256) and accumulator overflow return none.
+
+/// pre  n <= src.len
+/// post n = 0 → result = none
+/// post match result with
+///      | some v => ∀ j, 0 <= j → j < n → src.get j < 256
+///      | none   => True
+/// post n = 1 → 0 <= src.get 0 → src.get 0 < 128 → result = some (src.get 0)
+fn varint_decode(&[u64] src, u64 n) -> option<u64> {
+    if (n == 0) { return none; }
+    u64 value = 0;
+    u64 k = n;
+    /// invariant k <= n
+    /// invariant ∀ j, k <= j → j < n → src.get j < 256
+    /// invariant n = 1 → src.get 0 < 128 → ((k = 1 ∧ value = 0) ∨ (k = 0 ∧ value = src.get 0))
+    /// variant   k
+    while (k > 0) {
+        k = k - 1;
+        u64 b = src[k];
+        if (b >= 256) { return none; }
+        u64 d = b % 128;
+        if (value > (18446744073709551615 - d) / 128) { return none; }
+        value = value * 128 + d;
+    }
+    return some(value);
+}
+
+// The three obligations automation cannot reach; hypothesis names come
+// from the failure output.
+
+// Stepping the unrolled power chain: v/128 moves each disjunct one slot
+// to the right; the i = 0 slot uses x's type range, the i = 9 slot
+// (v ≤ 1) contradicts the path fact v ≥ 128. All linear once the
+// disjunction is in scope, so omega closes it.
+/// discharge varint_encode.inv_preserved.more_1_i_0_v_x_i_1_v_144115188075855871 by
+///   intro hm
+///   have hd := h_inv_more_1_i_0_v_x_i_1_v_144 h_path_more_1
+///   omega
+
+// Writing the continuation byte extends "all written bytes are in
+// [128, 256)" by one: get_set case split on k = i.
+/// discharge varint_encode.inv_preserved.more_1_k_0_k_k_i_128_out_get_k_out_get_k by
+///   intro hm k hk0 hk
+///   have hb := h_inv_more_1_k_0_k_k_i_128_out h_path_more_1
+///   by_cases hki : k = i
+///   · simp [Sable.Seq.get_set, hki]
+///     omega
+///   · simp [Sable.Seq.get_set, hki]
+///     exact hb k hk0 (by omega)
+
+// The final (continuation-free) byte: earlier bytes are untouched by the
+// store at i, and the byte at i is v itself, < 128 on this path.
+/// discharge varint_encode.inv_preserved.more_0_1_i_k_0_k_k_i_1_128_out_get_k_out.2 by
+///   intro hz
+///   have hb := h_inv_more_1_k_0_k_k_i_128_out h_path_more_1
+///   constructor
+///   · omega
+///   constructor
+///   · intro k hk0 hk
+///     have hki : k ≠ i := by omega
+///     simp [Sable.Seq.get_set, hki]
+///     exact hb k hk0 (by omega)
+///   · have hii : i + 1 - 1 = i := by omega
+///     rw [hii]
+///     simp [Sable.Seq.get_set]
+///     omega

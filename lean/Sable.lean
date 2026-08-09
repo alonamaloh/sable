@@ -4,3 +4,4 @@ import Sable.Seq
 import Sable.Ghost
 import Sable.Perm
 import Sable.Specs
+import Sable.SVM
