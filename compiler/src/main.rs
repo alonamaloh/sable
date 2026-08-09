@@ -41,12 +41,33 @@ fn main() -> ExitCode {
         Outcome::Verified {
             functions,
             obligations,
+            deferred,
+            assumed,
         } => {
             if !opts.emit_lean_only {
+                let proved = obligations - deferred.len() - assumed.len();
                 println!(
-                    "verified: {} — {obligations} obligation(s) proved across {functions} function(s)",
-                    file.display()
+                    "verified: {} — {obligations} obligation(s) across {functions} function(s): \
+                     {proved} proved, {} deferred, {} assumed",
+                    file.display(),
+                    deferred.len(),
+                    assumed.len(),
                 );
+                for d in &deferred {
+                    println!("  deferred (sound runtime trap): {d}");
+                }
+                for (a, reason) in &assumed {
+                    println!("  assumed (UNSOUND, audited):    {a} — {reason}");
+                }
+                if deferred.is_empty() && assumed.is_empty() {
+                    println!("status: fully verified");
+                } else {
+                    println!(
+                        "status: verified with escapes (defers: {}, assumes: {})",
+                        deferred.len(),
+                        assumed.len()
+                    );
+                }
             }
             ExitCode::SUCCESS
         }

@@ -41,9 +41,12 @@ pub fn parse(
         fns.push(parser.parse_fn()?);
     }
 
-    // Remaining blocks are module-level: ghost defs, theorems, discharges.
+    // Remaining blocks are module-level: ghost defs, theorems,
+    // discharges, defers, assumes.
     let mut discharges = Vec::new();
     let mut ghosts = Vec::new();
+    let mut defers = Vec::new();
+    let mut assumes = Vec::new();
     for (bi, block) in parser.blocks.iter().enumerate() {
         if parser.consumed[bi] {
             continue;
@@ -51,6 +54,8 @@ pub fn parse(
         for clause in &block.clauses {
             match clause.kind {
                 ClauseKind::Discharge => discharges.push(parse_discharge(clause)?),
+                ClauseKind::Defer => defers.push(parse_defer(clause)?),
+                ClauseKind::Assume => assumes.push(parse_assume(clause)?),
                 ClauseKind::GhostDef => ghosts.push(GhostItem {
                     keyword: "def",
                     text: clause.text.clone(),
@@ -87,6 +92,85 @@ pub fn parse(
         fns,
         discharges,
         ghosts,
+        defers,
+        assumes,
+    })
+}
+
+fn obligation_name(text: &str) -> (String, &str) {
+    let text = text.trim_start();
+    let name: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_')
+        .collect();
+    let rest = text[name.len()..].trim();
+    (name, rest)
+}
+
+fn parse_defer(clause: &Clause) -> PResult<Defer> {
+    let (name, rest) = obligation_name(&clause.text);
+    if name.is_empty() || !rest.is_empty() {
+        return Err(Diagnostic {
+            name: "proof.malformed_defer".into(),
+            title: "malformed `defer` clause".into(),
+            span: clause.span,
+            label: "expected `defer <obligation-name>`".into(),
+            notes: vec![],
+        });
+    }
+    Ok(Defer {
+        name,
+        span: clause.span,
+    })
+}
+
+fn parse_assume(clause: &Clause) -> PResult<Assume> {
+    // `#[audit(reason := "...")] NAME` — the audit payload is mandatory:
+    // an assume is a permanent, reviewed trust statement (design §9).
+    let text = clause.text.trim_start();
+    let missing_audit = || Diagnostic {
+        name: "proof.assume_needs_audit".into(),
+        title: "`assume` without an `#[audit]` payload".into(),
+        span: clause.span,
+        label: "an axiom must carry its justification".into(),
+        notes: vec![(
+            "note".into(),
+            "write `assume #[audit(reason := \"...\")] <obligation-name>` (design §9)".into(),
+        )],
+    };
+    let Some(rest) = text.strip_prefix("#[audit(reason") else {
+        return Err(missing_audit());
+    };
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix(":=") else {
+        return Err(missing_audit());
+    };
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix('"') else {
+        return Err(missing_audit());
+    };
+    let Some(quote_end) = rest.find('"') else {
+        return Err(missing_audit());
+    };
+    let reason = rest[..quote_end].to_string();
+    let rest = rest[quote_end + 1..].trim_start();
+    let Some(rest) = rest.strip_prefix(")]") else {
+        return Err(missing_audit());
+    };
+    let (name, tail) = obligation_name(rest);
+    if name.is_empty() || !tail.is_empty() || reason.trim().is_empty() {
+        return Err(Diagnostic {
+            name: "proof.malformed_assume".into(),
+            title: "malformed `assume` clause".into(),
+            span: clause.span,
+            label: "expected `assume #[audit(reason := \"...\")] <obligation-name>`".into(),
+            notes: vec![],
+        });
+    }
+    Ok(Assume {
+        name,
+        reason,
+        span: clause.span,
     })
 }
 

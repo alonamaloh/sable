@@ -1,0 +1,9 @@
+// expect-error: proof.defer_unmonitorable
+// A quantified goal cannot become a runtime check (M3 fragment).
+
+/// post ∀ k, 0 ≤ k → k < a.len → a.get k ≤ i32.max
+fn idle(&[i32] a) -> i32 {
+    return 0;
+}
+
+/// defer idle.post.k_0_k_k_a_len_a_get_k_i32_max

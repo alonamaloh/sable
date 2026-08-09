@@ -1,0 +1,9 @@
+// expect-error: proof.assume_needs_audit
+// An axiom without its justification is rejected.
+
+/// post result = a / b
+fn div_trusted(u32 a, u32 b) -> u32 {
+    return a / b;
+}
+
+/// assume div_trusted.div_zero.a_b

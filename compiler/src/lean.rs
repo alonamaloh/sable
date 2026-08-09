@@ -46,7 +46,11 @@ impl Emitter {
     }
 }
 
-pub fn emit(vc: &VcResult, discharges: &[crate::ast::Discharge]) -> Emitted {
+pub fn emit(
+    vc: &VcResult,
+    discharges: &[crate::ast::Discharge],
+    skip: &std::collections::HashSet<String>,
+) -> Emitted {
     let mut e = Emitter {
         buf: String::new(),
         line: 0,
@@ -101,6 +105,12 @@ pub fn emit(vc: &VcResult, discharges: &[crate::ast::Discharge]) -> Emitted {
     }
 
     for (i, ob) in vc.obligations.iter().enumerate() {
+        // Deferred/assumed obligations become runtime traps or axioms;
+        // no theorem is emitted (their goals are already assumed
+        // downstream by the generator, which is exactly their semantics).
+        if skip.contains(&ob.name) {
+            continue;
+        }
         let discharge = discharges.iter().find(|d| d.name == ob.name);
         let first = e.line + 1;
         e.push(&format!("/-- `{}` — {} -/", ob.name, doc_safe(&ob.kind_desc)));

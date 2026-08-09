@@ -291,9 +291,29 @@ pub struct GhostItem {
     pub span: Span,
 }
 
+/// `/// defer NAME` — the named obligation becomes a runtime trap
+/// instead of a proof (sound: downstream still assumes it, execution
+/// halts if it fails). Design §9.
+#[derive(Debug, Clone)]
+pub struct Defer {
+    pub name: String,
+    pub span: Span,
+}
+
+/// `/// assume #[audit(reason := "...")] NAME` — the named obligation
+/// becomes an axiom (UNSOUND; the audit payload is mandatory). Design §9.
+#[derive(Debug, Clone)]
+pub struct Assume {
+    pub name: String,
+    pub reason: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<Fn>,
     pub discharges: Vec<Discharge>,
     pub ghosts: Vec<GhostItem>,
+    pub defers: Vec<Defer>,
+    pub assumes: Vec<Assume>,
 }

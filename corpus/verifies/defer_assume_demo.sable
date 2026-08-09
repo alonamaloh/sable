@@ -1,0 +1,19 @@
+// The escape hatches (design §9). `defer` compiles one VC to a runtime
+// trap — sound, counted, greppable. `assume` takes one VC as an audited
+// axiom — unsound, counted, and its justification is mandatory.
+// Neither file is "fully verified"; the build report says so.
+
+/// post result = a + b
+fn add_unchecked(u32 a, u32 b) -> u32 {
+    return a + b;
+}
+
+/// defer add_unchecked.overflow.a_b
+
+/// post result = a / b
+fn div_trusted(u32 a, u32 b) -> u32 {
+    return a / b;
+}
+
+/// assume #[audit(reason := "network layer validates b > 0 before dispatch")]
+///        div_trusted.div_zero.a_b
