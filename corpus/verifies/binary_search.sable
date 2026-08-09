@@ -4,7 +4,7 @@
 // hypothesis instantiated and are discharged by hand below — exactly the
 // two-tier workflow the design intends.
 
-/// pre  ∀ i j, 0 ≤ i → i < j → j < a.len → a.get i ≤ a.get j
+/// pre  sorted a
 /// post match result with
 ///      | some i => 0 ≤ i ∧ i < a.len ∧ a.get i = key
 ///      | none   => ∀ k, 0 ≤ k → k < a.len → a.get k ≠ key

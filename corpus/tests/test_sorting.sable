@@ -4,20 +4,17 @@
 // permutation claim), loop invariants, and variants — plus the trap
 // checks (overflow, bounds, division) the verifier would emit VCs for.
 
-/// def sorted_seq (a : seq i32) : Prop :=
-///   ∀ p q, 0 ≤ p → p < q → q < a.len → a.get p ≤ a.get q
-
-/// post sorted_seq a
-/// post Sable.Seq.perm a (old a)
+/// post sorted a
+/// post perm a (old a)
 fn insertion_sort(&mut [i32] a) {
     u64 n = a.len;
     /// invariant ∀ p q, 0 ≤ p → p < q → q < i → a.get p ≤ a.get q
-    /// invariant Sable.Seq.perm a (old a)
+    /// invariant perm a (old a)
     for (u64 i : range(n)) {
         u64 j = i;
         /// invariant j ≤ i
         /// invariant ∀ p q, 0 ≤ p → p < q → q ≤ i → q ≠ j → a.get p ≤ a.get q
-        /// invariant Sable.Seq.perm a (old a)
+        /// invariant perm a (old a)
         /// variant   j
         while (j > 0 && a[j - 1] > a[j]) {
             i32 t = a[j - 1];
@@ -28,7 +25,7 @@ fn insertion_sort(&mut [i32] a) {
     }
 }
 
-/// pre  ∀ i j, 0 ≤ i → i < j → j < a.len → a.get i ≤ a.get j
+/// pre  sorted a
 /// post match result with
 ///      | some i => 0 ≤ i ∧ i < a.len ∧ a.get i = key
 ///      | none   => ∀ k, 0 ≤ k → k < a.len → a.get k ≠ key

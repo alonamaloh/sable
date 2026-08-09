@@ -47,6 +47,7 @@ Generated Lean goes to `.sable-out/` (gitignored), one file per module, `import 
 - **Every obligation is named** and the name is stable across unrelated edits (M0: expression-slug anchors; the design's content-anchoring scheme replaces this). Lean theorem names are sanitized versions; user-facing names live in the source map.
 - **Values are exact integers.** Program integers are represented in Lean as `Int`; per-operation VCs guarantee representability, so symbolic values never wrap. `wrap()` etc. (later) get explicit `mod 2^n` semantics.
 - **The prelude depends on Lean core only** — no mathlib. Cold-start and toolchain churn stay controlled; the multiset library (M2) is written in-repo.
+- **The specification vocabulary lives in the prelude** (`lean/Sable/Specs.lean`): `sorted`, `sortedRange`, `perm`, `contains`, `count` — reducible abbrevs (discharge scripts apply their hypotheses directly), `@[simp]` where unfolding helps automation (`perm` stays opaque behind its lemma library), each with a native evaluator in the monitorable fragment. Program identifiers may shadow these names; the program binding wins in clauses.
 
 ## `sable test` (dynamic checking)
 

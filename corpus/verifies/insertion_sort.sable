@@ -4,20 +4,17 @@
 // (lean/Sable/Perm.lean); `Seq.perm_swap` matches the three-statement
 // swap idiom below exactly.
 
-/// def sorted_seq (a : seq i32) : Prop :=
-///   ∀ p q, 0 ≤ p → p < q → q < a.len → a.get p ≤ a.get q
-
-/// post sorted_seq a
-/// post Sable.Seq.perm a (old a)
+/// post sorted a
+/// post perm a (old a)
 fn insertion_sort(&mut [i32] a) {
     u64 n = a.len;
     /// invariant ∀ p q, 0 ≤ p → p < q → q < i → a.get p ≤ a.get q
-    /// invariant Sable.Seq.perm a (old a)
+    /// invariant perm a (old a)
     for (u64 i : range(n)) {
         u64 j = i;
         /// invariant j ≤ i
         /// invariant ∀ p q, 0 ≤ p → p < q → q ≤ i → q ≠ j → a.get p ≤ a.get q
-        /// invariant Sable.Seq.perm a (old a)
+        /// invariant perm a (old a)
         /// variant   j
         while (j > 0 && a[j - 1] > a[j]) {
             i32 t = a[j - 1];
@@ -62,7 +59,7 @@ fn insertion_sort(&mut [i32] a) {
 ///         omega
 
 // Each swap is a permutation (prelude lemma), chained transitively:
-/// discharge insertion_sort.inv_preserved.sable_seq_perm_a_old_a by
+/// discharge insertion_sort.inv_preserved.perm_a_old_a by
 ///   exact Sable.Seq.perm_trans
 ///     (Sable.Seq.perm_swap a (j - 1) j (by omega) (by omega) (by omega) (by omega))
 ///     h_inv17_3

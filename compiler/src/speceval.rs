@@ -771,6 +771,33 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             Ok(SpecVal::Opt(Some(v)))
         }
         S::App(name, args) => {
+            let base = name.rsplit('.').next().unwrap_or(name);
+            match base {
+                "sorted" if args.len() == 1 => {
+                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    return Ok(SpecVal::Bool(a.windows(2).all(|w| w[0] <= w[1])));
+                }
+                "sortedRange" if args.len() == 3 => {
+                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    let lo = int(eval(&args[1], env, depth + 1)?)?.max(0) as usize;
+                    let hi = (int(eval(&args[2], env, depth + 1)?)?.max(0) as usize)
+                        .min(a.len());
+                    return Ok(SpecVal::Bool(
+                        lo >= hi || a[lo..hi].windows(2).all(|w| w[0] <= w[1]),
+                    ));
+                }
+                "contains" if args.len() == 2 => {
+                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    let v = int(eval(&args[1], env, depth + 1)?)?;
+                    return Ok(SpecVal::Bool(a.contains(&v)));
+                }
+                "count" if args.len() == 2 => {
+                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    let v = int(eval(&args[1], env, depth + 1)?)?;
+                    return Ok(SpecVal::Int(a.iter().filter(|x| **x == v).count() as i128));
+                }
+                _ => {}
+            }
             if name == "perm" || name.ends_with(".perm") {
                 if args.len() != 2 {
                     return Err(Unmonitorable("`perm` takes two sequences".into()));
