@@ -1,6 +1,6 @@
 # Sable — Language Design
 
-*Working draft 0.3 — subject to revision as real code generates friction.*
+*Working draft 0.4 — subject to revision as real code generates friction.*
 
 Sable is an imperative, C-flavored language in which every function carries a machine-checked proof of its contract. One source file interleaves two languages:
 
@@ -10,7 +10,7 @@ Sable is an imperative, C-flavored language in which every function carries a ma
 ## Design pillars
 
 1. **No undefined behavior.** Every syntactically valid program has a meaning defined by a formal machine model. Anything that would be UB in C is either statically excluded by a proof obligation or has defined trap semantics.
-2. **A formal machine model is the axiom base.** The default model is the Sable Virtual Machine (SVM, §10), formalized once in Lean. Proof obligations are theorems about machine traces; the verification-condition generator carries a mechanized soundness proof. Trusting a verified Sable program reduces to trusting the machine formalization and the Lean kernel — not the compiler. The SVM is a *semantic definition*, not a runtime: native compilation is (eventually verified) machine-behavior-preserving translation, and other machine models can sit below the same language (§11).
+2. **A formal machine model is the axiom base.** The default model is the Sable Virtual Machine (SVM, §10), formalized once in Lean. Proof obligations are theorems about machine traces. The SVM is a *semantic definition*, not a runtime: native compilation is (eventually verified) machine-behavior-preserving translation, and other machine models can sit below the same language (§11). The trusted base shrinks in **stages** (§10.1): initially the VC generator is trusted engineering, cross-checked by differential testing against the SVM formalization; a mechanized soundness proof of the VC generator — reducing trust to the machine formalization and the Lean kernel alone — is a scheduled long-running pillar, not a day-one claim.
 3. **Ownership before logic.** The type system enforces unique ownership with borrowing (§5). Because mutable aliasing is impossible in safe code, the verifier reasons about values rather than heaps, and framing is a type-system fact, not a per-call proof obligation.
 4. **Total verification, visible exceptions.** There are no build modes. An undischarged obligation is a compile error. The only ways past an obligation are written in the source, audited, and greppable: `defer` (sound runtime trap) and `assume` (unsound axiom) — §9.
 
@@ -49,7 +49,7 @@ Because contract expressions are unambiguously proof-language, they use real Lea
 |---|---|
 | Integers | `i8 i16 i32 i64 u8 u16 u32 u64` — fixed width; no silent wraparound (§2.2) |
 | Boolean | `bool` |
-| Floating | `f32 f64` (IEEE-754; verification limited to range/NaN facts in v0.3) |
+| Floating | `f32 f64` (IEEE-754; verification limited to range/NaN facts in v0.4) |
 | Aggregates | `struct`; fixed arrays `T[N]`; owned dynamic arrays `[T]` (length-carrying) |
 | Classes | `class` — structs with invariants, constructors, destructors (§7) |
 | References | `&T` shared/immutable borrow; `&mut T` unique/mutable borrow |
@@ -145,7 +145,7 @@ Collapse the `///` lines and the function reads as plain C with a two-line contr
 
 ## 5. Memory model: ownership + borrows
 
-Affine ownership with lexically scoped borrowing — the Rust discipline, simplified (no surface lifetime annotations in v0.3).
+Affine ownership with lexically scoped borrowing — the Rust discipline, simplified (no surface lifetime annotations in v0.4).
 
 1. Every value has one owner. Assignment and by-value passing **move** ownership unless the type is `copy` (scalars are). A moved-from variable is statically dead.
 2. `&x` creates shared borrows: any number may coexist; no mutation through them; the owner is frozen while they live.
@@ -153,7 +153,7 @@ Affine ownership with lexically scoped borrowing — the Rust discipline, simpli
 4. When the owner of a `class` value dies, its destructor runs (§7), in reverse declaration order — defined, like everything else.
 5. Shared mutable state goes through the library type `cell<T>` carrying a declared invariant; every access is a method call whose contract preserves it.
 
-Why ownership rather than a flat heap with separation logic: with a flat heap, every function needs footprint annotations and the proof layer stops being optional reading. Under ownership, framing, definite initialization, absence of use-after-free, and single-destruction are theorems of the *metatheory*, proved once — the per-program verifier sees an essentially functional program with mutation localized to uniquely-owned values. Empirically this is why ownership-based verifiers (Verus, Creusot) discharge obligations orders of magnitude faster than heap-logic tools. The machine-model heap is a partial map `Addr ⇀ Val ∪ {⊥}`; the metatheory proves the ownership discipline implies the separation-logic frame rule for all safe code.
+Why ownership rather than a flat heap with separation logic: with a flat heap, every function needs footprint annotations and the proof layer stops being optional reading. Under ownership, framing, definite initialization, absence of use-after-free, and single-destruction are theorems of the *metatheory*, proved once — the per-program verifier sees an essentially functional program with mutation localized to uniquely-owned values. Empirically this is why ownership-based verifiers (Verus, Creusot) discharge obligations orders of magnitude faster than heap-logic tools. The machine-model heap is a partial map `Addr ⇀ Val ∪ {⊥}`; the metatheory's target theorem is that the ownership discipline implies the separation-logic frame rule for all safe code. Mechanizing that theorem is part of the staged metatheory pillar (§10.1) — the nearest precedent, RustBelt, was a multi-year team effort for a fragment of Rust, and Sable's deliberately smaller surface (lexical borrows, no closures, no lifetimes) is what keeps it tractable.
 
 ```sable
 /// post *a = old *b ∧ *b = old *a
@@ -163,7 +163,7 @@ fn swap(&mut i32 a, &mut i32 b) {
 // swap(&mut x, &mut x) is not a verification failure — it is a type error.
 ```
 
-An `unsafe` sublanguage (raw regions, manufacturing ownership from bytes) is deliberately unspecified in v0.3; its design is a scheduled deliverable of the allocator benchmark (see the goals document), with full separation-logic obligations expected at the safe/unsafe boundary.
+An `unsafe` sublanguage (raw regions, manufacturing ownership from bytes) is deliberately unspecified in v0.4; its design is a scheduled deliverable of the allocator benchmark (see the goals document), with full separation-logic obligations expected at the safe/unsafe boundary. FFI rides on the same design. This deferral is correct for the benchmark-driven phase, but it should be named for what it is: **the gate between research artifact and usable language**. A systems language that cannot call anything is a proof pipeline with syntax; no adoption claim can be made before the unsafe/FFI boundary lands.
 
 ## 6. Ghost code
 
@@ -202,7 +202,9 @@ fn binary_search(&[i32] a, i32 key) -> option<u64> {
 ///   · exact ne_of_gt (h_inv₃ k h hk) |>.symm
 ```
 
-Every obligation has a stable name (`function.kind.index`); `discharge NAME by TACTIC` targets it. Undischarged obligations are compile errors printing the name, the goal, and the SMT backend's diagnosis.
+Every obligation has a stable, **content-anchored** name: the enclosing declaration, the clause kind, and a source anchor derived from the clause's own structure (here, the `none` match arm) or an explicit `#[label(...)]` on the clause. Names are never positional indices — inserting a statement must not renumber obligations and silently orphan `discharge` blocks. `discharge NAME by TACTIC` targets one obligation; if an edit changes a clause enough that its anchor no longer resolves, the orphaned `discharge` is itself a compile error, never silently dropped. Undischarged obligations are compile errors printing the name, the goal, and the SMT backend's diagnosis.
+
+The SMT↔Lean seam this feature sits on — reconstructing an SMT-failed goal as a Lean goal with stable, nameable hypotheses — is acknowledged as the highest-risk piece of engineering in the language, because hybrid systems (F* foremost) show user pain concentrates exactly here: quantifier triggers, bitvector-vs-ℤ lifting mismatches, opaque failures. Hypothesis naming in reconstructed goals follows the same content-anchoring rule as obligation names.
 
 ## 7. Classes, invariants, RAII
 
@@ -306,9 +308,18 @@ Rationale for keeping a sound trap-fallback at all: without `defer`, schedule pr
 The default machine model is deliberately boring: a typed stack machine with an object heap.
 
 - **Configuration**: `⟨code, frames, heap, ghost⟩`. Frames hold locals (each `Val ∪ ⊥`); the heap maps addresses to typed objects; `ghost` holds specification state erased from real execution.
-- **Semantics**: small-step, deterministic in v0.3 (concurrency deferred), formalized in Lean as an inductive step relation of ~40 rules. This single artifact is the language's meaning — there is no prose abstract machine to disagree with it.
-- **Soundness theorem** (mechanized, once): *if every VC of program P is a theorem, then no execution of ⟦P⟧ reads ⊥, executes a partial operation outside its domain, violates a contract, or — absent `partial` — diverges; and every `defer`red predicate either holds or the execution ends in a named trap.* The compiler is untrusted; the theorem, the machine formalization, and the Lean kernel are the trusted base.
+- **Semantics**: small-step, deterministic in v0.4 (concurrency deferred), formalized in Lean as an inductive step relation of ~40 rules. This single artifact is the language's meaning — there is no prose abstract machine to disagree with it.
+- **Soundness theorem** (the metatheory's target statement): *if every VC of program P is a theorem, then no execution of ⟦P⟧ reads ⊥, executes a partial operation outside its domain, violates a contract, or — absent `partial` — diverges; and every `defer`red predicate either holds or the execution ends in a named trap.* When mechanized (§10.1, stage 2), the compiler is untrusted; the theorem, the machine formalization, and the Lean kernel are the trusted base.
 - Allocation failure is defined behavior: `alloc_array` halts in a named OOM trap. Top-level correctness claims therefore read "every execution either satisfies the contract or halts in the OOM trap." (A `try_alloc` returning `option` exists for callers that must handle exhaustion.)
+
+### 10.1 The trusted base, in stages
+
+The soundness story is deliberately staged, because a mechanized VCgen soundness proof is RustBelt-scale work that sits on the critical path of nothing in the near-term goals:
+
+- **Stage 1 (from day one)**: the SVM step relation is formalized in Lean and is the language's normative meaning. The VC generator is *trusted engineering* — the same trust posture as Verus and Creusot today — but it is cross-checked continuously: the SVM formalization is executably testable via the reference interpreter (and later the self-hosted SVM interpreter, which doubles as a differential-testing oracle for every compiler question).
+- **Stage 2 (its own long-running pillar)**: mechanize the soundness theorem — VCgen correctness against the step relation, ghost-erasure soundness, and the ownership-implies-frame-rule metatheorem of §5. This retires the VCgen from the trusted base. It is scheduled as an explicit tier in the goals document, not implied by the design.
+
+Claims made about verified Sable programs must name the stage they rest on.
 
 ## 11. Profiles and alternative machine models
 
@@ -317,9 +328,11 @@ The SVM is one machine model, not a commitment. Two mechanisms keep the language
 - **`#[freestanding]` profile**: no implicit allocator — `alloc_array` and growable `[T]` are unavailable; only stack values, `T[N]`, and statically declared regions; `panic` becomes a user-supplied handler. This *shrinks* the trusted base (the OOM story vanishes) and serves embedded targets on its own.
 - **Alternative machine layers**: the same language can be proven against a formalized hardware model (e.g., the Sail RISC-V or ARM machine-readable specs) instead of the SVM, with privileged operations (page-table writes, interrupt control) exposed as contracted `unsafe` intrinsics specified against that model — the seL4 architecture, with Sable in place of C. Native compilation is validated per-build (translation validation) before any verified-compiler pillar exists.
 
-## 12. Deliberately missing from v0.3
+## 12. Deliberately missing from v0.4
 
-Concurrency (rely-guarantee with ghost resources), the `unsafe` sublanguage and FFI (design deliverable of the allocator benchmark), closures capturing borrows, floating-point verification beyond range facts, surface lifetime annotations for non-lexical borrows, and generics with law-carrying trait bounds (design deliverable of the hash-map benchmark). Each has known literature; none blocks the core.
+Concurrency (rely-guarantee with ghost resources), the `unsafe` sublanguage and FFI (design deliverable of the allocator benchmark, and the gate to any adoption claim — §5), closures capturing borrows, floating-point verification beyond range facts, surface lifetime annotations for non-lexical borrows, and generics with law-carrying trait bounds (design deliverable of the hash-map benchmark). Each has known literature; none blocks the core.
+
+One generics decision is committed upfront rather than left to the benchmark, because it constrains everything downstream: **monomorphization before VC generation** (Verus's route). Generic code is specialized before verification conditions are produced, so the VCgen, the SMT encoding, and the eventual metatheory (§10.1) never see type variables. The hash-map benchmark drives the surface design — trait syntax, law-carrying bounds, contract inheritance — not the compilation strategy. Retrofitting generics into a VCgen and a soundness proof is famously painful; fixing this early is deliberate risk reduction, at the known cost of code-size blowup and no polymorphic compilation, both acceptable for a verification-first systems language.
 
 ## Appendix A — the reader's contract, restated
 

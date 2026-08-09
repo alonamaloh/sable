@@ -32,7 +32,7 @@ Model-based specification style: `ghost model : seq T` / `map K V`, every method
 - Generics with **law-carrying trait bounds** (`T: Hashable` where `hash` must respect equality — the first contracted interface).
 - Amortized-capacity invariants, if complexity claims are wanted beyond functional correctness.
 
-Precedent: Verus. Known-hard-but-tractable; deliberately scheduled early so benchmark pressure, not speculation, drives the generics design.
+Precedent: Verus. Known-hard-but-tractable; deliberately scheduled early so benchmark pressure, not speculation, drives the generics design. One boundary on that: the benchmark drives the *surface* design (trait syntax, law-carrying bounds, contract inheritance), not the compilation strategy — monomorphization before VC generation is committed upfront (design §12), so the VCgen and the eventual metatheory never see type variables. Retrofitting that decision later is famously painful; it is not left to benchmark pressure.
 
 ## Tier 2 — Breadth: one benchmark per design axis
 
@@ -44,7 +44,7 @@ Precedent: Verus. Known-hard-but-tractable; deliberately scheduled early so benc
 
 **ChaCha20 + SHA-256 against the RFCs** — *the total-arithmetic axis.* Nearly all `wrap()` arithmetic by intent: no overflow VCs, pure functional correctness against transcribed RFC pseudocode. Precedent: HACL*, Fiat-Crypto. Also the prototyping ground for a future `secret` type qualifier whose obligations forbid branching or indexing on secret data — constant-time as a proof obligation. (Elliptic curves scoped out initially; Fiat-Crypto shows field arithmetic is really a compilation problem.)
 
-**Arena allocator, then free-list allocator** — *the unsafe-boundary axis.* Allocators cannot live in safe Sable: their job is manufacturing ownership from raw bytes. The real deliverable is the **design of unsafe Sable** — how small the `unsafe` region can be, what separation-logic obligations the boundary demands, whether the proof stays in the evidence layer. Precedent: verified allocators in Verus. Kernel-track work (Tier 4) consumes these answers.
+**Arena allocator, then free-list allocator** — *the unsafe-boundary axis.* Allocators cannot live in safe Sable: their job is manufacturing ownership from raw bytes. The real deliverable is the **design of unsafe Sable** — how small the `unsafe` region can be, what separation-logic obligations the boundary demands, whether the proof stays in the evidence layer. Precedent: verified allocators in Verus. Kernel-track work (Tier 4) consumes these answers — and so does any adoption story: FFI rides on the same boundary design, and until it lands, Sable is a research artifact, not a usable language (design §5). This benchmark is therefore the gate on the project's first adoption claim, not just a kernel prerequisite.
 
 ## Tier 3 — Moonshot: the bignum library
 
@@ -84,6 +84,16 @@ Write the SVM as a Sable program and prove it implements the inductive step rela
 
 Payoff: the language's own semantics becomes a program in the language; the Lean formalization becomes executably testable; and every future "does the compiler match the SVM?" question gains a differential-testing oracle for free. Bignum proves the language can verify *other* things; this proves it can verify *itself*. Together they make the project undeniable.
 
+It is also the load-bearing artifact of the stage-1 trust posture (design §10.1): while the VC generator is still trusted engineering, this interpreter plus the Lean formalization is what cross-checks it.
+
+## Tier 3″ — Metatheory track: mechanizing soundness
+
+**Stage 2 of the trusted-base ladder (design §10.1): a mechanized proof that the VC generator is sound against the SVM step relation** — VCgen correctness, ghost-erasure soundness, and the ownership-implies-frame-rule metatheorem. This retires the VCgen from the trusted base, leaving the machine formalization and the Lean kernel.
+
+This is scheduled as its own tier — not folded into the design pillars — because it is the one item on this roadmap that is *not* PhD-scale-with-precedent in the comfortable sense the other tiers are. The nearest precedent, RustBelt, took a team at MPI-SWS years for a fragment of Rust. Three things keep it tractable here, and they are design decisions, not hopes: the language surface is deliberately small (lexical borrows, no closures, no lifetimes, no concurrency); monomorphization means the metatheory never sees type variables; and the SVM is a boring ~40-rule stack machine rather than a real ISA.
+
+Sequencing: it sits on the critical path of nothing in Tiers 0–3. It starts only after the language surface stabilizes (post-stdlib tier — mechanizing a moving target is wasted work), runs long, and its first standalone publishable artifact is the frame-rule metatheorem for the ownership discipline alone. Until it completes, every verification claim is honestly labeled stage 1: "verified, modulo trusted VCgen, differentially tested against the formal semantics."
+
 ## Tier 4 — The kernel direction
 
 **Crown jewel: a formally verified OS kernel.** The apparent objection — "a VM language can't write a kernel" — dissolves on inspection: the SVM is a semantic definition, not a runtime, and the architecture of the field's flagship results is exactly "source proven against a formal model, refined down to metal" (seL4: C against Isabelle; CakeML: formal semantics compiled by verified translation to bare ARM/x64). A Sable kernel would never execute SVM steps, any more than seL4 executes Isabelle.
@@ -116,8 +126,11 @@ crypto kernels (ChaCha20/SHA-256)               ← independent; prototypes `sec
 arena → free-list allocator                     ← unsafe-Sable design track
 bignum M2–M5                                    ← moonshot completion
 SVM interpreter in Sable                        ← after stdlib tier is stable
+frame-rule metatheorem → mechanized VCgen soundness
+                                                ← metatheory track, starts after
+                                                  surface stabilizes; long-running
 freestanding → Sail RISC-V layer → page tables → firmware → separation kernel
                                                 ← kernel track, long-running
 ```
 
-The two pillars are **bignum** (the language can verify other things) and the **self-hosted SVM interpreter** (the language can verify itself). The standard-library tier is what everything rests on; the breadth tier is the demonstration that each domain gets a different answer to "why should I care"; the kernel track is the horizon.
+The two pillars are **bignum** (the language can verify other things) and the **self-hosted SVM interpreter** (the language can verify itself). The standard-library tier is what everything rests on; the breadth tier is the demonstration that each domain gets a different answer to "why should I care"; the metatheory track is what upgrades every claim from stage 1 to stage 2 trust (design §10.1); the kernel track is the horizon.
