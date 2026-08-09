@@ -1,0 +1,8 @@
+// expect-error: type.m0_recursion
+// Recursion needs a decreasing measure (M1).
+
+/// post result = 0
+fn countdown(u32 n) -> u32 {
+    if (n == 0) { return 0; }
+    return countdown(n - 1);
+}

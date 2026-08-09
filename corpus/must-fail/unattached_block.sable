@@ -1,0 +1,9 @@
+// expect-error: proof.unattached_block
+// A blank line detaches a proof block from the function below (design §1).
+
+/// pre  b > 0
+
+/// post result = a
+fn ident(u32 a, u32 b) -> u32 {
+    return a;
+}

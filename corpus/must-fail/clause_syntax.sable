@@ -1,0 +1,9 @@
+// expect-error: proof.clause_syntax
+// The pre clause is not well-formed proof language; the error must point
+// at the clause in this file, not at generated Lean.
+
+/// pre  b >
+/// post result = a
+fn ident(u32 a, u32 b) -> u32 {
+    return a;
+}

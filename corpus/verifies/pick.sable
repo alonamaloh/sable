@@ -1,0 +1,10 @@
+// Definite initialization across branches (design §2.3), and a bool
+// parameter used in contracts via Lean's Bool→Prop coercion.
+
+/// post b = true -> result = 1
+/// post b = false -> result = 2
+fn pick(bool b) -> i32 {
+    i32 x;
+    if (b) { x = 1; } else { x = 2; }
+    return x;
+}

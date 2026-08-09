@@ -1,0 +1,11 @@
+// Path-splitting through sequential ifs (4 paths), signed arithmetic,
+// disjunctive postcondition.
+
+/// post result >= a ∧ result >= b ∧ result >= c
+/// post result = a ∨ result = b ∨ result = c
+fn max3(i32 a, i32 b, i32 c) -> i32 {
+    i32 m = a;
+    if (b > m) { m = b; }
+    if (c > m) { m = c; }
+    return m;
+}

@@ -1,0 +1,14 @@
+// Call sites: callee pres become obligations, callee posts become
+// assumptions about the returned value.
+
+/// pre  b > 0
+/// pre  a + b <= u32.max
+/// post result = (a + b - 1) / b
+fn div_round_up(u32 a, u32 b) -> u32 {
+    return (a + b - 1) / b;
+}
+
+/// post result = 13
+fn pages_needed() -> u32 {
+    return div_round_up(100, 8);
+}

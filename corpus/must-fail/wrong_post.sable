@@ -1,0 +1,9 @@
+// expect-error: add_two.post
+// The postcondition is simply wrong: the body returns a + 2.
+// This is the "test your specs" case — a wrong contract must fail loudly.
+
+/// pre  a < 100
+/// post result = a + 1
+fn add_two(u32 a) -> u32 {
+    return a + 2;
+}

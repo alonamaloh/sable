@@ -1,0 +1,7 @@
+// expect-error: half.div_zero
+// No precondition excludes b = 0.
+
+/// post result = a / b
+fn half(u32 a, u32 b) -> u32 {
+    return a / b;
+}

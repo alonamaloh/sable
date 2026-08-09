@@ -1,0 +1,10 @@
+// Short-circuit &&: the right operand's obligations (here, divisor
+// nonzero) are guarded by the left operand.
+
+/// post result <= 1
+fn deep_enough(u32 total, u32 parts) -> u32 {
+    if (parts > 0 && total / parts >= 10) {
+        return 1;
+    }
+    return 0;
+}
