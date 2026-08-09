@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Lean toolchain and prelude
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            lean/.lake
+          key: lean-${{ runner.os }}-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml', 'lean/Sable.lean', 'lean/Sable/**') }}
+          restore-keys: lean-${{ runner.os }}-
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            compiler/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('compiler/Cargo.lock') }}
+
+      - name: Build Sable prelude (incl. SVM formalization)
+        working-directory: lean
+        run: lake build
+
+      - name: Build compiler
+        working-directory: compiler
+        run: cargo build --locked
+
+      - name: Full corpus + LSP tests
+        working-directory: compiler
+        run: cargo test --locked
