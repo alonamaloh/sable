@@ -1057,27 +1057,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
         },
         ExprKind::Borrow { array, mutable } => {
-            if !ctx.in_test {
-                return Err(Diagnostic {
-                    name: "type.borrow_outside_test".into(),
-                    title: "borrow expressions exist only in test functions for now".into(),
-                    span,
-                    label: "passing borrowed arrays between verified functions lands in M4"
-                        .into(),
-                    notes: vec![],
-                });
-            }
             let elem = array_elem_ty(ctx, array, span)?;
-            let owned = matches!(
-                ctx.vars.get(array.as_str()).map(|v| v.ty),
-                Some(Ty::Array(_, Mutability::Owned))
-            );
-            if !owned {
+            let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty) {
+                Some(Ty::Array(_, m)) => m,
+                _ => unreachable!("array_elem_ty checked"),
+            };
+            if *mutable && src_mut == Mutability::Shared {
                 return Err(Diagnostic {
-                    name: "type.borrow_non_owned".into(),
-                    title: format!("cannot borrow `{array}`"),
+                    name: "type.mut_borrow_shared".into(),
+                    title: format!("cannot mutably borrow `{array}` through `&[_]`"),
                     span,
-                    label: "only owned test arrays can be borrowed".into(),
+                    label: "a shared borrow cannot be reborrowed as `&mut`".into(),
                     notes: vec![],
                 });
             }
@@ -1236,14 +1226,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         })
                     }
                     Ty::Array(elem, m) => {
-                        if !ctx.in_test {
+                        if !matches!(arg.kind, ExprKind::Borrow { .. }) {
                             return Err(Diagnostic {
-                                name: "type.m1_array_arg".into(),
-                                title: "array-typed call arguments are not supported yet \
-                                        outside tests"
-                                    .into(),
+                                name: "type.array_arg_borrow".into(),
+                                title: "array arguments are passed by explicit borrow".into(),
                                 span: arg.span,
-                                label: "verified array-passing lands in M4".into(),
+                                label: format!(
+                                    "write `{}name`",
+                                    if m == Mutability::Mut { "&mut " } else { "&" }
+                                ),
                                 notes: vec![],
                             });
                         }

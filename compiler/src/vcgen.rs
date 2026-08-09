@@ -872,8 +872,11 @@ impl<'a> Generator<'a> {
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
             }
-            ExprKind::ArrayLit(_) | ExprKind::Borrow { .. } => {
-                unreachable!("checked: test-only expressions")
+            ExprKind::Borrow { array, .. } => {
+                Val::Arr(self.arr_str(array))
+            }
+            ExprKind::ArrayLit(_) => {
+                unreachable!("checked: test-only expression")
             }
             ExprKind::Index { array, index, .. } => {
                 let Val::Int(i) = self.eval(index) else {
@@ -1269,21 +1272,29 @@ impl<'a> Generator<'a> {
             ExprKind::Call { callee, args, .. } => {
                 let arg_vals: Vec<String> = args
                     .iter()
-                    .map(|a| {
-                        let Val::Int(v) = self.eval(a) else {
-                            unreachable!("checked: int args only")
-                        };
-                        v
+                    .map(|a| match self.eval(a) {
+                        Val::Int(v) | Val::Arr(v) => v,
+                        _ => unreachable!("checked: int/array args only"),
                     })
                     .collect();
                 let callee_fn = self.fn_map[callee.as_str()];
                 let sig = &self.sigs[callee.as_str()];
-                let subst_map: HashMap<String, String> = sig
+                let mut subst_map: HashMap<String, String> = sig
                     .params
                     .iter()
                     .map(|p| p.name.clone())
                     .zip(arg_vals.iter().cloned())
                     .collect();
+                // `old p` in the callee's contracts means the argument's
+                // pre-call state.
+                for p in &sig.params {
+                    if matches!(p.ty, Ty::Array(_, Mutability::Mut)) {
+                        subst_map.insert(
+                            format!("_old_{}", p.name),
+                            subst_map[&p.name].clone(),
+                        );
+                    }
+                }
 
                 for pre in &callee_fn.pres {
                     let goal = substitute(&pre.text, &subst_map, None);
@@ -1332,14 +1343,14 @@ impl<'a> Generator<'a> {
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
-                for (i, post) in callee_fn.posts.iter().enumerate() {
+                for post in callee_fn.posts.iter() {
                     let ret_ref = if sig.ret == Ty::Unit {
                         None
                     } else {
                         Some(ret_sym.as_str())
                     };
-                    let _ = i;
-                    let prop = substitute(&post.text, &subst_map, ret_ref);
+                    let text = preprocess_old_params(&post.text, &sig.params);
+                    let prop = substitute(&text, &subst_map, ret_ref);
                     self.hyps.push((
                         format!("h_{}_post_{}", sanitize(callee), hslug(&post.text)),
                         format!("({prop})"),
@@ -1648,8 +1659,9 @@ impl<'a> Generator<'a> {
 pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
     for s in stmts {
         match s {
-            Stmt::Assign { name, .. } => {
+            Stmt::Assign { name, value, .. } => {
                 out.insert(name.clone());
+                collect_mut_borrows(value, out);
             }
             Stmt::Store { array, .. } => {
                 out.insert(array.clone());
@@ -1659,11 +1671,16 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
             }
             Stmt::VarDecl { .. } => {}
             Stmt::ExprStmt(e) => {
-                // A &mut-self method call mutates its receiver; we cannot
-                // know mutability here, so be conservative.
                 if let ExprKind::MethodCall { recv, .. } = &e.kind {
                     out.insert(recv.clone());
                 }
+                collect_mut_borrows(e, out);
+            }
+            Stmt::Decl { init: Some(e), .. } => {
+                collect_mut_borrows(e, out);
+            }
+            Stmt::Return { value: Some(e), .. } => {
+                collect_mut_borrows(e, out);
             }
             Stmt::If {
                 then_block,
@@ -1678,6 +1695,46 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
             Stmt::While { body, .. } => collect_assigned(body, out),
             _ => {}
         }
+    }
+}
+
+/// `&mut a` anywhere inside an expression means `a` may be mutated by a
+/// call — conservative marking for loop havoc.
+fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    match &e.kind {
+        ExprKind::Borrow { array, mutable } => {
+            if *mutable {
+                out.insert(array.clone());
+            }
+        }
+        ExprKind::Unary { operand, .. } | ExprKind::Widen { arg: operand, .. } => {
+            collect_mut_borrows(operand, out)
+        }
+        ExprKind::SomeE(inner) => collect_mut_borrows(inner, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_mut_borrows(lhs, out);
+            collect_mut_borrows(rhs, out);
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::MethodCall { args, .. } => {
+            for a in args {
+                collect_mut_borrows(a, out);
+            }
+        }
+        ExprKind::AllocArray { len, init, .. } => {
+            collect_mut_borrows(len, out);
+            collect_mut_borrows(init, out);
+        }
+        ExprKind::Index { index, .. } | ExprKind::SelfFieldIndex { index, .. } => {
+            collect_mut_borrows(index, out)
+        }
+        ExprKind::ArrayLit(elems) => {
+            for el in elems {
+                collect_mut_borrows(el, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1757,6 +1814,23 @@ pub fn substitute(text: &str, map: &HashMap<String, String>, result: Option<&str
         i += 1;
     }
     String::from_utf8(out).expect("substitution preserves UTF-8")
+}
+
+/// Replace `old p` with `_old_p` for each named parameter (caller-side
+/// use of a callee's posts about its &mut array params).
+fn preprocess_old_params(text: &str, params: &[Param]) -> String {
+    let mut out = text.to_string();
+    for p in params {
+        if !matches!(p.ty, Ty::Array(_, Mutability::Mut)) {
+            continue;
+        }
+        // Token-aware replace of the two-token sequence `old <name>`.
+        let needle_variants = [format!("old {}", p.name), format!("old  {}", p.name)];
+        for needle in &needle_variants {
+            out = out.replace(needle.as_str(), &format!("_old_{}", p.name));
+        }
+    }
+    out
 }
 
 /// Replace `old self` with the `_old_self` token (caller-side use of a

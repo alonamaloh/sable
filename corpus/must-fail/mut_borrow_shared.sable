@@ -1,0 +1,12 @@
+// expect-error: type.mut_borrow_shared
+// A shared borrow cannot be reborrowed mutably.
+
+fn helper(&mut [i32] a) {
+    if (a.len > 0) {
+        a[0] = 1;
+    }
+}
+
+fn caller(&[i32] src) {
+    helper(&mut src);
+}

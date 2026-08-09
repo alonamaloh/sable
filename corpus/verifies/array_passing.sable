@@ -1,0 +1,32 @@
+// Verified array-passing: contracted helpers taking &[T] / &mut [T].
+// Callee pres become obligations on the argument's symbolic state;
+// &mut args come back as fresh states carrying the callee's posts
+// (length and element ranges preserved by construction).
+
+/// pre  src.len = dst.len
+/// post ∀ k, 0 ≤ k → k < src.len → dst.get k = src.get k
+fn copy_into(&[i32] src, &mut [i32] dst) {
+    u64 n = src.len;
+    /// invariant ∀ k, 0 ≤ k → k < i → dst.get k = src.get k
+    for (u64 i : range(n)) {
+        dst[i] = src[i];
+    }
+}
+
+/// post result = 5
+fn caller() -> i32 {
+    [i32] a = alloc_array<i32>(3, 5);
+    [i32] b = alloc_array<i32>(3, 0);
+    copy_into(&a, &mut b);
+    return b[0];
+}
+
+// Extending the copied prefix across the store needs the get_set case
+// split plus an instantiation of the invariant.
+/// discharge copy_into.inv_preserved.k_0_k_k_i_dst_get_k_src_get_k by
+///   intro k hk0 hk
+///   by_cases hki : k = i
+///   · simp [Sable.Seq.get_set, hki]
+///   · have h2 := h_inv_k_0_k_k_i_dst_get_k_src k hk0 (by omega)
+///     simp [Sable.Seq.get_set, hki]
+///     exact h2
