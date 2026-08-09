@@ -15,6 +15,12 @@ The compiler ships a language server: `sable lsp` (stdio). It provides:
 Build it once: `cd compiler && cargo build --release` (binary at
 `compiler/target/release/sable`).
 
+Optional but recommended: run `sable daemon` in a spare terminal — a
+persistent Lean server that makes every check (including the LSP's
+on-save verification and the Claude Code hook) ~10× faster
+(~0.25s instead of ~2.4s). Everything silently falls back to the batch
+path when the daemon isn't running.
+
 ## Neovim (zero plugins)
 
 ```lua

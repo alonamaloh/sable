@@ -218,9 +218,9 @@ range. A `nat`-indexed `seq` was tried first and does not elaborate against
 seeing `get`.)
 ```
 
-Every obligation has a stable, **content-anchored** name: the enclosing declaration, the clause kind, and a source anchor derived from the clause's own structure (here, the `none` match arm) or an explicit `#[label(...)]` on the clause. Names are never positional indices — inserting a statement must not renumber obligations and silently orphan `discharge` blocks. `discharge NAME by TACTIC` targets one obligation; if an edit changes a clause enough that its anchor no longer resolves, the orphaned `discharge` is itself a compile error, never silently dropped. Undischarged obligations are compile errors printing the name, the goal, and the SMT backend's diagnosis.
+Every obligation has a stable, **content-anchored** name: the enclosing declaration, the clause kind, and a source anchor derived from the clause's own structure (here, the `none` match arm) or an explicit `#[label(...)]` on the clause. Names are never positional indices — inserting a statement must not renumber obligations and silently orphan `discharge` blocks. `discharge NAME by TACTIC` targets one obligation; if an edit changes a clause enough that its anchor no longer resolves, the orphaned `discharge` is itself a compile error, never silently dropped. Undischarged obligations are compile errors printing the name, the goal, the context, and the automation portfolio's diagnosis.
 
-The SMT↔Lean seam this feature sits on — reconstructing an SMT-failed goal as a Lean goal with stable, nameable hypotheses — is acknowledged as the highest-risk piece of engineering in the language, because hybrid systems (F* foremost) show user pain concentrates exactly here: quantifier triggers, bitvector-vs-ℤ lifting mismatches, opaque failures. Hypothesis naming in reconstructed goals follows the same content-anchoring rule as obligation names.
+*(Implementation status, v0.4: there is no SMT solver anywhere — routine obligations are closed by an automation portfolio inside Lean (`omega`, `grind`, `simp`) and every proof, automated or hand-written, is checked by the Lean kernel; see ADR 0002. The seam that was expected to be the highest-risk engineering — presenting failed goals with stable, nameable hypotheses — is implemented: hypothesis names are content-anchored (`h_pre_sorted_a`, `h_inv_<slug>`, `h_path_<slug>`), so `discharge` scripts survive unrelated edits. Obligation-name anchors are currently expression slugs; the `#[label(...)]` form described above is not yet implemented.)*
 
 ## 7. Classes, invariants, RAII
 
@@ -317,6 +317,8 @@ There are **no build modes**. One source file has one meaning; an undischarged o
 
 Rationale for keeping a sound trap-fallback at all: without `defer`, schedule pressure funnels into `assume` — and an unproved-but-monitored predicate ("true or halt") is strictly safer than an unproved-and-assumed one.
 
+*(Implementation status, v0.4: `defer` and `assume` are implemented as module-level clauses naming an obligation — `/// defer NAME`, `/// assume #[audit(reason := "...")] NAME` — mirroring `discharge`'s workflow; the statement-attached `kind(expr)` form shown above is not yet implemented. Tallies and the fully-verified status line work as specified.)*
+
 **Testing before proving.** Specifications are code and have bugs; the cheapest way to find a wrong `post` is to run it. The `sable test` tool executes test functions with all monitorable contracts checked dynamically and all proof obligations skipped. It is a development tool in the sanitizer category: its artifacts cannot be released or depended upon, so it is not a language mode and creates no dialect. Workflow: write contracts → test them dynamically → prove them.
 
 ## 10. The SVM in one page
@@ -327,6 +329,8 @@ The default machine model is deliberately boring: a typed stack machine with an 
 - **Semantics**: small-step, deterministic in v0.4 (concurrency deferred), formalized in Lean as an inductive step relation of ~40 rules. This single artifact is the language's meaning — there is no prose abstract machine to disagree with it.
 - **Soundness theorem** (the metatheory's target statement): *if every VC of program P is a theorem, then no execution of ⟦P⟧ reads ⊥, executes a partial operation outside its domain, violates a contract, or — absent `partial` — diverges; and every `defer`red predicate either holds or the execution ends in a named trap.* When mechanized (§10.1, stage 2), the compiler is untrusted; the theorem, the machine formalization, and the Lean kernel are the trusted base.
 - Allocation failure is defined behavior: `alloc_array` halts in a named OOM trap. Top-level correctness claims therefore read "every execution either satisfies the contract or halts in the OOM trap." (A `try_alloc` returning `option` exists for callers that must handle exhaustion.)
+
+*(Formalization status: a first 73-rule draft of these semantics exists at `lean/Sable/SVM.lean` (core subset: expressions with trap outcomes, statements, loops; classes and calls scoped out). Writing it surfaced eleven ambiguities in this section's prose — among them: OOM vs. determinism needs an explicit capacity parameter; reading ⊥ in unchecked programs is currently stuck, contradicting pillar 1 as stated; `wrap()`/`checked()` must be operator modifiers, not functions; evaluation order and `&&`/`||` short-circuiting are nowhere stated normatively; the `ghost` configuration component has no transitions. The full list is `docs/notes/svm-draft.md`; resolving them into this document is scheduled work.)*
 
 ### 10.1 The trusted base, in stages
 
@@ -348,7 +352,7 @@ The SVM is one machine model, not a commitment. Two mechanisms keep the language
 
 Concurrency (rely-guarantee with ghost resources), the `unsafe` sublanguage and FFI (design deliverable of the allocator benchmark, and the gate to any adoption claim — §5), closures capturing borrows, floating-point verification beyond range facts, surface lifetime annotations for non-lexical borrows, and generics with law-carrying trait bounds (design deliverable of the hash-map benchmark). Each has known literature; none blocks the core.
 
-One generics decision is committed upfront rather than left to the benchmark, because it constrains everything downstream: **monomorphization before VC generation** (Verus's route). Generic code is specialized before verification conditions are produced, so the VCgen, the SMT encoding, and the eventual metatheory (§10.1) never see type variables. The hash-map benchmark drives the surface design — trait syntax, law-carrying bounds, contract inheritance — not the compilation strategy. Retrofitting generics into a VCgen and a soundness proof is famously painful; fixing this early is deliberate risk reduction, at the known cost of code-size blowup and no polymorphic compilation, both acceptable for a verification-first systems language.
+One generics decision is committed upfront rather than left to the benchmark, because it constrains everything downstream: **monomorphization before VC generation** (Verus's route). Generic code is specialized before verification conditions are produced, so the VCgen, the Lean encoding, and the eventual metatheory (§10.1) never see type variables. The hash-map benchmark drives the surface design — trait syntax, law-carrying bounds, contract inheritance — not the compilation strategy. Retrofitting generics into a VCgen and a soundness proof is famously painful; fixing this early is deliberate risk reduction, at the known cost of code-size blowup and no polymorphic compilation, both acceptable for a verification-first systems language.
 
 ## Appendix A — the reader's contract, restated
 

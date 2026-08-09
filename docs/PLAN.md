@@ -1,6 +1,6 @@
 # Implementation plan
 
-North star for v0.1: **verify `binary_search` and insertion sort end-to-end from a `.sable` file, with no hand-waving.** Everything not needed for that is out of scope until it is.
+Original north star for v0.1 — **verify `binary_search` and insertion sort end-to-end, with no hand-waving** — was reached 2026-08-08/09; the corpus now also carries fully-specified quicksort, the merge kernel, and round-trip codecs. Current north star: **Tier 1 of the roadmap — `Vec`, the hash map, and the generics design they force** (goals doc), on top of the remaining M6 odds and ends.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -83,7 +83,7 @@ Remaining M6 items: Base64 (nothing new technically after hex); `partial fn`; `n
 
 ## Parallel track (low intensity)
 
-The SVM step relation in Lean — started early not because anything depends on it, but because writing the ~40 rules is the cheapest way to find semantic holes in the design. The `sable test` interpreter (M3) is structured for later differential testing against it.
+The SVM step relation in Lean — **started**: `lean/Sable/SVM.lean` (73 rules, builds clean) with the design-audit findings in `docs/notes/svm-draft.md` (11 ambiguities, cross-referenced from design §10). Next steps there: determinism proof, a functional evaluator + agreement proof (the differential-testing oracle against `interp.rs`), then calls/frames. The audit findings should be resolved into the design doc.
 
 ## Testing strategy
 

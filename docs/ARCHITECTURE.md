@@ -49,7 +49,7 @@ Generated Lean goes to `.sable-out/` (gitignored), one file per module, `import 
 ## Key invariants
 
 - **Verbatim splice.** Contract clauses appear in generated Lean exactly as written (module call-site substitution of parameter names by argument expressions). Generated theorems bind program variables under their source names so clauses elaborate unchanged. If a clause doesn't elaborate, the error must point at the `.sable` clause, not at generated code.
-- **Every obligation is named** and the name is stable across unrelated edits (M0: expression-slug anchors; the design's content-anchoring scheme replaces this). Lean theorem names are sanitized versions; user-facing names live in the source map.
+- **Every obligation and every hypothesis is named by content.** Hypothesis names are content-anchored slugs (`h_pre_sorted_a`, `h_inv_<slug>`, `h_path_<slug>`, `h_<callee>_post_<slug>`; collisions for repeated same-callee calls get `_2` suffixes; identical facts shadow, which is the desired semantics) — discharge scripts survive unrelated edits. Obligation names are `fn.kind.<expression-slug>`; the design's `#[label]` refinement is still open. Lean theorem names are sanitized versions; user-facing names live in the source map.
 - **Values are exact integers.** Program integers are represented in Lean as `Int`; per-operation VCs guarantee representability, so symbolic values never wrap. `wrap()` etc. (later) get explicit `mod 2^n` semantics.
 - **The prelude depends on Lean core only** — no mathlib. Cold-start and toolchain churn stay controlled; the multiset library (M2) is written in-repo.
 - **The specification vocabulary lives in the prelude** (`lean/Sable/Specs.lean`): `sorted`, `sortedRange`, `perm`, `contains`, `count` — reducible abbrevs (discharge scripts apply their hypotheses directly), `@[simp]` where unfolding helps automation (`perm` stays opaque behind its lemma library), each with a native evaluator in the monitorable fragment. Program identifiers may shadow these names; the program binding wins in clauses.
@@ -77,9 +77,13 @@ docs/PLAN.md       milestones and exit criteria (kept current)
 docs/decisions/    ADRs — one settled decision each, with the why
 compiler/          Rust package `sable` (single crate until it hurts; split when it does)
 lean/              Lake package: Sable prelude; pinned via lean-toolchain
-corpus/verifies/   programs that must verify
+corpus/verifies/   programs that must verify (status: fully verified)
 corpus/must-fail/  programs annotated with the exact diagnostic that must fire
-.sable-out/        generated Lean (gitignored)
+corpus/tests/      dynamic-test programs: sable test must pass, zero skipped clauses
+corpus/test-fails/ dynamic tests that must be caught, annotated with the message
+docs/notes/        probe files and audit notes (SVM draft findings, class encoding)
+editors/           Neovim setup + VS Code extension
+.sable-out/        generated Lean + daemon socket (gitignored)
 ```
 
 ## Toolchain pins

@@ -25,7 +25,7 @@ Lean is pinned by `lean/lean-toolchain`; elan fetches it automatically. Never up
 
 ## Conventions
 
-- Every new diagnostic gets a `corpus/must-fail/` program with an `// expect-error: <name>` first line; every new feature gets `corpus/verifies/` programs. The corpus is executable documentation.
+- Every new diagnostic gets a `corpus/must-fail/` program with an `// expect-error: <name>` first line; every new feature gets `corpus/verifies/` programs, and dynamic behavior gets `corpus/tests/` (must pass with zero skipped clauses) or `corpus/test-fails/` (`// expect-test-failure: <substr>`). The corpus is executable documentation.
 - Commit early and often; push after each commit (repo is private). Substantive decisions get an ADR in `docs/decisions/`.
 - Keep `docs/PLAN.md` status and `docs/ARCHITECTURE.md` current when the code moves under them.
 - Dependencies: don't add Rust crates or Lean packages without a reason worth writing down (ADR 0003).
