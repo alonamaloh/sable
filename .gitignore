@@ -5,3 +5,4 @@
 /editors/vscode/node_modules/
 /editors/vscode/*.vsix
 /editors/vscode/package-lock.json
+/.claude/worktrees/
