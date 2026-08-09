@@ -76,7 +76,36 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
 
     // Verification conditions → Lean.
     let vc = vcgen::generate(&program, &checked.sigs, &source);
-    let emitted = lean::emit(&vc);
+
+    // Every discharge must name a real obligation — a renamed or vanished
+    // obligation must never silently orphan its proof (design §6).
+    for d in &program.discharges {
+        if !vc.obligations.iter().any(|ob| ob.name == d.name) {
+            let mut near: Vec<&str> = vc
+                .obligations
+                .iter()
+                .map(|ob| ob.name.as_str())
+                .filter(|n| {
+                    n.split('.').next() == d.name.split('.').next()
+                })
+                .collect();
+            near.truncate(8);
+            let d_diag = diag::Diagnostic {
+                name: "proof.unknown_discharge".into(),
+                title: format!("`discharge {}` names no obligation", d.name),
+                span: d.span,
+                label: "no obligation with this name exists".into(),
+                notes: if near.is_empty() {
+                    vec![("note".into(), "run `sable check` to list obligation names".into())]
+                } else {
+                    vec![("nearby obligations".into(), near.join("\n"))]
+                },
+            };
+            return Outcome::Failed(vec![render(&d_diag)]);
+        }
+    }
+
+    let emitted = lean::emit(&vc, &program.discharges);
 
     if opts.emit_lean_only {
         print!("{}", emitted.lean_source);

@@ -106,6 +106,26 @@ pub fn scan(source: &str) -> ScanResult {
         blocks.push(done);
     }
 
+    // Merge continuation lines (no leading clause keyword) into the
+    // preceding clause: multi-line `post match result with | ...` and
+    // multi-line discharge scripts depend on this. A continuation line
+    // with no preceding clause stays `Other`; the parser reports it.
+    for block in &mut blocks {
+        let mut merged: Vec<Clause> = Vec::new();
+        for clause in block.clauses.drain(..) {
+            match (clause.kind, merged.last_mut()) {
+                (ClauseKind::Other, Some(prev)) => {
+                    prev.text.push('\n');
+                    prev.text.push_str(&clause.text);
+                    prev.span = prev.span.join(clause.span);
+                    prev.line_span = prev.line_span.join(clause.line_span);
+                }
+                _ => merged.push(clause),
+            }
+        }
+        block.clauses = merged;
+    }
+
     ScanResult {
         program_text: program,
         blocks,
@@ -121,8 +141,22 @@ fn parse_clause(line: &str, indent: usize, line_offset: usize) -> Clause {
 
     let (kind, kw_len) = keyword(rest);
     let text_rel = kw_start_rel + kw_len;
-    let mut text = after_marker[text_rel..].trim_start().to_string();
-    let text_lead_ws = after_marker[text_rel..].len() - text.len();
+    // Continuation lines (no keyword) keep their leading indentation —
+    // multi-line tactic scripts need relative indent for nested bullets.
+    let mut text = if kind == ClauseKind::Other {
+        after_marker
+            .strip_prefix(' ')
+            .unwrap_or(after_marker)
+            .trim_end()
+            .to_string()
+    } else {
+        after_marker[text_rel..].trim_start().to_string()
+    };
+    let text_lead_ws = if kind == ClauseKind::Other {
+        after_marker.len() - after_marker.trim_start().len()
+    } else {
+        after_marker[text_rel..].len() - after_marker[text_rel..].trim_start().len()
+    };
 
     // Strip a trailing Lean line comment (see field doc on `text`).
     if let Some(pos) = text.find("--") {

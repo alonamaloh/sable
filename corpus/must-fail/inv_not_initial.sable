@@ -1,0 +1,13 @@
+// expect-error: count.inv_init
+// The invariant fails at loop entry (i starts at 0).
+
+/// post result ≥ 0
+fn count(u64 n) -> u64 {
+    u64 i = 0;
+    /// invariant i > 0
+    /// variant   n - i
+    while (i < n) {
+        i = i + 1;
+    }
+    return 0;
+}

@@ -85,6 +85,10 @@ impl IntTy {
 pub enum Ty {
     Int(IntTy),
     Bool,
+    /// Shared borrow of an array of integers: `&[i32]`. Parameters only in M1.
+    Array(IntTy),
+    /// `option<u64>` etc. Return types only in M1.
+    Option(IntTy),
 }
 
 impl Ty {
@@ -92,6 +96,8 @@ impl Ty {
         match self {
             Ty::Int(t) => t.name().to_string(),
             Ty::Bool => "bool".to_string(),
+            Ty::Array(t) => format!("&[{}]", t.name()),
+            Ty::Option(t) => format!("option<{}>", t.name()),
         }
     }
 }
@@ -171,6 +177,19 @@ pub enum ExprKind {
         callee_span: Span,
         args: Vec<Expr>,
     },
+    /// `a[i]` where `a` names an array parameter.
+    Index {
+        array: String,
+        array_span: Span,
+        index: Box<Expr>,
+    },
+    /// `a.len` where `a` names an array parameter.
+    Len { array: String },
+    /// `widen<T>(e)` — value-preserving widening; no VC, identity in Lean.
+    Widen { target: IntTy, arg: Box<Expr> },
+    /// `some(e)` / `none` — return position only in M1.
+    SomeE(Box<Expr>),
+    NoneE,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +222,14 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    While {
+        cond: Expr,
+        invariants: Vec<Clause>,
+        variant: Option<Clause>,
+        /// Span of the `while` keyword (for "missing variant" errors).
+        kw_span: Span,
+        body: Vec<Stmt>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -220,11 +247,23 @@ pub struct Fn {
     pub ret: Ty,
     pub pres: Vec<Clause>,
     pub posts: Vec<Clause>,
+    /// Termination measure for self-recursive functions.
+    pub variant: Option<Clause>,
     pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// `/// discharge NAME by <tactic script>` — replaces `sable_auto` as the
+/// proof of the named obligation.
+#[derive(Debug, Clone)]
+pub struct Discharge {
+    pub name: String,
+    pub script: String,
     pub span: Span,
 }
 
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<Fn>,
+    pub discharges: Vec<Discharge>,
 }

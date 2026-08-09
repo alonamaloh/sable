@@ -1,7 +1,7 @@
-//! Typechecking for the M0 subset: exact-width integer types with no
-//! implicit conversions, expected-type propagation into literals, definite
-//! initialization (both-branches rule), all-paths-return, and call-graph
-//! acyclicity (recursion needs measures — M1).
+//! Typechecking for the M1 subset: exact-width integer types with no
+//! implicit conversions (only explicit `widen`), array/option restrictions,
+//! definite initialization, all-paths-return, loop variants required, and
+//! recursion allowed only for self-calls with a declared measure.
 //!
 //! The checker writes types into the AST (`Expr::ty`) for the VC generator.
 
@@ -28,17 +28,17 @@ struct VarInfo {
 
 struct Ctx<'a> {
     sigs: &'a HashMap<String, FnSig>,
+    current_fn: String,
+    current_has_variant: bool,
     vars: HashMap<String, VarInfo>,
-    /// All names ever declared in this function (M0 rule: locals and
-    /// parameters must have pairwise-distinct names — keeps path-splitting
-    /// in the VC generator scope-free).
+    /// M1 rule: locals and parameters have pairwise-distinct names
+    /// (keeps path-splitting and havoc in the VC generator scope-free).
     declared: HashSet<String>,
-    /// Callees referenced by the current function (for cycle detection).
+    /// Non-self callees (for mutual-recursion detection).
     calls: Vec<String>,
 }
 
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
-    // Pass 1: collect signatures (contracts come along on the Fn itself).
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for f in &program.fns {
         if sigs.contains_key(&f.name) {
@@ -55,8 +55,17 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 name: "type.m0_bool_return".into(),
                 title: format!("function `{}` returns `bool`", f.name),
                 span: f.name_span,
-                label: "bool-valued functions are not supported in M0".into(),
-                notes: vec![("note".into(), "see docs/PLAN.md, M0 scope".into())],
+                label: "bool-valued functions are not supported yet".into(),
+                notes: vec![("note".into(), "see docs/PLAN.md".into())],
+            });
+        }
+        if matches!(f.ret, Ty::Array(_)) {
+            return Err(Diagnostic {
+                name: "type.array_return".into(),
+                title: format!("function `{}` returns an array", f.name),
+                span: f.name_span,
+                label: "arrays are parameters only in M1".into(),
+                notes: vec![],
             });
         }
         sigs.insert(
@@ -68,11 +77,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         );
     }
 
-    // Pass 2: check bodies.
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
     for f in &mut program.fns {
         let mut ctx = Ctx {
             sigs: &sigs,
+            current_fn: f.name.clone(),
+            current_has_variant: f.variant.is_some(),
             vars: HashMap::new(),
             declared: HashSet::new(),
             calls: Vec::new(),
@@ -84,6 +94,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     title: format!("duplicate parameter name `{}`", p.name),
                     span: p.span,
                     label: "already declared".into(),
+                    notes: vec![],
+                });
+            }
+            if matches!(p.ty, Ty::Option(_)) {
+                return Err(Diagnostic {
+                    name: "type.m1_option_param".into(),
+                    title: "option-typed parameters are not supported yet".into(),
+                    span: p.span,
+                    label: "`option<T>` is a return type in M1".into(),
                     notes: vec![],
                 });
             }
@@ -108,15 +127,16 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         call_graph.insert(f.name.clone(), ctx.calls);
     }
 
-    // Pass 3: recursion is an M1 feature (needs measures).
+    // Mutual recursion (self-recursion with a variant is handled inline).
     if let Some(cycle_member) = find_cycle(&call_graph) {
         let f = program.fns.iter().find(|f| f.name == cycle_member).unwrap();
         return Err(Diagnostic {
-            name: "type.m0_recursion".into(),
-            title: format!("`{}` is (mutually) recursive", f.name),
+            name: "type.mutual_recursion".into(),
+            title: format!("`{}` is mutually recursive", f.name),
             span: f.name_span,
-            label: "recursion requires a decreasing measure (M1)".into(),
-            notes: vec![("note".into(), "see docs/PLAN.md, M0 scope".into())],
+            label: "mutual recursion is not supported yet (self-recursion with `variant` is)"
+                .into(),
+            notes: vec![("note".into(), "see docs/PLAN.md".into())],
         });
     }
 
@@ -152,7 +172,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         label: "already declared in this function".into(),
                         notes: vec![(
                             "note".into(),
-                            "M0 requires all locals in a function to have distinct names".into(),
+                            "M1 requires all locals in a function to have distinct names".into(),
                         )],
                     });
                 }
@@ -184,6 +204,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         })
                     }
                 };
+                if matches!(ty, Ty::Array(_)) {
+                    return Err(Diagnostic {
+                        name: "type.array_assign".into(),
+                        title: format!("cannot assign to array `{name}`"),
+                        span: *name_span,
+                        label: "borrowed arrays are read-only in M1".into(),
+                        notes: vec![],
+                    });
+                }
                 check_expr(ctx, value, Some(ty))?;
                 ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
             }
@@ -207,34 +236,63 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     Some(b) => check_block(ctx, b, ret_ty)?,
                     None => false,
                 };
-                // A variable is initialized after the `if` iff it is
-                // initialized on every path that falls through to here.
-                // A returning branch contributes no fall-through path;
-                // "no else" contributes the pre-`if` state.
+                // Initialized after the `if` iff initialized on every path
+                // that falls through (returning branches contribute none).
                 let after_else: HashMap<String, bool> =
                     ctx.vars.iter().map(|(k, v)| (k.clone(), v.initialized)).collect();
                 for (name, v) in ctx.vars.iter_mut() {
                     let was = before.get(name).copied().unwrap_or(false);
-                    let mut reaching_inits = Vec::new();
+                    let mut reaching = Vec::new();
                     if !then_ret {
-                        reaching_inits.push(after_then.get(name).copied().unwrap_or(false));
+                        reaching.push(after_then.get(name).copied().unwrap_or(false));
                     }
                     if !else_ret {
-                        reaching_inits.push(match else_block {
+                        reaching.push(match else_block {
                             Some(_) => after_else.get(name).copied().unwrap_or(false),
                             None => was,
                         });
                     }
-                    v.initialized = if reaching_inits.is_empty() {
-                        was // join unreachable; state is irrelevant
+                    v.initialized = if reaching.is_empty() {
+                        was
                     } else {
-                        reaching_inits.iter().all(|b| *b)
+                        reaching.iter().all(|b| *b)
                     };
                 }
                 returned = then_ret && else_ret;
             }
+            Stmt::While {
+                cond,
+                variant,
+                kw_span,
+                body,
+                ..
+            } => {
+                if variant.is_none() {
+                    return Err(Diagnostic {
+                        name: "proof.missing_variant".into(),
+                        title: "loop has no `variant`".into(),
+                        span: *kw_span,
+                        label: "every loop must declare a decreasing measure (design §4)".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "add `/// variant <ghost nat expression>` directly above the loop"
+                                .into(),
+                        )],
+                    });
+                }
+                check_expr(ctx, cond, Some(Ty::Bool))?;
+                // The body may run zero times: check it against the entry
+                // state, then restore the entry state (body-declared locals
+                // become uninitialized after the loop).
+                let before: HashMap<String, bool> =
+                    ctx.vars.iter().map(|(k, v)| (k.clone(), v.initialized)).collect();
+                let _body_ret = check_block(ctx, body, ret_ty)?;
+                for (name, v) in ctx.vars.iter_mut() {
+                    v.initialized = before.get(name).copied().unwrap_or(false);
+                }
+            }
             Stmt::Return { value, span } => {
-                check_expr(ctx, value, Some(ret_ty)).map_err(|d| d)?;
+                check_expr(ctx, value, Some(ret_ty))?;
                 let _ = span;
                 returned = true;
             }
@@ -248,25 +306,27 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::Decl { name_span, .. } => *name_span,
         Stmt::Assign { name_span, .. } => *name_span,
         Stmt::If { cond, .. } => cond.span,
+        Stmt::While { kw_span, .. } => *kw_span,
         Stmt::Return { span, .. } => *span,
     }
 }
 
-/// Typecheck an expression. `expected` propagates into integer literals
-/// (design: literals adopt the type context demands; no implicit
-/// conversions anywhere else).
 fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
     let ty = infer_expr(ctx, e, expected)?;
     if let Some(exp) = expected {
         if ty != exp {
             return Err(Diagnostic {
                 name: "type.mismatch".into(),
-                title: format!("type mismatch: expected `{}`, found `{}`", exp.name(), ty.name()),
+                title: format!(
+                    "type mismatch: expected `{}`, found `{}`",
+                    exp.name(),
+                    ty.name()
+                ),
                 span: e.span,
                 label: format!("this has type `{}`", ty.name()),
                 notes: vec![(
                     "note".into(),
-                    "Sable has no implicit conversions; use `widen<T>` (M1) for widening".into(),
+                    "Sable has no implicit conversions; `widen<T>(e)` widens explicitly".into(),
                 )],
             });
         }
@@ -275,15 +335,16 @@ fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
 }
 
 fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
+    let span = e.span;
     let ty = match &mut e.kind {
         ExprKind::IntLit(n) => {
             let t = match expected {
                 Some(Ty::Int(t)) => t,
-                Some(Ty::Bool) => {
+                Some(other) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
-                        title: "expected `bool`, found an integer literal".into(),
-                        span: e.span,
+                        title: format!("expected `{}`, found an integer literal", other.name()),
+                        span,
                         label: "integer literal".into(),
                         notes: vec![],
                     })
@@ -292,7 +353,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     return Err(Diagnostic {
                         name: "type.ambiguous_literal".into(),
                         title: format!("cannot infer the type of literal `{n}`"),
-                        span: e.span,
+                        span,
                         label: "no type context".into(),
                         notes: vec![(
                             "note".into(),
@@ -305,7 +366,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 return Err(Diagnostic {
                     name: "type.literal_out_of_range".into(),
                     title: format!("literal `{n}` does not fit in `{}`", t.name()),
-                    span: e.span,
+                    span,
                     label: format!("`{}` holds {}..={}", t.name(), t.min(), t.max()),
                     notes: vec![],
                 });
@@ -315,15 +376,26 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
+                if matches!(v.ty, Ty::Array(_)) {
+                    return Err(Diagnostic {
+                        name: "type.m1_array_value".into(),
+                        title: format!("array `{name}` used as a value"),
+                        span,
+                        label: "arrays support only `a[i]` and `a.len` in M1".into(),
+                        notes: vec![],
+                    });
+                }
                 if !v.initialized {
                     return Err(Diagnostic {
                         name: "type.uninitialized".into(),
                         title: format!("`{name}` may be read before initialization"),
-                        span: e.span,
+                        span,
                         label: "not initialized on every path to this point".into(),
                         notes: vec![(
                             "note".into(),
-                            "there is no default zero (design §2.3); initialize on all paths".into(),
+                            "there is no default zero (design §2.3); initialize on all paths \
+                             (a loop body may run zero times)"
+                                .into(),
                         )],
                     });
                 }
@@ -333,8 +405,93 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 return Err(Diagnostic {
                     name: "type.unknown_variable".into(),
                     title: format!("unknown variable `{name}`"),
-                    span: e.span,
+                    span,
                     label: "not declared".into(),
+                    notes: vec![],
+                })
+            }
+        },
+        ExprKind::Index {
+            array,
+            array_span,
+            index,
+        } => {
+            let elem = array_elem_ty(ctx, array, *array_span)?;
+            check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
+            Ty::Int(elem)
+        }
+        ExprKind::Len { array } => {
+            array_elem_ty(ctx, array, span)?;
+            Ty::Int(IntTy::U64)
+        }
+        ExprKind::Widen { target, arg } => {
+            let src = match check_expr(ctx, arg, None) {
+                Ok(Ty::Int(t)) => t,
+                Ok(other) => {
+                    return Err(Diagnostic {
+                        name: "type.mismatch".into(),
+                        title: format!("`widen` applied to `{}`", other.name()),
+                        span,
+                        label: "expected an integer".into(),
+                        notes: vec![],
+                    })
+                }
+                Err(d) => {
+                    // Literals need context; widening a literal is pointless
+                    // but legal — retry with the target type.
+                    if d.name == "type.ambiguous_literal" {
+                        check_expr(ctx, arg, Some(Ty::Int(*target)))?;
+                        *target
+                    } else {
+                        return Err(d);
+                    }
+                }
+            };
+            if src.min() < target.min() || src.max() > target.max() {
+                return Err(Diagnostic {
+                    name: "type.narrowing_widen".into(),
+                    title: format!(
+                        "`widen<{}>` from `{}` is not value-preserving",
+                        target.name(),
+                        src.name()
+                    ),
+                    span,
+                    label: format!(
+                        "the range of `{}` is not contained in `{}`",
+                        src.name(),
+                        target.name()
+                    ),
+                    notes: vec![(
+                        "note".into(),
+                        "narrowing (`narrow<T>`, with a fits-VC) lands in M2".into(),
+                    )],
+                });
+            }
+            Ty::Int(*target)
+        }
+        ExprKind::SomeE(inner) => match expected {
+            Some(Ty::Option(t)) => {
+                check_expr(ctx, inner, Some(Ty::Int(t)))?;
+                Ty::Option(t)
+            }
+            _ => {
+                return Err(Diagnostic {
+                    name: "type.m1_option_position".into(),
+                    title: "`some(...)` outside an option-returning position".into(),
+                    span,
+                    label: "options are created only where an `option<T>` is expected".into(),
+                    notes: vec![],
+                })
+            }
+        },
+        ExprKind::NoneE => match expected {
+            Some(Ty::Option(t)) => Ty::Option(t),
+            _ => {
+                return Err(Diagnostic {
+                    name: "type.m1_option_position".into(),
+                    title: "`none` outside an option-returning position".into(),
+                    span,
+                    label: "options are created only where an `option<T>` is expected".into(),
                     notes: vec![],
                 })
             }
@@ -348,20 +505,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         return Err(Diagnostic {
                             name: "type.neg_unsigned".into(),
                             title: "unary minus on an unsigned value".into(),
-                            span: e.span,
+                            span,
                             label: "operand is unsigned".into(),
                             notes: vec![(
                                 "note".into(),
-                                "unsigned negation is modular; use `wrap()` when it lands (M1)"
-                                    .into(),
+                                "unsigned negation is modular; use `wrap()` when it lands".into(),
                             )],
                         })
                     }
-                    Ty::Bool => {
+                    _ => {
                         return Err(Diagnostic {
                             name: "type.mismatch".into(),
-                            title: "unary minus on a `bool`".into(),
-                            span: e.span,
+                            title: "unary minus on a non-integer".into(),
+                            span,
                             label: "expected an integer".into(),
                             notes: vec![],
                         })
@@ -379,34 +535,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             if op.is_arith() {
                 let expected_int = match expected {
                     Some(Ty::Int(_)) => expected,
-                    Some(Ty::Bool) => None, // will fail the outer expected check
-                    None => None,
+                    _ => None,
                 };
                 let t = infer_int_pair(ctx, lhs, rhs, expected_int, op_span)?;
-                if matches!(op, BinOp::Div | BinOp::Rem) && t.signed() {
-                    return Err(Diagnostic {
-                        name: "type.m0_signed_div".into(),
-                        title: "signed division/remainder is not supported in M0".into(),
-                        span: op_span,
-                        label: "signed `/` and `%` land in M1".into(),
-                        notes: vec![(
-                            "note".into(),
-                            "C truncation semantics need Int.tdiv/Int.tmod on the Lean side \
-                             (see docs/PLAN.md, M0 simplifications)"
-                                .into(),
-                        )],
-                    });
-                }
                 Ty::Int(t)
             } else if op.is_comparison() {
-                if matches!(op, BinOp::Eq | BinOp::Ne) {
-                    // Allow int == int only in M0 (bool equality would need
-                    // Prop-level iff in the VC encoding).
-                }
                 let _t = infer_int_pair(ctx, lhs, rhs, None, op_span)?;
                 Ty::Bool
             } else {
-                // && ||
                 check_expr(ctx, lhs, Some(Ty::Bool))?;
                 check_expr(ctx, rhs, Some(Ty::Bool))?;
                 Ty::Bool
@@ -437,31 +573,80 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         sig.params.len(),
                         args.len()
                     ),
-                    span: e.span,
+                    span,
                     label: "wrong number of arguments".into(),
                     notes: vec![],
+                });
+            }
+            if *callee == ctx.current_fn && !ctx.current_has_variant {
+                return Err(Diagnostic {
+                    name: "type.recursion_needs_variant".into(),
+                    title: format!("`{callee}` calls itself without a `variant`", ),
+                    span: *callee_span,
+                    label: "recursion requires a decreasing measure (design §8)".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "add `/// variant <ghost nat expression>` to the function's contract \
+                         block or between the signature and `{`"
+                            .into(),
+                    )],
                 });
             }
             let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty).collect();
             let ret = sig.ret;
             for (arg, pty) in args.iter_mut().zip(param_tys) {
-                if pty == Ty::Bool {
-                    return Err(Diagnostic {
-                        name: "type.m0_bool_arg".into(),
-                        title: "bool-typed call arguments are not supported in M0".into(),
-                        span: arg.span,
-                        label: "bool argument".into(),
-                        notes: vec![("note".into(), "see docs/PLAN.md, M0 scope".into())],
-                    });
+                match pty {
+                    Ty::Bool => {
+                        return Err(Diagnostic {
+                            name: "type.m0_bool_arg".into(),
+                            title: "bool-typed call arguments are not supported yet".into(),
+                            span: arg.span,
+                            label: "bool argument".into(),
+                            notes: vec![],
+                        })
+                    }
+                    Ty::Array(_) => {
+                        return Err(Diagnostic {
+                            name: "type.m1_array_arg".into(),
+                            title: "array-typed call arguments are not supported yet".into(),
+                            span: arg.span,
+                            label: "passing borrowed arrays lands in M2".into(),
+                            notes: vec![],
+                        })
+                    }
+                    _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }
-                check_expr(ctx, arg, Some(pty))?;
             }
-            ctx.calls.push(callee.clone());
+            if *callee != ctx.current_fn {
+                ctx.calls.push(callee.clone());
+            }
             ret
         }
     };
     e.ty = Some(ty);
     Ok(ty)
+}
+
+fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<IntTy> {
+    match ctx.vars.get(array) {
+        Some(VarInfo {
+            ty: Ty::Array(t), ..
+        }) => Ok(*t),
+        Some(v) => Err(Diagnostic {
+            name: "type.not_an_array".into(),
+            title: format!("`{array}` is not an array"),
+            span,
+            label: format!("this has type `{}`", v.ty.name()),
+            notes: vec![],
+        }),
+        None => Err(Diagnostic {
+            name: "type.unknown_variable".into(),
+            title: format!("unknown variable `{array}`"),
+            span,
+            label: "not declared".into(),
+            notes: vec![],
+        }),
+    }
 }
 
 /// Infer a same-typed integer pair, letting a literal side adopt the other
@@ -490,9 +675,9 @@ fn infer_int_pair(
 fn int_of(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>, op_span: Span) -> CResult<IntTy> {
     match check_expr(ctx, e, expected)? {
         Ty::Int(t) => Ok(t),
-        Ty::Bool => Err(Diagnostic {
+        other => Err(Diagnostic {
             name: "type.mismatch".into(),
-            title: "arithmetic/comparison on a `bool`".into(),
+            title: format!("arithmetic/comparison on `{}`", other.name()),
             span: op_span,
             label: "operands must be integers".into(),
             notes: vec![],

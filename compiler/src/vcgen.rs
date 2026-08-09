@@ -1,49 +1,53 @@
 //! Verification-condition generation by forward symbolic execution.
 //!
-//! Program integer values are represented as Lean `Int` expression strings,
-//! kept exact by per-operation obligations (overflow, divisor-nonzero).
-//! Control flow is handled by path-splitting: `if` executes both arms
-//! against the remaining statements with the branch condition (or its
-//! negation) as a hypothesis. Sound and simple; fine at M0 scale.
+//! Program integer values are Lean `Int` expression strings, kept exact by
+//! per-operation obligations. Control flow: path-splitting at `if`;
+//! `while` is handled by the standard havoc decomposition —
 //!
-//! Contract clauses are spliced verbatim (CLAUDE.md invariant); the only
-//! transformation ever applied is call-site substitution of callee
-//! parameter names by parenthesized argument expressions.
+//!   1. prove each invariant at loop entry (goal = invariant text with
+//!      variables substituted by their current symbolic values);
+//!   2. havoc every variable the body assigns (fresh binders under their
+//!      *source names*, so invariant/variant clauses splice verbatim as
+//!      hypotheses), dropping hypotheses that mention havocked names;
+//!   3. body path: assume invariants + condition, execute the body, and at
+//!      its end prove each invariant again (substituted) plus variant
+//!      decrease against a snapshot binder;
+//!   4. continuation: assume invariants + ¬condition and keep going.
+//!
+//! Every proven obligation's goal is then *assumed* (pushed as a
+//! hypothesis) — sound, and it is what lets later obligations (e.g. a gcd
+//! descent `a % b < b`) close by `assumption` instead of re-deriving
+//! nonlinear facts the portfolio cannot reach.
 
 use crate::ast::*;
 use crate::check::FnSig;
+use crate::scan::Clause;
 use crate::span::Span;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct Obligation {
-    /// User-facing obligation name, e.g. `div_round_up.overflow.a_add_b`.
     pub name: String,
-    /// Sanitized Lean theorem name.
     pub thm_name: String,
-    /// Short description used as the caret label.
     pub kind_desc: String,
-    /// Where to point in the .sable source.
     pub span: Span,
-    /// Lean proposition to prove.
     pub goal: String,
-    /// (name, "Int" | "Bool")
-    pub binders: Vec<(String, &'static str)>,
+    /// (name, Lean type)
+    pub binders: Vec<(String, String)>,
     /// (hypothesis name, Lean proposition)
     pub hyps: Vec<(String, String)>,
-    /// Human-readable summary of the context (pres, path conditions...).
     pub context: Vec<String>,
 }
 
-/// A `def ... : Prop` emitted per contract clause so that a clause that
-/// fails to elaborate produces an error mapped exactly to its own span.
 #[derive(Debug, Clone)]
 pub struct ClauseWf {
     pub def_name: String,
-    pub binders: Vec<(String, &'static str)>,
+    pub binders: Vec<(String, String)>,
     pub text: String,
     pub span: Span,
     pub desc: String,
+    /// "Prop" for logical clauses, "Int" for variant measures.
+    pub result_ty: &'static str,
 }
 
 pub struct VcResult {
@@ -67,6 +71,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             hyps: Vec::new(),
             context: Vec::new(),
             env: HashMap::new(),
+            var_tys: HashMap::new(),
             fresh: 0,
             name_counts: HashMap::new(),
             out: &mut result,
@@ -78,10 +83,19 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
 
 #[derive(Debug, Clone)]
 enum Val {
-    /// Lean `Int` expression.
     Int(String),
-    /// Lean proposition (bool-typed program values).
     Prop(String),
+    Opt(String),
+}
+
+#[derive(Clone)]
+enum Tail<'a> {
+    FnEnd,
+    Loop {
+        invariants: &'a [Clause],
+        variant: &'a Clause,
+        v0: String,
+    },
 }
 
 struct Generator<'a> {
@@ -89,10 +103,11 @@ struct Generator<'a> {
     sigs: &'a HashMap<String, FnSig>,
     fn_map: &'a HashMap<&'a str, &'a Fn>,
     source: &'a str,
-    binders: Vec<(String, &'static str)>,
+    binders: Vec<(String, String)>,
     hyps: Vec<(String, String)>,
     context: Vec<String>,
     env: HashMap<String, Val>,
+    var_tys: HashMap<String, Ty>,
     fresh: usize,
     name_counts: HashMap<String, usize>,
     out: &'a mut VcResult,
@@ -100,81 +115,152 @@ struct Generator<'a> {
 
 impl<'a> Generator<'a> {
     fn run(&mut self) {
-        // Parameters become binders with range facts; bool params are
-        // Bool binders used as `(p = true)` propositions.
         for p in &self.f.params {
+            self.var_tys.insert(p.name.clone(), p.ty);
             match p.ty {
                 Ty::Int(it) => {
-                    self.binders.push((p.name.clone(), "Int"));
-                    self.hyps.push((
-                        format!("h_{}_range", p.name),
-                        range_prop(&p.name, it),
-                    ));
-                    self.env
-                        .insert(p.name.clone(), Val::Int(p.name.clone()));
+                    self.binders.push((p.name.clone(), "Int".into()));
+                    self.hyps
+                        .push((format!("h_{}_range", p.name), range_prop(&p.name, it)));
+                    self.env.insert(p.name.clone(), Val::Int(p.name.clone()));
                 }
                 Ty::Bool => {
-                    self.binders.push((p.name.clone(), "Bool"));
+                    self.binders.push((p.name.clone(), "Bool".into()));
                     self.env
                         .insert(p.name.clone(), Val::Prop(format!("({} = true)", p.name)));
                 }
+                Ty::Array(elem) => {
+                    self.binders
+                        .push((p.name.clone(), "Sable.Seq Int".into()));
+                    self.hyps.push((
+                        format!("h_{}_len", p.name),
+                        format!("0 ≤ {0}.len ∧ {0}.len ≤ u64.max", p.name),
+                    ));
+                    self.hyps.push((
+                        format!("h_{}_elems", p.name),
+                        format!(
+                            "∀ k, 0 ≤ k → k < {0}.len → {1} ≤ {0}.get k ∧ {0}.get k ≤ {2}",
+                            p.name,
+                            elem.lean_min(),
+                            elem.lean_max()
+                        ),
+                    ));
+                    self.env.insert(p.name.clone(), Val::Prop(p.name.clone()));
+                    // Arrays are never substituted; env presence marks scope.
+                }
+                Ty::Option(_) => unreachable!("checked: no option params"),
             }
         }
-        // Preconditions: hypotheses everywhere in the body, and a
-        // well-formedness def each.
         for (i, pre) in self.f.pres.iter().enumerate() {
             self.hyps
                 .push((format!("h_pre_{}", i + 1), format!("({})", pre.text)));
             self.context.push(format!("pre {}", pre.text));
+            let binders = self.binders.clone();
             self.out.clause_wfs.push(ClauseWf {
                 def_name: format!("wf_{}_pre_{}", sanitize(&self.f.name), i + 1),
-                binders: self.binders.clone(),
+                binders,
                 text: pre.text.clone(),
                 span: pre.span,
                 desc: format!("`pre` clause of `{}`", self.f.name),
+                result_ty: "Prop",
             });
         }
         for (i, post) in self.f.posts.iter().enumerate() {
             let mut binders = self.binders.clone();
-            binders.push(("result".to_string(), "Int"));
+            binders.push(("result".to_string(), self.result_lean_ty()));
             self.out.clause_wfs.push(ClauseWf {
                 def_name: format!("wf_{}_post_{}", sanitize(&self.f.name), i + 1),
                 binders,
                 text: post.text.clone(),
                 span: post.span,
                 desc: format!("`post` clause of `{}`", self.f.name),
+                result_ty: "Prop",
+            });
+        }
+        if let Some(v) = &self.f.variant {
+            let binders = self.binders.clone();
+            self.out.clause_wfs.push(ClauseWf {
+                def_name: format!("wf_{}_variant", sanitize(&self.f.name)),
+                binders,
+                text: v.text.clone(),
+                span: v.span,
+                desc: format!("`variant` clause of `{}`", self.f.name),
+                result_ty: "Int",
             });
         }
 
         let stmts: Vec<&Stmt> = self.f.body.iter().collect();
-        self.exec(&stmts);
+        self.exec(&stmts, &Tail::FnEnd);
     }
 
-    /// Execute a statement list (continuation style: `if` re-enters with
-    /// branch ++ rest).
-    fn exec(&mut self, stmts: &[&'a Stmt]) {
+    fn result_lean_ty(&self) -> String {
+        match self.f.ret {
+            Ty::Option(_) => "Option Int".into(),
+            _ => "Int".into(),
+        }
+    }
+
+    fn exec(&mut self, stmts: &[&'a Stmt], tail: &Tail<'a>) {
         let Some((stmt, rest)) = stmts.split_first() else {
+            // A path fell off the end of a loop body: prove preservation.
+            if let Tail::Loop {
+                invariants,
+                variant,
+                v0,
+            } = tail
+            {
+                for inv in *invariants {
+                    let goal = self.subst_env(&inv.text);
+                    let ob = self.obligation(
+                        &format!("{}.inv_preserved.{}", self.f.name, slug(&inv.text)),
+                        "loop invariant must be preserved by the body".into(),
+                        inv.span,
+                        goal,
+                    );
+                    self.push_obligation(ob);
+                }
+                let goal = format!("0 ≤ {v0} ∧ ({}) < {v0}", self.subst_env(&variant.text));
+                let ob = self.obligation(
+                    &format!("{}.variant_decreases.{}", self.f.name, slug(&variant.text)),
+                    "loop variant must be a nonnegative measure that strictly decreases"
+                        .into(),
+                    variant.span,
+                    goal,
+                );
+                self.push_obligation(ob);
+            }
             return;
         };
         match stmt {
-            Stmt::Decl { name, init, .. } => {
+            Stmt::Decl { name, ty, init, .. } => {
+                self.var_tys.insert(name.clone(), *ty);
                 if let Some(e) = init {
                     let v = self.eval(e);
                     self.env.insert(name.clone(), v);
                 } else {
                     self.env.remove(name);
                 }
-                self.exec(rest);
+                self.exec(rest, tail);
             }
             Stmt::Assign { name, value, .. } => {
                 let v = self.eval(value);
                 self.env.insert(name.clone(), v);
-                self.exec(rest);
+                self.exec(rest, tail);
             }
             Stmt::Return { value, .. } => {
-                let v = self.eval(value);
-                let Val::Int(ret) = v else {
-                    unreachable!("bool returns rejected in M0");
+                let result_eq = match &value.kind {
+                    ExprKind::SomeE(inner) => {
+                        let Val::Int(v) = self.eval(inner) else {
+                            unreachable!()
+                        };
+                        format!("(result = some ({v}))")
+                    }
+                    ExprKind::NoneE => "(result = none)".to_string(),
+                    _ => match self.eval(value) {
+                        Val::Int(v) => format!("(result = {v})"),
+                        Val::Opt(v) => format!("(result = {v})"),
+                        Val::Prop(_) => unreachable!("bool returns rejected"),
+                    },
                 };
                 for post in &self.f.posts {
                     let mut ob = self.obligation(
@@ -183,11 +269,10 @@ impl<'a> Generator<'a> {
                         post.span,
                         post.text.clone(),
                     );
-                    ob.binders.push(("result".to_string(), "Int"));
-                    ob.hyps.push(("h_result".to_string(), format!("(result = {ret})")));
+                    ob.binders.push(("result".to_string(), self.result_lean_ty()));
+                    ob.hyps.push(("h_result".to_string(), result_eq.clone()));
                     self.push_obligation(ob);
                 }
-                // Path ends; nothing after `return` executes.
             }
             Stmt::If {
                 cond,
@@ -204,7 +289,7 @@ impl<'a> Generator<'a> {
                 self.context.push(format!("path {p}"));
                 let then_stmts: Vec<&Stmt> =
                     then_block.iter().chain(rest.iter().copied()).collect();
-                self.exec(&then_stmts);
+                self.exec(&then_stmts, tail);
 
                 self.env = snap_env;
                 self.hyps.truncate(snap_hyps);
@@ -217,18 +302,178 @@ impl<'a> Generator<'a> {
                     Some(eb) => {
                         let else_stmts: Vec<&Stmt> =
                             eb.iter().chain(rest.iter().copied()).collect();
-                        self.exec(&else_stmts);
+                        self.exec(&else_stmts, tail);
                     }
-                    None => self.exec(rest),
+                    None => self.exec(rest, tail),
                 }
+                self.hyps.truncate(snap_hyps);
+                self.context.truncate(snap_ctx);
+            }
+            Stmt::While {
+                cond,
+                invariants,
+                variant,
+                body,
+                ..
+            } => {
+                let variant = variant.as_ref().expect("checked: variant present");
+
+                // Well-formedness defs so clause elaboration errors map to
+                // the clause span. Binders: everything in scope.
+                let scope_binders: Vec<(String, String)> = self
+                    .var_tys
+                    .iter()
+                    .filter_map(|(name, ty)| match ty {
+                        Ty::Int(_) => Some((name.clone(), "Int".to_string())),
+                        Ty::Bool => Some((name.clone(), "Bool".to_string())),
+                        Ty::Array(_) => Some((name.clone(), "Sable.Seq Int".to_string())),
+                        Ty::Option(_) => None,
+                    })
+                    .collect();
+                for (i, clause) in invariants.iter().chain(std::iter::once(variant)).enumerate() {
+                    self.fresh += 1;
+                    self.out.clause_wfs.push(ClauseWf {
+                        def_name: format!(
+                            "wf_{}_loop{}_{}",
+                            sanitize(&self.f.name),
+                            self.fresh,
+                            i
+                        ),
+                        binders: scope_binders.clone(),
+                        text: clause.text.clone(),
+                        span: clause.span,
+                        desc: format!("loop annotation in `{}`", self.f.name),
+                        result_ty: if i == invariants.len() { "Int" } else { "Prop" },
+                    });
+                }
+
+                // 1. Invariants hold at entry (substituted goals).
+                for inv in invariants {
+                    let goal = self.subst_env(&inv.text);
+                    let ob = self.obligation(
+                        &format!("{}.inv_init.{}", self.f.name, slug(&inv.text)),
+                        "loop invariant must hold at loop entry".into(),
+                        inv.span,
+                        goal,
+                    );
+                    self.push_obligation(ob);
+                }
+
+                // 2. Havoc assigned state (fresh source-named binders).
+                self.havoc(body);
+
+                // 3. Assume invariants; evaluate the condition once in the
+                // havocked context (its VCs must follow from invariants).
+                self.fresh += 1;
+                let tag = self.fresh;
+                for (i, inv) in invariants.iter().enumerate() {
+                    self.hyps
+                        .push((format!("h_inv{}_{}", tag, i + 1), format!("({})", inv.text)));
+                    self.context.push(format!("invariant {}", inv.text));
+                }
+                let p = self.eval_prop(cond);
+
+                let snap_env = self.env.clone();
+                let snap_hyps = self.hyps.len();
+                let snap_ctx = self.context.len();
+
+                // 4. Body path.
+                self.fresh += 1;
+                let v0 = format!("_v{}", self.fresh);
+                self.binders.push((v0.clone(), "Int".into()));
+                self.hyps
+                    .push((format!("h{v0}"), format!("{v0} = ({})", variant.text)));
+                let h_cond = self.fresh_hyp("h_path");
+                self.hyps.push((h_cond, p.clone()));
+                self.context.push(format!("path {p}"));
+                let body_stmts: Vec<&Stmt> = body.iter().collect();
+                let loop_tail = Tail::Loop {
+                    invariants,
+                    variant,
+                    v0,
+                };
+                self.exec(&body_stmts, &loop_tail);
+
+                self.env = snap_env;
+                self.hyps.truncate(snap_hyps);
+                self.context.truncate(snap_ctx);
+
+                // 5. Continuation: invariants + ¬cond.
+                let h_exit = self.fresh_hyp("h_path");
+                self.hyps.push((h_exit, format!("¬{p}")));
+                self.context.push(format!("path ¬{p}"));
+                self.exec(rest, tail);
                 self.hyps.truncate(snap_hyps);
                 self.context.truncate(snap_ctx);
             }
         }
     }
 
-    /// Evaluate an integer-typed expression to a Lean `Int` string,
-    /// emitting obligations for every partial operation on the way.
+    /// Fresh source-named binders for everything the loop body assigns
+    /// (plus locals whose symbolic value mentions a havocked variable,
+    /// transitively). Hypotheses mentioning havocked names are dropped.
+    fn havoc(&mut self, body: &[Stmt]) {
+        let mut havoc_set: HashSet<String> = HashSet::new();
+        collect_assigned(body, &mut havoc_set);
+        // Cascade: symbolic values referring to havocked names die too.
+        loop {
+            let mut grew = false;
+            for (name, val) in &self.env {
+                if havoc_set.contains(name) {
+                    continue;
+                }
+                let s = match val {
+                    Val::Int(s) | Val::Opt(s) => s,
+                    Val::Prop(s) => s,
+                };
+                if havoc_set.iter().any(|h| mentions(s, h)) {
+                    // Arrays map to their own name and are never assigned.
+                    if !matches!(self.var_tys.get(name), Some(Ty::Array(_))) {
+                        havoc_set.insert(name.clone());
+                        grew = true;
+                        break;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        self.hyps
+            .retain(|(_, prop)| !havoc_set.iter().any(|h| mentions(prop, h)));
+        self.context
+            .retain(|note| !havoc_set.iter().any(|h| mentions(note, h)));
+
+        for name in &havoc_set {
+            // Rename any existing binder occupying the source name.
+            self.fresh += 1;
+            let stale = format!("_old{}_{name}", self.fresh);
+            for b in self.binders.iter_mut() {
+                if b.0 == *name {
+                    b.0 = stale.clone();
+                }
+            }
+            match self.var_tys.get(name) {
+                Some(Ty::Int(it)) => {
+                    let it = *it;
+                    self.binders.push((name.clone(), "Int".into()));
+                    self.hyps.push((
+                        format!("h_{name}_range{}", self.fresh),
+                        range_prop(name, it),
+                    ));
+                    self.env.insert(name.clone(), Val::Int(name.clone()));
+                }
+                Some(Ty::Bool) => {
+                    self.binders.push((name.clone(), "Bool".into()));
+                    self.env
+                        .insert(name.clone(), Val::Prop(format!("({name} = true)")));
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn eval(&mut self, e: &Expr) -> Val {
         match &e.kind {
             ExprKind::IntLit(n) => Val::Int(if *n < 0 {
@@ -238,6 +483,38 @@ impl<'a> Generator<'a> {
             }),
             ExprKind::BoolLit(b) => Val::Prop(if *b { "True".into() } else { "False".into() }),
             ExprKind::Var(name) => self.env.get(name).cloned().expect("checked: initialized"),
+            ExprKind::Len { array } => Val::Int(format!("{array}.len")),
+            ExprKind::Widen { arg, .. } => self.eval(arg),
+            ExprKind::SomeE(_) | ExprKind::NoneE => {
+                unreachable!("checked: options only in return position")
+            }
+            ExprKind::Index { array, index, .. } => {
+                let Val::Int(i) = self.eval(index) else {
+                    unreachable!()
+                };
+                let Ty::Int(elem) = e.ty.unwrap() else {
+                    unreachable!()
+                };
+                let goal = format!("0 ≤ {i} ∧ {i} < {array}.len");
+                let ob = self.obligation(
+                    &format!("{}.bounds.{}", self.f.name, slug(self.src(e.span))),
+                    format!("index `{}` must be within bounds", self.src_short(e.span)),
+                    e.span,
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                let value = format!("({array}.get {i})");
+                // Element range follows from the array's element fact +
+                // the just-proven bounds; assuming it here saves the
+                // automation a quantifier instantiation.
+                self.assume_fact(&format!(
+                    "{} ≤ {value} ∧ {value} ≤ {}",
+                    elem.lean_min(),
+                    elem.lean_max()
+                ));
+                Val::Int(value)
+            }
             ExprKind::Unary { op, operand } => match op {
                 UnOp::Neg => {
                     let Val::Int(v) = self.eval(operand) else {
@@ -247,6 +524,7 @@ impl<'a> Generator<'a> {
                     let Ty::Int(it) = e.ty.unwrap() else {
                         unreachable!()
                     };
+                    let goal = range_prop(&value, it);
                     let ob = self.obligation(
                         &format!("{}.overflow.{}", self.f.name, slug(self.src(e.span))),
                         format!(
@@ -255,9 +533,10 @@ impl<'a> Generator<'a> {
                             it.name()
                         ),
                         e.span,
-                        range_prop(&value, it),
+                        goal.clone(),
                     );
                     self.push_obligation(ob);
+                    self.assume_fact(&goal);
                     Val::Int(value)
                 }
                 UnOp::Not => {
@@ -287,37 +566,70 @@ impl<'a> Generator<'a> {
                     };
                     match op {
                         BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                            let goal = range_prop(&value, it);
                             let ob = self.obligation(
-                                &format!(
-                                    "{}.overflow.{}",
-                                    self.f.name,
-                                    slug(self.src(e.span))
-                                ),
+                                &format!("{}.overflow.{}", self.f.name, slug(self.src(e.span))),
                                 format!(
                                     "result of `{}` must fit in `{}`",
                                     self.src_short(e.span),
                                     it.name()
                                 ),
                                 e.span,
-                                range_prop(&value, it),
+                                goal.clone(),
                             );
                             self.push_obligation(ob);
+                            self.assume_fact(&goal);
                         }
                         BinOp::Div | BinOp::Rem => {
-                            // Unsigned only in M0 (checked); Lean `/`/`%` on
-                            // Int agree with C for nonneg operands, and the
-                            // result stays in range without a further VC.
+                            let goal = format!("{r} ≠ 0");
                             let ob = self.obligation(
-                                &format!(
-                                    "{}.div_zero.{}",
-                                    self.f.name,
-                                    slug(self.src(e.span))
+                                &format!("{}.div_zero.{}", self.f.name, slug(self.src(e.span))),
+                                format!(
+                                    "divisor `{}` must be nonzero",
+                                    self.src_short(rhs.span)
                                 ),
-                                format!("divisor `{}` must be nonzero", self.src_short(rhs.span)),
                                 rhs.span,
-                                format!("{r} ≠ 0"),
+                                goal.clone(),
                             );
                             self.push_obligation(ob);
+                            self.assume_fact(&goal);
+                            if it.signed() && *op == BinOp::Div {
+                                let goal = format!(
+                                    "¬({l} = {} ∧ {r} = (-1))",
+                                    it.lean_min()
+                                );
+                                let ob = self.obligation(
+                                    &format!(
+                                        "{}.div_overflow.{}",
+                                        self.f.name,
+                                        slug(self.src(e.span))
+                                    ),
+                                    format!(
+                                        "`{}` must not be `{}.min / -1` (Euclidean quotient \
+                                         overflows)",
+                                        self.src_short(e.span),
+                                        it.name()
+                                    ),
+                                    e.span,
+                                    goal.clone(),
+                                );
+                                self.push_obligation(ob);
+                                self.assume_fact(&goal);
+                            }
+                            if !it.signed() {
+                                // Euclidean bounds; provable from r > 0,
+                                // assumed to spare the portfolio nonlinear
+                                // reasoning (e.g. gcd's descent VC).
+                                if *op == BinOp::Rem {
+                                    self.assume_fact(&format!(
+                                        "0 ≤ {value} ∧ {value} < {r}"
+                                    ));
+                                } else {
+                                    self.assume_fact(&format!(
+                                        "0 ≤ {value} ∧ {value} ≤ {l}"
+                                    ));
+                                }
+                            }
                         }
                         _ => unreachable!(),
                     }
@@ -331,19 +643,22 @@ impl<'a> Generator<'a> {
                     .iter()
                     .map(|a| {
                         let Val::Int(v) = self.eval(a) else {
-                            unreachable!("bool args rejected in M0")
+                            unreachable!("checked: int args only")
                         };
                         v
                     })
                     .collect();
                 let callee_fn = self.fn_map[callee.as_str()];
                 let sig = &self.sigs[callee.as_str()];
-                let param_names: Vec<&str> =
-                    sig.params.iter().map(|p| p.name.as_str()).collect();
+                let subst_map: HashMap<String, String> = sig
+                    .params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .zip(arg_vals.iter().cloned())
+                    .collect();
 
-                // Callee preconditions become obligations here.
                 for pre in &callee_fn.pres {
-                    let goal = substitute(&pre.text, &param_names, &arg_vals, None);
+                    let goal = substitute(&pre.text, &subst_map, None);
                     let ob = self.obligation(
                         &format!("{}.call_pre.{}.{}", self.f.name, callee, slug(&pre.text)),
                         format!("`pre {}` of `{callee}` must hold at this call", pre.text),
@@ -353,34 +668,52 @@ impl<'a> Generator<'a> {
                     self.push_obligation(ob);
                 }
 
-                // Fresh symbol for the returned value; callee postconditions
-                // become hypotheses about it.
+                // Self-recursion: the callee's measure, on the arguments,
+                // must be a nonnegative decrease of the current measure.
+                if *callee == self.f.name {
+                    let variant = self.f.variant.as_ref().expect("checked");
+                    let callee_measure = substitute(&variant.text, &subst_map, None);
+                    let caller_measure = self.subst_env(&variant.text);
+                    let goal = format!(
+                        "0 ≤ ({callee_measure}) ∧ ({callee_measure}) < ({caller_measure})"
+                    );
+                    let ob = self.obligation(
+                        &format!("{}.termination.{}", self.f.name, slug(&variant.text)),
+                        "recursive call must decrease the function's `variant`".into(),
+                        e.span,
+                        goal,
+                    );
+                    self.push_obligation(ob);
+                }
+
                 self.fresh += 1;
                 let ret_sym = format!("_r{}", self.fresh);
-                self.binders.push((ret_sym.clone(), "Int"));
-                let Ty::Int(ret_it) = sig.ret else {
-                    unreachable!("bool returns rejected in M0")
-                };
-                self.hyps.push((
-                    format!("h{ret_sym}_range"),
-                    range_prop(&ret_sym, ret_it),
-                ));
+                match sig.ret {
+                    Ty::Int(ret_it) => {
+                        self.binders.push((ret_sym.clone(), "Int".into()));
+                        self.hyps
+                            .push((format!("h{ret_sym}_range"), range_prop(&ret_sym, ret_it)));
+                    }
+                    Ty::Option(_) => {
+                        self.binders.push((ret_sym.clone(), "Option Int".into()));
+                    }
+                    _ => unreachable!(),
+                }
                 for (i, post) in callee_fn.posts.iter().enumerate() {
-                    let prop =
-                        substitute(&post.text, &param_names, &arg_vals, Some(&ret_sym));
+                    let prop = substitute(&post.text, &subst_map, Some(&ret_sym));
                     self.hyps
                         .push((format!("h{ret_sym}_post_{}", i + 1), format!("({prop})")));
                     self.context
                         .push(format!("from `{callee}` post: {}", post.text));
                 }
-                Val::Int(ret_sym)
+                match sig.ret {
+                    Ty::Option(_) => Val::Opt(ret_sym),
+                    _ => Val::Int(ret_sym),
+                }
             }
         }
     }
 
-    /// Evaluate a bool-typed expression to a Lean proposition. `&&`/`||`
-    /// guard their right operand's obligations with the left operand (or
-    /// its negation), preserving short-circuit semantics for VCs.
     fn eval_prop(&mut self, e: &Expr) -> String {
         match &e.kind {
             ExprKind::BoolLit(b) => if *b { "True" } else { "False" }.to_string(),
@@ -436,6 +769,27 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Substitute in-scope variables' symbolic values into clause text.
+    /// Used for goals about a *specific* state (invariant entry/preservation,
+    /// variant measures); hypotheses always splice verbatim against
+    /// source-named binders.
+    fn subst_env(&self, text: &str) -> String {
+        let map: HashMap<String, String> = self
+            .env
+            .iter()
+            .filter_map(|(name, val)| match val {
+                Val::Int(s) if s != name => Some((name.clone(), s.clone())),
+                _ => None,
+            })
+            .collect();
+        substitute(text, &map, None)
+    }
+
+    fn assume_fact(&mut self, prop: &str) {
+        let h = self.fresh_hyp("h_fact");
+        self.hyps.push((h, prop.to_string()));
+    }
+
     fn obligation(
         &mut self,
         name: &str,
@@ -489,23 +843,74 @@ impl<'a> Generator<'a> {
     }
 }
 
+fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Assign { name, .. } => {
+                out.insert(name.clone());
+            }
+            Stmt::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_assigned(then_block, out);
+                if let Some(eb) = else_block {
+                    collect_assigned(eb, out);
+                }
+            }
+            Stmt::While { body, .. } => collect_assigned(body, out),
+            _ => {}
+        }
+    }
+}
+
 fn range_prop(value: &str, it: IntTy) -> String {
     format!("{} ≤ {value} ∧ {value} ≤ {}", it.lean_min(), it.lean_max())
 }
 
-/// Replace callee parameter names (and `result`) in clause text with
-/// parenthesized argument expressions. Identifier-boundary aware; skips
-/// identifiers preceded by `.` (field/namespace access like `u32.max`).
-fn substitute(
-    text: &str,
-    params: &[&str],
-    args: &[String],
-    result: Option<&str>,
-) -> String {
-    let mut out = String::with_capacity(text.len());
+/// True if `text` contains `name` as a standalone identifier token
+/// (not a field access like `.name`).
+fn mentions(text: &str, name: &str) -> bool {
+    scan_idents(text, |word, after_dot| !after_dot && word == name)
+}
+
+fn scan_idents(text: &str, mut pred: impl FnMut(&str, bool) -> bool) -> bool {
     let bytes = text.as_bytes();
     let mut i = 0;
-    let mut prev_byte: Option<u8> = None;
+    let mut prev: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'\'')
+            {
+                i += 1;
+            }
+            if pred(&text[start..i], prev == Some(b'.')) {
+                return true;
+            }
+            prev = Some(bytes[i - 1]);
+            continue;
+        }
+        prev = Some(b);
+        i += 1;
+    }
+    false
+}
+
+/// Replace identifiers per `map` (and `result`, when given) with
+/// parenthesized replacements. Identifier-boundary aware; skips
+/// identifiers preceded by `.` (field/namespace access like `u32.max`).
+pub fn substitute(text: &str, map: &HashMap<String, String>, result: Option<&str>) -> String {
+    // Byte-level scan: identifiers are pure ASCII, and non-ASCII bytes
+    // (∀, ≤, → ...) are copied through untouched — pushing them as `char`
+    // would mangle multi-byte UTF-8.
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut prev: Option<u8> = None;
     while i < bytes.len() {
         let b = bytes[i];
         if b.is_ascii_alphabetic() || b == b'_' {
@@ -516,29 +921,26 @@ fn substitute(
                 i += 1;
             }
             let word = &text[start..i];
-            let after_dot = prev_byte == Some(b'.');
+            let after_dot = prev == Some(b'.');
             let replacement = if after_dot {
                 None
             } else if word == "result" {
                 result.map(|r| r.to_string())
             } else {
-                params
-                    .iter()
-                    .position(|p| *p == word)
-                    .map(|idx| args[idx].clone())
+                map.get(word).cloned()
             };
             match replacement {
-                Some(r) => out.push_str(&format!("({r})")),
-                None => out.push_str(word),
+                Some(r) => out.extend_from_slice(format!("({r})").as_bytes()),
+                None => out.extend_from_slice(word.as_bytes()),
             }
-            prev_byte = Some(bytes[i - 1]);
+            prev = Some(bytes[i - 1]);
             continue;
         }
-        out.push(b as char);
-        prev_byte = Some(b);
+        out.push(b);
+        prev = Some(b);
         i += 1;
     }
-    out
+    String::from_utf8(out).expect("substitution preserves UTF-8")
 }
 
 pub fn sanitize(name: &str) -> String {

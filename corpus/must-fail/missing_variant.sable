@@ -1,0 +1,12 @@
+// expect-error: proof.missing_variant
+// Every loop needs a decreasing measure (design §4).
+
+/// post result = n
+fn spin(u64 n) -> u64 {
+    u64 i = 0;
+    /// invariant i ≤ n
+    while (i < n) {
+        i = i + 1;
+    }
+    return i;
+}

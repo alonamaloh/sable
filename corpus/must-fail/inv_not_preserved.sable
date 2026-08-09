@@ -1,0 +1,13 @@
+// expect-error: count.inv_preserved
+// The invariant is not inductive: i can pass 10 while the loop runs.
+
+/// post result ≥ 0
+fn count(u64 n) -> u64 {
+    u64 i = 0;
+    /// invariant i ≤ 10
+    /// variant   n - i
+    while (i < n) {
+        i = i + 1;
+    }
+    return 0;
+}

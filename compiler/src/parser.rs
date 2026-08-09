@@ -1,83 +1,118 @@
-//! Handwritten recursive-descent parser for the M0 subset, plus positional
-//! attachment of proof blocks to functions (design §1: a block attaches to
-//! the item starting on the line right after its last `///` line; a blank
-//! line detaches it).
+//! Handwritten recursive-descent parser, plus positional attachment of
+//! proof blocks (design §1): a block attaches to the item starting on the
+//! line right after its last `///` line; a blank line detaches it.
+//! Attachment targets in M1: functions (`pre`/`post`/`variant`), `while`
+//! loops (`invariant`/`variant`), the post-signature position
+//! (`variant`, design §8 style), and free-floating `discharge` blocks.
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::lexer::{Tok, Token};
-use crate::scan::{ClauseKind, ProofBlock};
+use crate::scan::{Clause, ClauseKind, ProofBlock};
 use crate::span::{LineMap, Span};
 
 pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    blocks: &'a [ProofBlock],
+    consumed: Vec<bool>,
+    lines: &'a LineMap,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
 
-pub fn parse(
-    tokens: &[Token],
-    blocks: &[ProofBlock],
-    lines: &LineMap,
-) -> PResult<Program> {
-    let mut parser = Parser { tokens, pos: 0 };
+pub fn parse(tokens: &[Token], blocks: &[ProofBlock], lines: &LineMap) -> PResult<Program> {
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        blocks,
+        consumed: vec![false; blocks.len()],
+        lines,
+    };
     let mut fns = Vec::new();
-    let mut consumed = vec![false; blocks.len()];
-
     while !parser.at(&Tok::Eof) {
-        let fn_line = lines.line_col(parser.peek_span().start).0;
-        let mut f = parser.parse_fn()?;
-        // Attach the proof block ending on the line just above `fn`.
-        for (bi, block) in blocks.iter().enumerate() {
-            if consumed[bi] || block.last_line + 1 != fn_line {
-                continue;
-            }
-            consumed[bi] = true;
-            for clause in &block.clauses {
-                match clause.kind {
-                    ClauseKind::Pre => f.pres.push(clause.clone()),
-                    ClauseKind::Post => f.posts.push(clause.clone()),
-                    other => {
-                        return Err(Diagnostic {
-                            name: "proof.bad_function_clause".into(),
-                            title: format!(
-                                "`{}` clause in a function contract block",
-                                kind_word(other)
-                            ),
-                            span: clause.line_span,
-                            label: "only `pre` and `post` may precede a function".into(),
-                            notes: vec![(
-                                "note".into(),
-                                milestone_hint(other).into(),
-                            )],
-                        });
-                    }
-                }
-            }
-        }
-        fns.push(f);
+        fns.push(parser.parse_fn()?);
     }
 
-    for (bi, block) in blocks.iter().enumerate() {
-        if !consumed[bi] {
+    // Remaining blocks: discharge blocks are module-level; anything else
+    // is an attachment error.
+    let mut discharges = Vec::new();
+    for (bi, block) in parser.blocks.iter().enumerate() {
+        if parser.consumed[bi] {
+            continue;
+        }
+        if block.clauses.iter().all(|c| c.kind == ClauseKind::Discharge) {
+            for clause in &block.clauses {
+                discharges.push(parse_discharge(clause)?);
+            }
+        } else {
             return Err(Diagnostic {
                 name: "proof.unattached_block".into(),
-                title: "proof block is not attached to any function".into(),
+                title: "proof block is not attached to anything".into(),
                 span: block.span,
-                label: "no function starts on the next line".into(),
+                label: "no function or loop starts on the next line".into(),
                 notes: vec![(
                     "note".into(),
-                    "free-floating (module-level) proof blocks and loop/statement \
-                     annotations are not supported in M0; a blank line after a contract \
-                     block detaches it from the function below"
+                    "a blank line detaches a proof block from the item below; \
+                     free-floating blocks may only contain `discharge` in M1 \
+                     (ghost `def`/`theorem` land in M2)"
                         .into(),
                 )],
             });
         }
     }
 
-    Ok(Program { fns })
+    Ok(Program { fns, discharges })
+}
+
+fn parse_discharge(clause: &Clause) -> PResult<Discharge> {
+    // Clause text: `NAME by\n  <script>` (the keyword `discharge` is
+    // already stripped by the scanner).
+    let text = clause.text.trim_start();
+    let name: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_')
+        .collect();
+    let rest = text[name.len()..].trim_start();
+    let malformed = || Diagnostic {
+        name: "proof.malformed_discharge".into(),
+        title: "malformed `discharge` clause".into(),
+        span: clause.span,
+        label: "expected `discharge <obligation-name> by <tactics>`".into(),
+        notes: vec![],
+    };
+    if name.is_empty() || !rest.starts_with("by") {
+        return Err(malformed());
+    }
+    // Dedent by the common leading indent so the emitter's uniform
+    // re-indent preserves nesting.
+    let raw = &rest["by".len()..];
+    let lines: Vec<&str> = raw
+        .lines()
+        .skip_while(|l| l.trim().is_empty())
+        .collect();
+    let min_indent = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let script = lines
+        .iter()
+        .map(|l| if l.len() >= min_indent { &l[min_indent..] } else { l.trim_end() })
+        .collect::<Vec<_>>()
+        .join("
+")
+        .trim_end()
+        .to_string();
+    if script.is_empty() {
+        return Err(malformed());
+    }
+    Ok(Discharge {
+        name,
+        script,
+        span: clause.span,
+    })
 }
 
 fn kind_word(k: ClauseKind) -> &'static str {
@@ -92,20 +127,7 @@ fn kind_word(k: ClauseKind) -> &'static str {
         ClauseKind::GhostDef => "def",
         ClauseKind::Theorem => "theorem",
         ClauseKind::Discharge => "discharge",
-        ClauseKind::Other => "<unrecognized>",
-    }
-}
-
-fn milestone_hint(k: ClauseKind) -> &'static str {
-    match k {
-        ClauseKind::Invariant | ClauseKind::Variant => "loop annotations arrive in M1",
-        ClauseKind::Assert | ClauseKind::Defer | ClauseKind::Assume => {
-            "statement-level proof blocks arrive in M3"
-        }
-        ClauseKind::GhostDef | ClauseKind::Theorem | ClauseKind::Discharge => {
-            "module-level proof blocks arrive with ghost definitions (M1-M2)"
-        }
-        _ => "unrecognized clause keyword; M0 supports `pre` and `post`",
+        ClauseKind::Other => "<continuation>",
     }
 }
 
@@ -118,6 +140,9 @@ impl<'a> Parser<'a> {
     }
     fn peek_span(&self) -> Span {
         self.tokens[self.pos].span
+    }
+    fn peek_line(&self) -> usize {
+        self.lines.line_col(self.peek_span().start).0
     }
     fn at(&self, t: &Tok) -> bool {
         self.peek() == t
@@ -146,6 +171,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The proof block whose last line immediately precedes `line`, if any.
+    fn take_block_ending_before(&mut self, line: usize) -> Option<&'a ProofBlock> {
+        for (bi, block) in self.blocks.iter().enumerate() {
+            if !self.consumed[bi] && block.last_line + 1 == line {
+                self.consumed[bi] = true;
+                return Some(block);
+            }
+        }
+        None
+    }
+
     fn ident(&mut self) -> PResult<(String, Span)> {
         match self.peek().clone() {
             Tok::Ident(name) => {
@@ -157,10 +193,36 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn ty(&mut self) -> PResult<(Ty, Span)> {
+    fn int_ty(&mut self) -> PResult<(IntTy, Span)> {
         let (name, span) = self.ident()?;
-        ty_from_name(&name)
-            .map(|t| (t, span))
+        IntTy::from_name(&name).map(|t| (t, span)).ok_or_else(|| Diagnostic {
+            name: "parse.unknown_type".into(),
+            title: format!("unknown integer type `{name}`"),
+            span,
+            label: "expected `u8`..`u64` or `i8`..`i64`".into(),
+            notes: vec![],
+        })
+    }
+
+    /// A parameter type: scalar, or `&[T]`.
+    fn param_ty(&mut self) -> PResult<(Ty, Span)> {
+        if self.at(&Tok::Amp) {
+            let start = self.bump().span;
+            self.expect(Tok::LBracket)?;
+            let (elem, _) = self.int_ty()?;
+            let end = self.expect(Tok::RBracket)?.span;
+            return Ok((Ty::Array(elem), start.join(end)));
+        }
+        self.scalar_ty()
+    }
+
+    fn scalar_ty(&mut self) -> PResult<(Ty, Span)> {
+        let (name, span) = self.ident()?;
+        if name == "bool" {
+            return Ok((Ty::Bool, span));
+        }
+        IntTy::from_name(&name)
+            .map(|t| (Ty::Int(t), span))
             .ok_or_else(|| Diagnostic {
                 name: "parse.unknown_type".into(),
                 title: format!("unknown type `{name}`"),
@@ -170,7 +232,22 @@ impl<'a> Parser<'a> {
             })
     }
 
+    /// A return type: scalar or `option<T>`.
+    fn ret_ty(&mut self) -> PResult<Ty> {
+        if let Tok::Ident(name) = self.peek() {
+            if name == "option" {
+                self.bump();
+                self.expect(Tok::Lt)?;
+                let (elem, _) = self.int_ty()?;
+                self.expect(Tok::Gt)?;
+                return Ok(Ty::Option(elem));
+            }
+        }
+        Ok(self.scalar_ty()?.0)
+    }
+
     fn parse_fn(&mut self) -> PResult<Fn> {
+        let fn_line = self.peek_line();
         let start = self.expect(Tok::KwFn)?.span;
         let (name, name_span) = self.ident()?;
         if is_reserved_name(&name) {
@@ -180,7 +257,7 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if !self.at(&Tok::RParen) {
             loop {
-                let (ty, tspan) = self.ty()?;
+                let (ty, tspan) = self.param_ty()?;
                 let (pname, pspan) = self.ident()?;
                 if is_reserved_name(&pname) {
                     return Err(reserved_name_error(&pname, pspan, "parameter"));
@@ -199,19 +276,51 @@ impl<'a> Parser<'a> {
         }
         self.expect(Tok::RParen)?;
         self.expect(Tok::Arrow)?;
-        let (ret, _) = self.ty()?;
-        let body = self.block()?;
-        let end = self.tokens[self.pos.saturating_sub(1)].span;
-        Ok(Fn {
+        let ret = self.ret_ty()?;
+
+        let mut f = Fn {
             name,
             name_span,
             params,
             ret,
             pres: Vec::new(),
             posts: Vec::new(),
-            body,
-            span: start.join(end),
-        })
+            variant: None,
+            body: Vec::new(),
+            span: start,
+        };
+
+        // Contract block above `fn`.
+        if let Some(block) = self.take_block_ending_before(fn_line) {
+            for clause in &block.clauses {
+                match clause.kind {
+                    ClauseKind::Pre => f.pres.push(clause.clone()),
+                    ClauseKind::Post => f.posts.push(clause.clone()),
+                    ClauseKind::Variant => set_fn_variant(&mut f, clause)?,
+                    other => return Err(bad_clause(other, clause, "a function contract block",
+                        "only `pre`, `post`, and `variant` may precede a function")),
+                }
+            }
+        }
+        // Post-signature block (design §8: `fn gcd(...) -> u64` / `/// variant b` / `{`).
+        let brace_line = self.peek_line();
+        if !self.at(&Tok::LBrace) {
+            return Err(self.error_expected("`{`"));
+        }
+        if let Some(block) = self.take_block_ending_before(brace_line) {
+            for clause in &block.clauses {
+                match clause.kind {
+                    ClauseKind::Variant => set_fn_variant(&mut f, clause)?,
+                    other => return Err(bad_clause(other, clause, "the post-signature position",
+                        "only `variant` may sit between a signature and its body")),
+                }
+            }
+        }
+
+        f.body = self.block()?;
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        f.span = start.join(end);
+        Ok(f)
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {
@@ -239,11 +348,10 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::KwIf => self.if_stmt(),
+            Tok::KwWhile => self.while_stmt(),
             Tok::Ident(first) => {
-                // Two identifiers in a row: a declaration if the first names
-                // a type; otherwise an assignment `x = expr;`.
                 if let Tok::Ident(_) = self.peek2() {
-                    let (ty, _) = self.ty()?;
+                    let (ty, _) = self.scalar_ty()?;
                     let (name, name_span) = self.ident()?;
                     if is_reserved_name(&name) {
                         return Err(reserved_name_error(&name, name_span, "variable"));
@@ -260,6 +368,14 @@ impl<'a> Parser<'a> {
                         name,
                         name_span,
                         init,
+                    })
+                } else if self.peek2() == &Tok::LBracket {
+                    Err(Diagnostic {
+                        name: "parse.m1_array_store".into(),
+                        title: "array element assignment is not supported yet".into(),
+                        span: self.peek_span(),
+                        label: "`a[i] = e` lands in M2 with `&mut [T]`".into(),
+                        notes: vec![("note".into(), "see docs/PLAN.md".into())],
                     })
                 } else {
                     let name_span = self.peek_span();
@@ -298,6 +414,44 @@ impl<'a> Parser<'a> {
             cond,
             then_block,
             else_block,
+        })
+    }
+
+    fn while_stmt(&mut self) -> PResult<Stmt> {
+        let while_line = self.peek_line();
+        let kw_span = self.expect(Tok::KwWhile)?.span;
+        let mut invariants = Vec::new();
+        let mut variant = None;
+        if let Some(block) = self.take_block_ending_before(while_line) {
+            for clause in &block.clauses {
+                match clause.kind {
+                    ClauseKind::Invariant => invariants.push(clause.clone()),
+                    ClauseKind::Variant => {
+                        if variant.replace(clause.clone()).is_some() {
+                            return Err(Diagnostic {
+                                name: "proof.duplicate_variant".into(),
+                                title: "a loop has exactly one `variant`".into(),
+                                span: clause.line_span,
+                                label: "second `variant` clause".into(),
+                                notes: vec![],
+                            });
+                        }
+                    }
+                    other => return Err(bad_clause(other, clause, "a loop annotation block",
+                        "only `invariant` and `variant` may precede a loop")),
+                }
+            }
+        }
+        self.expect(Tok::LParen)?;
+        let cond = self.expr()?;
+        self.expect(Tok::RParen)?;
+        let body = self.block()?;
+        Ok(Stmt::While {
+            cond,
+            invariants,
+            variant,
+            kw_span,
+            body,
         })
     }
 
@@ -340,7 +494,6 @@ impl<'a> Parser<'a> {
         let op_span = self.bump().span;
         let rhs = self.add_expr()?;
         let e = mk_bin(op, op_span, lhs, rhs);
-        // Non-associative: `a < b < c` is a parse error, on purpose.
         if matches!(
             self.peek(),
             Tok::Lt | Tok::Le | Tok::Gt | Tok::Ge | Tok::EqEq | Tok::Ne
@@ -393,7 +546,6 @@ impl<'a> Parser<'a> {
                 let span = self.bump().span;
                 let operand = self.unary_expr()?;
                 let full = span.join(operand.span);
-                // Fold negative literals immediately so `-128` fits in i8.
                 if let ExprKind::IntLit(n) = operand.kind {
                     return Ok(Expr {
                         kind: ExprKind::IntLit(-n),
@@ -428,41 +580,94 @@ impl<'a> Parser<'a> {
     }
 
     fn postfix_expr(&mut self) -> PResult<Expr> {
-        let e = self.primary_expr()?;
-        if self.at(&Tok::LParen) {
-            if let ExprKind::Var(name) = &e.kind {
-                let callee = name.clone();
-                let callee_span = e.span;
-                self.bump();
-                let mut args = Vec::new();
-                if !self.at(&Tok::RParen) {
-                    loop {
-                        args.push(self.expr()?);
-                        if self.at(&Tok::Comma) {
-                            self.bump();
-                        } else {
-                            break;
+        let mut e = self.primary_expr()?;
+        loop {
+            match self.peek() {
+                Tok::LParen => {
+                    let ExprKind::Var(name) = &e.kind else {
+                        return Err(Diagnostic {
+                            name: "parse.bad_call".into(),
+                            title: "only named functions can be called".into(),
+                            span: self.peek_span(),
+                            label: "call target must be a function name".into(),
+                            notes: vec![],
+                        });
+                    };
+                    let callee = name.clone();
+                    let callee_span = e.span;
+                    self.bump();
+                    let mut args = Vec::new();
+                    if !self.at(&Tok::RParen) {
+                        loop {
+                            args.push(self.expr()?);
+                            if self.at(&Tok::Comma) {
+                                self.bump();
+                            } else {
+                                break;
+                            }
                         }
                     }
+                    let close = self.expect(Tok::RParen)?.span;
+                    e = Expr {
+                        kind: ExprKind::Call {
+                            callee,
+                            callee_span,
+                            args,
+                        },
+                        span: callee_span.join(close),
+                        ty: None,
+                    };
                 }
-                let close = self.expect(Tok::RParen)?.span;
-                return Ok(Expr {
-                    kind: ExprKind::Call {
-                        callee,
-                        callee_span,
-                        args,
-                    },
-                    span: callee_span.join(close),
-                    ty: None,
-                });
+                Tok::LBracket => {
+                    let ExprKind::Var(name) = &e.kind else {
+                        return Err(Diagnostic {
+                            name: "parse.bad_index".into(),
+                            title: "only named arrays can be indexed".into(),
+                            span: self.peek_span(),
+                            label: "indexing applies to array parameters in M1".into(),
+                            notes: vec![],
+                        });
+                    };
+                    let array = name.clone();
+                    let array_span = e.span;
+                    self.bump();
+                    let index = self.expr()?;
+                    let close = self.expect(Tok::RBracket)?.span;
+                    e = Expr {
+                        kind: ExprKind::Index {
+                            array,
+                            array_span,
+                            index: Box::new(index),
+                        },
+                        span: array_span.join(close),
+                        ty: None,
+                    };
+                }
+                Tok::Dot => {
+                    let ExprKind::Var(name) = &e.kind else {
+                        return Err(self.error_expected("nothing (`.` applies to array names)"));
+                    };
+                    let array = name.clone();
+                    let array_span = e.span;
+                    self.bump();
+                    let (field, fspan) = self.ident()?;
+                    if field != "len" {
+                        return Err(Diagnostic {
+                            name: "parse.unknown_field".into(),
+                            title: format!("unknown field `.{field}`"),
+                            span: fspan,
+                            label: "`.len` is the only field in M1".into(),
+                            notes: vec![],
+                        });
+                    }
+                    e = Expr {
+                        kind: ExprKind::Len { array },
+                        span: array_span.join(fspan),
+                        ty: None,
+                    };
+                }
+                _ => break,
             }
-            return Err(Diagnostic {
-                name: "parse.bad_call".into(),
-                title: "only named functions can be called".into(),
-                span: self.peek_span(),
-                label: "call target must be a function name".into(),
-                notes: vec![],
-            });
         }
         Ok(e)
     }
@@ -494,6 +699,42 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::Ident(name) if name == "widen" => {
+                self.bump();
+                self.expect(Tok::Lt)?;
+                let (target, _) = self.int_ty()?;
+                self.expect(Tok::Gt)?;
+                self.expect(Tok::LParen)?;
+                let arg = self.expr()?;
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::Widen {
+                        target,
+                        arg: Box::new(arg),
+                    },
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
+            Tok::Ident(name) if name == "some" => {
+                self.bump();
+                self.expect(Tok::LParen)?;
+                let arg = self.expr()?;
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::SomeE(Box::new(arg)),
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
+            Tok::Ident(name) if name == "none" => {
+                self.bump();
+                Ok(Expr {
+                    kind: ExprKind::NoneE,
+                    span,
+                    ty: None,
+                })
+            }
             Tok::Ident(name) => {
                 self.bump();
                 Ok(Expr {
@@ -514,6 +755,39 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn set_fn_variant(f: &mut Fn, clause: &Clause) -> PResult<()> {
+    if f.variant.replace(clause.clone()).is_some() {
+        return Err(Diagnostic {
+            name: "proof.duplicate_variant".into(),
+            title: "a function has at most one `variant`".into(),
+            span: clause.line_span,
+            label: "second `variant` clause".into(),
+            notes: vec![],
+        });
+    }
+    Ok(())
+}
+
+fn bad_clause(
+    kind: ClauseKind,
+    clause: &Clause,
+    where_: &str,
+    rule: &str,
+) -> Diagnostic {
+    Diagnostic {
+        name: "proof.bad_clause".into(),
+        title: format!("`{}` clause in {where_}", kind_word(kind)),
+        span: clause.line_span,
+        label: rule.to_string(),
+        notes: vec![(
+            "note".into(),
+            "statement-level `assert`/`defer`/`assume` land in M3; ghost \
+             `def`/`theorem` land in M2; a continuation line must follow a clause"
+                .into(),
+        )],
+    }
+}
+
 fn mk_bin(op: BinOp, op_span: Span, lhs: Expr, rhs: Expr) -> Expr {
     let span = lhs.span.join(rhs.span);
     Expr {
@@ -528,21 +802,17 @@ fn mk_bin(op: BinOp, op_span: Span, lhs: Expr, rhs: Expr) -> Expr {
     }
 }
 
-fn ty_from_name(name: &str) -> Option<Ty> {
-    if name == "bool" {
-        return Some(Ty::Bool);
-    }
-    IntTy::from_name(name).map(Ty::Int)
-}
-
 /// Names that would collide with the proof language or generated Lean.
 fn is_reserved_name(name: &str) -> bool {
-    const LEAN_KEYWORDS: &[&str] = &[
-        "result", "old", "theorem", "def", "by", "fun", "match", "with", "do", "let", "have",
-        "show", "from", "open", "import", "namespace", "end", "in", "at", "forall", "exists",
-        "Prop", "Type", "Int", "Nat", "Bool", "True", "False",
+    const RESERVED: &[&str] = &[
+        "result", "old", "some", "none", "option", "widen", "theorem", "def", "by", "fun",
+        "match", "with", "do", "let", "have", "show", "from", "open", "import", "namespace",
+        "end", "in", "at", "forall", "exists", "Prop", "Type", "Int", "Nat", "Bool", "True",
+        "False", "len",
     ];
-    LEAN_KEYWORDS.contains(&name) || ty_from_name(name).is_some()
+    RESERVED.contains(&name)
+        || IntTy::from_name(name).is_some()
+        || name == "bool"
 }
 
 fn reserved_name_error(name: &str, span: Span, what: &str) -> Diagnostic {
@@ -554,7 +824,7 @@ fn reserved_name_error(name: &str, span: Span, what: &str) -> Diagnostic {
         notes: vec![(
             "note".into(),
             "program identifiers appear verbatim in proofs, so names that collide \
-             with Lean keywords or `result`/`old` are rejected"
+             with Lean keywords or Sable builtins are rejected"
                 .into(),
         )],
     }

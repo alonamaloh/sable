@@ -15,6 +15,9 @@ use std::process::Command;
 enum MapTarget {
     Clause { span: Span, desc: String },
     Obligation(usize),
+    /// Theorem proved by a user discharge script; errors point at the
+    /// discharge block.
+    Discharged { name: String, span: Span, goal: String },
 }
 
 struct MapEntry {
@@ -43,7 +46,7 @@ impl Emitter {
     }
 }
 
-pub fn emit(vc: &VcResult) -> Emitted {
+pub fn emit(vc: &VcResult, discharges: &[crate::ast::Discharge]) -> Emitted {
     let mut e = Emitter {
         buf: String::new(),
         line: 0,
@@ -58,9 +61,10 @@ pub fn emit(vc: &VcResult) -> Emitted {
     for wf in &vc.clause_wfs {
         let first = e.line + 1;
         e.push(&format!(
-            "def {} {} : Prop :=",
+            "def {} {} : {} :=",
             wf.def_name,
-            binder_list(&wf.binders)
+            binder_list(&wf.binders),
+            wf.result_ty
         ));
         e.push(&format!("  ({})", wf.text));
         e.push("");
@@ -75,18 +79,34 @@ pub fn emit(vc: &VcResult) -> Emitted {
     }
 
     for (i, ob) in vc.obligations.iter().enumerate() {
+        let discharge = discharges.iter().find(|d| d.name == ob.name);
         let first = e.line + 1;
         e.push(&format!("/-- `{}` — {} -/", ob.name, doc_safe(&ob.kind_desc)));
         e.push(&format!("theorem {} {}", ob.thm_name, binder_list(&ob.binders)));
         for (hname, hprop) in &ob.hyps {
             e.push(&format!("    ({hname} : {hprop})"));
         }
-        e.push(&format!("    : {} := by sable_auto", ob.goal));
+        match discharge {
+            None => e.push(&format!("    : ({}) := by sable_auto", ob.goal)),
+            Some(d) => {
+                e.push(&format!("    : ({}) := by", ob.goal));
+                for line in d.script.lines() {
+                    e.push(&format!("  {line}"));
+                }
+            }
+        }
         e.push("");
         map.push(MapEntry {
             first_line: first,
             last_line: e.line,
-            target: MapTarget::Obligation(i),
+            target: match discharge {
+                None => MapTarget::Obligation(i),
+                Some(d) => MapTarget::Discharged {
+                    name: ob.name.clone(),
+                    span: d.span,
+                    goal: ob.goal.clone(),
+                },
+            },
         });
     }
 
@@ -96,7 +116,7 @@ pub fn emit(vc: &VcResult) -> Emitted {
     }
 }
 
-fn binder_list(binders: &[(String, &'static str)]) -> String {
+fn binder_list(binders: &[(String, String)]) -> String {
     binders
         .iter()
         .map(|(name, ty)| format!("({name} : {ty})"))
@@ -214,6 +234,16 @@ pub fn diagnose(emitted: &Emitted, vc: &VcResult, messages: &[LeanMessage]) -> V
                 span: *span,
                 label: "this clause is not well-formed proof language".into(),
                 notes: vec![("lean".into(), msg.data.clone())],
+            }),
+            Some(MapTarget::Discharged { name, span, goal }) => diags.push(Diagnostic {
+                name: "proof.discharge_failed".into(),
+                title: format!("discharge of `{name}` does not prove it"),
+                span: *span,
+                label: "this tactic script fails".into(),
+                notes: vec![
+                    ("goal".into(), goal.clone()),
+                    ("lean".into(), msg.data.clone()),
+                ],
             }),
             Some(MapTarget::Obligation(i)) => {
                 let ob: &Obligation = &vc.obligations[*i];

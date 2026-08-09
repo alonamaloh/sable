@@ -1,0 +1,11 @@
+// expect-error: proof.unknown_discharge
+// A discharge naming no obligation is an error, never silently dropped
+// (design §6: orphaned discharges must not rot).
+
+/// post result = a
+fn ident(u32 a) -> u32 {
+    return a;
+}
+
+/// discharge ident.post.result_b by
+///   omega

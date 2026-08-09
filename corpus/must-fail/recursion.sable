@@ -1,5 +1,6 @@
-// expect-error: type.m0_recursion
-// Recursion needs a decreasing measure (M1).
+// expect-error: type.recursion_needs_variant
+// Recursion without a decreasing measure. (With `/// variant n` this
+// verifies — see corpus/verifies/gcd.sable.)
 
 /// post result = 0
 fn countdown(u32 n) -> u32 {

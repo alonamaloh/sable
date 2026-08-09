@@ -21,9 +21,13 @@ Milestone souvenir: implementing per-operation VCs immediately found a real bug 
 
 Known M0 simplifications (each has a scheduled fix): signed division/modulo rejected (Lean `/` on `Int` must be pinned to C truncation semantics first — M1); one clause per `///` line; call-site contract instantiation by token substitution; obligation-name anchors are expression slugs, not the final content-anchoring scheme.
 
-### M1 — loops, arrays, `option`
+### M1 — loops, arrays, `option` *(complete, 2026-08-08)*
 
-`while` with `invariant`/`variant`, owned/borrowed arrays with index VCs, `option<T>` with `match`, `widen`, recursion with measures, `discharge NAME by <tactic>` splicing. Signed division semantics pinned in the prelude. Exit: `binary_search` verifies, including at least one hand-written `discharge`.
+`while` with `invariant`/`variant` (havoc decomposition; every proven VC is assumed downstream, which is what lets e.g. gcd's descent close by `assumption`), borrowed `&[T]` with index VCs, `option<T>` returns, `widen`, self-recursion with measures, multi-line clauses, and `discharge NAME by <tactics>` splicing with orphan detection. Division is Euclidean (ADR 0004); signed `/` additionally requires `¬(MIN ∧ -1)`.
+
+Exit met: `binary_search` (design §6, all-Int spec style) verifies — 19 obligations, 17 automatic, 2 hand discharges (the sortedness-instantiation preservation goals; automation got `post.none`, which the design doc had expected to need one).
+
+Known M1 simplifications, scheduled fixes: discharge scripts reference generated hypothesis names (`h_inv7_2`) read from failure output — content-anchored hypothesis naming is the M2 refinement; obligation names are path-dependent for repeated clauses (`.2` suffixes); invariant/variant clauses must not bind variables shadowing program variable names (token substitution cannot see binders); bool locals mentioned in loop clauses are unsupported; array parameters cannot yet be passed to callees (M2, with `&mut [T]` and stores); `sable test`/`defer`/`assume` are M3.
 
 ### M2 — ghost definitions and the seq/multiset prelude
 

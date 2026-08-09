@@ -26,7 +26,10 @@ syntax "sable_auto" : tactic
 
 macro_rules
   | `(tactic| sable_auto) =>
-    `(tactic| first
+    -- `solve`, not `first`: an alternative that merely makes progress
+    -- (e.g. a partial simp_all) must not commit — every alternative
+    -- either closes the goal or the next one runs.
+    `(tactic| solve
         | assumption
         | rfl
         | ((try sable_norm) <;> omega)

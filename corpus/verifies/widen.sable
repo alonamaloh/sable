@@ -1,0 +1,12 @@
+// widen<T> is value-preserving and vanishes in the Int representation.
+
+/// post result = x
+fn to_i64(i32 x) -> i64 {
+    return widen<i64>(x);
+}
+
+/// pre  a ≤ 1000000 ∧ b ≤ 1000000
+/// post result = a + b
+fn sum_wide(u32 a, u32 b) -> u64 {
+    return widen<u64>(a) + widen<u64>(b);
+}

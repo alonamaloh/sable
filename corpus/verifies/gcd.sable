@@ -1,0 +1,11 @@
+// Recursion with a measure (design §8): the descent VC `a % b < b`
+// closes by assumption because the divisor-nonzero obligation's
+// Euclidean-remainder facts are assumed after being proven.
+
+/// post b = 0 -> result = a
+fn gcd(u64 a, u64 b) -> u64
+/// variant b
+{
+    if (b == 0) { return a; }
+    return gcd(b, a % b);
+}

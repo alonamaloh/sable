@@ -1,0 +1,7 @@
+// expect-error: first.bounds
+// The array could be empty; a[0] needs 0 < a.len.
+
+/// post result = a.get 0
+fn first(&[i32] a) -> i32 {
+    return a[0];
+}

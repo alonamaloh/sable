@@ -173,17 +173,17 @@ An `unsafe` sublanguage (raw regions, manufacturing ownership from bytes) is del
 
 ```sable
 /// def sorted (a : seq i32) : Prop :=
-///   ∀ i j, i < j → j < a.len → a.get i ≤ a.get j
+///   ∀ i j, 0 ≤ i → i < j → j < a.len → a.get i ≤ a.get j
 
 /// pre  sorted a
 /// post match result with
-///      | some i => i < a.len ∧ a.get i = key
-///      | none   => ∀ k, k < a.len → a.get k ≠ key
+///      | some i => 0 ≤ i ∧ i < a.len ∧ a.get i = key
+///      | none   => ∀ k, 0 ≤ k → k < a.len → a.get k ≠ key
 fn binary_search(&[i32] a, i32 key) -> option<u64> {
     u64 lo = 0;
     u64 hi = a.len;
     /// invariant hi ≤ a.len
-    /// invariant ∀ k, k < lo → a.get k < key
+    /// invariant ∀ k, 0 ≤ k → k < lo → a.get k < key
     /// invariant ∀ k, hi ≤ k → k < a.len → key < a.get k
     /// variant   hi - lo
     while (lo < hi) {
@@ -195,13 +195,25 @@ fn binary_search(&[i32] a, i32 key) -> option<u64> {
     return none;
 }
 
-/// -- Evidence: if the SMT backend can't bridge the invariant halves for the
-/// -- `none` case, discharge the named obligation with a tactic.
-/// discharge binary_search.post.none by
-///   intro k hk
-///   rcases lt_or_ge k lo with h | h
-///   · exact absurd (h_inv₂ k h) (by simp_all)
-///   · exact ne_of_gt (h_inv₃ k h hk) |>.symm
+/// -- Evidence: shrinking the interval preserves the "outside is ≠ key"
+/// -- invariants only because the array is sorted; instantiating the
+/// -- sortedness quantifier is beyond automation, so the obligation is
+/// -- discharged by name with a tactic script.
+/// discharge binary_search.inv_preserved.«∀k<lo» by
+///   intro k hk0 hk
+///   by_cases hklo : k < lo
+///   · exact h_inv_2 k hk0 hklo
+///   · by_cases hkm : k = lo + ((hi - lo) / 2)
+///     · rw [hkm]; exact h_path
+///     · calc a.get k ≤ a.get (lo + ((hi - lo) / 2)) :=
+///             h_sorted k _ hk0 (by omega) (by omega)
+///         _ < key := h_path
+
+(Sequence indices are ℤ, like every lifted program value; quantifiers over
+indices carry explicit `0 ≤ k` guards, and `a.get` is total with junk off
+range. A `nat`-indexed `seq` was tried first and does not elaborate against
+ℤ-lifted bounds — the checker commits `k : ℤ` at the comparison before ever
+seeing `get`.)
 ```
 
 Every obligation has a stable, **content-anchored** name: the enclosing declaration, the clause kind, and a source anchor derived from the clause's own structure (here, the `none` match arm) or an explicit `#[label(...)]` on the clause. Names are never positional indices — inserting a statement must not renumber obligations and silently orphan `discharge` blocks. `discharge NAME by TACTIC` targets one obligation; if an edit changes a clause enough that its anchor no longer resolves, the orphaned `discharge` is itself a compile error, never silently dropped. Undischarged obligations are compile errors printing the name, the goal, and the SMT backend's diagnosis.

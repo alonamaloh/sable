@@ -1,0 +1,14 @@
+// expect-error: drift.variant_decreases
+// The measure never changes: the body does not touch i.
+
+/// pre  n < 100
+/// post result ≥ 0
+fn drift(u64 n, u64 i) -> u64 {
+    u64 x = 0;
+    /// invariant x ≤ n
+    /// variant   n - i
+    while (x < n) {
+        x = x + 1;
+    }
+    return x;
+}
