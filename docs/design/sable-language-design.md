@@ -64,7 +64,9 @@ Every partial operation emits a verification condition (VC):
 | Expression | Obligation |
 |---|---|
 | `a + b`, `a - b`, `a * b` | result representable in the operand type |
-| `a / b`, `a % b` | `b ≠ 0`; for signed, additionally not `MIN / -1` |
+| `a / b`, `a % b` | `b ≠ 0`; for signed `/`, additionally not `MIN / -1` |
+
+Division is **Euclidean**, not C-truncating: `a = b*(a/b) + a%b` with `0 ≤ a%b < |b|` — the remainder is never negative, and `/`/`%` coincide exactly with the proof language's (Lean core's) integer division (ADR 0004).
 | `a[i]` | `0 ≤ i < a.len` |
 | `narrow<u8>(x)` | value fits in the target type |
 
@@ -105,7 +107,7 @@ Contracts are proof-language declarations in the block preceding a function. `pr
 
 ```sable
 /// pre  b > 0
-/// pre  a + b - 1 ≤ u32.max        -- in ℤ; makes the body's addition provable
+/// pre  a + b ≤ u32.max            -- in ℤ; makes the body's `a + b` provable
 /// post result = (a + b - 1) / b   -- division in ℤ agrees with u32 here (provable)
 fn div_round_up(u32 a, u32 b) -> u32 {
     return (a + b - 1) / b;

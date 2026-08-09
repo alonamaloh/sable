@@ -31,6 +31,7 @@ macro_rules
         | rfl
         | ((try sable_norm) <;> omega)
         | ((try sable_norm) <;> simp_all)
+        | ((try sable_norm) <;> (try subst_eqs) <;> simp_all <;> omega)
         | grind)
 
 end Sable
