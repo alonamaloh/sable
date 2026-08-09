@@ -36,17 +36,17 @@ fn binary_search(&[i32] a, i32 key) -> option<u64> {
 /// discharge binary_search.inv_preserved.k_0_k_k_lo_a_get_k_key by
 ///   intro k hk0 hk
 ///   by_cases hklo : k < lo
-///   · exact h_inv7_2 k hk0 hklo
+///   · exact h_inv_k_0_k_k_lo_a_get_k_key k hk0 hklo
 ///   · by_cases hkm : k = lo + ((hi - lo) / 2)
-///     · rw [hkm]; exact h_path16
+///     · rw [hkm]; exact h_path_a_get_lo_hi_lo_2_key
 ///     · calc a.get k ≤ a.get (lo + ((hi - lo) / 2)) :=
-///             h_pre_1 k _ hk0 (by omega) (by omega)
-///         _ < key := h_path16
+///             h_pre_sorted_a k _ hk0 (by omega) (by omega)
+///         _ < key := h_path_a_get_lo_hi_lo_2_key
 
 /// discharge binary_search.inv_preserved.k_hi_k_k_a_len_key_a_get_k.2 by
 ///   intro k hk hka
 ///   by_cases hkm : k = lo + ((hi - lo) / 2)
 ///   · rw [hkm]; omega
 ///   · have h1 : a.get (lo + ((hi - lo) / 2)) ≤ a.get k :=
-///       h_pre_1 _ k (by omega) (by omega) hka
+///       h_pre_sorted_a _ k (by omega) (by omega) hka
 ///     omega

@@ -271,18 +271,19 @@ impl<'a> Generator<'a> {
         for fld in &class.fields {
             match fld.ty {
                 Ty::Int(it) => {
-                    let h = self.fresh_hyp("h_field");
-                    self.hyps
-                        .push((h, range_prop(&format!("({binder}.{})", fld.name), it)));
+                    self.hyps.push((
+                        format!("h_field_{}_range", fld.name),
+                        range_prop(&format!("({binder}.{})", fld.name), it),
+                    ));
                 }
                 Ty::Array(elem, _) => {
                     let path = format!("({binder}.{})", fld.name);
-                    let h1 = self.fresh_hyp("h_field");
-                    self.hyps
-                        .push((h1, format!("0 ≤ {path}.len ∧ {path}.len ≤ u64.max")));
-                    let h2 = self.fresh_hyp("h_field");
                     self.hyps.push((
-                        h2,
+                        format!("h_field_{}_len", fld.name),
+                        format!("0 ≤ {path}.len ∧ {path}.len ≤ u64.max"),
+                    ));
+                    self.hyps.push((
+                        format!("h_field_{}_elems", fld.name),
                         format!(
                             "∀ k, 0 ≤ k → k < {path}.len → {} ≤ {path}.get k ∧ {path}.get k ≤ {}",
                             elem.lean_min(),
@@ -300,8 +301,8 @@ impl<'a> Generator<'a> {
         let map = self.class_state_map(class, state);
         for inv in &class.invariants {
             let prop = substitute(&inv.text, &map, None);
-            let h = self.fresh_hyp("h_cinv");
-            self.hyps.push((h, format!("({prop})")));
+            self.hyps
+                .push((format!("h_cinv_{}", hslug(&inv.text)), format!("({prop})")));
             self.context.push(format!("class invariant {}", inv.text));
         }
     }
@@ -370,7 +371,9 @@ impl<'a> Generator<'a> {
         for (i, pre) in f.pres.iter().enumerate() {
             let text = self.preprocess(&pre.text);
             let hyp = self.subst_env(&text);
-            self.hyps.push((format!("h_pre_{}", i + 1), format!("({hyp})")));
+            let _ = i;
+            self.hyps
+                .push((format!("h_pre_{}", hslug(&pre.text)), format!("({hyp})")));
             self.context.push(format!("pre {}", pre.text));
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
@@ -608,8 +611,8 @@ impl<'a> Generator<'a> {
                 let snap_hyps = self.hyps.len();
                 let snap_ctx = self.context.len();
 
-                let h_then = self.fresh_hyp("h_path");
-                self.hyps.push((h_then, p.clone()));
+                self.hyps
+                    .push((format!("h_path_{}", hslug(&p)), p.clone()));
                 self.context.push(format!("path {p}"));
                 let then_stmts: Vec<&Stmt> =
                     then_block.iter().chain(rest.iter().copied()).collect();
@@ -619,8 +622,8 @@ impl<'a> Generator<'a> {
                 self.hyps.truncate(snap_hyps);
                 self.context.truncate(snap_ctx);
 
-                let h_else = self.fresh_hyp("h_path");
-                self.hyps.push((h_else, format!("¬{p}")));
+                self.hyps
+                    .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
                 self.context.push(format!("path ¬{p}"));
                 match else_block {
                     Some(eb) => {
@@ -694,12 +697,10 @@ impl<'a> Generator<'a> {
 
                 // 3. Assume invariants; evaluate the condition once in the
                 // havocked context (its VCs must follow from invariants).
-                self.fresh += 1;
-                let tag = self.fresh;
-                for (i, inv) in invariants.iter().enumerate() {
+                for inv in invariants.iter() {
                     let text = self.subst_env(&self.preprocess(&inv.text));
                     self.hyps
-                        .push((format!("h_inv{}_{}", tag, i + 1), format!("({text})")));
+                        .push((format!("h_inv_{}", hslug(&inv.text)), format!("({text})")));
                     self.context.push(format!("invariant {}", inv.text));
                 }
                 let p = self.eval_prop(cond);
@@ -713,10 +714,12 @@ impl<'a> Generator<'a> {
                 let v0 = format!("_v{}", self.fresh);
                 self.binders.push((v0.clone(), "Int".into()));
                 let vtext = self.subst_env(&self.preprocess(&variant.text));
+                self.hyps.push((
+                    format!("h_variant_{}", hslug(&variant.text)),
+                    format!("{v0} = ({vtext})"),
+                ));
                 self.hyps
-                    .push((format!("h{v0}"), format!("{v0} = ({vtext})")));
-                let h_cond = self.fresh_hyp("h_path");
-                self.hyps.push((h_cond, p.clone()));
+                    .push((format!("h_path_{}", hslug(&p)), p.clone()));
                 self.context.push(format!("path {p}"));
                 let body_stmts: Vec<&Stmt> = body.iter().collect();
                 let loop_tail = Tail::Loop {
@@ -731,8 +734,8 @@ impl<'a> Generator<'a> {
                 self.context.truncate(snap_ctx);
 
                 // 5. Continuation: invariants + ¬cond.
-                let h_exit = self.fresh_hyp("h_path");
-                self.hyps.push((h_exit, format!("¬{p}")));
+                self.hyps
+                    .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
                 self.context.push(format!("path ¬{p}"));
                 self.exec(rest, tail);
                 self.hyps.truncate(snap_hyps);
@@ -807,10 +810,8 @@ impl<'a> Generator<'a> {
                 Some(Ty::Int(it)) => {
                     let it = *it;
                     self.binders.push((name.clone(), "Int".into()));
-                    self.hyps.push((
-                        format!("h_{name}_range{}", self.fresh),
-                        range_prop(name, it),
-                    ));
+                    self.hyps
+                        .push((format!("h_{name}_range"), range_prop(name, it)));
                     self.env.insert(name.clone(), Val::Int(name.clone()));
                 }
                 Some(Ty::Bool) => {
@@ -836,11 +837,11 @@ impl<'a> Generator<'a> {
                     let entry = self.mut_arrays[name.as_str()].clone();
                     self.binders.push((name.clone(), "Sable.Seq Int".into()));
                     self.hyps.push((
-                        format!("h_{name}_len{}", self.fresh),
+                        format!("h_{name}_len"),
                         format!("({name}.len) = ({entry}.len)"),
                     ));
                     self.hyps.push((
-                        format!("h_{name}_elems{}", self.fresh),
+                        format!("h_{name}_elems"),
                         format!(
                             "∀ k, 0 ≤ k → k < {name}.len → {} ≤ {name}.get k ∧ {name}.get k ≤ {}",
                             elem.lean_min(),
@@ -1015,10 +1016,17 @@ impl<'a> Generator<'a> {
                 self.push_invariant_hyps(cd, &b);
                 let mut post_map = self.class_state_map(cd, &b);
                 post_map.extend(subst_map);
-                for (i, post) in ifn.posts.iter().enumerate() {
+                for post in ifn.posts.iter() {
                     let prop = substitute(&post.text, &post_map, None);
-                    let h = format!("h{b}_post_{}", i + 1);
-                    self.hyps.push((h, format!("({prop})")));
+                    self.hyps.push((
+                        format!(
+                            "h_{}_{}_post_{}",
+                            sanitize(class),
+                            sanitize(init),
+                            hslug(&post.text)
+                        ),
+                        format!("({prop})"),
+                    ));
                 }
                 Val::Obj(b)
             }
@@ -1108,7 +1116,7 @@ impl<'a> Generator<'a> {
                 // `old self` in the callee's posts is the receiver's
                 // pre-call state.
                 post_map.insert("_old_self".to_string(), cur.clone());
-                for (i, post) in m.f.posts.iter().enumerate() {
+                for post in m.f.posts.iter() {
                     let text = preprocess_old_self(&post.text);
                     let ret_ref = if m.f.ret == Ty::Unit {
                         None
@@ -1116,8 +1124,15 @@ impl<'a> Generator<'a> {
                         Some(ret_sym.as_str())
                     };
                     let prop = substitute(&text, &post_map, ret_ref);
-                    let h = format!("h{ret_sym}m_post_{}", i + 1);
-                    self.hyps.push((h, format!("({prop})")));
+                    self.hyps.push((
+                        format!(
+                            "h_{}_{}_post_{}",
+                            sanitize(&cd.name),
+                            sanitize(method),
+                            hslug(&post.text)
+                        ),
+                        format!("({prop})"),
+                    ));
                     self.context
                         .push(format!("from `{}::{method}` post: {}", cd.name, post.text));
                 }
@@ -1323,9 +1338,12 @@ impl<'a> Generator<'a> {
                     } else {
                         Some(ret_sym.as_str())
                     };
+                    let _ = i;
                     let prop = substitute(&post.text, &subst_map, ret_ref);
-                    self.hyps
-                        .push((format!("h{ret_sym}_post_{}", i + 1), format!("({prop})")));
+                    self.hyps.push((
+                        format!("h_{}_post_{}", sanitize(callee), hslug(&post.text)),
+                        format!("({prop})"),
+                    ));
                     self.context
                         .push(format!("from `{callee}` post: {}", post.text));
                 }
@@ -1383,8 +1401,8 @@ impl<'a> Generator<'a> {
                     format!("¬{pl}")
                 };
                 let snap = self.hyps.len();
-                let h_guard = self.fresh_hyp("h_guard");
-                self.hyps.push((h_guard, guard));
+                let hname = format!("h_guard_{}", hslug(&guard));
+                self.hyps.push((hname, guard));
                 let pr = self.eval_prop(rhs);
                 self.hyps.truncate(snap);
                 let sym = if *op == BinOp::And { "∧" } else { "∨" };
@@ -1570,8 +1588,8 @@ impl<'a> Generator<'a> {
     }
 
     fn assume_fact(&mut self, prop: &str) {
-        let h = self.fresh_hyp("h_fact");
-        self.hyps.push((h, prop.to_string()));
+        self.hyps
+            .push((format!("h_fact_{}", hslug(prop)), prop.to_string()));
     }
 
     fn obligation(
@@ -1777,6 +1795,15 @@ pub fn sanitize(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+/// Short content-anchored slug for hypothesis names (design §6: names
+/// derive from clause content, never from positional counters, so
+/// discharge scripts survive unrelated edits). Lean allows shadowing,
+/// so repeated content simply shadows — no counters needed.
+fn hslug(text: &str) -> String {
+    let full = slug(text);
+    full.chars().take(24).collect::<String>().trim_end_matches('_').to_string()
 }
 
 pub fn slug(text: &str) -> String {

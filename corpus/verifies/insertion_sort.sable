@@ -32,8 +32,8 @@ fn insertion_sort(&mut [i32] a) {
 // case on where p and q fall relative to the swapped pair (j-1, j).
 /// discharge insertion_sort.inv_preserved.p_q_0_p_p_q_q_i_q_j_a_get_p_a_get_q by
 ///   intro p q hp hpq hqi hqj1
-///   have hj0 : 0 < j := h_path25.1
-///   have hgt : a.get (j - 1) > a.get j := h_path25.2
+///   have hj0 : 0 < j := h_path_j_0_a_get_j_1_a_get_j.1
+///   have hgt : a.get (j - 1) > a.get j := h_path_j_0_a_get_j_1_a_get_j.2
 ///   have hne : j - 1 ≠ j := by omega
 ///   by_cases hqj : q = j
 ///   · by_cases hpj1 : p = j - 1
@@ -41,20 +41,20 @@ fn insertion_sort(&mut [i32] a) {
 ///       omega
 ///     · have h1 : p ≠ j := by omega
 ///       have h2 : a.get p ≤ a.get (j - 1) :=
-///         h_inv17_2 p (j - 1) hp (by omega) (by omega) (by omega)
+///         h_inv_p_q_0_p_p_q_q_i_q_j_a_ge p (j - 1) hp (by omega) (by omega) (by omega)
 ///       simp [Sable.Seq.get_set, hqj, h1, hpj1]
 ///       omega
 ///   · by_cases hpj : p = j
 ///     · have h2 : a.get (j - 1) ≤ a.get q :=
-///         h_inv17_2 (j - 1) q (by omega) (by omega) hqi hqj
+///         h_inv_p_q_0_p_p_q_q_i_q_j_a_ge (j - 1) q (by omega) (by omega) hqi hqj
 ///       simp [Sable.Seq.get_set, hpj, hqj, hqj1]
 ///       omega
 ///     · by_cases hpj1 : p = j - 1
 ///       · have h2 : a.get j ≤ a.get q :=
-///           h_inv17_2 j q (by omega) (by omega) hqi hqj
+///           h_inv_p_q_0_p_p_q_q_i_q_j_a_ge j q (by omega) (by omega) hqi hqj
 ///         simp [Sable.Seq.get_set, hpj1, hne, hqj, hqj1]
 ///         omega
-///       · have h2 : a.get p ≤ a.get q := h_inv17_2 p q hp hpq hqi hqj
+///       · have h2 : a.get p ≤ a.get q := h_inv_p_q_0_p_p_q_q_i_q_j_a_ge p q hp hpq hqi hqj
 ///         simp [Sable.Seq.get_set, hpj, hpj1, hqj, hqj1]
 ///         omega
 
@@ -62,7 +62,7 @@ fn insertion_sort(&mut [i32] a) {
 /// discharge insertion_sort.inv_preserved.perm_a_old_a by
 ///   exact Sable.Seq.perm_trans
 ///     (Sable.Seq.perm_swap a (j - 1) j (by omega) (by omega) (by omega) (by omega))
-///     h_inv17_3
+///     h_inv_perm_a_old_a
 
 // When the inner loop stops (j = 0 or a[j-1] ≤ a[j]), the moving element
 // is in place, so the whole prefix [0, i+1) is sorted:
@@ -72,13 +72,13 @@ fn insertion_sort(&mut [i32] a) {
 ///   · by_cases hj0 : 0 < j
 ///     · have hle : a.get (j - 1) ≤ a.get j := by
 ///         by_cases hgt : a.get (j - 1) > a.get j
-///         · exact absurd ⟨hj0, hgt⟩ h_path35
+///         · exact absurd ⟨hj0, hgt⟩ h_path_not_j_0_a_get_j_1_a_get_j
 ///         · omega
 ///       by_cases hp1 : p = j - 1
 ///       · rw [hqj, hp1]; exact hle
 ///       · have h2 : a.get p ≤ a.get (j - 1) :=
-///           h_inv17_2 p (j - 1) hp (by omega) (by omega) (by omega)
+///           h_inv_p_q_0_p_p_q_q_i_q_j_a_ge p (j - 1) hp (by omega) (by omega) (by omega)
 ///         rw [hqj]
 ///         omega
 ///     · omega
-///   · exact h_inv17_2 p q hp hpq (by omega) hqj
+///   · exact h_inv_p_q_0_p_p_q_q_i_q_j_a_ge p q hp hpq (by omega) hqj
