@@ -127,7 +127,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         }
     }
 
-    let mut run_one = |f: &Fn, fname: String, cctx: Cctx, result: &mut VcResult| {
+    let run_one = |f: &Fn, fname: String, cctx: Cctx, result: &mut VcResult| {
         let mut generator = Generator {
             f,
             fname,
