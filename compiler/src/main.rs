@@ -21,6 +21,9 @@ fn main() -> ExitCode {
             "check" if command.is_none() => command = Some("check"),
             "test" if command.is_none() => command = Some("test"),
             "lsp" if command.is_none() => command = Some("lsp"),
+            // LSP clients conventionally append --stdio (vscode-languageclient
+            // does, among others); stdio is our only transport, so accept it.
+            "--stdio" if command == Some("lsp") => {}
             "--emit-lean" => opts.emit_lean_only = true,
             "-h" | "--help" => {
                 print!("{USAGE}");

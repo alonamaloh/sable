@@ -1,5 +1,5 @@
 const { workspace, window } = require("vscode");
-const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
+const { LanguageClient } = require("vscode-languageclient/node");
 
 let client;
 
@@ -8,7 +8,7 @@ function activate() {
   client = new LanguageClient(
     "sable",
     "Sable Language Server",
-    { command: serverPath, args: ["lsp"], transport: TransportKind.stdio },
+    { command: serverPath, args: ["lsp"] },
     { documentSelector: [{ scheme: "file", language: "sable" }] }
   );
   client.start().catch((err) => {

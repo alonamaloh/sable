@@ -28,7 +28,30 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 
+/// Append a breadcrumb to /tmp/sable-lsp.log — the black box for
+/// debugging editor-spawned instances whose stderr is hard to reach.
+fn logf(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sable-lsp.log")
+    {
+        let _ = writeln!(f, "[pid {}] {msg}", std::process::id());
+    }
+    eprintln!("sable lsp: {msg}");
+}
+
 pub fn run() -> Result<(), Box<dyn Error + Sync + Send>> {
+    std::panic::set_hook(Box::new(|info| {
+        logf(&format!("PANIC: {info}"));
+    }));
+    logf(&format!(
+        "starting; exe={:?} cwd={:?} args={:?}",
+        std::env::current_exe().ok(),
+        std::env::current_dir().ok(),
+        std::env::args().collect::<Vec<_>>(),
+    ));
     let (connection, io_threads) = Connection::stdio();
 
     let capabilities = ServerCapabilities {
@@ -60,9 +83,17 @@ pub fn run() -> Result<(), Box<dyn Error + Sync + Send>> {
         ..Default::default()
     };
 
-    connection.initialize(serde_json::to_value(capabilities)?)?;
-    main_loop(connection)?;
+    if let Err(e) = connection.initialize(serde_json::to_value(capabilities)?) {
+        logf(&format!("initialize failed: {e}"));
+        return Err(e.into());
+    }
+    logf("initialized");
+    if let Err(e) = main_loop(connection) {
+        logf(&format!("main loop error: {e}"));
+        return Err(e);
+    }
     io_threads.join()?;
+    logf("clean exit");
     Ok(())
 }
 
