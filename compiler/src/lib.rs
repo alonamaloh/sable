@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod check;
+pub mod daemon;
 pub mod diag;
 pub mod interp;
 pub mod lean;
@@ -349,14 +350,20 @@ pub fn check_file_structured(
         );
     }
 
-    let messages = match lean::run_lean(&repo_root, &lean_file) {
-        Ok(m) => m,
-        Err(msg) => {
-            return (
-                source,
-                Err(vec![io_diag("internal.lean_invocation", msg)]),
-            )
-        }
+    // Warm path: a running `sable daemon` keeps a Lean server alive and
+    // skips the per-check cold start. Any daemon problem falls back to the
+    // batch invocation below, unchanged.
+    let messages = match daemon::try_check(&repo_root, &lean_file) {
+        Some(m) => m,
+        None => match lean::run_lean(&repo_root, &lean_file) {
+            Ok(m) => m,
+            Err(msg) => {
+                return (
+                    source,
+                    Err(vec![io_diag("internal.lean_invocation", msg)]),
+                )
+            }
+        },
     };
 
     let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages));

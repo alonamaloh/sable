@@ -8,6 +8,8 @@ Usage:
   sable check --emit-lean <file>     print the generated Lean instead of checking
   sable test  <file.sable>           run test_* functions with dynamic contract checks
   sable lsp                          run the language server on stdio
+  sable daemon                       keep a warm Lean server for fast checks
+                                     (socket: .sable-out/daemon.sock)
 ";
 
 fn main() -> ExitCode {
@@ -21,6 +23,7 @@ fn main() -> ExitCode {
             "check" if command.is_none() => command = Some("check"),
             "test" if command.is_none() => command = Some("test"),
             "lsp" if command.is_none() => command = Some("lsp"),
+            "daemon" if command.is_none() => command = Some("daemon"),
             // LSP clients conventionally append --stdio (vscode-languageclient
             // does, among others); stdio is our only transport, so accept it.
             "--stdio" if command == Some("lsp") => {}
@@ -39,6 +42,30 @@ fn main() -> ExitCode {
         }
     }
 
+    if command == Some("daemon") {
+        let cwd = match std::env::current_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("daemon error: cannot determine current directory: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let Some(repo_root) = sable::lean::find_repo_root(&cwd) else {
+            eprintln!(
+                "daemon error: cannot locate the Sable repo (no ancestor of {} \
+                 contains lean/lean-toolchain)",
+                cwd.display()
+            );
+            return ExitCode::FAILURE;
+        };
+        return match sable::daemon::run(&repo_root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("daemon error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if command == Some("lsp") {
         return match sable::lsp::run() {
             Ok(()) => ExitCode::SUCCESS,

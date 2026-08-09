@@ -33,7 +33,12 @@ emit (compiler/src/lean.rs)           one Lean theorem per obligation:
   │                                   (name, .sable span, goal text, context)
   ▼
 check                                 `lake env lean --json` on the generated file
-  ▼                                   (prelude oleans built once by `lake build`)
+  ▼                                   (prelude oleans built once by `lake build`);
+  │                                   or, when `sable daemon` is running
+  │                                   (socket at .sable-out/daemon.sock), a warm
+  │                                   Lean LSP server checks it without the
+  │                                   per-invocation cold start (compiler/src/daemon.rs);
+  │                                   any daemon problem falls back to the batch path
 diagnose (compiler/src/diag.rs)       lean JSON messages → source map lookup →
                                       rendered error: obligation name, goal,
                                       .sable span, context, lean excerpt
