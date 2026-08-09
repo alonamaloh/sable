@@ -2,7 +2,7 @@
 
 Sable is a design for an imperative, C-flavored language in which **every function carries a machine-checked proof of its contract**. One source file interleaves two languages: a C-like program language with no undefined behavior and an ownership-based memory model, and a Lean 4–dialect proof language that lives entirely on lines beginning with `///`.
 
-**Status: early implementation (milestone M0 — see [`docs/PLAN.md`](docs/PLAN.md)).** The normative design documents (working draft 0.4):
+**Status: early implementation — milestone M0 (the full verify pipeline, straight-line programs) is complete; next is M1: loops, arrays, `option`, `discharge`. See [`docs/PLAN.md`](docs/PLAN.md).** The normative design documents (working draft 0.4):
 
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
 - [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.

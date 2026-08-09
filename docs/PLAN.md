@@ -6,16 +6,18 @@ Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator 
 
 ## Milestones
 
-### M0 — the pipeline exists *(in progress)*
+### M0 — the pipeline exists *(complete, 2026-08-08)*
 
 Scope: straight-line functions with `if`/`else`. Types `u8..u64`, `i8..i64`, `bool`. Contracts: `pre`/`post`. Calls to non-recursive, earlier-checked functions (pre obligations at call sites, post assumptions after). Definite-initialization checking. Per-operation VCs (overflow, div-by-zero, narrowing excluded — no narrowing yet).
 
 Pipeline: parse (program language + `///` block attachment) → typecheck → VCgen (symbolic execution, path-splitting) → emit one Lean theorem per obligation → `lake env lean --json` → map diagnostics back to `.sable` spans → render.
 
-Exit criteria:
-- `corpus/verifies/div_round_up.sable` verifies via the automation portfolio.
-- A wrong contract produces an error that names the obligation, quotes the goal, and points at the right `.sable` line.
-- `corpus/must-fail/` failures are asserted by obligation name in `cargo test`.
+Exit criteria — all met:
+- `corpus/verifies/div_round_up.sable` verifies via the automation portfolio (~2.4s cold; 4 obligations, kernel-checked).
+- A wrong contract produces an error that names the obligation, quotes the goal, and points at the right `.sable` line (see the outputs on `corpus/must-fail/`).
+- `corpus/must-fail/` failures are asserted by obligation name in `cargo test` (full corpus ~4.6s).
+
+Milestone souvenir: implementing per-operation VCs immediately found a real bug in the design doc's §3 `div_round_up` example (its pre admits `a + b = 2^32`); kept verbatim as `corpus/must-fail/overflow_design_doc.sable`. The design doc's example should be corrected when §3 is next revised.
 
 Known M0 simplifications (each has a scheduled fix): signed division/modulo rejected (Lean `/` on `Int` must be pinned to C truncation semantics first — M1); one clause per `///` line; call-site contract instantiation by token substitution; obligation-name anchors are expression slugs, not the final content-anchoring scheme.
 
