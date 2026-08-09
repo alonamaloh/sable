@@ -215,7 +215,7 @@ fn quicksort(&mut [i32] a) {
 
 // --- quicksort_range: composing the recursive calls' posts ---
 // The body threads four symbolic array states:
-//   _old_a --partition--> _arr1 (pivot slot _r2)
+//   _old_a --partition--> _arr1 (pivot slot p)
 //          --left rec-->  _arr3   (posts: h_quicksort_range_post_*)
 //          --right rec--> _arr5   (posts: h_quicksort_range_post_*_2)
 // Each call's frame post relates consecutive states only, so the posts
@@ -229,46 +229,46 @@ fn quicksort(&mut [i32] a) {
 // the right recursion's own post; across the pivot, partition's
 // "≤ pivot / ≥ pivot" facts survive via the recursions' bound-
 // preservation posts (left) and frame + bound posts (right), with the
-// pivot value itself pinned by both frames: _arr5[_r2] = _arr3[_r2] =
-// _arr1[_r2].
+// pivot value itself pinned by both frames: _arr5[p] = _arr3[p] =
+// _arr1[p].
 /// discharge quicksort_range.post.sortedrange_a_lo_hi by
 ///   have hlen53 : (_arr5).len = (_arr3).len := by assumption
 ///   have hlen31 : (_arr3).len = (_arr1).len := by assumption
 ///   have hlen10 : (_arr1).len = (_old_a).len := by assumption
-///   have hLle : ∀ k, lo ≤ k → k < _r2 → (_arr3).get k ≤ (_arr1).get _r2 :=
-///     h_quicksort_range_post_b_k_lo_k_k_hi_old_a_get ((_arr1).get _r2)
+///   have hLle : ∀ k, lo ≤ k → k < p → (_arr3).get k ≤ (_arr1).get p :=
+///     h_quicksort_range_post_b_k_lo_k_k_hi_old_a_get ((_arr1).get p)
 ///       h_partition_post_k_lo_k_k_result_a_get_k
-///   have hp53 : (_arr5).get _r2 = (_arr1).get _r2 := by
-///     have h1 : (_arr5).get _r2 = (_arr3).get _r2 :=
-///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k_2 _r2 (by omega) (by omega) (by omega)
-///     have h2 : (_arr3).get _r2 = (_arr1).get _r2 :=
-///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k _r2 (by omega) (by omega) (by omega)
+///   have hp53 : (_arr5).get p = (_arr1).get p := by
+///     have h1 : (_arr5).get p = (_arr3).get p :=
+///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k_2 p (by omega) (by omega) (by omega)
+///     have h2 : (_arr3).get p = (_arr1).get p :=
+///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k p (by omega) (by omega) (by omega)
 ///     rw [h1, h2]
-///   have hRge0 : ∀ k, _r2 + 1 ≤ k → k < hi → (_arr1).get _r2 ≤ (_arr3).get k := by
+///   have hRge0 : ∀ k, p + 1 ≤ k → k < hi → (_arr1).get p ≤ (_arr3).get k := by
 ///     intro k hk1 hk2
 ///     have h31 : (_arr3).get k = (_arr1).get k :=
 ///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k k (by omega) (by omega) (by omega)
 ///     rw [h31]
 ///     exact h_partition_post_k_result_k_k_hi_a_get_re k (by omega) hk2
-///   have hRge : ∀ k, _r2 + 1 ≤ k → k < hi → (_arr1).get _r2 ≤ (_arr5).get k :=
-///     h_quicksort_range_post_b_k_lo_k_k_hi_b_old_a_ge_2 ((_arr1).get _r2) hRge0
+///   have hRge : ∀ k, p + 1 ≤ k → k < hi → (_arr1).get p ≤ (_arr5).get k :=
+///     h_quicksort_range_post_b_k_lo_k_k_hi_b_old_a_ge_2 ((_arr1).get p) hRge0
 ///   intro x y hx0 hxy hyhi
-///   by_cases hyr : y ≤ _r2
+///   by_cases hyr : y ≤ p
 ///   · have hx5 : (_arr5).get x = (_arr3).get x :=
 ///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k_2 x (by omega) (by omega) (by omega)
 ///     have hy5 : (_arr5).get y = (_arr3).get y :=
 ///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k_2 y (by omega) (by omega) (by omega)
 ///     rw [hx5, hy5]
-///     by_cases hyp : y = _r2
-///     · have h2 : (_arr3).get _r2 = (_arr1).get _r2 :=
-///         h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k _r2 (by omega) (by omega) (by omega)
+///     by_cases hyp : y = p
+///     · have h2 : (_arr3).get p = (_arr1).get p :=
+///         h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k p (by omega) (by omega) (by omega)
 ///       rw [hyp, h2]
 ///       exact hLle x hx0 (by omega)
 ///     · exact h_quicksort_range_post_sortedrange_a_lo_hi x y hx0 hxy (by omega)
-///   · by_cases hxr : x ≤ _r2
-///     · have hyge : (_arr1).get _r2 ≤ (_arr5).get y := hRge y (by omega) hyhi
-///       have hxle : (_arr5).get x ≤ (_arr1).get _r2 := by
-///         by_cases hxeq : x = _r2
+///   · by_cases hxr : x ≤ p
+///     · have hyge : (_arr1).get p ≤ (_arr5).get y := hRge y (by omega) hyhi
+///       have hxle : (_arr5).get x ≤ (_arr1).get p := by
+///         by_cases hxeq : x = p
 ///         · rw [hxeq, hp53]
 ///           omega
 ///         · have hx5 : (_arr5).get x = (_arr3).get x :=
@@ -300,9 +300,9 @@ fn quicksort(&mut [i32] a) {
 ///   rw [h53, h31, h10]
 
 // Lower-bound preservation over [lo, hi): push the bound through
-// partition, then through the left recursion on [lo, _r2) (slots in
-// [_r2, hi) unchanged by its frame), then through the right recursion
-// on [_r2+1, hi) (slots in [lo, _r2] unchanged by its frame).
+// partition, then through the left recursion on [lo, p) (slots in
+// [p, hi) unchanged by its frame), then through the right recursion
+// on [p+1, hi) (slots in [lo, p] unchanged by its frame).
 /// discharge quicksort_range.post.b_k_lo_k_k_hi_b_old_a_get_k_k_lo_k_k_hi by
 ///   have hlen53 : (_arr5).len = (_arr3).len := by assumption
 ///   have hlen31 : (_arr3).len = (_arr1).len := by assumption
@@ -310,26 +310,26 @@ fn quicksort(&mut [i32] a) {
 ///   intro b hb
 ///   have hb1 : ∀ k, lo ≤ k → k < hi → b ≤ (_arr1).get k :=
 ///     h_partition_post_b_k_lo_k_k_hi_b_old_a_ge b hb
-///   have hbL : ∀ k, lo ≤ k → k < _r2 → b ≤ (_arr1).get k := by
+///   have hbL : ∀ k, lo ≤ k → k < p → b ≤ (_arr1).get k := by
 ///     intro k hk1 hk2
 ///     exact hb1 k hk1 (by omega)
-///   have hb3L : ∀ k, lo ≤ k → k < _r2 → b ≤ (_arr3).get k :=
+///   have hb3L : ∀ k, lo ≤ k → k < p → b ≤ (_arr3).get k :=
 ///     h_quicksort_range_post_b_k_lo_k_k_hi_b_old_a_ge b hbL
 ///   have hb3 : ∀ k, lo ≤ k → k < hi → b ≤ (_arr3).get k := by
 ///     intro k hk1 hk2
-///     by_cases hkr : k < _r2
+///     by_cases hkr : k < p
 ///     · exact hb3L k hk1 hkr
 ///     · have h31 : (_arr3).get k = (_arr1).get k :=
 ///         h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k k (by omega) (by omega) (by omega)
 ///       rw [h31]
 ///       exact hb1 k hk1 hk2
-///   have hbR : ∀ k, _r2 + 1 ≤ k → k < hi → b ≤ (_arr3).get k := by
+///   have hbR : ∀ k, p + 1 ≤ k → k < hi → b ≤ (_arr3).get k := by
 ///     intro k hk1 hk2
 ///     exact hb3 k (by omega) hk2
-///   have hb5R : ∀ k, _r2 + 1 ≤ k → k < hi → b ≤ (_arr5).get k :=
+///   have hb5R : ∀ k, p + 1 ≤ k → k < hi → b ≤ (_arr5).get k :=
 ///     h_quicksort_range_post_b_k_lo_k_k_hi_b_old_a_ge_2 b hbR
 ///   intro k hk1 hk2
-///   by_cases hkr : k < _r2 + 1
+///   by_cases hkr : k < p + 1
 ///   · have h53 : (_arr5).get k = (_arr3).get k :=
 ///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k_2 k (by omega) (by omega) (by omega)
 ///     rw [h53]
@@ -344,26 +344,26 @@ fn quicksort(&mut [i32] a) {
 ///   intro b hb
 ///   have hb1 : ∀ k, lo ≤ k → k < hi → (_arr1).get k ≤ b :=
 ///     h_partition_post_b_k_lo_k_k_hi_old_a_get b hb
-///   have hbL : ∀ k, lo ≤ k → k < _r2 → (_arr1).get k ≤ b := by
+///   have hbL : ∀ k, lo ≤ k → k < p → (_arr1).get k ≤ b := by
 ///     intro k hk1 hk2
 ///     exact hb1 k hk1 (by omega)
-///   have hb3L : ∀ k, lo ≤ k → k < _r2 → (_arr3).get k ≤ b :=
+///   have hb3L : ∀ k, lo ≤ k → k < p → (_arr3).get k ≤ b :=
 ///     h_quicksort_range_post_b_k_lo_k_k_hi_old_a_get b hbL
 ///   have hb3 : ∀ k, lo ≤ k → k < hi → (_arr3).get k ≤ b := by
 ///     intro k hk1 hk2
-///     by_cases hkr : k < _r2
+///     by_cases hkr : k < p
 ///     · exact hb3L k hk1 hkr
 ///     · have h31 : (_arr3).get k = (_arr1).get k :=
 ///         h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k k (by omega) (by omega) (by omega)
 ///       rw [h31]
 ///       exact hb1 k hk1 hk2
-///   have hbR : ∀ k, _r2 + 1 ≤ k → k < hi → (_arr3).get k ≤ b := by
+///   have hbR : ∀ k, p + 1 ≤ k → k < hi → (_arr3).get k ≤ b := by
 ///     intro k hk1 hk2
 ///     exact hb3 k (by omega) hk2
-///   have hb5R : ∀ k, _r2 + 1 ≤ k → k < hi → (_arr5).get k ≤ b :=
+///   have hb5R : ∀ k, p + 1 ≤ k → k < hi → (_arr5).get k ≤ b :=
 ///     h_quicksort_range_post_b_k_lo_k_k_hi_old_a_get_2 b hbR
 ///   intro k hk1 hk2
-///   by_cases hkr : k < _r2 + 1
+///   by_cases hkr : k < p + 1
 ///   · have h53 : (_arr5).get k = (_arr3).get k :=
 ///       h_quicksort_range_post_k_0_k_k_a_len_k_lo_hi_k_2 k (by omega) (by omega) (by omega)
 ///     rw [h53]

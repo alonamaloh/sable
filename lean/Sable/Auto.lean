@@ -1,4 +1,5 @@
 import Sable.Bounds
+import Sable.Seq
 
 /-
 Sable prelude: the automation portfolio.
@@ -33,6 +34,7 @@ macro_rules
         | assumption
         | rfl
         | ((try sable_norm) <;> omega)
+        | ((try sable_norm) <;> (try simp only [Sable.Seq.len_set] at *) <;> omega)
         | ((try sable_norm) <;> simp_all)
         | ((try sable_norm) <;> (try subst_eqs) <;> simp_all <;> omega)
         | grind)

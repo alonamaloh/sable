@@ -144,6 +144,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             var_tys: HashMap::new(),
             mut_arrays: HashMap::new(),
             fresh: 0,
+            name_hint: None,
             name_counts: HashMap::new(),
             out: result,
         };
@@ -219,6 +220,11 @@ struct Generator<'a> {
     /// &mut array params: source name → entry-state binder (`_old_a`).
     mut_arrays: HashMap<String, String>,
     fresh: usize,
+    /// Source-name hint for the next call/alloc/ctor result binder:
+    /// `u64 p = probe_step(...)` binds `p`, not `_r16`, so discharge
+    /// scripts survive unrelated edits (same motivation as
+    /// content-anchored hypothesis names).
+    name_hint: Option<String>,
     name_counts: HashMap<String, usize>,
     out: &'a mut VcResult,
 }
@@ -230,7 +236,7 @@ impl<'a> Generator<'a> {
         let mut map = HashMap::new();
         map.insert("self".to_string(), state.to_string());
         for fld in &class.fields {
-            map.insert(fld.name.clone(), format!("({state}.{})", fld.name));
+            map.insert(fld.name.clone(), project_field(state, &fld.name));
         }
         map
     }
@@ -468,7 +474,17 @@ impl<'a> Generator<'a> {
             Stmt::Decl { name, ty, init, .. } => {
                 self.var_tys.insert(name.clone(), *ty);
                 if let Some(e) = init {
+                    if matches!(
+                        e.kind,
+                        ExprKind::Call { .. }
+                            | ExprKind::MethodCall { .. }
+                            | ExprKind::CtorCall { .. }
+                            | ExprKind::AllocArray { .. }
+                    ) {
+                        self.name_hint = Some(name.clone());
+                    }
                     let v = self.eval(e);
+                    self.name_hint = None;
                     self.env.insert(name.clone(), v);
                 } else {
                     self.env.remove(name);
@@ -504,7 +520,17 @@ impl<'a> Generator<'a> {
                 self.exec(rest, tail);
             }
             Stmt::VarDecl { name, init, ty, .. } => {
+                if matches!(
+                    init.kind,
+                    ExprKind::Call { .. }
+                        | ExprKind::MethodCall { .. }
+                        | ExprKind::CtorCall { .. }
+                        | ExprKind::AllocArray { .. }
+                ) {
+                    self.name_hint = Some(name.clone());
+                }
                 let v = self.eval(init);
+                self.name_hint = None;
                 self.var_tys
                     .insert(name.clone(), ty.expect("checked: var type"));
                 self.env.insert(name.clone(), v);
@@ -608,9 +634,12 @@ impl<'a> Generator<'a> {
                 else_block,
             } => {
                 let p = self.eval_prop(cond);
+                // Full clones, not length-truncation: a havoc in a
+                // nested loop REWRITES earlier hypotheses in place
+                // (SSA versioning), which truncation cannot undo.
                 let snap_env = self.env.clone();
-                let snap_hyps = self.hyps.len();
-                let snap_ctx = self.context.len();
+                let snap_hyps = self.hyps.clone();
+                let snap_ctx = self.context.clone();
 
                 self.hyps
                     .push((format!("h_path_{}", hslug(&p)), p.clone()));
@@ -620,8 +649,8 @@ impl<'a> Generator<'a> {
                 self.exec(&then_stmts, tail);
 
                 self.env = snap_env;
-                self.hyps.truncate(snap_hyps);
-                self.context.truncate(snap_ctx);
+                self.hyps = snap_hyps.clone();
+                self.context = snap_ctx.clone();
 
                 self.hyps
                     .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
@@ -634,8 +663,8 @@ impl<'a> Generator<'a> {
                     }
                     None => self.exec(rest, tail),
                 }
-                self.hyps.truncate(snap_hyps);
-                self.context.truncate(snap_ctx);
+                self.hyps = snap_hyps;
+                self.context = snap_ctx;
             }
             Stmt::While {
                 cond,
@@ -720,9 +749,10 @@ impl<'a> Generator<'a> {
                 }
                 let p = self.eval_prop(cond);
 
+                // Full clones — see the If arm.
                 let snap_env = self.env.clone();
-                let snap_hyps = self.hyps.len();
-                let snap_ctx = self.context.len();
+                let snap_hyps = self.hyps.clone();
+                let snap_ctx = self.context.clone();
 
                 // 4. Body path.
                 self.fresh += 1;
@@ -745,16 +775,16 @@ impl<'a> Generator<'a> {
                 self.exec(&body_stmts, &loop_tail);
 
                 self.env = snap_env;
-                self.hyps.truncate(snap_hyps);
-                self.context.truncate(snap_ctx);
+                self.hyps = snap_hyps.clone();
+                self.context = snap_ctx.clone();
 
                 // 5. Continuation: invariants + ¬cond.
                 self.hyps
                     .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
                 self.context.push(format!("path ¬{p}"));
                 self.exec(rest, tail);
-                self.hyps.truncate(snap_hyps);
-                self.context.truncate(snap_ctx);
+                self.hyps = snap_hyps;
+                self.context = snap_ctx;
             }
         }
     }
@@ -794,27 +824,65 @@ impl<'a> Generator<'a> {
             }
         }
 
-        self.hyps
-            .retain(|(_, prop)| !havoc_set.iter().any(|h| mentions(prop, h)));
+        // SSA-style versioning: binders occupying havocked source names
+        // are renamed, and surviving hypotheses are REWRITTEN to the
+        // stale names — facts about the pre-havoc value stay true of the
+        // renamed binder. (Dropping them instead loses e.g. the alloc
+        // facts of an array the loop mutates.) Hypotheses mentioning a
+        // havocked name with no binder to rename (body-local decls) are
+        // dropped as before.
+        let mut stale_map: HashMap<String, String> = HashMap::new();
+        for name in &havoc_set {
+            if self.binders.iter().any(|(b, _)| b == name) {
+                self.fresh += 1;
+                let stale = format!("_old{}_{name}", self.fresh);
+                for b in self.binders.iter_mut() {
+                    if b.0 == *name {
+                        b.0 = stale.clone();
+                    }
+                }
+                stale_map.insert(name.clone(), stale);
+            }
+        }
+        self.hyps.retain(|(_, prop)| {
+            !havoc_set
+                .iter()
+                .any(|h| !stale_map.contains_key(h) && mentions(prop, h))
+        });
+        // Rewritten hypotheses get a `h_stale_` name so the fresh
+        // invariant hypotheses keep their content-anchored names —
+        // discharges cite the live facts, not the archived ones.
+        let mut seen: HashSet<String> = self.hyps.iter().map(|(n, _)| n.clone()).collect();
+        for idx in 0..self.hyps.len() {
+            if stale_map.keys().any(|h| mentions(&self.hyps[idx].1, h)) {
+                self.hyps[idx].1 = substitute(&self.hyps[idx].1, &stale_map, None);
+                let old_name = self.hyps[idx].0.clone();
+                let base = if old_name.starts_with("h_stale_") {
+                    old_name.clone()
+                } else {
+                    format!("h_stale_{}", old_name.trim_start_matches("h_"))
+                };
+                let mut name = base.clone();
+                let mut n = 1;
+                while seen.contains(&name) {
+                    n += 1;
+                    name = format!("{base}_{n}");
+                }
+                seen.remove(&old_name);
+                seen.insert(name.clone());
+                self.hyps[idx].0 = name;
+            }
+        }
         self.context
             .retain(|note| !havoc_set.iter().any(|h| mentions(note, h)));
 
         for name in &havoc_set {
-            // Rename any existing binder occupying the source name.
-            self.fresh += 1;
-            let stale = format!("_old{}_{name}", self.fresh);
-            for b in self.binders.iter_mut() {
-                if b.0 == *name {
-                    b.0 = stale.clone();
-                }
-            }
             // Mid-method self-mutation in a loop: fresh state binder,
             // field facts only (the class invariant is NOT in force
             // mid-method, design §7).
             if name == "self" {
                 if let Cctx::Method(class, _) = self.cctx {
-                    self.fresh += 1;
-                    let b = format!("_self{}", self.fresh);
+                    let b = self.hinted_sym("_self", Some("_self_loop".to_string()));
                     self.binders.push((b.clone(), class.name.clone()));
                     self.push_class_state_facts(class, &b);
                     self.env.insert("self".to_string(), Val::Obj(b));
@@ -850,14 +918,18 @@ impl<'a> Generator<'a> {
                     // chain — but only when that chain does not itself
                     // mention a havocked name (else drop to range facts).
                     let elem = *elem;
+                    // The prior chain may reference renamed binders
+                    // (alloc binders carry the source name): rewrite to
+                    // the stale names rather than dropping.
                     let prior = match self.env.get(name) {
-                        Some(Val::Arr(s)) => Some(s.clone()),
+                        Some(Val::Arr(s)) => Some(substitute(s, &stale_map, None)),
                         _ => None,
                     };
                     self.binders.push((name.clone(), "Sable.Seq Int".into()));
                     if let Some(prior) = prior {
-                        if !havoc_set.iter().any(|h| h != name && mentions(&prior, h))
-                            && !mentions(&prior, name)
+                        if !havoc_set
+                            .iter()
+                            .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
                         {
                             self.hyps.push((
                                 format!("h_{name}_len"),
@@ -972,6 +1044,7 @@ impl<'a> Generator<'a> {
                 Val::Int(value)
             }
             ExprKind::AllocArray { len, init, .. } => {
+                let hint = self.name_hint.take();
                 let Val::Int(n) = self.eval(len) else {
                     unreachable!()
                 };
@@ -980,8 +1053,7 @@ impl<'a> Generator<'a> {
                 };
                 // Allocation succeeds symbolically: failure is the named
                 // OOM trap (design §10), not a proof obligation.
-                self.fresh += 1;
-                let b = format!("_alloc{}", self.fresh);
+                let b = self.hinted_sym("_alloc", hint);
                 self.binders.push((b.clone(), "Sable.Seq Int".into()));
                 let h1 = self.fresh_hyp("h_alloc");
                 self.hyps.push((h1, format!("({b}.len) = {n}")));
@@ -999,7 +1071,7 @@ impl<'a> Generator<'a> {
                     .cloned()
                     .expect("checked: field initialized"),
                 Cctx::Method(..) => {
-                    Val::Int(format!("({}.{field})", self.self_chain()))
+                    Val::Int(project_field(&self.self_chain(), field))
                 }
                 Cctx::None => unreachable!("checked: fields only in members"),
             },
@@ -1035,6 +1107,7 @@ impl<'a> Generator<'a> {
             ExprKind::CtorCall {
                 class, init, args, ..
             } => {
+                let hint = self.name_hint.take();
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| {
@@ -1077,8 +1150,7 @@ impl<'a> Generator<'a> {
                 }
                 // Fresh post-construction state: the class invariant holds
                 // (proved at every init exit) and the init's posts describe it.
-                self.fresh += 1;
-                let b = format!("_obj{}", self.fresh);
+                let b = self.hinted_sym("_obj", hint);
                 self.binders.push((b.clone(), cd.name.clone()));
                 self.push_class_state_facts(cd, &b);
                 self.push_invariant_hyps(cd, &b);
@@ -1101,6 +1173,7 @@ impl<'a> Generator<'a> {
             ExprKind::MethodCall {
                 recv, method, args, ..
             } => {
+                let hint = self.name_hint.take();
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| {
@@ -1149,8 +1222,9 @@ impl<'a> Generator<'a> {
                 // Post-state: fresh for &mut self (invariant re-established),
                 // unchanged for &self.
                 let final_state = if m.self_kind == SelfKind::Mut {
-                    self.fresh += 1;
-                    let b = format!("_obj{}", self.fresh);
+                    // Post-call state named after the receiver (`m_2`,
+                    // `m_3`, ...) — stable and readable in discharges.
+                    let b = self.hinted_sym("_obj", Some(recv.clone()));
                     self.binders.push((b.clone(), cd.name.clone()));
                     self.push_class_state_facts(cd, &b);
                     self.push_invariant_hyps(cd, &b);
@@ -1160,12 +1234,11 @@ impl<'a> Generator<'a> {
                     cur.clone()
                 };
                 // Result symbol.
-                self.fresh += 1;
-                let ret_sym = format!("_r{}", self.fresh);
+                let ret_sym = self.hinted_sym("_r", hint);
                 match m.f.ret {
                     Ty::Int(it) => {
                         self.binders.push((ret_sym.clone(), "Int".into()));
-                        let h = format!("h{ret_sym}_range");
+                        let h = format!("h_{}_range", ret_sym.trim_start_matches('_'));
                         self.hyps.push((h, range_prop(&ret_sym, it)));
                     }
                     Ty::Option(_) => {
@@ -1335,6 +1408,7 @@ impl<'a> Generator<'a> {
                 }
             }
             ExprKind::Call { callee, args, .. } => {
+                let hint = self.name_hint.take();
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| match self.eval(a) {
@@ -1426,13 +1500,14 @@ impl<'a> Generator<'a> {
                     subst_map.insert(p.name.clone(), b);
                 }
 
-                self.fresh += 1;
-                let ret_sym = format!("_r{}", self.fresh);
+                let ret_sym = self.hinted_sym("_r", hint);
                 match sig.ret {
                     Ty::Int(ret_it) => {
                         self.binders.push((ret_sym.clone(), "Int".into()));
-                        self.hyps
-                            .push((format!("h{ret_sym}_range"), range_prop(&ret_sym, ret_it)));
+                        self.hyps.push((
+                            format!("h_{}_range", ret_sym.trim_start_matches('_')),
+                            range_prop(&ret_sym, ret_it),
+                        ));
                     }
                     Ty::Option(_) => {
                         self.binders.push((ret_sym.clone(), "Option Int".into()));
@@ -1599,7 +1674,7 @@ impl<'a> Generator<'a> {
                 Some(Val::Arr(s)) => s.clone(),
                 _ => unreachable!("checked: field initialized"),
             },
-            Cctx::Method(..) => format!("({}.{field})", self.self_chain()),
+            Cctx::Method(..) => project_field(&self.self_chain(), field),
             Cctx::None => unreachable!("checked: fields only in members"),
         }
     }
@@ -1709,6 +1784,23 @@ impl<'a> Generator<'a> {
 
     /// Push a hypothesis whose name must not shadow an existing one:
     /// on collision, suffix _2, _3, ... (stable: program order).
+    /// A binder name for a call/alloc result: the hinted source local
+    /// when the result is directly bound (deduped against live binders),
+    /// else `{fallback}{fresh}`.
+    fn hinted_sym(&mut self, fallback: &str, hint: Option<String>) -> String {
+        self.fresh += 1;
+        let Some(base) = hint else {
+            return format!("{fallback}{}", self.fresh);
+        };
+        let mut name = base.clone();
+        let mut k = 1;
+        while self.binders.iter().any(|(b, _)| *b == name) {
+            k += 1;
+            name = format!("{base}_{k}");
+        }
+        name
+    }
+
     fn push_hyp_unique(&mut self, base: String, prop: String) {
         let mut name = base.clone();
         let mut n = 1;
@@ -1956,6 +2048,47 @@ fn preprocess_old_params(text: &str, params: &[Param]) -> String {
 
 /// Replace `old self` with the `_old_self` token (caller-side use of a
 /// callee's posts; the Generator's own preprocess handles the member side).
+/// `{ X with f := v }.g` — the projection our chains force omega and
+/// simp to chew through unless we reduce it here: `v` when `f = g`,
+/// `X.g` (recursively) otherwise. Keeps VC goals over stable atoms.
+fn project_field(state: &str, field: &str) -> String {
+    let mut cur = state.trim();
+    loop {
+        let Some(body) = cur
+            .strip_prefix("{ ")
+            .and_then(|s| s.strip_suffix(" }"))
+        else {
+            break;
+        };
+        // The ` with ` belonging to THIS level is at brace/paren depth 0.
+        let bytes = body.as_bytes();
+        let mut depth = 0usize;
+        let mut with_at = None;
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'{' | b'(' => depth += 1,
+                b'}' | b')' => depth = depth.saturating_sub(1),
+                b' ' if depth == 0 && body[i..].starts_with(" with ") => {
+                    with_at = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(w) = with_at else { break };
+        let inner = &body[..w];
+        let rest = &body[w + " with ".len()..];
+        let Some((fname, value)) = rest.split_once(" := ") else {
+            break;
+        };
+        if fname == field {
+            return value.to_string();
+        }
+        cur = inner.trim();
+    }
+    format!("({cur}.{field})")
+}
+
 fn preprocess_old_self(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
