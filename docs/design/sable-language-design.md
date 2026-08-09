@@ -9,7 +9,7 @@ Sable is an imperative, C-flavored language in which every function carries a ma
 
 ## Design pillars
 
-1. **No undefined behavior.** Every syntactically valid program has a meaning defined by a formal machine model. Anything that would be UB in C is either statically excluded by a proof obligation or has defined trap semantics.
+1. **No undefined behavior.** Every syntactically valid program has a meaning defined by a formal machine model. Anything that would be UB in C is either statically excluded by a proof obligation, has defined trap semantics, or — for the one case a runtime check would be unaffordable, reading uninitialized memory in *unchecked* code — lands in an explicit `undef` terminal outcome that verified programs provably never reach (ADR 0005).
 2. **A formal machine model is the axiom base.** The default model is the Sable Virtual Machine (SVM, §10), formalized once in Lean. Proof obligations are theorems about machine traces. The SVM is a *semantic definition*, not a runtime: native compilation is (eventually verified) machine-behavior-preserving translation, and other machine models can sit below the same language (§11). The trusted base shrinks in **stages** (§10.1): initially the VC generator is trusted engineering, cross-checked by differential testing against the SVM formalization; a mechanized soundness proof of the VC generator — reducing trust to the machine formalization and the Lean kernel alone — is a scheduled long-running pillar, not a day-one claim.
 3. **Ownership before logic.** The type system enforces unique ownership with borrowing (§5). Because mutable aliasing is impossible in safe code, the verifier reasons about values rather than heaps, and framing is a type-system fact, not a per-call proof obligation.
 4. **Total verification, visible exceptions.** There are no build modes. An undischarged obligation is a compile error. The only ways past an obligation are written in the source, audited, and greppable: `defer` (sound runtime trap) and `assume` (unsound axiom) — §9.
@@ -70,7 +70,7 @@ Every partial operation emits a verification condition (VC):
 
 Division is **Euclidean**, not C-truncating: `a = b*(a/b) + a%b` with `0 ≤ a%b < |b|` — the remainder is never negative, and `/`/`%` coincide exactly with the proof language's (Lean core's) integer division (ADR 0004).
 
-Total operators exist for when modular or saturating behavior is *intended*; they emit no VC:
+Total operators exist for when modular or saturating behavior is *intended*; they emit no VC. They are operator **modifiers**, not functions: every arithmetic operator lexically inside the form is modular/checked/saturating in its operand type's width (not crossing into called functions or index computations); signed `wrap` is two's-complement (ADR 0005):
 
 ```sable
 u32 h = wrap(seed * 2654435761);   // modular arithmetic, defined
@@ -89,9 +89,11 @@ fn carrying_add(u64 a, u64 b, bool cin) -> (u64, bool);
 fn mul_wide(u64 a, u64 b) -> (u64, u64);   // (lo, hi)
 ```
 
+**Evaluation order is left-to-right and `&&`/`||` short-circuit — normatively** (ADR 0005). Trap identity depends on the former (for `a[i] = e`: index, then value, then the bounds check); the guarded-VC idiom `i < a.len && a[i] > 0` depends on the latter.
+
 ### 2.3 Definite initialization
 
-Reading a location requires a proof that it was initialized on every path — discharged by flow-sensitive typing in the common case, by the general verifier when control flow depends on proved facts. There is no default zero. The machine model represents uninitialized memory as `⊥`; the soundness theorem (§10) states that verified programs never read `⊥`.
+Reading a location requires a proof that it was initialized on every path — discharged by flow-sensitive typing in the common case, by the general verifier when control flow depends on proved facts. There is no default zero. The machine model represents uninitialized memory as `⊥`; a ⊥-read sends the machine to the explicit `undef` terminal outcome (so even unchecked programs have a defined meaning), and the soundness theorem (§10) states that verified programs never reach it.
 
 ```sable
 fn pick(bool b) -> i32 {
@@ -114,7 +116,7 @@ fn div_round_up(u32 a, u32 b) -> u32 {
 }
 ```
 
-A call site that cannot prove a `pre` fails to compile, and the error quotes the clause. Contracts are part of a function's *signature* for all purposes: documentation, semantic versioning (weakening a `pre` or strengthening a `post` is backward compatible; the reverse is breaking). Overload resolution never depends on them.
+Functions without a return type are procedures: falling off the end returns, and posts are proven at that implicit exit (ADR 0005). A call site that cannot prove a `pre` fails to compile, and the error quotes the clause. Contracts are part of a function's *signature* for all purposes: documentation, semantic versioning (weakening a `pre` or strengthening a `post` is backward compatible; the reverse is breaking). Overload resolution never depends on them.
 
 Contract clauses may freely reference ghost definitions (§6). This keeps interface blocks short: a rich property gets a *name* in the contract and a *definition* in an evidence block.
 
@@ -323,14 +325,14 @@ Rationale for keeping a sound trap-fallback at all: without `defer`, schedule pr
 
 ## 10. The SVM in one page
 
-The default machine model is deliberately boring: a typed stack machine with an object heap.
+The default machine model is deliberately boring: a **structured (AST-level) small-step semantics** (ADR 0005 — the earlier "typed stack machine" framing is retired; a lower-level machine may appear later as a compilation target with a refinement proof, not as the language's meaning).
 
-- **Configuration**: `⟨code, frames, heap, ghost⟩`. Frames hold locals (each `Val ∪ ⊥`); the heap maps addresses to typed objects; `ghost` holds specification state erased from real execution.
-- **Semantics**: small-step, deterministic in v0.4 (concurrency deferred), formalized in Lean as an inductive step relation of ~40 rules. This single artifact is the language's meaning — there is no prose abstract machine to disagree with it.
-- **Soundness theorem** (the metatheory's target statement): *if every VC of program P is a theorem, then no execution of ⟦P⟧ reads ⊥, executes a partial operation outside its domain, violates a contract, or — absent `partial` — diverges; and every `defer`red predicate either holds or the execution ends in a named trap.* When mechanized (§10.1, stage 2), the compiler is untrusted; the theorem, the machine formalization, and the Lean kernel are the trusted base.
+- **Configuration**: `⟨continuation, locals, ghost⟩` with three terminal outcomes: `done v`, `trapped t`, and `undef` (⊥-reads in unchecked code). Locals hold `Val ∪ ⊥`; ownership absorbs the heap (arrays and class values are owned values); `ghost` holds specification state erased from real execution (its transitions are scheduled work, tied to the erasure metatheorem).
+- **Semantics**: small-step for statements, big-step for the pure expression layer (calls are A-normalized to statement level, so expressions cannot diverge); deterministic given the allocation-capacity parameter `cap` (OOM is the defined trap above it; soundness quantifies over `cap`); left-to-right, short-circuiting. Formalized in Lean as inductive relations — the first draft (`lean/Sable/SVM.lean`) has 73 rules for the core subset, roughly half of them explicit trap propagation. This artifact is the language's meaning — there is no prose abstract machine to disagree with it.
+- **Soundness theorem** (the metatheory's target statement): *if every VC of program P is a theorem, then no execution of ⟦P⟧ reaches `undef`, executes a partial operation outside its domain, violates a contract, or — absent `partial` — diverges; and every `defer`red predicate either holds or the execution ends in a named trap.* When mechanized (§10.1, stage 2), the compiler is untrusted; the theorem, the machine formalization, and the Lean kernel are the trusted base.
 - Allocation failure is defined behavior: `alloc_array` halts in a named OOM trap. Top-level correctness claims therefore read "every execution either satisfies the contract or halts in the OOM trap." (A `try_alloc` returning `option` exists for callers that must handle exhaustion.)
 
-*(Formalization status: a first 73-rule draft of these semantics exists at `lean/Sable/SVM.lean` (core subset: expressions with trap outcomes, statements, loops; classes and calls scoped out). Writing it surfaced eleven ambiguities in this section's prose — among them: OOM vs. determinism needs an explicit capacity parameter; reading ⊥ in unchecked programs is currently stuck, contradicting pillar 1 as stated; `wrap()`/`checked()` must be operator modifiers, not functions; evaluation order and `&&`/`||` short-circuiting are nowhere stated normatively; the `ghost` configuration component has no transitions. The full list is `docs/notes/svm-draft.md`; resolving them into this document is scheduled work.)*
+*(Formalization status: a first 73-rule draft of these semantics exists at `lean/Sable/SVM.lean` — core subset: expressions with trap outcomes, statements, loops; classes and calls scoped out. Writing it surfaced eleven ambiguities in this section's prose; all eleven are now resolved in ADR 0005 and folded into this document (the `undef` outcome, modifier scope, the AST-level machine, A-normalized calls, normative evaluation order and short-circuiting, the capacity parameter, procedures, and the minor batch), with ghost transitions and trap-payload observability explicitly deferred. The formalization still needs the `undef` outcome added; audit trail in `docs/notes/svm-draft.md`.)*
 
 ### 10.1 The trusted base, in stages
 

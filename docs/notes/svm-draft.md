@@ -1,5 +1,7 @@
 # SVM draft: what formalizing §10 forced (design-audit note)
 
+> **Status: all eleven findings resolved 2026-08-09 — see ADR 0005 and the updated design §2.2/§2.3/§10.** This note remains as the audit trail.
+
 *2026-08-09, parallel track (docs/PLAN.md). Artifact: `lean/Sable/SVM.lean` (builds with `lake build`, core-only).*
 
 ## Shape
