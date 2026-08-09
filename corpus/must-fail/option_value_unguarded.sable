@@ -1,0 +1,17 @@
+// expect-error: careless.option
+// `.value` without establishing someness is a verification error, not
+// UB: the option.some obligation cannot be discharged.
+
+/// post result.is_some → result.value = 7
+fn maybe_seven(i32 yes) -> option<i32> {
+    if (yes > 0) {
+        return some(7);
+    }
+    return none;
+}
+
+/// post result = 7
+fn careless(i32 yes) -> i32 {
+    option<i32> r = maybe_seven(yes);
+    return r.value;
+}

@@ -53,7 +53,7 @@ Because contract expressions are unambiguously proof-language, they use real Lea
 | Aggregates | `struct`; fixed arrays `T[N]`; owned dynamic arrays `[T]` (length-carrying) |
 | Classes | `class` — structs with invariants, constructors, destructors (§7) |
 | References | `&T` shared/immutable borrow; `&mut T` unique/mutable borrow |
-| Options | `option<T>` with mandatory matching; there is no null |
+| Options | `option<T>` with `.is_some`/`.value` accessors (`.value` carries a someness obligation — ADR 0008; **no pattern matching in the program language**, as a standing principle); there is no null |
 
 Proof-side (ghost) types — usable only on `///` lines: `int` (unbounded ℤ), `nat`, `seq<T>`, `set<T>`, `map<K,V>`, `Prop`. Program values lift implicitly into proof terms: an `i32` lifts to an `int` with the fact that it lies in `[-2³¹, 2³¹)`; arrays lift to `seq<T>` with their length fact. There is no reverse lifting.
 

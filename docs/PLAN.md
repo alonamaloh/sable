@@ -122,6 +122,10 @@ Scanner-side, `json_string_end` carries the ∀-quantified forward-scan invarian
 
 Next: the JSON *parser* (token stream → structural validation — wants the hash map for object keys, and will force the option-consumption surface design); DEFLATE (bit-level ghosts).
 
+### M11 — option consumption (ADR 0008) *(complete, 2026-08-09)*
+
+The gap the JSON parser forces, resolved C++-`std::optional`-style — **no pattern matching in the program language, as a standing design principle** (a `match` statement was considered and rejected): option-typed locals, `.is_some` (bool), and `.value` (payload, under an `option.some` obligation — junk-on-none in the model like `Seq.get` off-range, trap in `sable test`). The prelude (`lean/Sable/OptionAcc.lean`) defines the same accessors over `Option Int`, so **the identical postfix syntax elaborates in clause text**: new contracts read `post result.is_some → result.value = x + 1` — the spec and the code converge on one accessor style, with no `match` in either. `corpus/verifies/option_access.sable` verifies fully automatically (20 obligations, someness VCs discharging from branch facts, unreachable-else vacuity included); guards: `must-fail/option_value_unguarded` (unguarded `.value` is a verification error) and `test-fails/option_value_trap` (dynamic trap). Known wart: the runtime monitor parses `↔` at `=`-precedence, so accessor-iff clauses need a parenthesized right side (`result.is_some ↔ (0 ≤ x)`).
+
 ## Parallel track (low intensity)
 
 The SVM step relation in Lean — **started**: `lean/Sable/SVM.lean` (73 rules, builds clean) with the design-audit findings in `docs/notes/svm-draft.md` (11 ambiguities, cross-referenced from design §10). Next steps there: determinism proof, a functional evaluator + agreement proof (the differential-testing oracle against `interp.rs`), then calls/frames. The audit findings should be resolved into the design doc.

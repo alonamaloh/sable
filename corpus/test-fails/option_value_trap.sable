@@ -1,0 +1,10 @@
+// expect-test-failure: `.value` of an empty option
+
+fn nothing() -> option<i32> {
+    return none;
+}
+
+fn test_value_of_none() {
+    option<i32> r = nothing();
+    i32 v = r.value;
+}

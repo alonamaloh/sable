@@ -1241,6 +1241,27 @@ impl<'a> Parser<'a> {
                     init: Some(init),
                 })
             }
+            Tok::Ident(first) if first == "option" && self.peek2() == &Tok::Lt => {
+                // `option<u32> r = decode(...);` — option local (ADR 0008;
+                // must be initialized).
+                self.bump();
+                self.expect(Tok::Lt)?;
+                let (elem, _) = self.int_ty()?;
+                self.expect(Tok::Gt)?;
+                let (name, name_span) = self.ident()?;
+                if is_reserved_name(&name) {
+                    return Err(reserved_name_error(&name, name_span, "variable"));
+                }
+                self.expect(Tok::Assign)?;
+                let init = self.expr()?;
+                self.expect(Tok::Semi)?;
+                Ok(Stmt::Decl {
+                    ty: Ty::Option(elem),
+                    name,
+                    name_span,
+                    init: Some(init),
+                })
+            }
             Tok::Ident(first) if first == "self" && self.peek2() == &Tok::Dot => {
                 // self.f = e;   self.f[i] = e;
                 self.bump();
@@ -1591,6 +1612,26 @@ impl<'a> Parser<'a> {
                     };
                 }
                 Tok::Dot => {
+                    // Option accessors postfix any expression (ADR 0008).
+                    if matches!(self.peek2(), Tok::Ident(f) if f == "is_some" || f == "value") {
+                        self.bump();
+                        let (field, fspan) = self.ident()?;
+                        let espan = e.span;
+                        e = Expr {
+                            kind: if field == "is_some" {
+                                ExprKind::IsSome {
+                                    operand: Box::new(e),
+                                }
+                            } else {
+                                ExprKind::OptValue {
+                                    operand: Box::new(e),
+                                }
+                            },
+                            span: espan.join(fspan),
+                            ty: None,
+                        };
+                        continue;
+                    }
                     let ExprKind::Var(name) = &e.kind else {
                         return Err(self.error_expected("nothing (`.` applies to names)"));
                     };
@@ -2012,6 +2053,7 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
         }
         ExprKind::Unary { operand, .. } => expr_vars(operand, out),
         ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => expr_vars(arg, out),
+        ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => expr_vars(operand, out),
         ExprKind::SomeE(inner) => expr_vars(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_vars(lhs, out);

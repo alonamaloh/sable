@@ -215,6 +215,13 @@ pub enum ExprKind {
     /// `narrow<T>(e)` — conversion to any integer type under a range VC
     /// (`narrow.range`); identity in Lean, trap in `sable test` (ADR 0007).
     Narrow { target: IntTy, arg: Box<Expr> },
+    /// `e.is_some` — option holds a value (ADR 0008; no pattern matching
+    /// in the program language, ever).
+    IsSome { operand: Box<Expr> },
+    /// `e.value` — the option's payload, under an `option.some` VC;
+    /// junk-on-none in the model (like `Seq.get` off-range), trap in
+    /// `sable test`.
+    OptValue { operand: Box<Expr> },
     /// `some(e)` / `none` — return position only in M1.
     SomeE(Box<Expr>),
     NoneE,

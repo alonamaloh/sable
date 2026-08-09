@@ -924,6 +924,35 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             Ty::Int(*target)
         }
+        ExprKind::IsSome { operand } => {
+            match check_expr(ctx, operand, None)? {
+                Ty::Option(_) => {}
+                other => {
+                    return Err(Diagnostic {
+                        name: "type.mismatch".into(),
+                        title: format!("`.is_some` on `{}`", other.name()),
+                        span,
+                        label: "expected an `option<T>` value".into(),
+                        notes: vec![],
+                    })
+                }
+            }
+            Ty::Bool
+        }
+        ExprKind::OptValue { operand } => {
+            match check_expr(ctx, operand, None)? {
+                Ty::Option(it) => Ty::Int(it),
+                other => {
+                    return Err(Diagnostic {
+                        name: "type.mismatch".into(),
+                        title: format!("`.value` on `{}`", other.name()),
+                        span,
+                        label: "expected an `option<T>` value".into(),
+                        notes: vec![],
+                    })
+                }
+            }
+        }
         ExprKind::AllocArray { elem, len, init } => {
             let elem = *elem;
             check_expr(ctx, len, Some(Ty::Int(IntTy::U64)))?;

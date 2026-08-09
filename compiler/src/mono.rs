@@ -583,7 +583,9 @@ impl Mono {
                     self.rewrite_expr(a, depth)?;
                 }
             }
-            ExprKind::Unary { operand, .. } => self.rewrite_expr(operand, depth)?,
+            ExprKind::Unary { operand, .. }
+            | ExprKind::IsSome { operand }
+            | ExprKind::OptValue { operand } => self.rewrite_expr(operand, depth)?,
             ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => {
                 self.rewrite_expr(arg, depth)?
             }
@@ -749,7 +751,9 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
                 subst_expr(x, args, bound_calls)?;
             }
         }
-        ExprKind::Unary { operand, .. } => subst_expr(operand, args, bound_calls)?,
+        ExprKind::Unary { operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand } => subst_expr(operand, args, bound_calls)?,
         ExprKind::SomeE(inner) => subst_expr(inner, args, bound_calls)?,
         ExprKind::Binary { lhs, rhs, .. } => {
             subst_expr(lhs, args, bound_calls)?;

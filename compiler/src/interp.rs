@@ -640,6 +640,24 @@ impl<'a> Interp<'a> {
                 }
                 Ok(RtVal::Int(arr[idx as usize]))
             }
+            ExprKind::IsSome { operand } => {
+                let RtVal::Opt(o) = self.eval(operand, frame)? else {
+                    unreachable!("checked: option operand")
+                };
+                Ok(RtVal::Bool(o.is_some()))
+            }
+            ExprKind::OptValue { operand } => {
+                let RtVal::Opt(o) = self.eval(operand, frame)? else {
+                    unreachable!("checked: option operand")
+                };
+                match o {
+                    Some(v) => Ok(RtVal::Int(v)),
+                    None => Err(Trap {
+                        message: "`.value` of an empty option".into(),
+                        span: e.span,
+                    }),
+                }
+            }
             ExprKind::Widen { arg, .. } => self.eval(arg, frame),
             ExprKind::Narrow { target, arg } => {
                 let v = self.eval_int(arg, frame)?;

@@ -268,6 +268,8 @@ enum S {
     SomeLit(Box<S>),
     NoneLit,
     Ite(Box<S>, Box<S>, Box<S>),
+    IsSomeE(Box<S>),
+    OptValE(Box<S>),
     App(String, Vec<S>),
     MatchOpt {
         scrutinee: Box<S>,
@@ -495,6 +497,8 @@ impl P {
             self.pos += 1;
             base = match f.as_str() {
                 "len" => S::Len(Box::new(base)),
+                "is_some" => S::IsSomeE(Box::new(base)),
+                "value" => S::OptValE(Box::new(base)),
                 "get" => {
                     let idx = self.atom()?;
                     S::Get(Box::new(base), Box::new(idx))
@@ -576,6 +580,8 @@ fn ident_to_expr(name: &str) -> EResult<S> {
     if let Some((head, field)) = name.rsplit_once('.') {
         return match field {
             "len" => Ok(S::Len(Box::new(ident_to_expr(head)?))),
+            "is_some" => Ok(S::IsSomeE(Box::new(ident_to_expr(head)?))),
+            "value" => Ok(S::OptValE(Box::new(ident_to_expr(head)?))),
             "get" => Ok(S::App(name.to_string(), vec![])), // args attach in app()
             "min" | "max" => {
                 let it = IntTy::from_name(head)
@@ -598,6 +604,8 @@ fn oldify(s: S) -> EResult<S> {
         S::Field(x, f) => S::Field(Box::new(oldify(*x)?), f),
         S::Get(x, i) => S::Get(Box::new(oldify(*x)?), i),
         S::Ite(c, a, b) => S::Ite(Box::new(oldify(*c)?), Box::new(oldify(*a)?), Box::new(oldify(*b)?)),
+        S::IsSomeE(x) => S::IsSomeE(Box::new(oldify(*x)?)),
+        S::OptValE(x) => S::OptValE(Box::new(oldify(*x)?)),
         _ => return Err(Unmonitorable("`old` applies to a variable or path".into())),
     })
 }
@@ -734,6 +742,15 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                     .unwrap_or(0),
             ))
         }
+        S::IsSomeE(x) => match eval(x, env, depth + 1)? {
+            SpecVal::Opt(o) => Ok(SpecVal::Bool(o.is_some())),
+            _ => Err(Unmonitorable("`.is_some` on a non-option".into())),
+        },
+        S::OptValE(x) => match eval(x, env, depth + 1)? {
+            // Junk-on-none matches the model (Option.getD 0).
+            SpecVal::Opt(o) => Ok(SpecVal::Int(o.unwrap_or(0))),
+            _ => Err(Unmonitorable("`.value` on a non-option".into())),
+        },
         S::Ite(c, a, b) => {
             if boolean(eval(c, env, depth + 1)?)? {
                 eval(a, env, depth + 1)

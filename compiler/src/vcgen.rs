@@ -919,6 +919,10 @@ impl<'a> Generator<'a> {
                     self.env
                         .insert(name.clone(), Val::Prop(format!("({name} = true)")));
                 }
+                Some(Ty::Option(_)) => {
+                    self.binders.push((name.clone(), "Option Int".into()));
+                    self.env.insert(name.clone(), Val::Opt(name.clone()));
+                }
                 Some(Ty::Class(ci)) => {
                     // A loop body called &mut methods on this local: fresh
                     // state; the invariant held at each method exit, so it
@@ -1002,6 +1006,32 @@ impl<'a> Generator<'a> {
             ExprKind::Len { array } => {
                 let arr = self.arr_str(array);
                 Val::Int(format!("({arr}.len)"))
+            }
+            ExprKind::IsSome { operand } => {
+                let Val::Opt(o) = self.eval(operand) else {
+                    unreachable!()
+                };
+                Val::Prop(format!("({o} ≠ none)"))
+            }
+            ExprKind::OptValue { operand } => {
+                // Junk-on-none like `Seq.get` off-range; the someness VC
+                // keeps verified code away from the junk (ADR 0008).
+                let Val::Opt(o) = self.eval(operand) else {
+                    unreachable!()
+                };
+                let goal = format!("({o}) ≠ none");
+                let ob = self.obligation(
+                    &format!("{}.option.{}", self.fname, slug(self.src(e.span))),
+                    format!(
+                        "`{}` must hold a value here",
+                        self.src_short(e.span)
+                    ),
+                    e.span,
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                Val::Int(format!("(({o}).value)"))
             }
             ExprKind::Widen { arg, .. } => self.eval(arg),
             ExprKind::Narrow { target, arg } => {
@@ -1939,7 +1969,9 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
         }
         ExprKind::Unary { operand, .. }
         | ExprKind::Widen { arg: operand, .. }
-        | ExprKind::Narrow { arg: operand, .. } => collect_mut_borrows(operand, out),
+        | ExprKind::Narrow { arg: operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand } => collect_mut_borrows(operand, out),
         ExprKind::SomeE(inner) => collect_mut_borrows(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_mut_borrows(lhs, out);

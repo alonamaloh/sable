@@ -1,0 +1,58 @@
+// Option consumption, C++-optional style (ADR 0008): option locals,
+// `.is_some`, and `.value` under a someness VC. No pattern matching in
+// the program language — and none in these contracts either: the same
+// accessors elaborate in clause text via the prelude, so the specs read
+// exactly like the code.
+
+/// pre  x < 2147483647
+/// post result.is_some ↔ (0 ≤ x)
+/// post result.is_some → result.value = x + 1
+fn incr_nonneg(i32 x) -> option<i32> {
+    if (x >= 0) {
+        return some(x + 1);
+    }
+    return none;
+}
+
+/// pre  0 ≤ x
+/// pre  x ≤ 1000
+/// post result = x + 1
+fn use_it(i32 x) -> i32 {
+    option<i32> r = incr_nonneg(x);
+    if (r.is_some) {
+        return r.value;
+    }
+    return 0;
+}
+
+// Guarded access where the guard is the callee's own contract: the
+// `option.some` obligation on `.value` discharges from the branch fact.
+
+/// post result.is_some → 0 ≤ result.value
+fn first_nonneg(&[i32] a) -> option<u64> {
+    u64 i = 0;
+    u64 n = a.len;
+    /// invariant i ≤ n
+    /// variant   n - i
+    while (i < n) {
+        if (a[i] >= 0) {
+            return some(i);
+        }
+        i = i + 1;
+    }
+    return none;
+}
+
+/// pre  a.len > 0
+/// pre  a.len ≤ 4611686018427387904
+/// post result.is_some → result.value < a.len
+fn find_it(&[i32] a) -> option<u64> {
+    option<u64> r = first_nonneg(&a);
+    if (r.is_some) {
+        if (r.value < a.len) {
+            return r;
+        }
+        return none;
+    }
+    return none;
+}
