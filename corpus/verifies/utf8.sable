@@ -1,0 +1,203 @@
+// Tier 2 opener: the UTF-8 codec. The encoder is specified against
+// ghost byte maps (utf8_b0..utf8_b3, if-chains over division by
+// CONSTANTS — omega's fragment once split); the decoder returns a value
+// equal to the ghost byte-level decoder applied to the input bytes
+// (junk-tolerant: arguments past the length class are ignored), plus a
+// completeness post — canonical bytes never decode to `none`. The
+// program-level roundtrip then follows from one ghost theorem,
+// utf8_decode_encode. Validation (continuation ranges, overlong forms,
+// surrogates, the 0x10FFFF ceiling) is real: RFC 3629 byte classes.
+
+/// def utf8_len (cp : int) : int := if cp < 128 then 1 else if cp < 2048 then 2 else if cp < 65536 then 3 else 4
+
+/// def utf8_b0 (cp : int) : int := if cp < 128 then cp else if cp < 2048 then 192 + cp / 64 else if cp < 65536 then 224 + cp / 4096 else 240 + cp / 262144
+
+/// def utf8_b1 (cp : int) : int := if cp < 2048 then 128 + cp % 64 else if cp < 65536 then 128 + (cp / 64) % 64 else 128 + (cp / 4096) % 64
+
+/// def utf8_b2 (cp : int) : int := if cp < 65536 then 128 + cp % 64 else 128 + (cp / 64) % 64
+
+/// def utf8_b3 (cp : int) : int := 128 + cp % 64
+
+/// def utf8_decode (b0 b1 b2 b3 : int) : int := if b0 < 128 then b0 else if b0 < 224 then (b0 - 192) * 64 + (b1 - 128) else if b0 < 240 then (b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128) else (b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+
+/// def scalar (cp : int) : Prop := 0 ≤ cp ∧ cp ≤ 1114111 ∧ (cp < 55296 ∨ cp > 57343)
+
+/// theorem utf8_b0_range (cp : int) (h : scalar cp) :
+///     0 ≤ utf8_b0 cp ∧ utf8_b0 cp ≤ 255 := by
+///   unfold scalar at h
+///   unfold utf8_b0
+///   repeat (first | omega | split)
+
+/// theorem utf8_b1_range (cp : int) (h : scalar cp) :
+///     128 ≤ utf8_b1 cp ∧ utf8_b1 cp ≤ 191 := by
+///   unfold scalar at h
+///   unfold utf8_b1
+///   repeat (first | omega | split)
+
+/// theorem utf8_b2_range (cp : int) (h : scalar cp) :
+///     128 ≤ utf8_b2 cp ∧ utf8_b2 cp ≤ 191 := by
+///   unfold scalar at h
+///   unfold utf8_b2
+///   repeat (first | omega | split)
+
+/// theorem utf8_b3_range (cp : int) (h : scalar cp) :
+///     128 ≤ utf8_b3 cp ∧ utf8_b3 cp ≤ 191 := by
+///   unfold scalar at h
+///   unfold utf8_b3
+///   omega
+
+/// theorem utf8_decode_encode (cp : int) (h : scalar cp) :
+///     utf8_decode (utf8_b0 cp) (utf8_b1 cp) (utf8_b2 cp) (utf8_b3 cp) = cp := by
+///   unfold scalar at h
+///   unfold utf8_decode utf8_b0 utf8_b1 utf8_b2 utf8_b3
+///   repeat (first | omega | split)
+
+/// theorem utf8_decode_encode2 (cp g1 g2 g3 : int) (h : scalar cp)
+///     (h1 : 2 ≤ utf8_len cp → g1 = utf8_b1 cp)
+///     (h2 : 3 ≤ utf8_len cp → g2 = utf8_b2 cp)
+///     (h3 : utf8_len cp = 4 → g3 = utf8_b3 cp) :
+///     utf8_decode (utf8_b0 cp) g1 g2 g3 = cp := by
+///   unfold scalar at h
+///   unfold utf8_len at h1 h2 h3
+///   unfold utf8_decode utf8_b0 utf8_b1 utf8_b2 utf8_b3 at *
+///   repeat (first | omega | split | split at h1 | split at h2 | split at h3)
+
+/// pre  scalar cp
+/// pre  out.len ≥ 4
+/// post result = utf8_len cp
+/// post out.get 0 = utf8_b0 cp
+/// post 2 ≤ utf8_len cp → out.get 1 = utf8_b1 cp
+/// post 3 ≤ utf8_len cp → out.get 2 = utf8_b2 cp
+/// post utf8_len cp = 4 → out.get 3 = utf8_b3 cp
+/// post ∀ k, utf8_len cp ≤ k → k < out.len → out.get k = (old out).get k
+fn encode_utf8(u32 cp, &mut [u8] out) -> u64 {
+    if (cp < 128) {
+        out[0] = narrow<u8>(cp);
+        return 1;
+    }
+    if (cp < 2048) {
+        out[0] = narrow<u8>(192 + cp / 64);
+        out[1] = narrow<u8>(128 + cp % 64);
+        return 2;
+    }
+    if (cp < 65536) {
+        out[0] = narrow<u8>(224 + cp / 4096);
+        out[1] = narrow<u8>(128 + (cp / 64) % 64);
+        out[2] = narrow<u8>(128 + cp % 64);
+        return 3;
+    }
+    out[0] = narrow<u8>(240 + cp / 262144);
+    out[1] = narrow<u8>(128 + (cp / 4096) % 64);
+    out[2] = narrow<u8>(128 + (cp / 64) % 64);
+    out[3] = narrow<u8>(128 + cp % 64);
+    return 4;
+}
+
+/// pre  pos < b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post match result with
+///      | some v => scalar v ∧ v = utf8_decode (b.get pos) (b.get (pos + 1)) (b.get (pos + 2)) (b.get (pos + 3))
+///      | none   => True
+/// post (∃ cp2, scalar cp2 ∧ pos + utf8_len cp2 ≤ b.len ∧ b.get pos = utf8_b0 cp2 ∧ (2 ≤ utf8_len cp2 → b.get (pos + 1) = utf8_b1 cp2) ∧ (3 ≤ utf8_len cp2 → b.get (pos + 2) = utf8_b2 cp2) ∧ (utf8_len cp2 = 4 → b.get (pos + 3) = utf8_b3 cp2)) → result ≠ none
+fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
+    u8 b0 = b[pos];
+    if (b0 < 128) {
+        return some(widen<u32>(b0));
+    }
+    if (b0 >= 194 && b0 <= 223) {
+        if (pos + 1 >= b.len) {
+            return none;
+        }
+        u8 b1 = b[pos + 1];
+        if (b1 < 128 || b1 > 191) {
+            return none;
+        }
+        u32 v = (widen<u32>(b0) - 192) * 64 + (widen<u32>(b1) - 128);
+        return some(v);
+    }
+    if (b0 >= 224 && b0 <= 239) {
+        if (pos + 2 >= b.len) {
+            return none;
+        }
+        u8 c1 = b[pos + 1];
+        u8 c2 = b[pos + 2];
+        if (c1 < 128 || c1 > 191) {
+            return none;
+        }
+        if (c2 < 128 || c2 > 191) {
+            return none;
+        }
+        if (b0 == 224 && c1 < 160) {
+            return none;
+        }
+        if (b0 == 237 && c1 > 159) {
+            return none;
+        }
+        u32 w = (widen<u32>(b0) - 224) * 4096 + (widen<u32>(c1) - 128) * 64 + (widen<u32>(c2) - 128);
+        return some(w);
+    }
+    if (b0 >= 240 && b0 <= 244) {
+        if (pos + 3 >= b.len) {
+            return none;
+        }
+        u8 d1 = b[pos + 1];
+        u8 d2 = b[pos + 2];
+        u8 d3 = b[pos + 3];
+        if (d1 < 128 || d1 > 191) {
+            return none;
+        }
+        if (d2 < 128 || d2 > 191) {
+            return none;
+        }
+        if (d3 < 128 || d3 > 191) {
+            return none;
+        }
+        if (b0 == 240 && d1 < 144) {
+            return none;
+        }
+        if (b0 == 244 && d1 > 143) {
+            return none;
+        }
+        u32 u = (widen<u32>(b0) - 240) * 262144 + (widen<u32>(d1) - 128) * 4096 + (widen<u32>(d2) - 128) * 64 + (widen<u32>(d3) - 128);
+        return some(u);
+    }
+    return none;
+}
+
+// The kernel-checked roundtrip: encode into a fresh buffer, decode it
+// back, get exactly the codepoint you started with.
+
+/// pre  scalar cp
+/// post result = some cp
+fn roundtrip(u32 cp) -> option<u32> {
+    [u8] buf = alloc_array<u8>(4, 0);
+    u64 n = encode_utf8(cp, &mut buf);
+    return decode_utf8(&buf, 0);
+}
+
+/// discharge roundtrip.post.result_some_cp by
+///   have hl4 : 1 ≤ utf8_len cp ∧ utf8_len cp ≤ 4 := by
+///     unfold utf8_len
+///     repeat (first | omega | split)
+///   have hex : ∃ cp2, scalar cp2 ∧ (0 : Int) + utf8_len cp2 ≤ (_arr4).len ∧ (_arr4).get 0 = utf8_b0 cp2 ∧ (2 ≤ utf8_len cp2 → (_arr4).get (0 + 1) = utf8_b1 cp2) ∧ (3 ≤ utf8_len cp2 → (_arr4).get (0 + 2) = utf8_b2 cp2) ∧ (utf8_len cp2 = 4 → (_arr4).get (0 + 3) = utf8_b3 cp2) := by
+///     refine ⟨cp, h_pre_scalar_cp, by omega, h_encode_utf8_post_out_get_0_utf8_b0_cp, ?_, ?_, ?_⟩
+///     · intro h2
+///       simpa using h_encode_utf8_post_2_utf8_len_cp_out_get_1 h2
+///     · intro h3
+///       simpa using h_encode_utf8_post_3_utf8_len_cp_out_get_2 h3
+///     · intro h4
+///       simpa using h_encode_utf8_post_utf8_len_cp_4_out_get_3 h4
+///   have hne := h_decode_utf8_post_cp2_scalar_cp2_pos_utf8 hex
+///   have hkey := utf8_decode_encode2 cp ((_arr4).get (0 + 1)) ((_arr4).get (0 + 2)) ((_arr4).get (0 + 3)) h_pre_scalar_cp
+///     (fun h2 => by simpa using h_encode_utf8_post_2_utf8_len_cp_out_get_1 h2)
+///     (fun h3 => by simpa using h_encode_utf8_post_3_utf8_len_cp_out_get_2 h3)
+///     (fun h4 => by simpa using h_encode_utf8_post_utf8_len_cp_4_out_get_3 h4)
+///   rw [h_result]
+///   cases hr : _r6 with
+///   | none =>
+///     exact absurd hr hne
+///   | some v =>
+///     rw [hr] at h_decode_utf8_post_match_result_with_some_v
+///     have hm2 := h_decode_utf8_post_match_result_with_some_v.2
+///     rw [h_encode_utf8_post_out_get_0_utf8_b0_cp] at hm2
+///     rw [hm2, hkey]

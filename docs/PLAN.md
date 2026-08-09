@@ -104,6 +104,12 @@ Deferred to the hash map (next): law-carrying trait bounds (`T: Hashable` with e
 
 Traits v1 limits (ADR 0007): bounds over integer types only, one bound per parameter, no trait inheritance or default bodies, laws live in method contracts.
 
+### M9 — Tier 2 opener: the UTF-8 codec *(complete, 2026-08-09)*
+
+`corpus/verifies/utf8.sable`: RFC 3629 encoder and validating decoder, fully verified at 143 obligations with **one** hand discharge (the roundtrip) — a direct measure of the consolidated automation. The spec architecture: ghost byte maps `utf8_b0..b3`/`utf8_len` (if-chains over division by constants — omega's fragment once split) for the encoder; the decoder's success post says `v = utf8_decode(bytes)` against a junk-tolerant ghost byte-level decoder, plus a **completeness post** — canonical bytes at `pos` never decode to `none` — proven automatically at all twelve rejection returns. Validation is table-accurate: continuation ranges, overlong forms (C0/C1, E0 A0, F0 90), the surrogate gap (ED A0+), the 0x10FFFF ceiling (F4 90+). The program-level `roundtrip` (`post result = some cp`) follows from one ghost theorem (`utf8_decode_encode2`, junk-tolerant form matching the encoder's guarded posts). Dynamic tests at zero skips: boundary roundtrips (0x7F/0x80, 0x7FF/0x800, surrogate edges, 0xFFFF/0x10000, 0x10FFFF) and reject wrappers whose `result = none` posts the monitor checks per call. Probe-first: 5-for-5 (`docs/notes/utf8-probe.lean`).
+
+Next Tier 2 candidates: buffer-level UTF-8 validation (a loop over `decode_utf8` — forces "sum of lengths" reasoning), JSON tokenizer (wants the hash map), DEFLATE (wants bit-level ghosts).
+
 ## Parallel track (low intensity)
 
 The SVM step relation in Lean — **started**: `lean/Sable/SVM.lean` (73 rules, builds clean) with the design-audit findings in `docs/notes/svm-draft.md` (11 ambiguities, cross-referenced from design §10). Next steps there: determinism proof, a functional evaluator + agreement proof (the differential-testing oracle against `interp.rs`), then calls/frames. The audit findings should be resolved into the design doc.

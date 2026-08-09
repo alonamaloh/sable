@@ -1,0 +1,195 @@
+// Dynamic checks over the UTF-8 codec: every clause — the ghost byte
+// maps (ite + constant div/mod), the match posts, the roundtrip — is
+// monitored at runtime. The kernel-checked ∃-completeness post is
+// omitted here (monitoring it would enumerate every scalar value); the
+// reject wrappers below carry `result = none` posts checked dynamically
+// instead. Byte classes per RFC 3629.
+
+/// def utf8_len (cp : int) : int := if cp < 128 then 1 else if cp < 2048 then 2 else if cp < 65536 then 3 else 4
+
+/// def utf8_b0 (cp : int) : int := if cp < 128 then cp else if cp < 2048 then 192 + cp / 64 else if cp < 65536 then 224 + cp / 4096 else 240 + cp / 262144
+
+/// def utf8_b1 (cp : int) : int := if cp < 2048 then 128 + cp % 64 else if cp < 65536 then 128 + (cp / 64) % 64 else 128 + (cp / 4096) % 64
+
+/// def utf8_b2 (cp : int) : int := if cp < 65536 then 128 + cp % 64 else 128 + (cp / 64) % 64
+
+/// def utf8_b3 (cp : int) : int := 128 + cp % 64
+
+/// def utf8_decode (b0 b1 b2 b3 : int) : int := if b0 < 128 then b0 else if b0 < 224 then (b0 - 192) * 64 + (b1 - 128) else if b0 < 240 then (b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128) else (b0 - 240) * 262144 + (b1 - 128) * 4096 + (b2 - 128) * 64 + (b3 - 128)
+
+/// def scalar (cp : int) : Prop := 0 ≤ cp ∧ cp ≤ 1114111 ∧ (cp < 55296 ∨ cp > 57343)
+
+/// pre  scalar cp
+/// pre  out.len ≥ 4
+/// post result = utf8_len cp
+/// post out.get 0 = utf8_b0 cp
+/// post 2 ≤ utf8_len cp → out.get 1 = utf8_b1 cp
+/// post 3 ≤ utf8_len cp → out.get 2 = utf8_b2 cp
+/// post utf8_len cp = 4 → out.get 3 = utf8_b3 cp
+/// post ∀ k, utf8_len cp ≤ k → k < out.len → out.get k = (old out).get k
+fn encode_utf8(u32 cp, &mut [u8] out) -> u64 {
+    if (cp < 128) {
+        out[0] = narrow<u8>(cp);
+        return 1;
+    }
+    if (cp < 2048) {
+        out[0] = narrow<u8>(192 + cp / 64);
+        out[1] = narrow<u8>(128 + cp % 64);
+        return 2;
+    }
+    if (cp < 65536) {
+        out[0] = narrow<u8>(224 + cp / 4096);
+        out[1] = narrow<u8>(128 + (cp / 64) % 64);
+        out[2] = narrow<u8>(128 + cp % 64);
+        return 3;
+    }
+    out[0] = narrow<u8>(240 + cp / 262144);
+    out[1] = narrow<u8>(128 + (cp / 4096) % 64);
+    out[2] = narrow<u8>(128 + (cp / 64) % 64);
+    out[3] = narrow<u8>(128 + cp % 64);
+    return 4;
+}
+
+/// pre  pos < b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post match result with
+///      | some v => scalar v ∧ v = utf8_decode (b.get pos) (b.get (pos + 1)) (b.get (pos + 2)) (b.get (pos + 3))
+///      | none   => True
+fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
+    u8 b0 = b[pos];
+    if (b0 < 128) {
+        return some(widen<u32>(b0));
+    }
+    if (b0 >= 194 && b0 <= 223) {
+        if (pos + 1 >= b.len) {
+            return none;
+        }
+        u8 b1 = b[pos + 1];
+        if (b1 < 128 || b1 > 191) {
+            return none;
+        }
+        u32 v = (widen<u32>(b0) - 192) * 64 + (widen<u32>(b1) - 128);
+        return some(v);
+    }
+    if (b0 >= 224 && b0 <= 239) {
+        if (pos + 2 >= b.len) {
+            return none;
+        }
+        u8 c1 = b[pos + 1];
+        u8 c2 = b[pos + 2];
+        if (c1 < 128 || c1 > 191) {
+            return none;
+        }
+        if (c2 < 128 || c2 > 191) {
+            return none;
+        }
+        if (b0 == 224 && c1 < 160) {
+            return none;
+        }
+        if (b0 == 237 && c1 > 159) {
+            return none;
+        }
+        u32 w = (widen<u32>(b0) - 224) * 4096 + (widen<u32>(c1) - 128) * 64 + (widen<u32>(c2) - 128);
+        return some(w);
+    }
+    if (b0 >= 240 && b0 <= 244) {
+        if (pos + 3 >= b.len) {
+            return none;
+        }
+        u8 d1 = b[pos + 1];
+        u8 d2 = b[pos + 2];
+        u8 d3 = b[pos + 3];
+        if (d1 < 128 || d1 > 191) {
+            return none;
+        }
+        if (d2 < 128 || d2 > 191) {
+            return none;
+        }
+        if (d3 < 128 || d3 > 191) {
+            return none;
+        }
+        if (b0 == 240 && d1 < 144) {
+            return none;
+        }
+        if (b0 == 244 && d1 > 143) {
+            return none;
+        }
+        u32 u = (widen<u32>(b0) - 240) * 262144 + (widen<u32>(d1) - 128) * 4096 + (widen<u32>(d2) - 128) * 64 + (widen<u32>(d3) - 128);
+        return some(u);
+    }
+    return none;
+}
+
+// The kernel-checked roundtrip: encode into a fresh buffer, decode it
+// back, get exactly the codepoint you started with.
+
+/// pre  scalar cp
+/// post result = some cp
+fn roundtrip(u32 cp) -> option<u32> {
+    [u8] buf = alloc_array<u8>(4, 0);
+    u64 n = encode_utf8(cp, &mut buf);
+    return decode_utf8(&buf, 0);
+}
+
+
+
+// Contract-carrying wrappers: their posts are false in general and
+// true for the specific inputs the tests feed them — the monitor checks
+// each call. (Array literals live in test functions; wrappers borrow.)
+
+/// pre  b.len ≥ 1
+/// pre  b.len ≤ 4611686018427387904
+/// post result = none
+fn expect_reject(&[u8] b) -> option<u32> {
+    return decode_utf8(&b, 0);
+}
+
+/// pre  b.len ≥ 1
+/// pre  b.len ≤ 4611686018427387904
+/// post result = some want
+fn expect_cp(&[u8] b, u32 want) -> option<u32> {
+    return decode_utf8(&b, 0);
+}
+
+fn test_roundtrips() {
+    roundtrip(0);
+    roundtrip(65);
+    roundtrip(127);
+    roundtrip(128);
+    roundtrip(233);
+    roundtrip(2047);
+    roundtrip(2048);
+    roundtrip(8364);
+    roundtrip(55295);
+    roundtrip(57344);
+    roundtrip(65535);
+    roundtrip(65536);
+    roundtrip(128512);
+    roundtrip(1114111);
+}
+
+fn test_rejects() {
+    [u8] overlong2 = [192, 128];
+    expect_reject(&overlong2);
+    [u8] overlong3 = [224, 128, 128];
+    expect_reject(&overlong3);
+    [u8] surrogate = [237, 160, 128];
+    expect_reject(&surrogate);
+    [u8] truncated = [226, 130];
+    expect_reject(&truncated);
+    [u8] badcont = [195, 40];
+    expect_reject(&badcont);
+    [u8] toobig = [244, 144, 128, 128];
+    expect_reject(&toobig);
+    [u8] badlead = [248, 128, 128, 128];
+    expect_reject(&badlead);
+}
+
+fn test_decode_valid() {
+    [u8] euro = [226, 130, 172];
+    expect_cp(&euro, 8364);
+    [u8] ascii = [65];
+    expect_cp(&ascii, 65);
+    [u8] emoji = [240, 159, 152, 128];
+    expect_cp(&emoji, 128512);
+}
