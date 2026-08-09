@@ -91,4 +91,43 @@ theorem utf8_decode_encode' (cp g1 g2 g3 : Int) (h : scalar cp)
   unfold utf8_decode utf8_b0 utf8_b1 utf8_b2 utf8_b3 at *
   repeat (first | omega | split | split at h1 | split at h2 | split at h3)
 
+/-- Buffer-level validity from `pos`: decomposable into canonical
+    scalar encodings. Well-founded on the remaining length; the probe
+    validates that this ghost-def shape (termination_by/decreasing_by on
+    an Int measure) survives the verbatim-splice pipeline. -/
+def validFrom (b : Sable.Seq Int) (pos : Int) : Prop :=
+  if b.len ≤ pos then True
+  else ∃ cp, scalar cp ∧ pos + utf8_len cp ≤ b.len ∧
+    b.get pos = utf8_b0 cp ∧
+    (2 ≤ utf8_len cp → b.get (pos + 1) = utf8_b1 cp) ∧
+    (3 ≤ utf8_len cp → b.get (pos + 2) = utf8_b2 cp) ∧
+    (utf8_len cp = 4 → b.get (pos + 3) = utf8_b3 cp) ∧
+    validFrom b (pos + utf8_len cp)
+termination_by (b.len - pos).toNat
+decreasing_by
+  unfold utf8_len
+  repeat (first | omega | split)
+
+/-- The forward-scan step: canonical bytes at `pos` plus validity of the
+    rest give validity at `pos`. -/
+theorem validFrom_step (b : Sable.Seq Int) (pos cp : Int)
+    (hpos : pos < b.len)
+    (hs : scalar cp) (hlen : pos + utf8_len cp ≤ b.len)
+    (h0 : b.get pos = utf8_b0 cp)
+    (h1 : 2 ≤ utf8_len cp → b.get (pos + 1) = utf8_b1 cp)
+    (h2 : 3 ≤ utf8_len cp → b.get (pos + 2) = utf8_b2 cp)
+    (h3 : utf8_len cp = 4 → b.get (pos + 3) = utf8_b3 cp)
+    (hrest : validFrom b (pos + utf8_len cp)) :
+    validFrom b pos := by
+  rw [validFrom]
+  rw [if_neg (by omega)]
+  exact ⟨cp, hs, hlen, h0, h1, h2, h3, hrest⟩
+
+/-- The scan-exit base case. -/
+theorem validFrom_end (b : Sable.Seq Int) (pos : Int) (h : b.len ≤ pos) :
+    validFrom b pos := by
+  rw [validFrom]
+  rw [if_pos h]
+  trivial
+
 end Utf8Probe

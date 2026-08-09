@@ -164,6 +164,130 @@ fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
     return none;
 }
 
+
+// Buffer-level validation. `utf8_step` classifies one position: 0 for
+// invalid, else the sequence length — with an existential canonicity
+// post (there IS a scalar value whose canonical bytes sit at pos).
+// `validFrom` is the well-founded ghost predicate "decomposable into
+// canonical scalar encodings from pos on"; the scanner carries the
+// classic forward-scan invariant `validFrom b pos → validFrom b 0`.
+
+/// def validFrom (b : Sable.Seq Int) (pos : int) : Prop :=
+///   if b.len ≤ pos then True
+///   else ∃ cp, scalar cp ∧ pos + utf8_len cp ≤ b.len ∧
+///     b.get pos = utf8_b0 cp ∧
+///     (2 ≤ utf8_len cp → b.get (pos + 1) = utf8_b1 cp) ∧
+///     (3 ≤ utf8_len cp → b.get (pos + 2) = utf8_b2 cp) ∧
+///     (utf8_len cp = 4 → b.get (pos + 3) = utf8_b3 cp) ∧
+///     validFrom b (pos + utf8_len cp)
+/// termination_by (b.len - pos).toNat
+/// decreasing_by
+///   unfold utf8_len
+///   repeat (first | omega | split)
+
+/// theorem validFrom_step (b : Sable.Seq Int) (pos cp : int)
+///     (hpos : pos < b.len)
+///     (hs : scalar cp) (hlen : pos + utf8_len cp ≤ b.len)
+///     (h0 : b.get pos = utf8_b0 cp)
+///     (h1 : 2 ≤ utf8_len cp → b.get (pos + 1) = utf8_b1 cp)
+///     (h2 : 3 ≤ utf8_len cp → b.get (pos + 2) = utf8_b2 cp)
+///     (h3 : utf8_len cp = 4 → b.get (pos + 3) = utf8_b3 cp)
+///     (hrest : validFrom b (pos + utf8_len cp)) :
+///     validFrom b pos := by
+///   rw [validFrom]
+///   rw [if_neg (by omega)]
+///   exact ⟨cp, hs, hlen, h0, h1, h2, h3, hrest⟩
+
+/// theorem validFrom_end (b : Sable.Seq Int) (pos : int) (h : b.len ≤ pos) :
+///     validFrom b pos := by
+///   rw [validFrom]
+///   rw [if_pos h]
+///   trivial
+
+/// pre  pos < b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post result ≤ 4
+/// post result ≠ 0 → ∃ cp, scalar cp ∧ pos + utf8_len cp ≤ b.len ∧ utf8_len cp = result ∧ b.get pos = utf8_b0 cp ∧ (2 ≤ utf8_len cp → b.get (pos + 1) = utf8_b1 cp) ∧ (3 ≤ utf8_len cp → b.get (pos + 2) = utf8_b2 cp) ∧ (utf8_len cp = 4 → b.get (pos + 3) = utf8_b3 cp)
+fn utf8_step(&[u8] b, u64 pos) -> u64 {
+    u8 b0 = b[pos];
+    if (b0 < 128) {
+        return 1;
+    }
+    if (b0 >= 194 && b0 <= 223) {
+        if (pos + 1 >= b.len) {
+            return 0;
+        }
+        u8 b1 = b[pos + 1];
+        if (b1 < 128 || b1 > 191) {
+            return 0;
+        }
+        return 2;
+    }
+    if (b0 >= 224 && b0 <= 239) {
+        if (pos + 2 >= b.len) {
+            return 0;
+        }
+        u8 c1 = b[pos + 1];
+        u8 c2 = b[pos + 2];
+        if (c1 < 128 || c1 > 191) {
+            return 0;
+        }
+        if (c2 < 128 || c2 > 191) {
+            return 0;
+        }
+        if (b0 == 224 && c1 < 160) {
+            return 0;
+        }
+        if (b0 == 237 && c1 > 159) {
+            return 0;
+        }
+        return 3;
+    }
+    if (b0 >= 240 && b0 <= 244) {
+        if (pos + 3 >= b.len) {
+            return 0;
+        }
+        u8 d1 = b[pos + 1];
+        u8 d2 = b[pos + 2];
+        u8 d3 = b[pos + 3];
+        if (d1 < 128 || d1 > 191) {
+            return 0;
+        }
+        if (d2 < 128 || d2 > 191) {
+            return 0;
+        }
+        if (d3 < 128 || d3 > 191) {
+            return 0;
+        }
+        if (b0 == 240 && d1 < 144) {
+            return 0;
+        }
+        if (b0 == 244 && d1 > 143) {
+            return 0;
+        }
+        return 4;
+    }
+    return 0;
+}
+
+/// pre  b.len ≤ 4611686018427387904
+/// post result → validFrom b 0
+fn validate_utf8(&[u8] b) -> bool {
+    u64 pos = 0;
+    u64 n = b.len;
+    /// invariant pos ≤ n
+    /// invariant validFrom b pos → validFrom b 0
+    /// variant   n - pos
+    while (pos < n) {
+        u64 s = utf8_step(&b, pos);
+        if (s == 0) {
+            return false;
+        }
+        pos = pos + s;
+    }
+    return true;
+}
+
 // The kernel-checked roundtrip: encode into a fresh buffer, decode it
 // back, get exactly the codepoint you started with.
 
@@ -201,3 +325,46 @@ fn roundtrip(u32 cp) -> option<u32> {
 ///     have hm2 := h_decode_utf8_post_match_result_with_some_v.2
 ///     rw [h_encode_utf8_post_out_get_0_utf8_b0_cp] at hm2
 ///     rw [hm2, hkey]
+
+// The scanner's discharges: the step posts need their existential
+// witness named (automation cannot invent `utf8_decode` of the bytes);
+// the scan invariant chains through validFrom_step / validFrom_end.
+
+/// discharge utf8_step.post.result_0_cp_scalar_cp_pos_utf8_len_cp_b by
+///   intro _
+///   refine ⟨utf8_decode ((b).get pos) ((b).get (pos + 1)) ((b).get (pos + 2)) ((b).get (pos + 3)), ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+///   all_goals simp only [scalar, utf8_decode, utf8_len, utf8_b0, utf8_b1, utf8_b2, utf8_b3]
+///   all_goals repeat (first | omega | split)
+
+/// discharge utf8_step.post.result_0_cp_scalar_cp_pos_utf8_len_cp_b.4 by
+///   intro _
+///   refine ⟨utf8_decode ((b).get pos) ((b).get (pos + 1)) ((b).get (pos + 2)) ((b).get (pos + 3)), ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+///   all_goals simp only [scalar, utf8_decode, utf8_len, utf8_b0, utf8_b1, utf8_b2, utf8_b3]
+///   all_goals repeat (first | omega | split)
+
+/// discharge utf8_step.post.result_0_cp_scalar_cp_pos_utf8_len_cp_b.10 by
+///   intro _
+///   refine ⟨utf8_decode ((b).get pos) ((b).get (pos + 1)) ((b).get (pos + 2)) ((b).get (pos + 3)), ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+///   all_goals simp only [scalar, utf8_decode, utf8_len, utf8_b0, utf8_b1, utf8_b2, utf8_b3]
+///   all_goals repeat (first | omega | split)
+
+/// discharge utf8_step.post.result_0_cp_scalar_cp_pos_utf8_len_cp_b.17 by
+///   intro _
+///   refine ⟨utf8_decode ((b).get pos) ((b).get (pos + 1)) ((b).get (pos + 2)) ((b).get (pos + 3)), ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+///   all_goals simp only [scalar, utf8_decode, utf8_len, utf8_b0, utf8_b1, utf8_b2, utf8_b3]
+///   all_goals repeat (first | omega | split)
+
+/// discharge validate_utf8.inv_preserved.validfrom_b_pos_validfrom_b_0 by
+///   intro hrest
+///   apply h_inv_validfrom_b_pos_validfro
+///   have hex := h_utf8_step_post_result_0_cp_scalar_cp_po h_path_not_s_0
+///   exact hex.elim (fun cp hcp => by
+///     have hlen := hcp.2.2.1
+///     exact validFrom_step b pos cp (by omega) hcp.1 hcp.2.1 hcp.2.2.2.1
+///       hcp.2.2.2.2.1 hcp.2.2.2.2.2.1 hcp.2.2.2.2.2.2
+///       (by rw [hlen]; exact hrest))
+
+/// discharge validate_utf8.post.result_validfrom_b_0.2 by
+///   intro _
+///   apply h_inv_validfrom_b_pos_validfro
+///   exact validFrom_end b pos (by omega)

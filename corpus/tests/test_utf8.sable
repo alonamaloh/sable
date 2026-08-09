@@ -133,6 +133,119 @@ fn roundtrip(u32 cp) -> option<u32> {
 
 
 
+/// pre  pos < b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post result ≤ 4
+fn utf8_step(&[u8] b, u64 pos) -> u64 {
+    u8 b0 = b[pos];
+    if (b0 < 128) {
+        return 1;
+    }
+    if (b0 >= 194 && b0 <= 223) {
+        if (pos + 1 >= b.len) {
+            return 0;
+        }
+        u8 b1 = b[pos + 1];
+        if (b1 < 128 || b1 > 191) {
+            return 0;
+        }
+        return 2;
+    }
+    if (b0 >= 224 && b0 <= 239) {
+        if (pos + 2 >= b.len) {
+            return 0;
+        }
+        u8 c1 = b[pos + 1];
+        u8 c2 = b[pos + 2];
+        if (c1 < 128 || c1 > 191) {
+            return 0;
+        }
+        if (c2 < 128 || c2 > 191) {
+            return 0;
+        }
+        if (b0 == 224 && c1 < 160) {
+            return 0;
+        }
+        if (b0 == 237 && c1 > 159) {
+            return 0;
+        }
+        return 3;
+    }
+    if (b0 >= 240 && b0 <= 244) {
+        if (pos + 3 >= b.len) {
+            return 0;
+        }
+        u8 d1 = b[pos + 1];
+        u8 d2 = b[pos + 2];
+        u8 d3 = b[pos + 3];
+        if (d1 < 128 || d1 > 191) {
+            return 0;
+        }
+        if (d2 < 128 || d2 > 191) {
+            return 0;
+        }
+        if (d3 < 128 || d3 > 191) {
+            return 0;
+        }
+        if (b0 == 240 && d1 < 144) {
+            return 0;
+        }
+        if (b0 == 244 && d1 > 143) {
+            return 0;
+        }
+        return 4;
+    }
+    return 0;
+}
+
+// (validFrom clauses are kernel-verified in the verifies file; they are
+// unmonitorable — recursive ∃ over all scalar values — so this copy
+// carries the behavioral wrappers below instead.)
+/// pre  b.len ≤ 4611686018427387904
+fn validate_utf8(&[u8] b) -> bool {
+    u64 pos = 0;
+    u64 n = b.len;
+    /// invariant pos ≤ n
+    /// variant   n - pos
+    while (pos < n) {
+        u64 s = utf8_step(&b, pos);
+        if (s == 0) {
+            return false;
+        }
+        pos = pos + s;
+    }
+    return true;
+}
+
+/// pre  b.len ≤ 4611686018427387904
+/// post result
+fn expect_valid(&[u8] b) -> bool {
+    return validate_utf8(&b);
+}
+
+/// pre  b.len ≤ 4611686018427387904
+/// post ¬result
+fn expect_invalid(&[u8] b) -> bool {
+    return validate_utf8(&b);
+}
+
+fn test_validate() {
+    [u8] empty = [];
+    expect_valid(&empty);
+    [u8] ascii = [72, 105, 33];
+    expect_valid(&ascii);
+    [u8] mixed = [65, 195, 169, 226, 130, 172, 240, 159, 152, 128];
+    expect_valid(&mixed);
+    [u8] trunc_tail = [65, 66, 226, 130];
+    expect_invalid(&trunc_tail);
+    [u8] embedded_overlong = [65, 192, 128, 66];
+    expect_invalid(&embedded_overlong);
+    [u8] embedded_surrogate = [237, 160, 128, 65];
+    expect_invalid(&embedded_surrogate);
+    [u8] bare_continuation = [65, 128, 66];
+    expect_invalid(&bare_continuation);
+}
+
 // Contract-carrying wrappers: their posts are false in general and
 // true for the specific inputs the tests feed them — the monitor checks
 // each call. (Array literals live in test functions; wrappers borrow.)

@@ -831,8 +831,14 @@ impl<'a> Generator<'a> {
         // facts of an array the loop mutates.) Hypotheses mentioning a
         // havocked name with no binder to rename (body-local decls) are
         // dropped as before.
+        // Sorted iteration: fresh-number assignment must not depend on
+        // hash order — the M8 CI failure was local-vs-CI divergence in
+        // positional binder numbering.
+        let mut havoc_names: Vec<&String> = havoc_set.iter().collect();
+        havoc_names.sort();
         let mut stale_map: HashMap<String, String> = HashMap::new();
-        for name in &havoc_set {
+        for name in &havoc_names {
+            let name = *name;
             if self.binders.iter().any(|(b, _)| b == name) {
                 self.fresh += 1;
                 let stale = format!("_old{}_{name}", self.fresh);
@@ -876,7 +882,8 @@ impl<'a> Generator<'a> {
         self.context
             .retain(|note| !havoc_set.iter().any(|h| mentions(note, h)));
 
-        for name in &havoc_set {
+        for name in &havoc_names {
+            let name = *name;
             // Mid-method self-mutation in a loop: fresh state binder,
             // field facts only (the class invariant is NOT in force
             // mid-method, design §7).
