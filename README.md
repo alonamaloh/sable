@@ -2,7 +2,7 @@
 
 Sable is an imperative, C-flavored language in which **every function carries a machine-checked proof of its contract**. One source file interleaves two languages: a C-like program language with no undefined behavior and an ownership-based memory model, and a Lean 4 proof language that lives entirely on lines beginning with `///`.
 
-**Status: milestones M0–M4 are complete; M5 (classes with invariants and RAII) is in progress on `m5-classes-wip`.** Verified sorting and searching work end to end today. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
+**Status: milestones M0–M6 (benchmarks) are complete.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), and the escape-hatch assurance ladder — all in a corpus that doubles as the compiler's regression conscience. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
 
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
 - [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
@@ -42,6 +42,7 @@ cd compiler && cargo build --release
 sable check file.sable                   # verify: every obligation kernel-checked by Lean
 sable test  file.sable                   # run test_* functions with dynamic contract checks
 sable lsp                                # language server (stdio)
+sable daemon                             # warm checker: ~0.25s/check instead of ~2.4s
 ```
 
 - **The pipeline** (M0–M2): contracts, loops with invariants/variants, `for`/`range` sugar, arrays (`&[T]`, `&mut [T]` with stores and `old` state), `option`, recursion with measures, ghost definitions, `discharge NAME by <tactics>` for the obligations automation can't reach. Headline artifacts: **in-place insertion sort verified against the full `sorted ∧ permutation` spec**, binary search, gcd. The multiset library lives in [`lean/Sable/Perm.lean`](lean/Sable/Perm.lean), core-only.

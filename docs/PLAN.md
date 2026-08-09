@@ -65,9 +65,21 @@ Exit met: **`BoundedStack` (design §7, near-verbatim) verifies — 23/23 obliga
 
 Known M5 simplifications: class values are locals only (no params/returns/moves/copies); one class per value chain (no class-typed fields); `deinit` bodies must be empty; init/method params are ints; methods cannot call sibling methods through `self`; field names must not collide with parameter names in clauses (token substitution).
 
-### M6 — the rest of Tier 0
+### M6 — the rest of Tier 0 *(benchmarks complete, 2026-08-09; ultracode session)*
 
-Merge/quicksort on the sorting infrastructure; the round-trip codec benchmarks (Base64/hex/varint); `partial fn`; whatever the codecs force (`narrow<T>`, byte types in earnest).
+**Enablers**: verified array-passing (`f(&src, &mut dst)`; callee pres on the argument's symbolic state, &mut args return as fresh states carrying length preservation + element ranges + the callee's posts) and content-anchored hypothesis names (design §6 — discharge scripts now survive unrelated edits).
+
+**Benchmarks** (agent-authored under ultracode orchestration, all `status: fully verified`, all with dynamic tests at zero skipped clauses):
+- **quicksort** — 74 obligations: in-place recursive quicksort over index ranges with contracted `partition`; full `sorted ∧ perm (old a)` top-level spec with frame posts ("unchanged outside [lo,hi)") and bound-preservation posts composing across the recursion; 15 discharges.
+- **merge_sorted** — 74 obligations: the merge kernel with `sorted out` AND the count-based multiset post `∀ v, count out v = count xs v + count ys v`; 15 discharges + an in-file counting lemma.
+- **hex_codec** — 44 obligations: pointwise encode/decode posts via *branchless arithmetic ghost maps* (`48 + d + 39*(d/10)` — simultaneously inside omega's and the dynamic checker's fragments), plus kernel-checked in-file round-trip theorems; 2 discharges.
+- **varint** — 64 obligations: LEB128 encode with the full byte-count bound (`result ≤ 10`, proven via a 10-way unrolled division chain — no `pow` needed), decode fully automatic.
+
+**Milestone souvenir (the big one)**: the quicksort agent caught a *genuine soundness bug* — the &mut-argument havoc block had been silently lost in a failed patch application, so callee posts were asserted over pre-call states and some VCs were provable from `False`. Fixed the same session; regression guard `must-fail/stale_state_after_call`; all benchmarks re-verified under the corrected encoding. Lesson recorded: a failed multi-part patch application must be re-verified part by part, and adversarial-review agents earn their keep.
+
+**Parallel tracks landed the same session**: the SVM step-relation draft (`lean/Sable/SVM.lean`, 73 rules, builds clean; `docs/notes/svm-draft.md` lists 11 design ambiguities the formalization forced out — OOM vs determinism, ⊥-reads vs pillar 1, `wrap()` as operator-modifier, unstated evaluation order/short-circuiting, ghost state without transitions, and more) and the **warm-check daemon** (`sable daemon`: persistent Lean server behind a unix socket; 2.4s → ~0.25s per check, ~10×; silent fallback to the batch path).
+
+Remaining M6 items: Base64 (nothing new technically after hex); `partial fn`; `narrow<T>` when something forces it; known warts — repeated `h_<arr>_len` facts across a call chain shadow (recover by type), `count`'s Lean form (`countUpto`+`toNat`) is clumsy in hand proofs.
 
 ## Parallel track (low intensity)
 

@@ -1,0 +1,80 @@
+// Dynamic checking of the quicksort contracts (design §9): the same
+// code as corpus/verifies/quicksort.sable minus the ∀-quantified
+// bound-preservation clauses, which range over an unbounded value and
+// are not monitorable — everything left checks natively, zero skips.
+
+/// pre  lo < hi
+/// pre  hi ≤ a.len
+/// post lo ≤ result ∧ result < hi
+/// post ∀ k, lo ≤ k → k < result → a.get k ≤ a.get result
+/// post ∀ k, result < k → k < hi → a.get result ≤ a.get k
+/// post perm a (old a)
+/// post ∀ k, 0 ≤ k → k < a.len → (k < lo ∨ hi ≤ k) → a.get k = (old a).get k
+fn partition(&mut [i32] a, u64 lo, u64 hi) -> u64 {
+    u64 h = hi - 1;
+    i32 pivot = a[h];
+    u64 i = lo;
+    /// invariant lo ≤ i ∧ i ≤ j
+    /// invariant a.get h = pivot
+    /// invariant ∀ k, lo ≤ k → k < i → a.get k < pivot
+    /// invariant ∀ k, i ≤ k → k < j → pivot ≤ a.get k
+    /// invariant perm a (old a)
+    /// invariant ∀ k, 0 ≤ k → k < a.len → (k < lo ∨ hi ≤ k) → a.get k = (old a).get k
+    for (u64 j : range(lo, h)) {
+        if (a[j] < pivot) {
+            i32 t = a[i];
+            a[i] = a[j];
+            a[j] = t;
+            i = i + 1;
+        }
+    }
+    i32 t2 = a[i];
+    a[i] = a[h];
+    a[h] = t2;
+    return i;
+}
+
+/// pre  lo ≤ hi
+/// pre  hi ≤ a.len
+/// post sortedRange a lo hi
+/// post perm a (old a)
+/// post ∀ k, 0 ≤ k → k < a.len → (k < lo ∨ hi ≤ k) → a.get k = (old a).get k
+fn quicksort_range(&mut [i32] a, u64 lo, u64 hi)
+/// variant hi - lo
+{
+    if (hi - lo > 1) {
+        u64 p = partition(&mut a, lo, hi);
+        quicksort_range(&mut a, lo, p);
+        quicksort_range(&mut a, p + 1, hi);
+    }
+}
+
+/// post sorted a
+/// post perm a (old a)
+fn quicksort(&mut [i32] a) {
+    u64 n = a.len;
+    quicksort_range(&mut a, 0, n);
+}
+
+fn test_quicksort_mixed() {
+    [i32] a = [5, 3, 8, 1, 9, 2, 7, 3, 0, 6];
+    quicksort(&mut a);
+}
+
+fn test_quicksort_edges() {
+    [i32] e = [];
+    quicksort(&mut e);
+    [i32] s = [42];
+    quicksort(&mut s);
+    [i32] d = [7, 7, 7, 7];
+    quicksort(&mut d);
+}
+
+fn test_quicksort_adversarial() {
+    [i32] r = [9, 8, 7, 6, 5, 4, 3, 2, 1];
+    quicksort(&mut r);
+    [i32] a = [1, 2, 3, 4, 5];
+    quicksort(&mut a);
+    [i32] m = [2, 1, 2, 1, 2, 1];
+    quicksort(&mut m);
+}
