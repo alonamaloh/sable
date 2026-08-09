@@ -30,6 +30,9 @@ struct Ctx<'a> {
     sigs: &'a HashMap<String, FnSig>,
     current_fn: String,
     current_has_variant: bool,
+    /// `test_*` functions: dynamic-only, excluded from verification,
+    /// allowed owned arrays / borrows / array-passing (design §9).
+    in_test: bool,
     vars: HashMap<String, VarInfo>,
     /// M1 rule: locals and parameters have pairwise-distinct names
     /// (keeps path-splitting and havoc in the VC generator scope-free).
@@ -79,10 +82,32 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
 
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
     for f in &mut program.fns {
+        let is_test = f.name.starts_with("test_");
+        if is_test
+            && (f.ret != Ty::Unit
+                || !f.params.is_empty()
+                || !f.pres.is_empty()
+                || !f.posts.is_empty()
+                || f.variant.is_some())
+        {
+            return Err(Diagnostic {
+                name: "type.test_shape".into(),
+                title: format!("`{}` is a test but has parameters, a return type, or contracts", f.name),
+                span: f.name_span,
+                label: "tests are contract-free procedures: `fn test_x() { ... }`".into(),
+                notes: vec![(
+                    "note".into(),
+                    "tests are executed by `sable test` with contracts of the code under \
+                     test checked dynamically; they are never verified (design §9)"
+                        .into(),
+                )],
+            });
+        }
         let mut ctx = Ctx {
             sigs: &sigs,
             current_fn: f.name.clone(),
             current_has_variant: f.variant.is_some(),
+            in_test: is_test,
             vars: HashMap::new(),
             declared: HashSet::new(),
             calls: Vec::new(),
@@ -174,6 +199,16 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             "note".into(),
                             "M1 requires all locals in a function to have distinct names".into(),
                         )],
+                    });
+                }
+                if matches!(ty, Ty::Array(_, Mutability::Owned)) && !ctx.in_test {
+                    return Err(Diagnostic {
+                        name: "type.owned_array_outside_test".into(),
+                        title: "owned arrays exist only in test functions for now".into(),
+                        span: *name_span,
+                        label: "allocation design is a scheduled deliverable (goals doc, Tier 2)"
+                            .into(),
+                        notes: vec![],
                     });
                 }
                 if let Some(e) = init {
@@ -318,6 +353,9 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
                 returned = true;
             }
+            Stmt::ExprStmt(e) => {
+                check_expr(ctx, e, None)?;
+            }
             Stmt::Store {
                 array,
                 array_span,
@@ -348,7 +386,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         })
                     }
                 };
-                if mutability != Mutability::Mut {
+                if mutability == Mutability::Shared {
                     return Err(Diagnostic {
                         name: "type.store_shared".into(),
                         title: format!("cannot store through shared borrow `&[{}]`", elem.name()),
@@ -373,6 +411,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::While { kw_span, .. } => *kw_span,
         Stmt::Return { span, .. } => *span,
         Stmt::Store { array_span, .. } => *array_span,
+        Stmt::ExprStmt(e) => e.span,
     }
 }
 
@@ -534,6 +573,66 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             Ty::Int(*target)
         }
+        ExprKind::ArrayLit(elems) => match expected {
+            Some(Ty::Array(t, Mutability::Owned)) => {
+                if !ctx.in_test {
+                    return Err(Diagnostic {
+                        name: "type.owned_array_outside_test".into(),
+                        title: "array literals exist only in test functions for now".into(),
+                        span,
+                        label: "see docs/PLAN.md (M3)".into(),
+                        notes: vec![],
+                    });
+                }
+                for el in elems {
+                    check_expr(ctx, el, Some(Ty::Int(t)))?;
+                }
+                Ty::Array(t, Mutability::Owned)
+            }
+            _ => {
+                return Err(Diagnostic {
+                    name: "type.array_literal_position".into(),
+                    title: "array literal outside an owned-array declaration".into(),
+                    span,
+                    label: "write `[i32] a = [ ... ];`".into(),
+                    notes: vec![],
+                })
+            }
+        },
+        ExprKind::Borrow { array, mutable } => {
+            if !ctx.in_test {
+                return Err(Diagnostic {
+                    name: "type.borrow_outside_test".into(),
+                    title: "borrow expressions exist only in test functions for now".into(),
+                    span,
+                    label: "passing borrowed arrays between verified functions lands in M4"
+                        .into(),
+                    notes: vec![],
+                });
+            }
+            let elem = array_elem_ty(ctx, array, span)?;
+            let owned = matches!(
+                ctx.vars.get(array.as_str()).map(|v| v.ty),
+                Some(Ty::Array(_, Mutability::Owned))
+            );
+            if !owned {
+                return Err(Diagnostic {
+                    name: "type.borrow_non_owned".into(),
+                    title: format!("cannot borrow `{array}`"),
+                    span,
+                    label: "only owned test arrays can be borrowed".into(),
+                    notes: vec![],
+                });
+            }
+            Ty::Array(
+                elem,
+                if *mutable {
+                    Mutability::Mut
+                } else {
+                    Mutability::Shared
+                },
+            )
+        }
         ExprKind::SomeE(inner) => match expected {
             Some(Ty::Option(t)) => {
                 check_expr(ctx, inner, Some(Ty::Int(t)))?;
@@ -643,6 +742,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            if callee.starts_with("test_") {
+                return Err(Diagnostic {
+                    name: "type.call_test".into(),
+                    title: format!("`{callee}` is a test and cannot be called"),
+                    span: *callee_span,
+                    label: "tests are entry points for `sable test` only".into(),
+                    notes: vec![],
+                });
+            }
             if *callee == ctx.current_fn && !ctx.current_has_variant {
                 return Err(Diagnostic {
                     name: "type.recursion_needs_variant".into(),
@@ -670,14 +778,32 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             notes: vec![],
                         })
                     }
-                    Ty::Array(..) => {
-                        return Err(Diagnostic {
-                            name: "type.m1_array_arg".into(),
-                            title: "array-typed call arguments are not supported yet".into(),
-                            span: arg.span,
-                            label: "passing borrowed arrays lands in M2".into(),
-                            notes: vec![],
-                        })
+                    Ty::Array(elem, m) => {
+                        if !ctx.in_test {
+                            return Err(Diagnostic {
+                                name: "type.m1_array_arg".into(),
+                                title: "array-typed call arguments are not supported yet \
+                                        outside tests"
+                                    .into(),
+                                span: arg.span,
+                                label: "verified array-passing lands in M4".into(),
+                                notes: vec![],
+                            });
+                        }
+                        let got = check_expr(ctx, arg, None)?;
+                        if got != Ty::Array(elem, m) {
+                            return Err(Diagnostic {
+                                name: "type.mismatch".into(),
+                                title: format!(
+                                    "expected `{}`, found `{}`",
+                                    Ty::Array(elem, m).name(),
+                                    got.name()
+                                ),
+                                span: arg.span,
+                                label: "borrow with the required mutability".into(),
+                                notes: vec![],
+                            });
+                        }
                     }
                     _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }

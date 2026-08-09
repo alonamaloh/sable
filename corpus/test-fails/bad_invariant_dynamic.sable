@@ -1,0 +1,16 @@
+// expect-test-failure: loop invariant violated
+
+/// post result = n
+fn count(u64 n) -> u64 {
+    u64 i = 0;
+    /// invariant i < 3
+    /// variant   n - i
+    while (i < n) {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn test_invariant_caught() {
+    count(10);
+}

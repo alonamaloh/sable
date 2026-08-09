@@ -64,6 +64,10 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         obligations: Vec::new(),
     };
     for f in &program.fns {
+        // Tests are dynamic-only (design §9): never verified.
+        if f.name.starts_with("test_") {
+            continue;
+        }
         let mut generator = Generator {
             f,
             sigs,
@@ -91,6 +95,7 @@ enum Val {
     Opt(String),
     /// Symbolic array value: entry binder or a `.set` chain over it.
     Arr(String),
+    Unit,
 }
 
 #[derive(Clone)]
@@ -143,6 +148,7 @@ impl<'a> Generator<'a> {
                     let binder = match mutability {
                         Mutability::Mut => format!("_old_{}", p.name),
                         Mutability::Shared => p.name.clone(),
+                        Mutability::Owned => unreachable!("owned arrays are test-only locals"),
                     };
                     self.binders.push((binder.clone(), "Sable.Seq Int".into()));
                     self.hyps.push((
@@ -288,6 +294,11 @@ impl<'a> Generator<'a> {
                     },
                 });
                 self.emit_posts(result_eq);
+            }
+            Stmt::ExprStmt(e) => {
+                // Evaluated for obligations/assumptions only.
+                let _ = self.eval(e);
+                self.exec(rest, tail);
             }
             Stmt::Store {
                 array,
@@ -474,6 +485,7 @@ impl<'a> Generator<'a> {
                 let s = match val {
                     Val::Int(s) | Val::Opt(s) | Val::Arr(s) => s,
                     Val::Prop(s) => s,
+                    Val::Unit => continue,
                 };
                 if havoc_set.iter().any(|h| mentions(s, h)) {
                     // Shared arrays map to their own name and never change.
@@ -563,6 +575,9 @@ impl<'a> Generator<'a> {
             ExprKind::Widen { arg, .. } => self.eval(arg),
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
+            }
+            ExprKind::ArrayLit(_) | ExprKind::Borrow { .. } => {
+                unreachable!("checked: test-only expressions")
             }
             ExprKind::Index { array, index, .. } => {
                 let Val::Int(i) = self.eval(index) else {
@@ -775,10 +790,16 @@ impl<'a> Generator<'a> {
                     Ty::Option(_) => {
                         self.binders.push((ret_sym.clone(), "Option Int".into()));
                     }
+                    Ty::Unit => {}
                     _ => unreachable!(),
                 }
                 for (i, post) in callee_fn.posts.iter().enumerate() {
-                    let prop = substitute(&post.text, &subst_map, Some(&ret_sym));
+                    let ret_ref = if sig.ret == Ty::Unit {
+                        None
+                    } else {
+                        Some(ret_sym.as_str())
+                    };
+                    let prop = substitute(&post.text, &subst_map, ret_ref);
                     self.hyps
                         .push((format!("h{ret_sym}_post_{}", i + 1), format!("({prop})")));
                     self.context
@@ -786,6 +807,7 @@ impl<'a> Generator<'a> {
                 }
                 match sig.ret {
                     Ty::Option(_) => Val::Opt(ret_sym),
+                    Ty::Unit => Val::Unit,
                     _ => Val::Int(ret_sym),
                 }
             }

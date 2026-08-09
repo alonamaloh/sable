@@ -98,6 +98,8 @@ pub enum Ty {
 pub enum Mutability {
     Shared,
     Mut,
+    /// A test-function local created by an array literal.
+    Owned,
 }
 
 impl Ty {
@@ -107,6 +109,7 @@ impl Ty {
             Ty::Bool => "bool".to_string(),
             Ty::Array(t, Mutability::Shared) => format!("&[{}]", t.name()),
             Ty::Array(t, Mutability::Mut) => format!("&mut [{}]", t.name()),
+            Ty::Array(t, Mutability::Owned) => format!("[{}]", t.name()),
             Ty::Option(t) => format!("option<{}>", t.name()),
             Ty::Unit => "()".to_string(),
         }
@@ -201,6 +204,13 @@ pub enum ExprKind {
     /// `some(e)` / `none` — return position only in M1.
     SomeE(Box<Expr>),
     NoneE,
+    /// `[e1, e2, ...]` — test functions only.
+    ArrayLit(Vec<Expr>),
+    /// `&a` / `&mut a` call argument — test functions only.
+    Borrow {
+        array: String,
+        mutable: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +244,8 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
+    /// A call evaluated for effect: `f(x);` (procedures, test calls).
+    ExprStmt(Expr),
     /// `a[i] = v;` on a `&mut [T]` parameter.
     Store {
         array: String,

@@ -1,0 +1,12 @@
+// expect-test-failure: post of `add_two` violated
+// The design §9 workflow: a wrong post is caught by running it, long
+// before anyone burns time on an impossible proof.
+
+/// post result = a + 1
+fn add_two(u32 a) -> u32 {
+    return a + 2;
+}
+
+fn test_catches_wrong_post() {
+    add_two(5);
+}

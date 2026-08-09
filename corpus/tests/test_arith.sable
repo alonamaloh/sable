@@ -1,0 +1,44 @@
+// Dynamic checks over the arithmetic corpus functions.
+
+/// post b = 0 -> result = a
+fn gcd(u64 a, u64 b) -> u64
+/// variant b
+{
+    if (b == 0) { return a; }
+    return gcd(b, a % b);
+}
+
+/// pre  b > 0
+/// pre  a + b <= u32.max
+/// post result = (a + b - 1) / b
+fn div_round_up(u32 a, u32 b) -> u32 {
+    return (a + b - 1) / b;
+}
+
+/// post result = n
+fn count_up(u64 n) -> u64 {
+    u64 i = 0;
+    /// invariant i ≤ n
+    /// variant   n - i
+    while (i < n) {
+        i = i + 1;
+    }
+    return i;
+}
+
+fn test_gcd() {
+    gcd(48, 36);
+    gcd(17, 0);
+    gcd(0, 5);
+}
+
+fn test_div_round_up() {
+    div_round_up(100, 8);
+    div_round_up(0, 3);
+    div_round_up(7, 7);
+}
+
+fn test_count_up() {
+    count_up(0);
+    count_up(1000);
+}

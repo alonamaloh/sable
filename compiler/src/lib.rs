@@ -4,11 +4,13 @@
 pub mod ast;
 pub mod check;
 pub mod diag;
+pub mod interp;
 pub mod lean;
 pub mod lexer;
 pub mod parser;
 pub mod scan;
 pub mod span;
+pub mod speceval;
 pub mod vcgen;
 
 use diag::Diagnostic;
@@ -44,6 +46,29 @@ impl Default for Options {
             emit_lean_only: false,
         }
     }
+}
+
+/// Run the front end and the dynamic test interpreter (`sable test`).
+/// Never invokes Lean; contracts are checked dynamically (design §9).
+pub fn test_file(path: &Path) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
+    let display_path = path.display().to_string();
+    let source = std::fs::read_to_string(path).map_err(|err| {
+        vec![Failure {
+            name: "io.read".into(),
+            rendered: format!("error: cannot read `{display_path}`: {err}\n"),
+        }]
+    })?;
+    let lines = LineMap::new(&source);
+    let render = |d: &Diagnostic| Failure {
+        name: d.name.clone(),
+        rendered: d.render(&display_path, &source, &lines),
+    };
+    let scanned = scan::scan(&source);
+    let tokens = lexer::lex(&scanned.program_text).map_err(|d| vec![render(&d)])?;
+    let mut program = parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
+        .map_err(|d| vec![render(&d)])?;
+    check::check(&mut program).map_err(|d| vec![render(&d)])?;
+    Ok(interp::run_tests(&program, &source, &display_path))
 }
 
 pub fn check_file(path: &Path, opts: &Options) -> Outcome {
@@ -89,7 +114,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
         let find = |name: &str| vc.obligations.iter().find(|ob| ob.name == name);
         let mut treated: std::collections::HashMap<&str, &str> =
             std::collections::HashMap::new();
-        let mut conflict_or_orphan = |name: &str, what: &'static str, span: span::Span| {
+        let conflict_or_orphan = |name: &str, what: &'static str, span: span::Span| {
             if find(name).is_none() {
                 return Some(diag::Diagnostic {
                     name: format!("proof.unknown_{what}"),

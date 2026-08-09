@@ -41,9 +41,13 @@ Hard-won empirical notes: ghost-type aliases must be *notation*, not `abbrev` (t
 
 Known M2 simplifications: `old x` only for `&mut` array params; array arguments in calls still rejected (passing borrows is M3, with scalar `&mut i32` refs); bool locals in loop clauses unsupported; `for` bounds may not mention the mutated array (workaround: `u64 n = a.len;` first); discharge scripts still cite generated hypothesis names.
 
-### M3 — escape hatches and dynamic checking
+### M3 — escape hatches and dynamic checking *(complete, 2026-08-09)*
 
-`defer` (trap compilation, incl. bounded-quantifier checking loops), `assume` with `#[audit]`, per-package build-report tallies, and the `sable test` tree-walking interpreter with dynamic contract checks.
+**Escape hatches**: `/// defer NAME` (obligation becomes a runtime trap; sound — its goal was already assumed downstream, which is exactly trap semantics; rejected for quantified goals) and `/// assume #[audit(reason := "...")] NAME` (audited axiom; payload mandatory). Orphans, conflicts, and missing audits are errors. The build report tallies proved/deferred/assumed and prints `status: fully verified` only at zero escapes — the §9 assurance ladder.
+
+**`sable test`**: tree-walking interpreter with trap semantics (overflow/bounds/division checked exactly where VCs would be; Euclidean division; fuel-bounded), plus a monitorable-fragment evaluator for the proof language (`speceval`): ℤ arithmetic, logic, `a.len`/`a.get`, `old a`, guard-bounded quantifiers (capped), non-recursive ghost-def expansion, `match result` on options, and `Seq.perm` as multiset equality. Pres, posts, loop invariants, and variant decrease/nonnegativity are all checked dynamically; unmonitorable clauses are reported as skipped, never guessed. **The entire current contract corpus is inside the fragment (zero skips)** — asserted by the harness so the fragment can't silently shrink. `test_*` functions (contract-free procedures) may build owned array literals and pass `&a`/`&mut a`; they are never verified (design §9: sanitizer category).
+
+Deviations/simplifications recorded: escape hatches are name-based module-level clauses (not the design's statement-attached `kind(expr)` form); statement-level `assert` not yet; bounded-quantifier `defer` compilation deferred (the interpreter checks everything anyway); owned arrays/borrow args are test-only until verified array-passing (M4+); the spec evaluator is explicitly best-effort tooling, not a second checker of record (ADR 0002 note).
 
 ### M4 — LSP
 

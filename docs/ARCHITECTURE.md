@@ -48,6 +48,21 @@ Generated Lean goes to `.sable-out/` (gitignored), one file per module, `import 
 - **Values are exact integers.** Program integers are represented in Lean as `Int`; per-operation VCs guarantee representability, so symbolic values never wrap. `wrap()` etc. (later) get explicit `mod 2^n` semantics.
 - **The prelude depends on Lean core only** — no mathlib. Cold-start and toolchain churn stay controlled; the multiset library (M2) is written in-repo.
 
+## `sable test` (dynamic checking)
+
+A separate, Lean-free path (design §9): `interp.rs` is a tree-walking
+interpreter with trap semantics (overflow/bounds/division checked exactly
+where the verifier emits VCs), and `speceval.rs` evaluates the
+*monitorable fragment* of the proof language (arithmetic, logic, sequence
+access, `old`, guard-bounded quantifiers, ghost-def expansion, option
+match, `perm` as multiset equality). Pres/posts/invariants/variants are
+checked dynamically; anything outside the fragment is reported as
+skipped, never guessed — this is best-effort dev tooling, not a second
+checker of record. `test_*` functions are its entry points and are never
+verified. Escape hatches: `defer` skips an obligation's theorem but keeps
+its downstream assumption (trap semantics); `assume` does the same as an
+audited axiom; both are tallied in the build report.
+
 ## Repo layout
 
 ```

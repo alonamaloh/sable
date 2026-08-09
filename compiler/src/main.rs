@@ -6,6 +6,7 @@ const USAGE: &str = "\
 Usage:
   sable check <file.sable>           verify a Sable source file
   sable check --emit-lean <file>     print the generated Lean instead of checking
+  sable test  <file.sable>           run test_* functions with dynamic contract checks
 ";
 
 fn main() -> ExitCode {
@@ -17,6 +18,7 @@ fn main() -> ExitCode {
     for arg in &args {
         match arg.as_str() {
             "check" if command.is_none() => command = Some("check"),
+            "test" if command.is_none() => command = Some("test"),
             "--emit-lean" => opts.emit_lean_only = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -32,10 +34,50 @@ fn main() -> ExitCode {
         }
     }
 
-    let (Some("check"), Some(file)) = (command, file) else {
+    let (Some(command), Some(file)) = (command, file) else {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
+
+    if command == "test" {
+        return match sable::test_file(&file) {
+            Err(failures) => {
+                for f in &failures {
+                    eprintln!("{}", f.rendered);
+                }
+                ExitCode::FAILURE
+            }
+            Ok(reports) => {
+                if reports.is_empty() {
+                    println!("no test_* functions in {}", file.display());
+                    return ExitCode::SUCCESS;
+                }
+                let mut failed = 0;
+                for r in &reports {
+                    match &r.outcome {
+                        Ok(()) => println!("test {} ... ok", r.name),
+                        Err(msg) => {
+                            failed += 1;
+                            println!("test {} ... FAILED", r.name);
+                            println!("    {msg}");
+                        }
+                    }
+                    for (clause, why) in &r.skipped {
+                        println!("    skipped (unmonitorable): {clause} — {why}");
+                    }
+                }
+                println!(
+                    "test result: {} passed, {failed} failed",
+                    reports.len() - failed
+                );
+                if failed == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+        };
+    }
 
     match check_file(&file, &opts) {
         Outcome::Verified {

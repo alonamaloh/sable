@@ -9,6 +9,7 @@ cd compiler && cargo build            # build the compiler
 cd compiler && cargo test             # unit tests + full corpus (runs Lean; slow-ish)
 cd lean && lake build                 # build the Sable prelude (needed once; cached)
 compiler/target/debug/sable check corpus/verifies/div_round_up.sable
+compiler/target/debug/sable test corpus/tests/test_sorting.sable   # dynamic contract checks, no Lean
 ```
 
 Lean is pinned by `lean/lean-toolchain`; elan fetches it automatically. Never upgrade the pin casually — it gets its own commit, tested against the corpus.

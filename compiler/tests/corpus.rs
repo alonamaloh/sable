@@ -96,6 +96,89 @@ fn corpus() {
         }
     }
 
+    // Dynamic-test corpus: corpus/tests must pass with no skipped
+    // clauses (the whole contract corpus is inside the monitorable
+    // fragment — a regression here means the fragment shrank).
+    for path in sable_files(&corpus_dir("tests")) {
+        match sable::test_file(&path) {
+            Err(diags) => failures.push(format!(
+                "{} failed the front end:\n{}",
+                path.display(),
+                diags
+                    .iter()
+                    .map(|f| f.rendered.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+            Ok(reports) => {
+                for r in &reports {
+                    if let Err(msg) = &r.outcome {
+                        failures.push(format!(
+                            "{} test {} failed: {msg}",
+                            path.display(),
+                            r.name
+                        ));
+                    }
+                    for (clause, why) in &r.skipped {
+                        failures.push(format!(
+                            "{} test {} skipped a clause (fragment regression): {clause} — {why}",
+                            path.display(),
+                            r.name
+                        ));
+                    }
+                }
+                println!("ok (dynamic): {} ({} tests)", path.display(), reports.len());
+            }
+        }
+    }
+
+    // corpus/test-fails: each must produce a dynamic failure whose
+    // message contains the expect-test-failure marker.
+    for path in sable_files(&corpus_dir("test-fails")) {
+        let expected: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("// expect-test-failure:")
+                    .map(|s| s.trim().to_string())
+            })
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "{} has no `// expect-test-failure:` header",
+            path.display()
+        );
+        match sable::test_file(&path) {
+            Err(diags) => failures.push(format!(
+                "{} failed the front end:\n{}",
+                path.display(),
+                diags
+                    .iter()
+                    .map(|f| f.rendered.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )),
+            Ok(reports) => {
+                let messages: Vec<&str> = reports
+                    .iter()
+                    .filter_map(|r| r.outcome.as_ref().err())
+                    .map(|s| s.as_str())
+                    .collect();
+                for exp in &expected {
+                    if !messages.iter().any(|m| m.contains(exp.as_str())) {
+                        failures.push(format!(
+                            "{} should fail dynamically with `{exp}`; got: [{}]",
+                            path.display(),
+                            messages.join(" | ")
+                        ));
+                    }
+                }
+                println!("ok (fails dynamically): {}", path.display());
+            }
+        }
+    }
+
     assert!(
         failures.is_empty(),
         "\n== corpus failures ==\n{}",

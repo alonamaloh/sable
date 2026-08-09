@@ -1,0 +1,10 @@
+// expect-test-failure: overflow
+
+/// post result = a + b
+fn add(u8 a, u8 b) -> u8 {
+    return a + b;
+}
+
+fn test_overflow_traps() {
+    add(200, 100);
+}

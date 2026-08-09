@@ -1,0 +1,11 @@
+// expect-test-failure: pre of `div_round_up` violated
+
+/// pre  b > 0
+/// post result = (a + b - 1) / b
+fn div_round_up(u32 a, u32 b) -> u32 {
+    return (a + b - 1) / b;
+}
+
+fn test_zero_divisor_rejected() {
+    div_round_up(10, 0);
+}

@@ -648,6 +648,26 @@ impl<'a> Parser<'a> {
             }
             Tok::KwIf => self.if_stmt(),
             Tok::KwWhile => self.while_stmt(),
+            Tok::LBracket => {
+                // `[i32] a = [1, 2, 3];` — owned array local (tests only;
+                // the checker enforces the context).
+                self.bump();
+                let (elem, _) = self.int_ty()?;
+                self.expect(Tok::RBracket)?;
+                let (name, name_span) = self.ident()?;
+                if is_reserved_name(&name) {
+                    return Err(reserved_name_error(&name, name_span, "variable"));
+                }
+                self.expect(Tok::Assign)?;
+                let init = self.expr()?;
+                self.expect(Tok::Semi)?;
+                Ok(Stmt::Decl {
+                    ty: Ty::Array(elem, Mutability::Owned),
+                    name,
+                    name_span,
+                    init: Some(init),
+                })
+            }
             Tok::Ident(first) => {
                 if let Tok::Ident(_) = self.peek2() {
                     let (ty, _) = self.scalar_ty()?;
@@ -668,6 +688,10 @@ impl<'a> Parser<'a> {
                         name_span,
                         init,
                     })
+                } else if self.peek2() == &Tok::LParen {
+                    let e = self.expr()?;
+                    self.expect(Tok::Semi)?;
+                    Ok(Stmt::ExprStmt(e))
                 } else if self.peek2() == &Tok::LBracket {
                     let array_span = self.peek_span();
                     self.bump();
@@ -1056,6 +1080,41 @@ impl<'a> Parser<'a> {
                 e.span = span.join(close);
                 Ok(e)
             }
+            Tok::LBracket => {
+                self.bump();
+                let mut elems = Vec::new();
+                if !self.at(&Tok::RBracket) {
+                    loop {
+                        elems.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(Tok::RBracket)?.span;
+                Ok(Expr {
+                    kind: ExprKind::ArrayLit(elems),
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
+            Tok::Amp => {
+                self.bump();
+                let mutable = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
+                    self.bump();
+                    true
+                } else {
+                    false
+                };
+                let (array, aspan) = self.ident()?;
+                Ok(Expr {
+                    kind: ExprKind::Borrow { array, mutable },
+                    span: span.join(aspan),
+                    ty: None,
+                })
+            }
             _ => Err(self.error_expected("an expression")),
         }
     }
@@ -1161,6 +1220,14 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
             for a in args {
                 expr_vars(a, out);
             }
+        }
+        ExprKind::ArrayLit(elems) => {
+            for el in elems {
+                expr_vars(el, out);
+            }
+        }
+        ExprKind::Borrow { array, .. } => {
+            out.insert(array.clone());
         }
         ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::NoneE => {}
     }
