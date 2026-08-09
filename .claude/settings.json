@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r \".tool_input.file_path // empty\"); case \"$f\" in *.sable) ;; *) exit 0;; esac; case \"$f\" in */corpus/must-fail/*|*/corpus/test-fails/*|*/corpus/tests/*) exit 0;; esac; bin=\"$CLAUDE_PROJECT_DIR/compiler/target/debug/sable\"; [ -x \"$bin\" ] || exit 0; out=$(\"$bin\" check \"$f\" 2>&1) && exit 0; { echo \"sable check failed for $f:\"; echo \"$out\"; } >&2; exit 2",
+            "timeout": 120,
+            "statusMessage": "sable check"
+          }
+        ]
+      }
+    ]
+  }
+}

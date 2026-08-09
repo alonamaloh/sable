@@ -1,0 +1,66 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Sable",
+  "scopeName": "source.sable",
+  "patterns": [
+    {
+      "comment": "Interface clauses (pre/post): bright — the reader's contract",
+      "match": "^\\s*(///)\\s*(pre|post)\\b(.*)$",
+      "captures": {
+        "1": { "name": "punctuation.definition.comment.sable" },
+        "2": { "name": "keyword.control.contract.sable" },
+        "3": { "name": "string.interpolated.contract.sable" }
+      }
+    },
+    {
+      "comment": "Evidence clauses with a keyword: dimmed, keyword visible",
+      "match": "^\\s*(///)\\s*(invariant|variant|discharge|defer|assume|def|theorem|assert)\\b(.*)$",
+      "name": "comment.block.documentation.sable",
+      "captures": {
+        "2": { "name": "keyword.other.evidence.sable" }
+      }
+    },
+    {
+      "comment": "Continuation / other proof lines: dimmed",
+      "match": "^\\s*///.*$",
+      "name": "comment.block.documentation.sable"
+    },
+    {
+      "match": "//[^/].*$|//$",
+      "name": "comment.line.double-slash.sable"
+    },
+    {
+      "match": "\\b(fn|return|if|else|while|for|range)\\b",
+      "name": "keyword.control.sable"
+    },
+    {
+      "match": "\\b(widen|some|none|option|mut)\\b",
+      "name": "keyword.other.sable"
+    },
+    {
+      "match": "\\b(true|false)\\b",
+      "name": "constant.language.sable"
+    },
+    {
+      "match": "\\b(u8|u16|u32|u64|i8|i16|i32|i64|bool)\\b",
+      "name": "storage.type.sable"
+    },
+    {
+      "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.control.sable" },
+        "2": { "name": "entity.name.function.sable" }
+      }
+    },
+    {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*\\(",
+      "captures": {
+        "1": { "name": "entity.name.function.call.sable" }
+      }
+    },
+    {
+      "match": "\\b[0-9][0-9_]*\\b",
+      "name": "constant.numeric.sable"
+    }
+  ]
+}

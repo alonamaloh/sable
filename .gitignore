@@ -2,3 +2,6 @@
 /lean/.lake/
 /.sable-out/
 .DS_Store
+/editors/vscode/node_modules/
+/editors/vscode/*.vsix
+/editors/vscode/package-lock.json

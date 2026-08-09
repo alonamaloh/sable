@@ -4,15 +4,21 @@
   "description": "Language support for the Sable verified programming language",
   "version": "0.1.0",
   "publisher": "sable-lang",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Programming Languages"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
   "main": "./extension.js",
   "activationEvents": [],
   "contributes": {
     "languages": [
       {
         "id": "sable",
-        "extensions": [".sable"],
+        "extensions": [
+          ".sable"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -25,7 +31,14 @@
           "description": "Path to the sable binary (run with `lsp`)."
         }
       }
-    }
+    },
+    "grammars": [
+      {
+        "language": "sable",
+        "scopeName": "source.sable",
+        "path": "./syntaxes/sable.tmLanguage.json"
+      }
+    ]
   },
   "scripts": {
     "package": "vsce package"
