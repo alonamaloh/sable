@@ -1,0 +1,24 @@
+// `for (T i : range(...))` sugar (proposed by Alvaro): the bounds
+// invariant, variant, and increment come for free; extra invariants
+// attach above the `for` as usual.
+
+/// post result = n
+fn count_for(u64 n) -> u64 {
+    u64 total = 0;
+    /// invariant total = i
+    for (u64 i : range(n)) {
+        total = total + 1;
+    }
+    return total;
+}
+
+/// pre  lo ≤ hi
+/// post result = hi - lo
+fn span_len(u32 lo, u32 hi) -> u32 {
+    u32 count = 0;
+    /// invariant count = i - lo
+    for (u32 i : range(lo, hi)) {
+        count = count + 1;
+    }
+    return count;
+}

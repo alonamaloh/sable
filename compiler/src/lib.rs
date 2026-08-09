@@ -65,7 +65,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
         Ok(t) => t,
         Err(d) => return Outcome::Failed(vec![render(&d)]),
     };
-    let mut program = match parser::parse(&tokens, &scanned.blocks, &lines) {
+    let mut program = match parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text) {
         Ok(p) => p,
         Err(d) => return Outcome::Failed(vec![render(&d)]),
     };

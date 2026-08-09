@@ -843,7 +843,7 @@ impl<'a> Generator<'a> {
     }
 }
 
-fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
+pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
     for s in stmts {
         match s {
             Stmt::Assign { name, .. } => {

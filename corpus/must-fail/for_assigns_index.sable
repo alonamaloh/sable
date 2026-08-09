@@ -1,0 +1,10 @@
+// expect-error: parse.for_assigns_index
+// The loop advances the index; the body may not.
+
+/// post result = n
+fn bad(u64 n) -> u64 {
+    for (u64 i : range(n)) {
+        i = i + 2;
+    }
+    return n;
+}

@@ -27,6 +27,8 @@ Known M0 simplifications (each has a scheduled fix): signed division/modulo reje
 
 Exit met: `binary_search` (design §6, all-Int spec style) verifies — 19 obligations, 17 automatic, 2 hand discharges (the sortedness-instantiation preservation goals; automation got `post.none`, which the design doc had expected to need one).
 
+Also in M1: `for (T i : range(lo, hi))` sugar (Alvaro's proposal) — bounds invariant, variant, and increment synthesized in the parser; extra invariants attach as usual (design §4).
+
 Known M1 simplifications, scheduled fixes: discharge scripts reference generated hypothesis names (`h_inv7_2`) read from failure output — content-anchored hypothesis naming is the M2 refinement; obligation names are path-dependent for repeated clauses (`.2` suffixes); invariant/variant clauses must not bind variables shadowing program variable names (token substitution cannot see binders); bool locals mentioned in loop clauses are unsupported; array parameters cannot yet be passed to callees (M2, with `&mut [T]` and stores); `sable test`/`defer`/`assume` are M3.
 
 ### M2 — ghost definitions and the seq/multiset prelude

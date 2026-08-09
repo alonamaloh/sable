@@ -17,17 +17,24 @@ pub struct Parser<'a> {
     blocks: &'a [ProofBlock],
     consumed: Vec<bool>,
     lines: &'a LineMap,
+    text: &'a str,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
 
-pub fn parse(tokens: &[Token], blocks: &[ProofBlock], lines: &LineMap) -> PResult<Program> {
+pub fn parse(
+    tokens: &[Token],
+    blocks: &[ProofBlock],
+    lines: &LineMap,
+    text: &str,
+) -> PResult<Program> {
     let mut parser = Parser {
         tokens,
         pos: 0,
         blocks,
         consumed: vec![false; blocks.len()],
         lines,
+        text,
     };
     let mut fns = Vec::new();
     while !parser.at(&Tok::Eof) {
@@ -330,10 +337,186 @@ impl<'a> Parser<'a> {
             if self.at(&Tok::Eof) {
                 return Err(self.error_expected("`}`"));
             }
-            stmts.push(self.stmt()?);
+            if self.at(&Tok::KwFor) {
+                stmts.extend(self.for_stmt()?);
+            } else {
+                stmts.push(self.stmt()?);
+            }
         }
         self.expect(Tok::RBrace)?;
         Ok(stmts)
+    }
+
+    /// `for (T i : range(hi))` / `for (T i : range(lo, hi))` — pure sugar,
+    /// desugared here to a declaration plus a `while` whose bounds
+    /// invariant, variant, and increment are synthesized from the bounds'
+    /// source text. Extra user `invariant`s above the `for` are kept; a
+    /// user `variant` is rejected (the sugar provides it).
+    fn for_stmt(&mut self) -> PResult<Vec<Stmt>> {
+        let for_line = self.peek_line();
+        let kw_span = self.expect(Tok::KwFor)?.span;
+
+        let mut user_invariants = Vec::new();
+        if let Some(block) = self.take_block_ending_before(for_line) {
+            for clause in &block.clauses {
+                match clause.kind {
+                    ClauseKind::Invariant => user_invariants.push(clause.clone()),
+                    ClauseKind::Variant => {
+                        return Err(Diagnostic {
+                            name: "proof.for_variant".into(),
+                            title: "`for` loops provide their own `variant`".into(),
+                            span: clause.line_span,
+                            label: "remove this clause (the range bound is the measure)".into(),
+                            notes: vec![],
+                        })
+                    }
+                    other => {
+                        return Err(bad_clause(
+                            other,
+                            clause,
+                            "a loop annotation block",
+                            "only `invariant` may precede a `for` loop",
+                        ))
+                    }
+                }
+            }
+        }
+
+        self.expect(Tok::LParen)?;
+        let (ity, _) = self.int_ty()?;
+        let (index, index_span) = self.ident()?;
+        if is_reserved_name(&index) {
+            return Err(reserved_name_error(&index, index_span, "loop index"));
+        }
+        self.expect(Tok::Colon)?;
+        let (range_word, range_span) = self.ident()?;
+        if range_word != "range" {
+            return Err(Diagnostic {
+                name: "parse.expected_range".into(),
+                title: format!("expected `range`, found `{range_word}`"),
+                span: range_span,
+                label: "`for` iterates over `range(hi)` or `range(lo, hi)`".into(),
+                notes: vec![],
+            });
+        }
+        self.expect(Tok::LParen)?;
+        let first_bound = self.expr()?;
+        let (lo_expr, hi_expr) = if self.at(&Tok::Comma) {
+            self.bump();
+            let hi = self.expr()?;
+            (Some(first_bound), hi)
+        } else {
+            (None, first_bound)
+        };
+        self.expect(Tok::RParen)?;
+        self.expect(Tok::RParen)?;
+        let body = self.block()?;
+
+        // The synthesized invariant refers to the bounds by their source
+        // text, so neither the index nor the bounds' variables may be
+        // assigned by the body.
+        let mut assigned = std::collections::HashSet::new();
+        crate::vcgen::collect_assigned(&body, &mut assigned);
+        if assigned.contains(&index) {
+            return Err(Diagnostic {
+                name: "parse.for_assigns_index".into(),
+                title: format!("`for` body assigns the loop index `{index}`"),
+                span: index_span,
+                label: "the index is advanced by the loop itself".into(),
+                notes: vec![],
+            });
+        }
+        let mut bound_vars = std::collections::HashSet::new();
+        expr_vars(&hi_expr, &mut bound_vars);
+        if let Some(lo) = &lo_expr {
+            expr_vars(lo, &mut bound_vars);
+        }
+        if let Some(clash) = bound_vars.iter().find(|v| assigned.contains(v.as_str())) {
+            return Err(Diagnostic {
+                name: "parse.for_mutates_bound".into(),
+                title: format!("`for` body assigns `{clash}`, which the range bound mentions"),
+                span: kw_span,
+                label: "range bounds must be loop-invariant".into(),
+                notes: vec![],
+            });
+        }
+
+        let lo_src = lo_expr
+            .as_ref()
+            .map(|e| self.text[e.span.start..e.span.end].to_string())
+            .unwrap_or_else(|| "0".to_string());
+        let hi_src = self.text[hi_expr.span.start..hi_expr.span.end].to_string();
+        let hi_span = hi_expr.span;
+
+        let synth_clause = |text: String, kind: ClauseKind| Clause {
+            kind,
+            text,
+            span: hi_span,
+            line_span: kw_span.join(hi_span),
+        };
+        let mut invariants = vec![synth_clause(
+            format!("({lo_src}) ≤ {index} ∧ {index} ≤ ({hi_src})"),
+            ClauseKind::Invariant,
+        )];
+        invariants.extend(user_invariants);
+        let variant = synth_clause(format!("({hi_src}) - {index}"), ClauseKind::Variant);
+
+        let var = |name: &str| Expr {
+            kind: ExprKind::Var(name.to_string()),
+            span: index_span,
+            ty: None,
+        };
+        let init = lo_expr.unwrap_or(Expr {
+            kind: ExprKind::IntLit(0),
+            span: kw_span,
+            ty: None,
+        });
+        let cond = Expr {
+            kind: ExprKind::Binary {
+                op: BinOp::Lt,
+                op_span: kw_span,
+                lhs: Box::new(var(&index)),
+                rhs: Box::new(hi_expr),
+            },
+            span: kw_span.join(hi_span),
+            ty: None,
+        };
+        let increment = Stmt::Assign {
+            name: index.clone(),
+            name_span: index_span,
+            value: Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Add,
+                    op_span: kw_span,
+                    lhs: Box::new(var(&index)),
+                    rhs: Box::new(Expr {
+                        kind: ExprKind::IntLit(1),
+                        span: kw_span,
+                        ty: None,
+                    }),
+                },
+                span: kw_span,
+                ty: None,
+            },
+        };
+        let mut while_body = body;
+        while_body.push(increment);
+
+        Ok(vec![
+            Stmt::Decl {
+                ty: Ty::Int(ity),
+                name: index,
+                name_span: index_span,
+                init: Some(init),
+            },
+            Stmt::While {
+                cond,
+                invariants,
+                variant: Some(variant),
+                kw_span,
+                body: while_body,
+            },
+        ])
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
@@ -827,5 +1010,35 @@ fn reserved_name_error(name: &str, span: Span, what: &str) -> Diagnostic {
              with Lean keywords or Sable builtins are rejected"
                 .into(),
         )],
+    }
+}
+
+/// Free program identifiers of an expression (over-approximate: includes
+/// array names and callees; used for `for`-bound stability checks).
+fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    match &e.kind {
+        ExprKind::Var(n) => {
+            out.insert(n.clone());
+        }
+        ExprKind::Index { array, index, .. } => {
+            out.insert(array.clone());
+            expr_vars(index, out);
+        }
+        ExprKind::Len { array } => {
+            out.insert(array.clone());
+        }
+        ExprKind::Unary { operand, .. } => expr_vars(operand, out),
+        ExprKind::Widen { arg, .. } => expr_vars(arg, out),
+        ExprKind::SomeE(inner) => expr_vars(inner, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_vars(lhs, out);
+            expr_vars(rhs, out);
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args {
+                expr_vars(a, out);
+            }
+        }
+        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::NoneE => {}
     }
 }
