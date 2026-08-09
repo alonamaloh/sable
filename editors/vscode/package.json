@@ -50,5 +50,6 @@
   },
   "devDependencies": {
     "@vscode/vsce": "^2.24.0"
-  }
+  },
+  "license": "(MIT OR Apache-2.0)"
 }
