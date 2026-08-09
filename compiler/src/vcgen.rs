@@ -492,7 +492,17 @@ impl<'a> Generator<'a> {
                 self.exec(rest, tail);
             }
             Stmt::Assign { name, value, .. } => {
+                if matches!(
+                    value.kind,
+                    ExprKind::Call { .. }
+                        | ExprKind::MethodCall { .. }
+                        | ExprKind::CtorCall { .. }
+                        | ExprKind::AllocArray { .. }
+                ) {
+                    self.name_hint = Some(name.clone());
+                }
                 let v = self.eval(value);
+                self.name_hint = None;
                 self.env.insert(name.clone(), v);
                 self.exec(rest, tail);
             }

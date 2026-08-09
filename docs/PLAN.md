@@ -112,6 +112,16 @@ Traits v1 limits (ADR 0007): bounds over integer types only, one bound per param
 
 Next Tier 2 candidates: JSON tokenizer (wants the hash map), DEFLATE (wants bit-level ghosts), UTF-8 decode-iteration (yielding codepoints — wants a way to consume `option` results in program code, still an open surface-design gap).
 
+### M10 — the JSON tokenizer *(complete, 2026-08-09)*
+
+`corpus/verifies/json_lex.sable`: the RFC 8259 lexical grammar, fully verified — 175 obligations across 9 functions, 11 discharges. The grammar lives in ghost predicates: `strTail` (string bodies — recursive with *varying* escape widths: 1 for plain chars, 2 for short escapes, 6 for `\uXXXX`), `digits`/`jint`/`jfrac`/`jexp`/`jnumber` (numbers, an ∃-split over phase boundaries), `jtoken` (the kind disjunction over punctuation/literals/strings/numbers), and `lexable` (whole-buffer tokenizability — the recursion target is *guarded*, `if pos < e then e else pos + 1`, so the ∃-bound token end needs no termination side condition: the split hands the decreasing proof its hypothesis).
+
+Two patterns matured here. **Phase functions**: every multi-path lexeme phase is a small contracted helper (`digit_run`, `hexd_ok`, `jint_scan`, `jfrac_scan`, `jexp_scan`), so path splits stay contained and `json_number_end`'s ∃-witnesses are stable call-result binders — its post needed exactly one discharge. **Spec strengthening beats discharge cleverness**: adding one nonemptiness post to `digit_run` (`i < b.len → digitc (b.get i) → i < result`) let four scan posts that needed atom-congruence gymnastics close automatically instead. Probe-first: 6-for-6 (`docs/notes/json-probe.lean`).
+
+Scanner-side, `json_string_end` carries the ∀-quantified forward-scan invariant (`∀ e2, strTail b i e2 → strTail b (pos+1) e2` — quantified because the closing position isn't known mid-scan), chained through `strTail_char`/`strTail_esc`/`strTail_hex` plus the inversion lemma `strTail_lt`. The capstone `json_lex_ok` post `result → lexable b 0` is kernel-checked; dynamic tests run real JSON (nested objects, escapes incl. `\u`, signed exponents) and nine reject classes at zero skips.
+
+Next: the JSON *parser* (token stream → structural validation — wants the hash map for object keys, and will force the option-consumption surface design); DEFLATE (bit-level ghosts).
+
 ## Parallel track (low intensity)
 
 The SVM step relation in Lean — **started**: `lean/Sable/SVM.lean` (73 rules, builds clean) with the design-audit findings in `docs/notes/svm-draft.md` (11 ambiguities, cross-referenced from design §10). Next steps there: determinism proof, a functional evaluator + agreement proof (the differential-testing oracle against `interp.rs`), then calls/frames. The audit findings should be resolved into the design doc.
