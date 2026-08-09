@@ -1,6 +1,6 @@
 # Implementation plan
 
-Original north star for v0.1 — **verify `binary_search` and insertion sort end-to-end, with no hand-waving** — was reached 2026-08-08/09; the corpus now also carries fully-specified quicksort, the merge kernel, and round-trip codecs. Current north star: **Tier 1 of the roadmap** (goals doc) — `Vec` and generics v1 landed (M7); next is **the hash map and the law-carrying trait bounds it forces** (`T: Hashable`), on top of the remaining M6 odds and ends.
+Original north star for v0.1 — **verify `binary_search` and insertion sort end-to-end, with no hand-waving** — was reached 2026-08-08/09; the corpus now also carries fully-specified quicksort, the merge kernel, and round-trip codecs. Current north star: **Tier 2 of the roadmap** (goals doc) — Tier 1 is complete (`Vec`/generics M7, traits/hash map M8) and the UTF-8 codec opened Tier 2 (M9); next: buffer-level UTF-8 validation, then the JSON tokenizer (which wants the hash map), with the remaining M6 odds and ends as filler.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
