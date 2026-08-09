@@ -1,0 +1,43 @@
+// The M5 exit criterion: design §7's BoundedStack, near-verbatim.
+// The class invariant is an interface block: an obligation at the exit
+// of every init and &mut-self method, an assumption at every entry.
+
+class BoundedStack {
+    [i32] buf;
+    u64  len;
+
+    /// invariant len ≤ buf.len
+    /// invariant buf.len > 0
+
+    /// pre cap > 0
+    init with_capacity(u64 cap) {
+        self.buf = alloc_array<i32>(cap, 0);
+        self.len = 0;
+    }
+
+    /// post result  → self.len = old self.len + 1 ∧ self.buf.get (old self.len) = x
+    /// post ¬result → self = old self
+    fn push(&mut self, i32 x) -> bool {
+        if (self.len == self.buf.len) { return false; }
+        self.buf[self.len] = x;
+        self.len = self.len + 1;
+        return true;
+    }
+
+    /// post old self.len = 0 → result = none
+    /// post old self.len > 0 → result = some (self.buf.get (old self.len - 1))
+    fn pop(&mut self) -> option<i32> {
+        if (self.len == 0) { return none; }
+        self.len = self.len - 1;
+        return some(self.buf[self.len]);
+    }
+
+    deinit {
+    }
+}
+
+fn demo() {
+    var s = BoundedStack::with_capacity(4);
+    s.push(7);
+    s.pop();
+}

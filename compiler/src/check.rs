@@ -15,6 +15,16 @@ pub struct FnSig {
     pub ret: Ty,
 }
 
+/// Lightweight class signature data, pre-collected so member bodies can
+/// be checked while the AST is mutably traversed.
+#[derive(Clone)]
+pub struct ClassMeta {
+    pub name: String,
+    pub fields: Vec<(String, Ty)>,
+    pub inits: Vec<(String, Vec<Param>)>,
+    pub methods: Vec<(String, Vec<Param>, Ty, SelfKind)>,
+}
+
 pub struct CheckResult {
     pub sigs: HashMap<String, FnSig>,
 }
@@ -39,6 +49,11 @@ struct Ctx<'a> {
     declared: HashSet<String>,
     /// Non-self callees (for mutual-recursion detection).
     calls: Vec<String>,
+    /// Class-member context: (class meta index, self is &mut).
+    in_class: Option<(usize, bool)>,
+    /// Inside an `init`: fields start uninitialized, `return` forbidden.
+    in_init: bool,
+    class_metas: &'a [ClassMeta],
 }
 
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
@@ -69,6 +84,78 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 ret: f.ret,
             },
         );
+    }
+
+    // Class signatures + validation.
+    let mut class_metas: Vec<ClassMeta> = Vec::new();
+    {
+        let mut seen = HashSet::new();
+        for c in &program.classes {
+            if !seen.insert(c.name.clone()) || sigs.contains_key(&c.name) {
+                return Err(Diagnostic {
+                    name: "type.duplicate_class".into(),
+                    title: format!("`{}` is defined twice", c.name),
+                    span: c.name_span,
+                    label: "class/function names share one namespace".into(),
+                    notes: vec![],
+                });
+            }
+            let mut fields = Vec::new();
+            let mut fseen = HashSet::new();
+            for fld in &c.fields {
+                if !fseen.insert(fld.name.clone()) {
+                    return Err(Diagnostic {
+                        name: "type.duplicate_field".into(),
+                        title: format!("duplicate field `{}`", fld.name),
+                        span: fld.span,
+                        label: "already declared".into(),
+                        notes: vec![],
+                    });
+                }
+                fields.push((fld.name.clone(), fld.ty));
+            }
+            let scalar_params = |params: &[Param]| -> CResult<()> {
+                for p in params {
+                    if !matches!(p.ty, Ty::Int(_)) {
+                        return Err(Diagnostic {
+                            name: "type.m5_member_param".into(),
+                            title: "init/method parameters must be integers for now".into(),
+                            span: p.span,
+                            label: format!("this has type `{}`", p.ty.name()),
+                            notes: vec![],
+                        });
+                    }
+                }
+                Ok(())
+            };
+            let mut inits = Vec::new();
+            for i in &c.inits {
+                scalar_params(&i.params)?;
+                inits.push((i.name.clone(), i.params.clone()));
+            }
+            let mut methods = Vec::new();
+            for m in &c.methods {
+                scalar_params(&m.f.params)?;
+                methods.push((m.f.name.clone(), m.f.params.clone(), m.f.ret, m.self_kind));
+            }
+            if let Some(d) = &c.deinit {
+                if !d.is_empty() {
+                    return Err(Diagnostic {
+                        name: "type.m5_deinit_body".into(),
+                        title: "`deinit` bodies must be empty for now".into(),
+                        span: c.name_span,
+                        label: "owned fields are freed automatically".into(),
+                        notes: vec![],
+                    });
+                }
+            }
+            class_metas.push(ClassMeta {
+                name: c.name.clone(),
+                fields,
+                inits,
+                methods,
+            });
+        }
     }
 
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
@@ -102,6 +189,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             vars: HashMap::new(),
             declared: HashSet::new(),
             calls: Vec::new(),
+            in_class: None,
+            in_init: false,
+            class_metas: &class_metas,
         };
         for p in &f.params {
             if !ctx.declared.insert(p.name.clone()) {
@@ -141,6 +231,107 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             });
         }
         call_graph.insert(f.name.clone(), ctx.calls);
+    }
+
+    // Class members.
+    for (ci, class) in program.classes.iter_mut().enumerate() {
+        let meta = &class_metas[ci];
+        for init in &mut class.inits {
+            let mut ctx = Ctx {
+                sigs: &sigs,
+                current_fn: format!("{}::{}", meta.name, init.name),
+                current_has_variant: false,
+                in_test: false,
+                vars: HashMap::new(),
+                declared: HashSet::new(),
+                calls: Vec::new(),
+                in_class: Some((ci, true)),
+                in_init: true,
+                class_metas: &class_metas,
+            };
+            for p in &init.params {
+                ctx.declared.insert(p.name.clone());
+                ctx.vars.insert(
+                    p.name.clone(),
+                    VarInfo {
+                        ty: p.ty,
+                        initialized: true,
+                    },
+                );
+            }
+            for (fname, fty) in &meta.fields {
+                ctx.vars.insert(
+                    format!("self.{fname}"),
+                    VarInfo {
+                        ty: *fty,
+                        initialized: false,
+                    },
+                );
+            }
+            check_block(&mut ctx, &mut init.body, Ty::Unit)?;
+            for (fname, _) in &meta.fields {
+                if !ctx.vars[&format!("self.{fname}")].initialized {
+                    return Err(Diagnostic {
+                        name: "type.field_uninitialized".into(),
+                        title: format!(
+                            "`{}::{}` does not initialize field `{fname}` on every path",
+                            meta.name, init.name
+                        ),
+                        span: init.name_span,
+                        label: "every field must be assigned before the init returns".into(),
+                        notes: vec![],
+                    });
+                }
+            }
+            call_graph.insert(ctx.current_fn.clone(), ctx.calls);
+        }
+        for m in &mut class.methods {
+            let mut ctx = Ctx {
+                sigs: &sigs,
+                current_fn: format!("{}::{}", meta.name, m.f.name),
+                current_has_variant: false,
+                in_test: false,
+                vars: HashMap::new(),
+                declared: HashSet::new(),
+                calls: Vec::new(),
+                in_class: Some((ci, m.self_kind == SelfKind::Mut)),
+                in_init: false,
+                class_metas: &class_metas,
+            };
+            for p in &m.f.params {
+                ctx.declared.insert(p.name.clone());
+                ctx.vars.insert(
+                    p.name.clone(),
+                    VarInfo {
+                        ty: p.ty,
+                        initialized: true,
+                    },
+                );
+            }
+            for (fname, fty) in &meta.fields {
+                ctx.vars.insert(
+                    format!("self.{fname}"),
+                    VarInfo {
+                        ty: *fty,
+                        initialized: true,
+                    },
+                );
+            }
+            let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
+            if !returns && m.f.ret != Ty::Unit {
+                return Err(Diagnostic {
+                    name: "type.missing_return".into(),
+                    title: format!(
+                        "not all paths in `{}::{}` return a value",
+                        meta.name, m.f.name
+                    ),
+                    span: m.f.name_span,
+                    label: "this method must return on every path".into(),
+                    notes: vec![],
+                });
+            }
+            call_graph.insert(ctx.current_fn.clone(), ctx.calls);
+        }
     }
 
     // Mutual recursion (self-recursion with a variant is handled inline).
@@ -192,7 +383,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         )],
                     });
                 }
-                if matches!(ty, Ty::Array(_, Mutability::Owned)) && !ctx.in_test {
+                let alloc_init = matches!(
+                    init.as_ref().map(|e| &e.kind),
+                    Some(ExprKind::AllocArray { .. })
+                );
+                if matches!(ty, Ty::Array(_, Mutability::Owned)) && !ctx.in_test && !alloc_init {
                     return Err(Diagnostic {
                         name: "type.owned_array_outside_test".into(),
                         title: "owned arrays exist only in test functions for now".into(),
@@ -230,6 +425,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         })
                     }
                 };
+                if matches!(ty, Ty::Class(_)) {
+                    return Err(Diagnostic {
+                        name: "type.class_assign".into(),
+                        title: format!("cannot assign to class value `{name}`"),
+                        span: *name_span,
+                        label: "class values cannot be reassigned".into(),
+                        notes: vec![],
+                    });
+                }
                 if matches!(ty, Ty::Array(..)) {
                     return Err(Diagnostic {
                         name: "type.array_assign".into(),
@@ -318,6 +522,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
             }
             Stmt::Return { value, span } => {
+                if ctx.in_init {
+                    return Err(Diagnostic {
+                        name: "type.return_in_init".into(),
+                        title: "`return` is not allowed inside `init`".into(),
+                        span: *span,
+                        label: "an init runs to the end of its body".into(),
+                        notes: vec![],
+                    });
+                }
                 match (value, ret_ty) {
                     (None, Ty::Unit) => {}
                     (Some(e), Ty::Unit) => {
@@ -346,6 +559,74 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             }
             Stmt::ExprStmt(e) => {
                 check_expr(ctx, e, None)?;
+            }
+            Stmt::VarDecl {
+                name,
+                name_span,
+                init,
+                ty,
+            } => {
+                if !ctx.declared.insert(name.clone()) {
+                    return Err(Diagnostic {
+                        name: "type.duplicate_name".into(),
+                        title: format!("duplicate variable name `{name}`"),
+                        span: *name_span,
+                        label: "already declared in this function".into(),
+                        notes: vec![],
+                    });
+                }
+                let t = check_expr(ctx, init, None)?;
+                if t == Ty::Unit {
+                    return Err(Diagnostic {
+                        name: "type.unit_binding".into(),
+                        title: "cannot bind the result of a procedure".into(),
+                        span: init.span,
+                        label: "this expression has no value".into(),
+                        notes: vec![],
+                    });
+                }
+                *ty = Some(t);
+                ctx.vars.insert(
+                    name.clone(),
+                    VarInfo {
+                        ty: t,
+                        initialized: true,
+                    },
+                );
+            }
+            Stmt::FieldAssign {
+                field,
+                field_span,
+                value,
+            } => {
+                let fty = ctx.self_field_ty(field, *field_span, true)?;
+                check_expr(ctx, value, Some(fty))?;
+                if ctx.in_init {
+                    ctx.vars
+                        .get_mut(&format!("self.{field}"))
+                        .unwrap()
+                        .initialized = true;
+                }
+            }
+            Stmt::FieldStore {
+                field,
+                field_span,
+                index,
+                value,
+            } => {
+                let fty = ctx.self_field_ty(field, *field_span, true)?;
+                let Ty::Array(elem, _) = fty else {
+                    return Err(Diagnostic {
+                        name: "type.not_an_array".into(),
+                        title: format!("field `{field}` is not an array"),
+                        span: *field_span,
+                        label: format!("this has type `{}`", fty.name()),
+                        notes: vec![],
+                    });
+                };
+                ctx.require_field_init(field, *field_span)?;
+                check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
+                check_expr(ctx, value, Some(Ty::Int(elem)))?;
             }
             Stmt::Store {
                 array,
@@ -403,6 +684,9 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::Return { span, .. } => *span,
         Stmt::Store { array_span, .. } => *array_span,
         Stmt::ExprStmt(e) => e.span,
+        Stmt::VarDecl { name_span, .. } => *name_span,
+        Stmt::FieldAssign { field_span, .. } => *field_span,
+        Stmt::FieldStore { field_span, .. } => *field_span,
     }
 }
 
@@ -471,6 +755,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
+                if matches!(v.ty, Ty::Class(_)) {
+                    return Err(Diagnostic {
+                        name: "type.class_value".into(),
+                        title: format!("class value `{name}` used as a value"),
+                        span,
+                        label: "class values cannot be copied or moved yet; call methods on \
+                                them (`{name}.method(...)`)"
+                            .into(),
+                        notes: vec![],
+                    });
+                }
                 if matches!(v.ty, Ty::Array(..)) {
                     return Err(Diagnostic {
                         name: "type.m1_array_value".into(),
@@ -563,6 +858,177 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
             Ty::Int(*target)
+        }
+        ExprKind::AllocArray { elem, len, init } => {
+            let elem = *elem;
+            check_expr(ctx, len, Some(Ty::Int(IntTy::U64)))?;
+            check_expr(ctx, init, Some(Ty::Int(elem)))?;
+            Ty::Array(elem, Mutability::Owned)
+        }
+        ExprKind::SelfField { field } => {
+            let fty = ctx.self_field_ty(field, span, false)?;
+            if matches!(fty, Ty::Array(..)) {
+                return Err(Diagnostic {
+                    name: "type.array_field_value".into(),
+                    title: format!("array field `{field}` used as a value"),
+                    span,
+                    label: "use `self.{field}[i]` or `self.{field}.len`".into(),
+                    notes: vec![],
+                });
+            }
+            if ctx.in_init {
+                ctx.require_field_init(field, span)?;
+            }
+            fty
+        }
+        ExprKind::SelfFieldLen { field } => {
+            let fty = ctx.self_field_ty(field, span, false)?;
+            if !matches!(fty, Ty::Array(..)) {
+                return Err(Diagnostic {
+                    name: "type.not_an_array".into(),
+                    title: format!("field `{field}` is not an array"),
+                    span,
+                    label: format!("this has type `{}`", fty.name()),
+                    notes: vec![],
+                });
+            }
+            if ctx.in_init {
+                ctx.require_field_init(field, span)?;
+            }
+            Ty::Int(IntTy::U64)
+        }
+        ExprKind::SelfFieldIndex { field, index } => {
+            let fty = ctx.self_field_ty(field, span, false)?;
+            let Ty::Array(elem, _) = fty else {
+                return Err(Diagnostic {
+                    name: "type.not_an_array".into(),
+                    title: format!("field `{field}` is not an array"),
+                    span,
+                    label: format!("this has type `{}`", fty.name()),
+                    notes: vec![],
+                });
+            };
+            if ctx.in_init {
+                ctx.require_field_init(field, span)?;
+            }
+            check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
+            Ty::Int(elem)
+        }
+        ExprKind::CtorCall {
+            class,
+            class_span,
+            init,
+            args,
+        } => {
+            let Some(ci) = ctx.class_metas.iter().position(|m| m.name == *class) else {
+                return Err(Diagnostic {
+                    name: "type.unknown_class".into(),
+                    title: format!("unknown class `{class}`"),
+                    span: *class_span,
+                    label: "not defined in this module".into(),
+                    notes: vec![],
+                });
+            };
+            let Some((_, params)) = ctx.class_metas[ci]
+                .inits
+                .iter()
+                .find(|(n, _)| n == init)
+                .cloned()
+                .map(|(n, p)| (n, p))
+            else {
+                return Err(Diagnostic {
+                    name: "type.unknown_init".into(),
+                    title: format!("`{class}` has no init `{init}`"),
+                    span,
+                    label: "not declared in the class".into(),
+                    notes: vec![],
+                });
+            };
+            if args.len() != params.len() {
+                return Err(Diagnostic {
+                    name: "type.arity".into(),
+                    title: format!(
+                        "`{class}::{init}` takes {} argument(s), {} given",
+                        params.len(),
+                        args.len()
+                    ),
+                    span,
+                    label: "wrong number of arguments".into(),
+                    notes: vec![],
+                });
+            }
+            for (arg, p) in args.iter_mut().zip(&params) {
+                check_expr(ctx, arg, Some(p.ty))?;
+            }
+            ctx.calls.push(format!("{class}::{init}"));
+            Ty::Class(ci)
+        }
+        ExprKind::MethodCall {
+            recv,
+            recv_span,
+            method,
+            method_span,
+            args,
+        } => {
+            let ci = match ctx.vars.get(recv.as_str()) {
+                Some(VarInfo {
+                    ty: Ty::Class(ci), ..
+                }) => *ci,
+                Some(v) => {
+                    return Err(Diagnostic {
+                        name: "type.not_a_class".into(),
+                        title: format!("`{recv}` is not a class value"),
+                        span: *recv_span,
+                        label: format!("this has type `{}`", v.ty.name()),
+                        notes: vec![],
+                    })
+                }
+                None => {
+                    return Err(Diagnostic {
+                        name: "type.unknown_variable".into(),
+                        title: format!("unknown variable `{recv}`"),
+                        span: *recv_span,
+                        label: "not declared".into(),
+                        notes: vec![],
+                    })
+                }
+            };
+            let Some((_, params, ret, _)) = ctx.class_metas[ci]
+                .methods
+                .iter()
+                .find(|(n, _, _, _)| n == method)
+                .cloned()
+            else {
+                return Err(Diagnostic {
+                    name: "type.unknown_method".into(),
+                    title: format!(
+                        "`{}` has no method `{method}`",
+                        ctx.class_metas[ci].name
+                    ),
+                    span: *method_span,
+                    label: "not declared in the class".into(),
+                    notes: vec![],
+                });
+            };
+            if args.len() != params.len() {
+                return Err(Diagnostic {
+                    name: "type.arity".into(),
+                    title: format!(
+                        "`{method}` takes {} argument(s), {} given",
+                        params.len(),
+                        args.len()
+                    ),
+                    span,
+                    label: "wrong number of arguments".into(),
+                    notes: vec![],
+                });
+            }
+            for (arg, p) in args.iter_mut().zip(&params) {
+                check_expr(ctx, arg, Some(p.ty))?;
+            }
+            ctx.calls
+                .push(format!("{}::{method}", ctx.class_metas[ci].name));
+            ret
         }
         ExprKind::ArrayLit(elems) => match expected {
             Some(Ty::Array(t, Mutability::Owned)) => {
@@ -807,6 +1273,61 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     };
     e.ty = Some(ty);
     Ok(ty)
+}
+
+impl<'a> Ctx<'a> {
+    /// Type of `self.field`; `mutating` additionally requires an
+    /// `init` or `&mut self` context.
+    fn self_field_ty(&self, field: &str, span: Span, mutating: bool) -> CResult<Ty> {
+        let Some((ci, is_mut)) = self.in_class else {
+            return Err(Diagnostic {
+                name: "type.self_outside_class".into(),
+                title: "`self` outside a class member".into(),
+                span,
+                label: "fields exist only in inits and methods".into(),
+                notes: vec![],
+            });
+        };
+        if mutating && !is_mut {
+            return Err(Diagnostic {
+                name: "type.mutate_shared_self".into(),
+                title: "a `&self` method cannot mutate fields".into(),
+                span,
+                label: "take `&mut self` to write".into(),
+                notes: vec![],
+            });
+        }
+        self.class_metas[ci]
+            .fields
+            .iter()
+            .find(|(n, _)| n == field)
+            .map(|(_, t)| *t)
+            .ok_or_else(|| Diagnostic {
+                name: "type.unknown_field".into(),
+                title: format!(
+                    "`{}` has no field `{field}`",
+                    self.class_metas[ci].name
+                ),
+                span,
+                label: "not declared in the class".into(),
+                notes: vec![],
+            })
+    }
+
+    fn require_field_init(&self, field: &str, span: Span) -> CResult<()> {
+        if let Some(v) = self.vars.get(&format!("self.{field}")) {
+            if !v.initialized {
+                return Err(Diagnostic {
+                    name: "type.uninitialized".into(),
+                    title: format!("field `{field}` may be read before initialization"),
+                    span,
+                    label: "not assigned on every path to this point".into(),
+                    notes: vec![],
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<IntTy> {

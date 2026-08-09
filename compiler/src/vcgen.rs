@@ -52,26 +52,90 @@ pub struct ClauseWf {
 
 pub struct VcResult {
     pub ghosts: Vec<GhostItem>,
+    pub classes: Vec<ClassEmit>,
     pub clause_wfs: Vec<ClauseWf>,
     pub obligations: Vec<Obligation>,
 }
 
+/// A class as the Lean emitter needs it: `structure name where fields`.
+#[derive(Debug, Clone)]
+pub struct ClassEmit {
+    pub name: String,
+    pub fields: Vec<(String, String)>,
+    pub span: Span,
+}
+
+fn lean_field_ty(ty: Ty) -> String {
+    match ty {
+        Ty::Int(_) => "Int".into(),
+        Ty::Bool => "Bool".into(),
+        Ty::Array(..) => "Sable.Seq Int".into(),
+        _ => unreachable!("checked: field types"),
+    }
+}
+
+/// The class-member verification context.
+#[derive(Clone, Copy)]
+enum Cctx<'a> {
+    None,
+    Init(&'a ClassDecl),
+    Method(&'a ClassDecl, SelfKind),
+}
+
 pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) -> VcResult {
     let fn_map: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
+    let class_map: HashMap<&str, &ClassDecl> = program
+        .classes
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
     let mut result = VcResult {
         ghosts: program.ghosts.clone(),
+        classes: program
+            .classes
+            .iter()
+            .map(|c| ClassEmit {
+                name: c.name.clone(),
+                fields: c
+                    .fields
+                    .iter()
+                    .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
+                    .collect(),
+                span: c.name_span,
+            })
+            .collect(),
         clause_wfs: Vec::new(),
         obligations: Vec::new(),
     };
-    for f in &program.fns {
-        // Tests are dynamic-only (design §9): never verified.
-        if f.name.starts_with("test_") {
-            continue;
+
+    // Class invariant well-formedness defs: binders are the bare fields.
+    for c in &program.classes {
+        let binders: Vec<(String, String)> = c
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
+            .collect();
+        for (i, inv) in c.invariants.iter().enumerate() {
+            result.clause_wfs.push(ClauseWf {
+                def_name: format!("wf_{}_invariant_{}", sanitize(&c.name), i + 1),
+                binders: binders.clone(),
+                text: inv.text.clone(),
+                span: inv.span,
+                desc: format!("class invariant of `{}`", c.name),
+                result_ty: "Prop",
+            });
         }
+    }
+
+    let mut run_one = |f: &Fn, fname: String, cctx: Cctx, result: &mut VcResult| {
         let mut generator = Generator {
             f,
+            fname,
+            cctx,
+            classes: &program.classes,
             sigs,
             fn_map: &fn_map,
+            class_map: &class_map,
             source,
             binders: Vec::new(),
             hyps: Vec::new(),
@@ -81,9 +145,36 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             mut_arrays: HashMap::new(),
             fresh: 0,
             name_counts: HashMap::new(),
-            out: &mut result,
+            out: result,
         };
         generator.run();
+    };
+
+    for f in &program.fns {
+        // Tests are dynamic-only (design §9): never verified.
+        if f.name.starts_with("test_") {
+            continue;
+        }
+        run_one(f, f.name.clone(), Cctx::None, &mut result);
+    }
+    for c in &program.classes {
+        for init in &c.inits {
+            run_one(
+                init,
+                format!("{}::{}", c.name, init.name),
+                Cctx::Init(c),
+                &mut result,
+            );
+        }
+        for m in &c.methods {
+            run_one(
+                &m.f,
+                format!("{}::{}", c.name, m.f.name),
+                Cctx::Method(c, m.self_kind),
+                &mut result,
+            );
+        }
+        // deinit bodies are empty in M5 (checked); nothing to verify.
     }
     result
 }
@@ -95,6 +186,8 @@ enum Val {
     Opt(String),
     /// Symbolic array value: entry binder or a `.set` chain over it.
     Arr(String),
+    /// Symbolic class value: a binder or a `{ _ with f := v }` chain.
+    Obj(String),
     Unit,
 }
 
@@ -110,8 +203,13 @@ enum Tail<'a> {
 
 struct Generator<'a> {
     f: &'a Fn,
+    /// Display name for obligations: `f` or `Class::member`.
+    fname: String,
+    cctx: Cctx<'a>,
+    classes: &'a [ClassDecl],
     sigs: &'a HashMap<String, FnSig>,
     fn_map: &'a HashMap<&'a str, &'a Fn>,
+    class_map: &'a HashMap<&'a str, &'a ClassDecl>,
     source: &'a str,
     binders: Vec<(String, String)>,
     hyps: Vec<(String, String)>,
@@ -126,7 +224,102 @@ struct Generator<'a> {
 }
 
 impl<'a> Generator<'a> {
+    /// Substitution map for clauses about a specific self-state: bare
+    /// field names and `self` map onto the given state expression.
+    fn class_state_map(&self, class: &ClassDecl, state: &str) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        map.insert("self".to_string(), state.to_string());
+        for fld in &class.fields {
+            map.insert(fld.name.clone(), format!("({state}.{})", fld.name));
+        }
+        map
+    }
+
+    /// In inits, fields map to their tracked symbolic values instead.
+    fn init_state_map(&self, class: &ClassDecl) -> (String, HashMap<String, String>) {
+        let literal = format!(
+            "({}.mk {})",
+            class.name,
+            class
+                .fields
+                .iter()
+                .map(|fld| {
+                    match self.env.get(&format!("self.{}", fld.name)) {
+                        Some(Val::Int(s)) | Some(Val::Arr(s)) => format!("{s}"),
+                        Some(Val::Prop(p)) => format!("(decide {p})"),
+                        _ => "0".to_string(), // unreachable: checked init
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let mut map = HashMap::new();
+        map.insert("self".to_string(), literal.clone());
+        for fld in &class.fields {
+            if let Some(Val::Int(s)) | Some(Val::Arr(s)) =
+                self.env.get(&format!("self.{}", fld.name))
+            {
+                map.insert(fld.name.clone(), s.clone());
+            }
+        }
+        (literal, map)
+    }
+
+    /// Per-field representability facts about a class-state binder —
+    /// justified the same way havoc facts are: every store is checked.
+    fn push_class_state_facts(&mut self, class: &ClassDecl, binder: &str) {
+        for fld in &class.fields {
+            match fld.ty {
+                Ty::Int(it) => {
+                    let h = self.fresh_hyp("h_field");
+                    self.hyps
+                        .push((h, range_prop(&format!("({binder}.{})", fld.name), it)));
+                }
+                Ty::Array(elem, _) => {
+                    let path = format!("({binder}.{})", fld.name);
+                    let h1 = self.fresh_hyp("h_field");
+                    self.hyps
+                        .push((h1, format!("0 ≤ {path}.len ∧ {path}.len ≤ u64.max")));
+                    let h2 = self.fresh_hyp("h_field");
+                    self.hyps.push((
+                        h2,
+                        format!(
+                            "∀ k, 0 ≤ k → k < {path}.len → {} ≤ {path}.get k ∧ {path}.get k ≤ {}",
+                            elem.lean_min(),
+                            elem.lean_max()
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Class invariant as hypotheses about a given state.
+    fn push_invariant_hyps(&mut self, class: &ClassDecl, state: &str) {
+        let map = self.class_state_map(class, state);
+        for inv in &class.invariants {
+            let prop = substitute(&inv.text, &map, None);
+            let h = self.fresh_hyp("h_cinv");
+            self.hyps.push((h, format!("({prop})")));
+            self.context.push(format!("class invariant {}", inv.text));
+        }
+    }
+
     fn run(&mut self) {
+        // Class-member setup: methods get the entry-state binder
+        // `_old_self` with field facts and the class invariant assumed
+        // (design §7 desugaring); inits start with no self at all.
+        if let Cctx::Method(class, _) = self.cctx {
+            self.binders
+                .push(("_old_self".to_string(), class.name.clone()));
+            self.mut_arrays
+                .insert("self".to_string(), "_old_self".to_string());
+            self.push_class_state_facts(class, "_old_self");
+            self.push_invariant_hyps(class, "_old_self");
+            self.env
+                .insert("self".to_string(), Val::Obj("_old_self".to_string()));
+        }
         for p in &self.f.params {
             self.var_tys.insert(p.name.clone(), p.ty);
             match p.ty {
@@ -168,7 +361,9 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
-                Ty::Option(_) | Ty::Unit => unreachable!("checked: no such params"),
+                Ty::Option(_) | Ty::Unit | Ty::Class(_) => {
+                    unreachable!("checked: no such params")
+                }
             }
         }
         let f = self.f;
@@ -179,11 +374,11 @@ impl<'a> Generator<'a> {
             self.context.push(format!("pre {}", pre.text));
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_pre_{}", sanitize(&f.name), i + 1),
+                def_name: format!("wf_{}_pre_{}", sanitize(&self.fname), i + 1),
                 binders,
                 text,
                 span: pre.span,
-                desc: format!("`pre` clause of `{}`", f.name),
+                desc: format!("`pre` clause of `{}`", self.fname),
                 result_ty: "Prop",
             });
         }
@@ -193,22 +388,22 @@ impl<'a> Generator<'a> {
                 binders.push(("result".to_string(), self.result_lean_ty()));
             }
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_post_{}", sanitize(&f.name), i + 1),
+                def_name: format!("wf_{}_post_{}", sanitize(&self.fname), i + 1),
                 binders,
                 text: self.preprocess(&post.text),
                 span: post.span,
-                desc: format!("`post` clause of `{}`", f.name),
+                desc: format!("`post` clause of `{}`", self.fname),
                 result_ty: "Prop",
             });
         }
         if let Some(v) = &f.variant {
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_variant", sanitize(&f.name)),
+                def_name: format!("wf_{}_variant", sanitize(&self.fname)),
                 binders,
                 text: self.preprocess(&v.text),
                 span: v.span,
-                desc: format!("`variant` clause of `{}`", f.name),
+                desc: format!("`variant` clause of `{}`", self.fname),
                 result_ty: "Int",
             });
         }
@@ -243,7 +438,7 @@ impl<'a> Generator<'a> {
                 for inv in *invariants {
                     let goal = self.subst_env(&self.preprocess(&inv.text));
                     let ob = self.obligation(
-                        &format!("{}.inv_preserved.{}", self.f.name, slug(&inv.text)),
+                        &format!("{}.inv_preserved.{}", self.fname, slug(&inv.text)),
                         "loop invariant must be preserved by the body".into(),
                         inv.span,
                         goal,
@@ -255,7 +450,7 @@ impl<'a> Generator<'a> {
                     self.subst_env(&self.preprocess(&variant.text))
                 );
                 let ob = self.obligation(
-                    &format!("{}.variant_decreases.{}", self.f.name, slug(&variant.text)),
+                    &format!("{}.variant_decreases.{}", self.fname, slug(&variant.text)),
                     "loop variant must be a nonnegative measure that strictly decreases"
                         .into(),
                     variant.span,
@@ -304,6 +499,76 @@ impl<'a> Generator<'a> {
                 let _ = self.eval(e);
                 self.exec(rest, tail);
             }
+            Stmt::VarDecl { name, init, ty, .. } => {
+                let v = self.eval(init);
+                self.var_tys
+                    .insert(name.clone(), ty.expect("checked: var type"));
+                self.env.insert(name.clone(), v);
+                self.exec(rest, tail);
+            }
+            Stmt::FieldAssign { field, value, .. } => {
+                let v = self.eval(value);
+                match self.cctx {
+                    Cctx::Init(_) => {
+                        self.env.insert(format!("self.{field}"), v);
+                    }
+                    Cctx::Method(..) => {
+                        let vs = match v {
+                            Val::Int(s) | Val::Arr(s) => s,
+                            _ => unreachable!("checked: field value"),
+                        };
+                        let chain = self.self_chain();
+                        self.env.insert(
+                            "self".to_string(),
+                            Val::Obj(format!("{{ {chain} with {field} := {vs} }}")),
+                        );
+                    }
+                    Cctx::None => unreachable!("checked: fields only in members"),
+                }
+                self.exec(rest, tail);
+            }
+            Stmt::FieldStore {
+                field,
+                field_span,
+                index,
+                value,
+            } => {
+                let Val::Int(i) = self.eval(index) else {
+                    unreachable!()
+                };
+                let Val::Int(v) = self.eval(value) else {
+                    unreachable!()
+                };
+                let arr = self.self_field_str(field);
+                let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
+                let ob = self.obligation(
+                    &format!("{}.bounds.{}", self.fname, slug(self.src(index.span))),
+                    format!(
+                        "store index `{}` must be within bounds",
+                        self.src_short(index.span)
+                    ),
+                    field_span.join(index.span),
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                let updated = format!("({arr}.set {i} {v})");
+                match self.cctx {
+                    Cctx::Init(_) => {
+                        self.env
+                            .insert(format!("self.{field}"), Val::Arr(updated));
+                    }
+                    Cctx::Method(..) => {
+                        let chain = self.self_chain();
+                        self.env.insert(
+                            "self".to_string(),
+                            Val::Obj(format!("{{ {chain} with {field} := {updated} }}")),
+                        );
+                    }
+                    Cctx::None => unreachable!("checked: fields only in members"),
+                }
+                self.exec(rest, tail);
+            }
             Stmt::Store {
                 array,
                 array_span,
@@ -319,7 +584,7 @@ impl<'a> Generator<'a> {
                 let arr = self.arr_str(array);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
                 let ob = self.obligation(
-                    &format!("{}.bounds.{}", self.f.name, slug(self.src(index.span))),
+                    &format!("{}.bounds.{}", self.fname, slug(self.src(index.span))),
                     format!(
                         "store index `{}` must be within bounds",
                         self.src_short(index.span)
@@ -386,6 +651,9 @@ impl<'a> Generator<'a> {
                         Ty::Int(_) => Some((name.clone(), "Int".to_string())),
                         Ty::Bool => Some((name.clone(), "Bool".to_string())),
                         Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
+                        Ty::Class(ci) => {
+                            Some((name.clone(), self.classes[*ci].name.clone()))
+                        }
                         Ty::Option(_) | Ty::Unit => None,
                     })
                     .collect();
@@ -397,14 +665,14 @@ impl<'a> Generator<'a> {
                     self.out.clause_wfs.push(ClauseWf {
                         def_name: format!(
                             "wf_{}_loop{}_{}",
-                            sanitize(&self.f.name),
+                            sanitize(&self.fname),
                             self.fresh,
                             i
                         ),
                         binders: scope_binders.clone(),
                         text: self.preprocess(&clause.text),
                         span: clause.span,
-                        desc: format!("loop annotation in `{}`", self.f.name),
+                        desc: format!("loop annotation in `{}`", self.fname),
                         result_ty: if i == invariants.len() { "Int" } else { "Prop" },
                     });
                 }
@@ -413,7 +681,7 @@ impl<'a> Generator<'a> {
                 for inv in invariants {
                     let goal = self.subst_env(&self.preprocess(&inv.text));
                     let ob = self.obligation(
-                        &format!("{}.inv_init.{}", self.f.name, slug(&inv.text)),
+                        &format!("{}.inv_init.{}", self.fname, slug(&inv.text)),
                         "loop invariant must hold at loop entry".into(),
                         inv.span,
                         goal,
@@ -487,7 +755,7 @@ impl<'a> Generator<'a> {
                     continue;
                 }
                 let s = match val {
-                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) => s,
+                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) | Val::Obj(s) => s,
                     Val::Prop(s) => s,
                     Val::Unit => continue,
                 };
@@ -522,6 +790,19 @@ impl<'a> Generator<'a> {
                     b.0 = stale.clone();
                 }
             }
+            // Mid-method self-mutation in a loop: fresh state binder,
+            // field facts only (the class invariant is NOT in force
+            // mid-method, design §7).
+            if name == "self" {
+                if let Cctx::Method(class, _) = self.cctx {
+                    self.fresh += 1;
+                    let b = format!("_self{}", self.fresh);
+                    self.binders.push((b.clone(), class.name.clone()));
+                    self.push_class_state_facts(class, &b);
+                    self.env.insert("self".to_string(), Val::Obj(b));
+                    continue;
+                }
+            }
             match self.var_tys.get(name) {
                 Some(Ty::Int(it)) => {
                     let it = *it;
@@ -536,6 +817,16 @@ impl<'a> Generator<'a> {
                     self.binders.push((name.clone(), "Bool".into()));
                     self.env
                         .insert(name.clone(), Val::Prop(format!("({name} = true)")));
+                }
+                Some(Ty::Class(ci)) => {
+                    // A loop body called &mut methods on this local: fresh
+                    // state; the invariant held at each method exit, so it
+                    // is sound to assume at the havoc point.
+                    let cd = &self.classes[*ci];
+                    self.binders.push((name.clone(), cd.name.clone()));
+                    self.push_class_state_facts(cd, name);
+                    self.push_invariant_hyps(cd, name);
+                    self.env.insert(name.clone(), Val::Obj(name.clone()));
                 }
                 Some(Ty::Array(elem, Mutability::Mut)) => {
                     // Stores are the only mutation and preserve length and
@@ -593,7 +884,7 @@ impl<'a> Generator<'a> {
                 let arr = self.arr_str(array);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
                 let ob = self.obligation(
-                    &format!("{}.bounds.{}", self.f.name, slug(self.src(e.span))),
+                    &format!("{}.bounds.{}", self.fname, slug(self.src(e.span))),
                     format!("index `{}` must be within bounds", self.src_short(e.span)),
                     e.span,
                     goal.clone(),
@@ -611,6 +902,232 @@ impl<'a> Generator<'a> {
                 ));
                 Val::Int(value)
             }
+            ExprKind::AllocArray { len, init, .. } => {
+                let Val::Int(n) = self.eval(len) else {
+                    unreachable!()
+                };
+                let Val::Int(v0) = self.eval(init) else {
+                    unreachable!()
+                };
+                // Allocation succeeds symbolically: failure is the named
+                // OOM trap (design §10), not a proof obligation.
+                self.fresh += 1;
+                let b = format!("_alloc{}", self.fresh);
+                self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                let h1 = self.fresh_hyp("h_alloc");
+                self.hyps.push((h1, format!("({b}.len) = {n}")));
+                let h2 = self.fresh_hyp("h_alloc");
+                self.hyps.push((
+                    h2,
+                    format!("∀ k, 0 ≤ k → k < {b}.len → {b}.get k = {v0}"),
+                ));
+                Val::Arr(b)
+            }
+            ExprKind::SelfField { field } => match self.cctx {
+                Cctx::Init(_) => self
+                    .env
+                    .get(&format!("self.{field}"))
+                    .cloned()
+                    .expect("checked: field initialized"),
+                Cctx::Method(..) => {
+                    Val::Int(format!("({}.{field})", self.self_chain()))
+                }
+                Cctx::None => unreachable!("checked: fields only in members"),
+            },
+            ExprKind::SelfFieldLen { field } => {
+                let arr = self.self_field_str(field);
+                Val::Int(format!("({arr}.len)"))
+            }
+            ExprKind::SelfFieldIndex { field, index } => {
+                let Val::Int(i) = self.eval(index) else {
+                    unreachable!()
+                };
+                let Ty::Int(elem) = e.ty.unwrap() else {
+                    unreachable!()
+                };
+                let arr = self.self_field_str(field);
+                let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
+                let ob = self.obligation(
+                    &format!("{}.bounds.{}", self.fname, slug(self.src(e.span))),
+                    format!("index `{}` must be within bounds", self.src_short(e.span)),
+                    e.span,
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                let value = format!("({arr}.get {i})");
+                self.assume_fact(&format!(
+                    "{} ≤ {value} ∧ {value} ≤ {}",
+                    elem.lean_min(),
+                    elem.lean_max()
+                ));
+                Val::Int(value)
+            }
+            ExprKind::CtorCall {
+                class, init, args, ..
+            } => {
+                let arg_vals: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        let Val::Int(v) = self.eval(a) else {
+                            unreachable!("checked: int args")
+                        };
+                        v
+                    })
+                    .collect();
+                let cd: &ClassDecl = self.class_map[class.as_str()];
+                let ifn = cd
+                    .inits
+                    .iter()
+                    .find(|i| i.name == *init)
+                    .expect("checked: init exists");
+                let subst_map: HashMap<String, String> = ifn
+                    .params
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .zip(arg_vals.iter().cloned())
+                    .collect();
+                for pre in &ifn.pres {
+                    let goal = substitute(&pre.text, &subst_map, None);
+                    let ob = self.obligation(
+                        &format!(
+                            "{}.call_pre.{}_{}.{}",
+                            self.fname,
+                            class,
+                            init,
+                            slug(&pre.text)
+                        ),
+                        format!(
+                            "`pre {}` of `{class}::{init}` must hold at this call",
+                            pre.text
+                        ),
+                        e.span,
+                        goal,
+                    );
+                    self.push_obligation(ob);
+                }
+                // Fresh post-construction state: the class invariant holds
+                // (proved at every init exit) and the init's posts describe it.
+                self.fresh += 1;
+                let b = format!("_obj{}", self.fresh);
+                self.binders.push((b.clone(), cd.name.clone()));
+                self.push_class_state_facts(cd, &b);
+                self.push_invariant_hyps(cd, &b);
+                let mut post_map = self.class_state_map(cd, &b);
+                post_map.extend(subst_map);
+                for (i, post) in ifn.posts.iter().enumerate() {
+                    let prop = substitute(&post.text, &post_map, None);
+                    let h = format!("h{b}_post_{}", i + 1);
+                    self.hyps.push((h, format!("({prop})")));
+                }
+                Val::Obj(b)
+            }
+            ExprKind::MethodCall {
+                recv, method, args, ..
+            } => {
+                let arg_vals: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        let Val::Int(v) = self.eval(a) else {
+                            unreachable!("checked: int args")
+                        };
+                        v
+                    })
+                    .collect();
+                let Some(Ty::Class(ci)) = self.var_tys.get(recv.as_str()).copied() else {
+                    unreachable!("checked: class receiver")
+                };
+                let cd = &self.classes[ci];
+                let m = cd
+                    .methods
+                    .iter()
+                    .find(|m| m.f.name == *method)
+                    .expect("checked: method exists");
+                let cur = match self.env.get(recv.as_str()) {
+                    Some(Val::Obj(s)) => s.clone(),
+                    _ => unreachable!("checked: class value"),
+                };
+                let mut entry_map = self.class_state_map(cd, &cur);
+                for (p, a) in m.f.params.iter().zip(arg_vals.iter()) {
+                    entry_map.insert(p.name.clone(), a.clone());
+                }
+                for pre in &m.f.pres {
+                    let goal = substitute(&pre.text, &entry_map, None);
+                    let ob = self.obligation(
+                        &format!(
+                            "{}.call_pre.{}_{}.{}",
+                            self.fname,
+                            cd.name,
+                            method,
+                            slug(&pre.text)
+                        ),
+                        format!(
+                            "`pre {}` of `{}::{method}` must hold at this call",
+                            pre.text, cd.name
+                        ),
+                        e.span,
+                        goal,
+                    );
+                    self.push_obligation(ob);
+                }
+                // Post-state: fresh for &mut self (invariant re-established),
+                // unchanged for &self.
+                let final_state = if m.self_kind == SelfKind::Mut {
+                    self.fresh += 1;
+                    let b = format!("_obj{}", self.fresh);
+                    self.binders.push((b.clone(), cd.name.clone()));
+                    self.push_class_state_facts(cd, &b);
+                    self.push_invariant_hyps(cd, &b);
+                    self.env.insert(recv.clone(), Val::Obj(b.clone()));
+                    b
+                } else {
+                    cur.clone()
+                };
+                // Result symbol.
+                self.fresh += 1;
+                let ret_sym = format!("_r{}", self.fresh);
+                match m.f.ret {
+                    Ty::Int(it) => {
+                        self.binders.push((ret_sym.clone(), "Int".into()));
+                        let h = format!("h{ret_sym}_range");
+                        self.hyps.push((h, range_prop(&ret_sym, it)));
+                    }
+                    Ty::Option(_) => {
+                        self.binders.push((ret_sym.clone(), "Option Int".into()));
+                    }
+                    Ty::Bool => {
+                        self.binders.push((ret_sym.clone(), "Prop".into()));
+                    }
+                    Ty::Unit => {}
+                    _ => unreachable!(),
+                }
+                let mut post_map = self.class_state_map(cd, &final_state);
+                for (p, a) in m.f.params.iter().zip(arg_vals.iter()) {
+                    post_map.insert(p.name.clone(), a.clone());
+                }
+                // `old self` in the callee's posts is the receiver's
+                // pre-call state.
+                post_map.insert("_old_self".to_string(), cur.clone());
+                for (i, post) in m.f.posts.iter().enumerate() {
+                    let text = preprocess_old_self(&post.text);
+                    let ret_ref = if m.f.ret == Ty::Unit {
+                        None
+                    } else {
+                        Some(ret_sym.as_str())
+                    };
+                    let prop = substitute(&text, &post_map, ret_ref);
+                    let h = format!("h{ret_sym}m_post_{}", i + 1);
+                    self.hyps.push((h, format!("({prop})")));
+                    self.context
+                        .push(format!("from `{}::{method}` post: {}", cd.name, post.text));
+                }
+                match m.f.ret {
+                    Ty::Option(_) => Val::Opt(ret_sym),
+                    Ty::Unit => Val::Unit,
+                    Ty::Bool => Val::Prop(ret_sym),
+                    _ => Val::Int(ret_sym),
+                }
+            }
             ExprKind::Unary { op, operand } => match op {
                 UnOp::Neg => {
                     let Val::Int(v) = self.eval(operand) else {
@@ -622,7 +1139,7 @@ impl<'a> Generator<'a> {
                     };
                     let goal = range_prop(&value, it);
                     let ob = self.obligation(
-                        &format!("{}.overflow.{}", self.f.name, slug(self.src(e.span))),
+                        &format!("{}.overflow.{}", self.fname, slug(self.src(e.span))),
                         format!(
                             "result of `{}` must fit in `{}`",
                             self.src_short(e.span),
@@ -664,7 +1181,7 @@ impl<'a> Generator<'a> {
                         BinOp::Add | BinOp::Sub | BinOp::Mul => {
                             let goal = range_prop(&value, it);
                             let ob = self.obligation(
-                                &format!("{}.overflow.{}", self.f.name, slug(self.src(e.span))),
+                                &format!("{}.overflow.{}", self.fname, slug(self.src(e.span))),
                                 format!(
                                     "result of `{}` must fit in `{}`",
                                     self.src_short(e.span),
@@ -679,7 +1196,7 @@ impl<'a> Generator<'a> {
                         BinOp::Div | BinOp::Rem => {
                             let goal = format!("{r} ≠ 0");
                             let ob = self.obligation(
-                                &format!("{}.div_zero.{}", self.f.name, slug(self.src(e.span))),
+                                &format!("{}.div_zero.{}", self.fname, slug(self.src(e.span))),
                                 format!(
                                     "divisor `{}` must be nonzero",
                                     self.src_short(rhs.span)
@@ -697,7 +1214,7 @@ impl<'a> Generator<'a> {
                                 let ob = self.obligation(
                                     &format!(
                                         "{}.div_overflow.{}",
-                                        self.f.name,
+                                        self.fname,
                                         slug(self.src(e.span))
                                     ),
                                     format!(
@@ -756,7 +1273,7 @@ impl<'a> Generator<'a> {
                 for pre in &callee_fn.pres {
                     let goal = substitute(&pre.text, &subst_map, None);
                     let ob = self.obligation(
-                        &format!("{}.call_pre.{}.{}", self.f.name, callee, slug(&pre.text)),
+                        &format!("{}.call_pre.{}.{}", self.fname, callee, slug(&pre.text)),
                         format!("`pre {}` of `{callee}` must hold at this call", pre.text),
                         e.span,
                         goal,
@@ -766,7 +1283,7 @@ impl<'a> Generator<'a> {
 
                 // Self-recursion: the callee's measure, on the arguments,
                 // must be a nonnegative decrease of the current measure.
-                if *callee == self.f.name {
+                if *callee == self.fname {
                     let variant = self.f.variant.as_ref().expect("checked");
                     let vtext = self.preprocess(&variant.text);
                     let callee_measure = substitute(&vtext, &subst_map, None);
@@ -775,7 +1292,7 @@ impl<'a> Generator<'a> {
                         "0 ≤ ({callee_measure}) ∧ ({callee_measure}) < ({caller_measure})"
                     );
                     let ob = self.obligation(
-                        &format!("{}.termination.{}", self.f.name, slug(&variant.text)),
+                        &format!("{}.termination.{}", self.fname, slug(&variant.text)),
                         "recursive call must decrease the function's `variant`".into(),
                         e.span,
                         goal,
@@ -890,7 +1407,9 @@ impl<'a> Generator<'a> {
             .env
             .iter()
             .filter_map(|(name, val)| match val {
-                Val::Int(s) | Val::Arr(s) if s != name => Some((name.clone(), s.clone())),
+                Val::Int(s) | Val::Arr(s) | Val::Obj(s) if s != name => {
+                    Some((name.clone(), s.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -927,6 +1446,26 @@ impl<'a> Generator<'a> {
         out
     }
 
+    /// Current symbolic self-state (methods only).
+    fn self_chain(&self) -> String {
+        match self.env.get("self") {
+            Some(Val::Obj(s)) => s.clone(),
+            _ => unreachable!("checked: self in scope"),
+        }
+    }
+
+    /// Current symbolic expression for an array field of self.
+    fn self_field_str(&self, field: &str) -> String {
+        match self.cctx {
+            Cctx::Init(_) => match self.env.get(&format!("self.{field}")) {
+                Some(Val::Arr(s)) => s.clone(),
+                _ => unreachable!("checked: field initialized"),
+            },
+            Cctx::Method(..) => format!("({}.{field})", self.self_chain()),
+            Cctx::None => unreachable!("checked: fields only in members"),
+        }
+    }
+
     /// Current symbolic array expression for an in-scope array name.
     fn arr_str(&self, name: &str) -> String {
         match self.env.get(name) {
@@ -949,8 +1488,16 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), "Sable.Seq Int".into()));
                     }
                 }
-                Ty::Option(_) | Ty::Unit => {}
+                Ty::Option(_) | Ty::Unit | Ty::Class(_) => {}
             }
+        }
+        match self.cctx {
+            Cctx::Init(c) => out.push(("self".to_string(), c.name.clone())),
+            Cctx::Method(c, _) => {
+                out.push(("self".to_string(), c.name.clone()));
+                out.push(("_old_self".to_string(), c.name.clone()));
+            }
+            Cctx::None => {}
         }
         out
     }
@@ -960,16 +1507,55 @@ impl<'a> Generator<'a> {
     /// &mut arrays mean their *final* state — substituted here.
     fn emit_posts(&mut self, result_eq: Option<String>) {
         let f = self.f;
-        let mut_map: HashMap<String, String> = self
+        let mut mut_map: HashMap<String, String> = self
             .mut_arrays
             .keys()
+            .filter(|n| n.as_str() != "self")
             .map(|name| (name.clone(), self.arr_str(name)))
             .collect();
+        // Class-member exits: the invariant is an obligation at every exit
+        // of an init or &mut-self method (design §7 desugaring), and posts
+        // speak about the final self-state.
+        match self.cctx {
+            Cctx::Init(class) => {
+                let (_lit, map) = self.init_state_map(class);
+                for inv in &class.invariants {
+                    let goal = substitute(&inv.text, &map, None);
+                    let ob = self.obligation(
+                        &format!("{}.inv_exit.{}", self.fname, slug(&inv.text)),
+                        "class invariant must hold when the init returns".into(),
+                        inv.span,
+                        goal,
+                    );
+                    self.push_obligation(ob);
+                }
+                mut_map.extend(map);
+            }
+            Cctx::Method(class, kind) => {
+                let chain = self.self_chain();
+                let map = self.class_state_map(class, &chain);
+                if kind == SelfKind::Mut {
+                    for inv in &class.invariants {
+                        let goal = substitute(&inv.text, &map, None);
+                        let ob = self.obligation(
+                            &format!("{}.inv_exit.{}", self.fname, slug(&inv.text)),
+                            "class invariant must hold when the method returns".into(),
+                            inv.span,
+                            goal,
+                        );
+                        self.push_obligation(ob);
+                    }
+                }
+                mut_map.extend(map);
+            }
+            Cctx::None => {}
+        }
         for post in &f.posts {
             let goal = substitute(&self.preprocess(&post.text), &mut_map, None);
+
             let mut ob = self.obligation(
-                &format!("{}.post.{}", f.name, slug(&post.text)),
-                format!("postcondition of `{}`", f.name),
+                &format!("{}.post.{}", self.fname, slug(&post.text)),
+                format!("postcondition of `{}`", self.fname),
                 post.span,
                 goal,
             );
@@ -1049,6 +1635,17 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
             }
             Stmt::Store { array, .. } => {
                 out.insert(array.clone());
+            }
+            Stmt::FieldAssign { .. } | Stmt::FieldStore { .. } => {
+                out.insert("self".to_string());
+            }
+            Stmt::VarDecl { .. } => {}
+            Stmt::ExprStmt(e) => {
+                // A &mut-self method call mutates its receiver; we cannot
+                // know mutability here, so be conservative.
+                if let ExprKind::MethodCall { recv, .. } = &e.kind {
+                    out.insert(recv.clone());
+                }
             }
             Stmt::If {
                 then_block,
@@ -1142,6 +1739,38 @@ pub fn substitute(text: &str, map: &HashMap<String, String>, result: Option<&str
         i += 1;
     }
     String::from_utf8(out).expect("substitution preserves UTF-8")
+}
+
+/// Replace `old self` with the `_old_self` token (caller-side use of a
+/// callee's posts; the Generator's own preprocess handles the member side).
+fn preprocess_old_self(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("old") {
+        let before_ok = pos == 0
+            || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                && rest.as_bytes()[pos - 1] != b'_'
+                && rest.as_bytes()[pos - 1] != b'.';
+        let after = &rest[pos + 3..];
+        let after_trim = after.trim_start();
+        if before_ok && after_trim.starts_with("self") {
+            let after_self = &after_trim[4..];
+            let boundary = after_self
+                .bytes()
+                .next()
+                .map_or(true, |b| !b.is_ascii_alphanumeric() && b != b'_');
+            if boundary {
+                out.push_str(&rest[..pos]);
+                out.push_str("_old_self");
+                rest = after_self;
+                continue;
+            }
+        }
+        out.push_str(&rest[..pos + 3]);
+        rest = &rest[pos + 3..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn sanitize(name: &str) -> String {
