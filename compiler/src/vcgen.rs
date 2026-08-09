@@ -220,6 +220,9 @@ impl<'a> Generator<'a> {
     fn result_lean_ty(&self) -> String {
         match self.f.ret {
             Ty::Option(_) => "Option Int".into(),
+            // Bool results are Prop-valued in the logic: posts like
+            // `result → P` splice with no coercion noise.
+            Ty::Bool => "Prop".into(),
             _ => "Int".into(),
         }
     }
@@ -290,7 +293,8 @@ impl<'a> Generator<'a> {
                     _ => match self.eval(value) {
                         Val::Int(v) => format!("(result = {v})"),
                         Val::Opt(v) => format!("(result = {v})"),
-                        _ => unreachable!("bool returns rejected"),
+                        Val::Prop(p) => format!("(result ↔ ({p}))"),
+                        _ => unreachable!("unit values cannot be returned"),
                     },
                 });
                 self.emit_posts(result_eq);
@@ -790,6 +794,9 @@ impl<'a> Generator<'a> {
                     Ty::Option(_) => {
                         self.binders.push((ret_sym.clone(), "Option Int".into()));
                     }
+                    Ty::Bool => {
+                        self.binders.push((ret_sym.clone(), "Prop".into()));
+                    }
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
@@ -808,6 +815,7 @@ impl<'a> Generator<'a> {
                 match sig.ret {
                     Ty::Option(_) => Val::Opt(ret_sym),
                     Ty::Unit => Val::Unit,
+                    Ty::Bool => Val::Prop(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -865,7 +873,11 @@ impl<'a> Generator<'a> {
                 let sym = if *op == BinOp::And { "∧" } else { "∨" };
                 format!("({pl} {sym} {pr})")
             }
-            _ => unreachable!("checked: bool-typed expression"),
+            // Bool-typed calls (and anything else the checker typed Bool).
+            _ => match self.eval(e) {
+                Val::Prop(p) => p,
+                _ => unreachable!("checked: bool-typed expression"),
+            },
         }
     }
 

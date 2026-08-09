@@ -141,6 +141,14 @@ fn tokenize(text: &str) -> EResult<Vec<T>> {
                 out.push(T::Ne);
                 i += 1;
             }
+            '↔' => {
+                out.push(T::Eq);
+                i += 1;
+            }
+            '<' if chars.get(i + 1) == Some(&'-') && chars.get(i + 2) == Some(&'>') => {
+                out.push(T::Eq);
+                i += 3;
+            }
             '<' if chars.get(i + 1) == Some(&'=') => {
                 out.push(T::Le);
                 i += 2;

@@ -53,15 +53,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 notes: vec![],
             });
         }
-        if f.ret == Ty::Bool {
-            return Err(Diagnostic {
-                name: "type.m0_bool_return".into(),
-                title: format!("function `{}` returns `bool`", f.name),
-                span: f.name_span,
-                label: "bool-valued functions are not supported yet".into(),
-                notes: vec![("note".into(), "see docs/PLAN.md".into())],
-            });
-        }
         if matches!(f.ret, Ty::Array(..)) {
             return Err(Diagnostic {
                 name: "type.array_return".into(),
