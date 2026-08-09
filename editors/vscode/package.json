@@ -11,7 +11,9 @@
     "Programming Languages"
   ],
   "main": "./extension.js",
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:sable"
+  ],
   "contributes": {
     "languages": [
       {

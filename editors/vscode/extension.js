@@ -1,4 +1,4 @@
-const { workspace } = require("vscode");
+const { workspace, window } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
 let client;
@@ -11,7 +11,12 @@ function activate() {
     { command: serverPath, args: ["lsp"], transport: TransportKind.stdio },
     { documentSelector: [{ scheme: "file", language: "sable" }] }
   );
-  client.start();
+  client.start().catch((err) => {
+    window.showErrorMessage(
+      `Sable language server failed to start (${serverPath} lsp): ${err.message}. ` +
+        `Set "sable.serverPath" to the sable binary.`
+    );
+  });
 }
 
 function deactivate() {
