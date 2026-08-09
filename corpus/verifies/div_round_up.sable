@@ -1,0 +1,11 @@
+// The first Sable program: ceiling division, from the design doc §3 —
+// with the precondition corrected. The design doc's original
+// `pre a + b - 1 <= u32.max` admits a + b = 2^32, which overflows the
+// intermediate `a + b`; see corpus/must-fail/overflow_design_doc.sable.
+
+/// pre  b > 0
+/// pre  a + b <= u32.max
+/// post result = (a + b - 1) / b
+fn div_round_up(u32 a, u32 b) -> u32 {
+    return (a + b - 1) / b;
+}
