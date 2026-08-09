@@ -41,9 +41,15 @@ pub fn parse(
     };
     let mut fns = Vec::new();
     let mut classes = Vec::new();
+    let mut traits = Vec::new();
+    let mut impls = Vec::new();
     while !parser.at(&Tok::Eof) {
         if parser.at(&Tok::KwClass) {
             classes.push(parser.parse_class()?);
+        } else if matches!(parser.peek(), Tok::Ident(n) if n == "trait") {
+            traits.push(parser.parse_trait()?);
+        } else if matches!(parser.peek(), Tok::Ident(n) if n == "impl") {
+            impls.push(parser.parse_impl()?);
         } else {
             fns.push(parser.parse_fn()?);
         }
@@ -99,6 +105,8 @@ pub fn parse(
     Ok(Program {
         fns,
         classes,
+        traits,
+        impls,
         discharges,
         ghosts,
         defers,
@@ -183,6 +191,29 @@ fn parse_assume(clause: &Clause) -> PResult<Assume> {
     })
 }
 
+/// `spec NAME : <lean-type>` inside a trait (ADR 0007).
+fn parse_trait_spec(clause: &Clause) -> PResult<TraitSpecFn> {
+    let text = clause.text.trim_start();
+    let name: String = text
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    let rest = text[name.len()..].trim_start();
+    if name.is_empty() || !rest.starts_with(':') || rest[1..].trim().is_empty() {
+        return Err(Diagnostic {
+            name: "proof.malformed_spec".into(),
+            title: "malformed `spec` clause".into(),
+            span: clause.span,
+            label: "expected `spec <name> : <lean-type>`".into(),
+            notes: vec![],
+        });
+    }
+    Ok(TraitSpecFn {
+        name,
+        span: clause.span,
+    })
+}
+
 fn parse_discharge(clause: &Clause) -> PResult<Discharge> {
     // Clause text: `NAME by\n  <script>` (the keyword `discharge` is
     // already stripped by the scanner).
@@ -243,6 +274,7 @@ fn kind_word(k: ClauseKind) -> &'static str {
         ClauseKind::Defer => "defer",
         ClauseKind::Assume => "assume",
         ClauseKind::GhostDef => "def",
+        ClauseKind::Spec => "spec",
         ClauseKind::Theorem => "theorem",
         ClauseKind::Discharge => "discharge",
         ClauseKind::Other => "<continuation>",
@@ -305,7 +337,7 @@ impl<'a> Parser<'a> {
     /// or `::` parses as type arguments.
     fn at_generic_args(&self) -> bool {
         // Builtin angle-bracket forms have dedicated arms.
-        if matches!(self.peek(), Tok::Ident(n) if n == "widen" || n == "alloc_array") {
+        if matches!(self.peek(), Tok::Ident(n) if n == "widen" || n == "narrow" || n == "alloc_array") {
             return false;
         }
         let mut i = self.pos + 1;
@@ -362,13 +394,14 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `<T, U>` after a declaration name.
-    fn type_param_list(&mut self) -> PResult<Vec<String>> {
+    /// `<T, U>` / `<K: Hashable, V>` after a declaration name.
+    fn type_param_list(&mut self) -> PResult<(Vec<String>, Vec<Option<String>>)> {
         if !self.at(&Tok::Lt) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         self.bump();
         let mut out = Vec::new();
+        let mut bounds = Vec::new();
         loop {
             let (name, span) = self.ident()?;
             if IntTy::from_name(&name).is_some() || is_reserved_name(&name) {
@@ -381,6 +414,13 @@ impl<'a> Parser<'a> {
                 });
             }
             out.push(name);
+            if self.at(&Tok::Colon) {
+                self.bump();
+                let (bound, _) = self.ident()?;
+                bounds.push(Some(bound));
+            } else {
+                bounds.push(None);
+            }
             if self.at(&Tok::Comma) {
                 self.bump();
             } else {
@@ -388,7 +428,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::Gt)?;
-        Ok(out)
+        Ok((out, bounds))
     }
 
     /// `<i32, u8>` at a use site (concrete or in-scope-parameter types).
@@ -465,7 +505,8 @@ impl<'a> Parser<'a> {
     fn parse_class(&mut self) -> PResult<ClassDecl> {
         let start = self.expect(Tok::KwClass)?.span;
         let (name, name_span) = self.ident()?;
-        self.tparams = self.type_param_list()?;
+        let (tp, type_bounds) = self.type_param_list()?;
+        self.tparams = tp;
         let type_params = self.tparams.clone();
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
@@ -559,6 +600,7 @@ impl<'a> Parser<'a> {
             name,
             name_span,
             type_params,
+            type_bounds,
             fields,
             invariants,
             inits,
@@ -607,6 +649,7 @@ impl<'a> Parser<'a> {
             name,
             name_span,
             type_params: Vec::new(),
+            type_bounds: Vec::new(),
             params,
             ret: Ty::Unit,
             pres: Vec::new(),
@@ -654,6 +697,7 @@ impl<'a> Parser<'a> {
                 name,
                 name_span,
                 type_params: Vec::new(),
+                type_bounds: Vec::new(),
                 params,
                 ret,
                 pres: Vec::new(),
@@ -697,7 +741,8 @@ impl<'a> Parser<'a> {
         if is_reserved_name(&name) {
             return Err(reserved_name_error(&name, name_span, "function"));
         }
-        self.tparams = self.type_param_list()?;
+        let (tp, type_bounds) = self.type_param_list()?;
+        self.tparams = tp;
         let type_params = self.tparams.clone();
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
@@ -732,6 +777,7 @@ impl<'a> Parser<'a> {
             name,
             name_span,
             type_params,
+            type_bounds,
             params,
             ret,
             pres: Vec::new(),
@@ -773,6 +819,184 @@ impl<'a> Parser<'a> {
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         f.span = start.join(end);
         Ok(f)
+    }
+
+    /// `trait Name { /// spec ... /// post ... fn m(Self x) -> T; ... }`
+    /// — `Self` is in scope as a type parameter (ADR 0007).
+    fn parse_trait(&mut self) -> PResult<TraitDecl> {
+        let start = self.bump().span; // `trait`
+        let (name, name_span) = self.ident()?;
+        if is_reserved_name(&name) {
+            return Err(reserved_name_error(&name, name_span, "trait"));
+        }
+        self.expect(Tok::LBrace)?;
+        self.tparams = vec!["Self".to_string()];
+        let mut specs = Vec::new();
+        let mut methods = Vec::new();
+        while !self.at(&Tok::RBrace) {
+            if self.at(&Tok::Eof) {
+                return Err(self.error_expected("`}`"));
+            }
+            let item_line = self.peek_line();
+            let fstart = self.expect(Tok::KwFn)?.span;
+            let (mname, mspan) = self.ident()?;
+            if is_reserved_name(&mname) {
+                return Err(reserved_name_error(&mname, mspan, "trait method"));
+            }
+            self.expect(Tok::LParen)?;
+            let params = self.param_list()?;
+            self.expect(Tok::RParen)?;
+            let ret = if self.at(&Tok::Arrow) {
+                self.bump();
+                self.ret_ty()?
+            } else {
+                Ty::Unit
+            };
+            let end = self.expect(Tok::Semi)?.span;
+            let mut f = Fn {
+                name: mname,
+                name_span: mspan,
+                type_params: Vec::new(),
+                type_bounds: Vec::new(),
+                params,
+                ret,
+                pres: Vec::new(),
+                posts: Vec::new(),
+                variant: None,
+                body: Vec::new(),
+                span: fstart.join(end),
+            };
+            if let Some(block) = self.take_block_ending_before(item_line) {
+                for clause in &block.clauses {
+                    match clause.kind {
+                        ClauseKind::Pre => f.pres.push(clause.clone()),
+                        ClauseKind::Post => f.posts.push(clause.clone()),
+                        ClauseKind::Spec => specs.push(parse_trait_spec(clause)?),
+                        other => {
+                            return Err(bad_clause(
+                                other,
+                                clause,
+                                "a trait method block",
+                                "only `spec`, `pre`, and `post` may precede a trait method",
+                            ))
+                        }
+                    }
+                }
+            }
+            methods.push(f);
+        }
+        let end = self.expect(Tok::RBrace)?.span;
+        self.tparams.clear();
+        Ok(TraitDecl {
+            name,
+            name_span,
+            specs,
+            methods,
+            span: start.join(end),
+        })
+    }
+
+    /// `impl Trait for i32 { /// def spec... fn m(...) { ... } }` —
+    /// bodies plus spec-function ghost defs; contracts come from the
+    /// trait (ADR 0007).
+    fn parse_impl(&mut self) -> PResult<ImplDecl> {
+        let start = self.bump().span; // `impl`
+        let (trait_name, trait_span) = self.ident()?;
+        self.expect(Tok::KwFor)?;
+        let (for_ty, for_span) = self.int_ty()?;
+        self.expect(Tok::LBrace)?;
+        let body_first_line = self.peek_line();
+        let mut ghosts = Vec::new();
+        let mut fns = Vec::new();
+        while !self.at(&Tok::RBrace) {
+            if self.at(&Tok::Eof) {
+                return Err(self.error_expected("`}`"));
+            }
+            let item_line = self.peek_line();
+            let fstart = self.expect(Tok::KwFn)?.span;
+            let (mname, mspan) = self.ident()?;
+            self.expect(Tok::LParen)?;
+            let params = self.param_list()?;
+            self.expect(Tok::RParen)?;
+            let ret = if self.at(&Tok::Arrow) {
+                self.bump();
+                self.ret_ty()?
+            } else {
+                Ty::Unit
+            };
+            if let Some(block) = self.take_block_ending_before(item_line) {
+                for clause in &block.clauses {
+                    match clause.kind {
+                        ClauseKind::GhostDef => ghosts.push(GhostItem {
+                            keyword: "def",
+                            text: clause.text.clone(),
+                            span: clause.span,
+                        }),
+                        other => {
+                            return Err(bad_clause(
+                                other,
+                                clause,
+                                "an impl body",
+                                "impl bodies carry no contracts — the trait\'s contract \
+                                 applies (ADR 0007); only `def` may appear here",
+                            ))
+                        }
+                    }
+                }
+            }
+            let body = self.block()?;
+            let end = self.tokens[self.pos.saturating_sub(1)].span;
+            fns.push(Fn {
+                name: mname,
+                name_span: mspan,
+                type_params: Vec::new(),
+                type_bounds: Vec::new(),
+                params,
+                ret,
+                pres: Vec::new(),
+                posts: Vec::new(),
+                variant: None,
+                body,
+                span: fstart.join(end),
+            });
+        }
+        let end = self.expect(Tok::RBrace)?.span;
+        let body_last_line = self.lines.line_col(end.start).0;
+        // Free-floating blocks inside the impl body are spec functions.
+        for (bi, block) in self.blocks.iter().enumerate() {
+            if self.consumed[bi]
+                || block.first_line < body_first_line
+                || block.last_line > body_last_line
+            {
+                continue;
+            }
+            self.consumed[bi] = true;
+            for clause in &block.clauses {
+                if clause.kind == ClauseKind::GhostDef {
+                    ghosts.push(GhostItem {
+                        keyword: "def",
+                        text: clause.text.clone(),
+                        span: clause.span,
+                    });
+                } else {
+                    return Err(bad_clause(
+                        clause.kind,
+                        clause,
+                        "an impl body",
+                        "free blocks inside an impl hold only `def` (spec functions)",
+                    ));
+                }
+            }
+        }
+        Ok(ImplDecl {
+            trait_name,
+            trait_span,
+            for_ty,
+            for_span,
+            ghosts,
+            fns,
+            span: start.join(end),
+        })
     }
 
     fn block(&mut self) -> PResult<Vec<Stmt>> {
@@ -1597,7 +1821,8 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
-            Tok::Ident(name) if name == "widen" => {
+            Tok::Ident(name) if name == "widen" || name == "narrow" => {
+                let is_widen = name == "widen";
                 self.bump();
                 self.expect(Tok::Lt)?;
                 let (target, _) = self.int_ty()?;
@@ -1606,9 +1831,16 @@ impl<'a> Parser<'a> {
                 let arg = self.expr()?;
                 let close = self.expect(Tok::RParen)?.span;
                 Ok(Expr {
-                    kind: ExprKind::Widen {
-                        target,
-                        arg: Box::new(arg),
+                    kind: if is_widen {
+                        ExprKind::Widen {
+                            target,
+                            arg: Box::new(arg),
+                        }
+                    } else {
+                        ExprKind::Narrow {
+                            target,
+                            arg: Box::new(arg),
+                        }
                     },
                     span: span.join(close),
                     ty: None,
@@ -1738,7 +1970,8 @@ fn mk_bin(op: BinOp, op_span: Span, lhs: Expr, rhs: Expr) -> Expr {
 /// Names that would collide with the proof language or generated Lean.
 fn is_reserved_name(name: &str) -> bool {
     const RESERVED: &[&str] = &[
-        "result", "old", "mut", "some", "none", "option", "widen", "theorem", "def", "by", "fun",
+        "result", "old", "mut", "some", "none", "option", "widen", "narrow", "theorem", "def", "by",
+        "fun",
         "match", "with", "do", "let", "have", "show", "from", "open", "import", "namespace",
         "end", "in", "at", "forall", "exists", "Prop", "Type", "Int", "Nat", "Bool", "True",
         "False", "len",
@@ -1778,7 +2011,7 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
             out.insert(array.clone());
         }
         ExprKind::Unary { operand, .. } => expr_vars(operand, out),
-        ExprKind::Widen { arg, .. } => expr_vars(arg, out),
+        ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => expr_vars(arg, out),
         ExprKind::SomeE(inner) => expr_vars(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_vars(lhs, out);

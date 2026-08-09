@@ -212,6 +212,9 @@ pub enum ExprKind {
     Len { array: String },
     /// `widen<T>(e)` — value-preserving widening; no VC, identity in Lean.
     Widen { target: IntTy, arg: Box<Expr> },
+    /// `narrow<T>(e)` — conversion to any integer type under a range VC
+    /// (`narrow.range`); identity in Lean, trap in `sable test` (ADR 0007).
+    Narrow { target: IntTy, arg: Box<Expr> },
     /// `some(e)` / `none` — return position only in M1.
     SomeE(Box<Expr>),
     NoneE,
@@ -342,6 +345,9 @@ pub struct Fn {
     /// Generic type parameters (`fn swap<T>(...)`). Non-empty only
     /// before monomorphization.
     pub type_params: Vec<String>,
+    /// Per-parameter trait bound (`<K: Hashable>`), parallel to
+    /// `type_params` (ADR 0007).
+    pub type_bounds: Vec<Option<String>>,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub pres: Vec<Clause>,
@@ -410,6 +416,40 @@ pub struct Method {
     pub f: Fn,
 }
 
+/// `/// spec name : sig` inside a trait — a spec-level (Lean) function
+/// symbol each impl must provide as a ghost def (ADR 0007).
+#[derive(Debug, Clone)]
+pub struct TraitSpecFn {
+    pub name: String,
+    pub span: Span,
+}
+
+/// `trait Name { /// spec ... /// post ... fn m(Self x) -> T; ... }` —
+/// within the trait, `Self` is `IntTy::TParam(0)`.
+#[derive(Debug, Clone)]
+pub struct TraitDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub specs: Vec<TraitSpecFn>,
+    /// Method signatures (empty bodies) carrying the trait's contracts.
+    pub methods: Vec<Fn>,
+    pub span: Span,
+}
+
+/// `impl Trait for i32 { /// def spec... fn m(...) { ... } }` — bodies
+/// only; contracts come from the trait (ADR 0007).
+#[derive(Debug, Clone)]
+pub struct ImplDecl {
+    pub trait_name: String,
+    pub trait_span: Span,
+    pub for_ty: IntTy,
+    pub for_span: Span,
+    /// The impl's ghost defs — must map 1:1 onto the trait's spec fns.
+    pub ghosts: Vec<GhostItem>,
+    pub fns: Vec<Fn>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClassDecl {
     pub name: String,
@@ -417,6 +457,8 @@ pub struct ClassDecl {
     /// Generic type parameters (`class Vec<T>`). Non-empty only before
     /// monomorphization.
     pub type_params: Vec<String>,
+    /// Per-parameter trait bound, parallel to `type_params` (ADR 0007).
+    pub type_bounds: Vec<Option<String>>,
     pub fields: Vec<Field>,
     /// Class invariant clauses — interface blocks (design §7).
     pub invariants: Vec<Clause>,
@@ -431,6 +473,9 @@ pub struct ClassDecl {
 pub struct Program {
     pub fns: Vec<Fn>,
     pub classes: Vec<ClassDecl>,
+    /// Consumed entirely by monomorphization (ADR 0007).
+    pub traits: Vec<TraitDecl>,
+    pub impls: Vec<ImplDecl>,
     pub discharges: Vec<Discharge>,
     pub ghosts: Vec<GhostItem>,
     pub defers: Vec<Defer>,

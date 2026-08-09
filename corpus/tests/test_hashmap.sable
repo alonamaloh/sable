@@ -1,0 +1,189 @@
+// Dynamic checks over the generic hash map: every clause — including
+// the probe-path class invariant (ite ghost defs), the existential get
+// post, the trait law `result = Self::hash x`, and the insert frame
+// posts — is monitored at runtime with zero skips. Keys 1, 9, 17 share
+// bucket (x + 2^31) % 8, exercising collision probing and wraparound.
+
+trait Hashable {
+    /// spec hash : int → int
+    /// post 0 ≤ result
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for i32 {
+    /// def hash (x : int) : int := x + 2147483648
+    fn hash(i32 x) -> u64 {
+        i64 y = widen<i64>(x) + 2147483648;
+        return narrow<u64>(y);
+    }
+}
+
+
+impl Hashable for u64 {
+    /// def hash (x : int) : int := x
+    fn hash(u64 x) -> u64 {
+        return x;
+    }
+}
+
+/// def probe (h j cap : int) : int := if h + j < cap then h + j else h + j - cap
+
+/// def dist (h i cap : int) : int := if h ≤ i then i - h else cap + i - h
+
+// The wraparound step, contracted against the ghost `probe`: callers
+// get `result = probe h j cap` as a single fact — no path split leaks
+// into the map's loops.
+
+/// pre  h < cap
+/// pre  j < cap
+/// pre  cap ≤ 4611686018427387904
+/// post result = probe h j cap
+/// post result < cap
+fn probe_step(u64 h, u64 j, u64 cap) -> u64 {
+    u64 p = h + j;
+    if (p >= cap) {
+        return p - cap;
+    }
+    return p;
+}
+
+class HashMap<K: Hashable, V> {
+    [K]  keys;
+    [V]  vals;
+    [u8] occ;
+    u64  len;
+
+    /// invariant occ.len = keys.len
+    /// invariant occ.len = vals.len
+    /// invariant occ.len > 0
+    /// invariant occ.len ≤ 4611686018427387904
+    /// invariant len ≤ occ.len
+    /// invariant ∀ i, 0 ≤ i → i < occ.len → occ.get i = 0 ∨ occ.get i = 1
+    /// invariant ∀ i, 0 ≤ i → i < occ.len → occ.get i = 1 → ∀ j2, 0 ≤ j2 → j2 < dist ((K::hash (keys.get i)) % occ.len) i occ.len → occ.get (probe ((K::hash (keys.get i)) % occ.len) j2 occ.len) = 1
+    /// invariant ∀ i1, 0 ≤ i1 → i1 < occ.len → ∀ i2, 0 ≤ i2 → i2 < occ.len → occ.get i1 = 1 → occ.get i2 = 1 → keys.get i1 = keys.get i2 → i1 = i2
+
+    /// pre  cap > 0
+    /// pre  cap ≤ 4611686018427387904
+    /// post self.len = 0
+    /// post self.occ.len = cap
+    init with_capacity(u64 cap) {
+        self.keys = alloc_array<K>(cap, 0);
+        self.vals = alloc_array<V>(cap, 0);
+        self.occ = alloc_array<u8>(cap, 0);
+        self.len = 0;
+    }
+
+    /// post result = self.len
+    fn size(&self) -> u64 {
+        return self.len;
+    }
+
+    /// post match result with
+    ///      | some v => ∃ i, 0 ≤ i ∧ i < self.occ.len ∧ self.occ.get i = 1 ∧ self.keys.get i = k ∧ self.vals.get i = v
+    ///      | none   => ∀ i, 0 ≤ i → i < self.occ.len → self.occ.get i = 1 → self.keys.get i ≠ k
+    fn get(&self, K k) -> option<V> {
+        u64 cap = self.occ.len;
+        u64 hv = K::hash(k);
+        u64 h = hv % cap;
+        u64 j = 0;
+        /// invariant j ≤ cap
+        /// invariant 0 ≤ h ∧ h < cap
+        /// invariant ∀ j2, 0 ≤ j2 → j2 < j → self.occ.get (probe h j2 cap) = 1 ∧ self.keys.get (probe h j2 cap) ≠ k
+        /// variant   cap - j
+        while (j < cap) {
+            u64 p = probe_step(h, j, cap);
+            if (self.occ[p] == 0) {
+                return none;
+            }
+            if (self.keys[p] == k) {
+                return some(self.vals[p]);
+            }
+            j = j + 1;
+        }
+        return none;
+    }
+
+    /// pre  self.len < self.occ.len
+    /// post self.occ.len = (old self).occ.len
+    /// post self.len ≤ (old self).len + 1
+    /// post result → ∃ i, 0 ≤ i ∧ i < self.occ.len ∧ self.occ.get i = 1 ∧ self.keys.get i = k ∧ self.vals.get i = v
+    /// post ∀ i, 0 ≤ i → i < self.occ.len → (old self).occ.get i = 1 → self.occ.get i = 1 ∧ self.keys.get i = (old self).keys.get i ∧ ((old self).keys.get i ≠ k → self.vals.get i = (old self).vals.get i)
+    fn insert(&mut self, K k, V v) -> bool {
+        u64 cap = self.occ.len;
+        u64 hv = K::hash(k);
+        u64 h = hv % cap;
+        u64 j = 0;
+        /// invariant j ≤ cap
+        /// invariant 0 ≤ h ∧ h < cap
+        /// invariant self.occ.len = cap ∧ self.keys.len = cap ∧ self.vals.len = cap
+        /// invariant self.len = (old self).len ∧ self.len < cap
+        /// invariant ∀ i, 0 ≤ i → i < cap → self.occ.get i = (old self).occ.get i ∧ self.keys.get i = (old self).keys.get i ∧ self.vals.get i = (old self).vals.get i
+        /// invariant ∀ i, 0 ≤ i → i < cap → self.occ.get i = 0 ∨ self.occ.get i = 1
+        /// invariant ∀ i, 0 ≤ i → i < cap → self.occ.get i = 1 → ∀ j2, 0 ≤ j2 → j2 < dist ((K::hash (self.keys.get i)) % cap) i cap → self.occ.get (probe ((K::hash (self.keys.get i)) % cap) j2 cap) = 1
+    /// invariant ∀ i1, 0 ≤ i1 → i1 < cap → ∀ i2, 0 ≤ i2 → i2 < cap → self.occ.get i1 = 1 → self.occ.get i2 = 1 → self.keys.get i1 = self.keys.get i2 → i1 = i2
+        /// invariant ∀ j2, 0 ≤ j2 → j2 < j → self.occ.get (probe h j2 cap) = 1 ∧ self.keys.get (probe h j2 cap) ≠ k
+        /// variant   cap - j
+        while (j < cap) {
+            u64 p = probe_step(h, j, cap);
+            if (self.occ[p] == 0) {
+                self.keys[p] = k;
+                self.vals[p] = v;
+                self.occ[p] = 1;
+                self.len = self.len + 1;
+                return true;
+            }
+            if (self.keys[p] == k) {
+                self.vals[p] = v;
+                return true;
+            }
+            j = j + 1;
+        }
+        return false;
+    }
+
+    deinit {
+    }
+}
+
+fn test_insert_get_roundtrip() {
+    var m = HashMap<i32, u64>::with_capacity(8);
+    m.insert(1, 10);
+    m.insert(2, 20);
+    m.get(1);
+    m.get(2);
+    m.get(3);
+    m.size();
+}
+
+fn test_collisions_and_overwrite() {
+    var m = HashMap<i32, u64>::with_capacity(8);
+    m.insert(1, 100);
+    m.insert(9, 900);
+    m.insert(17, 1700);
+    m.insert(9, 901);
+    m.get(9);
+    m.get(17);
+    m.get(25);
+    m.size();
+}
+
+fn test_wraparound() {
+    var m = HashMap<i32, u64>::with_capacity(4);
+    m.insert(3, 30);
+    m.insert(7, 70);
+    m.insert(2, 22);
+    m.get(3);
+    m.get(7);
+    m.get(2);
+    m.get(6);
+}
+
+fn test_u64_instance() {
+    var m = HashMap<u64, u64>::with_capacity(4);
+    m.insert(5, 55);
+    m.insert(9, 99);
+    m.get(5);
+    m.get(9);
+    m.get(13);
+}

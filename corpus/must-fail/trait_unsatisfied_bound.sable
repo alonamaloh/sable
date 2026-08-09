@@ -1,0 +1,24 @@
+// expect-error: mono.unsatisfied_bound
+
+trait Hashable {
+    /// spec hash : int → int
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for u64 {
+    /// def hash (x : int) : int := x
+    fn hash(u64 x) -> u64 {
+        return x;
+    }
+}
+
+/// post result = K::hash a % 64
+fn bucket64<K: Hashable>(K a) -> u64 {
+    return K::hash(a) % 64;
+}
+
+/// post result = 5
+fn demo() -> u64 {
+    return bucket64<u8>(5);
+}

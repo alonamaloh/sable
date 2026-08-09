@@ -1,0 +1,503 @@
+// The Tier-1 hash map: open addressing with linear probing, generic
+// over a law-carrying `Hashable` bound (ADR 0007). The class invariant
+// is the linear-probing contract: every occupied slot is reachable from
+// its key's home bucket through occupied slots — which is exactly what
+// makes stopping at the first empty slot sound (`hash_absent` below).
+// Cyclic index arithmetic is by subtraction (`probe`/`dist`), never by
+// variable modulus, so goals stay inside omega's fragment; the only `%`
+// is `hash k % cap`, an opaque atom with emod bounds. The wraparound
+// branch lives in the contracted helper `probe_step`, so the map's own
+// loops see `p = probe h j cap` as a single call fact with no path
+// split.
+//
+// v1 scope: no deletion (no tombstones), and `insert` may return false
+// after a full sweep — proving a non-full table always succeeds needs a
+// counting (pigeonhole) invariant, deliberately deferred.
+
+trait Hashable {
+    /// spec hash : int → int
+    /// post 0 ≤ result
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for i32 {
+    /// def hash (x : int) : int := x + 2147483648
+    fn hash(i32 x) -> u64 {
+        i64 y = widen<i64>(x) + 2147483648;
+        return narrow<u64>(y);
+    }
+}
+
+/// def probe (h j cap : int) : int := if h + j < cap then h + j else h + j - cap
+
+/// def dist (h i cap : int) : int := if h ≤ i then i - h else cap + i - h
+
+/// theorem probe_bounds (h j cap : int) (h0 : 0 ≤ h) (hc : h < cap)
+///     (j0 : 0 ≤ j) (jc : j < cap) :
+///     0 ≤ probe h j cap ∧ probe h j cap < cap := by
+///   unfold probe; split <;> omega
+
+/// theorem dist_bounds (h i cap : int) (h0 : 0 ≤ h) (hc : h < cap)
+///     (i0 : 0 ≤ i) (ic : i < cap) :
+///     0 ≤ dist h i cap ∧ dist h i cap < cap := by
+///   unfold dist; split <;> omega
+
+/// theorem dist_probe_eq (h j cap : int) (h0 : 0 ≤ h) (hc : h < cap)
+///     (j0 : 0 ≤ j) (jc : j < cap) : dist h (probe h j cap) cap = j := by
+///   unfold probe dist; split <;> split <;> omega
+
+/// theorem probe_dist_eq (h i cap : int) (h0 : 0 ≤ h) (hc : h < cap)
+///     (i0 : 0 ≤ i) (ic : i < cap) : probe h (dist h i cap) cap = i := by
+///   unfold probe dist; split <;> split <;> omega
+
+/// theorem hash_absent (cap : int) (occ keys : Sable.Seq Int)
+///     (hm : int → int) (k j : int)
+///     (hbnd : ∀ x, 0 ≤ hm x ∧ hm x < cap)
+///     (hinv : ∀ i, 0 ≤ i → i < cap → occ.get i = 1 →
+///        ∀ j2, 0 ≤ j2 → j2 < dist (hm (keys.get i)) i cap →
+///          occ.get (probe (hm (keys.get i)) j2 cap) = 1)
+///     (hloop : ∀ j2, 0 ≤ j2 → j2 < j →
+///       occ.get (probe (hm k) j2 cap) = 1 ∧ keys.get (probe (hm k) j2 cap) ≠ k)
+///     (hj : 0 ≤ j) (hjc : j < cap)
+///     (hempty : occ.get (probe (hm k) j cap) ≠ 1) :
+///     ∀ i, 0 ≤ i → i < cap → occ.get i = 1 → keys.get i ≠ k := by
+///   intro i hi0 hic hocc hkey
+///   have hb := hbnd k
+///   have hdb := dist_bounds (hm k) i cap hb.1 hb.2 hi0 hic
+///   have hpd : probe (hm k) (dist (hm k) i cap) cap = i :=
+///     probe_dist_eq (hm k) i cap hb.1 hb.2 hi0 hic
+///   by_cases hdj : dist (hm k) i cap = j
+///   · rw [hdj] at hpd
+///     rw [hpd] at hempty
+///     exact hempty hocc
+///   · by_cases hdlt : dist (hm k) i cap < j
+///     · have h2 := (hloop _ hdb.1 hdlt).2
+///       rw [hpd] at h2
+///       exact h2 hkey
+///     · have h3 := hinv i hi0 hic hocc
+///       rw [hkey] at h3
+///       exact hempty (h3 j hj (by omega))
+
+/// theorem hash_inv_preserved (cap : int) (occ keys : Sable.Seq Int)
+///     (hm : int → int) (s k j : int)
+///     (hbnd : ∀ x, 0 ≤ hm x ∧ hm x < cap)
+///     (hinv : ∀ i, 0 ≤ i → i < cap → occ.get i = 1 →
+///        ∀ j2, 0 ≤ j2 → j2 < dist (hm (keys.get i)) i cap →
+///          occ.get (probe (hm (keys.get i)) j2 cap) = 1)
+///     (hs : s = probe (hm k) j cap)
+///     (hj : 0 ≤ j) (hjc : j < cap)
+///     (hempty : occ.get s ≠ 1)
+///     (hloop : ∀ j2, 0 ≤ j2 → j2 < j →
+///       occ.get (probe (hm k) j2 cap) = 1 ∧ keys.get (probe (hm k) j2 cap) ≠ k) :
+///     ∀ i, 0 ≤ i → i < cap → (occ.set s 1).get i = 1 →
+///       ∀ j2, 0 ≤ j2 → j2 < dist (hm ((keys.set s k).get i)) i cap →
+///         (occ.set s 1).get (probe (hm ((keys.set s k).get i)) j2 cap) = 1 := by
+///   intro i hi0 hic hocc j2 hj0 hj2
+///   have hb := hbnd k
+///   have hsb : 0 ≤ s ∧ s < cap := by
+///     rw [hs]; exact probe_bounds (hm k) j cap hb.1 hb.2 hj hjc
+///   by_cases his : i = s
+///   · subst his
+///     have hks : (keys.set i k).get i = k := by
+///       rw [Sable.Seq.get_set, if_pos rfl]
+///     rw [hks] at hj2 ⊢
+///     have hdp : dist (hm k) i cap = j := by
+///       rw [hs]; exact dist_probe_eq (hm k) j cap hb.1 hb.2 hj hjc
+///     rw [hdp] at hj2
+///     have hl := (hloop j2 hj0 hj2).1
+///     by_cases hps : probe (hm k) j2 cap = i
+///     · rw [Sable.Seq.get_set, hps, if_pos rfl]
+///     · rw [Sable.Seq.get_set, if_neg hps]
+///       exact hl
+///   · rw [Sable.Seq.get_set, if_neg his] at hocc
+///     have hkey2 : (keys.set s k).get i = keys.get i := by
+///       rw [Sable.Seq.get_set, if_neg his]
+///     rw [hkey2] at hj2 ⊢
+///     have hold := hinv i hi0 hic hocc j2 hj0 hj2
+///     by_cases hps : probe (hm (keys.get i)) j2 cap = s
+///     · rw [Sable.Seq.get_set, hps, if_pos rfl]
+///     · rw [Sable.Seq.get_set, if_neg hps]
+///       exact hold
+
+/// theorem hash_nodup_preserved (cap : int) (occ keys : Sable.Seq Int)
+///     (hm : int → int) (s k j : int)
+///     (hbnd : ∀ x, 0 ≤ hm x ∧ hm x < cap)
+///     (hinv : ∀ i, 0 ≤ i → i < cap → occ.get i = 1 →
+///        ∀ j2, 0 ≤ j2 → j2 < dist (hm (keys.get i)) i cap →
+///          occ.get (probe (hm (keys.get i)) j2 cap) = 1)
+///     (hnodup : ∀ i1, 0 ≤ i1 → i1 < cap → ∀ i2, 0 ≤ i2 → i2 < cap →
+///       occ.get i1 = 1 → occ.get i2 = 1 → keys.get i1 = keys.get i2 → i1 = i2)
+///     (hs : s = probe (hm k) j cap)
+///     (hj : 0 ≤ j) (hjc : j < cap)
+///     (hempty : occ.get s ≠ 1)
+///     (hloop : ∀ j2, 0 ≤ j2 → j2 < j →
+///       occ.get (probe (hm k) j2 cap) = 1 ∧ keys.get (probe (hm k) j2 cap) ≠ k) :
+///     ∀ i1, 0 ≤ i1 → i1 < cap → ∀ i2, 0 ≤ i2 → i2 < cap →
+///       (occ.set s 1).get i1 = 1 → (occ.set s 1).get i2 = 1 →
+///       (keys.set s k).get i1 = (keys.set s k).get i2 → i1 = i2 := by
+///   have habs := hash_absent cap occ keys hm k j hbnd hinv hloop hj hjc
+///     (by rw [hs] at hempty; exact hempty)
+///   intro i1 h10 h1c i2 h20 h2c ho1 ho2 hk
+///   by_cases h1s : i1 = s
+///   · by_cases h2s : i2 = s
+///     · rw [h1s, h2s]
+///     · rw [Sable.Seq.get_set, if_neg h2s] at ho2
+///       rw [h1s] at hk
+///       rw [Sable.Seq.get_set, if_pos rfl, Sable.Seq.get_set, if_neg h2s] at hk
+///       exact absurd hk.symm (habs i2 h20 h2c ho2)
+///   · by_cases h2s : i2 = s
+///     · rw [Sable.Seq.get_set, if_neg h1s] at ho1
+///       rw [h2s] at hk
+///       rw [Sable.Seq.get_set, if_neg h1s, Sable.Seq.get_set, if_pos rfl] at hk
+///       exact absurd hk (habs i1 h10 h1c ho1)
+///     · rw [Sable.Seq.get_set, if_neg h1s] at ho1
+///       rw [Sable.Seq.get_set, if_neg h2s] at ho2
+///       rw [Sable.Seq.get_set, if_neg h1s, Sable.Seq.get_set, if_neg h2s] at hk
+///       exact hnodup i1 h10 h1c i2 h20 h2c ho1 ho2 hk
+
+// The wraparound step, contracted against the ghost `probe`: callers
+// get `result = probe h j cap` as a single fact — no path split leaks
+// into the map's loops.
+
+/// pre  h < cap
+/// pre  j < cap
+/// pre  cap ≤ 4611686018427387904
+/// post result = probe h j cap
+/// post result < cap
+fn probe_step(u64 h, u64 j, u64 cap) -> u64 {
+    u64 p = h + j;
+    if (p >= cap) {
+        return p - cap;
+    }
+    return p;
+}
+
+class HashMap<K: Hashable, V> {
+    [K]  keys;
+    [V]  vals;
+    [u8] occ;
+    u64  len;
+
+    /// invariant occ.len = keys.len
+    /// invariant occ.len = vals.len
+    /// invariant occ.len > 0
+    /// invariant occ.len ≤ 4611686018427387904
+    /// invariant len ≤ occ.len
+    /// invariant ∀ i, 0 ≤ i → i < occ.len → occ.get i = 0 ∨ occ.get i = 1
+    /// invariant ∀ i, 0 ≤ i → i < occ.len → occ.get i = 1 → ∀ j2, 0 ≤ j2 → j2 < dist ((K::hash (keys.get i)) % occ.len) i occ.len → occ.get (probe ((K::hash (keys.get i)) % occ.len) j2 occ.len) = 1
+    /// invariant ∀ i1, 0 ≤ i1 → i1 < occ.len → ∀ i2, 0 ≤ i2 → i2 < occ.len → occ.get i1 = 1 → occ.get i2 = 1 → keys.get i1 = keys.get i2 → i1 = i2
+
+    /// pre  cap > 0
+    /// pre  cap ≤ 4611686018427387904
+    /// post self.len = 0
+    /// post self.occ.len = cap
+    init with_capacity(u64 cap) {
+        self.keys = alloc_array<K>(cap, 0);
+        self.vals = alloc_array<V>(cap, 0);
+        self.occ = alloc_array<u8>(cap, 0);
+        self.len = 0;
+    }
+
+    /// post result = self.len
+    fn size(&self) -> u64 {
+        return self.len;
+    }
+
+    /// post match result with
+    ///      | some v => ∃ i, 0 ≤ i ∧ i < self.occ.len ∧ self.occ.get i = 1 ∧ self.keys.get i = k ∧ self.vals.get i = v
+    ///      | none   => ∀ i, 0 ≤ i → i < self.occ.len → self.occ.get i = 1 → self.keys.get i ≠ k
+    fn get(&self, K k) -> option<V> {
+        u64 cap = self.occ.len;
+        u64 hv = K::hash(k);
+        u64 h = hv % cap;
+        u64 j = 0;
+        /// invariant j ≤ cap
+        /// invariant 0 ≤ h ∧ h < cap
+        /// invariant ∀ j2, 0 ≤ j2 → j2 < j → self.occ.get (probe h j2 cap) = 1 ∧ self.keys.get (probe h j2 cap) ≠ k
+        /// variant   cap - j
+        while (j < cap) {
+            u64 p = probe_step(h, j, cap);
+            if (self.occ[p] == 0) {
+                return none;
+            }
+            if (self.keys[p] == k) {
+                return some(self.vals[p]);
+            }
+            j = j + 1;
+        }
+        return none;
+    }
+
+    /// pre  self.len < self.occ.len
+    /// post self.occ.len = (old self).occ.len
+    /// post self.len ≤ (old self).len + 1
+    /// post result → ∃ i, 0 ≤ i ∧ i < self.occ.len ∧ self.occ.get i = 1 ∧ self.keys.get i = k ∧ self.vals.get i = v
+    /// post ∀ i, 0 ≤ i → i < self.occ.len → (old self).occ.get i = 1 → self.occ.get i = 1 ∧ self.keys.get i = (old self).keys.get i ∧ ((old self).keys.get i ≠ k → self.vals.get i = (old self).vals.get i)
+    fn insert(&mut self, K k, V v) -> bool {
+        u64 cap = self.occ.len;
+        u64 hv = K::hash(k);
+        u64 h = hv % cap;
+        u64 j = 0;
+        /// invariant j ≤ cap
+        /// invariant 0 ≤ h ∧ h < cap
+        /// invariant self.occ.len = cap ∧ self.keys.len = cap ∧ self.vals.len = cap
+        /// invariant self.len = (old self).len ∧ self.len < cap
+        /// invariant ∀ i, 0 ≤ i → i < cap → self.occ.get i = (old self).occ.get i ∧ self.keys.get i = (old self).keys.get i ∧ self.vals.get i = (old self).vals.get i
+        /// invariant ∀ i, 0 ≤ i → i < cap → self.occ.get i = 0 ∨ self.occ.get i = 1
+        /// invariant ∀ i, 0 ≤ i → i < cap → self.occ.get i = 1 → ∀ j2, 0 ≤ j2 → j2 < dist ((K::hash (self.keys.get i)) % cap) i cap → self.occ.get (probe ((K::hash (self.keys.get i)) % cap) j2 cap) = 1
+    /// invariant ∀ i1, 0 ≤ i1 → i1 < cap → ∀ i2, 0 ≤ i2 → i2 < cap → self.occ.get i1 = 1 → self.occ.get i2 = 1 → self.keys.get i1 = self.keys.get i2 → i1 = i2
+        /// invariant ∀ j2, 0 ≤ j2 → j2 < j → self.occ.get (probe h j2 cap) = 1 ∧ self.keys.get (probe h j2 cap) ≠ k
+        /// variant   cap - j
+        while (j < cap) {
+            u64 p = probe_step(h, j, cap);
+            if (self.occ[p] == 0) {
+                self.keys[p] = k;
+                self.vals[p] = v;
+                self.occ[p] = 1;
+                self.len = self.len + 1;
+                return true;
+            }
+            if (self.keys[p] == k) {
+                self.vals[p] = v;
+                return true;
+            }
+            j = j + 1;
+        }
+        return false;
+    }
+
+    deinit {
+    }
+}
+
+fn demo() {
+    var m = HashMap<i32, u64>::with_capacity(8);
+    m.insert(1, 10);
+    m.insert(2, 20);
+    m.get(1);
+    m.get(3);
+    m.size();
+}
+
+// ------------------------------------------------------------------
+// Discharges. The heavy lifting is in the in-file theorems above; the
+// scripts below mostly massage VC symbols into theorem shape: rewrite
+// `_r1 = hash_spec k` (the trait law) and `p = probe h j cap` (the
+// probe_step contract), align lengths across `.set` chains, then apply.
+// `sable_auto` times out on these contexts (quantified probe-path hyps
+// defeat grind's splitter), so even some goals omega could finish need
+// explicit scripts.
+
+// -------------------------------------------------------- get
+
+/// discharge HashMap_i32_u64::get.inv_preserved.j2_0_j2_j2_j_self_occ_get_probe_h_j2_cap by
+///   intro j2 hj20 hj2
+///   by_cases hjj : j2 = j
+///   · subst hjj
+///     rw [← h_probe_step_post_result_probe_h_j_cap]
+///     refine ⟨?_, h_path_not_old_self_keys_get_r8_k⟩
+///     have h01 := h_cinv_i_0_i_i_occ_len_occ_get _r8 h_fact_0_r8_r8_old_self_occ_len.1 h_fact_0_r8_r8_old_self_occ_len.2
+///     omega
+///   · exact h_inv_j2_0_j2_j2_j_self_occ_ge j2 hj20 (by omega)
+
+/// discharge HashMap_i32_u64::get.post.match_result_with_some_v_i_0_i_i_self_oc by
+///   subst h_result
+///   have hbnd : ∀ x, 0 ≤ Hashable_i32_hash_spec x % ((_old_self.occ).len) ∧ Hashable_i32_hash_spec x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
+///     intro x
+///     exact ⟨Int.emod_nonneg _ (by omega), Int.emod_lt_of_pos _ (by omega)⟩
+///   have hloop := h_inv_j2_0_j2_j2_j_self_occ_ge
+///   rw [h_Hashable_i32_hash_post_result_hashable_i32_hash] at hloop
+///   have hemp : (_old_self.occ).get (probe (Hashable_i32_hash_spec k % ((_old_self.occ).len)) j ((_old_self.occ).len)) ≠ 1 := by
+///     rw [← h_Hashable_i32_hash_post_result_hashable_i32_hash, ← h_probe_step_post_result_probe_h_j_cap]
+///     omega
+///   exact hash_absent ((_old_self.occ).len) (_old_self.occ) (_old_self.keys)
+///     (fun x => Hashable_i32_hash_spec x % ((_old_self.occ).len)) k j
+///     hbnd h_cinv_i_0_i_i_occ_len_occ_get_2 hloop h_j_range.1 h_path_j_old_self_occ_len hemp
+
+/// discharge HashMap_i32_u64::get.post.match_result_with_some_v_i_0_i_i_self_oc.2 by
+///   subst h_result
+///   refine ⟨_r8, h_fact_0_r8_r8_old_self_occ_len.1, h_fact_0_r8_r8_old_self_occ_len.2, ?_, ?_, rfl⟩
+///   · have h01 := h_cinv_i_0_i_i_occ_len_occ_get _r8 h_fact_0_r8_r8_old_self_occ_len.1 h_fact_0_r8_r8_old_self_occ_len.2
+///     omega
+///   · exact h_path_old_self_keys_get_r8_k
+
+/// discharge HashMap_i32_u64::get.post.match_result_with_some_v_i_0_i_i_self_oc.3 by
+///   subst h_result
+///   intro i hi0 hic hocc
+///   have hdb := dist_bounds ((_r1 % ((_old_self.occ).len))) i ((_old_self.occ).len) h_inv_0_h_h_cap.1 h_inv_0_h_h_cap.2 hi0 hic
+///   have hpd := probe_dist_eq ((_r1 % ((_old_self.occ).len))) i ((_old_self.occ).len) h_inv_0_h_h_cap.1 h_inv_0_h_h_cap.2 hi0 hic
+///   have hl := h_inv_j2_0_j2_j2_j_self_occ_ge (dist ((_r1 % ((_old_self.occ).len))) i ((_old_self.occ).len)) hdb.1 (by omega)
+///   rw [hpd] at hl
+///   exact hl.2
+
+// -------------------------------------------------------- insert
+
+/// discharge HashMap_i32_u64::insert.inv_preserved.j2_0_j2_j2_j_self_occ_get_probe_h_j2_cap by
+///   intro j2 hj20 hj2
+///   by_cases hjj : j2 = j
+///   · subst hjj
+///     rw [← h_probe_step_post_result_probe_h_j_cap]
+///     refine ⟨?_, h_path_not_self13_keys_get_r16_k⟩
+///     have h01 := h_inv_i_0_i_i_cap_self_occ_get_2 _r16 h_r16_range.1 h_probe_step_post_result_cap
+///     omega
+///   · exact h_inv_j2_0_j2_j2_j_self_occ_ge j2 hj20 (by omega)
+
+/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_keys_len by
+///   simp only [Sable.Seq.len_set]
+///   omega
+
+/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_vals_len by
+///   simp only [Sable.Seq.len_set]
+///   omega
+
+/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_vals_len.2 by
+///   simp only [Sable.Seq.len_set]
+///   omega
+
+/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_0 by
+///   simp only [Sable.Seq.len_set]
+///   omega
+
+/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_4611686018427387904 by
+///   simp only [Sable.Seq.len_set]
+///   omega
+
+/// discharge HashMap_i32_u64::insert.inv_exit.len_occ_len by
+///   simp only [Sable.Seq.len_set]
+///   omega
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1 by
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   intro i hi0 hic
+///   by_cases hip : i = _r16
+///   · rw [if_pos hip]
+///     right
+///     rfl
+///   · rw [if_neg hip]
+///     exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.2 by
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   intro i hi0 hic
+///   exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.3 by
+///   intro i hi0 hic
+///   exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d by
+///   have hbnd : ∀ x, 0 ≤ Hashable_i32_hash_spec x % ((_old_self.occ).len) ∧ Hashable_i32_hash_spec x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
+///     intro x
+///     exact ⟨Int.emod_nonneg _ (by omega), Int.emod_lt_of_pos _ (by omega)⟩
+///   have hloop := h_inv_j2_0_j2_j2_j_self_occ_ge
+///   rw [h_Hashable_i32_hash_post_result_hashable_i32_hash] at hloop
+///   have hs : _r16 = probe (Hashable_i32_hash_spec k % ((_old_self.occ).len)) j ((_old_self.occ).len) := by
+///     rw [← h_Hashable_i32_hash_post_result_hashable_i32_hash]
+///     exact h_probe_step_post_result_probe_h_j_cap
+///   have hemp : (_self13.occ).get _r16 ≠ 1 := by omega
+///   simp only [Sable.Seq.len_set]
+///   rw [h_inv_self_occ_len_cap_self_ke.1]
+///   exact hash_inv_preserved ((_old_self.occ).len) (_self13.occ) (_self13.keys)
+///     (fun x => Hashable_i32_hash_spec x % ((_old_self.occ).len)) _r16 k j
+///     hbnd h_inv_i_0_i_i_cap_self_occ_get_3 hs h_j_range.1 h_path_j_old_self_occ_len hemp hloop
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d.2 by
+///   rw [h_inv_self_occ_len_cap_self_ke.1]
+///   exact h_inv_i_0_i_i_cap_self_occ_get_3
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d.3 by
+///   rw [h_inv_self_occ_len_cap_self_ke.1]
+///   exact h_inv_i_0_i_i_cap_self_occ_get_3
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc by
+///   have hbnd : ∀ x, 0 ≤ Hashable_i32_hash_spec x % ((_old_self.occ).len) ∧ Hashable_i32_hash_spec x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
+///     intro x
+///     exact ⟨Int.emod_nonneg _ (by omega), Int.emod_lt_of_pos _ (by omega)⟩
+///   have hloop := h_inv_j2_0_j2_j2_j_self_occ_ge
+///   rw [h_Hashable_i32_hash_post_result_hashable_i32_hash] at hloop
+///   have hs : _r16 = probe (Hashable_i32_hash_spec k % ((_old_self.occ).len)) j ((_old_self.occ).len) := by
+///     rw [← h_Hashable_i32_hash_post_result_hashable_i32_hash]
+///     exact h_probe_step_post_result_probe_h_j_cap
+///   have hemp : (_self13.occ).get _r16 ≠ 1 := by omega
+///   simp only [Sable.Seq.len_set]
+///   rw [h_inv_self_occ_len_cap_self_ke.1]
+///   exact hash_nodup_preserved ((_old_self.occ).len) (_self13.occ) (_self13.keys)
+///     (fun x => Hashable_i32_hash_spec x % ((_old_self.occ).len)) _r16 k j
+///     hbnd h_inv_i_0_i_i_cap_self_occ_get_3 h_inv_i1_0_i1_i1_cap_i2_0_i2_i hs h_j_range.1 h_path_j_old_self_occ_len hemp hloop
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc.2 by
+///   rw [h_inv_self_occ_len_cap_self_ke.1]
+///   exact h_inv_i1_0_i1_i1_cap_i2_0_i2_i
+
+/// discharge HashMap_i32_u64::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc.3 by
+///   rw [h_inv_self_occ_len_cap_self_ke.1]
+///   exact h_inv_i1_0_i1_i1_cap_i2_0_i2_i
+
+/// discharge HashMap_i32_u64::insert.post.self_occ_len_old_self_occ_len by
+///   simp only [Sable.Seq.len_set]
+///   omega
+
+/// discharge HashMap_i32_u64::insert.post.result_i_0_i_i_self_occ_len_self_occ_get by
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   intro _
+///   refine ⟨_r16, h_r16_range.1, by omega, ?_, ?_, ?_⟩
+///   · rw [if_pos rfl]
+///   · rw [if_pos rfl]
+///   · rw [if_pos rfl]
+
+/// discharge HashMap_i32_u64::insert.post.result_i_0_i_i_self_occ_len_self_occ_get.2 by
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   intro _
+///   refine ⟨_r16, h_r16_range.1, by omega, ?_, ?_, ?_⟩
+///   · have h01 := h_inv_i_0_i_i_cap_self_occ_get_2 _r16 h_r16_range.1 h_probe_step_post_result_cap
+///     omega
+///   · exact h_path_self13_keys_get_r16_k
+///   · rw [if_pos rfl]
+
+/// discharge HashMap_i32_u64::insert.post.result_i_0_i_i_self_occ_len_self_occ_get.3 by
+///   intro h
+///   exact (h_result.mp h).elim
+
+/// discharge HashMap_i32_u64::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i by
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   intro i hi0 hic hold
+///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
+///   by_cases hip : i = _r16
+///   · exfalso
+///     rw [hip] at hfr hold
+///     omega
+///   · refine ⟨?_, ?_, ?_⟩
+///     · rw [if_neg hip, hfr.1]
+///       exact hold
+///     · rw [if_neg hip, hfr.2.1]
+///     · intro hne
+///       rw [if_neg hip]
+///       exact hfr.2.2
+
+/// discharge HashMap_i32_u64::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.2 by
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
+///   intro i hi0 hic hold
+///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
+///   refine ⟨?_, ?_, ?_⟩
+///   · rw [hfr.1]
+///     exact hold
+///   · rw [hfr.2.1]
+///   · intro hne
+///     by_cases hip : i = _r16
+///     · exfalso
+///       apply hne
+///       rw [← hfr.2.1, hip]
+///       exact h_path_self13_keys_get_r16_k
+///     · rw [if_neg hip]
+///       exact hfr.2.2
+
+/// discharge HashMap_i32_u64::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.3 by
+///   intro i hi0 hic hold
+///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
+///   refine ⟨?_, ?_, ?_⟩
+///   · rw [hfr.1]
+///     exact hold
+///   · rw [hfr.2.1]
+///   · intro hne
+///     exact hfr.2.2

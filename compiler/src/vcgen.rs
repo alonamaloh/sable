@@ -301,8 +301,9 @@ impl<'a> Generator<'a> {
         let map = self.class_state_map(class, state);
         for inv in &class.invariants {
             let prop = substitute(&inv.text, &map, None);
-            self.hyps
-                .push((format!("h_cinv_{}", hslug(&inv.text)), format!("({prop})")));
+            // Deduped: invariants with a shared slug prefix must not
+            // shadow each other (discharges cite these names).
+            self.push_hyp_unique(format!("h_cinv_{}", hslug(&inv.text)), format!("({prop})"));
             self.context.push(format!("class invariant {}", inv.text));
         }
     }
@@ -710,8 +711,11 @@ impl<'a> Generator<'a> {
                 // havocked context (its VCs must follow from invariants).
                 for inv in invariants.iter() {
                     let text = self.subst_env(&self.preprocess(&inv.text));
-                    self.hyps
-                        .push((format!("h_inv_{}", hslug(&inv.text)), format!("({text})")));
+                    // Deduped: same-slug invariants must not shadow.
+                    self.push_hyp_unique(
+                        format!("h_inv_{}", hslug(&inv.text)),
+                        format!("({text})"),
+                    );
                     self.context.push(format!("invariant {}", inv.text));
                 }
                 let p = self.eval_prop(cond);
@@ -911,6 +915,25 @@ impl<'a> Generator<'a> {
                 Val::Int(format!("({arr}.len)"))
             }
             ExprKind::Widen { arg, .. } => self.eval(arg),
+            ExprKind::Narrow { target, arg } => {
+                let Val::Int(v) = self.eval(arg) else {
+                    unreachable!()
+                };
+                let goal = range_prop(&v, *target);
+                let ob = self.obligation(
+                    &format!("{}.narrow.{}", self.fname, slug(self.src(e.span))),
+                    format!(
+                        "`{}` must fit in `{}`",
+                        self.src_short(e.span),
+                        target.name()
+                    ),
+                    e.span,
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                Val::Int(v)
+            }
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
             }
@@ -1538,6 +1561,15 @@ impl<'a> Generator<'a> {
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect();
             if before_ok && !ident.is_empty() {
+                // `old self` in any method clause (posts, but also loop
+                // invariants — the frame invariant a self-havocking loop
+                // needs) is the entry state.
+                if ident == "self" && matches!(self.cctx, Cctx::Method(..)) {
+                    out.push_str(&rest[..pos]);
+                    out.push_str("_old_self");
+                    rest = &after_trim[ident.len()..];
+                    continue;
+                }
                 if let Some(entry) = self.mut_arrays.get(&ident) {
                     out.push_str(&rest[..pos]);
                     out.push_str(entry);
@@ -1796,9 +1828,9 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
                 out.insert(array.clone());
             }
         }
-        ExprKind::Unary { operand, .. } | ExprKind::Widen { arg: operand, .. } => {
-            collect_mut_borrows(operand, out)
-        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Widen { arg: operand, .. }
+        | ExprKind::Narrow { arg: operand, .. } => collect_mut_borrows(operand, out),
         ExprKind::SomeE(inner) => collect_mut_borrows(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_mut_borrows(lhs, out);

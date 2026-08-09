@@ -1,0 +1,16 @@
+// expect-error: Hashable_u64_hash.post
+// An impl whose body does not compute the declared spec function is a
+// failed obligation — the trait law is verified, not trusted.
+
+trait Hashable {
+    /// spec hash : int → int
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for u64 {
+    /// def hash (x : int) : int := x
+    fn hash(u64 x) -> u64 {
+        return 0;
+    }
+}

@@ -641,6 +641,19 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Int(arr[idx as usize]))
             }
             ExprKind::Widen { arg, .. } => self.eval(arg, frame),
+            ExprKind::Narrow { target, arg } => {
+                let v = self.eval_int(arg, frame)?;
+                if v < target.min() || v > target.max() {
+                    return Err(Trap {
+                        message: format!(
+                            "narrow out of range: {v} does not fit in `{}`",
+                            target.name()
+                        ),
+                        span: e.span,
+                    });
+                }
+                Ok(RtVal::Int(v))
+            }
             ExprKind::SomeE(inner) => {
                 let v = self.eval_int(inner, frame)?;
                 Ok(RtVal::Opt(Some(v)))

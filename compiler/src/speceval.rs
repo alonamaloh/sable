@@ -267,6 +267,7 @@ enum S {
     },
     SomeLit(Box<S>),
     NoneLit,
+    Ite(Box<S>, Box<S>, Box<S>),
     App(String, Vec<S>),
     MatchOpt {
         scrutinee: Box<S>,
@@ -431,10 +432,11 @@ impl P {
             return Ok(head);
         }
         let mut args = Vec::new();
-        while matches!(
-            self.peek(),
-            Some(T::Num(_)) | Some(T::Ident(_)) | Some(T::LParen)
-        ) {
+        while match self.peek() {
+            Some(T::Num(_)) | Some(T::LParen) => true,
+            Some(T::Ident(n)) => n != "then" && n != "else",
+            _ => false,
+        } {
             args.push(self.atom()?);
         }
         if args.is_empty() {
@@ -479,6 +481,7 @@ impl P {
                 "False" => S::False,
                 "none" => S::NoneLit,
                 "match" => return self.match_opt(),
+                "if" => return self.ite(),
                 _ => ident_to_expr(&name)?,
             },
             other => {
@@ -502,6 +505,21 @@ impl P {
             };
         }
         Ok(base)
+    }
+
+    /// `if C then A else B` — Lean ite, needed by cyclic-index ghost
+    /// defs like `probe`/`dist` (ADR 0007).
+    fn ite(&mut self) -> EResult<S> {
+        let cond = self.expr()?;
+        if !matches!(self.bump(), Some(T::Ident(w)) if w == "then") {
+            return Err(Unmonitorable("expected `then`".into()));
+        }
+        let then_e = self.expr()?;
+        if !matches!(self.bump(), Some(T::Ident(w)) if w == "else") {
+            return Err(Unmonitorable("expected `else`".into()));
+        }
+        let else_e = self.expr()?;
+        Ok(S::Ite(Box::new(cond), Box::new(then_e), Box::new(else_e)))
     }
 
     /// `match result with | some i => E | none => E` (either arm order).
@@ -579,6 +597,7 @@ fn oldify(s: S) -> EResult<S> {
         S::Len(x) => S::Len(Box::new(oldify(*x)?)),
         S::Field(x, f) => S::Field(Box::new(oldify(*x)?), f),
         S::Get(x, i) => S::Get(Box::new(oldify(*x)?), i),
+        S::Ite(c, a, b) => S::Ite(Box::new(oldify(*c)?), Box::new(oldify(*a)?), Box::new(oldify(*b)?)),
         _ => return Err(Unmonitorable("`old` applies to a variable or path".into())),
     })
 }
@@ -714,6 +733,13 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                     .and_then(|k| arr.get(k).copied())
                     .unwrap_or(0),
             ))
+        }
+        S::Ite(c, a, b) => {
+            if boolean(eval(c, env, depth + 1)?)? {
+                eval(a, env, depth + 1)
+            } else {
+                eval(b, env, depth + 1)
+            }
         }
         S::Neg(e) => Ok(SpecVal::Int(-int(eval(e, env, depth + 1)?)?)),
         S::Not(e) => Ok(SpecVal::Bool(!boolean(eval(e, env, depth + 1)?)?)),

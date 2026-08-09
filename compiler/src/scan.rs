@@ -20,6 +20,8 @@ pub enum ClauseKind {
     Assume,
     GhostDef,
     Theorem,
+    /// `/// spec name : sig` — a trait's spec-level function (ADR 0007).
+    Spec,
     Discharge,
     /// Continuation or unrecognized — reported by the parser when reached.
     Other,
@@ -187,6 +189,7 @@ fn keyword(rest: &str) -> (ClauseKind, usize) {
         "defer" => ClauseKind::Defer,
         "assume" => ClauseKind::Assume,
         "def" => ClauseKind::GhostDef,
+        "spec" => ClauseKind::Spec,
         "theorem" => ClauseKind::Theorem,
         "discharge" => ClauseKind::Discharge,
         _ => return (ClauseKind::Other, 0),

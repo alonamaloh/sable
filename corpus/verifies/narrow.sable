@@ -1,0 +1,15 @@
+// narrow<T>(e): any-to-any integer conversion under a range VC
+// (ADR 0007). The i32 hash pipeline is the motivating shape: a signed
+// value shifted into non-negative range, then converted to u64.
+
+/// post result = x + 2147483648
+fn shift_to_u64(i32 x) -> u64 {
+    i64 y = widen<i64>(x) + 2147483648;
+    return narrow<u64>(y);
+}
+
+/// pre 0 ≤ x ∧ x ≤ 255
+/// post result = x
+fn to_byte(u64 x) -> u8 {
+    return narrow<u8>(x);
+}

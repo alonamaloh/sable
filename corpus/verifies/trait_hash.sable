@@ -1,0 +1,41 @@
+// Traits v1 (ADR 0007): a law-carrying bound. The trait pairs a
+// spec-level function (`Self::hash`, a Lean def each impl provides)
+// with a program method contracted to compute it — the law that lets
+// generic specs apply `hash` and get determinism across calls.
+
+trait Hashable {
+    /// spec hash : int → int
+    /// post 0 ≤ result
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for i32 {
+    /// def hash (x : int) : int := x + 2147483648
+    fn hash(i32 x) -> u64 {
+        i64 y = widen<i64>(x) + 2147483648;
+        return narrow<u64>(y);
+    }
+}
+
+impl Hashable for u64 {
+    /// def hash (x : int) : int := x
+    fn hash(u64 x) -> u64 {
+        return x;
+    }
+}
+
+/// post result = K::hash a % 64
+fn bucket64<K: Hashable>(K a) -> u64 {
+    return K::hash(a) % 64;
+}
+
+/// post result = 5
+fn demo_i32() -> u64 {
+    return bucket64<i32>(5);
+}
+
+/// post result = 63
+fn demo_u64() -> u64 {
+    return bucket64<u64>(127);
+}

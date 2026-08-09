@@ -894,9 +894,33 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     ),
                     notes: vec![(
                         "note".into(),
-                        "narrowing (`narrow<T>`, with a fits-VC) lands in M2".into(),
+                        "use `narrow<T>(e)` — any-to-any conversion under a range VC".into(),
                     )],
                 });
+            }
+            Ty::Int(*target)
+        }
+        ExprKind::Narrow { target, arg } => {
+            // Any integer type to any integer type; the range fact is a
+            // proof obligation (`narrow.range`), not a typing rule.
+            match check_expr(ctx, arg, None) {
+                Ok(Ty::Int(_)) => {}
+                Ok(other) => {
+                    return Err(Diagnostic {
+                        name: "type.mismatch".into(),
+                        title: format!("`narrow` applied to `{}`", other.name()),
+                        span,
+                        label: "expected an integer".into(),
+                        notes: vec![],
+                    })
+                }
+                Err(d) => {
+                    if d.name == "type.ambiguous_literal" {
+                        check_expr(ctx, arg, Some(Ty::Int(*target)))?;
+                    } else {
+                        return Err(d);
+                    }
+                }
             }
             Ty::Int(*target)
         }

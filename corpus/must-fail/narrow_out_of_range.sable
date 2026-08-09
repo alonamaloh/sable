@@ -1,0 +1,7 @@
+// expect-error: truncate.narrow.narrow_u8_x
+// Without the range precondition, u64 → u8 must be rejected.
+
+/// post result = x
+fn truncate(u64 x) -> u8 {
+    return narrow<u8>(x);
+}

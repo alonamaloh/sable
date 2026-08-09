@@ -1,0 +1,13 @@
+// expect-error: impl.missing_spec
+
+trait Hashable {
+    /// spec hash : int → int
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for u64 {
+    fn hash(u64 x) -> u64 {
+        return x;
+    }
+}
