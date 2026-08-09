@@ -37,8 +37,13 @@ pub fn parse(
         text,
     };
     let mut fns = Vec::new();
+    let mut classes = Vec::new();
     while !parser.at(&Tok::Eof) {
-        fns.push(parser.parse_fn()?);
+        if parser.at(&Tok::KwClass) {
+            classes.push(parser.parse_class()?);
+        } else {
+            fns.push(parser.parse_fn()?);
+        }
     }
 
     // Remaining blocks are module-level: ghost defs, theorems,
@@ -90,6 +95,7 @@ pub fn parse(
 
     Ok(Program {
         fns,
+        classes,
         discharges,
         ghosts,
         defers,
@@ -359,6 +365,231 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(self.scalar_ty()?.0)
+    }
+
+    /// `class Name { fields... /// invariant ... init ... fn ... deinit }`
+    /// (design §7). Blocks immediately preceding an init/method are its
+    /// contract; remaining blocks inside the body are the class invariant.
+    fn parse_class(&mut self) -> PResult<ClassDecl> {
+        let start = self.expect(Tok::KwClass)?.span;
+        let (name, name_span) = self.ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut fields = Vec::new();
+        let mut inits = Vec::new();
+        let mut methods = Vec::new();
+        let mut deinit = None;
+        let body_first_line = self.peek_line();
+
+        while !self.at(&Tok::RBrace) {
+            if self.at(&Tok::Eof) {
+                return Err(self.error_expected("`}`"));
+            }
+            let item_line = self.peek_line();
+            match self.peek().clone() {
+                Tok::KwInit => {
+                    let mut f = self.parse_init()?;
+                    self.attach_member_contract(item_line, &mut f, "an `init`")?;
+                    inits.push(f);
+                }
+                Tok::KwFn => {
+                    let mut m = self.parse_method()?;
+                    self.attach_member_contract(item_line, &mut m.f, "a method")?;
+                    methods.push(m);
+                }
+                Tok::KwDeinit => {
+                    self.bump();
+                    if deinit.replace(self.block()?).is_some() {
+                        return Err(Diagnostic {
+                            name: "parse.duplicate_deinit".into(),
+                            title: "a class has at most one `deinit`".into(),
+                            span: self.peek_span(),
+                            label: "second `deinit`".into(),
+                            notes: vec![],
+                        });
+                    }
+                }
+                Tok::LBracket => {
+                    self.bump();
+                    let (elem, _) = self.int_ty()?;
+                    self.expect(Tok::RBracket)?;
+                    let (fname, fspan) = self.ident()?;
+                    self.expect(Tok::Semi)?;
+                    fields.push(Field {
+                        name: fname,
+                        ty: Ty::Array(elem, Mutability::Owned),
+                        span: fspan,
+                    });
+                }
+                Tok::Ident(_) => {
+                    let (ty, _) = self.scalar_ty()?;
+                    let (fname, fspan) = self.ident()?;
+                    self.expect(Tok::Semi)?;
+                    fields.push(Field {
+                        name: fname,
+                        ty,
+                        span: fspan,
+                    });
+                }
+                _ => return Err(self.error_expected("a field, `init`, `fn`, or `deinit`")),
+            }
+        }
+        let end = self.expect(Tok::RBrace)?.span;
+        let body_last_line = self.lines.line_col(end.start).0;
+
+        // Remaining blocks inside the body are the class invariant.
+        let mut invariants = Vec::new();
+        for (bi, block) in self.blocks.iter().enumerate() {
+            if self.consumed[bi]
+                || block.first_line < body_first_line
+                || block.last_line > body_last_line
+            {
+                continue;
+            }
+            self.consumed[bi] = true;
+            for clause in &block.clauses {
+                if clause.kind == ClauseKind::Invariant {
+                    invariants.push(clause.clone());
+                } else {
+                    return Err(bad_clause(
+                        clause.kind,
+                        clause,
+                        "a class body",
+                        "free blocks inside a class hold only `invariant` clauses",
+                    ));
+                }
+            }
+        }
+
+        Ok(ClassDecl {
+            name,
+            name_span,
+            fields,
+            invariants,
+            inits,
+            methods,
+            deinit,
+            span: start.join(end),
+        })
+    }
+
+    fn attach_member_contract(
+        &mut self,
+        item_line: usize,
+        f: &mut Fn,
+        what: &str,
+    ) -> PResult<()> {
+        if let Some(block) = self.take_block_ending_before(item_line) {
+            for clause in &block.clauses {
+                match clause.kind {
+                    ClauseKind::Pre => f.pres.push(clause.clone()),
+                    ClauseKind::Post => f.posts.push(clause.clone()),
+                    other => {
+                        return Err(bad_clause(
+                            other,
+                            clause,
+                            "a class-member contract block",
+                            "only `pre` and `post` may precede an init or method",
+                        ))
+                    }
+                }
+            }
+        }
+        let _ = what;
+        Ok(())
+    }
+
+    /// `init name(params) { ... }` — a named constructor (Unit-"returning").
+    fn parse_init(&mut self) -> PResult<Fn> {
+        let start = self.expect(Tok::KwInit)?.span;
+        let (name, name_span) = self.ident()?;
+        self.expect(Tok::LParen)?;
+        let params = self.param_list()?;
+        self.expect(Tok::RParen)?;
+        let body = self.block()?;
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        Ok(Fn {
+            name,
+            name_span,
+            params,
+            ret: Ty::Unit,
+            pres: Vec::new(),
+            posts: Vec::new(),
+            variant: None,
+            body,
+            span: start.join(end),
+        })
+    }
+
+    /// `fn name(&mut self, params) -> ty { ... }`
+    fn parse_method(&mut self) -> PResult<Method> {
+        let start = self.expect(Tok::KwFn)?.span;
+        let (name, name_span) = self.ident()?;
+        self.expect(Tok::LParen)?;
+        self.expect(Tok::Amp)?;
+        let self_kind = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
+            self.bump();
+            SelfKind::Mut
+        } else {
+            SelfKind::Shared
+        };
+        match self.bump().tok {
+            Tok::Ident(w) if w == "self" => {}
+            _ => return Err(self.error_expected("`self`")),
+        }
+        let params = if self.at(&Tok::Comma) {
+            self.bump();
+            self.param_list()?
+        } else {
+            Vec::new()
+        };
+        self.expect(Tok::RParen)?;
+        let ret = if self.at(&Tok::Arrow) {
+            self.bump();
+            self.ret_ty()?
+        } else {
+            Ty::Unit
+        };
+        let body = self.block()?;
+        let end = self.tokens[self.pos.saturating_sub(1)].span;
+        Ok(Method {
+            self_kind,
+            f: Fn {
+                name,
+                name_span,
+                params,
+                ret,
+                pres: Vec::new(),
+                posts: Vec::new(),
+                variant: None,
+                body,
+                span: start.join(end),
+            },
+        })
+    }
+
+    fn param_list(&mut self) -> PResult<Vec<Param>> {
+        let mut params = Vec::new();
+        if matches!(self.peek(), Tok::RParen) {
+            return Ok(params);
+        }
+        loop {
+            let (ty, tspan) = self.param_ty()?;
+            let (pname, pspan) = self.ident()?;
+            if is_reserved_name(&pname) {
+                return Err(reserved_name_error(&pname, pspan, "parameter"));
+            }
+            params.push(Param {
+                name: pname,
+                ty,
+                span: tspan.join(pspan),
+            });
+            if self.at(&Tok::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        Ok(params)
     }
 
     fn parse_fn(&mut self) -> PResult<Fn> {
@@ -648,6 +879,22 @@ impl<'a> Parser<'a> {
             }
             Tok::KwIf => self.if_stmt(),
             Tok::KwWhile => self.while_stmt(),
+            Tok::KwVar => {
+                self.bump();
+                let (name, name_span) = self.ident()?;
+                if is_reserved_name(&name) {
+                    return Err(reserved_name_error(&name, name_span, "variable"));
+                }
+                self.expect(Tok::Assign)?;
+                let init = self.expr()?;
+                self.expect(Tok::Semi)?;
+                Ok(Stmt::VarDecl {
+                    name,
+                    name_span,
+                    init,
+                    ty: None,
+                })
+            }
             Tok::LBracket => {
                 // `[i32] a = [1, 2, 3];` — owned array local (tests only;
                 // the checker enforces the context).
@@ -667,6 +914,49 @@ impl<'a> Parser<'a> {
                     name_span,
                     init: Some(init),
                 })
+            }
+            Tok::Ident(first) if first == "self" && self.peek2() == &Tok::Dot => {
+                // self.f = e;   self.f[i] = e;
+                self.bump();
+                self.bump();
+                let (field, field_span) = self.ident()?;
+                if self.at(&Tok::LBracket) {
+                    self.bump();
+                    let index = self.expr()?;
+                    self.expect(Tok::RBracket)?;
+                    self.expect(Tok::Assign)?;
+                    let value = self.expr()?;
+                    self.expect(Tok::Semi)?;
+                    return Ok(Stmt::FieldStore {
+                        field,
+                        field_span,
+                        index,
+                        value,
+                    });
+                }
+                self.expect(Tok::Assign)?;
+                let value = self.expr()?;
+                self.expect(Tok::Semi)?;
+                Ok(Stmt::FieldAssign {
+                    field,
+                    field_span,
+                    value,
+                })
+            }
+            Tok::Ident(_) if self.peek2() == &Tok::Dot => {
+                // Method-call statement: `s.push(7);`
+                let e = self.expr()?;
+                if !matches!(e.kind, ExprKind::MethodCall { .. }) {
+                    return Err(Diagnostic {
+                        name: "parse.expr_stmt".into(),
+                        title: "only calls can be used as statements".into(),
+                        span: e.span,
+                        label: "this expression has no effect".into(),
+                        notes: vec![],
+                    });
+                }
+                self.expect(Tok::Semi)?;
+                Ok(Stmt::ExprStmt(e))
             }
             Tok::Ident(first) => {
                 if let Tok::Ident(_) = self.peek2() {
@@ -975,24 +1265,52 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Dot => {
                     let ExprKind::Var(name) = &e.kind else {
-                        return Err(self.error_expected("nothing (`.` applies to array names)"));
+                        return Err(self.error_expected("nothing (`.` applies to names)"));
                     };
-                    let array = name.clone();
-                    let array_span = e.span;
+                    let recv = name.clone();
+                    let recv_span = e.span;
                     self.bump();
                     let (field, fspan) = self.ident()?;
+                    if self.at(&Tok::LParen) {
+                        // recv.method(args)
+                        self.bump();
+                        let mut args = Vec::new();
+                        if !self.at(&Tok::RParen) {
+                            loop {
+                                args.push(self.expr()?);
+                                if self.at(&Tok::Comma) {
+                                    self.bump();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        let close = self.expect(Tok::RParen)?.span;
+                        e = Expr {
+                            kind: ExprKind::MethodCall {
+                                recv,
+                                recv_span,
+                                method: field,
+                                method_span: fspan,
+                                args,
+                            },
+                            span: recv_span.join(close),
+                            ty: None,
+                        };
+                        continue;
+                    }
                     if field != "len" {
                         return Err(Diagnostic {
                             name: "parse.unknown_field".into(),
                             title: format!("unknown field `.{field}`"),
                             span: fspan,
-                            label: "`.len` is the only field in M1".into(),
+                            label: "`.len` (arrays) and `.method(...)` are the accessors".into(),
                             notes: vec![],
                         });
                     }
                     e = Expr {
-                        kind: ExprKind::Len { array },
-                        span: array_span.join(fspan),
+                        kind: ExprKind::Len { array: recv },
+                        span: recv_span.join(fspan),
                         ty: None,
                     };
                 }
@@ -1026,6 +1344,96 @@ impl<'a> Parser<'a> {
                 Ok(Expr {
                     kind: ExprKind::BoolLit(false),
                     span,
+                    ty: None,
+                })
+            }
+            Tok::Ident(name) if name == "alloc_array" => {
+                self.bump();
+                self.expect(Tok::Lt)?;
+                let (elem, _) = self.int_ty()?;
+                self.expect(Tok::Gt)?;
+                self.expect(Tok::LParen)?;
+                let len = self.expr()?;
+                self.expect(Tok::Comma)?;
+                let init = self.expr()?;
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::AllocArray {
+                        elem,
+                        len: Box::new(len),
+                        init: Box::new(init),
+                    },
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
+            Tok::Ident(name) if name == "self" && self.peek2() == &Tok::Dot => {
+                self.bump();
+                self.bump();
+                let (field, fspan) = self.ident()?;
+                if self.at(&Tok::LBracket) {
+                    self.bump();
+                    let index = self.expr()?;
+                    let close = self.expect(Tok::RBracket)?.span;
+                    return Ok(Expr {
+                        kind: ExprKind::SelfFieldIndex {
+                            field,
+                            index: Box::new(index),
+                        },
+                        span: span.join(close),
+                        ty: None,
+                    });
+                }
+                if self.at(&Tok::Dot) {
+                    self.bump();
+                    let (sub, sspan) = self.ident()?;
+                    if sub != "len" {
+                        return Err(Diagnostic {
+                            name: "parse.unknown_field".into(),
+                            title: format!("unknown field `.{sub}`"),
+                            span: sspan,
+                            label: "`.len` is the only array-field accessor".into(),
+                            notes: vec![],
+                        });
+                    }
+                    return Ok(Expr {
+                        kind: ExprKind::SelfFieldLen { field },
+                        span: span.join(sspan),
+                        ty: None,
+                    });
+                }
+                Ok(Expr {
+                    kind: ExprKind::SelfField { field },
+                    span: span.join(fspan),
+                    ty: None,
+                })
+            }
+            Tok::Ident(class) if self.peek2() == &Tok::ColonColon => {
+                let class_span = self.peek_span();
+                self.bump();
+                self.bump();
+                let (init, _) = self.ident()?;
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    loop {
+                        args.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::CtorCall {
+                        class,
+                        class_span,
+                        init,
+                        args,
+                    },
+                    span: span.join(close),
                     ty: None,
                 })
             }
@@ -1224,6 +1632,28 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
         ExprKind::ArrayLit(elems) => {
             for el in elems {
                 expr_vars(el, out);
+            }
+        }
+        ExprKind::AllocArray { len, init, .. } => {
+            expr_vars(len, out);
+            expr_vars(init, out);
+        }
+        ExprKind::SelfField { .. } | ExprKind::SelfFieldLen { .. } => {
+            out.insert("self".to_string());
+        }
+        ExprKind::SelfFieldIndex { index, .. } => {
+            out.insert("self".to_string());
+            expr_vars(index, out);
+        }
+        ExprKind::CtorCall { args, .. } => {
+            for a in args {
+                expr_vars(a, out);
+            }
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            out.insert(recv.clone());
+            for a in args {
+                expr_vars(a, out);
             }
         }
         ExprKind::Borrow { array, .. } => {

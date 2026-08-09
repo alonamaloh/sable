@@ -85,6 +85,8 @@ impl IntTy {
 pub enum Ty {
     Int(IntTy),
     Bool,
+    /// A class value (owned local); index into `Program::classes`.
+    Class(usize),
     /// Borrowed array of integers: `&[i32]` (shared) or `&mut [i32]`
     /// (unique, mutable). Parameters only.
     Array(IntTy, Mutability),
@@ -110,6 +112,7 @@ impl Ty {
             Ty::Array(t, Mutability::Shared) => format!("&[{}]", t.name()),
             Ty::Array(t, Mutability::Mut) => format!("&mut [{}]", t.name()),
             Ty::Array(t, Mutability::Owned) => format!("[{}]", t.name()),
+            Ty::Class(_) => "class".to_string(),
             Ty::Option(t) => format!("option<{}>", t.name()),
             Ty::Unit => "()".to_string(),
         }
@@ -206,6 +209,37 @@ pub enum ExprKind {
     NoneE,
     /// `[e1, e2, ...]` — test functions only.
     ArrayLit(Vec<Expr>),
+    /// `alloc_array<T>(len, init)` — a fresh owned array (design §7/§10:
+    /// allocation failure is a named OOM trap, not a VC).
+    AllocArray {
+        elem: IntTy,
+        len: Box<Expr>,
+        init: Box<Expr>,
+    },
+    /// `self.f` — int/bool field read (methods only).
+    SelfField { field: String },
+    /// `self.f.len` — array-field length (methods only).
+    SelfFieldLen { field: String },
+    /// `self.f[i]` — array-field element read (methods only).
+    SelfFieldIndex {
+        field: String,
+        index: Box<Expr>,
+    },
+    /// `Class::init_name(args)` — construction.
+    CtorCall {
+        class: String,
+        class_span: Span,
+        init: String,
+        args: Vec<Expr>,
+    },
+    /// `recv.method(args)` where recv is a class-typed local.
+    MethodCall {
+        recv: String,
+        recv_span: Span,
+        method: String,
+        method_span: Span,
+        args: Vec<Expr>,
+    },
     /// `&a` / `&mut a` call argument — test functions only.
     Borrow {
         array: String,
@@ -246,6 +280,27 @@ pub enum Stmt {
     },
     /// A call evaluated for effect: `f(x);` (procedures, test calls).
     ExprStmt(Expr),
+    /// `var x = expr;` — type inferred by the checker (class construction).
+    VarDecl {
+        name: String,
+        name_span: Span,
+        init: Expr,
+        /// Filled by the checker.
+        ty: Option<Ty>,
+    },
+    /// `self.f = e;` (methods/inits only).
+    FieldAssign {
+        field: String,
+        field_span: Span,
+        value: Expr,
+    },
+    /// `self.f[i] = e;` on an array field.
+    FieldStore {
+        field: String,
+        field_span: Span,
+        index: Expr,
+        value: Expr,
+    },
     /// `a[i] = v;` on a `&mut [T]` parameter.
     Store {
         array: String,
@@ -321,9 +376,45 @@ pub struct Assume {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfKind {
+    Shared,
+    Mut,
+}
+
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+/// A class method: an ordinary `Fn` whose first parameter is `&self` /
+/// `&mut self` (recorded here, not in `params`).
+#[derive(Debug, Clone)]
+pub struct Method {
+    pub self_kind: SelfKind,
+    pub f: Fn,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub fields: Vec<Field>,
+    /// Class invariant clauses — interface blocks (design §7).
+    pub invariants: Vec<Clause>,
+    /// Named constructors (`init with_capacity(...) { ... }`).
+    pub inits: Vec<Fn>,
+    pub methods: Vec<Method>,
+    pub deinit: Option<Vec<Stmt>>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<Fn>,
+    pub classes: Vec<ClassDecl>,
     pub discharges: Vec<Discharge>,
     pub ghosts: Vec<GhostItem>,
     pub defers: Vec<Defer>,

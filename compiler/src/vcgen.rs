@@ -1050,6 +1050,17 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
             Stmt::Store { array, .. } => {
                 out.insert(array.clone());
             }
+            Stmt::FieldAssign { .. } | Stmt::FieldStore { .. } => {
+                out.insert("self".to_string());
+            }
+            Stmt::VarDecl { .. } => {}
+            Stmt::ExprStmt(e) => {
+                // A &mut-self method call mutates its receiver; we cannot
+                // know mutability here, so be conservative.
+                if let ExprKind::MethodCall { recv, .. } = &e.kind {
+                    out.insert(recv.clone());
+                }
+            }
             Stmt::If {
                 then_block,
                 else_block,
