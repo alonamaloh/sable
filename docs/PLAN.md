@@ -31,9 +31,15 @@ Also in M1: `for (T i : range(lo, hi))` sugar (Alvaro's proposal) — bounds inv
 
 Known M1 simplifications, scheduled fixes: discharge scripts reference generated hypothesis names (`h_inv7_2`) read from failure output — content-anchored hypothesis naming is the M2 refinement; obligation names are path-dependent for repeated clauses (`.2` suffixes); invariant/variant clauses must not bind variables shadowing program variable names (token substitution cannot see binders); bool locals mentioned in loop clauses are unsupported; array parameters cannot yet be passed to callees (M2, with `&mut [T]` and stores); `sable test`/`defer`/`assume` are M3.
 
-### M2 — ghost definitions and the seq/multiset prelude
+### M2 — ghost definitions and the seq/multiset prelude *(complete, 2026-08-09)*
 
-`ghost def`, free-floating proof blocks, `seq<T>` lifting of arrays, a multiset library in the Lean prelude (this is the known trap — expect iteration). Exit: insertion sort with the full `sorted ∧ multiset-equal` spec.
+Ghost `def`/`theorem` in free-floating blocks (emitted verbatim; non-recursive defs get `@[simp]` so contracts naming them unfold); `&mut [T]` with element stores (functional `Seq.set` chains; length and element-range preservation assumed at havoc, sound because stores are the only mutation); `old a` in posts and invariants (entry-state binders `_old_a`); procedures (no return type, implicit return proves posts); the prelude multiset library (`countUpto`, `perm`, `perm_swap` — core-only induction proofs).
+
+Exit met: **in-place insertion sort verifies with the full `sorted ∧ perm (old a)` spec** — 27 obligations, 24 automatic, 3 hand discharges (swap preserves sorted-except-moving-element, swap is a permutation via `perm_trans ∘ perm_swap`, loop exit sorts the prefix). The known trap cost exactly what it should: a ~90-line prelude library plus three ~10-line discharges.
+
+Hard-won empirical notes: ghost-type aliases must be *notation*, not `abbrev` (type-synonym residue silently defeats omega's atom recognition — the goal displays identically and automation dies); `subst` on `q = j` eliminates `j` and breaks later references (use `simp`/`rw` with the equation in discharge scripts); `simp_all`'s orientation of variable equations is unstable, so scripts should not depend on it.
+
+Known M2 simplifications: `old x` only for `&mut` array params; array arguments in calls still rejected (passing borrows is M3, with scalar `&mut i32` refs); bool locals in loop clauses unsupported; `for` bounds may not mention the mutated array (workaround: `u64 n = a.len;` first); discharge scripts still cite generated hypothesis names.
 
 ### M3 — escape hatches and dynamic checking
 

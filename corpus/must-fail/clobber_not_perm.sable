@@ -1,0 +1,9 @@
+// expect-error: clobber.post
+// Overwriting an element is not a permutation; the post must fail.
+
+/// post Sable.Seq.perm a (old a)
+fn clobber(&mut [i32] a) {
+    if (a.len > 0) {
+        a[0] = 0;
+    }
+}

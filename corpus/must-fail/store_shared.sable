@@ -1,0 +1,8 @@
+// expect-error: type.store_shared
+// Shared borrows are read-only; writing needs &mut [T].
+
+/// post result = 0
+fn poke(&[i32] a) -> i32 {
+    a[0] = 1;
+    return 0;
+}

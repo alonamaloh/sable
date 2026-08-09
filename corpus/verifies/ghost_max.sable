@@ -1,0 +1,10 @@
+// Ghost definitions: the contract names a property, the evidence layer
+// defines it (design §6). Non-recursive ghost defs unfold automatically.
+
+/// def maxof (m x y : int) : Prop := (m = x ∨ m = y) ∧ x ≤ m ∧ y ≤ m
+
+/// post maxof result a b
+fn max2(i32 a, i32 b) -> i32 {
+    if (a > b) { return a; }
+    return b;
+}

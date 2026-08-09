@@ -85,10 +85,19 @@ impl IntTy {
 pub enum Ty {
     Int(IntTy),
     Bool,
-    /// Shared borrow of an array of integers: `&[i32]`. Parameters only in M1.
-    Array(IntTy),
-    /// `option<u64>` etc. Return types only in M1.
+    /// Borrowed array of integers: `&[i32]` (shared) or `&mut [i32]`
+    /// (unique, mutable). Parameters only.
+    Array(IntTy, Mutability),
+    /// `option<u64>` etc. Return types only.
     Option(IntTy),
+    /// No return value (procedures like in-place sorts).
+    Unit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutability {
+    Shared,
+    Mut,
 }
 
 impl Ty {
@@ -96,8 +105,10 @@ impl Ty {
         match self {
             Ty::Int(t) => t.name().to_string(),
             Ty::Bool => "bool".to_string(),
-            Ty::Array(t) => format!("&[{}]", t.name()),
+            Ty::Array(t, Mutability::Shared) => format!("&[{}]", t.name()),
+            Ty::Array(t, Mutability::Mut) => format!("&mut [{}]", t.name()),
             Ty::Option(t) => format!("option<{}>", t.name()),
+            Ty::Unit => "()".to_string(),
         }
     }
 }
@@ -219,8 +230,16 @@ pub enum Stmt {
         else_block: Option<Vec<Stmt>>,
     },
     Return {
-        value: Expr,
+        /// None for `return;` in a procedure.
+        value: Option<Expr>,
         span: Span,
+    },
+    /// `a[i] = v;` on a `&mut [T]` parameter.
+    Store {
+        array: String,
+        array_span: Span,
+        index: Expr,
+        value: Expr,
     },
     While {
         cond: Expr,
@@ -262,8 +281,19 @@ pub struct Discharge {
     pub span: Span,
 }
 
+/// A free-floating ghost item: `/// def ...` or `/// theorem ...`,
+/// emitted verbatim into the generated Lean (design §6).
+#[derive(Debug, Clone)]
+pub struct GhostItem {
+    /// "def" or "theorem".
+    pub keyword: &'static str,
+    pub text: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<Fn>,
     pub discharges: Vec<Discharge>,
+    pub ghosts: Vec<GhostItem>,
 }

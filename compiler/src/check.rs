@@ -59,7 +59,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 notes: vec![("note".into(), "see docs/PLAN.md".into())],
             });
         }
-        if matches!(f.ret, Ty::Array(_)) {
+        if matches!(f.ret, Ty::Array(..)) {
             return Err(Diagnostic {
                 name: "type.array_return".into(),
                 title: format!("function `{}` returns an array", f.name),
@@ -115,7 +115,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             );
         }
         let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
-        if !returns {
+        if !returns && f.ret != Ty::Unit {
             return Err(Diagnostic {
                 name: "type.missing_return".into(),
                 title: format!("not all paths in `{}` return a value", f.name),
@@ -204,7 +204,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         })
                     }
                 };
-                if matches!(ty, Ty::Array(_)) {
+                if matches!(ty, Ty::Array(..)) {
                     return Err(Diagnostic {
                         name: "type.array_assign".into(),
                         title: format!("cannot assign to array `{name}`"),
@@ -292,9 +292,73 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
             }
             Stmt::Return { value, span } => {
-                check_expr(ctx, value, Some(ret_ty))?;
-                let _ = span;
+                match (value, ret_ty) {
+                    (None, Ty::Unit) => {}
+                    (Some(e), Ty::Unit) => {
+                        return Err(Diagnostic {
+                            name: "type.return_value_in_procedure".into(),
+                            title: "this function has no return type".into(),
+                            span: e.span,
+                            label: "remove the value (or declare `-> T`)".into(),
+                            notes: vec![],
+                        })
+                    }
+                    (None, _) => {
+                        return Err(Diagnostic {
+                            name: "type.missing_return_value".into(),
+                            title: format!("`return;` in a function returning `{}`", ret_ty.name()),
+                            span: *span,
+                            label: "a value is required".into(),
+                            notes: vec![],
+                        })
+                    }
+                    (Some(e), _) => {
+                        check_expr(ctx, e, Some(ret_ty))?;
+                    }
+                }
                 returned = true;
+            }
+            Stmt::Store {
+                array,
+                array_span,
+                index,
+                value,
+            } => {
+                let (elem, mutability) = match ctx.vars.get(array.as_str()) {
+                    Some(VarInfo {
+                        ty: Ty::Array(t, m),
+                        ..
+                    }) => (*t, *m),
+                    Some(v) => {
+                        return Err(Diagnostic {
+                            name: "type.not_an_array".into(),
+                            title: format!("`{array}` is not an array"),
+                            span: *array_span,
+                            label: format!("this has type `{}`", v.ty.name()),
+                            notes: vec![],
+                        })
+                    }
+                    None => {
+                        return Err(Diagnostic {
+                            name: "type.unknown_variable".into(),
+                            title: format!("unknown variable `{array}`"),
+                            span: *array_span,
+                            label: "not declared".into(),
+                            notes: vec![],
+                        })
+                    }
+                };
+                if mutability != Mutability::Mut {
+                    return Err(Diagnostic {
+                        name: "type.store_shared".into(),
+                        title: format!("cannot store through shared borrow `&[{}]`", elem.name()),
+                        span: *array_span,
+                        label: format!("`{array}` must be `&mut [{}]` to be written", elem.name()),
+                        notes: vec![],
+                    });
+                }
+                check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
+                check_expr(ctx, value, Some(Ty::Int(elem)))?;
             }
         }
     }
@@ -308,6 +372,7 @@ fn stmt_span(stmt: &Stmt) -> Span {
         Stmt::If { cond, .. } => cond.span,
         Stmt::While { kw_span, .. } => *kw_span,
         Stmt::Return { span, .. } => *span,
+        Stmt::Store { array_span, .. } => *array_span,
     }
 }
 
@@ -376,7 +441,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
-                if matches!(v.ty, Ty::Array(_)) {
+                if matches!(v.ty, Ty::Array(..)) {
                     return Err(Diagnostic {
                         name: "type.m1_array_value".into(),
                         title: format!("array `{name}` used as a value"),
@@ -605,7 +670,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             notes: vec![],
                         })
                     }
-                    Ty::Array(_) => {
+                    Ty::Array(..) => {
                         return Err(Diagnostic {
                             name: "type.m1_array_arg".into(),
                             title: "array-typed call arguments are not supported yet".into(),
@@ -630,7 +695,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
 fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<IntTy> {
     match ctx.vars.get(array) {
         Some(VarInfo {
-            ty: Ty::Array(t), ..
+            ty: Ty::Array(t, _), ..
         }) => Ok(*t),
         Some(v) => Err(Diagnostic {
             name: "type.not_an_array".into(),

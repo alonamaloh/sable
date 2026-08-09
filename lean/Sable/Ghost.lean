@@ -1,26 +1,33 @@
 /-
 Sable prelude: ghost-type aliases so clause authors can write the
-design-doc surface syntax (`seq i32`, `int`, `nat`) while everything
-remains the uniform Int representation underneath (design §2.1).
-The `iN`/`uN` type aliases coexist with the `iN.min`/`uN.max` bound
-constants — Lean resolves dotted names as declarations first.
+design-doc surface syntax (`seq i32`, `int`, `nat`).
+
+These are *notation*, not abbrevs, on purpose: an `abbrev int := Int`
+leaves a reducible type-synonym in elaborated terms, and `omega` then
+fails to recognize `(x : int) ≤ y` as an integer constraint (verified
+empirically — the goal displays identically but automation dies).
+Notation expands at parse time, leaving no residue.
+
+`i32.max` etc. still resolve to the bound constants in Bounds.lean:
+dotted identifiers are single tokens, so the bare-`i32` notation never
+fires on them.
 -/
 
 import Sable.Seq
 
 namespace Sable
 
-abbrev int : Type := Int
-abbrev nat : Type := Nat
-abbrev seq : Type → Type := Sable.Seq
+notation "int" => Int
+notation "nat" => Nat
+notation "seq" => Sable.Seq
 
-abbrev u8 : Type := Int
-abbrev u16 : Type := Int
-abbrev u32 : Type := Int
-abbrev u64 : Type := Int
-abbrev i8 : Type := Int
-abbrev i16 : Type := Int
-abbrev i32 : Type := Int
-abbrev i64 : Type := Int
+notation "u8" => Int
+notation "u16" => Int
+notation "u32" => Int
+notation "u64" => Int
+notation "i8" => Int
+notation "i16" => Int
+notation "i32" => Int
+notation "i64" => Int
 
 end Sable

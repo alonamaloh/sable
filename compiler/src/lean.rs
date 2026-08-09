@@ -58,6 +58,28 @@ pub fn emit(vc: &VcResult, discharges: &[crate::ast::Discharge]) -> Emitted {
     e.push("set_option linter.unusedVariables false");
     e.push("");
 
+    for g in &vc.ghosts {
+        let first = e.line + 1;
+        // Non-recursive ghost defs get @[simp] so contracts naming them
+        // unfold under the portfolio; recursive ones would loop and are
+        // unfolded manually in discharges.
+        let attr = if g.keyword == "def" && !ghost_recursive(&g.text) {
+            "@[simp] "
+        } else {
+            ""
+        };
+        e.push(&format!("{attr}{} {}", g.keyword, g.text));
+        e.push("");
+        map.push(MapEntry {
+            first_line: first,
+            last_line: e.line,
+            target: MapTarget::Clause {
+                span: g.span,
+                desc: format!("ghost `{}`", g.keyword),
+            },
+        });
+    }
+
     for wf in &vc.clause_wfs {
         let first = e.line + 1;
         e.push(&format!(
@@ -122,6 +144,19 @@ fn binder_list(binders: &[(String, String)]) -> String {
         .map(|(name, ty)| format!("({name} : {ty})"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A ghost def is recursive if its body mentions its own head name.
+fn ghost_recursive(text: &str) -> bool {
+    let name: String = text
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    match text.split_once(":=") {
+        Some((_, body)) => !name.is_empty() && crate::vcgen::mentions(body, &name),
+        None => false,
+    }
 }
 
 fn doc_safe(s: &str) -> String {

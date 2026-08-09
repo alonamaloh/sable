@@ -1,0 +1,14 @@
+// &mut arrays, stores, and old-state in a procedure post.
+
+/// pre  a.len ≥ 2
+/// post a.get 0 = (old a).get 1
+/// post a.get 1 = (old a).get 0
+/// post Sable.Seq.perm a (old a)
+fn swap01(&mut [i32] a) {
+    i32 t = a[0];
+    a[0] = a[1];
+    a[1] = t;
+}
+
+/// discharge swap01.post.sable_seq_perm_a_old_a by
+///   exact Sable.Seq.perm_swap _old_a 0 1 (by omega) (by omega) (by omega) (by omega)

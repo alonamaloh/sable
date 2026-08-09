@@ -25,7 +25,7 @@ def Seq.countUpto (s : Seq Int) (v : Int) : Nat → Int
 def Seq.perm (a b : Seq Int) : Prop :=
   a.len = b.len ∧ ∀ v : Int, a.countUpto v a.len.toNat = b.countUpto v b.len.toNat
 
-theorem Seq.perm_refl (a : Seq Int) : a.perm a :=
+@[simp] theorem Seq.perm_refl (a : Seq Int) : a.perm a :=
   ⟨rfl, fun _ => rfl⟩
 
 theorem Seq.perm_symm {a b : Seq Int} (h : a.perm b) : b.perm a :=

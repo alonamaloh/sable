@@ -51,6 +51,7 @@ pub struct ClauseWf {
 }
 
 pub struct VcResult {
+    pub ghosts: Vec<GhostItem>,
     pub clause_wfs: Vec<ClauseWf>,
     pub obligations: Vec<Obligation>,
 }
@@ -58,6 +59,7 @@ pub struct VcResult {
 pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) -> VcResult {
     let fn_map: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let mut result = VcResult {
+        ghosts: program.ghosts.clone(),
         clause_wfs: Vec::new(),
         obligations: Vec::new(),
     };
@@ -72,6 +74,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             context: Vec::new(),
             env: HashMap::new(),
             var_tys: HashMap::new(),
+            mut_arrays: HashMap::new(),
             fresh: 0,
             name_counts: HashMap::new(),
             out: &mut result,
@@ -86,6 +89,8 @@ enum Val {
     Int(String),
     Prop(String),
     Opt(String),
+    /// Symbolic array value: entry binder or a `.set` chain over it.
+    Arr(String),
 }
 
 #[derive(Clone)]
@@ -108,6 +113,8 @@ struct Generator<'a> {
     context: Vec<String>,
     env: HashMap<String, Val>,
     var_tys: HashMap<String, Ty>,
+    /// &mut array params: source name → entry-state binder (`_old_a`).
+    mut_arrays: HashMap<String, String>,
     fresh: usize,
     name_counts: HashMap<String, usize>,
     out: &'a mut VcResult,
@@ -129,62 +136,73 @@ impl<'a> Generator<'a> {
                     self.env
                         .insert(p.name.clone(), Val::Prop(format!("({} = true)", p.name)));
                 }
-                Ty::Array(elem) => {
-                    self.binders
-                        .push((p.name.clone(), "Sable.Seq Int".into()));
+                Ty::Array(elem, mutability) => {
+                    // A &mut array's binder is the *entry* state `_old_a`;
+                    // the current state lives in the symbolic env (a `.set`
+                    // chain), and `old a` in clauses resolves to the binder.
+                    let binder = match mutability {
+                        Mutability::Mut => format!("_old_{}", p.name),
+                        Mutability::Shared => p.name.clone(),
+                    };
+                    self.binders.push((binder.clone(), "Sable.Seq Int".into()));
                     self.hyps.push((
                         format!("h_{}_len", p.name),
-                        format!("0 ≤ {0}.len ∧ {0}.len ≤ u64.max", p.name),
+                        format!("0 ≤ {binder}.len ∧ {binder}.len ≤ u64.max"),
                     ));
                     self.hyps.push((
                         format!("h_{}_elems", p.name),
                         format!(
-                            "∀ k, 0 ≤ k → k < {0}.len → {1} ≤ {0}.get k ∧ {0}.get k ≤ {2}",
-                            p.name,
+                            "∀ k, 0 ≤ k → k < {binder}.len → {} ≤ {binder}.get k ∧ {binder}.get k ≤ {}",
                             elem.lean_min(),
                             elem.lean_max()
                         ),
                     ));
-                    self.env.insert(p.name.clone(), Val::Prop(p.name.clone()));
-                    // Arrays are never substituted; env presence marks scope.
+                    if mutability == Mutability::Mut {
+                        self.mut_arrays.insert(p.name.clone(), binder.clone());
+                    }
+                    self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
-                Ty::Option(_) => unreachable!("checked: no option params"),
+                Ty::Option(_) | Ty::Unit => unreachable!("checked: no such params"),
             }
         }
-        for (i, pre) in self.f.pres.iter().enumerate() {
-            self.hyps
-                .push((format!("h_pre_{}", i + 1), format!("({})", pre.text)));
+        let f = self.f;
+        for (i, pre) in f.pres.iter().enumerate() {
+            let text = self.preprocess(&pre.text);
+            let hyp = self.subst_env(&text);
+            self.hyps.push((format!("h_pre_{}", i + 1), format!("({hyp})")));
             self.context.push(format!("pre {}", pre.text));
-            let binders = self.binders.clone();
+            let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_pre_{}", sanitize(&self.f.name), i + 1),
+                def_name: format!("wf_{}_pre_{}", sanitize(&f.name), i + 1),
                 binders,
-                text: pre.text.clone(),
+                text,
                 span: pre.span,
-                desc: format!("`pre` clause of `{}`", self.f.name),
+                desc: format!("`pre` clause of `{}`", f.name),
                 result_ty: "Prop",
             });
         }
-        for (i, post) in self.f.posts.iter().enumerate() {
-            let mut binders = self.binders.clone();
-            binders.push(("result".to_string(), self.result_lean_ty()));
+        for (i, post) in f.posts.iter().enumerate() {
+            let mut binders = self.wf_binders();
+            if f.ret != Ty::Unit {
+                binders.push(("result".to_string(), self.result_lean_ty()));
+            }
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_post_{}", sanitize(&self.f.name), i + 1),
+                def_name: format!("wf_{}_post_{}", sanitize(&f.name), i + 1),
                 binders,
-                text: post.text.clone(),
+                text: self.preprocess(&post.text),
                 span: post.span,
-                desc: format!("`post` clause of `{}`", self.f.name),
+                desc: format!("`post` clause of `{}`", f.name),
                 result_ty: "Prop",
             });
         }
-        if let Some(v) = &self.f.variant {
-            let binders = self.binders.clone();
+        if let Some(v) = &f.variant {
+            let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_variant", sanitize(&self.f.name)),
+                def_name: format!("wf_{}_variant", sanitize(&f.name)),
                 binders,
-                text: v.text.clone(),
+                text: self.preprocess(&v.text),
                 span: v.span,
-                desc: format!("`variant` clause of `{}`", self.f.name),
+                desc: format!("`variant` clause of `{}`", f.name),
                 result_ty: "Int",
             });
         }
@@ -202,6 +220,10 @@ impl<'a> Generator<'a> {
 
     fn exec(&mut self, stmts: &[&'a Stmt], tail: &Tail<'a>) {
         let Some((stmt, rest)) = stmts.split_first() else {
+            // A procedure path falling off the end is its implicit return.
+            if matches!(tail, Tail::FnEnd) && self.f.ret == Ty::Unit {
+                self.emit_posts(None);
+            }
             // A path fell off the end of a loop body: prove preservation.
             if let Tail::Loop {
                 invariants,
@@ -210,7 +232,7 @@ impl<'a> Generator<'a> {
             } = tail
             {
                 for inv in *invariants {
-                    let goal = self.subst_env(&inv.text);
+                    let goal = self.subst_env(&self.preprocess(&inv.text));
                     let ob = self.obligation(
                         &format!("{}.inv_preserved.{}", self.f.name, slug(&inv.text)),
                         "loop invariant must be preserved by the body".into(),
@@ -219,7 +241,10 @@ impl<'a> Generator<'a> {
                     );
                     self.push_obligation(ob);
                 }
-                let goal = format!("0 ≤ {v0} ∧ ({}) < {v0}", self.subst_env(&variant.text));
+                let goal = format!(
+                    "0 ≤ {v0} ∧ ({}) < {v0}",
+                    self.subst_env(&self.preprocess(&variant.text))
+                );
                 let ob = self.obligation(
                     &format!("{}.variant_decreases.{}", self.f.name, slug(&variant.text)),
                     "loop variant must be a nonnegative measure that strictly decreases"
@@ -248,7 +273,7 @@ impl<'a> Generator<'a> {
                 self.exec(rest, tail);
             }
             Stmt::Return { value, .. } => {
-                let result_eq = match &value.kind {
+                let result_eq = value.as_ref().map(|value| match &value.kind {
                     ExprKind::SomeE(inner) => {
                         let Val::Int(v) = self.eval(inner) else {
                             unreachable!()
@@ -259,20 +284,39 @@ impl<'a> Generator<'a> {
                     _ => match self.eval(value) {
                         Val::Int(v) => format!("(result = {v})"),
                         Val::Opt(v) => format!("(result = {v})"),
-                        Val::Prop(_) => unreachable!("bool returns rejected"),
+                        _ => unreachable!("bool returns rejected"),
                     },
+                });
+                self.emit_posts(result_eq);
+            }
+            Stmt::Store {
+                array,
+                array_span,
+                index,
+                value,
+            } => {
+                let Val::Int(i) = self.eval(index) else {
+                    unreachable!()
                 };
-                for post in &self.f.posts {
-                    let mut ob = self.obligation(
-                        &format!("{}.post.{}", self.f.name, slug(&post.text)),
-                        format!("postcondition of `{}`", self.f.name),
-                        post.span,
-                        post.text.clone(),
-                    );
-                    ob.binders.push(("result".to_string(), self.result_lean_ty()));
-                    ob.hyps.push(("h_result".to_string(), result_eq.clone()));
-                    self.push_obligation(ob);
-                }
+                let Val::Int(v) = self.eval(value) else {
+                    unreachable!()
+                };
+                let arr = self.arr_str(array);
+                let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
+                let ob = self.obligation(
+                    &format!("{}.bounds.{}", self.f.name, slug(self.src(index.span))),
+                    format!(
+                        "store index `{}` must be within bounds",
+                        self.src_short(index.span)
+                    ),
+                    array_span.join(index.span),
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                self.env
+                    .insert(array.clone(), Val::Arr(format!("({arr}.set {i} {v})")));
+                self.exec(rest, tail);
             }
             Stmt::If {
                 cond,
@@ -320,16 +364,19 @@ impl<'a> Generator<'a> {
 
                 // Well-formedness defs so clause elaboration errors map to
                 // the clause span. Binders: everything in scope.
-                let scope_binders: Vec<(String, String)> = self
+                let mut scope_binders: Vec<(String, String)> = self
                     .var_tys
                     .iter()
                     .filter_map(|(name, ty)| match ty {
                         Ty::Int(_) => Some((name.clone(), "Int".to_string())),
                         Ty::Bool => Some((name.clone(), "Bool".to_string())),
-                        Ty::Array(_) => Some((name.clone(), "Sable.Seq Int".to_string())),
-                        Ty::Option(_) => None,
+                        Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
+                        Ty::Option(_) | Ty::Unit => None,
                     })
                     .collect();
+                for entry in self.mut_arrays.values() {
+                    scope_binders.push((entry.clone(), "Sable.Seq Int".to_string()));
+                }
                 for (i, clause) in invariants.iter().chain(std::iter::once(variant)).enumerate() {
                     self.fresh += 1;
                     self.out.clause_wfs.push(ClauseWf {
@@ -340,7 +387,7 @@ impl<'a> Generator<'a> {
                             i
                         ),
                         binders: scope_binders.clone(),
-                        text: clause.text.clone(),
+                        text: self.preprocess(&clause.text),
                         span: clause.span,
                         desc: format!("loop annotation in `{}`", self.f.name),
                         result_ty: if i == invariants.len() { "Int" } else { "Prop" },
@@ -349,7 +396,7 @@ impl<'a> Generator<'a> {
 
                 // 1. Invariants hold at entry (substituted goals).
                 for inv in invariants {
-                    let goal = self.subst_env(&inv.text);
+                    let goal = self.subst_env(&self.preprocess(&inv.text));
                     let ob = self.obligation(
                         &format!("{}.inv_init.{}", self.f.name, slug(&inv.text)),
                         "loop invariant must hold at loop entry".into(),
@@ -367,8 +414,9 @@ impl<'a> Generator<'a> {
                 self.fresh += 1;
                 let tag = self.fresh;
                 for (i, inv) in invariants.iter().enumerate() {
+                    let text = self.subst_env(&self.preprocess(&inv.text));
                     self.hyps
-                        .push((format!("h_inv{}_{}", tag, i + 1), format!("({})", inv.text)));
+                        .push((format!("h_inv{}_{}", tag, i + 1), format!("({text})")));
                     self.context.push(format!("invariant {}", inv.text));
                 }
                 let p = self.eval_prop(cond);
@@ -381,8 +429,9 @@ impl<'a> Generator<'a> {
                 self.fresh += 1;
                 let v0 = format!("_v{}", self.fresh);
                 self.binders.push((v0.clone(), "Int".into()));
+                let vtext = self.subst_env(&self.preprocess(&variant.text));
                 self.hyps
-                    .push((format!("h{v0}"), format!("{v0} = ({})", variant.text)));
+                    .push((format!("h{v0}"), format!("{v0} = ({vtext})")));
                 let h_cond = self.fresh_hyp("h_path");
                 self.hyps.push((h_cond, p.clone()));
                 self.context.push(format!("path {p}"));
@@ -423,12 +472,15 @@ impl<'a> Generator<'a> {
                     continue;
                 }
                 let s = match val {
-                    Val::Int(s) | Val::Opt(s) => s,
+                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) => s,
                     Val::Prop(s) => s,
                 };
                 if havoc_set.iter().any(|h| mentions(s, h)) {
-                    // Arrays map to their own name and are never assigned.
-                    if !matches!(self.var_tys.get(name), Some(Ty::Array(_))) {
+                    // Shared arrays map to their own name and never change.
+                    if !matches!(
+                        self.var_tys.get(name),
+                        Some(Ty::Array(_, Mutability::Shared))
+                    ) {
                         havoc_set.insert(name.clone());
                         grew = true;
                         break;
@@ -469,6 +521,27 @@ impl<'a> Generator<'a> {
                     self.env
                         .insert(name.clone(), Val::Prop(format!("({name} = true)")));
                 }
+                Some(Ty::Array(elem, Mutability::Mut)) => {
+                    // Stores are the only mutation and preserve length and
+                    // element ranges by construction, so both facts are
+                    // sound to assume at havoc.
+                    let elem = *elem;
+                    let entry = self.mut_arrays[name.as_str()].clone();
+                    self.binders.push((name.clone(), "Sable.Seq Int".into()));
+                    self.hyps.push((
+                        format!("h_{name}_len{}", self.fresh),
+                        format!("({name}.len) = ({entry}.len)"),
+                    ));
+                    self.hyps.push((
+                        format!("h_{name}_elems{}", self.fresh),
+                        format!(
+                            "∀ k, 0 ≤ k → k < {name}.len → {} ≤ {name}.get k ∧ {name}.get k ≤ {}",
+                            elem.lean_min(),
+                            elem.lean_max()
+                        ),
+                    ));
+                    self.env.insert(name.clone(), Val::Arr(name.clone()));
+                }
                 _ => {}
             }
         }
@@ -483,7 +556,10 @@ impl<'a> Generator<'a> {
             }),
             ExprKind::BoolLit(b) => Val::Prop(if *b { "True".into() } else { "False".into() }),
             ExprKind::Var(name) => self.env.get(name).cloned().expect("checked: initialized"),
-            ExprKind::Len { array } => Val::Int(format!("{array}.len")),
+            ExprKind::Len { array } => {
+                let arr = self.arr_str(array);
+                Val::Int(format!("({arr}.len)"))
+            }
             ExprKind::Widen { arg, .. } => self.eval(arg),
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
@@ -495,7 +571,8 @@ impl<'a> Generator<'a> {
                 let Ty::Int(elem) = e.ty.unwrap() else {
                     unreachable!()
                 };
-                let goal = format!("0 ≤ {i} ∧ {i} < {array}.len");
+                let arr = self.arr_str(array);
+                let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
                 let ob = self.obligation(
                     &format!("{}.bounds.{}", self.f.name, slug(self.src(e.span))),
                     format!("index `{}` must be within bounds", self.src_short(e.span)),
@@ -504,7 +581,7 @@ impl<'a> Generator<'a> {
                 );
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
-                let value = format!("({array}.get {i})");
+                let value = format!("({arr}.get {i})");
                 // Element range follows from the array's element fact +
                 // the just-proven bounds; assuming it here saves the
                 // automation a quantifier instantiation.
@@ -672,8 +749,9 @@ impl<'a> Generator<'a> {
                 // must be a nonnegative decrease of the current measure.
                 if *callee == self.f.name {
                     let variant = self.f.variant.as_ref().expect("checked");
-                    let callee_measure = substitute(&variant.text, &subst_map, None);
-                    let caller_measure = self.subst_env(&variant.text);
+                    let vtext = self.preprocess(&variant.text);
+                    let callee_measure = substitute(&vtext, &subst_map, None);
+                    let caller_measure = self.subst_env(&vtext);
                     let goal = format!(
                         "0 ≤ ({callee_measure}) ∧ ({callee_measure}) < ({caller_measure})"
                     );
@@ -778,11 +856,97 @@ impl<'a> Generator<'a> {
             .env
             .iter()
             .filter_map(|(name, val)| match val {
-                Val::Int(s) if s != name => Some((name.clone(), s.clone())),
+                Val::Int(s) | Val::Arr(s) if s != name => Some((name.clone(), s.clone())),
                 _ => None,
             })
             .collect();
         substitute(text, &map, None)
+    }
+
+    /// Replace `old x` (x a &mut array param) with its entry-state binder.
+    fn preprocess(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(pos) = rest.find("old") {
+            let before_ok = pos == 0
+                || !rest.as_bytes()[pos - 1].is_ascii_alphanumeric()
+                    && rest.as_bytes()[pos - 1] != b'_'
+                    && rest.as_bytes()[pos - 1] != b'.';
+            let after = &rest[pos + 3..];
+            let after_trim = after.trim_start();
+            let ident: String = after_trim
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if before_ok && !ident.is_empty() {
+                if let Some(entry) = self.mut_arrays.get(&ident) {
+                    out.push_str(&rest[..pos]);
+                    out.push_str(entry);
+                    rest = &after_trim[ident.len()..];
+                    continue;
+                }
+            }
+            out.push_str(&rest[..pos + 3]);
+            rest = &rest[pos + 3..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Current symbolic array expression for an in-scope array name.
+    fn arr_str(&self, name: &str) -> String {
+        match self.env.get(name) {
+            Some(Val::Arr(s)) => s.clone(),
+            _ => unreachable!("checked: array in scope"),
+        }
+    }
+
+    /// Binders for clause well-formedness defs: source names (plus the
+    /// `_old_` twin for &mut arrays, so `old a` elaborates).
+    fn wf_binders(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for p in &self.f.params {
+            match p.ty {
+                Ty::Int(_) => out.push((p.name.clone(), "Int".into())),
+                Ty::Bool => out.push((p.name.clone(), "Bool".into())),
+                Ty::Array(..) => {
+                    out.push((p.name.clone(), "Sable.Seq Int".into()));
+                    if let Some(entry) = self.mut_arrays.get(&p.name) {
+                        out.push((entry.clone(), "Sable.Seq Int".into()));
+                    }
+                }
+                Ty::Option(_) | Ty::Unit => {}
+            }
+        }
+        out
+    }
+
+    /// Postcondition obligations for the current path. In post goals,
+    /// by-value parameters mean their *entry* values (verbatim binders) but
+    /// &mut arrays mean their *final* state — substituted here.
+    fn emit_posts(&mut self, result_eq: Option<String>) {
+        let f = self.f;
+        let mut_map: HashMap<String, String> = self
+            .mut_arrays
+            .keys()
+            .map(|name| (name.clone(), self.arr_str(name)))
+            .collect();
+        for post in &f.posts {
+            let goal = substitute(&self.preprocess(&post.text), &mut_map, None);
+            let mut ob = self.obligation(
+                &format!("{}.post.{}", f.name, slug(&post.text)),
+                format!("postcondition of `{}`", f.name),
+                post.span,
+                goal,
+            );
+            if f.ret != Ty::Unit {
+                ob.binders.push(("result".to_string(), self.result_lean_ty()));
+            }
+            if let Some(eq) = &result_eq {
+                ob.hyps.push(("h_result".to_string(), eq.clone()));
+            }
+            self.push_obligation(ob);
+        }
     }
 
     fn assume_fact(&mut self, prop: &str) {
@@ -849,6 +1013,9 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
             Stmt::Assign { name, .. } => {
                 out.insert(name.clone());
             }
+            Stmt::Store { array, .. } => {
+                out.insert(array.clone());
+            }
             Stmt::If {
                 then_block,
                 else_block,
@@ -871,7 +1038,7 @@ fn range_prop(value: &str, it: IntTy) -> String {
 
 /// True if `text` contains `name` as a standalone identifier token
 /// (not a field access like `.name`).
-fn mentions(text: &str, name: &str) -> bool {
+pub fn mentions(text: &str, name: &str) -> bool {
     scan_idents(text, |word, after_dot| !after_dot && word == name)
 }
 

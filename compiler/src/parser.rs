@@ -41,35 +41,53 @@ pub fn parse(
         fns.push(parser.parse_fn()?);
     }
 
-    // Remaining blocks: discharge blocks are module-level; anything else
-    // is an attachment error.
+    // Remaining blocks are module-level: ghost defs, theorems, discharges.
     let mut discharges = Vec::new();
+    let mut ghosts = Vec::new();
     for (bi, block) in parser.blocks.iter().enumerate() {
         if parser.consumed[bi] {
             continue;
         }
-        if block.clauses.iter().all(|c| c.kind == ClauseKind::Discharge) {
-            for clause in &block.clauses {
-                discharges.push(parse_discharge(clause)?);
+        for clause in &block.clauses {
+            match clause.kind {
+                ClauseKind::Discharge => discharges.push(parse_discharge(clause)?),
+                ClauseKind::GhostDef => ghosts.push(GhostItem {
+                    keyword: "def",
+                    text: clause.text.clone(),
+                    span: clause.span,
+                }),
+                ClauseKind::Theorem => ghosts.push(GhostItem {
+                    keyword: "theorem",
+                    text: clause.text.clone(),
+                    span: clause.span,
+                }),
+                other => {
+                    return Err(Diagnostic {
+                        name: "proof.unattached_block".into(),
+                        title: format!(
+                            "`{}` clause in a free-floating proof block",
+                            kind_word(other)
+                        ),
+                        span: clause.line_span,
+                        label: "module-level blocks hold `def`, `theorem`, and `discharge`"
+                            .into(),
+                        notes: vec![(
+                            "note".into(),
+                            "a blank line detaches a proof block from the item below — \
+                             contracts must touch their function"
+                                .into(),
+                        )],
+                    })
+                }
             }
-        } else {
-            return Err(Diagnostic {
-                name: "proof.unattached_block".into(),
-                title: "proof block is not attached to anything".into(),
-                span: block.span,
-                label: "no function or loop starts on the next line".into(),
-                notes: vec![(
-                    "note".into(),
-                    "a blank line detaches a proof block from the item below; \
-                     free-floating blocks may only contain `discharge` in M1 \
-                     (ghost `def`/`theorem` land in M2)"
-                        .into(),
-                )],
-            });
         }
     }
 
-    Ok(Program { fns, discharges })
+    Ok(Program {
+        fns,
+        discharges,
+        ghosts,
+    })
 }
 
 fn parse_discharge(clause: &Clause) -> PResult<Discharge> {
@@ -211,14 +229,20 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// A parameter type: scalar, or `&[T]`.
+    /// A parameter type: scalar, `&[T]`, or `&mut [T]`.
     fn param_ty(&mut self) -> PResult<(Ty, Span)> {
         if self.at(&Tok::Amp) {
             let start = self.bump().span;
+            let mutability = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
+                self.bump();
+                Mutability::Mut
+            } else {
+                Mutability::Shared
+            };
             self.expect(Tok::LBracket)?;
             let (elem, _) = self.int_ty()?;
             let end = self.expect(Tok::RBracket)?.span;
-            return Ok((Ty::Array(elem), start.join(end)));
+            return Ok((Ty::Array(elem, mutability), start.join(end)));
         }
         self.scalar_ty()
     }
@@ -282,8 +306,12 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(Tok::RParen)?;
-        self.expect(Tok::Arrow)?;
-        let ret = self.ret_ty()?;
+        let ret = if self.at(&Tok::Arrow) {
+            self.bump();
+            self.ret_ty()?
+        } else {
+            Ty::Unit
+        };
 
         let mut f = Fn {
             name,
@@ -523,7 +551,11 @@ impl<'a> Parser<'a> {
         match self.peek().clone() {
             Tok::KwReturn => {
                 let kw = self.bump().span;
-                let value = self.expr()?;
+                let value = if self.at(&Tok::Semi) {
+                    None
+                } else {
+                    Some(self.expr()?)
+                };
                 let end = self.expect(Tok::Semi)?.span;
                 Ok(Stmt::Return {
                     value,
@@ -553,12 +585,19 @@ impl<'a> Parser<'a> {
                         init,
                     })
                 } else if self.peek2() == &Tok::LBracket {
-                    Err(Diagnostic {
-                        name: "parse.m1_array_store".into(),
-                        title: "array element assignment is not supported yet".into(),
-                        span: self.peek_span(),
-                        label: "`a[i] = e` lands in M2 with `&mut [T]`".into(),
-                        notes: vec![("note".into(), "see docs/PLAN.md".into())],
+                    let array_span = self.peek_span();
+                    self.bump();
+                    self.bump();
+                    let index = self.expr()?;
+                    self.expect(Tok::RBracket)?;
+                    self.expect(Tok::Assign)?;
+                    let value = self.expr()?;
+                    self.expect(Tok::Semi)?;
+                    Ok(Stmt::Store {
+                        array: first,
+                        array_span,
+                        index,
+                        value,
                     })
                 } else {
                     let name_span = self.peek_span();
@@ -988,7 +1027,7 @@ fn mk_bin(op: BinOp, op_span: Span, lhs: Expr, rhs: Expr) -> Expr {
 /// Names that would collide with the proof language or generated Lean.
 fn is_reserved_name(name: &str) -> bool {
     const RESERVED: &[&str] = &[
-        "result", "old", "some", "none", "option", "widen", "theorem", "def", "by", "fun",
+        "result", "old", "mut", "some", "none", "option", "widen", "theorem", "def", "by", "fun",
         "match", "with", "do", "let", "have", "show", "from", "open", "import", "namespace",
         "end", "in", "at", "forall", "exists", "Prop", "Type", "Int", "Nat", "Bool", "True",
         "False", "len",
