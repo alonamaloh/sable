@@ -2,10 +2,12 @@
 
 Sable is a design for an imperative, C-flavored language in which **every function carries a machine-checked proof of its contract**. One source file interleaves two languages: a C-like program language with no undefined behavior and an ownership-based memory model, and a Lean 4–dialect proof language that lives entirely on lines beginning with `///`.
 
-**Status: design phase.** There is no compiler yet. This repository currently holds the two design documents (working draft 0.4):
+**Status: early implementation (milestone M0 — see [`docs/PLAN.md`](docs/PLAN.md)).** The normative design documents (working draft 0.4):
 
-- [`sable-language-design.md`](sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
-- [`sable-goals-and-roadmap.md`](sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
+- [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
+- [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
+
+The compiler is written in Rust (`compiler/`); the proof language is checked by Lean itself against the prelude in `lean/` — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the ADRs in [`docs/decisions/`](docs/decisions/).
 
 ## The idea in thirty seconds
 

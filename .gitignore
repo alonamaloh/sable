@@ -1,0 +1,4 @@
+/compiler/target/
+/lean/.lake/
+/.sable-out/
+.DS_Store
