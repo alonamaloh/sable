@@ -18,4 +18,16 @@ structure Seq (α : Type) where
   len : Int
   get : Int → α
 
+/-- Functional store: the model of `a[i] = v` on `&mut [T]`. Length is
+preserved by construction, which is why the generator may assume
+`a.len = old a.len` across havoc. -/
+def Seq.set (s : Seq α) (i : Int) (v : α) : Seq α :=
+  ⟨s.len, fun k => if k = i then v else s.get k⟩
+
+@[simp] theorem Seq.len_set (s : Seq α) (i : Int) (v : α) :
+    (s.set i v).len = s.len := rfl
+
+@[simp] theorem Seq.get_set (s : Seq α) (i j : Int) (v : α) :
+    (s.set i v).get j = if j = i then v else s.get j := rfl
+
 end Sable
