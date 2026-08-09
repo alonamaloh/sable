@@ -9,6 +9,7 @@ pub mod interp;
 pub mod lean;
 pub mod lexer;
 pub mod lsp;
+pub mod mono;
 pub mod parser;
 pub mod scan;
 pub mod span;
@@ -59,6 +60,9 @@ pub fn front_diagnostics(source: &str) -> Vec<Diagnostic> {
         Ok(p) => p,
         Err(d) => return vec![d],
     };
+    if let Err(d) = mono::monomorphize(&mut program) {
+        return vec![d];
+    }
     if let Err(d) = check::check(&mut program) {
         return vec![d];
     }
@@ -97,6 +101,7 @@ pub fn test_file(path: &Path) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
     let tokens = lexer::lex(&scanned.program_text).map_err(|d| vec![render(&d)])?;
     let mut program = parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
         .map_err(|d| vec![render(&d)])?;
+    mono::monomorphize(&mut program).map_err(|d| vec![render(&d)])?;
     check::check(&mut program).map_err(|d| vec![render(&d)])?;
     Ok(interp::run_tests(&program, &source, &display_path))
 }
@@ -167,6 +172,9 @@ pub fn check_file_structured(
         Ok(p) => p,
         Err(d) => return (source, Err(vec![render(&d)])),
     };
+    if let Err(d) = mono::monomorphize(&mut program) {
+        return (source, Err(vec![render(&d)]));
+    }
     let checked = match check::check(&mut program) {
         Ok(c) => c,
         Err(d) => return (source, Err(vec![render(&d)])),

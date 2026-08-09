@@ -18,6 +18,8 @@ pub struct Parser<'a> {
     consumed: Vec<bool>,
     lines: &'a LineMap,
     text: &'a str,
+    /// Type parameters of the generic declaration being parsed.
+    tparams: Vec<String>,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -35,6 +37,7 @@ pub fn parse(
         consumed: vec![false; blocks.len()],
         lines,
         text,
+        tparams: Vec::new(),
     };
     let mut fns = Vec::new();
     let mut classes = Vec::new();
@@ -107,7 +110,7 @@ fn obligation_name(text: &str) -> (String, &str) {
     let text = text.trim_start();
     let name: String = text
         .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_')
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == ':')
         .collect();
     let rest = text[name.len()..].trim();
     (name, rest)
@@ -186,7 +189,7 @@ fn parse_discharge(clause: &Clause) -> PResult<Discharge> {
     let text = clause.text.trim_start();
     let name: String = text
         .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_')
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == ':')
         .collect();
     let rest = text[name.len()..].trim_start();
     let malformed = || Diagnostic {
@@ -297,6 +300,42 @@ impl<'a> Parser<'a> {
         None
     }
 
+    /// Disambiguate `f<i32>(...)` / `C<i32>::...` from comparisons:
+    /// only a `<`-list of type names closed by `>` and followed by `(`
+    /// or `::` parses as type arguments.
+    fn at_generic_args(&self) -> bool {
+        // Builtin angle-bracket forms have dedicated arms.
+        if matches!(self.peek(), Tok::Ident(n) if n == "widen" || n == "alloc_array") {
+            return false;
+        }
+        let mut i = self.pos + 1;
+        if self.tokens.get(i).map(|t| &t.tok) != Some(&Tok::Lt) {
+            return false;
+        }
+        i += 1;
+        loop {
+            match self.tokens.get(i).map(|t| &t.tok) {
+                Some(Tok::Ident(n))
+                    if IntTy::from_name(n).is_some()
+                        || self.tparams.iter().any(|p| p == n) => {}
+                _ => return false,
+            }
+            i += 1;
+            match self.tokens.get(i).map(|t| &t.tok) {
+                Some(Tok::Comma) => i += 1,
+                Some(Tok::Gt) => {
+                    i += 1;
+                    break;
+                }
+                _ => return false,
+            }
+        }
+        matches!(
+            self.tokens.get(i).map(|t| &t.tok),
+            Some(Tok::LParen) | Some(Tok::ColonColon)
+        )
+    }
+
     fn ident(&mut self) -> PResult<(String, Span)> {
         match self.peek().clone() {
             Tok::Ident(name) => {
@@ -310,13 +349,63 @@ impl<'a> Parser<'a> {
 
     fn int_ty(&mut self) -> PResult<(IntTy, Span)> {
         let (name, span) = self.ident()?;
+        if let Some(i) = self.tparams.iter().position(|p| *p == name) {
+            return Ok((IntTy::TParam(i as u8), span));
+        }
         IntTy::from_name(&name).map(|t| (t, span)).ok_or_else(|| Diagnostic {
             name: "parse.unknown_type".into(),
             title: format!("unknown integer type `{name}`"),
             span,
-            label: "expected `u8`..`u64` or `i8`..`i64`".into(),
+            label: "expected `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter"
+                .into(),
             notes: vec![],
         })
+    }
+
+    /// `<T, U>` after a declaration name.
+    fn type_param_list(&mut self) -> PResult<Vec<String>> {
+        if !self.at(&Tok::Lt) {
+            return Ok(Vec::new());
+        }
+        self.bump();
+        let mut out = Vec::new();
+        loop {
+            let (name, span) = self.ident()?;
+            if IntTy::from_name(&name).is_some() || is_reserved_name(&name) {
+                return Err(Diagnostic {
+                    name: "parse.bad_type_param".into(),
+                    title: format!("`{name}` cannot be a type parameter"),
+                    span,
+                    label: "shadows a concrete type or reserved name".into(),
+                    notes: vec![],
+                });
+            }
+            out.push(name);
+            if self.at(&Tok::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.expect(Tok::Gt)?;
+        Ok(out)
+    }
+
+    /// `<i32, u8>` at a use site (concrete or in-scope-parameter types).
+    fn type_arg_list(&mut self) -> PResult<Vec<IntTy>> {
+        self.expect(Tok::Lt)?;
+        let mut out = Vec::new();
+        loop {
+            let (t, _) = self.int_ty()?;
+            out.push(t);
+            if self.at(&Tok::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.expect(Tok::Gt)?;
+        Ok(out)
     }
 
     /// A parameter type: scalar, `&[T]`, or `&mut [T]`.
@@ -341,6 +430,9 @@ impl<'a> Parser<'a> {
         let (name, span) = self.ident()?;
         if name == "bool" {
             return Ok((Ty::Bool, span));
+        }
+        if let Some(i) = self.tparams.iter().position(|p| *p == name) {
+            return Ok((Ty::Int(IntTy::TParam(i as u8)), span));
         }
         IntTy::from_name(&name)
             .map(|t| (Ty::Int(t), span))
@@ -373,6 +465,8 @@ impl<'a> Parser<'a> {
     fn parse_class(&mut self) -> PResult<ClassDecl> {
         let start = self.expect(Tok::KwClass)?.span;
         let (name, name_span) = self.ident()?;
+        self.tparams = self.type_param_list()?;
+        let type_params = self.tparams.clone();
         self.expect(Tok::LBrace)?;
         let mut fields = Vec::new();
         let mut inits = Vec::new();
@@ -460,9 +554,11 @@ impl<'a> Parser<'a> {
             }
         }
 
+        self.tparams.clear();
         Ok(ClassDecl {
             name,
             name_span,
+            type_params,
             fields,
             invariants,
             inits,
@@ -510,6 +606,7 @@ impl<'a> Parser<'a> {
         Ok(Fn {
             name,
             name_span,
+            type_params: Vec::new(),
             params,
             ret: Ty::Unit,
             pres: Vec::new(),
@@ -556,6 +653,7 @@ impl<'a> Parser<'a> {
             f: Fn {
                 name,
                 name_span,
+                type_params: Vec::new(),
                 params,
                 ret,
                 pres: Vec::new(),
@@ -599,6 +697,8 @@ impl<'a> Parser<'a> {
         if is_reserved_name(&name) {
             return Err(reserved_name_error(&name, name_span, "function"));
         }
+        self.tparams = self.type_param_list()?;
+        let type_params = self.tparams.clone();
         self.expect(Tok::LParen)?;
         let mut params = Vec::new();
         if !self.at(&Tok::RParen) {
@@ -631,6 +731,7 @@ impl<'a> Parser<'a> {
         let mut f = Fn {
             name,
             name_span,
+            type_params,
             params,
             ret,
             pres: Vec::new(),
@@ -668,6 +769,7 @@ impl<'a> Parser<'a> {
         }
 
         f.body = self.block()?;
+        self.tparams.clear();
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         f.span = start.join(end);
         Ok(f)
@@ -1232,6 +1334,7 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Call {
                             callee,
                             callee_span,
+                            type_args: Vec::new(),
                             args,
                         },
                         span: callee_span.join(close),
@@ -1408,6 +1511,62 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::Ident(head) if self.at_generic_args() => {
+                let head_span = self.peek_span();
+                self.bump();
+                let type_args = self.type_arg_list()?;
+                if self.at(&Tok::ColonColon) {
+                    self.bump();
+                    let (init, _) = self.ident()?;
+                    self.expect(Tok::LParen)?;
+                    let mut args = Vec::new();
+                    if !self.at(&Tok::RParen) {
+                        loop {
+                            args.push(self.expr()?);
+                            if self.at(&Tok::Comma) {
+                                self.bump();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let close = self.expect(Tok::RParen)?.span;
+                    return Ok(Expr {
+                        kind: ExprKind::CtorCall {
+                            class: head,
+                            class_span: head_span,
+                            type_args,
+                            init,
+                            args,
+                        },
+                        span: span.join(close),
+                        ty: None,
+                    });
+                }
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    loop {
+                        args.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::Call {
+                        callee: head,
+                        callee_span: head_span,
+                        type_args,
+                        args,
+                    },
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
             Tok::Ident(class) if self.peek2() == &Tok::ColonColon => {
                 let class_span = self.peek_span();
                 self.bump();
@@ -1430,6 +1589,7 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::CtorCall {
                         class,
                         class_span,
+                        type_args: Vec::new(),
                         init,
                         args,
                     },

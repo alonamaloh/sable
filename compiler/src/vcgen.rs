@@ -660,8 +660,19 @@ impl<'a> Generator<'a> {
                         Ty::Option(_) | Ty::Unit => None,
                     })
                     .collect();
-                for entry in self.mut_arrays.values() {
+                for (name, entry) in self.mut_arrays.iter() {
+                    if name == "self" {
+                        continue; // handled below with the class type
+                    }
                     scope_binders.push((entry.clone(), "Sable.Seq Int".to_string()));
+                }
+                match self.cctx {
+                    Cctx::Init(c) => scope_binders.push(("self".to_string(), c.name.clone())),
+                    Cctx::Method(c, _) => {
+                        scope_binders.push(("self".to_string(), c.name.clone()));
+                        scope_binders.push(("_old_self".to_string(), c.name.clone()));
+                    }
+                    Cctx::None => {}
                 }
                 for (i, clause) in invariants.iter().chain(std::iter::once(variant)).enumerate() {
                     self.fresh += 1;
@@ -828,6 +839,37 @@ impl<'a> Generator<'a> {
                     self.push_class_state_facts(cd, name);
                     self.push_invariant_hyps(cd, name);
                     self.env.insert(name.clone(), Val::Obj(name.clone()));
+                }
+                Some(Ty::Array(elem, Mutability::Owned)) => {
+                    // Owned local mutated by the loop body: fresh state.
+                    // Stores preserve length, so equate to the pre-havoc
+                    // chain — but only when that chain does not itself
+                    // mention a havocked name (else drop to range facts).
+                    let elem = *elem;
+                    let prior = match self.env.get(name) {
+                        Some(Val::Arr(s)) => Some(s.clone()),
+                        _ => None,
+                    };
+                    self.binders.push((name.clone(), "Sable.Seq Int".into()));
+                    if let Some(prior) = prior {
+                        if !havoc_set.iter().any(|h| h != name && mentions(&prior, h))
+                            && !mentions(&prior, name)
+                        {
+                            self.hyps.push((
+                                format!("h_{name}_len"),
+                                format!("({name}.len) = ({prior}.len)"),
+                            ));
+                        }
+                    }
+                    self.hyps.push((
+                        format!("h_{name}_elems"),
+                        format!(
+                            "∀ k, 0 ≤ k → k < {name}.len → {} ≤ {name}.get k ∧ {name}.get k ≤ {}",
+                            elem.lean_min(),
+                            elem.lean_max()
+                        ),
+                    ));
+                    self.env.insert(name.clone(), Val::Arr(name.clone()));
                 }
                 Some(Ty::Array(elem, Mutability::Mut)) => {
                     // Stores are the only mutation and preserve length and

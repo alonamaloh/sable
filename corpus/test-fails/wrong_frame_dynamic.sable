@@ -1,0 +1,27 @@
+// expect-test-failure: post of `Cell::clobber` violated
+// Guards the (old self).f projection in the runtime monitor: this frame
+// post is false (set overwrites slot 0), and must be caught, not
+// skipped or vacuously passed.
+
+class Cell {
+    [i32] buf;
+
+    /// invariant buf.len > 0
+
+    init make() {
+        self.buf = alloc_array<i32>(2, 5);
+    }
+
+    /// post ∀ k, 0 ≤ k → k < self.buf.len → self.buf.get k = (old self).buf.get k
+    fn clobber(&mut self) {
+        self.buf[0] = 99;
+    }
+
+    deinit {
+    }
+}
+
+fn test_clobber() {
+    var c = Cell::make();
+    c.clobber();
+}

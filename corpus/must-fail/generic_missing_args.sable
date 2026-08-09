@@ -1,0 +1,11 @@
+// expect-error: mono.missing_type_args
+
+/// post result = a
+fn id<T>(T a) -> T {
+    return a;
+}
+
+/// post result = 3
+fn caller() -> i32 {
+    return id(3);
+}

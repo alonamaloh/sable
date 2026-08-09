@@ -1,6 +1,6 @@
 # Implementation plan
 
-Original north star for v0.1 — **verify `binary_search` and insertion sort end-to-end, with no hand-waving** — was reached 2026-08-08/09; the corpus now also carries fully-specified quicksort, the merge kernel, and round-trip codecs. Current north star: **Tier 1 of the roadmap — `Vec`, the hash map, and the generics design they force** (goals doc), on top of the remaining M6 odds and ends.
+Original north star for v0.1 — **verify `binary_search` and insertion sort end-to-end, with no hand-waving** — was reached 2026-08-08/09; the corpus now also carries fully-specified quicksort, the merge kernel, and round-trip codecs. Current north star: **Tier 1 of the roadmap** (goals doc) — `Vec` and generics v1 landed (M7); next is **the hash map and the law-carrying trait bounds it forces** (`T: Hashable`), on top of the remaining M6 odds and ends.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -80,6 +80,19 @@ Known M5 simplifications: class values are locals only (no params/returns/moves/
 **Parallel tracks landed the same session**: the SVM step-relation draft (`lean/Sable/SVM.lean`, 73 rules, builds clean; `docs/notes/svm-draft.md` lists 11 design ambiguities the formalization forced out — OOM vs determinism, ⊥-reads vs pillar 1, `wrap()` as operator-modifier, unstated evaluation order/short-circuiting, ghost state without transitions, and more) and the **warm-check daemon** (`sable daemon`: persistent Lean server behind a unix socket; 2.4s → ~0.25s per check, ~10×; silent fallback to the batch path).
 
 Remaining M6 items: Base64 (nothing new technically after hex); `partial fn`; `narrow<T>` when something forces it; known warts — repeated `h_<arr>_len` facts across a call chain shadow (recover by type), `count`'s Lean form (`countUpto`+`toNat`) is clumsy in hand proofs.
+
+### M7 — generics v1 and `Vec<T>` *(complete, 2026-08-09)*
+
+**Generics** per ADR 0006: explicit instantiation only (`Vec<i32>::with_capacity(4)`, `id<u8>(x)`), parameters range over the eight integer types, and a monomorphization pass (`compiler/src/mono.rs`) expands every instantiation between parse and typecheck — no downstream stage (checker, VCgen, interpreter, spec evaluator) ever sees a type variable. Clause text substitutes parameters bare, so `T.max` becomes `i32.max` and the existing clause pipeline just works. Instances verify independently under mangled names (`Vec_i32`); the per-instance duplication of hand discharges is the accepted v1 cost. Diagnostics: `mono.missing_type_args`, `mono.arity`, `mono.not_generic`, plus recursion caps.
+
+**`Vec<T>`** (`corpus/verifies/vec.sable`): growable vector with amortized-doubling `push` — capacity invariant `buf.len ≤ 2^62` makes the doubling overflow-free by construction; `push` carries the full frame post `∀ k < old self.len → self.buf.get k = (old self).buf.get k` across the reallocation-and-copy path. Two instances (`Vec<i32>`, `Vec<u8>`) verify at 151 obligations with 8 discharges (the copy-loop invariant and frame post, per growth path, per instance); dynamic tests exercise growth, set/pop, and both instances at zero skipped clauses.
+
+**Soundness fixes forced along the way** (each with a must-fail regression guard):
+- Owned local arrays mutated inside a loop were never havocked at the loop head — the pre-loop allocation's symbolic value survived the loop (`must-fail/owned_loop_stale`). Fresh binders now carry length preservation (only when the prior chain mentions no havocked name) plus element ranges.
+- Loop well-formedness definitions inside class methods lacked `self`/`_old_self` binders, breaking any invariant mentioning fields.
+- The runtime monitor's spec fragment gained `(old obj).field` projections and chained postfix (`(old self).buf.get k`), so `Vec`'s frame posts are *monitored*, not skipped — guarded by `test-fails/wrong_frame_dynamic`, which proves a violated frame post is caught rather than vacuously passed.
+
+Deferred to the hash map (next): law-carrying trait bounds (`T: Hashable` with equations the proofs can use), non-integer type arguments, template-level discharges instantiated by mono.
 
 ## Parallel track (low intensity)
 

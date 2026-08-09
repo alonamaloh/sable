@@ -1,0 +1,11 @@
+// expect-error: mono.arity
+
+/// post result = a
+fn id<T>(T a) -> T {
+    return a;
+}
+
+/// post result = 3
+fn caller() -> i32 {
+    return id<i32, u8>(3);
+}

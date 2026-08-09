@@ -210,6 +210,8 @@ fn tokenize(text: &str) -> EResult<Vec<T>> {
                     j += 1;
                 }
                 out.push(T::DotField(chars[start..j].iter().collect()));
+                // Postfix projections chain: `(old self).buf.get k`.
+                prev_rparen = true;
                 i = j;
             }
             c if c.is_ascii_digit() => {
@@ -494,11 +496,9 @@ impl P {
                     let idx = self.atom()?;
                     S::Get(Box::new(base), Box::new(idx))
                 }
-                other => {
-                    return Err(Unmonitorable(format!(
-                        "`.{other}` is outside the monitorable fragment"
-                    )))
-                }
+                // Any other name is a class-field projection, e.g.
+                // `(old self).buf.get k`.
+                other => S::Field(Box::new(base), other.to_string()),
             };
         }
         Ok(base)

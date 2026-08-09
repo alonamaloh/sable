@@ -1,0 +1,11 @@
+// expect-error: mono.not_generic
+
+/// post result = a
+fn plain(i32 a) -> i32 {
+    return a;
+}
+
+/// post result = 3
+fn caller() -> i32 {
+    return plain<i32>(3);
+}

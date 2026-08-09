@@ -1,0 +1,23 @@
+// expect-error: caller.post
+// Regression guard: an owned local mutated inside a loop must be
+// havocked at the loop head — its pre-loop symbolic value (here, the
+// all-fives allocation) must not survive the loop.
+
+/// post result = 5
+fn caller() -> i32 {
+    [i32] b = alloc_array<i32>(3, 5);
+    u64 n = b.len;
+    /// invariant ∀ k, 0 ≤ k → k < i → b.get k = 0
+    for (u64 i : range(n)) {
+        b[i] = 0;
+    }
+    return b[0];
+}
+
+/// discharge caller.inv_preserved.k_0_k_k_i_b_get_k_0 by
+///   intro k hk0 hk
+///   by_cases hki : k = i
+///   · simp [Sable.Seq.get_set, hki]
+///   · have h2 := h_inv_k_0_k_k_i_b_get_k_0 k hk0 (by omega)
+///     simp [Sable.Seq.get_set, hki]
+///     exact h2

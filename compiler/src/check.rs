@@ -600,7 +600,48 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 value,
             } => {
                 let fty = ctx.self_field_ty(field, *field_span, true)?;
-                check_expr(ctx, value, Some(fty))?;
+                // Array fields accept an owned-array MOVE (`self.buf = nb;`
+                // — Vec growth) or a fresh allocation; the moved-from local
+                // is not tracked as dead in v1 (documented).
+                let mut checked = false;
+                if let Ty::Array(elem, _) = fty {
+                    match &value.kind {
+                        ExprKind::Var(name) => {
+                            match ctx.vars.get(name.as_str()).map(|v| v.ty) {
+                                Some(Ty::Array(e2, Mutability::Owned)) if e2 == elem => {
+                                    value.ty = Some(Ty::Array(e2, Mutability::Owned));
+                                    checked = true;
+                                }
+                                _ => {
+                                    return Err(Diagnostic {
+                                        name: "type.field_array_move".into(),
+                                        title: format!(
+                                            "`{name}` cannot move into array field `{field}`"
+                                        ),
+                                        span: value.span,
+                                        label: "needs an owned array of the same element type"
+                                            .into(),
+                                        notes: vec![],
+                                    })
+                                }
+                            }
+                        }
+                        ExprKind::AllocArray { .. } => {}
+                        _ => {
+                            return Err(Diagnostic {
+                                name: "type.field_array_move".into(),
+                                title: format!("array field `{field}` needs an owned array"),
+                                span: value.span,
+                                label: "assign a fresh `alloc_array` or move an owned local"
+                                    .into(),
+                                notes: vec![],
+                            })
+                        }
+                    }
+                }
+                if !checked {
+                    check_expr(ctx, value, Some(fty))?;
+                }
                 if ctx.in_init {
                     ctx.vars
                         .get_mut(&format!("self.{field}"))
@@ -917,9 +958,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::CtorCall {
             class,
             class_span,
+            type_args,
             init,
             args,
         } => {
+            debug_assert!(
+                type_args.is_empty(),
+                "type arguments must be consumed by monomorphization"
+            );
             let Some(ci) = ctx.class_metas.iter().position(|m| m.name == *class) else {
                 return Err(Diagnostic {
                     name: "type.unknown_class".into(),
@@ -1162,8 +1208,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Call {
             callee,
             callee_span,
+            type_args,
             args,
         } => {
+            debug_assert!(
+                type_args.is_empty(),
+                "type arguments must be consumed by monomorphization"
+            );
             let sig = match ctx.sigs.get(callee.as_str()) {
                 Some(s) => s,
                 None => {

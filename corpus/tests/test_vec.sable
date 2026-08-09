@@ -1,0 +1,123 @@
+// Dynamic checks over the generic Vec: growth reallocation, the
+// copy-loop frame, get/set, pop-to-empty, and a second instantiation.
+
+// Tier 1 (M7): the growable vector, GENERIC — the first instantiated
+// artifact under ADR 0006. Contracts are pointwise against the backing
+// buffer prefix [0, len); the class invariant carries the capacity
+// bound that makes doubling growth overflow-free. Logical max capacity
+// is 2^62 elements (unreachable before the OOM trap).
+
+class Vec<T> {
+    [T] buf;
+    u64 len;
+
+    /// invariant len ≤ buf.len
+    /// invariant buf.len > 0
+    /// invariant buf.len ≤ 4611686018427387904
+
+    /// pre cap > 0
+    /// pre cap ≤ 4611686018427387904
+    /// post self.len = 0
+    /// post self.buf.len = cap
+    init with_capacity(u64 cap) {
+        self.buf = alloc_array<T>(cap, 0);
+        self.len = 0;
+    }
+
+    /// post result = self.len
+    fn size(&self) -> u64 {
+        return self.len;
+    }
+
+    /// pre  i < self.len
+    /// post result = self.buf.get i
+    fn get(&self, u64 i) -> T {
+        return self.buf[i];
+    }
+
+    /// pre  i < self.len
+    /// post self.len = old self.len
+    /// post self.buf.get i = x
+    /// post ∀ k, 0 ≤ k → k < self.len → k ≠ i → self.buf.get k = (old self).buf.get k
+    fn set(&mut self, u64 i, T x) {
+        self.buf[i] = x;
+    }
+
+    /// pre  self.len < 4611686018427387904
+    /// post self.len = old self.len + 1
+    /// post self.buf.get (old self.len) = x
+    /// post ∀ k, 0 ≤ k → k < old self.len → self.buf.get k = (old self).buf.get k
+    fn push(&mut self, T x) {
+        if (self.len == self.buf.len) {
+            u64 nc = 2 * self.buf.len;
+            if (nc > 4611686018427387904) {
+                nc = 4611686018427387904;
+            }
+            [T] nb = alloc_array<T>(nc, 0);
+            u64 n = self.len;
+            /// invariant ∀ k, 0 ≤ k → k < i → nb.get k = self.buf.get k
+            for (u64 i : range(n)) {
+                nb[i] = self.buf[i];
+            }
+            self.buf = nb;
+        }
+        self.buf[self.len] = x;
+        self.len = self.len + 1;
+    }
+
+    /// post old self.len = 0 → result = none
+    /// post old self.len > 0 → result = some (self.buf.get (old self.len - 1))
+    /// post old self.len > 0 → self.len = old self.len - 1
+    fn pop(&mut self) -> option<T> {
+        if (self.len == 0) { return none; }
+        self.len = self.len - 1;
+        return some(self.buf[self.len]);
+    }
+
+    deinit {
+    }
+}
+
+fn demo_i32() -> i32 {
+    var v = Vec<i32>::with_capacity(2);
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    return v.get(2);
+}
+
+/// post result = 7
+fn demo_u8() -> u8 {
+    var w = Vec<u8>::with_capacity(1);
+    w.push(7);
+    return w.get(0);
+}
+
+fn test_push_get_growth() {
+    var v = Vec<i32>::with_capacity(2);
+    v.push(10);
+    v.push(20);
+    v.push(30);
+    v.push(40);
+    v.push(50);
+    v.get(0);
+    v.get(4);
+    v.size();
+}
+
+fn test_set_and_pop() {
+    var v = Vec<i32>::with_capacity(1);
+    v.push(7);
+    v.push(8);
+    v.set(0, 99);
+    v.pop();
+    v.pop();
+    v.pop();
+}
+
+fn test_u8_instance() {
+    var v = Vec<u8>::with_capacity(4);
+    v.push(255);
+    v.pop();
+    v.pop();
+}

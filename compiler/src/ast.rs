@@ -14,6 +14,10 @@ pub enum IntTy {
     I16,
     I32,
     I64,
+    /// A type parameter of the enclosing generic declaration (index into
+    /// its parameter list). Exists only between parse and
+    /// monomorphization; every later stage may assert its absence.
+    TParam(u8),
 }
 
 impl IntTy {
@@ -27,6 +31,7 @@ impl IntTy {
             IntTy::I16 => "i16",
             IntTy::I32 => "i32",
             IntTy::I64 => "i64",
+            IntTy::TParam(_) => "<T>",
         }
     }
     pub fn signed(self) -> bool {
@@ -38,6 +43,7 @@ impl IntTy {
             IntTy::U16 | IntTy::I16 => 16,
             IntTy::U32 | IntTy::I32 => 32,
             IntTy::U64 | IntTy::I64 => 64,
+            IntTy::TParam(_) => unreachable!("type parameter after monomorphization"),
         }
     }
     pub fn min(self) -> i128 {
@@ -192,6 +198,8 @@ pub enum ExprKind {
     Call {
         callee: String,
         callee_span: Span,
+        /// Explicit type arguments (`swap<i32>(...)`); consumed by mono.
+        type_args: Vec<IntTy>,
         args: Vec<Expr>,
     },
     /// `a[i]` where `a` names an array parameter.
@@ -225,10 +233,12 @@ pub enum ExprKind {
         field: String,
         index: Box<Expr>,
     },
-    /// `Class::init_name(args)` — construction.
+    /// `Class::init_name(args)` / `Class<T>::init_name(args)`.
     CtorCall {
         class: String,
         class_span: Span,
+        /// Explicit type arguments (`Vec<i32>::new()`); consumed by mono.
+        type_args: Vec<IntTy>,
         init: String,
         args: Vec<Expr>,
     },
@@ -329,6 +339,9 @@ pub struct Param {
 pub struct Fn {
     pub name: String,
     pub name_span: Span,
+    /// Generic type parameters (`fn swap<T>(...)`). Non-empty only
+    /// before monomorphization.
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub pres: Vec<Clause>,
@@ -401,6 +414,9 @@ pub struct Method {
 pub struct ClassDecl {
     pub name: String,
     pub name_span: Span,
+    /// Generic type parameters (`class Vec<T>`). Non-empty only before
+    /// monomorphization.
+    pub type_params: Vec<String>,
     pub fields: Vec<Field>,
     /// Class invariant clauses — interface blocks (design §7).
     pub invariants: Vec<Clause>,
