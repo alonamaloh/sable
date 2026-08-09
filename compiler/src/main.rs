@@ -7,6 +7,7 @@ Usage:
   sable check <file.sable>           verify a Sable source file
   sable check --emit-lean <file>     print the generated Lean instead of checking
   sable test  <file.sable>           run test_* functions with dynamic contract checks
+  sable lsp                          run the language server on stdio
 ";
 
 fn main() -> ExitCode {
@@ -19,6 +20,7 @@ fn main() -> ExitCode {
         match arg.as_str() {
             "check" if command.is_none() => command = Some("check"),
             "test" if command.is_none() => command = Some("test"),
+            "lsp" if command.is_none() => command = Some("lsp"),
             "--emit-lean" => opts.emit_lean_only = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -34,6 +36,15 @@ fn main() -> ExitCode {
         }
     }
 
+    if command == Some("lsp") {
+        return match sable::lsp::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("lsp error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let (Some(command), Some(file)) = (command, file) else {
         eprint!("{USAGE}");
         return ExitCode::from(2);

@@ -1,0 +1,39 @@
+{
+  "name": "sable",
+  "displayName": "Sable",
+  "description": "Language support for the Sable verified programming language",
+  "version": "0.1.0",
+  "publisher": "sable-lang",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "sable",
+        "extensions": [".sable"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "Sable",
+      "properties": {
+        "sable.serverPath": {
+          "type": "string",
+          "default": "sable",
+          "description": "Path to the sable binary (run with `lsp`)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^2.24.0"
+  }
+}

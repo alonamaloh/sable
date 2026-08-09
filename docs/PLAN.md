@@ -49,9 +49,11 @@ Known M2 simplifications: `old x` only for `&mut` array params; array arguments 
 
 Deviations/simplifications recorded: escape hatches are name-based module-level clauses (not the design's statement-attached `kind(expr)` form); statement-level `assert` not yet; bounded-quantifier `defer` compilation deferred (the interpreter checks everything anyway); owned arrays/borrow args are test-only until verified array-passing (M4+); the spec evaluator is explicitly best-effort tooling, not a second checker of record (ADR 0002 note).
 
-### M4 — LSP
+### M4 — LSP *(complete, 2026-08-09)*
 
-Diagnostics, hover-shows-contract, folding ranges for evidence blocks, semantic tokens for dimming. The parser is written with error recovery from day 1 to make this possible.
+`sable lsp` (stdio, `lsp-server`/`lsp-types`): diagnostics (fast front-end pass on every edit, full Lean verification on open/save) with Sable diagnostic codes and UTF-16-correct positions; hover on a function name shows its contract — signature + `pre`/`post`/`variant`, never the body ("no reader may be shown a function without its contract"); folding ranges for proof blocks; semantic tokens typing evidence lines as `comment` (dimmed in every theme) and interface lines as `property` ("a reader may ignore proofs"). Integration-tested with a real stdio handshake (`tests/lsp.rs`). Editor wiring in `editors/`: zero-plugin Neovim config and a minimal VS Code client extension.
+
+Known simplifications: single-diagnostic parsing (no multi-error recovery yet); full verification blocks the server loop for its ~2s (fine single-user; async later); hover resolves by name only (no scope analysis).
 
 ### M5 — classes/RAII and the rest of Tier 0
 

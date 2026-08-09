@@ -7,6 +7,7 @@ pub mod diag;
 pub mod interp;
 pub mod lean;
 pub mod lexer;
+pub mod lsp;
 pub mod parser;
 pub mod scan;
 pub mod span;
@@ -33,6 +34,34 @@ pub enum Outcome {
         assumed: Vec<(String, String)>,
     },
     Failed(Vec<Failure>),
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedInfo {
+    pub functions: usize,
+    pub obligations: usize,
+    pub deferred: Vec<String>,
+    pub assumed: Vec<(String, String)>,
+}
+
+/// Fast, Lean-free pass over source text: scan → lex → parse → typecheck.
+/// Returns the first diagnostic, if any (used by the LSP on every edit).
+pub fn front_diagnostics(source: &str) -> Vec<Diagnostic> {
+    let lines = LineMap::new(source);
+    let scanned = scan::scan(source);
+    let tokens = match lexer::lex(&scanned.program_text) {
+        Ok(t) => t,
+        Err(d) => return vec![d],
+    };
+    let mut program = match parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
+    {
+        Ok(p) => p,
+        Err(d) => return vec![d],
+    };
+    if let Err(d) = check::check(&mut program) {
+        return vec![d];
+    }
+    Vec::new()
 }
 
 pub struct Options {
@@ -71,36 +100,75 @@ pub fn test_file(path: &Path) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
     Ok(interp::run_tests(&program, &source, &display_path))
 }
 
+/// Rendered-output wrapper around `check_file_structured`.
 pub fn check_file(path: &Path, opts: &Options) -> Outcome {
+    let display_path = path.display().to_string();
+    let (source, result) = check_file_structured(path, opts);
+    let lines = LineMap::new(&source);
+    match result {
+        Ok(info) => Outcome::Verified {
+            functions: info.functions,
+            obligations: info.obligations,
+            deferred: info.deferred,
+            assumed: info.assumed,
+        },
+        Err(diags) => Outcome::Failed(
+            diags
+                .iter()
+                .map(|d| Failure {
+                    name: d.name.clone(),
+                    rendered: d.render(&display_path, &source, &lines),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn io_diag(name: &str, message: String) -> Diagnostic {
+    Diagnostic {
+        name: name.into(),
+        title: message,
+        span: span::Span::new(0, 0),
+        label: String::new(),
+        notes: vec![],
+    }
+}
+
+/// The full pipeline with structured (span-carrying) diagnostics — the
+/// entry point the LSP uses.
+pub fn check_file_structured(
+    path: &Path,
+    opts: &Options,
+) -> (String, Result<VerifiedInfo, Vec<Diagnostic>>) {
     let display_path = path.display().to_string();
     let source = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(err) => {
-            return Outcome::Failed(vec![Failure {
-                name: "io.read".into(),
-                rendered: format!("error: cannot read `{display_path}`: {err}\n"),
-            }])
+            return (
+                String::new(),
+                Err(vec![io_diag(
+                    "io.read",
+                    format!("cannot read `{display_path}`: {err}"),
+                )]),
+            )
         }
     };
     let lines = LineMap::new(&source);
-    let render = |d: &Diagnostic| Failure {
-        name: d.name.clone(),
-        rendered: d.render(&display_path, &source, &lines),
-    };
+    let render = |d: &Diagnostic| d.clone();
 
     // Front end.
     let scanned = scan::scan(&source);
     let tokens = match lexer::lex(&scanned.program_text) {
         Ok(t) => t,
-        Err(d) => return Outcome::Failed(vec![render(&d)]),
+        Err(d) => return (source, Err(vec![render(&d)])),
     };
     let mut program = match parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text) {
         Ok(p) => p,
-        Err(d) => return Outcome::Failed(vec![render(&d)]),
+        Err(d) => return (source, Err(vec![render(&d)])),
     };
     let checked = match check::check(&mut program) {
         Ok(c) => c,
-        Err(d) => return Outcome::Failed(vec![render(&d)]),
+        Err(d) => return (source, Err(vec![render(&d)])),
     };
 
     // Verification conditions → Lean.
@@ -131,7 +199,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
         };
         for d in &program.defers {
             if let Some(diag) = conflict_or_orphan(&d.name, "defer", d.span) {
-                return Outcome::Failed(vec![render(&diag)]);
+                return (source, Err(vec![diag]));
             }
             let goal = &find(&d.name).unwrap().goal;
             if goal.contains('∀') || goal.contains('∃') {
@@ -151,13 +219,13 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
                         ),
                     ],
                 };
-                return Outcome::Failed(vec![render(&diag)]);
+                return (source, Err(vec![diag]));
             }
             treated.insert(d.name.as_str(), "defer");
         }
         for a in &program.assumes {
             if let Some(diag) = conflict_or_orphan(&a.name, "assume", a.span) {
-                return Outcome::Failed(vec![render(&diag)]);
+                return (source, Err(vec![diag]));
             }
             if let Some(prev) = treated.insert(a.name.as_str(), "assume") {
                 let diag = diag::Diagnostic {
@@ -167,7 +235,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
                     label: "one obligation, one treatment".into(),
                     notes: vec![],
                 };
-                return Outcome::Failed(vec![render(&diag)]);
+                return (source, Err(vec![diag]));
             }
         }
         for d in &program.discharges {
@@ -179,7 +247,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
                     label: "one obligation, one treatment".into(),
                     notes: vec![],
                 };
-                return Outcome::Failed(vec![render(&diag)]);
+                return (source, Err(vec![diag]));
             }
         }
     }
@@ -208,7 +276,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
                     vec![("nearby obligations".into(), near.join("\n"))]
                 },
             };
-            return Outcome::Failed(vec![render(&d_diag)]);
+            return (source, Err(vec![d_diag]));
         }
     }
 
@@ -229,12 +297,15 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
 
     if opts.emit_lean_only {
         print!("{}", emitted.lean_source);
-        return Outcome::Verified {
-            functions: program.fns.len(),
-            obligations: vc.obligations.len(),
-            deferred,
-            assumed,
-        };
+        return (
+            source,
+            Ok(VerifiedInfo {
+                functions: program.fns.len(),
+                obligations: vc.obligations.len(),
+                deferred,
+                assumed,
+            }),
+        );
     }
 
     let Some(repo_root) = lean::find_repo_root(
@@ -242,20 +313,26 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
     )
     .or_else(|| lean::find_repo_root(&std::env::current_dir().ok()?))
     else {
-        return Outcome::Failed(vec![Failure {
-            name: "internal.no_lean_dir".into(),
-            rendered: "error: cannot locate the Sable Lean prelude \
-                       (no ancestor directory contains lean/lean-toolchain)\n"
-                .into(),
-        }]);
+        return (
+            source,
+            Err(vec![io_diag(
+                "internal.no_lean_dir",
+                "cannot locate the Sable Lean prelude (no ancestor directory \
+                 contains lean/lean-toolchain)"
+                    .into(),
+            )]),
+        );
     };
 
     let out_dir = repo_root.join(".sable-out");
     if let Err(err) = std::fs::create_dir_all(&out_dir) {
-        return Outcome::Failed(vec![Failure {
-            name: "io.out_dir".into(),
-            rendered: format!("error: cannot create {}: {err}\n", out_dir.display()),
-        }]);
+        return (
+            source,
+            Err(vec![io_diag(
+                "io.out_dir",
+                format!("cannot create {}: {err}", out_dir.display()),
+            )]),
+        );
     }
     let stem = path
         .file_stem()
@@ -263,31 +340,37 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
         .unwrap_or_else(|| "module".into());
     let lean_file = out_dir.join(format!("{stem}.lean"));
     if let Err(err) = std::fs::write(&lean_file, &emitted.lean_source) {
-        return Outcome::Failed(vec![Failure {
-            name: "io.write".into(),
-            rendered: format!("error: cannot write {}: {err}\n", lean_file.display()),
-        }]);
+        return (
+            source,
+            Err(vec![io_diag(
+                "io.write",
+                format!("cannot write {}: {err}", lean_file.display()),
+            )]),
+        );
     }
 
     let messages = match lean::run_lean(&repo_root, &lean_file) {
         Ok(m) => m,
         Err(msg) => {
-            return Outcome::Failed(vec![Failure {
-                name: "internal.lean_invocation".into(),
-                rendered: format!("error: {msg}\n"),
-            }])
+            return (
+                source,
+                Err(vec![io_diag("internal.lean_invocation", msg)]),
+            )
         }
     };
 
     let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages));
     if diags.is_empty() {
-        Outcome::Verified {
-            functions: program.fns.len(),
-            obligations: vc.obligations.len(),
-            deferred,
-            assumed,
-        }
+        (
+            source,
+            Ok(VerifiedInfo {
+                functions: program.fns.len(),
+                obligations: vc.obligations.len(),
+                deferred,
+                assumed,
+            }),
+        )
     } else {
-        Outcome::Failed(diags.iter().map(render).collect())
+        (source, Err(diags))
     }
 }
