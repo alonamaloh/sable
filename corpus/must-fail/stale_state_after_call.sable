@@ -1,0 +1,30 @@
+// expect-error: caller.post
+// Regression guard for the call-site havoc soundness bug (2026-08-09,
+// found by the quicksort agent): after f(&mut b), the caller's view of
+// b must be the callee's POST-state, not the pre-call state. Here the
+// callee zeroes b, so the caller's claim about the old contents must
+// fail — under the bug it "verified" from inconsistent hypotheses.
+
+/// post ∀ k, 0 ≤ k → k < a.len → a.get k = 0
+fn zero_out(&mut [i32] a) {
+    u64 n = a.len;
+    /// invariant ∀ k, 0 ≤ k → k < i → a.get k = 0
+    for (u64 i : range(n)) {
+        a[i] = 0;
+    }
+}
+
+/// post result = 5
+fn caller() -> i32 {
+    [i32] b = alloc_array<i32>(3, 5);
+    zero_out(&mut b);
+    return b[0];
+}
+
+/// discharge zero_out.inv_preserved.k_0_k_k_i_a_get_k_0 by
+///   intro k hk0 hk
+///   by_cases hki : k = i
+///   · simp [Sable.Seq.get_set, hki]
+///   · have h2 := h_inv_k_0_k_k_i_a_get_k_0 k hk0 (by omega)
+///     simp [Sable.Seq.get_set, hki]
+///     exact h2

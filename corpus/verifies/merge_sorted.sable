@@ -1,0 +1,256 @@
+// The merge kernel of merge sort (M6 Tier 0): two sorted inputs merged
+// into a pre-sized output, with the full specification — the output is
+// sorted AND carries exactly the multiset of both inputs (count-based).
+
+/// pre  sorted xs
+/// pre  sorted ys
+/// pre  out.len = xs.len + ys.len
+/// post sorted out
+/// post ∀ v, count out v = count xs v + count ys v
+/// post ∀ p, 0 ≤ p → p < out.len → count out (out.get p) = count xs (out.get p) + count ys (out.get p)
+fn merge(&[i32] xs, &[i32] ys, &mut [i32] out) {
+    u64 n = xs.len;
+    u64 m = ys.len;
+    u64 i = 0;
+    u64 j = 0;
+    u64 k = 0;
+    /// invariant i ≤ xs.len
+    /// invariant j ≤ ys.len
+    /// invariant k = i + j
+    /// invariant sortedRange out 0 k
+    /// invariant ∀ p q, 0 ≤ p → p < k → i ≤ q → q < xs.len → out.get p ≤ xs.get q
+    /// invariant ∀ p q, 0 ≤ p → p < k → j ≤ q → q < ys.len → out.get p ≤ ys.get q
+    /// invariant ∀ v, out.countUpto v (Int.toNat k) = xs.countUpto v (Int.toNat i) + ys.countUpto v (Int.toNat j)
+    /// variant   (xs.len - i) + (ys.len - j)
+    while (i < n && j < m) {
+        if (xs[i] <= ys[j]) {
+            out[k] = xs[i];
+            i = i + 1;
+        } else {
+            out[k] = ys[j];
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    /// invariant i ≤ xs.len
+    /// invariant j ≤ ys.len
+    /// invariant k = i + j
+    /// invariant i < xs.len → j = ys.len
+    /// invariant sortedRange out 0 k
+    /// invariant ∀ p q, 0 ≤ p → p < k → i ≤ q → q < xs.len → out.get p ≤ xs.get q
+    /// invariant ∀ p q, 0 ≤ p → p < k → j ≤ q → q < ys.len → out.get p ≤ ys.get q
+    /// invariant ∀ v, out.countUpto v (Int.toNat k) = xs.countUpto v (Int.toNat i) + ys.countUpto v (Int.toNat j)
+    /// variant   xs.len - i
+    while (i < n) {
+        out[k] = xs[i];
+        i = i + 1;
+        k = k + 1;
+    }
+    /// invariant j ≤ ys.len
+    /// invariant i = xs.len
+    /// invariant k = i + j
+    /// invariant sortedRange out 0 k
+    /// invariant ∀ p q, 0 ≤ p → p < k → j ≤ q → q < ys.len → out.get p ≤ ys.get q
+    /// invariant ∀ v, out.countUpto v (Int.toNat k) = xs.countUpto v (Int.toNat i) + ys.countUpto v (Int.toNat j)
+    /// variant   ys.len - j
+    while (j < m) {
+        out[k] = ys[j];
+        j = j + 1;
+        k = k + 1;
+    }
+}
+
+// Counting over an Int-measured prefix: extending the prefix by one slot
+// adds one occurrence test. (The prelude's countUpto recurses on Nat; the
+// invariants above measure the prefix with Int cursors, so this bridge
+// lemma is stated in Int and proved by unfolding one step.)
+/// theorem cnt_snoc (s : Sable.Seq Int) (v kk : Int) (hkk : 0 ≤ kk) :
+///     s.countUpto v (Int.toNat (kk + 1)) =
+///       s.countUpto v (Int.toNat kk) + (if s.get kk = v then 1 else 0) := by
+///   have h1 : Int.toNat (kk + 1) = Int.toNat kk + 1 := by omega
+///   have h2 : ((Int.toNat kk : Nat) : Int) = kk := by omega
+///   rw [h1]
+///   simp only [Sable.Seq.countUpto]
+///   rw [h2]
+
+// Empty prefixes all count zero.
+/// discharge merge.inv_init.v_out_countupto_v_int_tonat_k_xs_countup by
+///   intro v
+///   rfl
+
+// Main loop, xs branch: the written slot extends the sorted prefix
+// because out[0..k) ≤ xs[i] (candidate invariant at q := i).
+/// discharge merge.inv_preserved.sortedrange_out_0_k by
+///   intro p q hp hpq hq
+///   by_cases hqk : q = k
+///   · have h2 : out.get p ≤ xs.get i :=
+///       h_inv_p_q_0_p_p_k_i_q_q_xs_len p i hp (by omega) (by omega) (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ out.get q := h_inv_sortedrange_out_0_k p q hp hpq (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+
+// Main loop, xs branch: prefix stays below the remaining xs candidates
+// (the new slot xs[i] is ≤ xs[q] for q ≥ i+1 by sortedness of xs).
+/// discharge merge.inv_preserved.p_q_0_p_p_k_i_q_q_xs_len_out_get_p_xs_ge by
+///   intro p q hp hpk1 hq hql
+///   by_cases hpk : p = k
+///   · have h2 : xs.get i ≤ xs.get q := h_pre_sorted_xs i q (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ xs.get q :=
+///       h_inv_p_q_0_p_p_k_i_q_q_xs_len p q hp (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+
+// Main loop, xs branch: prefix stays below the remaining ys candidates
+// (xs[i] ≤ ys[j] ≤ ys[q] via the branch test and sortedness of ys).
+/// discharge merge.inv_preserved.p_q_0_p_p_k_j_q_q_ys_len_out_get_p_ys_ge by
+///   intro p q hp hpk1 hq hql
+///   by_cases hpk : p = k
+///   · have h2 : ys.get j ≤ ys.get q := by
+///       by_cases hqj : q = j
+///       · rw [hqj]; omega
+///       · exact h_pre_sorted_ys j q (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     omega
+///   · have h2 : out.get p ≤ ys.get q :=
+///       h_inv_p_q_0_p_p_k_j_q_q_ys_len p q hp (by omega) hq hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+
+// Main loop, xs branch: one store, one cursor step — both sides of the
+// count invariant gain the same "is xs[i] = v" test.
+/// discharge merge.inv_preserved.v_out_countupto_v_int_tonat_k_xs_countup by
+///   intro v
+///   have hs := cnt_snoc (out.set k (xs.get i)) v k (by omega)
+///   have hg := Sable.Seq.countUpto_set_ge out (xs.get i) v k (Int.toNat k) (by omega)
+///   have hx := cnt_snoc xs v i (by omega)
+///   have hh := h_inv_v_out_countupto_v_int_to v
+///   rw [hs, hg, hh, hx]
+///   simp [Sable.Seq.get_set]
+///   omega
+
+// Main loop, ys branch: mirror images of the four above.
+/// discharge merge.inv_preserved.sortedrange_out_0_k.2 by
+///   intro p q hp hpq hq
+///   by_cases hqk : q = k
+///   · have h2 : out.get p ≤ ys.get j :=
+///       h_inv_p_q_0_p_p_k_j_q_q_ys_len p j hp (by omega) (by omega) (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ out.get q := h_inv_sortedrange_out_0_k p q hp hpq (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+
+/// discharge merge.inv_preserved.p_q_0_p_p_k_i_q_q_xs_len_out_get_p_xs_ge.2 by
+///   intro p q hp hpk1 hq hql
+///   by_cases hpk : p = k
+///   · have h2 : xs.get i ≤ xs.get q := by
+///       by_cases hqi : q = i
+///       · rw [hqi]; omega
+///       · exact h_pre_sorted_xs i q (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     omega
+///   · have h2 : out.get p ≤ xs.get q :=
+///       h_inv_p_q_0_p_p_k_i_q_q_xs_len p q hp (by omega) hq hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+
+/// discharge merge.inv_preserved.p_q_0_p_p_k_j_q_q_ys_len_out_get_p_ys_ge.2 by
+///   intro p q hp hpk1 hq hql
+///   by_cases hpk : p = k
+///   · have h2 : ys.get j ≤ ys.get q := h_pre_sorted_ys j q (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ ys.get q :=
+///       h_inv_p_q_0_p_p_k_j_q_q_ys_len p q hp (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+
+/// discharge merge.inv_preserved.v_out_countupto_v_int_tonat_k_xs_countup.2 by
+///   intro v
+///   have hs := cnt_snoc (out.set k (ys.get j)) v k (by omega)
+///   have hg := Sable.Seq.countUpto_set_ge out (ys.get j) v k (Int.toNat k) (by omega)
+///   have hy := cnt_snoc ys v j (by omega)
+///   have hh := h_inv_v_out_countupto_v_int_to v
+///   rw [hs, hg, hh, hy]
+///   simp [Sable.Seq.get_set]
+///   omega
+
+// xs drain loop: same three arguments as the main loop's xs branch
+// (the ys candidate set is empty here, so its invariant went through
+// automatically).
+/// discharge merge.inv_preserved.sortedrange_out_0_k.3 by
+///   intro p q hp hpq hq
+///   by_cases hqk : q = k
+///   · have h2 : out.get p ≤ xs.get i :=
+///       h_inv_p_q_0_p_p_k_i_q_q_xs_len p i hp (by omega) (by omega) (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ out.get q := h_inv_sortedrange_out_0_k p q hp hpq (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+
+/// discharge merge.inv_preserved.p_q_0_p_p_k_i_q_q_xs_len_out_get_p_xs_ge.3 by
+///   intro p q hp hpk1 hq hql
+///   by_cases hpk : p = k
+///   · have h2 : xs.get i ≤ xs.get q := h_pre_sorted_xs i q (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ xs.get q :=
+///       h_inv_p_q_0_p_p_k_i_q_q_xs_len p q hp (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+
+/// discharge merge.inv_preserved.v_out_countupto_v_int_tonat_k_xs_countup.3 by
+///   intro v
+///   have hs := cnt_snoc (out.set k (xs.get i)) v k (by omega)
+///   have hg := Sable.Seq.countUpto_set_ge out (xs.get i) v k (Int.toNat k) (by omega)
+///   have hx := cnt_snoc xs v i (by omega)
+///   have hh := h_inv_v_out_countupto_v_int_to v
+///   rw [hs, hg, hh, hx]
+///   simp [Sable.Seq.get_set]
+///   omega
+
+// ys drain loop: mirror images.
+/// discharge merge.inv_preserved.sortedrange_out_0_k.4 by
+///   intro p q hp hpq hq
+///   by_cases hqk : q = k
+///   · have h2 : out.get p ≤ ys.get j :=
+///       h_inv_p_q_0_p_p_k_j_q_q_ys_len p j hp (by omega) (by omega) (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ out.get q := h_inv_sortedrange_out_0_k p q hp hpq (by omega)
+///     have hpk : p ≠ k := by omega
+///     simp [Sable.Seq.get_set, hqk, hpk]
+///     exact h2
+
+/// discharge merge.inv_preserved.p_q_0_p_p_k_j_q_q_ys_len_out_get_p_ys_ge.4 by
+///   intro p q hp hpk1 hq hql
+///   by_cases hpk : p = k
+///   · have h2 : ys.get j ≤ ys.get q := h_pre_sorted_ys j q (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+///   · have h2 : out.get p ≤ ys.get q :=
+///       h_inv_p_q_0_p_p_k_j_q_q_ys_len p q hp (by omega) (by omega) hql
+///     simp [Sable.Seq.get_set, hpk]
+///     exact h2
+
+/// discharge merge.inv_preserved.v_out_countupto_v_int_tonat_k_xs_countup.4 by
+///   intro v
+///   have hs := cnt_snoc (out.set k (ys.get j)) v k (by omega)
+///   have hg := Sable.Seq.countUpto_set_ge out (ys.get j) v k (Int.toNat k) (by omega)
+///   have hy := cnt_snoc ys v j (by omega)
+///   have hh := h_inv_v_out_countupto_v_int_to v
+///   rw [hs, hg, hh, hy]
+///   simp [Sable.Seq.get_set]
+///   omega

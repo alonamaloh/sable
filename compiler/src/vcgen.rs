@@ -1021,7 +1021,7 @@ impl<'a> Generator<'a> {
                 post_map.extend(subst_map);
                 for post in ifn.posts.iter() {
                     let prop = substitute(&post.text, &post_map, None);
-                    self.hyps.push((
+                    self.push_hyp_unique(
                         format!(
                             "h_{}_{}_post_{}",
                             sanitize(class),
@@ -1029,7 +1029,7 @@ impl<'a> Generator<'a> {
                             hslug(&post.text)
                         ),
                         format!("({prop})"),
-                    ));
+                    );
                 }
                 Val::Obj(b)
             }
@@ -1127,7 +1127,7 @@ impl<'a> Generator<'a> {
                         Some(ret_sym.as_str())
                     };
                     let prop = substitute(&text, &post_map, ret_ref);
-                    self.hyps.push((
+                    self.push_hyp_unique(
                         format!(
                             "h_{}_{}_post_{}",
                             sanitize(&cd.name),
@@ -1135,7 +1135,7 @@ impl<'a> Generator<'a> {
                             hslug(&post.text)
                         ),
                         format!("({prop})"),
-                    ));
+                    );
                     self.context
                         .push(format!("from `{}::{method}` post: {}", cd.name, post.text));
                 }
@@ -1326,6 +1326,41 @@ impl<'a> Generator<'a> {
                     self.push_obligation(ob);
                 }
 
+                // &mut array arguments come back in a FRESH state — the
+                // callee may have mutated them arbitrarily (within its
+                // posts). Length and element ranges are preserved by
+                // construction (stores are the only mutation); the callee's
+                // posts, substituted over the fresh symbol, say the rest.
+                // Omitting this havoc asserts posts over the pre-call state
+                // and yields inconsistent hypotheses — the soundness bug
+                // caught by the quicksort agent on 2026-08-09.
+                for (p, arg) in sig.params.iter().zip(args.iter()) {
+                    let Ty::Array(elem, Mutability::Mut) = p.ty else {
+                        continue;
+                    };
+                    let ExprKind::Borrow { array, .. } = &arg.kind else {
+                        unreachable!("checked: borrow args")
+                    };
+                    let old_chain = subst_map[&p.name].clone();
+                    self.fresh += 1;
+                    let b = format!("_arr{}", self.fresh);
+                    self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                    self.hyps.push((
+                        format!("h_{array}_len"),
+                        format!("({b}.len) = ({old_chain}.len)"),
+                    ));
+                    self.hyps.push((
+                        format!("h_{array}_elems"),
+                        format!(
+                            "∀ k, 0 ≤ k → k < {b}.len → {} ≤ {b}.get k ∧ {b}.get k ≤ {}",
+                            elem.lean_min(),
+                            elem.lean_max()
+                        ),
+                    ));
+                    self.env.insert(array.clone(), Val::Arr(b.clone()));
+                    subst_map.insert(p.name.clone(), b);
+                }
+
                 self.fresh += 1;
                 let ret_sym = format!("_r{}", self.fresh);
                 match sig.ret {
@@ -1351,10 +1386,10 @@ impl<'a> Generator<'a> {
                     };
                     let text = preprocess_old_params(&post.text, &sig.params);
                     let prop = substitute(&text, &subst_map, ret_ref);
-                    self.hyps.push((
+                    self.push_hyp_unique(
                         format!("h_{}_post_{}", sanitize(callee), hslug(&post.text)),
                         format!("({prop})"),
-                    ));
+                    );
                     self.context
                         .push(format!("from `{callee}` post: {}", post.text));
                 }
@@ -1596,6 +1631,18 @@ impl<'a> Generator<'a> {
             }
             self.push_obligation(ob);
         }
+    }
+
+    /// Push a hypothesis whose name must not shadow an existing one:
+    /// on collision, suffix _2, _3, ... (stable: program order).
+    fn push_hyp_unique(&mut self, base: String, prop: String) {
+        let mut name = base.clone();
+        let mut n = 1;
+        while self.hyps.iter().any(|(h, _)| *h == name) {
+            n += 1;
+            name = format!("{base}_{n}");
+        }
+        self.hyps.push((name, prop));
     }
 
     fn assume_fact(&mut self, prop: &str) {

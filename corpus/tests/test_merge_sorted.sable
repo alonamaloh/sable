@@ -1,0 +1,95 @@
+// Dynamic checking of the merge kernel's contracts: sortedness of both
+// inputs (pre), the size arithmetic (pre), sortedness of the output and
+// the count-based multiset claim (posts), plus every loop invariant and
+// variant along the way.
+//
+// This is the verified merge from corpus/verifies/merge_sorted.sable with
+// the proof-only countUpto prefix invariants left out (they are outside
+// the monitorable fragment) and the multiset post stated in its bounded,
+// monitorable form; everything below is checked with zero skips.
+
+/// pre  sorted xs
+/// pre  sorted ys
+/// pre  out.len = xs.len + ys.len
+/// post sorted out
+/// post ∀ p, 0 ≤ p → p < out.len → count out (out.get p) = count xs (out.get p) + count ys (out.get p)
+fn merge(&[i32] xs, &[i32] ys, &mut [i32] out) {
+    u64 n = xs.len;
+    u64 m = ys.len;
+    u64 i = 0;
+    u64 j = 0;
+    u64 k = 0;
+    /// invariant i ≤ xs.len
+    /// invariant j ≤ ys.len
+    /// invariant k = i + j
+    /// invariant sortedRange out 0 k
+    /// invariant ∀ p q, 0 ≤ p → p < k → i ≤ q → q < xs.len → out.get p ≤ xs.get q
+    /// invariant ∀ p q, 0 ≤ p → p < k → j ≤ q → q < ys.len → out.get p ≤ ys.get q
+    /// variant   (xs.len - i) + (ys.len - j)
+    while (i < n && j < m) {
+        if (xs[i] <= ys[j]) {
+            out[k] = xs[i];
+            i = i + 1;
+        } else {
+            out[k] = ys[j];
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    /// invariant i ≤ xs.len
+    /// invariant j ≤ ys.len
+    /// invariant k = i + j
+    /// invariant i < xs.len → j = ys.len
+    /// invariant sortedRange out 0 k
+    /// invariant ∀ p q, 0 ≤ p → p < k → i ≤ q → q < xs.len → out.get p ≤ xs.get q
+    /// invariant ∀ p q, 0 ≤ p → p < k → j ≤ q → q < ys.len → out.get p ≤ ys.get q
+    /// variant   xs.len - i
+    while (i < n) {
+        out[k] = xs[i];
+        i = i + 1;
+        k = k + 1;
+    }
+    /// invariant j ≤ ys.len
+    /// invariant i = xs.len
+    /// invariant k = i + j
+    /// invariant sortedRange out 0 k
+    /// invariant ∀ p q, 0 ≤ p → p < k → j ≤ q → q < ys.len → out.get p ≤ ys.get q
+    /// variant   ys.len - j
+    while (j < m) {
+        out[k] = ys[j];
+        j = j + 1;
+        k = k + 1;
+    }
+}
+
+fn test_merge_interleaved() {
+    [i32] xs = [1, 3, 5, 7];
+    [i32] ys = [2, 3, 6];
+    [i32] out = alloc_array<i32>(7, 0);
+    merge(&xs, &ys, &mut out);
+}
+
+fn test_merge_empty_sides() {
+    [i32] e1 = [];
+    [i32] ys = [4, 5];
+    [i32] out1 = alloc_array<i32>(2, 0);
+    merge(&e1, &ys, &mut out1);
+    [i32] e2 = [];
+    [i32] out2 = alloc_array<i32>(2, 0);
+    merge(&ys, &e2, &mut out2);
+    [i32] e3 = [];
+    [i32] e4 = [];
+    [i32] out3 = alloc_array<i32>(0, 0);
+    merge(&e3, &e4, &mut out3);
+}
+
+fn test_merge_drain_and_duplicates() {
+    [i32] xs = [10, 20, 30];
+    [i32] ys = [1, 2, 3];
+    [i32] out = alloc_array<i32>(6, 0);
+    merge(&xs, &ys, &mut out);
+    [i32] ds = [2, 2, 4];
+    [i32] dt = [2, 4, 4];
+    [i32] dout = alloc_array<i32>(6, 0);
+    merge(&ds, &dt, &mut dout);
+}
