@@ -103,7 +103,7 @@ fn encode_utf8(u32 cp, &mut [u8] out) -> u64 {
 ///      | some v => scalar v ∧ v = utf8_decode (b.get pos) (b.get (pos + 1)) (b.get (pos + 2)) (b.get (pos + 3))
 ///      | none   => True
 /// post (∃ cp2, scalar cp2 ∧ pos + utf8_len cp2 ≤ b.len ∧ b.get pos = utf8_b0 cp2 ∧ (2 ≤ utf8_len cp2 → b.get (pos + 1) = utf8_b1 cp2) ∧ (3 ≤ utf8_len cp2 → b.get (pos + 2) = utf8_b2 cp2) ∧ (utf8_len cp2 = 4 → b.get (pos + 3) = utf8_b3 cp2)) → result ≠ none
-fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
+pub fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
     u8 b0 = b[pos];
     if (b0 < 128) {
         return some(widen<u32>(b0));
@@ -595,7 +595,7 @@ fn utf8_step(&[u8] b, u64 pos) -> u64 {
 
 /// pre  b.len ≤ MAX_BYTES
 /// post result → validFrom b 0
-fn validate_utf8(&[u8] b) -> bool {
+pub fn validate_utf8(&[u8] b) -> bool {
     mut u64 pos = 0;
     u64 n = b.len;
     /// invariant pos ≤ n
@@ -616,7 +616,7 @@ fn validate_utf8(&[u8] b) -> bool {
 
 /// pre  scalar cp
 /// post result = some cp
-fn roundtrip(u32 cp) -> option<u32> {
+pub fn roundtrip(u32 cp) -> option<u32> {
     mut [u8] buf = alloc_array<u8>(4, 0);
     u64 n = encode_utf8(cp, &mut buf);
     return decode_utf8(&buf, 0);

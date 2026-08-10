@@ -3,6 +3,6 @@
 
 /// pre  a <= 1000
 /// post result = a + a
-fn esc_double(u32 a) -> u32 {
+pub fn esc_double(u32 a) -> u32 {
     return a + a;
 }

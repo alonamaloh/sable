@@ -8,7 +8,7 @@
 /// post sorted out
 /// post ∀ v, count out v = count xs v + count ys v
 /// post ∀ p, 0 ≤ p → p < out.len → count out (out.get p) = count xs (out.get p) + count ys (out.get p)
-fn merge(&[i32] xs, &[i32] ys, &mut [i32] out) {
+pub fn merge(&[i32] xs, &[i32] ys, &mut [i32] out) {
     u64 n = xs.len;
     u64 m = ys.len;
     mut u64 i = 0;

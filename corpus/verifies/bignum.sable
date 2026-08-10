@@ -808,7 +808,7 @@
 
 // ------------------------------- the class -------------------------------
 
-class Nat {
+pub class Nat {
     [u32] limbs;
 
     /// invariant limbs.len = 0 ∨ limbs.get (limbs.len - 1) ≥ 1
@@ -927,7 +927,7 @@ fn norm_factor(u64 t0) -> u64 {
 /// post #[label(eq)] result = 0 ↔ natVal a.limbs = natVal b.limbs
 /// post #[label(gt)] result = 1 ↔ natVal b.limbs < natVal a.limbs
 /// post #[label(range)] result = -1 ∨ result = 0 ∨ result = 1
-fn cmp(&Nat a, &Nat b) -> i32 {
+pub fn cmp(&Nat a, &Nat b) -> i32 {
     if (a.limbs.len < b.limbs.len) {
         return -1;
     }
@@ -954,7 +954,7 @@ fn cmp(&Nat a, &Nat b) -> i32 {
 
 /// pre  a.limbs.len + b.limbs.len ≤ 4611686018427387904
 /// post #[label(sum)] natVal result.limbs = natVal a.limbs + natVal b.limbs
-fn add(&Nat a, &Nat b) -> Nat {
+pub fn add(&Nat a, &Nat b) -> Nat {
     u64 la = a.limbs.len;
     u64 lb = b.limbs.len;
     u64 n = max_len(la, lb) + 1;
@@ -978,7 +978,7 @@ fn add(&Nat a, &Nat b) -> Nat {
 
 /// pre  natVal b.limbs ≤ natVal a.limbs
 /// post #[label(diff)] natVal result.limbs = natVal a.limbs - natVal b.limbs
-fn sub(&Nat a, &Nat b) -> Nat {
+pub fn sub(&Nat a, &Nat b) -> Nat {
     u64 la = a.limbs.len;
     mut [u32] out = alloc_array<u32>(la, 0);
     mut u64 borrow = 0;
@@ -1081,7 +1081,7 @@ fn sub(&Nat a, &Nat b) -> Nat {
 
 /// pre  a.limbs.len + b.limbs.len ≤ 4611686018427387904
 /// post #[label(prod)] natVal result.limbs = natVal a.limbs * natVal b.limbs
-fn mul(&Nat a, &Nat b) -> Nat {
+pub fn mul(&Nat a, &Nat b) -> Nat {
     u64 la = a.limbs.len;
     u64 lb = b.limbs.len;
     u64 n = la + lb;
@@ -1132,7 +1132,7 @@ fn mul(&Nat a, &Nat b) -> Nat {
 /// pre  natVal b.limbs ≥ 1
 /// pre  a.limbs.len + b.limbs.len ≤ 2305843009213693952
 /// post #[label(quot)] natVal result.limbs = natVal a.limbs / natVal b.limbs
-fn div(&Nat a, &Nat b) -> Nat {
+pub fn div(&Nat a, &Nat b) -> Nat {
     u64 n = b.limbs.len;
     /// assert #[label(n_pos)] 1 ≤ n
     u64 mfac = norm_factor(widen<u64>(b.limbs[n - 1]));
@@ -1205,7 +1205,7 @@ fn div(&Nat a, &Nat b) -> Nat {
 /// pre  natVal b.limbs ≥ 1
 /// pre  a.limbs.len + b.limbs.len ≤ 2305843009213693952
 /// post #[label(rem)] natVal result.limbs = natVal a.limbs % natVal b.limbs
-fn rem(&Nat a, &Nat b) -> Nat {
+pub fn rem(&Nat a, &Nat b) -> Nat {
     var q = a / b;
     var p = q * b;
     var r = a - p;
@@ -1277,7 +1277,7 @@ operator cmp = cmp;
 
 /// pre  a.limbs.len + b.limbs.len ≤ 576460752303423488
 /// post #[label(gcd)] natVal result.limbs = igcd (natVal a.limbs) (natVal b.limbs)
-fn gcd(&Nat a, &Nat b) -> Nat {
+pub fn gcd(&Nat a, &Nat b) -> Nat {
     [u32] zarr = alloc_array<u32>(1, 0);
     var zero = Nat::from_prefix(&zarr, 0);
     /// assert #[label(zero_val)] natVal zero.limbs = 0

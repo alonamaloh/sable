@@ -1,0 +1,8 @@
+// expect-error: module.bad_pub
+// `pub` marks fn/class/trait/const declarations, nothing else.
+
+pub use lib_pair;
+
+fn caller() -> i32 {
+    return 1;
+}

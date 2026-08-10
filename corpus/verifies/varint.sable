@@ -15,7 +15,7 @@
 /// post 0 <= out.get (result - 1) ∧ out.get (result - 1) < 128
 /// post x < 128 → result = 1 ∧ out.get 0 = x
 /// post 128 <= x → 2 <= result
-fn varint_encode(&mut [u64] out, u64 x) -> u64 {
+pub fn varint_encode(&mut [u64] out, u64 x) -> u64 {
     mut u64 v = x;
     mut u64 i = 0;
     mut u64 more = 1;
@@ -54,7 +54,7 @@ fn varint_encode(&mut [u64] out, u64 x) -> u64 {
 ///      | some v => ∀ j, 0 <= j → j < n → src.get j < 256
 ///      | none   => True
 /// post n = 1 → 0 <= src.get 0 → src.get 0 < 128 → result = some (src.get 0)
-fn varint_decode(&[u64] src, u64 n) -> option<u64> {
+pub fn varint_decode(&[u64] src, u64 n) -> option<u64> {
     if (n == 0) { return none; }
     mut u64 value = 0;
     mut u64 k = n;

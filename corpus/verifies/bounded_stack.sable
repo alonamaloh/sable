@@ -2,7 +2,7 @@
 // The class invariant is an interface block: an obligation at the exit
 // of every init and &mut-self method, an assumption at every entry.
 
-class BoundedStack {
+pub class BoundedStack {
     [i32] buf;
     u64  len;
 

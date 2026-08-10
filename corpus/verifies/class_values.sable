@@ -5,7 +5,7 @@
 // carry their invariant in (borrow_inv, caller-side obligation) and
 // returned values carry it out (ret_inv, callee-side obligation).
 
-class Range {
+pub class Range {
     i32 lo;
     i32 hi;
 
@@ -22,13 +22,13 @@ class Range {
 }
 
 /// post #[label(width)] result = r.hi - r.lo
-fn width(&Range r) -> i32 {
+pub fn width(&Range r) -> i32 {
     return r.hi - r.lo;
 }
 
 /// post #[label(lo_min)] (result.lo = a.lo ∨ result.lo = b.lo) ∧ result.lo ≤ a.lo ∧ result.lo ≤ b.lo
 /// post #[label(hi_max)] (result.hi = a.hi ∨ result.hi = b.hi) ∧ result.hi ≥ a.hi ∧ result.hi ≥ b.hi
-fn union_of(&Range a, &Range b) -> Range {
+pub fn union_of(&Range a, &Range b) -> Range {
     mut i32 mn = a.lo;
     if (b.lo < mn) {
         mn = b.lo;
@@ -42,7 +42,7 @@ fn union_of(&Range a, &Range b) -> Range {
 }
 
 /// post result = 9
-fn demo() -> i32 {
+pub fn demo() -> i32 {
     var x = Range::make(1, 5);
     var y = Range::make(3, 10);
     var u = union_of(&x, &y);

@@ -3,11 +3,11 @@
 
 /// pre  x < 100
 /// post result = x + 1
-fn bump(i32 x) -> i32 {
+pub fn bump(i32 x) -> i32 {
     return x + 1;
 }
 
 /// post result = x
-fn same(i32 x) -> i32 {
+pub fn same(i32 x) -> i32 {
     return x;
 }

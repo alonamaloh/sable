@@ -6,7 +6,7 @@
 
 /// post sorted a
 /// post perm a (old a)
-fn insertion_sort(&mut [i32] a) {
+pub fn insertion_sort(&mut [i32] a) {
     u64 n = a.len;
     /// invariant ∀ p q, 0 ≤ p → p < q → q < i → a.get p ≤ a.get q
     /// invariant perm a (old a)

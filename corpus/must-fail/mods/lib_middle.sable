@@ -1,0 +1,11 @@
+// Helper module: imports lib_hidden and re-uses its export — the
+// transitive-reference guard's middle hop.
+
+use lib_hidden;
+
+/// pre  x < 500
+/// pre  0 - 500 < x
+/// post result = shown x
+pub fn middle(i32 x) -> i32 {
+    return shown(x);
+}

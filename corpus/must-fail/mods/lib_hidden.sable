@@ -1,0 +1,20 @@
+// Helper module: one export, one private item — the visibility guards'
+// subject.
+
+/// post result = x + 1
+pub fn shown(i32 x) -> i32 {
+    return x + 1;
+}
+
+/// post result = x * 2
+fn hidden(i32 x) -> i32 {
+    i32 y = x + x;
+    return y;
+}
+
+/// pre  x < 1000
+/// pre  0 - 1000 < x
+/// post result = shown x
+pub fn outer(i32 x) -> i32 {
+    return shown(x);
+}

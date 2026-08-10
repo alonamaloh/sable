@@ -57,7 +57,7 @@ fn quicksort_range(&mut [i32] a, u64 lo, u64 hi)
 
 /// post sorted a
 /// post perm a (old a)
-fn quicksort(&mut [i32] a) {
+pub fn quicksort(&mut [i32] a) {
     u64 n = a.len;
     quicksort_range(&mut a, 0, n);
 }

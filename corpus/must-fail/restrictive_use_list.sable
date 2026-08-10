@@ -1,0 +1,9 @@
+// expect-error: module.not_imported
+// A listed import is restrictive: names outside the list are not in
+// scope even though they are exported.
+
+use lib_hidden::{outer};
+
+fn caller() -> i32 {
+    return shown(7);
+}

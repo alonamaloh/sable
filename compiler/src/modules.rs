@@ -107,6 +107,12 @@ struct Loading {
     /// DFS stack of canonical paths (cycle detection).
     stack: Vec<PathBuf>,
     module_paths: Vec<PathBuf>,
+    /// Resolved direct imports: (importer idx, the `use`, dep idx) —
+    /// the edges the visibility pass (ADR 0019) checks against.
+    imports: Vec<(usize, UseDecl, usize)>,
+    /// Per module: the extern class-name table its parse was seeded
+    /// with, so parse-time `Ty::Class` indices resolve back to names.
+    externs: Vec<(usize, Vec<String>)>,
 }
 
 /// Load `root` and its transitive imports; returns the merged program
@@ -125,6 +131,8 @@ pub fn load(
         seen: Vec::new(),
         stack: Vec::new(),
         module_paths: module_paths.to_vec(),
+        imports: Vec::new(),
+        externs: Vec::new(),
     };
     if let Err(d) = load_file(&mut loading, root, None) {
         // Errors carry combined-source spans; hand back the partial set
@@ -135,10 +143,334 @@ pub fn load(
         }
         return Err((d, loading.set));
     }
+    if let Err(d) = enforce_visibility(&loading) {
+        return Err((d, loading.set));
+    }
     match merge(loading) {
         Ok(ok) => Ok(ok),
         Err((d, set)) => Err((d, set)),
     }
+}
+
+/// Visibility (ADR 0019): the program language sees its own module
+/// plus the `pub` items of modules it directly imports (a `use` list
+/// restricts further); the proof layer (ghost defs, theorems, clause
+/// text) sees the whole DAG. Enforced on the per-module parses, before
+/// the flat merge erases ownership.
+fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
+    use crate::ast::{Expr, ExprKind, Stmt, Ty};
+    use std::collections::HashMap;
+
+    // Global item index: name → (owner module, pub).
+    let mut items: HashMap<&str, (usize, bool)> = HashMap::new();
+    let mut consts: HashMap<&str, (usize, bool)> = HashMap::new();
+    for (idx, p) in &loading.programs {
+        for f in &p.fns {
+            items.entry(f.name.as_str()).or_insert((*idx, f.is_pub));
+        }
+        for c in &p.classes {
+            items.entry(c.name.as_str()).or_insert((*idx, c.is_pub));
+        }
+        for t in &p.traits {
+            items.entry(t.name.as_str()).or_insert((*idx, t.is_pub));
+        }
+        for c in &p.consts {
+            consts.entry(c.name.as_str()).or_insert((*idx, c.is_pub));
+            items.entry(c.name.as_str()).or_insert((*idx, c.is_pub));
+        }
+    }
+
+    let module_name = |idx: usize| -> String {
+        let m = &loading.set.modules[idx];
+        Path::new(&m.display)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| m.display.clone())
+    };
+
+    // May module `from` reference `name`?
+    let check = |from: usize, name: &str, span: Span| -> Result<(), Diagnostic> {
+        let Some(&(owner, is_pub)) = items.get(name) else {
+            return Ok(()); // unknown names are the checker's diagnostics
+        };
+        if owner == from {
+            return Ok(());
+        }
+        if !is_pub {
+            return Err(Diagnostic {
+                name: "module.private".into(),
+                title: format!("`{name}` is private to module `{}`", module_name(owner)),
+                span,
+                label: "not exported".into(),
+                notes: vec![(
+                    "note".into(),
+                    format!(
+                        "mark it `pub` in {} to export it",
+                        loading.set.modules[owner].display
+                    ),
+                )],
+            });
+        }
+        let edge = loading
+            .imports
+            .iter()
+            .find(|(f, _, dep)| *f == from && *dep == owner);
+        match edge {
+            None => Err(Diagnostic {
+                name: "module.not_imported".into(),
+                title: format!(
+                    "`{name}` is in module `{}`, which this module does not import",
+                    module_name(owner)
+                ),
+                span,
+                label: "no direct `use` for its module".into(),
+                notes: vec![(
+                    "note".into(),
+                    format!(
+                        "the program language sees direct imports only; add `use {};`",
+                        module_name(owner)
+                    ),
+                )],
+            }),
+            Some((_, u, _)) => match &u.names {
+                None => Ok(()),
+                Some(list) if list.iter().any(|n| n == name) => Ok(()),
+                Some(_) => Err(Diagnostic {
+                    name: "module.not_imported".into(),
+                    title: format!(
+                        "`{name}` is not in this module's `use {}::{{…}}` list",
+                        module_name(owner)
+                    ),
+                    span,
+                    label: "not imported by the list".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "a listed import is restrictive: add the name to the list, \
+                         or import the module wholesale"
+                            .into(),
+                    )],
+                }),
+            },
+        }
+    };
+
+    fn walk_expr(
+        e: &Expr,
+        refs: &mut Vec<(String, Span)>,
+        const_names: &HashMap<&str, (usize, bool)>,
+    ) {
+        match &e.kind {
+            ExprKind::Call {
+                callee,
+                callee_span,
+                args,
+                ..
+            } => {
+                refs.push((callee.clone(), *callee_span));
+                for a in args {
+                    walk_expr(a, refs, const_names);
+                }
+            }
+            ExprKind::CtorCall {
+                class,
+                class_span,
+                args,
+                ..
+            } => {
+                refs.push((class.clone(), *class_span));
+                for a in args {
+                    walk_expr(a, refs, const_names);
+                }
+            }
+            ExprKind::MethodCall { args, .. } | ExprKind::TraitCall { args, .. } => {
+                for a in args {
+                    walk_expr(a, refs, const_names);
+                }
+            }
+            ExprKind::Var(name) => {
+                // Bare tokens are how consts are referenced (the const
+                // pass substitutes them); only const names count.
+                if const_names.contains_key(name.as_str()) {
+                    refs.push((name.clone(), e.span));
+                }
+            }
+            ExprKind::Unary { operand, .. } => walk_expr(operand, refs, const_names),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                walk_expr(lhs, refs, const_names);
+                walk_expr(rhs, refs, const_names);
+            }
+            ExprKind::Index { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. } => walk_expr(index, refs, const_names),
+            ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => {
+                walk_expr(arg, refs, const_names)
+            }
+            ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
+                walk_expr(operand, refs, const_names)
+            }
+            ExprKind::SomeE(inner) => walk_expr(inner, refs, const_names),
+            ExprKind::ArrayLit(elems) => {
+                for el in elems {
+                    walk_expr(el, refs, const_names);
+                }
+            }
+            ExprKind::AllocArray { len, init, .. } => {
+                walk_expr(len, refs, const_names);
+                walk_expr(init, refs, const_names);
+            }
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Len { .. }
+            | ExprKind::NoneE
+            | ExprKind::Borrow { .. }
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::ClassFieldLen { .. } => {}
+        }
+    }
+
+    fn walk_stmts(
+        stmts: &[Stmt],
+        refs: &mut Vec<(String, Span)>,
+        const_names: &HashMap<&str, (usize, bool)>,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::Decl { init, .. } => {
+                    if let Some(e) = init {
+                        walk_expr(e, refs, const_names);
+                    }
+                }
+                Stmt::Assign { value, .. } => walk_expr(value, refs, const_names),
+                Stmt::VarDecl { init, .. } => walk_expr(init, refs, const_names),
+                Stmt::ExprStmt(e) => walk_expr(e, refs, const_names),
+                Stmt::FieldAssign { value, .. } => walk_expr(value, refs, const_names),
+                Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                    walk_expr(index, refs, const_names);
+                    walk_expr(value, refs, const_names);
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(e) = value {
+                        walk_expr(e, refs, const_names);
+                    }
+                }
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    walk_expr(cond, refs, const_names);
+                    walk_stmts(then_block, refs, const_names);
+                    if let Some(eb) = else_block {
+                        walk_stmts(eb, refs, const_names);
+                    }
+                }
+                Stmt::While { cond, body, .. } => {
+                    walk_expr(cond, refs, const_names);
+                    walk_stmts(body, refs, const_names);
+                }
+                Stmt::Assert(_) => {}
+            }
+        }
+    }
+
+    for (idx, p) in &loading.programs {
+        let externs: &[String] = loading
+            .externs
+            .iter()
+            .find(|(i, _)| i == idx)
+            .map(|(_, e)| e.as_slice())
+            .unwrap_or(&[]);
+        let mut refs: Vec<(String, Span)> = Vec::new();
+
+        let mut walk_fn = |f: &crate::ast::Fn, refs: &mut Vec<(String, Span)>| {
+            walk_stmts(&f.body, refs, &consts);
+            for (ty, span) in f
+                .params
+                .iter()
+                .map(|pa| (&pa.ty, pa.span))
+                .chain(std::iter::once((&f.ret, f.name_span)))
+            {
+                if let Ty::Class(ci) | Ty::ClassRef(ci) = ty {
+                    if let Some(name) = externs.get(*ci) {
+                        refs.push((name.clone(), span));
+                    }
+                }
+            }
+            for b in f.type_bounds.iter().flatten() {
+                refs.push((b.clone(), f.name_span));
+            }
+        };
+
+        for f in &p.fns {
+            walk_fn(f, &mut refs);
+        }
+        for c in &p.classes {
+            for i in &c.inits {
+                walk_fn(i, &mut refs);
+            }
+            for m in &c.methods {
+                walk_fn(&m.f, &mut refs);
+            }
+            if let Some(d) = &c.deinit {
+                walk_stmts(d, &mut refs, &consts);
+            }
+            for fi in &c.fields {
+                if let Ty::Class(ci) | Ty::ClassRef(ci) = fi.ty {
+                    if let Some(name) = externs.get(ci) {
+                        refs.push((name.clone(), fi.span));
+                    }
+                }
+            }
+            for b in c.type_bounds.iter().flatten() {
+                refs.push((b.clone(), c.name_span));
+            }
+        }
+        for im in &p.impls {
+            refs.push((im.trait_name.clone(), im.trait_span));
+            for f in &im.fns {
+                walk_fn(f, &mut refs);
+            }
+        }
+        for ob in &p.operators {
+            refs.push((ob.fn_name.clone(), ob.span));
+        }
+        // A listed `use` may only name exports.
+        for (from, u, dep) in &loading.imports {
+            if from == idx {
+                if let Some(list) = &u.names {
+                    for n in list {
+                        if let Some(&(owner, is_pub)) = items.get(n.as_str()) {
+                            if owner == *dep && !is_pub {
+                                return Err(Diagnostic {
+                                    name: "module.private".into(),
+                                    title: format!(
+                                        "`{n}` is private to module `{}`",
+                                        module_name(*dep)
+                                    ),
+                                    span: u.span,
+                                    label: "listed, but not exported".into(),
+                                    notes: vec![(
+                                        "note".into(),
+                                        format!(
+                                            "mark it `pub` in {} to export it",
+                                            loading.set.modules[*dep].display
+                                        ),
+                                    )],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (name, span) in refs {
+            check(*idx, &name, span)?;
+        }
+    }
+    Ok(())
 }
 
 fn load_file(
@@ -249,6 +581,7 @@ fn load_file(
             });
         };
         let dep_idx = load_file(loading, found, Some(u.span))?;
+        loading.imports.push((idx, u.clone(), dep_idx));
         // Listed imports validate the names exist in the target module.
         if let Some(names) = &u.names {
             let (_, dep) = loading
@@ -293,6 +626,7 @@ fn load_file(
     };
     // The combined program text mirrors the combined source (same
     // lengths, proof lines blanked).
+    loading.externs.push((idx, extern_classes.clone()));
     let combined_program: String = {
         let mut buf = String::new();
         for m in &loading.set.modules {

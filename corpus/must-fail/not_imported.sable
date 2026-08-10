@@ -1,0 +1,9 @@
+// expect-error: module.not_imported
+// The program language sees direct imports only: `shown` is exported
+// by lib_hidden, but this module imports only lib_middle.
+
+use lib_middle;
+
+fn caller() -> i32 {
+    return shown(7);
+}

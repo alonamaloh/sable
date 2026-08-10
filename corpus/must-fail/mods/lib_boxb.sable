@@ -3,7 +3,7 @@
 
 use lib_box;
 
-fn boxb_make() -> i32 {
+pub fn boxb_make() -> i32 {
     var b = Box<i32>::new(5);
     return b.val;
 }

@@ -3,7 +3,7 @@
 // bound that makes doubling growth overflow-free. Logical max capacity
 // is 2^62 elements (unreachable before the OOM trap).
 
-class Vec<T> {
+pub class Vec<T> {
     [T] buf;
     u64 len;
 

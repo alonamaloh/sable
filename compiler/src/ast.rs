@@ -403,6 +403,9 @@ pub struct Param {
 
 #[derive(Debug, Clone)]
 pub struct Fn {
+    /// Exported to importers (`pub fn`, ADR 0019). Methods, inits,
+    /// and trait signatures ignore this (class visibility governs).
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     /// Generic type parameters (`fn swap<T>(...)`). Non-empty only
@@ -502,6 +505,8 @@ pub struct TraitSpecFn {
 /// within the trait, `Self` is `IntTy::TParam(0)`.
 #[derive(Debug, Clone)]
 pub struct TraitDecl {
+    /// Exported to importers (`pub trait`, ADR 0019).
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     pub specs: Vec<TraitSpecFn>,
@@ -526,6 +531,8 @@ pub struct ImplDecl {
 
 #[derive(Debug, Clone)]
 pub struct ClassDecl {
+    /// Exported to importers (`pub class`, ADR 0019).
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     /// Generic type parameters (`class Vec<T>`). Non-empty only before
@@ -551,6 +558,8 @@ pub struct ClassDecl {
 /// before any later stage runs.
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
+    /// Exported to importers (`pub const`, ADR 0019).
+    pub is_pub: bool,
     pub name: String,
     pub name_span: Span,
     pub ty: IntTy,

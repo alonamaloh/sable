@@ -79,9 +79,10 @@ use lib_pair::{bump};     // import with a checked name list
   contracts through Lean's own module system. The source-level design
   was chosen so this changed only the emitter/checker plumbing, not the
   language — and it did.
-- **Deferred with slice 2+**: `pub` visibility (and `use` lists
-  becoming restrictive), module subdirectories/paths in source
-  (`use a::b;` as a filesystem path), re-exports.
+- **Deferred with slice 2+**: ~~`pub` visibility (and `use` lists
+  becoming restrictive)~~ *(landed — ADR 0019: default private,
+  restrictive lists, direct-imports-only)*; module subdirectories/paths
+  in source (`use a::b;` as a filesystem path); re-exports.
 - Whole-DAG verification means touching a leaf module re-verifies its
   dependents' obligations too when *they* are checked — acceptable now,
   the forcing function for slice 2 later.

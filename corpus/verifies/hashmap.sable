@@ -14,7 +14,7 @@
 // after a full sweep — proving a non-full table always succeeds needs a
 // counting (pigeonhole) invariant, deliberately deferred.
 
-trait Hashable {
+pub trait Hashable {
     /// spec hash : int → int
     /// post 0 ≤ result
     /// post result = Self::hash x
@@ -173,7 +173,7 @@ fn probe_step(u64 h, u64 j, u64 cap) -> u64 {
     return p;
 }
 
-class HashMap<K: Hashable, V> {
+pub class HashMap<K: Hashable, V> {
     [K]  keys;
     [V]  vals;
     [u8] occ;

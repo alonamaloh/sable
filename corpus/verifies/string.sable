@@ -7,7 +7,7 @@
 
 use utf8;
 
-class String {
+pub class String {
     [u8] bytes;
 
     /// invariant validScan bytes 0
@@ -38,7 +38,7 @@ class String {
 /// post #[label(eq)] result = 0 ↔ (a.bytes.len = b.bytes.len ∧
 ///      ∀ j, 0 ≤ j → j < a.bytes.len → a.bytes.get j = b.bytes.get j)
 /// post #[label(range)] result = -1 ∨ result = 0 ∨ result = 1
-fn cmp(&String a, &String b) -> i32 {
+pub fn cmp(&String a, &String b) -> i32 {
     mut u64 n = a.bytes.len;
     if (b.bytes.len < n) {
         n = b.bytes.len;

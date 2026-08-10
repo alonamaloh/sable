@@ -90,18 +90,51 @@ pub fn parse_module(
             uses.push(parser.parse_use()?);
             continue;
         }
+        // `pub` exports an item to importers (ADR 0019); everything
+        // else is private to its module.
+        let is_pub = matches!(parser.peek(), Tok::Ident(n) if n == "pub");
+        if is_pub {
+            let span = parser.peek_span();
+            parser.bump();
+            if !(parser.at(&Tok::KwClass)
+                || matches!(parser.peek(), Tok::Ident(n) if n == "trait" || n == "const" || n == "fn")
+                || parser.at(&Tok::KwFn))
+            {
+                return Err(Diagnostic {
+                    name: "module.bad_pub".into(),
+                    title: "`pub` does not apply here".into(),
+                    span,
+                    label: "only `fn`, `class`, `trait`, and `const` take `pub`".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "impls and operator bindings export with their trait/class; \
+                         the proof layer (ghost defs, theorems) is always visible \
+                         (ADR 0019)"
+                            .into(),
+                    )],
+                });
+            }
+        }
         if parser.at(&Tok::KwClass) {
-            classes.push(parser.parse_class()?);
+            let mut c = parser.parse_class()?;
+            c.is_pub = is_pub;
+            classes.push(c);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "trait") {
-            traits.push(parser.parse_trait()?);
+            let mut t = parser.parse_trait()?;
+            t.is_pub = is_pub;
+            traits.push(t);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "impl") {
             impls.push(parser.parse_impl()?);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "operator") {
             operators.push(parser.parse_operator()?);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "const") {
-            consts.push(parser.parse_const()?);
+            let mut c = parser.parse_const()?;
+            c.is_pub = is_pub;
+            consts.push(c);
         } else {
-            fns.push(parser.parse_fn()?);
+            let mut f = parser.parse_fn()?;
+            f.is_pub = is_pub;
+            fns.push(f);
         }
     }
 
@@ -706,6 +739,7 @@ impl<'a> Parser<'a> {
 
         self.tparams.clear();
         Ok(ClassDecl {
+            is_pub: false,
             name,
             name_span,
             type_params,
@@ -798,6 +832,7 @@ impl<'a> Parser<'a> {
         self.bump();
         let end = self.expect(Tok::Semi)?.span;
         Ok(crate::ast::ConstDecl {
+            is_pub: false,
             name,
             name_span,
             ty,
@@ -838,6 +873,7 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Ok(Fn {
+            is_pub: false,
             name,
             name_span,
             type_params: Vec::new(),
@@ -888,6 +924,7 @@ impl<'a> Parser<'a> {
         Ok(Method {
             self_kind,
             f: Fn {
+                is_pub: false,
                 name,
                 name_span,
                 type_params: Vec::new(),
@@ -970,6 +1007,7 @@ impl<'a> Parser<'a> {
         };
 
         let mut f = Fn {
+            is_pub: false,
             name,
             name_span,
             type_params,
@@ -1080,6 +1118,7 @@ impl<'a> Parser<'a> {
             };
             let end = self.expect(Tok::Semi)?.span;
             let mut f = Fn {
+            is_pub: false,
                 name: mname,
                 name_span: mspan,
                 type_params: Vec::new(),
@@ -1117,6 +1156,7 @@ impl<'a> Parser<'a> {
         let end = self.expect(Tok::RBrace)?.span;
         self.tparams.clear();
         Ok(TraitDecl {
+            is_pub: false,
             name,
             name_span,
             specs,
@@ -1178,6 +1218,7 @@ impl<'a> Parser<'a> {
             let body = self.block()?;
             let end = self.tokens[self.pos.saturating_sub(1)].span;
             fns.push(Fn {
+                is_pub: false,
                 name: mname,
                 name_span: mspan,
                 type_params: Vec::new(),

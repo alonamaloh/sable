@@ -6,6 +6,6 @@
 /// pre  0 <= x
 /// pre  x < 1000
 /// post result = gtwice x
-fn twice(i32 x) -> i32 {
+pub fn twice(i32 x) -> i32 {
     return x + x;
 }

@@ -365,7 +365,7 @@ fn json_token(&[u8] b, u64 pos) -> u64 {
 
 /// pre  b.len ≤ MAX_BYTES
 /// post result → lexable b 0
-fn json_lex_ok(&[u8] b) -> bool {
+pub fn json_lex_ok(&[u8] b) -> bool {
     mut u64 pos = 0;
     u64 n = b.len;
     /// invariant pos ≤ n

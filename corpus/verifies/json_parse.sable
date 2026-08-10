@@ -633,7 +633,7 @@ fn json_value_end(&[u8] b, u64 pos) -> u64
 
 /// pre  b.len ≤ MAX_BYTES
 /// post result → (∃ e, jgram b 0 0 e ∧ wsTo b e b.len)
-fn json_valid(&[u8] b) -> bool {
+pub fn json_valid(&[u8] b) -> bool {
     u64 e = json_value_end(&b, 0);
     if (e == 0) {
         return false;

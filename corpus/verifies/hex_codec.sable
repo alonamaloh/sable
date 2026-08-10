@@ -30,7 +30,7 @@ fn unhex_char(u8 c) -> u8 {
 /// post ∀ k, 0 ≤ k → k < src.len →
 ///      dst.get (2 * k) = hex_digit (src.get k / 16) ∧
 ///      dst.get (2 * k + 1) = hex_digit (src.get k % 16)
-fn hex_encode(&[u8] src, &mut [u8] dst) {
+pub fn hex_encode(&[u8] src, &mut [u8] dst) {
     u64 n = src.len;
     /// invariant ∀ k, 0 ≤ k → k < i →
     ///           dst.get (2 * k) = hex_digit (src.get k / 16) ∧
@@ -48,7 +48,7 @@ fn hex_encode(&[u8] src, &mut [u8] dst) {
 /// pre  src.len = 2 * dst.len
 /// post result → ∀ k, 0 ≤ k → k < dst.len →
 ///      dst.get k = 16 * unhex (src.get (2 * k)) + unhex (src.get (2 * k + 1))
-fn hex_decode(&[u8] src, &mut [u8] dst) -> bool {
+pub fn hex_decode(&[u8] src, &mut [u8] dst) -> bool {
     u64 n = dst.len;
     /// invariant ∀ k, 0 ≤ k → k < i →
     ///           dst.get k = 16 * unhex (src.get (2 * k)) + unhex (src.get (2 * k + 1))

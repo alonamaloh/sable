@@ -1,0 +1,9 @@
+// expect-error: module.private
+// Default-private: an importer may only reference a module's `pub`
+// items.
+
+use lib_hidden;
+
+fn caller() -> i32 {
+    return hidden(3);
+}
