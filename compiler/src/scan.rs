@@ -22,6 +22,10 @@ pub enum ClauseKind {
     Theorem,
     /// `/// spec name : sig` — a trait's spec-level function (ADR 0007).
     Spec,
+    /// `/// requires <prop about type params>` — a concept precondition
+    /// (ADR 0009): hypothesis at template level, obligation at each
+    /// instantiation.
+    Requires,
     Discharge,
     /// Continuation or unrecognized — reported by the parser when reached.
     Other,
@@ -181,6 +185,7 @@ fn parse_clause(line: &str, indent: usize, line_offset: usize) -> Clause {
             | ClauseKind::Invariant
             | ClauseKind::Variant
             | ClauseKind::Assert
+            | ClauseKind::Requires
     ) {
         if let Some(rest) = text.strip_prefix("#[label(") {
             if let Some(close) = rest.find(")]") {
@@ -224,6 +229,7 @@ fn keyword(rest: &str) -> (ClauseKind, usize) {
         "assume" => ClauseKind::Assume,
         "def" => ClauseKind::GhostDef,
         "spec" => ClauseKind::Spec,
+        "requires" => ClauseKind::Requires,
         "theorem" => ClauseKind::Theorem,
         "discharge" => ClauseKind::Discharge,
         _ => return (ClauseKind::Other, 0),

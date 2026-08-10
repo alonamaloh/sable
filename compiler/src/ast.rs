@@ -355,6 +355,12 @@ pub struct Fn {
     /// Per-parameter trait bound (`<K: Hashable>`), parallel to
     /// `type_params` (ADR 0007).
     pub type_bounds: Vec<Option<String>>,
+    /// Concept preconditions on the type parameters (ADR 0009).
+    pub requires: Vec<Clause>,
+    /// Set by mono on instances of a template-verified generic: the
+    /// instance skips its own obligations (the template's theorems
+    /// cover them) and owes only the substituted `requires`.
+    pub from_template: Option<String>,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub pres: Vec<Clause>,
@@ -479,6 +485,9 @@ pub struct ClassDecl {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<Fn>,
+    /// Generic fn templates, preserved by mono for template-level
+    /// verification (ADR 0009). Class templates are not yet here.
+    pub fn_templates: Vec<Fn>,
     pub classes: Vec<ClassDecl>,
     /// Consumed entirely by monomorphization (ADR 0007).
     pub traits: Vec<TraitDecl>,

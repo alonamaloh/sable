@@ -134,6 +134,14 @@ The grammar is **one mode-encoded well-founded ghost predicate** (`jgram`: value
 
 Layer 1 scope: acceptance soundness only (no completeness claim for rejections), and no duplicate-key detection — that is layer 2, where the verified hash map finally meets a client (per-object key sets via 64-bit span hashes, with the spec stated over hash equality).
 
+### M13 — proof ergonomics: `#[label]` and concepts slice 1 *(2026-08-10)*
+
+**`#[label(name)]`** (design §6's open refinement): a short stable name on a contract clause replaces the content slug in both the obligation name and the hypothesis name — `zero_all.inv_preserved.prefix_zeroed`, `h_inv_prefix_zeroed` — so discharges survive clause rewording, not just unrelated edits.
+
+**Concepts (ADR 0009), slice 1**: Alvaro's design — C++ concepts done right, as *type preconditions*. A template type parameter verifies against an abstract `Sable.IntModel` (`min`/`max` — the entire semantic content of a Sable integer type, which is why this is tractable here and not in C++) satisfying `wf` plus declared `/// requires` clauses; clause text like `T.max ≥ 100` elaborates unchanged via field projection (verbatim splice preserved). **Generic functions without trait bounds are now verified once, at the template**; instantiations owe only the `requires` obligations (numeric facts, automatic), and literals at type `T` become fits-VCs discharged from `wf`/`requires` (`corpus/verifies/concepts.sable`, all-automatic; guards: an under-provisioned instantiation fails `roomy_id_u8.requires.u8_max_1000`, a requires-less literal fails the template's `lit` obligation). Monomorphization is unchanged for code — ADR 0006 stands.
+
+Slices remaining: generic classes (acceptance: `Vec<T>`'s 8-per-instance discharges collapse to one template set), then trait-bounded templates (acceptance: `HashMap`'s 27 collapse). Slice-1 template restrictions (no `/`/`%` on `T` values, no `widen`/`narrow` touching `T`, no generic-to-generic calls) are diagnosed, not silent.
+
 ## Parallel track (low intensity)
 
 The SVM step relation in Lean — **started**: `lean/Sable/SVM.lean` (73 rules, builds clean) with the design-audit findings in `docs/notes/svm-draft.md` (11 ambiguities, cross-referenced from design §10). Next steps there: determinism proof, a functional evaluator + agreement proof (the differential-testing oracle against `interp.rs`), then calls/frames. The audit findings should be resolved into the design doc.

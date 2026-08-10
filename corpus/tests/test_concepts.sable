@@ -1,0 +1,55 @@
+// Dynamic checks over concept-templated code: instances execute
+// normally; the requires facts are compile-time only (zero runtime
+// cost), and the contracts are monitored per call as usual.
+
+/// requires #[label(has_room)] T.max ≥ 100
+/// pre  lo ≤ hi
+/// post #[label(clamped)] lo ≤ result ∧ result ≤ hi
+/// post #[label(faithful)] (lo ≤ x ∧ x ≤ hi) → result = x
+fn clamp<T>(T x, T lo, T hi) -> T {
+    if (x < lo) {
+        return lo;
+    }
+    if (x > hi) {
+        return hi;
+    }
+    return x;
+}
+
+/// requires T.max ≥ 100
+/// post result ≤ 100
+fn cap_at_100<T>(T x) -> T {
+    T cap = 100;
+    if (x > cap) {
+        return cap;
+    }
+    return x;
+}
+
+/// post result = 7
+fn demo_i32() -> i32 {
+    return clamp<i32>(7, 0, 50);
+}
+
+/// post result ≤ 10
+fn demo_u16() -> u16 {
+    return clamp<u16>(500, 0, 10);
+}
+
+/// post result ≤ 100
+fn demo_cap() -> u64 {
+    return cap_at_100<u64>(40000);
+}
+
+
+fn test_clamp() {
+    clamp<i32>(7, 0, 50);
+    clamp<i32>(-5, 0, 50);
+    clamp<i32>(99, 0, 50);
+    clamp<u16>(500, 0, 10);
+    cap_at_100<u64>(40000);
+    cap_at_100<u64>(3);
+    demo_i32();
+    demo_u16();
+    demo_cap();
+}

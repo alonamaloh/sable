@@ -1,0 +1,17 @@
+// expect-error: .lit.
+// A literal at type T with no requires to justify it: the fits-VC
+// against the abstract model is unprovable.
+
+/// post result ≤ 300
+fn cap_at_300<T>(T x) -> T {
+    T cap = 300;
+    if (x > cap) {
+        return cap;
+    }
+    return x;
+}
+
+/// post result ≤ 300
+fn demo() -> u16 {
+    return cap_at_300<u16>(200);
+}

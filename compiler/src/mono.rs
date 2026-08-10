@@ -191,6 +191,11 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             program.fns.push(f);
         } else {
             check_bounds_known(&f.type_bounds, &traits, f.name_span)?;
+            // Preserved for template-level verification (ADR 0009);
+            // slice 1: fn templates without trait bounds.
+            if f.type_bounds.iter().all(|b| b.is_none()) {
+                program.fn_templates.push(f.clone());
+            }
             fn_templates.insert(f.name.clone(), f);
         }
     }
@@ -410,6 +415,14 @@ impl Mono {
             let (text_map, bound_calls) =
                 self.subst_maps(&param_names, &bounds, &req.args);
             f.name = mangle(&req.template, &req.args);
+            // Template-verified instances (ADR 0009): skip their own
+            // obligations; owe the substituted `requires`.
+            if bounds.iter().all(|b| b.is_none()) {
+                f.from_template = Some(req.template.clone());
+            }
+            for r in f.requires.iter_mut() {
+                r.text = subst_clause_text(&r.text, &text_map);
+            }
             self.subst_fn(&mut f, &req.args, &text_map, &bound_calls, req.depth)?;
             self.new_fns.push(f);
         }

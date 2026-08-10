@@ -1,0 +1,15 @@
+// expect-error: .requires.
+// Instantiating below the concept precondition: the template verifies
+// (the requires is a pure precondition, unused by the body), and the
+// instantiation owes `u8.max ≥ 1000` — which it cannot pay.
+
+/// requires T.max ≥ 1000
+/// post result = x
+fn roomy_id<T>(T x) -> T {
+    return x;
+}
+
+/// post result = 7
+fn demo() -> u8 {
+    return roomy_id<u8>(7);
+}

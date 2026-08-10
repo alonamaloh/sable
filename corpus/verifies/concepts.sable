@@ -1,0 +1,45 @@
+// Concepts (ADR 0009): type preconditions + template-level
+// verification. `clamp<T>` is verified ONCE, against an abstract
+// IntModel satisfying `wf` plus the declared `requires`; each
+// instantiation owes only the `requires` facts (numeric, automatic).
+// The literal `100` in the body cannot be range-checked statically at
+// type T — it becomes a fits-VC discharged from the `requires`.
+
+/// requires #[label(has_room)] T.max ≥ 100
+/// pre  lo ≤ hi
+/// post #[label(clamped)] lo ≤ result ∧ result ≤ hi
+/// post #[label(faithful)] (lo ≤ x ∧ x ≤ hi) → result = x
+fn clamp<T>(T x, T lo, T hi) -> T {
+    if (x < lo) {
+        return lo;
+    }
+    if (x > hi) {
+        return hi;
+    }
+    return x;
+}
+
+/// requires T.max ≥ 100
+/// post result ≤ 100
+fn cap_at_100<T>(T x) -> T {
+    T cap = 100;
+    if (x > cap) {
+        return cap;
+    }
+    return x;
+}
+
+/// post result = 7
+fn demo_i32() -> i32 {
+    return clamp<i32>(7, 0, 50);
+}
+
+/// post result ≤ 10
+fn demo_u16() -> u16 {
+    return clamp<u16>(500, 0, 10);
+}
+
+/// post result ≤ 100
+fn demo_cap() -> u64 {
+    return cap_at_100<u64>(40000);
+}

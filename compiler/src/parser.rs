@@ -106,6 +106,7 @@ pub fn parse(
     Ok(Program {
         fns,
         classes,
+        fn_templates: Vec::new(),
         traits,
         impls,
         discharges,
@@ -299,6 +300,7 @@ fn kind_word(k: ClauseKind) -> &'static str {
         ClauseKind::Assume => "assume",
         ClauseKind::GhostDef => "def",
         ClauseKind::Spec => "spec",
+        ClauseKind::Requires => "requires",
         ClauseKind::Theorem => "theorem",
         ClauseKind::Discharge => "discharge",
         ClauseKind::Other => "<continuation>",
@@ -676,6 +678,8 @@ impl<'a> Parser<'a> {
             name_span,
             type_params: Vec::new(),
             type_bounds: Vec::new(),
+            requires: Vec::new(),
+            from_template: None,
             params,
             ret: Ty::Unit,
             pres: Vec::new(),
@@ -724,6 +728,8 @@ impl<'a> Parser<'a> {
                 name_span,
                 type_params: Vec::new(),
                 type_bounds: Vec::new(),
+                requires: Vec::new(),
+                from_template: None,
                 params,
                 ret,
                 pres: Vec::new(),
@@ -804,6 +810,8 @@ impl<'a> Parser<'a> {
             name_span,
             type_params,
             type_bounds,
+            requires: Vec::new(),
+            from_template: None,
             params,
             ret,
             pres: Vec::new(),
@@ -821,8 +829,22 @@ impl<'a> Parser<'a> {
                     ClauseKind::Pre => f.pres.push(clause.clone()),
                     ClauseKind::Post => f.posts.push(clause.clone()),
                     ClauseKind::Variant => set_fn_variant(&mut f, clause)?,
+                    ClauseKind::Requires => {
+                        if f.type_params.is_empty() {
+                            return Err(Diagnostic {
+                                name: "concepts.requires_non_generic".into(),
+                                title: "`requires` on a non-generic function".into(),
+                                span: clause.span,
+                                label: "concept preconditions constrain type \
+                                        parameters (ADR 0009)"
+                                    .into(),
+                                notes: vec![],
+                            });
+                        }
+                        f.requires.push(clause.clone());
+                    }
                     other => return Err(bad_clause(other, clause, "a function contract block",
-                        "only `pre`, `post`, and `variant` may precede a function")),
+                        "only `pre`, `post`, `variant`, and `requires` may precede a function")),
                 }
             }
         }
@@ -886,6 +908,8 @@ impl<'a> Parser<'a> {
                 name_span: mspan,
                 type_params: Vec::new(),
                 type_bounds: Vec::new(),
+                requires: Vec::new(),
+                from_template: None,
                 params,
                 ret,
                 pres: Vec::new(),
@@ -981,6 +1005,8 @@ impl<'a> Parser<'a> {
                 name_span: mspan,
                 type_params: Vec::new(),
                 type_bounds: Vec::new(),
+                requires: Vec::new(),
+                from_template: None,
                 params,
                 ret,
                 pres: Vec::new(),

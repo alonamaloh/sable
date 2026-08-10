@@ -144,6 +144,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             var_tys: HashMap::new(),
             mut_arrays: HashMap::new(),
             fresh: 0,
+            tparams: Vec::new(),
             name_hint: None,
             name_counts: HashMap::new(),
             out: result,
@@ -156,7 +157,69 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         if f.name.starts_with("test_") {
             continue;
         }
+        // Template-verified instances (ADR 0009): the template theorems
+        // cover their obligations; the residue is the substituted
+        // `requires` — pure numeric facts about concrete bounds.
+        if let Some(tname) = &f.from_template {
+            for (i, req) in f.requires.iter().enumerate() {
+                let name = format!("{}.requires.{}", f.name, cslug(req));
+                result.obligations.push(Obligation {
+                    thm_name: format!("vc_{}_{}", sanitize(&name), i),
+                    name,
+                    kind_desc: format!(
+                        "`requires` of template `{tname}` at this instantiation"
+                    ),
+                    span: req.span,
+                    goal: format!("({})", req.text),
+                    binders: Vec::new(),
+                    hyps: Vec::new(),
+                    context: vec![format!("instantiated from `{tname}`")],
+                });
+            }
+            continue;
+        }
         run_one(f, f.name.clone(), Cctx::None, &mut result);
+    }
+
+    // Fn templates (ADR 0009): verified once against the abstract
+    // model — obligations bind `(T : Sable.IntModel)` with `T.wf` and
+    // the declared `requires` as hypotheses.
+    for f in &program.fn_templates {
+        let mut generator = Generator {
+            f,
+            fname: f.name.clone(),
+            cctx: Cctx::None,
+            classes: &program.classes,
+            sigs,
+            fn_map: &fn_map,
+            class_map: &class_map,
+            source,
+            binders: Vec::new(),
+            hyps: Vec::new(),
+            context: Vec::new(),
+            env: HashMap::new(),
+            var_tys: HashMap::new(),
+            mut_arrays: HashMap::new(),
+            fresh: 0,
+            tparams: f.type_params.clone(),
+            name_hint: None,
+            name_counts: HashMap::new(),
+            out: &mut result,
+        };
+        for t in &f.type_params {
+            generator.binders.push((t.clone(), "Sable.IntModel".into()));
+            generator
+                .hyps
+                .push((format!("h_{t}_wf"), format!("{t}.wf")));
+            generator.context.push(format!("type parameter {t}"));
+        }
+        for req in &f.requires {
+            generator
+                .hyps
+                .push((format!("h_req_{}", chslug(req)), format!("({})", req.text)));
+            generator.context.push(format!("requires {}", req.text));
+        }
+        generator.run();
     }
     for c in &program.classes {
         for init in &c.inits {
@@ -220,6 +283,9 @@ struct Generator<'a> {
     /// &mut array params: source name → entry-state binder (`_old_a`).
     mut_arrays: HashMap<String, String>,
     fresh: usize,
+    /// Template mode (ADR 0009): the type-parameter names; `TParam(i)`
+    /// ranges render through `tparams[i]` as an `IntModel`.
+    tparams: Vec<String>,
     /// Source-name hint for the next call/alloc/ctor result binder:
     /// `u64 p = probe_step(...)` binds `p`, not `_r16`, so discharge
     /// scripts survive unrelated edits (same motivation as
@@ -279,7 +345,7 @@ impl<'a> Generator<'a> {
                 Ty::Int(it) => {
                     self.hyps.push((
                         format!("h_field_{}_range", fld.name),
-                        range_prop(&format!("({binder}.{})", fld.name), it),
+                        self.r_prop(&format!("({binder}.{})", fld.name), it),
                     ));
                 }
                 Ty::Array(elem, _) => {
@@ -292,8 +358,8 @@ impl<'a> Generator<'a> {
                         format!("h_field_{}_elems", fld.name),
                         format!(
                             "∀ k, 0 ≤ k → k < {path}.len → {} ≤ {path}.get k ∧ {path}.get k ≤ {}",
-                            elem.lean_min(),
-                            elem.lean_max()
+                            self.t_min(elem),
+                            self.t_max(elem)
                         ),
                     ));
                 }
@@ -334,7 +400,7 @@ impl<'a> Generator<'a> {
                 Ty::Int(it) => {
                     self.binders.push((p.name.clone(), "Int".into()));
                     self.hyps
-                        .push((format!("h_{}_range", p.name), range_prop(&p.name, it)));
+                        .push((format!("h_{}_range", p.name), self.r_prop(&p.name, it)));
                     self.env.insert(p.name.clone(), Val::Int(p.name.clone()));
                 }
                 Ty::Bool => {
@@ -360,8 +426,8 @@ impl<'a> Generator<'a> {
                         format!("h_{}_elems", p.name),
                         format!(
                             "∀ k, 0 ≤ k → k < {binder}.len → {} ≤ {binder}.get k ∧ {binder}.get k ≤ {}",
-                            elem.lean_min(),
-                            elem.lean_max()
+                            self.t_min(elem),
+                            self.t_max(elem)
                         ),
                     ));
                     if mutability == Mutability::Mut {
@@ -911,7 +977,7 @@ impl<'a> Generator<'a> {
                     let it = *it;
                     self.binders.push((name.clone(), "Int".into()));
                     self.hyps
-                        .push((format!("h_{name}_range"), range_prop(name, it)));
+                        .push((format!("h_{name}_range"), self.r_prop(name, it)));
                     self.env.insert(name.clone(), Val::Int(name.clone()));
                 }
                 Some(Ty::Bool) => {
@@ -962,8 +1028,8 @@ impl<'a> Generator<'a> {
                         format!("h_{name}_elems"),
                         format!(
                             "∀ k, 0 ≤ k → k < {name}.len → {} ≤ {name}.get k ∧ {name}.get k ≤ {}",
-                            elem.lean_min(),
-                            elem.lean_max()
+                            self.t_min(elem),
+                            self.t_max(elem)
                         ),
                     ));
                     self.env.insert(name.clone(), Val::Arr(name.clone()));
@@ -983,8 +1049,8 @@ impl<'a> Generator<'a> {
                         format!("h_{name}_elems"),
                         format!(
                             "∀ k, 0 ≤ k → k < {name}.len → {} ≤ {name}.get k ∧ {name}.get k ≤ {}",
-                            elem.lean_min(),
-                            elem.lean_max()
+                            self.t_min(elem),
+                            self.t_max(elem)
                         ),
                     ));
                     self.env.insert(name.clone(), Val::Arr(name.clone()));
@@ -996,11 +1062,28 @@ impl<'a> Generator<'a> {
 
     fn eval(&mut self, e: &Expr) -> Val {
         match &e.kind {
-            ExprKind::IntLit(n) => Val::Int(if *n < 0 {
-                format!("({n})")
-            } else {
-                format!("{n}")
-            }),
+            ExprKind::IntLit(n) => {
+                let v = if *n < 0 {
+                    format!("({n})")
+                } else {
+                    format!("{n}")
+                };
+                // A literal at type `T` cannot be range-checked
+                // statically: emit a fits-VC against the model
+                // (ADR 0009); dischargeable from `wf`/`requires`.
+                if let Some(Ty::Int(it @ IntTy::TParam(_))) = e.ty {
+                    let goal = self.r_prop(&v, it);
+                    let ob = self.obligation(
+                        &format!("{}.lit.{}", self.fname, slug(&v)),
+                        format!("literal `{n}` must fit the type parameter"),
+                        e.span,
+                        goal.clone(),
+                    );
+                    self.push_obligation(ob);
+                    self.assume_fact(&goal);
+                }
+                Val::Int(v)
+            }
             ExprKind::BoolLit(b) => Val::Prop(if *b { "True".into() } else { "False".into() }),
             ExprKind::Var(name) => self.env.get(name).cloned().expect("checked: initialized"),
             ExprKind::Len { array } => {
@@ -1038,7 +1121,7 @@ impl<'a> Generator<'a> {
                 let Val::Int(v) = self.eval(arg) else {
                     unreachable!()
                 };
-                let goal = range_prop(&v, *target);
+                let goal = self.r_prop(&v, *target);
                 let ob = self.obligation(
                     &format!("{}.narrow.{}", self.fname, slug(self.src(e.span))),
                     format!(
@@ -1085,8 +1168,8 @@ impl<'a> Generator<'a> {
                 // automation a quantifier instantiation.
                 self.assume_fact(&format!(
                     "{} ≤ {value} ∧ {value} ≤ {}",
-                    elem.lean_min(),
-                    elem.lean_max()
+                    self.t_min(elem),
+                    self.t_max(elem)
                 ));
                 Val::Int(value)
             }
@@ -1146,8 +1229,8 @@ impl<'a> Generator<'a> {
                 let value = format!("({arr}.get {i})");
                 self.assume_fact(&format!(
                     "{} ≤ {value} ∧ {value} ≤ {}",
-                    elem.lean_min(),
-                    elem.lean_max()
+                    self.t_min(elem),
+                    self.t_max(elem)
                 ));
                 Val::Int(value)
             }
@@ -1286,7 +1369,7 @@ impl<'a> Generator<'a> {
                     Ty::Int(it) => {
                         self.binders.push((ret_sym.clone(), "Int".into()));
                         let h = format!("h_{}_range", ret_sym.trim_start_matches('_'));
-                        self.hyps.push((h, range_prop(&ret_sym, it)));
+                        self.hyps.push((h, self.r_prop(&ret_sym, it)));
                     }
                     Ty::Option(_) => {
                         self.binders.push((ret_sym.clone(), "Option Int".into()));
@@ -1340,7 +1423,7 @@ impl<'a> Generator<'a> {
                     let Ty::Int(it) = e.ty.unwrap() else {
                         unreachable!()
                     };
-                    let goal = range_prop(&value, it);
+                    let goal = self.r_prop(&value, it);
                     let ob = self.obligation(
                         &format!("{}.overflow.{}", self.fname, slug(self.src(e.span))),
                         format!(
@@ -1382,7 +1465,7 @@ impl<'a> Generator<'a> {
                     };
                     match op {
                         BinOp::Add | BinOp::Sub | BinOp::Mul => {
-                            let goal = range_prop(&value, it);
+                            let goal = self.r_prop(&value, it);
                             let ob = self.obligation(
                                 &format!("{}.overflow.{}", self.fname, slug(self.src(e.span))),
                                 format!(
@@ -1539,8 +1622,8 @@ impl<'a> Generator<'a> {
                         format!("h_{array}_elems"),
                         format!(
                             "∀ k, 0 ≤ k → k < {b}.len → {} ≤ {b}.get k ∧ {b}.get k ≤ {}",
-                            elem.lean_min(),
-                            elem.lean_max()
+                            self.t_min(elem),
+                            self.t_max(elem)
                         ),
                     ));
                     self.env.insert(array.clone(), Val::Arr(b.clone()));
@@ -1553,7 +1636,7 @@ impl<'a> Generator<'a> {
                         self.binders.push((ret_sym.clone(), "Int".into()));
                         self.hyps.push((
                             format!("h_{}_range", ret_sym.trim_start_matches('_')),
-                            range_prop(&ret_sym, ret_it),
+                            self.r_prop(&ret_sym, ret_it),
                         ));
                     }
                     Ty::Option(_) => {
@@ -1738,6 +1821,10 @@ impl<'a> Generator<'a> {
     /// `_old_` twin for &mut arrays, so `old a` elaborates).
     fn wf_binders(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
+        // Template clauses reference `T.min`/`T.max` (ADR 0009).
+        for t in &self.tparams {
+            out.push((t.clone(), "Sable.IntModel".into()));
+        }
         for p in &self.f.params {
             match p.ty {
                 Ty::Int(_) => out.push((p.name.clone(), "Int".into())),
@@ -1831,6 +1918,28 @@ impl<'a> Generator<'a> {
 
     /// Push a hypothesis whose name must not shadow an existing one:
     /// on collision, suffix _2, _3, ... (stable: program order).
+    /// Model-aware range fact: `T.min ≤ v ∧ v ≤ T.max` for a type
+    /// parameter, the concrete bounds otherwise (ADR 0009).
+    fn r_prop(&self, value: &str, it: IntTy) -> String {
+        if let IntTy::TParam(i) = it {
+            let t = &self.tparams[i as usize];
+            return format!("{t}.min ≤ {value} ∧ {value} ≤ {t}.max");
+        }
+        range_prop(value, it)
+    }
+    fn t_min(&self, it: IntTy) -> String {
+        if let IntTy::TParam(i) = it {
+            return format!("{}.min", self.tparams[i as usize]);
+        }
+        it.lean_min()
+    }
+    fn t_max(&self, it: IntTy) -> String {
+        if let IntTy::TParam(i) = it {
+            return format!("{}.max", self.tparams[i as usize]);
+        }
+        it.lean_max()
+    }
+
     /// A binder name for a call/alloc result: the hinted source local
     /// when the result is directly bound (deduped against live binders),
     /// else `{fallback}{fresh}`.

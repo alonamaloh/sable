@@ -233,6 +233,54 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         call_graph.insert(f.name.clone(), ctx.calls);
     }
 
+    // Fn templates (ADR 0009): typecheck against the abstract model —
+    // TParam flows as an ordinary integer type; the TParam-specific
+    // gates (literals, conversions, division) fire on the way.
+    let mut templates = std::mem::take(&mut program.fn_templates);
+    for f in &mut templates {
+        let mut ctx = Ctx {
+            sigs: &sigs,
+            current_fn: f.name.clone(),
+            current_has_variant: f.variant.is_some(),
+            in_test: false,
+            vars: HashMap::new(),
+            declared: HashSet::new(),
+            calls: Vec::new(),
+            in_class: None,
+            in_init: false,
+            class_metas: &class_metas,
+        };
+        for p in &f.params {
+            if !ctx.declared.insert(p.name.clone()) {
+                return Err(Diagnostic {
+                    name: "type.duplicate_name".into(),
+                    title: format!("duplicate parameter name `{}`", p.name),
+                    span: p.span,
+                    label: "already declared".into(),
+                    notes: vec![],
+                });
+            }
+            ctx.vars.insert(
+                p.name.clone(),
+                VarInfo {
+                    ty: p.ty,
+                    initialized: true,
+                },
+            );
+        }
+        let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
+        if !returns && f.ret != Ty::Unit {
+            return Err(Diagnostic {
+                name: "type.missing_return".into(),
+                title: format!("not all paths in `{}` return a value", f.name),
+                span: f.name_span,
+                label: "this function must return on every path".into(),
+                notes: vec![],
+            });
+        }
+    }
+    program.fn_templates = templates;
+
     // Class members.
     for (ci, class) in program.classes.iter_mut().enumerate() {
         let meta = &class_metas[ci];
@@ -782,7 +830,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     })
                 }
             };
-            if *n < t.min() || *n > t.max() {
+            if !matches!(t, IntTy::TParam(_)) && (*n < t.min() || *n > t.max()) {
                 return Err(Diagnostic {
                     name: "type.literal_out_of_range".into(),
                     title: format!("literal `{n}` does not fit in `{}`", t.name()),
@@ -878,6 +926,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     }
                 }
             };
+            if matches!(src, IntTy::TParam(_)) || matches!(target, IntTy::TParam(_)) {
+                return Err(Diagnostic {
+                    name: "concepts.template_conv".into(),
+                    title: "`widen`/`narrow` on a type parameter".into(),
+                    span,
+                    label: "conversions involving type parameters are not yet \
+                            supported in templates (ADR 0009 slice 1)"
+                        .into(),
+                    notes: vec![],
+                });
+            }
             if src.min() < target.min() || src.max() > target.max() {
                 return Err(Diagnostic {
                     name: "type.narrowing_widen".into(),
@@ -1248,6 +1307,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     _ => None,
                 };
                 let t = infer_int_pair(ctx, lhs, rhs, expected_int, op_span)?;
+                if matches!(op, BinOp::Div | BinOp::Rem) && matches!(t, IntTy::TParam(_)) {
+                    return Err(Diagnostic {
+                        name: "concepts.template_div".into(),
+                        title: "division on a type parameter".into(),
+                        span: op_span,
+                        label: "`/`/`%` on `T`-typed values needs signedness \
+                                knowledge; not yet supported in templates \
+                                (ADR 0009 slice 1)"
+                            .into(),
+                        notes: vec![],
+                    });
+                }
                 Ty::Int(t)
             } else if op.is_comparison() {
                 let _t = infer_int_pair(ctx, lhs, rhs, None, op_span)?;
