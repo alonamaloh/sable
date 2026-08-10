@@ -691,4 +691,52 @@ theorem ediv_mul_le_self (a b : Int) (_ha : 0 ≤ a) (hb : 1 ≤ b) :
   rw [Int.mul_comm]
   omega
 
+-- ---------------------------------------------------------------- gcd
+
+/-- Euclid as a ghost def, spliceable: the spec target for gcd. -/
+def igcd (a b : Int) : Int := if b ≤ 0 then a else igcd b (a % b)
+termination_by b.toNat
+decreasing_by
+  have h1 := Int.emod_nonneg a (by omega : b ≠ 0)
+  have h2 := Int.emod_lt_of_pos a (by omega : 0 < b)
+  omega
+
+theorem igcd_zero (a : Int) : igcd a 0 = a := by
+  rw [igcd, if_pos (by omega)]
+
+/-- The loop step: one Euclid round preserves the gcd. -/
+theorem igcd_step (x y : Int) (hy : 1 ≤ y) : igcd y (x % y) = igcd x y := by
+  conv => rhs; rw [igcd]
+  rw [if_neg (by omega)]
+
+/-- The remainder strictly shrinks: gcd's ghost variant decreases. -/
+theorem emod_lt (x y : Int) (hy : 1 ≤ y) : x % y < y :=
+  Int.emod_lt_of_pos x (by omega)
+
+theorem emod_nonneg' (x y : Int) (hy : 1 ≤ y) : 0 ≤ x % y :=
+  Int.emod_nonneg x (by omega)
+
+/-- Honesty check: on the naturals, igcd IS Lean's gcd. -/
+theorem igcd_eq_gcd (a b : Int) (ha : 0 ≤ a) (hb : 0 ≤ b) :
+    igcd a b = Int.gcd a b := by
+  revert ha hb
+  fun_induction igcd a b with
+  | case1 a b h =>
+      intro ha hb
+      have hb0 : b = 0 := by omega
+      subst hb0
+      simp [Int.gcd]
+      omega
+  | case2 a b h ih =>
+      intro ha hb
+      have h1 := Int.emod_nonneg a (by omega : b ≠ 0)
+      have h2 := ih (by omega) h1
+      rw [h2]
+      have hnab : (a % b).natAbs = a.natAbs % b.natAbs := by
+        rw [Int.natAbs_emod a (by omega : b ≠ 0), if_pos (Or.inl ha)]
+      have hg : Int.gcd b (a % b) = Int.gcd a b := by
+        rw [Int.gcd, Int.gcd, hnab, Nat.gcd_comm b.natAbs, ← Nat.gcd_rec,
+            Nat.gcd_comm]
+      rw [hg]
+
 end BignumProbe

@@ -646,6 +646,10 @@ impl GhostDefs {
 /// `name (p q : ty) (r : ty) : RetTy := body`
 fn parse_ghost_def(text: &str) -> Option<(Vec<String>, String, S)> {
     let (header, body) = text.split_once(":=")?;
+    // Well-founded defs carry `termination_by`/`decreasing_by` tails whose
+    // tactic text is not clause language (`:=`, ascriptions) — the monitor
+    // only needs the equation, so cut the tail before tokenizing.
+    let body = body.split("termination_by").next().unwrap_or(body);
     let header = header.trim();
     let name_end = header
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))

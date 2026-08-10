@@ -1,5 +1,5 @@
 // Dynamic checks for the bignum layer: the natVal contracts of
-// cmp/add/sub/mul/div/rem monitored per call, loop invariants (weighted
+// cmp/add/sub/mul/div/rem/gcd monitored per call, loop invariants (weighted
 // carry and borrow sums, the schoolbook accumulator, the double-and-
 // subtract quotient relation with its ghost natVal variant) checked per
 // iteration, and the normalization invariant at init exits, RAII drops,
@@ -223,10 +223,42 @@ fn rem(&Nat a, &Nat b) -> Nat {
     var r = sub(&a, &p);
     return r;
 }
-// ------------------------------ discharges ------------------------------
-// The value-level reasoning: normalization at init exit, the trim
-// step, and the cmp closers (first-difference, shorter-is-smaller,
-// pointwise-equal-means-equal), all through the in-file lemmas.
+
+/// def igcd (a b : int) : int := if b ≤ 0 then a else igcd b (a % b)
+/// termination_by b.toNat
+/// decreasing_by
+///   have h1 := Int.emod_nonneg a (by omega : b ≠ 0)
+///   have h2 := Int.emod_lt_of_pos a (by omega : 0 < b)
+///   omega
+
+// Euclid, riding entirely on rem's contract: the invariant carries the
+// gcd of the working pair back to the inputs through igcd_step, the
+// ghost value natVal y.limbs is the termination measure (rem's post
+// plus emod_lt gives strict decrease), and igcd_zero closes the exit.
+// igcd provably agrees with Lean's own Int.gcd (igcd_eq_gcd).
+
+/// pre  a.limbs.len + b.limbs.len ≤ 576460752303423488
+/// post #[label(gcd)] natVal result.limbs = igcd (natVal a.limbs) (natVal b.limbs)
+fn gcd(&Nat a, &Nat b) -> Nat {
+    [u32] zarr = alloc_array<u32>(1, 0);
+    var zero = Nat::from_prefix(&zarr, 0);
+    var x = add(&a, &zero);
+    var y = add(&b, &zero);
+    i32 c = cmp(&y, &zero);
+    /// invariant igcd (natVal x.limbs) (natVal y.limbs) = igcd (natVal a.limbs) (natVal b.limbs)
+    /// invariant (c = 0 ↔ natVal y.limbs = 0)
+    /// invariant c = -1 ∨ c = 0 ∨ c = 1
+    /// invariant x.limbs.len ≤ a.limbs.len + b.limbs.len
+    /// invariant y.limbs.len ≤ a.limbs.len + b.limbs.len
+    /// variant   natVal y.limbs
+    while (c != 0) {
+        var t = rem(&x, &y);
+        x = add(&y, &zero);
+        y = add(&t, &zero);
+        c = cmp(&y, &zero);
+    }
+    return x;
+}
 
 // Monitored assertion: the pre is the check.
 /// pre x = y
@@ -361,4 +393,49 @@ fn test_div_by_one() {
     [u32] zs = [ 1 ];
     var z = Nat::from_prefix(&zs, 0);
     expect_eq(cmp(&m, &z), 0);
+}
+
+fn test_gcd_basics() {
+    [u32] xs = [ 12 ];
+    var a = Nat::from_prefix(&xs, 1);
+    [u32] ys = [ 18 ];
+    var b = Nat::from_prefix(&ys, 1);
+    var g = gcd(&a, &b);
+    [u32] es = [ 6 ];
+    var e = Nat::from_prefix(&es, 1);
+    expect_eq(cmp(&g, &e), 0);
+    var g2 = gcd(&b, &a);
+    expect_eq(cmp(&g2, &e), 0);
+}
+
+fn test_gcd_zero_and_self() {
+    [u32] xs = [ 40, 2 ];
+    var a = Nat::from_prefix(&xs, 2);
+    [u32] zs = [ 1 ];
+    var z = Nat::from_prefix(&zs, 0);
+    var g = gcd(&a, &z);
+    expect_eq(cmp(&g, &a), 0);
+    var g2 = gcd(&z, &a);
+    expect_eq(cmp(&g2, &a), 0);
+    var g3 = gcd(&a, &a);
+    expect_eq(cmp(&g3, &a), 0);
+}
+
+fn test_gcd_coprime_and_multilimb() {
+    [u32] xs = [ 35 ];
+    var a = Nat::from_prefix(&xs, 1);
+    [u32] ys = [ 64 ];
+    var b = Nat::from_prefix(&ys, 1);
+    var g = gcd(&a, &b);
+    [u32] os = [ 1 ];
+    var one = Nat::from_prefix(&os, 1);
+    expect_eq(cmp(&g, &one), 0);
+    [u32] cs = [ 0, 6 ];
+    var c = Nat::from_prefix(&cs, 2);
+    [u32] ds = [ 0, 4 ];
+    var d = Nat::from_prefix(&ds, 2);
+    var g2 = gcd(&c, &d);
+    [u32] es = [ 0, 2 ];
+    var e = Nat::from_prefix(&es, 2);
+    expect_eq(cmp(&g2, &e), 0);
 }
