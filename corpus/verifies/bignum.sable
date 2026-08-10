@@ -598,6 +598,116 @@ fn sub(&Nat a, &Nat b) -> Nat {
     return r;
 }
 
+/// theorem valIn_zeros (a : Sable.Seq Int) (i n : int)
+///     (hz : ∀ k, i ≤ k → k < n → a.get k = 0) : valIn a i n = 0 := by
+///   revert hz
+///   fun_induction valIn a i n with
+///   | case1 i h ih =>
+///       intro hz
+///       have h1 := ih (fun k hk1 hk2 => hz k (by omega) hk2)
+///       have h2 := hz i (by omega) h
+///       omega
+///   | case2 i h =>
+///       intro _
+///       omega
+
+/// theorem mul_bound (x y : int)
+///     (hx : 0 ≤ x ∧ x ≤ 4294967295) (hy : 0 ≤ y ∧ y ≤ 4294967295) :
+///     0 ≤ x * y ∧ x * y ≤ 18446744065119617025 := by
+///   constructor
+///   · exact Int.mul_nonneg hx.1 hy.1
+///   · calc x * y ≤ x * 4294967295 := Int.mul_le_mul_of_nonneg_left hy.2 hx.1
+///       _ ≤ 4294967295 * 4294967295 := Int.mul_le_mul_of_nonneg_right hx.2 (by omega)
+///       _ = 18446744065119617025 := by decide
+
+/// theorem mul_inner_step (out a b : Sable.Seq Int) (i j n lb carry t : int)
+///     (hi : 0 ≤ i) (hj : 0 ≤ j) (hjlb : j < lb) (hin : i + lb ≤ n)
+///     (ht : t = out.get (i + j) + a.get i * b.get j + carry)
+///     (hinv : valIn out 0 n + carry * pw (i + j)
+///           = valIn a 0 i * valIn b 0 lb + a.get i * valIn b 0 j * pw i) :
+///     valIn (out.set (i + j) (t % 4294967296)) 0 n
+///         + t / 4294967296 * pw (i + (j + 1))
+///       = valIn a 0 i * valIn b 0 lb
+///       + a.get i * valIn b 0 (j + 1) * pw i := by
+///   rw [show i + (j + 1) = i + j + 1 from by omega]
+///   have hset := valIn_set out 0 n (i + j) (t % 4294967296) (by omega) (by omega)
+///   rw [show i + j - 0 = i + j from by omega] at hset
+///   have hp1 : pw (i + j + 1) = 4294967296 * pw (i + j) :=
+///     pw_succ (i + j) (by omega)
+///   have hkey : valIn (out.set (i + j) (t % 4294967296)) 0 n
+///       + t / 4294967296 * pw (i + j + 1)
+///       = valIn out 0 n + (t - out.get (i + j)) * pw (i + j) := by
+///     have hc := carry_split t (pw (i + j))
+///     rw [hset, hp1, Int.sub_mul, Int.sub_mul]
+///     omega
+///   have hsb : valIn b 0 (j + 1) = valIn b 0 j + b.get j * pw j := by
+///     have h := valIn_snoc b 0 j (by omega)
+///     rw [show j - 0 = j from by omega] at h
+///     exact h
+///   have hab : (t - out.get (i + j)) * pw (i + j)
+///       = a.get i * b.get j * pw (i + j) + carry * pw (i + j) := by
+///     rw [ht]
+///     have e : out.get (i + j) + a.get i * b.get j + carry - out.get (i + j)
+///            = a.get i * b.get j + carry := by omega
+///     rw [e, Int.add_mul]
+///   have hd : a.get i * valIn b 0 (j + 1) * pw i
+///       = a.get i * valIn b 0 j * pw i + a.get i * b.get j * pw (i + j) := by
+///     rw [hsb, Int.mul_add, Int.add_mul, pw_add i j hi hj]
+///     have e : a.get i * (b.get j * pw j) * pw i
+///            = a.get i * b.get j * (pw i * pw j) := by
+///       ac_rfl
+///     rw [e]
+///   rw [hkey, hab, hd]
+///   omega
+
+/// theorem mul_outer_close (out a b : Sable.Seq Int) (i n lb carry : int)
+///     (hi : 0 ≤ i) (hlb : 0 ≤ lb) (hin : i + lb < n)
+///     (hzero : out.get (i + lb) = 0)
+///     (hinv : valIn out 0 n + carry * pw (i + lb)
+///           = valIn a 0 i * valIn b 0 lb + a.get i * valIn b 0 lb * pw i) :
+///     valIn (out.set (i + lb) carry) 0 n
+///       = valIn a 0 (i + 1) * valIn b 0 lb := by
+///   have hset := valIn_set out 0 n (i + lb) carry (by omega) (by omega)
+///   rw [show i + lb - 0 = i + lb from by omega, hzero, Int.sub_zero] at hset
+///   have hsa : valIn a 0 (i + 1) = valIn a 0 i + a.get i * pw i := by
+///     have h := valIn_snoc a 0 i (by omega)
+///     rw [show i - 0 = i from by omega] at h
+///     exact h
+///   rw [hset, hsa, Int.add_mul]
+///   have e : a.get i * pw i * valIn b 0 lb
+///          = a.get i * valIn b 0 lb * pw i := by
+///     rw [Int.mul_assoc, Int.mul_comm (pw i) (valIn b 0 lb), ← Int.mul_assoc]
+///   rw [e]
+///   omega
+
+// --------------------------- multiplication -----------------------------
+
+/// pre  a.limbs.len + b.limbs.len ≤ 4611686018427387904
+/// post #[label(prod)] natVal result.limbs = natVal a.limbs * natVal b.limbs
+fn mul(&Nat a, &Nat b) -> Nat {
+    u64 la = a.limbs.len;
+    u64 lb = b.limbs.len;
+    u64 n = la + lb;
+    [u32] out = alloc_array<u32>(n, 0);
+    /// invariant valIn out 0 n = valIn a.limbs 0 i * valIn b.limbs 0 lb
+    /// invariant ∀ k, i + lb ≤ k → k < n → out.get k = 0
+    for (u64 i : range(la)) {
+        u64 carry = 0;
+        /// invariant carry ≤ 4294967295
+        /// invariant valIn out 0 n + carry * pw (i + j) = valIn a.limbs 0 i * valIn b.limbs 0 lb + a.limbs.get i * valIn b.limbs 0 j * pw i
+        /// invariant ∀ k, i + lb ≤ k → k < n → out.get k = 0
+        for (u64 j : range(lb)) {
+            u64 t = widen<u64>(out[i + j]) + widen<u64>(a.limbs[i]) * widen<u64>(b.limbs[j]) + carry;
+            out[i + j] = narrow<u32>(t % 4294967296);
+            carry = t / 4294967296;
+        }
+        out[i + lb] = narrow<u32>(carry);
+    }
+    u64 rl = trim_len(&out);
+    var r = Nat::from_prefix(&out, rl);
+    return r;
+}
+
 // ------------------------------ discharges ------------------------------
 // The value-level reasoning: normalization at init exit, the trim
 // step, and the cmp closers (first-difference, shorter-is-smaller,
@@ -894,6 +1004,76 @@ fn sub(&Nat a, &Nat b) -> Nat {
 ///       h_pre_natval_b_limbs_natval_a
 ///       h_inv_valin_out_0_i_borrow_pw
 ///   rw [hb0] at h_inv_valin_out_0_i_borrow_pw
+///   rw [h_result]
+///   simp only [natVal] at *
+///   rw [h_out_len, h_stale_alloc2] at h_trim_len_post_value
+///   omega
+
+// The mul discharges: the zeroed accumulator base case, the inner
+// carry step (the genuine summation rearrangement), the row close
+// storing the leftover carry into a still-zero slot, the u64 product
+// headroom, and the exit composition.
+
+/// discharge mul.inv_init.valin_out_0_n_valin_a_limbs_0_i_valin_b by
+///   rw [valIn_nil a.limbs 0 0 (by omega), Int.zero_mul]
+///   exact valIn_zeros out 0 (a.limbs.len + b.limbs.len)
+///     (fun k hk1 hk2 => h_alloc3 k (by omega) (by omega))
+
+/// discharge mul.inv_init.k_i_lb_k_k_n_out_get_k_0 by
+///   intro k hk1 hk2
+///   exact h_alloc3 k (by omega) (by omega)
+
+/// discharge mul.inv_init.valin_out_0_n_carry_pw_i_j_valin_a_limbs by
+///   rw [valIn_nil b.limbs 0 0 (by omega), Int.mul_zero, Int.zero_mul]
+///   omega
+
+/// discharge mul.overflow.widen_u64_a_limbs_i_widen_u64_b_limbs_j by
+///   sable_norm
+///   have hb := mul_bound (a.limbs.get i) (b.limbs.get j)
+///     (h_field_limbs_elems i (by omega) (by omega))
+///     (h_field_limbs_elems_2 j (by omega) (by omega))
+///   omega
+
+/// discharge mul.overflow.widen_u64_out_i_j_widen_u64_a_limbs_i_wi by
+///   sable_norm
+///   have hb := mul_bound (a.limbs.get i) (b.limbs.get j)
+///     (h_field_limbs_elems i (by omega) (by omega))
+///     (h_field_limbs_elems_2 j (by omega) (by omega))
+///   omega
+
+/// discharge mul.overflow.widen_u64_out_i_j_widen_u64_a_limbs_i_wi.2 by
+///   sable_norm
+///   have hb := mul_bound (a.limbs.get i) (b.limbs.get j)
+///     (h_field_limbs_elems i (by omega) (by omega))
+///     (h_field_limbs_elems_2 j (by omega) (by omega))
+///   omega
+
+/// discharge mul.inv_preserved.valin_out_0_n_carry_pw_i_j_valin_a_limbs by
+///   exact mul_inner_step out a.limbs b.limbs i j (a.limbs.len + b.limbs.len)
+///     b.limbs.len carry _ (by omega) (by omega) (by omega) (by omega) rfl
+///     h_inv_valin_out_0_n_carry_pw_i
+
+/// discharge mul.inv_preserved.k_i_lb_k_k_n_out_get_k_0 by
+///   intro k hk1 hk2
+///   rw [Sable.Seq.get_set, if_neg (by omega)]
+///   exact h_inv_k_i_lb_k_k_n_out_get_k_0 k hk1 hk2
+
+/// discharge mul.inv_preserved.k_i_lb_k_k_n_out_get_k_0.2 by
+///   intro k hk1 hk2
+///   rw [Sable.Seq.get_set, if_neg (by omega)]
+///   exact h_inv_k_i_lb_k_k_n_out_get_k_0 k (by omega) hk2
+
+/// discharge mul.inv_preserved.valin_out_0_n_valin_a_limbs_0_i_valin_b by
+///   have hj : j = b.limbs.len := by omega
+///   rw [hj] at h_inv_valin_out_0_n_carry_pw_i
+///   exact mul_outer_close out a.limbs b.limbs i (a.limbs.len + b.limbs.len)
+///     b.limbs.len carry (by omega) (by omega) (by omega)
+///     (h_inv_k_i_lb_k_k_n_out_get_k_0 (i + b.limbs.len) (by omega) (by omega))
+///     h_inv_valin_out_0_n_carry_pw_i
+
+/// discharge mul.post.prod by
+///   have hin : i = a.limbs.len := by omega
+///   rw [hin] at h_inv_valin_out_0_n_valin_a_li
 ///   rw [h_result]
 ///   simp only [natVal] at *
 ///   rw [h_out_len, h_stale_alloc2] at h_trim_len_post_value
