@@ -1,0 +1,12 @@
+// expect-error: class.use_after_move
+// Classes are affine: a by-value argument consumes the local, so the
+// moved-from name is dead.
+
+use lib_cls;
+
+fn caller() -> u64 {
+    var i = Cell::make(3);
+    var a = Holder::hold(i);
+    var b = Holder::hold(i);
+    return 0;
+}

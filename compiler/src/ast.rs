@@ -307,9 +307,14 @@ pub enum ExprKind {
         method_span: Span,
         args: Vec<Expr>,
     },
-    /// `&a` / `&mut a` call argument — test functions only.
+    /// `&a` / `&mut a` call argument, or `&x.f` / `&self.f` — a borrow
+    /// of a class-valued field (ADR 0020: borrowing a *place*, not
+    /// only a local).
     Borrow {
         array: String,
+        /// Some for a field borrow; the base is then a class-typed
+        /// name (or `self`).
+        field: Option<String>,
         mutable: bool,
     },
 }

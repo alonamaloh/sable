@@ -1,0 +1,20 @@
+// Helper module: a class with a class-valued field, for the affine
+// move guards.
+
+pub class Cell {
+    u64 v;
+
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+pub class Holder {
+    Cell c;
+
+    /// post self.c.v = k.v
+    init hold(Cell k) {
+        self.c = k;
+    }
+}

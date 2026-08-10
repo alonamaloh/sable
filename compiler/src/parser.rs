@@ -600,6 +600,14 @@ impl<'a> Parser<'a> {
             let end = self.expect(Tok::RBracket)?.span;
             return Ok((Ty::Array(elem, mutability), start.join(end)));
         }
+        // `Nat m` — a class taken by value: the argument is moved into
+        // the callee (classes are affine).
+        if let Tok::Ident(n) = self.peek() {
+            if let Some(ci) = self.class_names.iter().position(|c| c == n) {
+                let span = self.bump().span;
+                return Ok((Ty::Class(ci), span));
+            }
+        }
         self.scalar_ty()
     }
 
@@ -696,8 +704,16 @@ impl<'a> Parser<'a> {
                         span: fspan,
                     });
                 }
-                Tok::Ident(_) => {
-                    let (ty, _) = self.scalar_ty()?;
+                Tok::Ident(n) => {
+                    // A class-typed field: the class owns the value
+                    // (dropped with it, in reverse declaration order).
+                    let ty = match self.class_names.iter().position(|c| *c == n) {
+                        Some(ci) => {
+                            self.bump();
+                            Ty::Class(ci)
+                        }
+                        None => self.scalar_ty()?.0,
+                    };
                     let (fname, fspan) = self.ident()?;
                     self.expect(Tok::Semi)?;
                     fields.push(Field {
@@ -1592,6 +1608,7 @@ impl<'a> Parser<'a> {
                                 init: "from_bytes".into(),
                                 args: vec![Expr {
                                     kind: ExprKind::Borrow {
+                                        field: None,
                                         array: temp,
                                         mutable: false,
                                     },
@@ -2419,8 +2436,20 @@ impl<'a> Parser<'a> {
                     false
                 };
                 let (array, aspan) = self.ident()?;
+                // `&x.f` — borrow a class-valued field.
+                let (field, aspan) = if self.at(&Tok::Dot) {
+                    self.bump();
+                    let (f, fspan) = self.ident()?;
+                    (Some(f), fspan)
+                } else {
+                    (None, aspan)
+                };
                 Ok(Expr {
-                    kind: ExprKind::Borrow { array, mutable },
+                    kind: ExprKind::Borrow {
+                        array,
+                        field,
+                        mutable,
+                    },
                     span: span.join(aspan),
                     ty: None,
                 })

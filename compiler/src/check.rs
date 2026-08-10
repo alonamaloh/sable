@@ -34,6 +34,10 @@ type CResult<T> = Result<T, Diagnostic>;
 struct VarInfo {
     ty: Ty,
     initialized: bool,
+    /// Moved out (ADR 0020): classes are affine, so passing one by
+    /// value consumes the local. A moved-from name is dead — reading
+    /// it is an error, and it is not dropped at scope end.
+    moved: bool,
     /// Declared `mut` (ADR 0016). Params are immutable; `self.f`
     /// pseudo-vars are governed by the receiver kind instead.
     mutable: bool,
@@ -155,7 +159,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             }
             let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
                 for p in params {
-                    let ok = matches!(p.ty, Ty::Int(_))
+                    // Class parameters: by value (moved in) or shared
+                    // borrow (ADR 0020).
+                    let ok = matches!(p.ty, Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(_))
                         || (allow_shared_arrays
                             && matches!(p.ty, Ty::Array(_, Mutability::Shared)));
                     if !ok {
@@ -337,6 +343,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 VarInfo {
                     ty: p.ty,
                     initialized: true,
+                    moved: false,
                     mutable: false,
                 },
             );
@@ -389,6 +396,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 VarInfo {
                     ty: p.ty,
                     initialized: true,
+                    moved: false,
                     mutable: false,
                 },
             );
@@ -432,6 +440,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: p.ty,
                         initialized: true,
+                    moved: false,
                         mutable: false,
                     },
                 );
@@ -442,6 +451,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: *fty,
                         initialized: false,
+                    moved: false,
                         mutable: true,
                     },
                 );
@@ -486,6 +496,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: p.ty,
                         initialized: true,
+                    moved: false,
                         mutable: false,
                     },
                 );
@@ -496,6 +507,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: *fty,
                         initialized: true,
+                    moved: false,
                         mutable: true,
                     },
                 );
@@ -580,6 +592,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: p.ty,
                             initialized: true,
+                    moved: false,
                             mutable: false,
                         },
                     );
@@ -590,6 +603,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: *fty,
                             initialized: false,
+                    moved: false,
                             mutable: true,
                         },
                     );
@@ -633,6 +647,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: p.ty,
                             initialized: true,
+                    moved: false,
                             mutable: false,
                         },
                     );
@@ -643,6 +658,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: *fty,
                             initialized: true,
+                    moved: false,
                             mutable: true,
                         },
                     );
@@ -737,6 +753,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     VarInfo {
                         ty: *ty,
                         initialized: init.is_some(),
+                        moved: false,
                         mutable: *mutable,
                     },
                 );
@@ -963,6 +980,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     VarInfo {
                         ty: t,
                         initialized: true,
+                    moved: false,
                         mutable: *mutable,
                     },
                 );
@@ -1180,9 +1198,22 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
+                if v.moved {
+                    return Err(Diagnostic {
+                        name: "class.use_after_move".into(),
+                        title: format!("`{name}` has been moved out"),
+                        span,
+                        label: "the value was passed by value earlier".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "classes are affine: a by-value argument consumes the local                              (ADR 0020); borrow with `&` to keep it"
+                                .into(),
+                        )],
+                    });
+                }
                 if matches!(v.ty, Ty::Class(_)) {
-                    // The one class-value position allowed: moving a
-                    // local out through `return` (ADR 0010).
+                    // Class values move: out through `return`, or into
+                    // a by-value parameter (ADR 0010/0020).
                     if matches!(expected, Some(Ty::Class(_))) {
                         return Ok(v.ty);
                     }
@@ -1631,6 +1662,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
+                    Ty::Class(_) => {
+                        check_expr(ctx, arg, Some(p.ty))?;
+                        mark_moved(ctx, arg)?;
+                    }
                     _ => check_expr(ctx, arg, Some(p.ty)).map(|_| ())?,
                 }
             }
@@ -1733,7 +1768,82 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
         },
-        ExprKind::Borrow { array, mutable } => {
+        ExprKind::Borrow {
+            array,
+            field,
+            mutable,
+        } => {
+            // `&x.f` / `&self.f` — borrowing a class-valued field
+            // (ADR 0020). The base must name a class; the field must
+            // itself be class-typed.
+            if let Some(fname) = field {
+                if *mutable {
+                    return Err(Diagnostic {
+                        name: "class.mut_borrow_deferred".into(),
+                        title: "`&mut` class borrows are not supported yet".into(),
+                        span,
+                        label: "shared borrows only (ADR 0010)".into(),
+                        notes: vec![],
+                    });
+                }
+                let base = if array == "self" {
+                    match ctx.in_class {
+                        Some((ci, _)) => Ty::ClassRef(ci),
+                        None => {
+                            return Err(Diagnostic {
+                                name: "type.self_outside_class".into(),
+                                title: "`self` outside a class member".into(),
+                                span,
+                                label: "no receiver here".into(),
+                                notes: vec![],
+                            });
+                        }
+                    }
+                } else {
+                    match ctx.vars.get(array.as_str()).map(|v| v.ty) {
+                        Some(t) => t,
+                        None => {
+                            return Err(Diagnostic {
+                                name: "type.unknown_name".into(),
+                                title: format!("unknown name `{array}`"),
+                                span,
+                                label: "not in scope".into(),
+                                notes: vec![],
+                            });
+                        }
+                    }
+                };
+                let (Ty::Class(bci) | Ty::ClassRef(bci)) = base else {
+                    return Err(Diagnostic {
+                        name: "type.not_a_class".into(),
+                        title: format!("`{array}` is not a class value"),
+                        span,
+                        label: "field borrows need a class base".into(),
+                        notes: vec![],
+                    });
+                };
+                let fld = ctx.class_metas[bci]
+                    .fields
+                    .iter()
+                    .find(|(n, _)| n == fname)
+                    .ok_or_else(|| Diagnostic {
+                        name: "type.unknown_field".into(),
+                        title: format!("class has no field `{fname}`"),
+                        span,
+                        label: "unknown field".into(),
+                        notes: vec![],
+                    })?;
+                let Ty::Class(fci) = fld.1 else {
+                    return Err(Diagnostic {
+                        name: "type.not_a_class".into(),
+                        title: format!("field `{fname}` is not a class value"),
+                        span,
+                        label: "only class-valued fields are borrowed this way".into(),
+                        notes: vec![],
+                    });
+                };
+                return Ok(Ty::ClassRef(fci));
+            }
             // `&c` of a class local, or a shared re-borrow of a `&C`
             // parameter passed along to a callee (ADR 0010).
             if let Some(Ty::Class(ci) | Ty::ClassRef(ci)) =
@@ -1922,6 +2032,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 let borrow = |name: String, span: Span| Expr {
                     kind: ExprKind::Borrow {
                         array: name,
+                        field: None,
                         mutable: false,
                     },
                     span,
@@ -2080,6 +2191,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
+                    Ty::Class(_) => {
+                        check_expr(ctx, arg, Some(pty))?;
+                        mark_moved(ctx, arg)?;
+                    }
                     _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }
             }
@@ -2091,6 +2206,20 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     };
     e.ty = Some(ty);
     Ok(ty)
+}
+
+/// A class value passed by value is moved out of the local that named
+/// it (ADR 0020). Only a plain name can be moved: a borrow keeps the
+/// value, and a call result is already a temporary.
+fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
+    if let ExprKind::Var(name) = &arg.kind {
+        if let Some(v) = ctx.vars.get_mut(name.as_str()) {
+            if matches!(v.ty, Ty::Class(_)) {
+                v.moved = true;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl<'a> Ctx<'a> {

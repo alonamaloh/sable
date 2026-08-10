@@ -60,6 +60,8 @@ fresh-state call-site treatment arrays get), class-valued fields (drop
 order), methods taking/returning classes, borrows of generic class
 instances.
 
+**Slice B, partly landed — see ADR 0020**: class-valued fields, by-value class parameters (moves), and borrowing a class field. `&mut C`, local-to-local moves, and generic-class field borrows remain deferred.
+
 **Landed since (forced by bignum division):** shared re-borrow of `&C`
 parameters (passing a borrow along to a callee), and class-local
 reassignment from call/constructor results — a move-in; the old value is

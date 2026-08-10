@@ -4,6 +4,7 @@
 // always.
 
 use class_values;
+use class_fields;
 
 fn test_class_values() {
     var x = Range::make(1, 5);
@@ -14,4 +15,14 @@ fn test_class_values() {
     demo();
     var z = union_of(&x, &x);
     width(&z);
+}
+
+// Class-valued fields, moves, and field borrows (ADR 0020).
+fn test_class_fields() {
+    var i = Inner::make(7);
+    var o = Outer::wrap(i, 3);
+    read_inner(&o.inner);
+    o.inner_value();
+    nest_and_read();
+    nested_method();
 }

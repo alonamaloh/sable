@@ -1,0 +1,62 @@
+// Class values as places (ADR 0020): a class-valued field, a class
+// taken by value (moved in), and a borrow of a field — the three
+// pieces that let ownership talk about parts of things, not only
+// whole locals.
+
+pub class Inner {
+    u64 v;
+
+    /// invariant v ≤ 1000
+
+    /// pre  x ≤ 1000
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+/// post result = i.v
+pub fn read_inner(&Inner i) -> u64 {
+    return i.v;
+}
+
+pub class Outer {
+    Inner inner;
+    u64 tag;
+
+    /// invariant tag ≤ 5
+
+    /// pre  t ≤ 5
+    /// post self.inner.v = k.v
+    /// post self.tag = t
+    init wrap(Inner k, u64 t) {
+        self.inner = k;
+        self.tag = t;
+    }
+
+    // Direct nested reads (`self.inner.v`) are not surface syntax yet;
+    // borrowing the field and using an accessor is today's spelling.
+    /// post result = self.inner.v
+    fn inner_value(&self) -> u64 {
+        u64 r = read_inner(&self.inner);
+        return r;
+    }
+}
+
+// The move is the point: `i` is consumed by `Outer::wrap`, and the
+// nested value stays reachable through the field.
+/// post result = 7
+pub fn nest_and_read() -> u64 {
+    var i = Inner::make(7);
+    var o = Outer::wrap(i, 3);
+    u64 r = read_inner(&o.inner);
+    return r;
+}
+
+/// post result = 42
+pub fn nested_method() -> u64 {
+    var i = Inner::make(42);
+    var o = Outer::wrap(i, 0);
+    u64 r = o.inner_value();
+    return r;
+}

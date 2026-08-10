@@ -67,11 +67,13 @@ pub struct ClassEmit {
     pub span: Span,
 }
 
-fn lean_field_ty(ty: Ty) -> String {
+fn lean_field_ty(ty: Ty, classes: &[ClassDecl]) -> String {
     match ty {
         Ty::Int(_) => "Int".into(),
         Ty::Bool => "Bool".into(),
         Ty::Array(..) => "Sable.Seq Int".into(),
+        // A class-valued field is a nested structure (ADR 0020).
+        Ty::Class(ci) => lean_class_name(&classes[ci].name),
         _ => unreachable!("checked: field types"),
     }
 }
@@ -106,7 +108,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 fields: c
                     .fields
                     .iter()
-                    .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
+                    .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes)))
                     .collect(),
                 span: c.name_span,
             })
@@ -121,7 +123,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             fields: c
                 .fields
                 .iter()
-                .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
+                .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes)))
                 .collect(),
             span: c.name_span,
         });
@@ -132,7 +134,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         let binders: Vec<(String, String)> = c
             .fields
             .iter()
-            .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
+            .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes)))
             .collect();
         for (i, inv) in c.invariants.iter().enumerate() {
             let mut wf_binders: Vec<(String, String)> = Vec::new();
@@ -436,7 +438,9 @@ impl<'a> Generator<'a> {
                 .iter()
                 .map(|fld| {
                     match self.env.get(&format!("self.{}", fld.name)) {
-                        Some(Val::Int(s)) | Some(Val::Arr(s)) => format!("{s}"),
+                        Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) => {
+                            format!("{s}")
+                        }
                         Some(Val::Prop(p)) => format!("(decide {p})"),
                         _ => "0".to_string(), // unreachable: checked init
                     }
@@ -447,7 +451,7 @@ impl<'a> Generator<'a> {
         let mut map = HashMap::new();
         map.insert("self".to_string(), literal.clone());
         for fld in &class.fields {
-            if let Some(Val::Int(s)) | Some(Val::Arr(s)) =
+            if let Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) =
                 self.env.get(&format!("self.{}", fld.name))
             {
                 map.insert(fld.name.clone(), s.clone());
@@ -533,6 +537,14 @@ impl<'a> Generator<'a> {
                         ),
                     );
                 }
+                // A class-valued field carries its own class's facts and
+                // invariant, one level down (ADR 0020).
+                Ty::Class(ci) => {
+                    let inner = self.classes[ci].clone();
+                    let path = format!("{binder}.{}", fld.name);
+                    self.push_class_state_facts(&inner, &path);
+                    self.push_invariant_hyps(&inner, &path);
+                }
                 _ => {}
             }
         }
@@ -568,10 +580,12 @@ impl<'a> Generator<'a> {
         for p in &self.f.params {
             self.var_tys.insert(p.name.clone(), p.ty);
             match p.ty {
-                Ty::ClassRef(ci) => {
-                    // `&C` parameter (ADR 0010): the class value with its
-                    // field facts and invariant — the method-entry
-                    // treatment, re-aimed.
+                Ty::Class(ci) | Ty::ClassRef(ci) => {
+                    // `&C` parameter (ADR 0010) or a class taken by
+                    // value (ADR 0020): the class value with its field
+                    // facts and invariant — the method-entry treatment,
+                    // re-aimed. A move and a borrow differ in the affine
+                    // discipline and at runtime, not in the logic.
                     let cd = &self.classes[ci];
                     self.binders
                         .push((p.name.clone(), lean_class_name(&cd.name)));
@@ -617,7 +631,7 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
-                Ty::Option(_) | Ty::Unit | Ty::Class(_) => {
+                Ty::Option(_) | Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
             }
@@ -831,7 +845,8 @@ impl<'a> Generator<'a> {
                     }
                     Cctx::Method(..) => {
                         let vs = match v {
-                            Val::Int(s) | Val::Arr(s) => s,
+                            Val::Int(s) | Val::Arr(s) | Val::Obj(s) => s,
+                            Val::Prop(p) => format!("(decide {p})"),
                             _ => unreachable!("checked: field value"),
                         };
                         let chain = self.self_chain();
@@ -1395,10 +1410,27 @@ impl<'a> Generator<'a> {
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
             }
-            ExprKind::Borrow { array, .. } => match self.env.get(array.as_str()) {
-                Some(Val::Obj(chain)) => Val::Obj(chain.clone()),
-                _ => Val::Arr(self.arr_str(array)),
-            },
+            ExprKind::Borrow { array, field, .. } => {
+                let base = match self.env.get(array.as_str()) {
+                    Some(Val::Obj(chain)) => Some(chain.clone()),
+                    _ => None,
+                };
+                match (base, field) {
+                    // `&x.f` — the borrowed place is the field, not the
+                    // base object (ADR 0020).
+                    (Some(chain), Some(f)) => Val::Obj(project_field(&chain, f)),
+                    (Some(chain), None) => Val::Obj(chain),
+                    (None, Some(f)) => {
+                        // `&self.f` inside a member.
+                        let selfv = match self.env.get("self") {
+                            Some(Val::Obj(chain)) => chain.clone(),
+                            _ => "self".to_string(),
+                        };
+                        Val::Obj(project_field(&selfv, f))
+                    }
+                    (None, None) => Val::Arr(self.arr_str(array)),
+                }
+            }
             ExprKind::ArrayLit(elems) => {
                 let hint = self.name_hint.take();
                 let b = self.hinted_sym("_lit", hint);
@@ -1545,8 +1577,11 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) => v,
-                        _ => unreachable!("checked: int/shared-array ctor args"),
+                        // Class args (by value or borrowed) substitute
+                        // as their symbolic structure value (ADR 0020).
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) => v,
+                        Val::Prop(p) => format!("(decide {p})"),
+                        _ => unreachable!("checked: ctor args"),
                     })
                     .collect();
                 let cd: &ClassDecl = self.class_map[class.as_str()];
@@ -2226,7 +2261,7 @@ impl<'a> Generator<'a> {
             match p.ty {
                 Ty::Int(_) => out.push((p.name.clone(), "Int".into())),
                 Ty::Bool => out.push((p.name.clone(), "Bool".into())),
-                Ty::ClassRef(ci) => {
+                Ty::Class(ci) | Ty::ClassRef(ci) => {
                     out.push((p.name.clone(), lean_class_name(&self.classes[ci].name)))
                 }
                 Ty::Array(..) => {
@@ -2235,7 +2270,7 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), "Sable.Seq Int".into()));
                     }
                 }
-                Ty::Option(_) | Ty::Unit | Ty::Class(_) => {}
+                Ty::Option(_) | Ty::Unit => {}
             }
         }
         match self.cctx {
@@ -2472,7 +2507,7 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
 /// call — conservative marking for loop havoc.
 fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
     match &e.kind {
-        ExprKind::Borrow { array, mutable } => {
+        ExprKind::Borrow { array, mutable, .. } => {
             if *mutable {
                 out.insert(array.clone());
             }

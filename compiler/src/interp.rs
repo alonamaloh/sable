@@ -757,7 +757,26 @@ impl<'a> Interp<'a> {
                 }
                 Ok(RtVal::Arr(Rc::new(RefCell::new(v))))
             }
-            ExprKind::Borrow { array, .. } => Ok(frame.vars[array.as_str()].clone()),
+            ExprKind::Borrow { array, field, .. } => {
+                let base = if array == "self" {
+                    let (class, fields) = frame.self_ctx.clone().expect("checked: member ctx");
+                    RtVal::Obj { class, fields }
+                } else {
+                    frame.vars[array.as_str()].clone()
+                };
+                match field {
+                    // `&x.f` — borrow the field's value, not the base
+                    // (ADR 0020). Sharing the Rc is the borrow.
+                    Some(f) => {
+                        let RtVal::Obj { fields, .. } = base else {
+                            unreachable!("checked: class base")
+                        };
+                        let v = fields.borrow()[f.as_str()].clone();
+                        Ok(v)
+                    }
+                    None => Ok(base),
+                }
+            }
             ExprKind::AllocArray { len, init, .. } => {
                 let n = self.eval_int(len, frame)?;
                 let v0 = self.eval_int(init, frame)?;
