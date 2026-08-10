@@ -1,0 +1,8 @@
+// Helper module: a provable overflow obligation, target of the
+// foreign-escape guard.
+
+/// pre  a <= 1000
+/// post result = a + a
+fn esc_double(u32 a) -> u32 {
+    return a + a;
+}

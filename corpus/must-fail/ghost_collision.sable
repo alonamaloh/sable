@@ -1,0 +1,13 @@
+// expect-error: module.name_collision
+// Imports are a flat namespace for ghost definitions too: under
+// separate verification, redefining an imported module's ghost would
+// silently shadow one with the other, so it is rejected like any
+// cross-module collision.
+
+use lib_ghost;
+
+/// def gtwice (x : int) : int := x * 2
+
+fn user_fn(i32 x) -> i32 {
+    return 1;
+}

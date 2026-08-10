@@ -1,0 +1,10 @@
+// Helper module: a generic class template, used by the duplicate-
+// instantiation guard.
+
+class Box<T> {
+    T val;
+
+    init new(T v) {
+        self.val = v;
+    }
+}

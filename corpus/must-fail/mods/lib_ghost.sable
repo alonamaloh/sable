@@ -1,0 +1,11 @@
+// Helper module: exports a ghost definition, used by the cross-module
+// ghost-collision guard.
+
+/// def gtwice (x : int) : int := x + x
+
+/// pre  0 <= x
+/// pre  x < 1000
+/// post result = gtwice x
+fn twice(i32 x) -> i32 {
+    return x + x;
+}

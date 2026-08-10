@@ -1,0 +1,9 @@
+// Helper module: instantiates Box<i32>; together with lib_boxb this
+// makes two sibling modules own the same generic instance.
+
+use lib_box;
+
+fn boxa_make() -> i32 {
+    var b = Box<i32>::new(5);
+    return b.val;
+}

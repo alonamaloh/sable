@@ -23,6 +23,10 @@ use std::path::{Path, PathBuf};
 pub struct ModuleInfo {
     /// Path as shown in diagnostics.
     pub display: String,
+    /// Canonical filesystem path (empty for synthesized single-module
+    /// sets) — the stable identity used by the per-module verification
+    /// cache and by cross-load span remapping.
+    pub path: PathBuf,
     /// Byte offset of this module's source in the combined string.
     pub base: usize,
     /// Length of this module's source.
@@ -48,6 +52,7 @@ impl ModuleSet {
             combined_source: source.clone(),
             modules: vec![ModuleInfo {
                 display,
+                path: PathBuf::new(),
                 base: 0,
                 len,
                 source,
@@ -177,6 +182,7 @@ fn load_file(
     let idx = loading.set.modules.len();
     loading.set.modules.push(ModuleInfo {
         display,
+        path: canonical.clone(),
         base,
         len: source.len(),
         lines: LineMap::new(&source),

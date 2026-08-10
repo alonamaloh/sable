@@ -33,8 +33,36 @@ struct MapEntry {
     target: MapTarget,
 }
 
+/// The Lean-level names a generated module file declares. Importers
+/// subtract these sets so a declaration is emitted (and verified) in
+/// exactly one file of the import DAG.
+#[derive(Default, Clone)]
+pub struct EmittedNames {
+    /// Structure names (`lean_class_name`).
+    pub classes: std::collections::HashSet<String>,
+    /// Ghost def/theorem head names.
+    pub ghosts: std::collections::HashSet<String>,
+    /// Clause well-formedness def names.
+    pub wfs: std::collections::HashSet<String>,
+    /// Obligation theorem names.
+    pub thms: std::collections::HashSet<String>,
+    /// Obligation names (escape-hatch ownership checks).
+    pub obligations: std::collections::HashSet<String>,
+}
+
+impl EmittedNames {
+    pub fn is_empty(&self) -> bool {
+        self.classes.is_empty()
+            && self.ghosts.is_empty()
+            && self.wfs.is_empty()
+            && self.thms.is_empty()
+    }
+}
+
 pub struct Emitted {
     pub lean_source: String,
+    /// What this file declares (after exclusion filtering).
+    pub names: EmittedNames,
     map: Vec<MapEntry>,
 }
 
@@ -53,18 +81,28 @@ impl Emitter {
     }
 }
 
+/// Emit a module's Lean file. `imports` are generated dependency
+/// artifacts (`import <name>` lines after `import Sable`); anything
+/// named in `exclude` is declared by one of those imports and is
+/// filtered out here — the import supplies it, already verified.
 pub fn emit(
     vc: &VcResult,
     discharges: &[crate::ast::Discharge],
     skip: &std::collections::HashSet<String>,
+    imports: &[String],
+    exclude: &EmittedNames,
 ) -> Emitted {
     let mut e = Emitter {
         buf: String::new(),
         line: 0,
     };
     let mut map = Vec::new();
+    let mut names = EmittedNames::default();
 
     e.push("import Sable");
+    for i in imports {
+        e.push(&format!("import {i}"));
+    }
     e.push("open Sable");
     e.push("set_option linter.unusedVariables false");
     // Test/CI hook: shrink or disable the grind heartbeat budget
@@ -77,6 +115,11 @@ pub fn emit(
     e.push("");
 
     for c in &vc.classes {
+        let lean_name = crate::vcgen::lean_class_name(&c.name);
+        if exclude.classes.contains(&lean_name) {
+            continue;
+        }
+        names.classes.insert(lean_name);
         let first = e.line + 1;
         e.push(&format!(
             "structure {} where",
@@ -97,6 +140,11 @@ pub fn emit(
     }
 
     for g in &vc.ghosts {
+        let head = ghost_head_name(&g.text);
+        if exclude.ghosts.contains(&head) {
+            continue;
+        }
+        names.ghosts.insert(head);
         let first = e.line + 1;
         // Non-recursive ghost defs get @[simp] so contracts naming them
         // unfold under the portfolio; recursive ones would loop and are
@@ -121,6 +169,10 @@ pub fn emit(
     }
 
     for wf in &vc.clause_wfs {
+        if exclude.wfs.contains(&wf.def_name) {
+            continue;
+        }
+        names.wfs.insert(wf.def_name.clone());
         let first = e.line + 1;
         e.push(&format!(
             "def {} {} : {} :=",
@@ -144,9 +196,11 @@ pub fn emit(
         // Deferred/assumed obligations become runtime traps or axioms;
         // no theorem is emitted (their goals are already assumed
         // downstream by the generator, which is exactly their semantics).
-        if skip.contains(&ob.name) {
+        if skip.contains(&ob.name) || exclude.thms.contains(&ob.thm_name) {
             continue;
         }
+        names.thms.insert(ob.thm_name.clone());
+        names.obligations.insert(ob.name.clone());
         let discharge = discharges.iter().find(|d| d.name == ob.name);
         let first = e.line + 1;
         e.push(&format!(
@@ -188,8 +242,18 @@ pub fn emit(
 
     Emitted {
         lean_source: e.buf,
+        names,
         map,
     }
+}
+
+/// Head name of a ghost `def`/`theorem` (the first identifier of its
+/// verbatim text).
+pub fn ghost_head_name(text: &str) -> String {
+    text.trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
 }
 
 fn binder_list(binders: &[(String, String)]) -> String {
@@ -202,11 +266,7 @@ fn binder_list(binders: &[(String, String)]) -> String {
 
 /// A ghost def is recursive if its body mentions its own head name.
 fn ghost_recursive(text: &str) -> bool {
-    let name: String = text
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
+    let name = ghost_head_name(text);
     match text.split_once(":=") {
         Some((_, body)) => !name.is_empty() && crate::vcgen::mentions(body, &name),
         None => false,
@@ -240,8 +300,46 @@ pub struct LeanMessage {
     pub data: String,
 }
 
-/// Build the prelude if needed and check the generated file.
-pub fn run_lean(repo_root: &Path, lean_file: &Path) -> Result<Vec<LeanMessage>, String> {
+/// The generated-artifact directory (`import`able compiled modules) —
+/// on `LEAN_PATH` for every check, whether or not it exists yet.
+pub fn modules_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(".sable-out").join("modules")
+}
+
+/// The full `LEAN_PATH` for checking generated files: the lake
+/// workspace's own path (prelude + toolchain; queried once per process)
+/// extended with the generated-artifact directory.
+pub fn lean_search_path(repo_root: &Path) -> Result<String, String> {
+    use std::sync::OnceLock;
+    static LAKE_PATH: OnceLock<Result<String, String>> = OnceLock::new();
+    let base = LAKE_PATH
+        .get_or_init(|| {
+            let out = Command::new("lake")
+                .args(["env", "printenv", "LEAN_PATH"])
+                .current_dir(repo_root.join("lean"))
+                .output()
+                .map_err(|err| format!("failed to run `lake env`: {err}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "`lake env printenv LEAN_PATH` failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .clone()?;
+    Ok(format!("{base}:{}", modules_dir(repo_root).display()))
+}
+
+/// Build the prelude if needed and check the generated file. With
+/// `olean_out`, additionally compile it into an importable artifact
+/// (the file must live in the modules dir, which becomes `--root` so
+/// the Lean module name matches the file stem).
+pub fn run_lean(
+    repo_root: &Path,
+    lean_file: &Path,
+    olean_out: Option<&Path>,
+) -> Result<Vec<LeanMessage>, String> {
     let lean_dir = repo_root.join("lean");
 
     // `lake build` is a fast no-op when the prelude is current, and keeps
@@ -260,14 +358,23 @@ pub fn run_lean(repo_root: &Path, lean_file: &Path) -> Result<Vec<LeanMessage>, 
         ));
     }
 
-    let output = Command::new("lake")
-        .arg("env")
-        .arg("lean")
-        .arg("--json")
+    // Direct `lean` (the elan shim resolves the pinned toolchain from
+    // `lean/`): `lake env lean` rebuilds LEAN_PATH from scratch and
+    // drops ambient additions, so the search path is passed explicitly.
+    let mut cmd = Command::new("lean");
+    cmd.arg("--json")
+        .env("LEAN_PATH", lean_search_path(repo_root)?)
+        .current_dir(&lean_dir);
+    if let Some(olean) = olean_out {
+        cmd.arg("--root")
+            .arg(modules_dir(repo_root))
+            .arg("-o")
+            .arg(olean);
+    }
+    let output = cmd
         .arg(lean_file)
-        .current_dir(&lean_dir)
         .output()
-        .map_err(|err| format!("failed to run `lake env lean`: {err}"))?;
+        .map_err(|err| format!("failed to run `lean`: {err}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut messages = Vec::new();

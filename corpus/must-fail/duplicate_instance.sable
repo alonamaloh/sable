@@ -1,0 +1,11 @@
+// expect-error: module.duplicate_decl
+// Two sibling modules each instantiate Box<i32>, so each of their
+// artifacts declares the instance; importing both would collide at the
+// Lean level. The fix is to instantiate in one shared module.
+
+use lib_boxa;
+use lib_boxb;
+
+fn dup_root() -> i32 {
+    return boxa_make();
+}

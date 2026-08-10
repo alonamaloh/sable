@@ -1,0 +1,12 @@
+// expect-error: module.foreign_escape
+// An escape hatch lives in the module that owns the obligation: under
+// separate verification an imported module's VCs are proven in its own
+// artifact, so deferring one from the importer could not take effect.
+
+use lib_escape;
+
+/// defer esc_double.overflow.a_a
+
+fn use_it() -> u32 {
+    return esc_double(7);
+}

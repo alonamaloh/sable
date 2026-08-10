@@ -217,16 +217,21 @@ struct LeanServer {
 
 impl LeanServer {
     fn spawn(lean_dir: &Path) -> Result<LeanServer, String> {
-        let mut child = Command::new("lake")
-            .arg("env")
-            .arg("lean")
+        // Direct `lean` with the explicit search path (workspace +
+        // generated-artifact dir): generated files import per-module
+        // artifacts (ADR 0013 slice 2), and their content-addressed
+        // names change with content, so a header re-import always sees
+        // the current artifact.
+        let repo_root = lean_dir.parent().ok_or("lean dir has no parent")?;
+        let mut child = Command::new("lean")
             .arg("--server")
+            .env("LEAN_PATH", crate::lean::lean_search_path(repo_root)?)
             .current_dir(lean_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|err| format!("failed to spawn `lake env lean --server`: {err}"))?;
+            .map_err(|err| format!("failed to spawn `lean --server`: {err}"))?;
         let stdin = child.stdin.take().expect("piped stdin");
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let (tx, incoming) = channel();

@@ -468,21 +468,31 @@ impl<'a> Generator<'a> {
                 }
             }
         }
-        scope_binders.extend(self.var_tys.iter().filter_map(|(name, ty)| match ty {
-            Ty::Int(_) => Some((name.clone(), "Int".to_string())),
-            Ty::Bool => Some((name.clone(), "Bool".to_string())),
-            Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
-            Ty::Class(ci) | Ty::ClassRef(ci) => {
-                Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
-            }
-            Ty::Option(_) | Ty::Unit => None,
-        }));
-        for (name, entry) in self.mut_arrays.iter() {
-            if name == "self" {
-                continue; // handled below with the class type
-            }
-            scope_binders.push((entry.clone(), "Sable.Seq Int".to_string()));
-        }
+        // Name-sorted: the maps iterate in hash order, and generated
+        // files must be byte-stable for content-addressed caching.
+        let mut vars: Vec<(String, String)> = self
+            .var_tys
+            .iter()
+            .filter_map(|(name, ty)| match ty {
+                Ty::Int(_) => Some((name.clone(), "Int".to_string())),
+                Ty::Bool => Some((name.clone(), "Bool".to_string())),
+                Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
+                Ty::Class(ci) | Ty::ClassRef(ci) => {
+                    Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
+                }
+                Ty::Option(_) | Ty::Unit => None,
+            })
+            .collect();
+        vars.sort();
+        scope_binders.extend(vars);
+        let mut olds: Vec<(String, String)> = self
+            .mut_arrays
+            .iter()
+            .filter(|(name, _)| *name != "self") // handled below with the class type
+            .map(|(_, entry)| (entry.clone(), "Sable.Seq Int".to_string()))
+            .collect();
+        olds.sort();
+        scope_binders.extend(olds);
         match self.cctx {
             Cctx::Init(c) => scope_binders.push(("self".to_string(), lean_class_name(&c.name))),
             Cctx::Method(c, _) => {
