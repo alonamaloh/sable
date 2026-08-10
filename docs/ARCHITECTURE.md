@@ -47,7 +47,10 @@ check                                 `lake env lean --json` on the generated fi
   │                                   (socket at .sable-out/daemon.sock), a warm
   │                                   Lean LSP server checks it without the
   │                                   per-invocation cold start (compiler/src/daemon.rs);
-  │                                   any daemon problem falls back to the batch path
+  │                                   any daemon problem falls back to the batch path;
+  │                                   a client killed mid-check cancels the check
+  │                                   (didClose terminates the file's worker — no
+  │                                   orphaned lean processes grinding on dead work)
 diagnose (compiler/src/diag.rs)       lean JSON messages → source map lookup →
                                       rendered error: obligation name, goal,
                                       .sable span, context, lean excerpt

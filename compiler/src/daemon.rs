@@ -28,12 +28,21 @@
 //! The client side (`try_check`) treats *any* problem — no socket, stale
 //! socket, daemon error — as "no daemon": the caller falls back to the batch
 //! path, so `sable check` never gets worse because a daemon misbehaved.
+//!
+//! Cancel-on-disconnect: while a check is in flight the daemon watches the
+//! client socket; if the client dies (killed `sable check`), the daemon
+//! `didClose`s the document, which makes Lean's server terminate that
+//! file's worker — no orphaned `lean --worker` grinding on dead work. The
+//! canceled document leaves the warm set (the next check of that file pays
+//! one cold didOpen), a fair trade against minutes of wasted CPU.
 
 use crate::lean::LeanMessage;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 pub fn socket_path(repo_root: &Path) -> PathBuf {
     repo_root.join(".sable-out").join("daemon.sock")
@@ -154,7 +163,7 @@ fn handle_request(
         }
     }
 
-    match server.check(Path::new(file)) {
+    match server.check(Path::new(file), stream) {
         Ok(messages) => {
             let messages: Vec<serde_json::Value> = messages
                 .iter()
@@ -190,7 +199,11 @@ const MAX_OPEN_DOCS: usize = 4;
 struct LeanServer {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Messages parsed off the server's stdout by a dedicated reader
+    /// thread — the check loop must poll with a timeout so it can watch
+    /// the client socket at the same time. The thread exits when the
+    /// pipe closes (server death or daemon drop-kill).
+    incoming: Receiver<Result<serde_json::Value, String>>,
     next_id: i64,
     /// Monotonic didOpen/didChange version, shared across documents.
     next_version: i64,
@@ -215,11 +228,25 @@ impl LeanServer {
             .spawn()
             .map_err(|err| format!("failed to spawn `lake env lean --server`: {err}"))?;
         let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let (tx, incoming) = channel();
+        std::thread::spawn(move || loop {
+            match read_framed(&mut stdout) {
+                Ok(msg) => {
+                    if tx.send(Ok(msg)).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err));
+                    break;
+                }
+            }
+        });
         let mut server = LeanServer {
             child,
             stdin,
-            stdout,
+            incoming,
             next_id: 0,
             next_version: 0,
             open_docs: Vec::new(),
@@ -244,7 +271,13 @@ impl LeanServer {
     }
 
     /// Check one generated .lean file; returns messages in batch-path shape.
-    fn check(&mut self, lean_file: &Path) -> Result<Vec<LeanMessage>, String> {
+    /// Watches `client` while waiting: a disconnect cancels the check by
+    /// closing the document (terminating its worker).
+    fn check(
+        &mut self,
+        lean_file: &Path,
+        client: &mut UnixStream,
+    ) -> Result<Vec<LeanMessage>, String> {
         let text = std::fs::read_to_string(lean_file)
             .map_err(|err| format!("cannot read {}: {err}", lean_file.display()))?;
         let uri = file_uri(lean_file);
@@ -299,13 +332,39 @@ impl LeanServer {
         let mut diagnostics: Option<serde_json::Value> = None;
         let mut wait_failed = false;
         let mut progress_done = false;
+        let mut canceled = false;
+        // After a cancel didClose, keep draining briefly so the server's
+        // in-flight replies for this uri are consumed rather than left to
+        // confuse the next request.
+        let mut cancel_deadline: Option<Instant> = None;
         let result = loop {
-            if wait_failed && progress_done {
+            if !canceled && wait_failed && progress_done {
                 break Ok(());
             }
-            let msg = match self.receive() {
-                Ok(m) => m,
-                Err(err) => break Err(err),
+            if let Some(deadline) = cancel_deadline {
+                if Instant::now() >= deadline {
+                    break Err("canceled: client disconnected".into());
+                }
+            }
+            let msg = match self.receive_timeout(Duration::from_millis(100)) {
+                None => {
+                    if !canceled && client_disconnected(client) {
+                        canceled = true;
+                        eprintln!(
+                            "sable daemon: client disconnected — closing {} to stop its worker",
+                            lean_file.display()
+                        );
+                        let _ = self.notify(
+                            "textDocument/didClose",
+                            serde_json::json!({ "textDocument": { "uri": uri } }),
+                        );
+                        cancel_deadline =
+                            Some(Instant::now() + Duration::from_secs(10));
+                    }
+                    continue;
+                }
+                Some(Ok(m)) => m,
+                Some(Err(err)) => break Err(err),
             };
             if msg["method"] == "textDocument/publishDiagnostics"
                 && msg["params"]["uri"] == serde_json::Value::String(uri.clone())
@@ -320,6 +379,11 @@ impl LeanServer {
                 continue;
             }
             if msg["id"] == serde_json::Value::from(wait_id) && msg.get("method").is_none() {
+                if canceled {
+                    // The worker is gone (didClose); this is the pending
+                    // waitForDiagnostics resolving, however it resolved.
+                    break Err("canceled: client disconnected".into());
+                }
                 if msg.get("error").is_none() {
                     break Ok(());
                 }
@@ -341,13 +405,16 @@ impl LeanServer {
 
         if let Err(err) = result {
             // Leave the document out of the warm set; a fresh didOpen next
-            // time is the safest way back to a known state.
+            // time is the safest way back to a known state. (On cancel the
+            // didClose already happened.)
             self.open_docs.retain(|u| *u != uri);
             self.last_diags.remove(&uri);
-            let _ = self.notify(
-                "textDocument/didClose",
-                serde_json::json!({ "textDocument": { "uri": uri } }),
-            );
+            if !canceled {
+                let _ = self.notify(
+                    "textDocument/didClose",
+                    serde_json::json!({ "textDocument": { "uri": uri } }),
+                );
+            }
             return Err(err);
         }
         match diagnostics {
@@ -433,36 +500,74 @@ impl LeanServer {
         }))
     }
 
-    /// Read one Content-Length-framed JSON-RPC message.
+    /// Next server message, blocking (startup handshake path).
     fn receive(&mut self) -> Result<serde_json::Value, String> {
-        let mut content_length: Option<usize> = None;
-        loop {
-            let mut line = String::new();
-            let n = self
-                .stdout
-                .read_line(&mut line)
-                .map_err(|err| format!("read from lean server failed: {err}"))?;
-            if n == 0 {
-                return Err("lean server closed its stdout".into());
-            }
-            let line = line.trim_end();
-            if line.is_empty() {
-                break;
-            }
-            if let Some(value) = line
-                .strip_prefix("Content-Length:")
-                .or_else(|| line.strip_prefix("content-length:"))
-            {
-                content_length = value.trim().parse().ok();
+        match self.incoming.recv() {
+            Ok(msg) => msg,
+            Err(_) => Err("lean server reader thread exited".into()),
+        }
+    }
+
+    /// Next server message, or None on timeout (the check loop's poll —
+    /// timeouts are when the client socket gets watched).
+    fn receive_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Option<Result<serde_json::Value, String>> {
+        match self.incoming.recv_timeout(timeout) {
+            Ok(msg) => Some(msg),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                Some(Err("lean server reader thread exited".into()))
             }
         }
-        let len = content_length.ok_or("lean server message missing Content-Length")?;
-        let mut body = vec![0u8; len];
-        self.stdout
-            .read_exact(&mut body)
+    }
+}
+
+/// Read one Content-Length-framed JSON-RPC message (reader thread).
+fn read_framed(stdout: &mut BufReader<ChildStdout>) -> Result<serde_json::Value, String> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let n = stdout
+            .read_line(&mut line)
             .map_err(|err| format!("read from lean server failed: {err}"))?;
-        serde_json::from_slice(&body)
-            .map_err(|err| format!("lean server sent invalid JSON: {err}"))
+        if n == 0 {
+            return Err("lean server closed its stdout".into());
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some(value) = line
+            .strip_prefix("Content-Length:")
+            .or_else(|| line.strip_prefix("content-length:"))
+        {
+            content_length = value.trim().parse().ok();
+        }
+    }
+    let len = content_length.ok_or("lean server message missing Content-Length")?;
+    let mut body = vec![0u8; len];
+    stdout
+        .read_exact(&mut body)
+        .map_err(|err| format!("read from lean server failed: {err}"))?;
+    serde_json::from_slice(&body)
+        .map_err(|err| format!("lean server sent invalid JSON: {err}"))
+}
+
+/// Has the check client gone away? A read on the request socket after the
+/// request line: EOF means disconnected; the client never sends more, so a
+/// zero-ish timeout probe consumes nothing meaningful.
+fn client_disconnected(stream: &mut UnixStream) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
+    let mut buf = [0u8; 1];
+    match stream.read(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(err) => !matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
     }
 }
 
