@@ -5,7 +5,7 @@
 // exactly like the code.
 
 /// pre  x < 2147483647
-/// post result.is_some ↔ (0 ≤ x)
+/// post result.is_some ↔ 0 ≤ x
 /// post result.is_some → result.value = x + 1
 fn incr_nonneg(i32 x) -> option<i32> {
     if (x >= 0) {

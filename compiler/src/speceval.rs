@@ -41,6 +41,7 @@ enum T {
     Bar,
     Arrow,   // → or ->
     FatArrow, // =>
+    Iff,     // ↔ or <->
     Forall,
     Exists,
     Not,
@@ -144,11 +145,11 @@ fn tokenize(text: &str) -> EResult<Vec<T>> {
                 i += 1;
             }
             '↔' => {
-                out.push(T::Eq);
+                out.push(T::Iff);
                 i += 1;
             }
             '<' if chars.get(i + 1) == Some(&'-') && chars.get(i + 2) == Some(&'>') => {
-                out.push(T::Eq);
+                out.push(T::Iff);
                 i += 3;
             }
             '<' if chars.get(i + 1) == Some(&'=') => {
@@ -297,6 +298,7 @@ enum Op {
     And,
     Or,
     Imp,
+    Iff,
 }
 
 struct P {
@@ -325,7 +327,17 @@ impl P {
     }
 
     fn expr(&mut self) -> EResult<S> {
-        self.imp()
+        self.iff()
+    }
+    /// `↔` sits BELOW `→`/`∨`/`∧`, matching Lean exactly — the monitor
+    /// must parse the same proposition Lean elaborates.
+    fn iff(&mut self) -> EResult<S> {
+        let mut lhs = self.imp()?;
+        while self.eat(&T::Iff) {
+            let rhs = self.imp()?;
+            lhs = S::Bin(Op::Iff, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
     }
     fn imp(&mut self) -> EResult<S> {
         let lhs = self.or()?;
@@ -781,6 +793,12 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                             || boolean(eval(r, env, depth + 1)?)?,
                     ))
                 }
+                Op::Iff => {
+                    return Ok(SpecVal::Bool(
+                        boolean(eval(l, env, depth + 1)?)?
+                            == boolean(eval(r, env, depth + 1)?)?,
+                    ))
+                }
                 _ => {}
             }
             let lv = eval(l, env, depth + 1)?;
@@ -804,7 +822,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                 Op::Ge => SpecVal::Bool(a >= b),
                 Op::Eq => SpecVal::Bool(a == b),
                 Op::Ne => SpecVal::Bool(a != b),
-                Op::And | Op::Or | Op::Imp => unreachable!(),
+                Op::And | Op::Or | Op::Imp | Op::Iff => unreachable!(),
             })
         }
         S::Quant { forall, vars, body } => eval_quant(*forall, vars, body, env, depth),

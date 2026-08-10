@@ -3,7 +3,7 @@
 // evaluate with the same junk-on-none convention as the model.
 
 /// pre  x < 2147483647
-/// post result.is_some ↔ (0 ≤ x)
+/// post result.is_some ↔ 0 ≤ x
 /// post result.is_some → result.value = x + 1
 fn incr_nonneg(i32 x) -> option<i32> {
     if (x >= 0) {
@@ -29,4 +29,19 @@ fn test_option_roundtrip() {
     use_it(1000);
     incr_nonneg(-5);
     incr_nonneg(-1);
+}
+
+// Precedence guard: `↔` must parse at Lean's precedence (loosest — below
+// ∧/∨/→). Under Lean's parse this post is (1 = 2 ∧ result) ↔ 1 = 2,
+// which holds for result = true. Any tighter `↔` makes it false (or
+// unparseable), so this test plus the zero-skip harness pin the
+// monitor's grammar to Lean's.
+
+/// post 1 = 2 ∧ result ↔ 1 = 2
+fn iff_precedence_witness() -> bool {
+    return true;
+}
+
+fn test_iff_precedence() {
+    iff_precedence_witness();
 }
