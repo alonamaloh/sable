@@ -1388,6 +1388,11 @@ impl<'a> Parser<'a> {
                     let e = self.expr()?;
                     self.expect(Tok::Semi)?;
                     Ok(Stmt::ExprStmt(e))
+                } else if self.at_generic_args() {
+                    // `clamp<i32>(...);` — a generic call for effect.
+                    let e = self.expr()?;
+                    self.expect(Tok::Semi)?;
+                    Ok(Stmt::ExprStmt(e))
                 } else if self.peek2() == &Tok::LBracket {
                     let array_span = self.peek_span();
                     self.bump();
