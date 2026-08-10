@@ -610,20 +610,14 @@ fn load_file(
 
     // Dependencies are parsed; their classes (in merge order) seed this
     // module's class-index space.
-    let extern_classes: Vec<String> = {
-        let mut order: Vec<usize> = loading.programs.iter().map(|(i, _)| *i).collect();
-        order.sort();
-        let mut names = Vec::new();
-        for i in order {
-            let (_, p) = loading
-                .programs
-                .iter()
-                .find(|(j, _)| *j == i)
-                .expect("loaded");
-            names.extend(p.classes.iter().map(|c| c.name.clone()));
-        }
-        names
-    };
+    // Finish order, not load order: a module always finishes after its
+    // dependencies, so concatenating classes in finish order puts every
+    // module's own classes exactly where its parse assumed they were.
+    let extern_classes: Vec<String> = loading
+        .programs
+        .iter()
+        .flat_map(|(_, p)| p.classes.iter().map(|c| c.name.clone()))
+        .collect();
     // The combined program text mirrors the combined source (same
     // lengths, proof lines blanked).
     loading.externs.push((idx, extern_classes.clone()));
@@ -702,16 +696,15 @@ fn shift(s: Span, base: usize) -> Span {
     Span::new(s.start + base, s.end + base)
 }
 
-/// Flat merge. Class-index consistency requires the same order the
-/// parser saw as `extern_classes`: ascending module index among
-/// finished dependencies, with each module's own classes appended when
-/// it parses — i.e. classes ordered by (finish-set at parse time). The
-/// loader finishes dependencies before dependents, and extern order is
-/// ascending index over finished programs, so merging in ascending
-/// index order over the finished list reproduces it exactly.
+/// Flat merge, in **finish order**. Class-index consistency requires the
+/// same order each parse saw as `extern_classes`: the classes of every
+/// module that had already finished, concatenated in finish order, with
+/// the module's own classes appended when it finishes. Since a module
+/// always finishes after its dependencies, merging in finish order
+/// reproduces every module's view simultaneously. (Load order will not
+/// do: the root is loaded first and finishes last.)
 fn merge(loading: Loading) -> Result<(Program, ModuleSet), (Diagnostic, ModuleSet)> {
-    let mut programs = loading.programs;
-    programs.sort_by_key(|(idx, _)| *idx);
+    let programs = loading.programs;
     let mut it = programs.into_iter();
     let (_, mut merged) = it.next().expect("root loaded");
     for (_, p) in it {

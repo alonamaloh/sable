@@ -1,0 +1,23 @@
+// A module that both declares a class and imports one: class indices
+// must agree between each module's parse (which sees its dependencies'
+// classes first) and the merged program. Load order will not do — the
+// root is loaded first but finishes last.
+
+use class_fields;
+
+pub class Tagged {
+    Inner payload;
+
+    /// post self.payload.v = k.v
+    init of(Inner k) {
+        self.payload = k;
+    }
+}
+
+/// post result = 9
+pub fn through_two_classes() -> u64 {
+    var i = Inner::make(9);
+    var t = Tagged::of(i);
+    u64 r = read_inner(&t.payload);
+    return r;
+}
