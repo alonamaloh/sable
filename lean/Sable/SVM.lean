@@ -1,14 +1,11 @@
 /-
-SVM: operational semantics for a core Sable subset (design §10).
+SVM: operational semantics for a core Sable subset (design §10, ADR 0005).
 
-DESIGN-AUDIT ARTIFACT (parallel track, docs/PLAN.md). The point of this
-file is to force the prose design into rules and surface the places where
-the prose is ambiguous or inconsistent; the findings live in
-`docs/notes/svm-draft.md`. It is deliberately incomplete — classes,
-borrows as distinct values, function calls, ghost state, and the heap are
-scoped out with notes.
+The scope is deliberately partial — classes, borrows as distinct values,
+function calls, ghost state, and the heap are scoped out with notes; the
+findings the first draft forced are resolved in ADR 0005 and design §10.
 
-Shape (justified in the notes file):
+Shape:
 
 - **Statements: small-step**, an inductive relation `Step` over
   configurations, as design §10 mandates ("small-step, deterministic").
@@ -16,18 +13,24 @@ Shape (justified in the notes file):
   distinguishable, and small-step is what makes divergence a real
   behavior rather than a missing derivation.
 - **Expressions: big-step**, an inductive relation `Eval`. In this
-  fragment expressions are pure and call-free, so evaluation cannot
-  diverge and big-step loses no distinctions — but every trap and every
-  trap-*propagation* rule is still an explicit constructor, because
-  evaluation order (hence which trap fires) is exactly the kind of
-  decision the prose never made.
-- **Traps are terminal outcomes** (`Config.trapped`), distinct from
-  normal termination (`Config.done`). Reading uninitialized memory (⊥)
-  has deliberately *no* rule: such configurations are stuck, which is the
-  §2.3/§10 tension discussed in the notes.
-- The machine is parameterized by an allocation capacity `cap`; without
-  it, "deterministic" (§10) and "alloc failure is a defined OOM trap"
-  (§10) contradict each other. See the notes.
+  fragment expressions are pure and call-free (calls are A-normalized to
+  statements, ADR 0005), so evaluation cannot diverge and big-step loses
+  no distinctions — but every abnormal-*propagation* rule is still an
+  explicit constructor, because evaluation order (hence which trap
+  fires) is normative: left-to-right, short-circuit `&&`/`||`.
+- **Three terminal outcomes** (ADR 0005): normal termination
+  (`Config.done`), traps (`Config.trapped`), and `Config.undef` — the
+  outcome of every state the static semantics is responsible for
+  excluding (⊥-reads, type confusion, out-of-range literals). The
+  machine is total: every syntactically valid program has a meaning
+  (pillar 1 holds literally), and the soundness theorem sharpens to
+  "verified programs never reach `undef`".
+- The machine is parameterized by an allocation capacity `cap`;
+  without it, "deterministic" and "alloc failure is a defined OOM trap"
+  (§10) contradict each other.
+
+Determinism, totality, and agreement with the functional evaluator are
+theorems, not claims — see `Sable/SVMEval.lean`.
 
 Values are exact `Int`s; fixed widths live in the *syntax* (each
 arithmetic node carries the `IntTy` at which representability is
@@ -82,13 +85,12 @@ instance (t : IntTy) (n : Int) : Decidable (t.inRange n) :=
   inferInstanceAs (Decidable (_ ∧ _))
 
 /-- Two's-complement wrap into `[t.min, t.max]` — the semantics of the
-total operator `wrap(·)` (§2.2). For unsigned `t` this is `n mod 2^bits`.
-NOTE (audit): the design only shows `wrap` on unsigned; two's-complement
-behavior on signed types is this file's choice, not the prose's. -/
+total operator `wrap(·)` (§2.2, ADR 0005: signed `wrap` is
+two's-complement). For unsigned `t` this is `n mod 2^bits`. -/
 def IntTy.wrap (t : IntTy) (n : Int) : Int :=
   (n - t.min).emod ((2 : Int) ^ t.bits) + t.min
 
-/-! ## Values and traps -/
+/-! ## Values, traps, and abnormal outcomes -/
 
 /-- Machine values. Integers are exact (`Int`); their widths live in the
 typed syntax, and per-operation rules enforce representability — the
@@ -106,7 +108,7 @@ inductive Val where
 *structural* (they carry the operation and the offending data); the
 obligation *names* of §6/§9 are compiler artifacts layered on top —
 except for `deferViolation`, where the compiled `defer` check carries its
-obligation name into machine syntax. See notes. -/
+obligation name into machine syntax (ADR 0005). -/
 inductive Trap where
   | overflow  (t : IntTy)
   | divByZero
@@ -115,6 +117,15 @@ inductive Trap where
   | oom       (len : Int)
   | deferViolation (name : String)
   deriving Repr
+
+/-- An abnormal outcome: a trap, or `undef` — the outcome of every state
+the static semantics must exclude (⊥-reads, type confusion, out-of-range
+literals; ADR 0005). `undef` is a *defined* outcome, so the machine is
+total and pillar 1 holds literally; the soundness theorem sharpens to
+"verified programs never reach `undef`". -/
+inductive Abort where
+  | trap (t : Trap)
+  | undef
 
 /-! ## Syntax -/
 
@@ -143,10 +154,10 @@ def CmpOp.denote : CmpOp → Int → Int → Bool
 
 /-- Expressions. Arithmetic nodes carry the `IntTy` at which the
 representability check happens (the compiler's typed AST provides it).
-Arrays are referred to by variable, matching the compiler's AST — array
-*expressions* as index/store bases are an unforced surface question.
-Scoped out: function calls, method calls, class constructors, borrows as
-distinct values, `sat(·)`, `match`. -/
+Arrays are referred to by variable, matching the compiler's AST.
+Scoped out: function calls (A-normalized to statements, ADR 0005),
+method calls, class constructors, borrows as distinct values, `sat(·)`,
+option accessors. -/
 inductive Expr where
   | intLit  (t : IntTy) (n : Int)
   | boolLit (b : Bool)
@@ -154,11 +165,11 @@ inductive Expr where
   | neg     (t : IntTy) (e : Expr)
   | not     (e : Expr)
   | arith   (op : ArithOp) (t : IntTy) (e₁ e₂ : Expr)
-  /-- `wrap(a ⊕ b)` — total modular arithmetic, §2.2. Necessarily a
-  *variant of the operator*, not a function on a computed value: an
-  ordinary operand would already have trapped on overflow. See notes. -/
+  /-- `wrap(a ⊕ b)` — total modular arithmetic (§2.2). An operator
+  *modifier*, not a function: an ordinary operand would already have
+  trapped on overflow (ADR 0005). -/
   | wrapArith (op : ArithOp) (t : IntTy) (e₁ e₂ : Expr)
-  /-- `checked(a ⊕ b)` — `none` on overflow, §2.2. Same caveat. -/
+  /-- `checked(a ⊕ b)` — `none` on overflow (§2.2). Same caveat. -/
   | checkedArith (op : ArithOp) (t : IntTy) (e₁ e₂ : Expr)
   | div     (t : IntTy) (e₁ e₂ : Expr)
   | mod     (t : IntTy) (e₁ e₂ : Expr)
@@ -188,9 +199,8 @@ inductive Stmt where
 /-! ## Environments
 
 One frame of locals. `none` is ⊥ (design §2.3: uninitialized, no default
-zero). Note the model conflates "undeclared" with "declared but ⊥" —
-frames in §10 hold `Val ∪ ⊥` per local, which suggests declarations
-allocate ⊥ slots; declaration statements are scoped out here. -/
+zero). The model conflates "undeclared" with "declared but ⊥" —
+declaration statements are scoped out; reading either is `undef`. -/
 
 def Env := String → Option Val
 
@@ -201,50 +211,62 @@ def Env.update (ρ : Env) (x : String) (v : Val) : Env :=
 
 /-! ## Expression evaluation (big-step) -/
 
-/-- Outcome of evaluating an expression: a value, or a trap. -/
+/-- Outcome of evaluating an expression: a value, or an abnormal
+outcome (trap / undef). -/
 inductive EOut where
-  | ok   (v : Val)
-  | trap (t : Trap)
+  | ok    (v : Val)
+  | abort (a : Abort)
 
 /--
 `Eval cap ρ e out`: under locals `ρ`, expression `e` evaluates to `out`.
 
-Decisions the prose forced but never made (see notes for the full list):
-- **Left-to-right operand order**, so the *left* operand's trap wins.
-- **Short-circuit `&&`/`||`**: the right operand (and its traps) is
-  unreachable when the left operand decides.
-- Reading ⊥ (`ρ x = none`), non-bool `if` conditions, out-of-range
-  literals, negative `alloc_array` lengths: **no rule — stuck**. These
-  are the states the static semantics must exclude; pillar 1's "every
-  syntactically valid program has a meaning" is not honored by this
-  relation and must be restated against *checked* programs.
+Normative decisions (ADR 0005):
+- **Left-to-right operand order**, so the *left* operand's abnormal
+  outcome wins; each operand's shape is decided where it is produced
+  (a right operand is never evaluated once the left is known ill-shaped).
+- **Short-circuit `&&`/`||`**: the right operand (and its abnormal
+  outcomes) is unreachable when the left operand decides.
+- Reading ⊥ (`ρ x = none`), type confusion, out-of-range literals, and
+  negative `alloc_array` lengths (excluded by `u64` typing) evaluate to
+  **`undef`** — the machine is total, and the static semantics is
+  responsible for making `undef` unreachable.
 -/
 inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
-  -- literals; an out-of-range literal has no meaning (typechecker duty)
+  -- literals; an out-of-range literal is checker duty, hence undef
   | intLit {ρ : Env} {t : IntTy} {n : Int} (h : t.inRange n) :
       Eval cap ρ (.intLit t n) (.ok (.int n))
+  | intLit_undef {ρ : Env} {t : IntTy} {n : Int} (h : ¬ t.inRange n) :
+      Eval cap ρ (.intLit t n) (.abort .undef)
   | boolLit {ρ : Env} {b : Bool} :
       Eval cap ρ (.boolLit b) (.ok (.bool b))
-  -- variables; `ρ x = none` (⊥) has no rule: stuck, per §2.3
+  -- variables; reading ⊥ is the canonical undef (§2.3, ADR 0005)
   | var {ρ : Env} {x : String} {v : Val} (h : ρ x = some v) :
       Eval cap ρ (.var x) (.ok v)
-  -- unary minus (audit: on unsigned this traps unless the operand is 0;
-  -- whether unary minus is even legal on unsigned is unstated)
+  | var_undef {ρ : Env} {x : String} (h : ρ x = none) :
+      Eval cap ρ (.var x) (.abort .undef)
+  -- unary minus (unary minus on unsigned is a type error — ADR 0005;
+  -- the machine still gives the ill-typed term a meaning)
   | neg_ok {ρ : Env} {t : IntTy} {e : Expr} {n : Int}
       (h : Eval cap ρ e (.ok (.int n))) (hr : t.inRange (-n)) :
       Eval cap ρ (.neg t e) (.ok (.int (-n)))
   | neg_overflow {ρ : Env} {t : IntTy} {e : Expr} {n : Int}
       (h : Eval cap ρ e (.ok (.int n))) (hr : ¬ t.inRange (-n)) :
-      Eval cap ρ (.neg t e) (.trap (.overflow t))
-  | neg_trap {ρ : Env} {t : IntTy} {e : Expr} {tr : Trap}
-      (h : Eval cap ρ e (.trap tr)) :
-      Eval cap ρ (.neg t e) (.trap tr)
+      Eval cap ρ (.neg t e) (.abort (.trap (.overflow t)))
+  | neg_undef {ρ : Env} {t : IntTy} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.neg t e) (.abort .undef)
+  | neg_abort {ρ : Env} {t : IntTy} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.neg t e) (.abort a)
   | not_ok {ρ : Env} {e : Expr} {b : Bool}
       (h : Eval cap ρ e (.ok (.bool b))) :
       Eval cap ρ (.not e) (.ok (.bool (!b)))
-  | not_trap {ρ : Env} {e : Expr} {tr : Trap}
-      (h : Eval cap ρ e (.trap tr)) :
-      Eval cap ρ (.not e) (.trap tr)
+  | not_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ b, v ≠ .bool b) :
+      Eval cap ρ (.not e) (.abort .undef)
+  | not_abort {ρ : Env} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.not e) (.abort a)
   -- checked arithmetic: + - * with the §2.2 representability obligation
   | arith_ok {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
@@ -253,23 +275,37 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | arith_overflow {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
       (hr : ¬ t.inRange (op.denote a b)) :
-      Eval cap ρ (.arith op t e₁ e₂) (.trap (.overflow t))
-  | arith_trap₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.arith op t e₁ e₂) (.trap tr)
-  | arith_trap₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {v : Val} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.arith op t e₁ e₂) (.trap tr)
-  -- wrap(·): total, no overflow rule — but operand traps still propagate
+      Eval cap ρ (.arith op t e₁ e₂) (.abort (.trap (.overflow t)))
+  | arith_undef₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.arith op t e₁ e₂) (.abort .undef)
+  | arith_abort₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.arith op t e₁ e₂) (.abort a)
+  | arith_undef₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ m, v ≠ .int m) :
+      Eval cap ρ (.arith op t e₁ e₂) (.abort .undef)
+  | arith_abort₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.arith op t e₁ e₂) (.abort a)
+  -- wrap(·): total, no overflow rule — but abnormal operands propagate
   | wrap_ok {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b))) :
       Eval cap ρ (.wrapArith op t e₁ e₂) (.ok (.int (t.wrap (op.denote a b))))
-  | wrap_trap₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.wrapArith op t e₁ e₂) (.trap tr)
-  | wrap_trap₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {v : Val} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.wrapArith op t e₁ e₂) (.trap tr)
+  | wrap_undef₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.wrapArith op t e₁ e₂) (.abort .undef)
+  | wrap_abort₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.wrapArith op t e₁ e₂) (.abort a)
+  | wrap_undef₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ m, v ≠ .int m) :
+      Eval cap ρ (.wrapArith op t e₁ e₂) (.abort .undef)
+  | wrap_abort₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.wrapArith op t e₁ e₂) (.abort a)
   -- checked(·): none on overflow
   | checked_some {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
@@ -279,117 +315,178 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
       (hr : ¬ t.inRange (op.denote a b)) :
       Eval cap ρ (.checkedArith op t e₁ e₂) (.ok (.opt none))
-  | checked_trap₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.checkedArith op t e₁ e₂) (.trap tr)
-  | checked_trap₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {v : Val} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.checkedArith op t e₁ e₂) (.trap tr)
+  | checked_undef₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.checkedArith op t e₁ e₂) (.abort .undef)
+  | checked_abort₁ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.checkedArith op t e₁ e₂) (.abort a)
+  | checked_undef₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ m, v ≠ .int m) :
+      Eval cap ρ (.checkedArith op t e₁ e₂) (.abort .undef)
+  | checked_abort₂ {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.checkedArith op t e₁ e₂) (.abort a)
   -- Euclidean division (ADR 0004). The signed MIN / -1 case is the unique
   -- unrepresentable quotient, stated here uniformly as representability.
   | div_ok {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
       (hz : b ≠ 0) (hr : t.inRange (a.ediv b)) :
       Eval cap ρ (.div t e₁ e₂) (.ok (.int (a.ediv b)))
-  | div_zero {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {v : Val}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.ok (.int 0))) :
-      Eval cap ρ (.div t e₁ e₂) (.trap .divByZero)
+  | div_zero {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {a : Int}
+      (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int 0))) :
+      Eval cap ρ (.div t e₁ e₂) (.abort (.trap .divByZero))
   | div_overflow {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
       (hz : b ≠ 0) (hr : ¬ t.inRange (a.ediv b)) :
-      Eval cap ρ (.div t e₁ e₂) (.trap (.overflow t))
-  | div_trap₁ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.div t e₁ e₂) (.trap tr)
-  | div_trap₂ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {v : Val} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.div t e₁ e₂) (.trap tr)
+      Eval cap ρ (.div t e₁ e₂) (.abort (.trap (.overflow t)))
+  | div_undef₁ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.div t e₁ e₂) (.abort .undef)
+  | div_abort₁ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.div t e₁ e₂) (.abort a)
+  | div_undef₂ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ m, v ≠ .int m) :
+      Eval cap ρ (.div t e₁ e₂) (.abort .undef)
+  | div_abort₂ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.div t e₁ e₂) (.abort a)
   -- Euclidean remainder: no overflow rule — `emod_inRange` below proves
   -- the result always representable, even at signed extremes.
   | mod_ok {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
       (hz : b ≠ 0) :
       Eval cap ρ (.mod t e₁ e₂) (.ok (.int (a.emod b)))
-  | mod_zero {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {v : Val}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.ok (.int 0))) :
-      Eval cap ρ (.mod t e₁ e₂) (.trap .divByZero)
-  | mod_trap₁ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.mod t e₁ e₂) (.trap tr)
-  | mod_trap₂ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {v : Val} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.mod t e₁ e₂) (.trap tr)
-  -- comparisons (integer operands only; bool == bool is scoped out)
+  | mod_zero {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {a : Int}
+      (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int 0))) :
+      Eval cap ρ (.mod t e₁ e₂) (.abort (.trap .divByZero))
+  | mod_undef₁ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.mod t e₁ e₂) (.abort .undef)
+  | mod_abort₁ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.mod t e₁ e₂) (.abort a)
+  | mod_undef₂ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ m, v ≠ .int m) :
+      Eval cap ρ (.mod t e₁ e₂) (.abort .undef)
+  | mod_abort₂ {ρ : Env} {t : IntTy} {e₁ e₂ : Expr} {n : Int} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.mod t e₁ e₂) (.abort a)
+  -- comparisons (integer operands; `bool ==` is a checker restriction,
+  -- so mixed shapes are undef — the machine compares on ℤ)
   | cmp_ok {ρ : Env} {op : CmpOp} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b))) :
       Eval cap ρ (.cmp op e₁ e₂) (.ok (.bool (op.denote a b)))
-  | cmp_trap₁ {ρ : Env} {op : CmpOp} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.cmp op e₁ e₂) (.trap tr)
-  | cmp_trap₂ {ρ : Env} {op : CmpOp} {e₁ e₂ : Expr} {v : Val} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.cmp op e₁ e₂) (.trap tr)
-  -- short-circuit && and || (the prose never states short-circuiting;
-  -- the guarded-RHS VC idiom `i < a.len && a[i] > 0` requires it)
+  | cmp_undef₁ {ρ : Env} {op : CmpOp} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.cmp op e₁ e₂) (.abort .undef)
+  | cmp_abort₁ {ρ : Env} {op : CmpOp} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.cmp op e₁ e₂) (.abort a)
+  | cmp_undef₂ {ρ : Env} {op : CmpOp} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ m, v ≠ .int m) :
+      Eval cap ρ (.cmp op e₁ e₂) (.abort .undef)
+  | cmp_abort₂ {ρ : Env} {op : CmpOp} {e₁ e₂ : Expr} {n : Int} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.cmp op e₁ e₂) (.abort a)
+  -- short-circuit && and || (normative, ADR 0005: the guarded-RHS VC
+  -- idiom `i < a.len && a[i] > 0` requires it)
   | and_false {ρ : Env} {e₁ e₂ : Expr}
       (h : Eval cap ρ e₁ (.ok (.bool false))) :
       Eval cap ρ (.and e₁ e₂) (.ok (.bool false))
   | and_true {ρ : Env} {e₁ e₂ : Expr} {b : Bool}
       (h₁ : Eval cap ρ e₁ (.ok (.bool true))) (h₂ : Eval cap ρ e₂ (.ok (.bool b))) :
       Eval cap ρ (.and e₁ e₂) (.ok (.bool b))
-  | and_trap₁ {ρ : Env} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.and e₁ e₂) (.trap tr)
-  | and_trap₂ {ρ : Env} {e₁ e₂ : Expr} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok (.bool true))) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.and e₁ e₂) (.trap tr)
+  | and_undef₁ {ρ : Env} {e₁ e₂ : Expr} {v : Val}
+      (h : Eval cap ρ e₁ (.ok v)) (hv : ∀ b, v ≠ .bool b) :
+      Eval cap ρ (.and e₁ e₂) (.abort .undef)
+  | and_abort₁ {ρ : Env} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.and e₁ e₂) (.abort a)
+  | and_undef₂ {ρ : Env} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.bool true))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ b, v ≠ .bool b) :
+      Eval cap ρ (.and e₁ e₂) (.abort .undef)
+  | and_abort₂ {ρ : Env} {e₁ e₂ : Expr} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.bool true))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.and e₁ e₂) (.abort a)
   | or_true {ρ : Env} {e₁ e₂ : Expr}
       (h : Eval cap ρ e₁ (.ok (.bool true))) :
       Eval cap ρ (.or e₁ e₂) (.ok (.bool true))
   | or_false {ρ : Env} {e₁ e₂ : Expr} {b : Bool}
       (h₁ : Eval cap ρ e₁ (.ok (.bool false))) (h₂ : Eval cap ρ e₂ (.ok (.bool b))) :
       Eval cap ρ (.or e₁ e₂) (.ok (.bool b))
-  | or_trap₁ {ρ : Env} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.or e₁ e₂) (.trap tr)
-  | or_trap₂ {ρ : Env} {e₁ e₂ : Expr} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok (.bool false))) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.or e₁ e₂) (.trap tr)
+  | or_undef₁ {ρ : Env} {e₁ e₂ : Expr} {v : Val}
+      (h : Eval cap ρ e₁ (.ok v)) (hv : ∀ b, v ≠ .bool b) :
+      Eval cap ρ (.or e₁ e₂) (.abort .undef)
+  | or_abort₁ {ρ : Env} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.or e₁ e₂) (.abort a)
+  | or_undef₂ {ρ : Env} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.bool false))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ b, v ≠ .bool b) :
+      Eval cap ρ (.or e₁ e₂) (.abort .undef)
+  | or_abort₂ {ρ : Env} {e₁ e₂ : Expr} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.bool false))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.or e₁ e₂) (.abort a)
   -- arrays: length and load; `a.get` is total-with-junk (Sable.Seq) but
-  -- the machine only reads it under the bounds check
+  -- the machine only reads it under the bounds check. The index
+  -- expression is evaluated before the array lookup (matching stores).
   | len {ρ : Env} {x : String} {a : Seq Int}
       (h : ρ x = some (.arr a)) :
       Eval cap ρ (.len x) (.ok (.int a.len))
+  | len_undef {ρ : Env} {x : String}
+      (h : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
+      Eval cap ρ (.len x) (.abort .undef)
   | index_ok {ρ : Env} {x : String} {e : Expr} {a : Seq Int} {n : Int}
-      (ha : ρ x = some (.arr a)) (hi : Eval cap ρ e (.ok (.int n)))
+      (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr a))
       (h₀ : 0 ≤ n) (h₁ : n < a.len) :
       Eval cap ρ (.index x e) (.ok (.int (a.get n)))
   | index_oob {ρ : Env} {x : String} {e : Expr} {a : Seq Int} {n : Int}
-      (ha : ρ x = some (.arr a)) (hi : Eval cap ρ e (.ok (.int n)))
+      (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr a))
       (h : n < 0 ∨ a.len ≤ n) :
-      Eval cap ρ (.index x e) (.trap (.indexOOB n a.len))
-  | index_trap {ρ : Env} {x : String} {e : Expr} {tr : Trap}
-      (h : Eval cap ρ e (.trap tr)) :
-      Eval cap ρ (.index x e) (.trap tr)
+      Eval cap ρ (.index x e) (.abort (.trap (.indexOOB n a.len)))
+  | index_undef_idx {ρ : Env} {x : String} {e : Expr} {v : Val}
+      (hi : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.index x e) (.abort .undef)
+  | index_abort {ρ : Env} {x : String} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.index x e) (.abort a)
+  | index_undef_arr {ρ : Env} {x : String} {e : Expr} {n : Int}
+      (hi : Eval cap ρ e (.ok (.int n)))
+      (ha : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
+      Eval cap ρ (.index x e) (.abort .undef)
   -- widen: total and, on the exact-Int value plane, the identity
   | widen_ok {ρ : Env} {dst : IntTy} {e : Expr} {n : Int}
       (h : Eval cap ρ e (.ok (.int n))) :
       Eval cap ρ (.widen dst e) (.ok (.int n))
-  | widen_trap {ρ : Env} {dst : IntTy} {e : Expr} {tr : Trap}
-      (h : Eval cap ρ e (.trap tr)) :
-      Eval cap ρ (.widen dst e) (.trap tr)
+  | widen_undef {ρ : Env} {dst : IntTy} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.widen dst e) (.abort .undef)
+  | widen_abort {ρ : Env} {dst : IntTy} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.widen dst e) (.abort a)
   -- narrow<T>: the §2.2 fits-obligation; trap when deferred
   | narrow_ok {ρ : Env} {dst : IntTy} {e : Expr} {n : Int}
       (h : Eval cap ρ e (.ok (.int n))) (hr : dst.inRange n) :
       Eval cap ρ (.narrow dst e) (.ok (.int n))
   | narrow_oob {ρ : Env} {dst : IntTy} {e : Expr} {n : Int}
       (h : Eval cap ρ e (.ok (.int n))) (hr : ¬ dst.inRange n) :
-      Eval cap ρ (.narrow dst e) (.trap (.narrowOOB dst n))
-  | narrow_trap {ρ : Env} {dst : IntTy} {e : Expr} {tr : Trap}
-      (h : Eval cap ρ e (.trap tr)) :
-      Eval cap ρ (.narrow dst e) (.trap tr)
+      Eval cap ρ (.narrow dst e) (.abort (.trap (.narrowOOB dst n)))
+  | narrow_undef {ρ : Env} {dst : IntTy} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.narrow dst e) (.abort .undef)
+  | narrow_abort {ρ : Env} {dst : IntTy} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.narrow dst e) (.abort a)
   -- alloc_array(n, v): OOM is a defined trap (§10), decided against the
-  -- machine's capacity parameter. Negative length: no rule (typing).
+  -- machine's capacity parameter. Negative length is excluded by `u64`
+  -- typing (ADR 0005), hence undef.
   | alloc_ok {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
       (h₀ : 0 ≤ n) (hc : n ≤ cap) :
@@ -397,20 +494,34 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | alloc_oom {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
       (h₀ : 0 ≤ n) (hc : cap < n) :
-      Eval cap ρ (.allocArray e₁ e₂) (.trap (.oom n))
-  | alloc_trap₁ {ρ : Env} {e₁ e₂ : Expr} {tr : Trap}
-      (h : Eval cap ρ e₁ (.trap tr)) :
-      Eval cap ρ (.allocArray e₁ e₂) (.trap tr)
-  | alloc_trap₂ {ρ : Env} {e₁ e₂ : Expr} {v : Val} {tr : Trap}
-      (h₁ : Eval cap ρ e₁ (.ok v)) (h₂ : Eval cap ρ e₂ (.trap tr)) :
-      Eval cap ρ (.allocArray e₁ e₂) (.trap tr)
+      Eval cap ρ (.allocArray e₁ e₂) (.abort (.trap (.oom n)))
+  | alloc_neg {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
+      (h₀ : n < 0) :
+      Eval cap ρ (.allocArray e₁ e₂) (.abort .undef)
+  | alloc_undef₁ {ρ : Env} {e₁ e₂ : Expr} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.allocArray e₁ e₂) (.abort .undef)
+  | alloc_abort₁ {ρ : Env} {e₁ e₂ : Expr} {a : Abort}
+      (h : Eval cap ρ e₁ (.abort a)) :
+      Eval cap ρ (.allocArray e₁ e₂) (.abort a)
+  | alloc_undef₂ {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (hv : ∀ m, v ≠ .int m) :
+      Eval cap ρ (.allocArray e₁ e₂) (.abort .undef)
+  | alloc_abort₂ {ρ : Env} {e₁ e₂ : Expr} {n : Int} {a : Abort}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
+      Eval cap ρ (.allocArray e₁ e₂) (.abort a)
   -- options (integer payload)
   | someE_ok {ρ : Env} {e : Expr} {n : Int}
       (h : Eval cap ρ e (.ok (.int n))) :
       Eval cap ρ (.someE e) (.ok (.opt (some n)))
-  | someE_trap {ρ : Env} {e : Expr} {tr : Trap}
-      (h : Eval cap ρ e (.trap tr)) :
-      Eval cap ρ (.someE e) (.trap tr)
+  | someE_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Eval cap ρ (.someE e) (.abort .undef)
+  | someE_abort {ρ : Env} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.someE e) (.abort a)
   | noneE {ρ : Env} :
       Eval cap ρ .noneE (.ok (.opt none))
 
@@ -419,36 +530,40 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
 /-- A configuration: either running (a continuation of statements plus
 one frame of locals — design §10's ⟨code, frames, heap, ghost⟩ with the
 frame stack collapsed to one frame, the heap absorbed into owned array
-values, and the ghost component scoped out), or one of the two terminal
-outcomes. Traps are terminal and distinct from normal termination. -/
+values, and the ghost component scoped out), or one of the three
+terminal outcomes (ADR 0005): normal termination, a trap, or `undef`. -/
 inductive Config where
   | run     (k : List Stmt) (ρ : Env)
   | done    (v : Val)
   | trapped (t : Trap)
+  | undef
+
+/-- The terminal configuration an abnormal expression outcome forces. -/
+def Abort.toConfig : Abort → Config
+  | .trap t => .trapped t
+  | .undef  => .undef
 
 /--
-`Step cap c c'`: one machine step. Small-step, deterministic (§10) —
-determinism is by construction of the rule side conditions (each pair of
-rules for the same head statement is separated by mutually exclusive
-conditions on the same left-to-right evaluation); proving it is the first
-follow-up theorem, deliberately not attempted in this draft.
+`Step cap c c'`: one machine step. Small-step, deterministic, and total
+on `run` configurations (§10, ADR 0005) — determinism and progress are
+theorems (`Sable/SVMEval.lean`), via agreement with the functional
+evaluator.
 
-Decisions the prose forced (see notes):
+Normative decisions (ADR 0005):
 - `store`: index evaluated, then value, then the bounds check — the
-  value's trap beats the OOB trap, matching `interp.rs` (itself
-  undocumented in the design).
+  value's trap beats the OOB trap, matching `interp.rs`.
 - `while` unfolds to its body plus itself: loops run by unfolding, the
   invariant/variant having been erased.
-- an empty continuation returns `unit` (fall-off-the-end, cf. `swap` §5
-  which has no `return`; the prose never mentions unit-valued functions).
+- an empty continuation returns `unit` (fall-off-the-end; procedures
+  are blessed, cf. `swap` §5).
 -/
 inductive Step (cap : Int) : Config → Config → Prop where
   | assign_ok {ρ : Env} {x : String} {e : Expr} {v : Val} {k : List Stmt}
       (h : Eval cap ρ e (.ok v)) :
       Step cap (.run (.assign x e :: k) ρ) (.run k (ρ.update x v))
-  | assign_trap {ρ : Env} {x : String} {e : Expr} {tr : Trap} {k : List Stmt}
-      (h : Eval cap ρ e (.trap tr)) :
-      Step cap (.run (.assign x e :: k) ρ) (.trapped tr)
+  | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt}
+      (h : Eval cap ρ e (.abort a)) :
+      Step cap (.run (.assign x e :: k) ρ) a.toConfig
   | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ρ x = some (.arr a)) (h₀ : 0 ≤ n) (h₁ : n < a.len) :
@@ -457,36 +572,53 @@ inductive Step (cap : Int) : Config → Config → Prop where
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ρ x = some (.arr a)) (h : n < 0 ∨ a.len ≤ n) :
       Step cap (.run (.store x ei ev :: k) ρ) (.trapped (.indexOOB n a.len))
-  | store_trap_idx {ρ : Env} {x : String} {ei ev : Expr} {tr : Trap} {k : List Stmt}
-      (hi : Eval cap ρ ei (.trap tr)) :
-      Step cap (.run (.store x ei ev :: k) ρ) (.trapped tr)
-  | store_trap_val {ρ : Env} {x : String} {ei ev : Expr} {vi : Val} {tr : Trap} {k : List Stmt}
-      (hi : Eval cap ρ ei (.ok vi)) (hv : Eval cap ρ ev (.trap tr)) :
-      Step cap (.run (.store x ei ev :: k) ρ) (.trapped tr)
+  | store_abort_idx {ρ : Env} {x : String} {ei ev : Expr} {a : Abort} {k : List Stmt}
+      (hi : Eval cap ρ ei (.abort a)) :
+      Step cap (.run (.store x ei ev :: k) ρ) a.toConfig
+  | store_undef_idx {ρ : Env} {x : String} {ei ev : Expr} {v : Val} {k : List Stmt}
+      (hi : Eval cap ρ ei (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Step cap (.run (.store x ei ev :: k) ρ) .undef
+  | store_abort_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {a : Abort} {k : List Stmt}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.abort a)) :
+      Step cap (.run (.store x ei ev :: k) ρ) a.toConfig
+  | store_undef_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {v : Val} {k : List Stmt}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok v))
+      (hw : ∀ m, v ≠ .int m) :
+      Step cap (.run (.store x ei ev :: k) ρ) .undef
+  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {k : List Stmt}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
+      (ha : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
+      Step cap (.run (.store x ei ev :: k) ρ) .undef
   | ite_true {ρ : Env} {c : Expr} {thn els k : List Stmt}
       (h : Eval cap ρ c (.ok (.bool true))) :
       Step cap (.run (.ite c thn els :: k) ρ) (.run (thn ++ k) ρ)
   | ite_false {ρ : Env} {c : Expr} {thn els k : List Stmt}
       (h : Eval cap ρ c (.ok (.bool false))) :
       Step cap (.run (.ite c thn els :: k) ρ) (.run (els ++ k) ρ)
-  | ite_trap {ρ : Env} {c : Expr} {thn els k : List Stmt} {tr : Trap}
-      (h : Eval cap ρ c (.trap tr)) :
-      Step cap (.run (.ite c thn els :: k) ρ) (.trapped tr)
+  | ite_undef {ρ : Env} {c : Expr} {thn els k : List Stmt} {v : Val}
+      (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
+      Step cap (.run (.ite c thn els :: k) ρ) .undef
+  | ite_abort {ρ : Env} {c : Expr} {thn els k : List Stmt} {a : Abort}
+      (h : Eval cap ρ c (.abort a)) :
+      Step cap (.run (.ite c thn els :: k) ρ) a.toConfig
   | while_true {ρ : Env} {c : Expr} {body k : List Stmt}
       (h : Eval cap ρ c (.ok (.bool true))) :
       Step cap (.run (.while c body :: k) ρ) (.run (body ++ .while c body :: k) ρ)
   | while_false {ρ : Env} {c : Expr} {body k : List Stmt}
       (h : Eval cap ρ c (.ok (.bool false))) :
       Step cap (.run (.while c body :: k) ρ) (.run k ρ)
-  | while_trap {ρ : Env} {c : Expr} {body k : List Stmt} {tr : Trap}
-      (h : Eval cap ρ c (.trap tr)) :
-      Step cap (.run (.while c body :: k) ρ) (.trapped tr)
+  | while_undef {ρ : Env} {c : Expr} {body k : List Stmt} {v : Val}
+      (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
+      Step cap (.run (.while c body :: k) ρ) .undef
+  | while_abort {ρ : Env} {c : Expr} {body k : List Stmt} {a : Abort}
+      (h : Eval cap ρ c (.abort a)) :
+      Step cap (.run (.while c body :: k) ρ) a.toConfig
   | ret_ok {ρ : Env} {e : Expr} {v : Val} {k : List Stmt}
       (h : Eval cap ρ e (.ok v)) :
       Step cap (.run (.ret e :: k) ρ) (.done v)
-  | ret_trap {ρ : Env} {e : Expr} {tr : Trap} {k : List Stmt}
-      (h : Eval cap ρ e (.trap tr)) :
-      Step cap (.run (.ret e :: k) ρ) (.trapped tr)
+  | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt}
+      (h : Eval cap ρ e (.abort a)) :
+      Step cap (.run (.ret e :: k) ρ) a.toConfig
   -- compiled `defer` (§9): "true or halt", carrying the obligation name
   | check_pass {ρ : Env} {name : String} {c : Expr} {k : List Stmt}
       (h : Eval cap ρ c (.ok (.bool true))) :
@@ -494,9 +626,12 @@ inductive Step (cap : Int) : Config → Config → Prop where
   | check_fail {ρ : Env} {name : String} {c : Expr} {k : List Stmt}
       (h : Eval cap ρ c (.ok (.bool false))) :
       Step cap (.run (.check name c :: k) ρ) (.trapped (.deferViolation name))
-  | check_trap {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {tr : Trap}
-      (h : Eval cap ρ c (.trap tr)) :
-      Step cap (.run (.check name c :: k) ρ) (.trapped tr)
+  | check_undef {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {v : Val}
+      (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
+      Step cap (.run (.check name c :: k) ρ) .undef
+  | check_abort {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {a : Abort}
+      (h : Eval cap ρ c (.abort a)) :
+      Step cap (.run (.check name c :: k) ρ) a.toConfig
   -- fall off the end of the body: return unit
   | nil_ret {ρ : Env} :
       Step cap (.run [] ρ) (.done .unit)
@@ -507,13 +642,14 @@ inductive Steps (cap : Int) : Config → Config → Prop where
   | head {c₁ c₂ c₃ : Config} (h : Step cap c₁ c₂) (hs : Steps cap c₂ c₃) :
       Steps cap c₁ c₃
 
-/-- Terminal configurations: normal return or trap. Stuck `run`
-configurations (⊥-reads, type confusion) are *not* terminal — they are
-the states the static semantics must prove unreachable. -/
+/-- Terminal configurations: normal return, trap, or undef. `run`
+configurations are never terminal — the machine is total (progress is a
+theorem in `Sable/SVMEval.lean`). -/
 def Config.Terminal : Config → Prop
   | .run .. => False
   | .done _ => True
   | .trapped _ => True
+  | .undef => True
 
 /-- Behavior of a function body `k` from locals `ρ`: normal return. -/
 def Returns (cap : Int) (k : List Stmt) (ρ : Env) (v : Val) : Prop :=
@@ -522,6 +658,11 @@ def Returns (cap : Int) (k : List Stmt) (ρ : Env) (v : Val) : Prop :=
 /-- Behavior: terminal trap. -/
 def TrapsWith (cap : Int) (k : List Stmt) (ρ : Env) (t : Trap) : Prop :=
   Steps cap (.run k ρ) (.trapped t)
+
+/-- Behavior: the undef outcome — what the static semantics must prove
+unreachable for checked programs. -/
+def ReachesUndef (cap : Int) (k : List Stmt) (ρ : Env) : Prop :=
+  Steps cap (.run k ρ) .undef
 
 /-- Divergence: every reachable configuration can still step. This is
 what `partial fn` (§8) permits and totality forbids. -/
@@ -538,6 +679,10 @@ theorem done_no_step {cap : Int} {v : Val} {c : Config} :
 catching; a `defer` failure halts the machine). -/
 theorem trapped_no_step {cap : Int} {t : Trap} {c : Config} :
     ¬ Step cap (.trapped t) c := nofun
+
+/-- ... nor `undef`. -/
+theorem undef_no_step {cap : Int} {c : Config} :
+    ¬ Step cap .undef c := nofun
 
 /-- The Euclidean remainder is representable whenever the divisor is —
 even at signed extremes (e.g. `i8`: `|b| ≤ 128` gives `a emod b ≤ 127`).
@@ -557,7 +702,7 @@ theorem IntTy.emod_inRange (t : IntTy) {a b : Int}
   generalize a.emod b = r at h0 hlt
   cases t <;> simp only [IntTy.inRange, IntTy.min, IntTy.max] at hbl hbu ⊢ <;> omega
 
-/-! ## Smoke tests: tiny derivations exercising both outcome kinds -/
+/-! ## Smoke tests: tiny derivations exercising the outcome kinds -/
 
 private def ρ₀ : Env := Env.empty
 
@@ -580,14 +725,19 @@ example :
 example :
     TrapsWith 1000 [.ret (.div .i32 (.intLit .i32 7) (.intLit .i32 0))]
       ρ₀ .divByZero :=
-  .head (.ret_trap (.div_zero (.intLit (by decide)) (.intLit (by decide)))) .refl
+  .head (.ret_abort (.div_zero (.intLit (by decide)) (.intLit (by decide)))) .refl
 
 /-- `return (255 + 1 : u8)` ends in the overflow trap. -/
 example :
     TrapsWith 1000 [.ret (.arith .add .u8 (.intLit .u8 255) (.intLit .u8 1))]
       ρ₀ (.overflow .u8) :=
-  .head (.ret_trap (.arith_overflow (.intLit (by decide)) (.intLit (by decide))
+  .head (.ret_abort (.arith_overflow (.intLit (by decide)) (.intLit (by decide))
     (by decide))) .refl
+
+/-- `return x` with `x` uninitialized ends in `undef`: the ⊥-read has a
+defined outcome (ADR 0005), which checked programs never reach. -/
+example : ReachesUndef 1000 [.ret (.var "x")] ρ₀ :=
+  .head (.ret_abort (.var_undef rfl)) .refl
 
 end SVM
 end Sable

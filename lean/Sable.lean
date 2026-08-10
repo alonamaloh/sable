@@ -7,3 +7,4 @@ import Sable.Ghost
 import Sable.Perm
 import Sable.Specs
 import Sable.SVM
+import Sable.SVMEval
