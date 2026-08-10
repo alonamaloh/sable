@@ -102,6 +102,19 @@ verified. Escape hatches: `defer` skips an obligation's theorem but keeps
 its downstream assumption (trap semantics); `assume` does the same as an
 audited axiom; both are tallied in the build report.
 
+## The SVM differential oracle
+
+The machine semantics (`lean/Sable/SVM.lean`, design §10) is executable:
+`lean/Sable/SVMEval.lean` defines a functional evaluator/stepper proven to
+agree with the inductive rules in both directions — determinism, totality,
+and progress are kernel-checked corollaries. The harness
+(`compiler/tests/svm_diff.rs`, ADR 0017) lowers every function in
+`corpus/svm-diff/` to Lean terms (`compiler/src/svm.rs`), runs each on both
+`interp.rs` and the Lean evaluator, and compares canonical outcomes exactly
+— a divergence is a bug in one of two artifacts that are otherwise trusted
+independently. Lowering is strict: a subject outside the machine's core
+subset is a hard failure, never a skip.
+
 ## Repo layout
 
 ```
@@ -117,6 +130,9 @@ corpus/tests/      dynamic-test programs (import subjects from corpus/verifies v
                    (known-unmonitorable subject clauses fenced by `// expect-skip:`;
                    a fence matching no skip is itself a failure)
 corpus/test-fails/ dynamic tests that must be caught, annotated with the message
+corpus/svm-diff/   differential subjects: every function runs on interp.rs and on
+                   the Lean SVM evaluator; outcomes must agree exactly (traps are
+                   expected outcomes here, so this dir is never verified)
 docs/notes/        probe files and audit notes (SVM draft findings, class encoding)
 editors/           Neovim setup + VS Code extension
 .sable-out/        generated Lean + daemon socket (gitignored)

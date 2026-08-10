@@ -26,6 +26,7 @@ Lean is pinned by `lean/lean-toolchain`; elan fetches it automatically. Never up
 ## Conventions
 
 - Every new diagnostic gets a `corpus/must-fail/` program with an `// expect-error: <name>` first line; every new feature gets `corpus/verifies/` programs, and dynamic behavior gets `corpus/tests/` (must pass with zero skipped clauses; a deliberately-unmonitorable subject clause needs an `// expect-skip: <substr>` fence, and stale fences are failures) or `corpus/test-fails/` (`// expect-test-failure: <substr>`). The corpus is executable documentation.
+- Machine-semantics changes extend the rules, the functional evaluator, and the agreement proofs together (`lean/Sable/SVM.lean` + `SVMEval.lean` — the build fails otherwise) and get `corpus/svm-diff/` subjects: zero-arg functions, traps are expected outcomes, compared against `interp.rs` by `cargo test` (ADR 0017).
 - Commit early and often; push after each commit (repo is private). Substantive decisions get an ADR in `docs/decisions/`.
 - **No development-history references in code, corpus, or diagnostics.** Comments, diagnostic names, and user-facing messages describe the present design — never milestones ("M6"), slices, layers, tiers, or "found by X" stories; that history lives in git and `docs/PLAN.md`. Citing an ADR or a design-doc section is fine (those are normative documents); citing when or in what order something landed is not.
 - Keep `docs/PLAN.md` status and `docs/ARCHITECTURE.md` current when the code moves under them.
