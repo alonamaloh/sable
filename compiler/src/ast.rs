@@ -331,6 +331,10 @@ pub enum Stmt {
     },
     /// A call evaluated for effect: `f(x);` (procedures, test calls).
     ExprStmt(Expr),
+    /// `/// assert P` at a statement position: a named obligation at this
+    /// program point, then a hypothesis downstream; monitored dynamically
+    /// like any other clause.
+    Assert(crate::scan::Clause),
     /// `var x = expr;` — type inferred by the checker (class construction).
     VarDecl {
         name: String,

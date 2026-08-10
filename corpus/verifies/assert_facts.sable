@@ -1,0 +1,31 @@
+// Inline `assert`: a named obligation at its program point that becomes
+// a hypothesis for everything downstream — a stepping-stone lemma proven
+// once (by automation or a `discharge`) instead of re-derived inside
+// every later obligation's proof. The second function shows asserts
+// feeding an *operation VC*: the nonlinear square bound is stated once,
+// discharged once, and the u64 overflow check closes automatically.
+
+/// pre  a.len ≥ 2
+/// pre  ∀ k, 0 ≤ k → k < a.len → a.get k ≥ 1
+/// post result ≥ 2
+fn first_two(&[u32] a) -> u64 {
+    /// assert #[label(both_positive)] a.get 0 ≥ 1 ∧ a.get 1 ≥ 1
+    return widen<u64>(a[0]) + widen<u64>(a[1]);
+}
+
+/// pre  x ≥ 3
+/// pre  x ≤ 100
+/// post result ≥ 9
+fn square_lower(u64 x) -> u64 {
+    /// assert #[label(sq_mono)]  x * x ≥ 3 * x
+    /// assert #[label(sq_bound)] x * x ≤ 10000
+    return x * x;
+}
+
+/// discharge square_lower.assert.sq_mono by
+///   have h := Int.mul_le_mul_of_nonneg_right h_pre_x_3 (by omega : (0:Int) ≤ x)
+///   omega
+
+/// discharge square_lower.assert.sq_bound by
+///   have h := Int.mul_le_mul_of_nonneg_right h_pre_x_100 (by omega : (0:Int) ≤ x)
+///   omega

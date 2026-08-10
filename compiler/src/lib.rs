@@ -387,7 +387,7 @@ pub fn check_file_structured(
         },
     };
 
-    let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages));
+    let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages, &lines));
     if diags.is_empty() {
         let warnings =
             lean::dedup_by_name(lean::diagnose_warnings(&emitted, &vc, &messages));

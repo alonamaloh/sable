@@ -1103,14 +1103,50 @@ impl<'a> Parser<'a> {
             if self.at(&Tok::Eof) {
                 return Err(self.error_expected("`}`"));
             }
+            // A proof block ending just above a non-loop statement holds
+            // inline `assert` clauses (loops consume their own preceding
+            // block for `invariant`/`variant`/`assert`).
+            if !self.at(&Tok::KwFor) && !self.at(&Tok::KwWhile) {
+                self.take_asserts(&mut stmts)?;
+            }
+            if self.at(&Tok::RBrace) {
+                break;
+            }
             if self.at(&Tok::KwFor) {
                 stmts.extend(self.for_stmt()?);
+            } else if self.at(&Tok::KwWhile) {
+                stmts.extend(self.while_stmt()?);
             } else {
                 stmts.push(self.stmt()?);
             }
         }
+        // Trailing asserts just before the closing brace.
+        self.take_asserts(&mut stmts)?;
         self.expect(Tok::RBrace)?;
         Ok(stmts)
+    }
+
+    /// Consume a proof block ending immediately above the current token
+    /// as inline `assert` statements.
+    fn take_asserts(&mut self, stmts: &mut Vec<Stmt>) -> PResult<()> {
+        let line = self.peek_line();
+        if let Some(block) = self.take_block_ending_before(line) {
+            for clause in &block.clauses {
+                validate_clause_label(clause)?;
+                match clause.kind {
+                    ClauseKind::Assert => stmts.push(Stmt::Assert(clause.clone())),
+                    other => {
+                        return Err(bad_clause(
+                            other,
+                            clause,
+                            "a statement position",
+                            "only `assert` clauses may precede a statement",
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `for (T i : range(hi))` / `for (T i : range(lo, hi))` — pure sugar,
@@ -1303,7 +1339,6 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::KwIf => self.if_stmt(),
-            Tok::KwWhile => self.while_stmt(),
             Tok::KwVar => {
                 self.bump();
                 let (name, name_span) = self.ident()?;
@@ -1488,16 +1523,18 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn while_stmt(&mut self) -> PResult<Stmt> {
+    fn while_stmt(&mut self) -> PResult<Vec<Stmt>> {
         let while_line = self.peek_line();
         let kw_span = self.expect(Tok::KwWhile)?.span;
         let mut invariants = Vec::new();
+        let mut asserts = Vec::new();
         let mut variant = None;
         if let Some(block) = self.take_block_ending_before(while_line) {
             for clause in &block.clauses {
                 validate_clause_label(clause)?;
                 match clause.kind {
                     ClauseKind::Invariant => invariants.push(clause.clone()),
+                    ClauseKind::Assert => asserts.push(Stmt::Assert(clause.clone())),
                     ClauseKind::Variant => {
                         if variant.replace(clause.clone()).is_some() {
                             return Err(Diagnostic {
@@ -1510,7 +1547,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     other => return Err(bad_clause(other, clause, "a loop annotation block",
-                        "only `invariant` and `variant` may precede a loop")),
+                        "only `invariant`, `variant`, and `assert` may precede a loop")),
                 }
             }
         }
@@ -1518,13 +1555,14 @@ impl<'a> Parser<'a> {
         let cond = self.expr()?;
         self.expect(Tok::RParen)?;
         let body = self.block()?;
-        Ok(Stmt::While {
+        asserts.push(Stmt::While {
             cond,
             invariants,
             variant,
             kw_span,
             body,
-        })
+        });
+        Ok(asserts)
     }
 
     // Precedence climbing. Comparisons are non-associative by design.

@@ -1,0 +1,10 @@
+// expect-error: bad.assert.x_10
+// An inline assert is an obligation like any other: unprovable means a
+// named compile error at the assert's own line.
+
+/// pre x ≤ 5
+/// post result ≤ 5
+fn bad(u64 x) -> u64 {
+    /// assert #[label(x_10)] x ≥ 10
+    return x;
+}

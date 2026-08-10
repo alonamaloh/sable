@@ -1,0 +1,44 @@
+// Dynamic coverage: inline asserts evaluated at their program points
+// (zero skips), and contracted calls in loop conditions executing per
+// head check.
+
+/// post #[label(sel)] result = (if x < y then y else x)
+fn pick(u64 x, u64 y) -> u64 {
+    if (x < y) {
+        return y;
+    }
+    return x;
+}
+
+/// post result ≤ 10
+fn clamp_down(u64 n) -> u64 {
+    u64 k = n;
+    /// variant k
+    while (pick(k, 10) > 10) {
+        k = k - 1;
+    }
+    return k;
+}
+
+/// pre  x ≥ 3
+/// pre  x ≤ 100
+/// post result ≥ 9
+fn square_lower(u64 x) -> u64 {
+    /// assert #[label(sq_mono)]  x * x ≥ 3 * x
+    /// assert #[label(sq_bound)] x * x ≤ 10000
+    return x * x;
+}
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+fn test_cond_call_loop() {
+    expect_eq(clamp_down(17), 10);
+    expect_eq(clamp_down(3), 3);
+}
+
+fn test_asserts_monitored() {
+    expect_eq(square_lower(3), 9);
+    expect_eq(square_lower(100), 10000);
+}

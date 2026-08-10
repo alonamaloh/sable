@@ -289,7 +289,12 @@ pub fn run_lean(repo_root: &Path, lean_file: &Path) -> Result<Vec<LeanMessage>, 
 }
 
 /// Map lean error messages back to .sable diagnostics.
-pub fn diagnose(emitted: &Emitted, vc: &VcResult, messages: &[LeanMessage]) -> Vec<Diagnostic> {
+pub fn diagnose(
+    emitted: &Emitted,
+    vc: &VcResult,
+    messages: &[LeanMessage],
+    lines: &crate::span::LineMap,
+) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for msg in messages {
         if msg.severity != "error" {
@@ -321,7 +326,21 @@ pub fn diagnose(emitted: &Emitted, vc: &VcResult, messages: &[LeanMessage]) -> V
                 let ob: &Obligation = &vc.obligations[*i];
                 let mut notes = vec![("goal".into(), ob.goal.clone())];
                 if !ob.context.is_empty() {
-                    notes.push(("context".into(), ob.context.join("\n")));
+                    // Each entry carries the line its fact came from, so
+                    // the provenance of every hypothesis is traceable.
+                    let rendered: Vec<String> = ob
+                        .context
+                        .iter()
+                        .map(|(text, span)| {
+                            if span.start == 0 && span.end == 0 {
+                                text.clone()
+                            } else {
+                                let (line, _) = lines.line_col(span.start);
+                                format!("{text}   (line {line})")
+                            }
+                        })
+                        .collect();
+                    notes.push(("context".into(), rendered.join("\n")));
                 }
                 notes.push((
                     "automation".into(),

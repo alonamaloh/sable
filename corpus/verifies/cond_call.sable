@@ -1,0 +1,22 @@
+// A contracted call in a loop condition: the callee's posts bind to the
+// path condition in BOTH directions — the body path needs `pick`'s post
+// to prove the decrement safe, and the exit path needs it for the
+// function's own post. No hoisted temp, no iff invariants.
+
+/// post #[label(sel)] result = (if x < y then y else x)
+fn pick(u64 x, u64 y) -> u64 {
+    if (x < y) {
+        return y;
+    }
+    return x;
+}
+
+/// post result ≤ 10
+fn clamp_down(u64 n) -> u64 {
+    u64 k = n;
+    /// variant k
+    while (pick(k, 10) > 10) {
+        k = k - 1;
+    }
+    return k;
+}

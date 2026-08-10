@@ -36,7 +36,9 @@ pub struct Obligation {
     pub binders: Vec<(String, String)>,
     /// (hypothesis name, Lean proposition)
     pub hyps: Vec<(String, String)>,
-    pub context: Vec<String>,
+    /// Human context entries with their source spans (span (0,0) when
+    /// no source location applies, e.g. template facts).
+    pub context: Vec<(String, Span)>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,7 +205,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                     goal: format!("({})", req.text),
                     binders: Vec::new(),
                     hyps: Vec::new(),
-                    context: vec![format!("instantiated from `{tname}`")],
+                    context: vec![(format!("instantiated from `{tname}`"), Span::new(0, 0))],
                 });
             }
             continue;
@@ -242,7 +244,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             generator
                 .hyps
                 .push((format!("h_{t}_wf"), format!("{t}.wf")));
-            generator.context.push(format!("type parameter {t}"));
+            generator.context.push((format!("type parameter {t}"), Span::new(0, 0)));
             if let Some(Some(b)) = f.type_bounds.get(i) {
                 let tr = trait_map[b.as_str()];
                 for sp in &tr.specs {
@@ -251,14 +253,14 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                         .push((format!("{t}_{}", sp.name), sp.sig.clone()));
                 }
                 generator.trait_ctx.insert(t.clone(), tr);
-                generator.context.push(format!("bound {t}: {b}"));
+                generator.context.push((format!("bound {t}: {b}"), Span::new(0, 0)));
             }
         }
         for req in &f.requires {
             generator
                 .hyps
                 .push((format!("h_req_{}", chslug(req)), format!("({})", req.text)));
-            generator.context.push(format!("requires {}", req.text));
+            generator.context.push((format!("requires {}", req.text), req.line_span));
         }
         generator.run();
     }
@@ -307,7 +309,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 generator
                     .hyps
                     .push((format!("h_{t}_wf"), format!("{t}.wf")));
-                generator.context.push(format!("type parameter {t}"));
+                generator.context.push((format!("type parameter {t}"), Span::new(0, 0)));
                 if let Some(Some(b)) = c.type_bounds.get(i) {
                     let tr = trait_map[b.as_str()];
                     for sp in &tr.specs {
@@ -316,7 +318,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                             .push((format!("{t}_{}", sp.name), sp.sig.clone()));
                     }
                     generator.trait_ctx.insert(t.clone(), tr);
-                    generator.context.push(format!("bound {t}: {b}"));
+                    generator.context.push((format!("bound {t}: {b}"), Span::new(0, 0)));
                 }
             }
             generator.run();
@@ -383,7 +385,7 @@ struct Generator<'a> {
     source: &'a str,
     binders: Vec<(String, String)>,
     hyps: Vec<(String, String)>,
-    context: Vec<String>,
+    context: Vec<(String, Span)>,
     env: HashMap<String, Val>,
     var_tys: HashMap<String, Ty>,
     /// &mut array params: source name → entry-state binder (`_old_a`).
@@ -446,6 +448,46 @@ impl<'a> Generator<'a> {
         (literal, map)
     }
 
+    /// Everything in scope, as Lean binders — the environment for clause
+    /// well-formedness defs (loop annotations, inline asserts).
+    fn scope_binders(&self) -> Vec<(String, String)> {
+        let mut scope_binders: Vec<(String, String)> = Vec::new();
+        for t in &self.tparams {
+            scope_binders.push((t.clone(), "Sable.IntModel".to_string()));
+            if let Some(tr) = self.trait_ctx.get(t.as_str()) {
+                for sp in &tr.specs {
+                    scope_binders.push((format!("{t}_{}", sp.name), sp.sig.clone()));
+                }
+            }
+        }
+        scope_binders.extend(self.var_tys.iter().filter_map(|(name, ty)| match ty {
+            Ty::Int(_) => Some((name.clone(), "Int".to_string())),
+            Ty::Bool => Some((name.clone(), "Bool".to_string())),
+            Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
+            Ty::Class(ci) | Ty::ClassRef(ci) => {
+                Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
+            }
+            Ty::Option(_) | Ty::Unit => None,
+        }));
+        for (name, entry) in self.mut_arrays.iter() {
+            if name == "self" {
+                continue; // handled below with the class type
+            }
+            scope_binders.push((entry.clone(), "Sable.Seq Int".to_string()));
+        }
+        match self.cctx {
+            Cctx::Init(c) => {
+                scope_binders.push(("self".to_string(), lean_class_name(&c.name)))
+            }
+            Cctx::Method(c, _) => {
+                scope_binders.push(("self".to_string(), lean_class_name(&c.name)));
+                scope_binders.push(("_old_self".to_string(), lean_class_name(&c.name)));
+            }
+            Cctx::None => {}
+        }
+        scope_binders
+    }
+
     /// Per-field representability facts about a class-state binder —
     /// justified the same way havoc facts are: every store is checked.
     fn push_class_state_facts(&mut self, class: &ClassDecl, binder: &str) {
@@ -488,7 +530,7 @@ impl<'a> Generator<'a> {
             // Deduped: invariants with a shared slug prefix must not
             // shadow each other (discharges cite these names).
             self.push_hyp_unique(format!("h_cinv_{}", chslug(inv)), format!("({prop})"));
-            self.context.push(format!("class invariant {}", inv.text));
+            self.context.push((format!("class invariant {}", inv.text), inv.line_span));
         }
     }
 
@@ -570,7 +612,7 @@ impl<'a> Generator<'a> {
             let _ = i;
             self.hyps
                 .push((format!("h_pre_{}", chslug(pre)), format!("({hyp})")));
-            self.context.push(format!("pre {}", pre.text));
+            self.context.push((format!("pre {}", pre.text), pre.line_span));
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
                 def_name: format!("wf_{}_pre_{}", sanitize(&self.fname), i + 1),
@@ -873,7 +915,7 @@ impl<'a> Generator<'a> {
 
                 self.hyps
                     .push((format!("h_path_{}", hslug(&p)), p.clone()));
-                self.context.push(format!("path {p}"));
+                self.context.push((format!("path {p}"), cond.span));
                 let then_stmts: Vec<&Stmt> =
                     then_block.iter().chain(rest.iter().copied()).collect();
                 self.exec(&then_stmts, tail);
@@ -884,7 +926,7 @@ impl<'a> Generator<'a> {
 
                 self.hyps
                     .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
-                self.context.push(format!("path ¬{p}"));
+                self.context.push((format!("path ¬{p}"), cond.span));
                 match else_block {
                     Some(eb) => {
                         let else_stmts: Vec<&Stmt> =
@@ -895,6 +937,40 @@ impl<'a> Generator<'a> {
                 }
                 self.hyps = snap_hyps;
                 self.context = snap_ctx;
+            }
+            Stmt::Assert(clause) => {
+                // Well-formedness def so a clause that fails to elaborate
+                // maps to its own span.
+                self.fresh += 1;
+                self.out.clause_wfs.push(ClauseWf {
+                    def_name: format!(
+                        "wf_{}_assert{}",
+                        sanitize(&self.fname),
+                        self.fresh
+                    ),
+                    binders: self.scope_binders(),
+                    text: self.preprocess(&clause.text),
+                    span: clause.line_span,
+                    desc: format!("`assert` in `{}`", self.fname),
+                    result_ty: "Prop",
+                });
+                // The obligation at this point, then the fact downstream —
+                // an inline stepping-stone lemma: prove once (automation or
+                // a `discharge`), use everywhere after.
+                let goal = self.subst_env(&self.preprocess(&clause.text));
+                let ob = self.obligation(
+                    &format!("{}.assert.{}", self.fname, cslug(clause)),
+                    "inline `assert` must hold at this point".into(),
+                    clause.line_span,
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.push_hyp_unique(
+                    format!("h_assert_{}", chslug(clause)),
+                    format!("({goal})"),
+                );
+                self.context.push((format!("assert {}", clause.text), clause.line_span));
+                self.exec(rest, tail);
             }
             Stmt::While {
                 cond,
@@ -907,42 +983,7 @@ impl<'a> Generator<'a> {
 
                 // Well-formedness defs so clause elaboration errors map to
                 // the clause span. Binders: everything in scope.
-                let mut scope_binders: Vec<(String, String)> = Vec::new();
-                for t in &self.tparams {
-                    scope_binders.push((t.clone(), "Sable.IntModel".to_string()));
-                    if let Some(tr) = self.trait_ctx.get(t.as_str()) {
-                        for sp in &tr.specs {
-                            scope_binders
-                                .push((format!("{t}_{}", sp.name), sp.sig.clone()));
-                        }
-                    }
-                }
-                scope_binders.extend(self
-                    .var_tys
-                    .iter()
-                    .filter_map(|(name, ty)| match ty {
-                        Ty::Int(_) => Some((name.clone(), "Int".to_string())),
-                        Ty::Bool => Some((name.clone(), "Bool".to_string())),
-                        Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
-                        Ty::Class(ci) | Ty::ClassRef(ci) => {
-                            Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
-                        }
-                        Ty::Option(_) | Ty::Unit => None,
-                    }));
-                for (name, entry) in self.mut_arrays.iter() {
-                    if name == "self" {
-                        continue; // handled below with the class type
-                    }
-                    scope_binders.push((entry.clone(), "Sable.Seq Int".to_string()));
-                }
-                match self.cctx {
-                    Cctx::Init(c) => scope_binders.push(("self".to_string(), lean_class_name(&c.name))),
-                    Cctx::Method(c, _) => {
-                        scope_binders.push(("self".to_string(), lean_class_name(&c.name)));
-                        scope_binders.push(("_old_self".to_string(), lean_class_name(&c.name)));
-                    }
-                    Cctx::None => {}
-                }
+                let scope_binders = self.scope_binders();
                 for (i, clause) in invariants.iter().chain(std::iter::once(variant)).enumerate() {
                     self.fresh += 1;
                     self.out.clause_wfs.push(ClauseWf {
@@ -984,7 +1025,7 @@ impl<'a> Generator<'a> {
                         format!("h_inv_{}", chslug(inv)),
                         format!("({text})"),
                     );
-                    self.context.push(format!("invariant {}", inv.text));
+                    self.context.push((format!("invariant {}", inv.text), inv.line_span));
                 }
                 let p = self.eval_prop(cond);
 
@@ -1004,7 +1045,7 @@ impl<'a> Generator<'a> {
                 ));
                 self.hyps
                     .push((format!("h_path_{}", hslug(&p)), p.clone()));
-                self.context.push(format!("path {p}"));
+                self.context.push((format!("path {p}"), cond.span));
                 let body_stmts: Vec<&Stmt> = body.iter().collect();
                 let loop_tail = Tail::Loop {
                     invariants,
@@ -1020,7 +1061,7 @@ impl<'a> Generator<'a> {
                 // 5. Continuation: invariants + ¬cond.
                 self.hyps
                     .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
-                self.context.push(format!("path ¬{p}"));
+                self.context.push((format!("path ¬{p}"), cond.span));
                 self.exec(rest, tail);
                 self.hyps = snap_hyps;
                 self.context = snap_ctx;
@@ -1119,7 +1160,7 @@ impl<'a> Generator<'a> {
             }
         }
         self.context
-            .retain(|note| !havoc_set.iter().any(|h| mentions(note, h)));
+            .retain(|note| !havoc_set.iter().any(|h| mentions(&note.0, h)));
 
         for name in &havoc_names {
             let name = *name;
@@ -1624,7 +1665,7 @@ impl<'a> Generator<'a> {
                         format!("({prop})"),
                     );
                     self.context
-                        .push(format!("from `{param}::{method}` post: {}", post.text));
+                        .push((format!("from `{param}::{method}` post: {}", post.text), post.line_span));
                 }
                 Val::Int(ret_sym)
             }
@@ -1733,7 +1774,7 @@ impl<'a> Generator<'a> {
                         format!("({prop})"),
                     );
                     self.context
-                        .push(format!("from `{}::{method}` post: {}", cd.name, post.text));
+                        .push((format!("from `{}::{method}` post: {}", cd.name, post.text), post.line_span));
                 }
                 match m.f.ret {
                     Ty::Option(_) => Val::Opt(ret_sym),
@@ -2026,7 +2067,7 @@ impl<'a> Generator<'a> {
                         format!("({prop})"),
                     );
                     self.context
-                        .push(format!("from `{callee}` post: {}", post.text));
+                        .push((format!("from `{callee}` post: {}", post.text), post.line_span));
                 }
                 match sig.ret {
                     Ty::Option(_) => Val::Opt(ret_sym),
@@ -2413,7 +2454,7 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
             Stmt::FieldAssign { .. } | Stmt::FieldStore { .. } => {
                 out.insert("self".to_string());
             }
-            Stmt::VarDecl { .. } => {}
+            Stmt::VarDecl { .. } | Stmt::Assert(_) => {}
             Stmt::ExprStmt(e) => {
                 if let ExprKind::MethodCall { recv, .. } = &e.kind {
                     out.insert(recv.clone());

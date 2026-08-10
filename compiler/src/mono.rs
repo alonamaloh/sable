@@ -394,6 +394,9 @@ fn prepare_stmts(
                     prepare_stmts(eb, qual, bound_params);
                 }
             }
+            Stmt::Assert(c) => {
+                c.text = subst_clause_text(&c.text, qual);
+            }
             Stmt::While {
                 cond,
                 invariants,
@@ -672,7 +675,9 @@ impl Mono {
                 | Stmt::VarDecl { init: e, .. }
                 | Stmt::FieldAssign { value: e, .. }
                 | Stmt::Return { value: Some(e), .. } => self.rewrite_expr(e, depth)?,
-                Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
+                Stmt::Decl { init: None, .. }
+                | Stmt::Return { value: None, .. }
+                | Stmt::Assert(_) => {}
                 Stmt::Store { index, value, .. }
                 | Stmt::FieldStore { index, value, .. } => {
                     self.rewrite_expr(index, depth)?;
@@ -853,6 +858,9 @@ fn subst_stmts(
                 if let Some(eb) = else_block {
                     subst_stmts(eb, args, text_map, bound_calls)?;
                 }
+            }
+            Stmt::Assert(c) => {
+                c.text = subst_clause_text(&c.text, text_map);
             }
             Stmt::While {
                 cond,

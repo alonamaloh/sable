@@ -840,6 +840,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     },
                 );
             }
+            Stmt::Assert(_) => {
+                // Proof language: elaborated by Lean (well-formedness def)
+                // and evaluated by the monitor; nothing to typecheck.
+            }
             Stmt::FieldAssign {
                 field,
                 field_span,
@@ -965,6 +969,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
 fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
         Stmt::Decl { name_span, .. } => *name_span,
+        Stmt::Assert(c) => c.line_span,
         Stmt::Assign { name_span, .. } => *name_span,
         Stmt::If { cond, .. } => cond.span,
         Stmt::While { kw_span, .. } => *kw_span,

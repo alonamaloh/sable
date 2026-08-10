@@ -1,0 +1,13 @@
+// expect-test-failure: inline assert
+// Asserts are monitored: sable test evaluates each one at its program
+// point, and a violation is caught, not skipped.
+
+/// post result ≤ 100
+fn helper(u64 x) -> u64 {
+    /// assert #[label(never)] x ≥ 10
+    return x;
+}
+
+fn test_violates() {
+    helper(3);
+}

@@ -345,6 +345,10 @@ impl<'a> Interp<'a> {
                 self.eval(e, frame)?;
                 Ok(Flow::Normal)
             }
+            Stmt::Assert(clause) => {
+                self.check_clause(frame, clause, None, "inline assert")?;
+                Ok(Flow::Normal)
+            }
             Stmt::VarDecl { name, init, .. } => {
                 let v = self.eval(init, frame)?;
                 frame.vars.insert(name.clone(), v);
@@ -957,6 +961,7 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
 fn stmt_span(stmt: &Stmt) -> crate::span::Span {
     match stmt {
         Stmt::Decl { name_span, .. } | Stmt::Assign { name_span, .. } => *name_span,
+        Stmt::Assert(c) => c.line_span,
         Stmt::If { cond, .. } => cond.span,
         Stmt::While { kw_span, .. } => *kw_span,
         Stmt::Return { span, .. } => *span,
