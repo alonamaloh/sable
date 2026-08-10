@@ -5,6 +5,29 @@
 
 use sable::{check_file, Options, Outcome};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::thread;
+
+/// Run `work` over `items` on a small thread pool; collect the failure
+/// strings. The Lean checks dominate wall clock and the files are
+/// independent, so this is a near-linear speedup.
+fn parallel<T: Send>(items: Vec<T>, work: impl Fn(&T) -> Vec<String> + Sync) -> Vec<String> {
+    let n = thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(8);
+    let items = Mutex::new(items.into_iter());
+    let failures = Mutex::new(Vec::new());
+    thread::scope(|s| {
+        for _ in 0..n {
+            s.spawn(|| loop {
+                let Some(item) = items.lock().unwrap().next() else {
+                    break;
+                };
+                let fs = work(&item);
+                failures.lock().unwrap().extend(fs);
+            });
+        }
+    });
+    failures.into_inner().unwrap()
+}
 
 fn corpus_dir(sub: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -43,44 +66,42 @@ fn corpus() {
     let opts = Options::default();
     let mut failures: Vec<String> = Vec::new();
 
-    for path in sable_files(&corpus_dir("verifies")) {
-        match check_file(&path, &opts) {
+    failures.extend(parallel(sable_files(&corpus_dir("verifies")), |path| {
+        match check_file(path, &opts) {
             Outcome::Verified { obligations, .. } => {
                 println!("ok: {} ({obligations} obligations)", path.display());
+                vec![]
             }
-            Outcome::Failed(diags) => {
-                failures.push(format!(
-                    "{} should verify but failed:\n{}",
-                    path.display(),
-                    diags
-                        .iter()
-                        .map(|f| f.rendered.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ));
-            }
+            Outcome::Failed(diags) => vec![format!(
+                "{} should verify but failed:\n{}",
+                path.display(),
+                diags
+                    .iter()
+                    .map(|f| f.rendered.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )],
         }
-    }
+    }));
 
-    for path in sable_files(&corpus_dir("must-fail")) {
-        let expected = expected_errors(&path);
+    failures.extend(parallel(sable_files(&corpus_dir("must-fail")), |path| {
+        let expected = expected_errors(path);
         assert!(
             !expected.is_empty(),
             "{} has no `// expect-error:` header",
             path.display()
         );
-        match check_file(&path, &opts) {
-            Outcome::Verified { .. } => {
-                failures.push(format!(
-                    "{} should FAIL (expected {:?}) but verified",
-                    path.display(),
-                    expected
-                ));
-            }
+        match check_file(path, &opts) {
+            Outcome::Verified { .. } => vec![format!(
+                "{} should FAIL (expected {:?}) but verified",
+                path.display(),
+                expected
+            )],
             Outcome::Failed(diags) => {
+                let mut out = Vec::new();
                 for exp in &expected {
                     if !diags.iter().any(|d| d.name.contains(exp.as_str())) {
-                        failures.push(format!(
+                        out.push(format!(
                             "{} failed, but no diagnostic matches `{exp}`; got: [{}]",
                             path.display(),
                             diags
@@ -92,9 +113,10 @@ fn corpus() {
                     }
                 }
                 println!("ok (fails as expected): {}", path.display());
+                out
             }
         }
-    }
+    }));
 
     // Dynamic-test corpus: corpus/tests must pass with no skipped
     // clauses (the whole contract corpus is inside the monitorable
