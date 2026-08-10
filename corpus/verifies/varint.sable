@@ -1,4 +1,4 @@
-// LEB128-style varint codec for a single u64 (M6 codec track).
+// LEB128-style varint codec for a single u64.
 //
 // No `narrow<T>` exists yet, so the byte buffer is a [u64] whose elements
 // the contracts keep in byte range (< 256); see the report note.

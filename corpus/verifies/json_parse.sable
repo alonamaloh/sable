@@ -1,4 +1,4 @@
-// Tier 2, the JSON parser: structural validation against the RFC 8259
+// The JSON parser: structural validation against the RFC 8259
 // value grammar. The grammar is ONE mode-encoded well-founded ghost
 // predicate (`jgram`: 0 value / 1 object-interior / 4 object-tail /
 // 2 array-interior / 6 array-tail — ghost defs splice as single defs,
@@ -9,7 +9,7 @@
 // forward-scan invariants over the tail modes). `json_valid` returning
 // true is a kernel-checked proof the buffer is one JSON value in
 // optional whitespace. String/number lexing and their proofs are the
-// M10 artifacts, carried verbatim.
+// lexer artifacts, carried verbatim.
 //
 // Layer 2 (next): duplicate object keys via the verified hash map.
 
@@ -470,8 +470,7 @@ fn ws_run(&[u8] b, u64 i) -> u64 {
 
 // One self-recursive function; objects and arrays are interior loops.
 // Every success return is a `jgram` construction through the step
-// lemmas; every 0 return is a rejection (no completeness claim in
-// layer 1).
+// lemmas; every 0 return is a rejection (no completeness claim).
 
 /// pre  pos ≤ b.len
 /// pre  b.len ≤ 4611686018427387904
@@ -643,7 +642,7 @@ fn json_valid(&[u8] b) -> bool {
 }
 
 
-// ---------------- discharges carried from the M10 lexer ----------------
+// ------------------ discharges carried from the lexer ------------------
 
 /// discharge digit_run.inv_preserved.k_i_k_k_j_digitc_b_get_k by
 ///   intro k hk1 hk2

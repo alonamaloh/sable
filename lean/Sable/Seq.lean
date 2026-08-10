@@ -9,7 +9,7 @@ quantifiers over indices carry explicit `0 ≤ k` guards.
 (The alternative — `Nat`-typed lengths and indices — does not elaborate
 against Int-lifted program values: in `∀ k, k < lo → a.get k < key` Lean
 commits `k : Int` at the comparison before ever seeing `get`. All-Int
-with guards is uniform and coercion-free; decided during M1, 2026-08-08.)
+with guards is uniform and coercion-free.)
 -/
 
 namespace Sable

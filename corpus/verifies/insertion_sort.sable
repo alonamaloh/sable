@@ -1,4 +1,4 @@
-// The M2 exit criterion: in-place insertion sort with the full
+// In-place insertion sort with the full
 // specification — the output is sorted AND a permutation of the input.
 // The permutation half rides on the prelude's counting library
 // (lean/Sable/Perm.lean); `Seq.perm_swap` matches the three-statement

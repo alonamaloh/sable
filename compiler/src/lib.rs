@@ -185,8 +185,8 @@ pub fn check_file_structured(
 
     // Escape-hatch validation: every defer/assume/discharge must name a
     // real obligation; one obligation gets at most one treatment; a
-    // deferred obligation must be runtime-monitorable (design §9 — M3
-    // supports the quantifier-free fragment).
+    // deferred obligation must be runtime-monitorable (design §9 —
+    // the quantifier-free fragment).
     {
         let find = |name: &str| vc.obligations.iter().find(|ob| ob.name == name);
         let mut treated: std::collections::HashMap<&str, &str> =
@@ -221,9 +221,9 @@ pub fn check_file_structured(
                         ("goal".into(), goal.clone()),
                         (
                             "note".into(),
-                            "defer compiles an obligation to a runtime check; M3 supports \
-                             the quantifier-free fragment (bounded-quantifier checking \
-                             loops are scheduled)"
+                            "defer compiles an obligation to a runtime check; only the \
+                             quantifier-free fragment is supported (bounded-quantifier \
+                             checking loops are scheduled)"
                                 .into(),
                         ),
                     ],

@@ -1,5 +1,4 @@
-// Tier 1 (M7): the growable vector, GENERIC — the first instantiated
-// artifact under ADR 0006. Contracts are pointwise against the backing
+// The growable vector, GENERIC — instantiated under ADR 0006. Contracts are pointwise against the backing
 // buffer prefix [0, len); the class invariant carries the capacity
 // bound that makes doubling growth overflow-free. Logical max capacity
 // is 2^62 elements (unreachable before the OOM trap).
@@ -93,7 +92,7 @@ fn demo_u8() -> u8 {
 
 // The copy loop's preservation and the push frame post need the loop
 // invariant instantiated across the get_set case split — ONCE, at the
-// template (ADR 0009 slice 2): these four discharges cover every
+// template (ADR 0009): these four discharges cover every
 // instantiation of Vec<T>.
 
 /// discharge Vec::push.inv_preserved.k_0_k_k_i_nb_get_k_self_buf_get_k by

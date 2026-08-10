@@ -1,4 +1,4 @@
-// Round-trip hex codec (M6): hex_encode maps each byte to two lowercase
+// Round-trip hex codec: hex_encode maps each byte to two lowercase
 // ASCII hex characters; hex_decode inverts it, rejecting non-hex input.
 // The ghost maps are written arithmetically (Euclidean division by a
 // constant) rather than with if-then-else so they stay inside both

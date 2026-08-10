@@ -1,7 +1,7 @@
 //! Handwritten recursive-descent parser, plus positional attachment of
 //! proof blocks (design §1): a block attaches to the item starting on the
 //! line right after its last `///` line; a blank line detaches it.
-//! Attachment targets in M1: functions (`pre`/`post`/`variant`), `while`
+//! Attachment targets: functions (`pre`/`post`/`variant`), `while`
 //! loops (`invariant`/`variant`), the post-signature position
 //! (`variant`, design §8 style), and free-floating `discharge` blocks.
 
@@ -502,7 +502,7 @@ impl<'a> Parser<'a> {
             } else {
                 Mutability::Shared
             };
-            // `&Nat` — shared borrow of a class (ADR 0010 slice A).
+            // `&Nat` — shared borrow of a class (ADR 0010).
             if let Tok::Ident(n) = self.peek() {
                 if let Some(ci) = self.class_names.iter().position(|c| c == n) {
                     if mutability == Mutability::Mut {
@@ -510,7 +510,7 @@ impl<'a> Parser<'a> {
                             name: "class.mut_borrow_deferred".into(),
                             title: "`&mut` class borrows are not supported yet".into(),
                             span: self.peek_span(),
-                            label: "ADR 0010 slice A: shared borrows and returns only"
+                            label: "shared borrows and returns only (ADR 0010)"
                                 .into(),
                             notes: vec![],
                         });
@@ -1697,7 +1697,7 @@ impl<'a> Parser<'a> {
                             name: "parse.bad_index".into(),
                             title: "only named arrays can be indexed".into(),
                             span: self.peek_span(),
-                            label: "indexing applies to array parameters in M1".into(),
+                            label: "indexing applies to array values".into(),
                             notes: vec![],
                         });
                     };
@@ -2130,8 +2130,8 @@ fn bad_clause(
         label: rule.to_string(),
         notes: vec![(
             "note".into(),
-            "statement-level `assert`/`defer`/`assume` land in M3; ghost \
-             `def`/`theorem` land in M2; a continuation line must follow a clause"
+            "statement-level `assert` is not supported; a continuation \
+             line must follow a clause"
                 .into(),
         )],
     }

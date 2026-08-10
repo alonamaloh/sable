@@ -1,5 +1,6 @@
 // expect-error: proof.defer_unmonitorable
-// A quantified goal cannot become a runtime check (M3 fragment).
+// A quantified goal cannot become a runtime check (outside the
+// monitorable fragment).
 
 /// post ∀ k, 0 ≤ k → k < a.len → a.get k ≤ i32.max
 fn idle(&[i32] a) -> i32 {

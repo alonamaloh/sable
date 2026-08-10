@@ -1,4 +1,4 @@
-// Tier 2: the JSON tokenizer (RFC 8259 lexical grammar). The grammar
+// The JSON tokenizer (RFC 8259 lexical grammar). The grammar
 // lives in ghost predicates — `strTail` (string bodies, recursive with
 // varying escape widths), `digits`/`jint`/`jfrac`/`jexp`/`jnumber`
 // (numbers, an ∃-split over phase boundaries), `jtoken` (the kind

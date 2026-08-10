@@ -271,8 +271,7 @@ fn ws_run(&[u8] b, u64 i) -> u64 {
 
 // One self-recursive function; objects and arrays are interior loops.
 // Every success return is a `jgram` construction through the step
-// lemmas; every 0 return is a rejection (no completeness claim in
-// layer 1).
+// lemmas; every 0 return is a rejection (no completeness claim).
 
 /// pre  pos ≤ b.len
 /// pre  b.len ≤ 4611686018427387904
@@ -439,7 +438,7 @@ fn json_valid(&[u8] b) -> bool {
     return false;
 }
 
-// ---------------- discharges carried from the M10 lexer ----------------
+// ------------------ discharges carried from the lexer ------------------
 
 // ---------------------- the parser's own discharges ----------------------
 

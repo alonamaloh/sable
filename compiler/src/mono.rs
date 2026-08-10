@@ -298,7 +298,7 @@ struct ImplInfo {
     specs: HashMap<String, String>,
 }
 
-/// Template-save preparation (ADR 0009 slice 3): rewrite the qualified
+/// Template-save preparation (ADR 0009): rewrite the qualified
 /// spec references in clause text (`K::hash` → the abstract binder
 /// `K_hash`) and convert bounded-parameter calls into `TraitCall`.
 fn template_qual_map(

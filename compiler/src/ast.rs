@@ -1,4 +1,4 @@
-//! AST for the M0 program-language subset (see docs/PLAN.md for scope).
+//! AST for the program language (see docs/PLAN.md for scope).
 //! Types are filled in by the checker (`ty` fields start as None).
 
 use crate::scan::Clause;
@@ -225,7 +225,7 @@ pub enum ExprKind {
     /// junk-on-none in the model (like `Seq.get` off-range), trap in
     /// `sable test`.
     OptValue { operand: Box<Expr> },
-    /// `some(e)` / `none` — return position only in M1.
+    /// `some(e)` / `none` — return position only for now.
     SomeE(Box<Expr>),
     NoneE,
     /// `[e1, e2, ...]` — test functions only.
@@ -274,7 +274,7 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     /// `K::m(args)` through a trait bound, inside a TEMPLATE body
-    /// (ADR 0009 slice 3): modeled as an opaque call whose posts are the
+    /// (ADR 0009): modeled as an opaque call whose posts are the
     /// trait's contracts over the abstract spec functions. Instances
     /// never contain this (mono resolves them to concrete calls).
     TraitCall {
@@ -507,7 +507,7 @@ pub struct ClassDecl {
     /// Per-parameter trait bound, parallel to `type_params` (ADR 0007).
     pub type_bounds: Vec<Option<String>>,
     /// Set by mono on instances of a template-verified generic class
-    /// (ADR 0009 slice 2): members skip their own obligations.
+    /// (ADR 0009): members skip their own obligations.
     pub from_template: Option<String>,
     pub fields: Vec<Field>,
     /// Class invariant clauses — interface blocks (design §7).

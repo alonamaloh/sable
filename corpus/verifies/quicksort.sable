@@ -1,4 +1,4 @@
-// In-place quicksort over index ranges (M6): Lomuto partition with a
+// In-place quicksort over index ranges: Lomuto partition with a
 // full functional contract, recursive quicksort_range with a frame
 // ("unchanged outside [lo,hi)") and bound-preservation posts that make
 // the sortedness glue compose, and the top-level `sorted + perm` spec.

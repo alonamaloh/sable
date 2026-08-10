@@ -1,4 +1,4 @@
-// The M5 exit criterion: design §7's BoundedStack, near-verbatim.
+// Design §7's BoundedStack, near-verbatim.
 // The class invariant is an interface block: an obligation at the exit
 // of every init and &mut-self method, an assumption at every entry.
 

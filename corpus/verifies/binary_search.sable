@@ -1,4 +1,4 @@
-// The M1 exit criterion: the design doc's §6 binary_search, with the
+// The design doc's §6 binary_search, with the
 // all-Int spec style (explicit 0 ≤ k guards; see lean/Sable/Seq.lean).
 // Two invariant-preservation obligations genuinely need the sortedness
 // hypothesis instantiated and are discharged by hand below — exactly the

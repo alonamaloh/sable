@@ -1,8 +1,7 @@
 // Dynamic checks over the generic Vec: growth reallocation, the
 // copy-loop frame, get/set, pop-to-empty, and a second instantiation.
 
-// Tier 1 (M7): the growable vector, GENERIC — the first instantiated
-// artifact under ADR 0006. Contracts are pointwise against the backing
+// The growable vector, GENERIC — instantiated under ADR 0006. Contracts are pointwise against the backing
 // buffer prefix [0, len); the class invariant carries the capacity
 // bound that makes doubling growth overflow-free. Logical max capacity
 // is 2^62 elements (unreachable before the OOM trap).

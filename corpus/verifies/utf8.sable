@@ -1,4 +1,4 @@
-// Tier 2 opener: the UTF-8 codec. The encoder is specified against
+// The UTF-8 codec. The encoder is specified against
 // ghost byte maps (utf8_b0..utf8_b3, if-chains over division by
 // CONSTANTS — omega's fragment once split); the decoder returns a value
 // equal to the ghost byte-level decoder applied to the input bytes

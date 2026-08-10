@@ -1,4 +1,4 @@
-// The merge kernel of merge sort (M6 Tier 0): two sorted inputs merged
+// The merge kernel of merge sort: two sorted inputs merged
 // into a pre-sized output, with the full specification — the output is
 // sorted AND carries exactly the multiset of both inputs (count-based).
 

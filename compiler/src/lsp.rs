@@ -1,6 +1,6 @@
 //! The Sable language server (`sable lsp`, stdio transport).
 //!
-//! M4 scope — the design's reader-contract UX (design §1, Appendix A)
+//! Scope — the design's reader-contract UX (design §1, Appendix A)
 //! made visible:
 //!   - diagnostics: fast front-end pass on every edit; the full Lean
 //!     verification on open and save

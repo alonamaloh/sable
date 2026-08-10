@@ -1,4 +1,4 @@
-// First-class class values, slice A (ADR 0010): shared class borrows
+// First-class class values (ADR 0010): shared class borrows
 // as parameters, class returns, and field reads on borrowed values.
 // Contracts speak about class values as structures — `a.lo`,
 // `result.hi` — with no new spec surface at all; borrowed arguments
