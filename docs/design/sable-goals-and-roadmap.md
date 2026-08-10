@@ -72,7 +72,7 @@ Why this is the crown-jewel *library* target:
 
 1. `Nat` with normalization invariant (no leading zero limb ⇒ `value` injective ⇒ equality is limb equality); `cmp`, `add`, `sub` (with `pre a ≥ b` on magnitude subtraction). All obligations SMT-automatic — validates the whole pipeline end to end.
 2. Schoolbook `mul`; division by a single limb. First real Lean lemmas.
-3. Knuth Algorithm D long division — the boss fight. When `/// theorem qhat_bound` is discharged, the moonshot is essentially won.
+3. Knuth Algorithm D long division — the boss fight. When `/// theorem qhat_bound` is discharged, the moonshot is essentially won. *(Done, 2026-08-10: `div` is Algorithm D, `qhat_ge`/`qhat_le4` discharged and load-bearing for the counted correction loop; quarter-normalization deviation recorded in `docs/notes/algd-probe.lean`. See PLAN.md M24.)*
 4. Signed `Int` wrapper (sign + magnitude; pure algebra over `Nat`, almost free); GMP-shaped public API.
 5. Karatsuba, introduced with its recombination proof `defer`red, benchmarked, then defers ratcheted to zero — the intended workout for the §9 escape-hatch design.
 
