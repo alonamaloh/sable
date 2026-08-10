@@ -1,0 +1,6 @@
+// expect-error: proof.malformed_label
+
+/// post #[label(] result = x
+fn ident(i32 x) -> i32 {
+    return x;
+}

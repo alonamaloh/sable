@@ -309,7 +309,7 @@ impl<'a> Generator<'a> {
             let prop = substitute(&inv.text, &map, None);
             // Deduped: invariants with a shared slug prefix must not
             // shadow each other (discharges cite these names).
-            self.push_hyp_unique(format!("h_cinv_{}", hslug(&inv.text)), format!("({prop})"));
+            self.push_hyp_unique(format!("h_cinv_{}", chslug(inv)), format!("({prop})"));
             self.context.push(format!("class invariant {}", inv.text));
         }
     }
@@ -380,7 +380,7 @@ impl<'a> Generator<'a> {
             let hyp = self.subst_env(&text);
             let _ = i;
             self.hyps
-                .push((format!("h_pre_{}", hslug(&pre.text)), format!("({hyp})")));
+                .push((format!("h_pre_{}", chslug(pre)), format!("({hyp})")));
             self.context.push(format!("pre {}", pre.text));
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
@@ -448,7 +448,7 @@ impl<'a> Generator<'a> {
                 for inv in *invariants {
                     let goal = self.subst_env(&self.preprocess(&inv.text));
                     let ob = self.obligation(
-                        &format!("{}.inv_preserved.{}", self.fname, slug(&inv.text)),
+                        &format!("{}.inv_preserved.{}", self.fname, cslug(inv)),
                         "loop invariant must be preserved by the body".into(),
                         inv.span,
                         goal,
@@ -460,7 +460,7 @@ impl<'a> Generator<'a> {
                     self.subst_env(&self.preprocess(&variant.text))
                 );
                 let ob = self.obligation(
-                    &format!("{}.variant_decreases.{}", self.fname, slug(&variant.text)),
+                    &format!("{}.variant_decreases.{}", self.fname, cslug(variant)),
                     "loop variant must be a nonnegative measure that strictly decreases"
                         .into(),
                     variant.span,
@@ -735,7 +735,7 @@ impl<'a> Generator<'a> {
                 for inv in invariants {
                     let goal = self.subst_env(&self.preprocess(&inv.text));
                     let ob = self.obligation(
-                        &format!("{}.inv_init.{}", self.fname, slug(&inv.text)),
+                        &format!("{}.inv_init.{}", self.fname, cslug(inv)),
                         "loop invariant must hold at loop entry".into(),
                         inv.span,
                         goal,
@@ -752,7 +752,7 @@ impl<'a> Generator<'a> {
                     let text = self.subst_env(&self.preprocess(&inv.text));
                     // Deduped: same-slug invariants must not shadow.
                     self.push_hyp_unique(
-                        format!("h_inv_{}", hslug(&inv.text)),
+                        format!("h_inv_{}", chslug(inv)),
                         format!("({text})"),
                     );
                     self.context.push(format!("invariant {}", inv.text));
@@ -770,7 +770,7 @@ impl<'a> Generator<'a> {
                 self.binders.push((v0.clone(), "Int".into()));
                 let vtext = self.subst_env(&self.preprocess(&variant.text));
                 self.hyps.push((
-                    format!("h_variant_{}", hslug(&variant.text)),
+                    format!("h_variant_{}", chslug(variant)),
                     format!("{v0} = ({vtext})"),
                 ));
                 self.hyps
@@ -1184,7 +1184,7 @@ impl<'a> Generator<'a> {
                             self.fname,
                             class,
                             init,
-                            slug(&pre.text)
+                            cslug(pre)
                         ),
                         format!(
                             "`pre {}` of `{class}::{init}` must hold at this call",
@@ -1210,7 +1210,7 @@ impl<'a> Generator<'a> {
                             "h_{}_{}_post_{}",
                             sanitize(class),
                             sanitize(init),
-                            hslug(&post.text)
+                            chslug(post)
                         ),
                         format!("({prop})"),
                     );
@@ -1255,7 +1255,7 @@ impl<'a> Generator<'a> {
                             self.fname,
                             cd.name,
                             method,
-                            slug(&pre.text)
+                            cslug(pre)
                         ),
                         format!(
                             "`pre {}` of `{}::{method}` must hold at this call",
@@ -1317,7 +1317,7 @@ impl<'a> Generator<'a> {
                             "h_{}_{}_post_{}",
                             sanitize(&cd.name),
                             sanitize(method),
-                            hslug(&post.text)
+                            chslug(post)
                         ),
                         format!("({prop})"),
                     );
@@ -1485,7 +1485,7 @@ impl<'a> Generator<'a> {
                 for pre in &callee_fn.pres {
                     let goal = substitute(&pre.text, &subst_map, None);
                     let ob = self.obligation(
-                        &format!("{}.call_pre.{}.{}", self.fname, callee, slug(&pre.text)),
+                        &format!("{}.call_pre.{}.{}", self.fname, callee, cslug(pre)),
                         format!("`pre {}` of `{callee}` must hold at this call", pre.text),
                         e.span,
                         goal,
@@ -1504,7 +1504,7 @@ impl<'a> Generator<'a> {
                         "0 ≤ ({callee_measure}) ∧ ({callee_measure}) < ({caller_measure})"
                     );
                     let ob = self.obligation(
-                        &format!("{}.termination.{}", self.fname, slug(&variant.text)),
+                        &format!("{}.termination.{}", self.fname, cslug(variant)),
                         "recursive call must decrease the function's `variant`".into(),
                         e.span,
                         goal,
@@ -1574,7 +1574,7 @@ impl<'a> Generator<'a> {
                     let text = preprocess_old_params(&post.text, &sig.params);
                     let prop = substitute(&text, &subst_map, ret_ref);
                     self.push_hyp_unique(
-                        format!("h_{}_post_{}", sanitize(callee), hslug(&post.text)),
+                        format!("h_{}_post_{}", sanitize(callee), chslug(post)),
                         format!("({prop})"),
                     );
                     self.context
@@ -1782,7 +1782,7 @@ impl<'a> Generator<'a> {
                 for inv in &class.invariants {
                     let goal = substitute(&inv.text, &map, None);
                     let ob = self.obligation(
-                        &format!("{}.inv_exit.{}", self.fname, slug(&inv.text)),
+                        &format!("{}.inv_exit.{}", self.fname, cslug(inv)),
                         "class invariant must hold when the init returns".into(),
                         inv.span,
                         goal,
@@ -1798,7 +1798,7 @@ impl<'a> Generator<'a> {
                     for inv in &class.invariants {
                         let goal = substitute(&inv.text, &map, None);
                         let ob = self.obligation(
-                            &format!("{}.inv_exit.{}", self.fname, slug(&inv.text)),
+                            &format!("{}.inv_exit.{}", self.fname, cslug(inv)),
                             "class invariant must hold when the method returns".into(),
                             inv.span,
                             goal,
@@ -1814,7 +1814,7 @@ impl<'a> Generator<'a> {
             let goal = substitute(&self.preprocess(&post.text), &mut_map, None);
 
             let mut ob = self.obligation(
-                &format!("{}.post.{}", self.fname, slug(&post.text)),
+                &format!("{}.post.{}", self.fname, cslug(post)),
                 format!("postcondition of `{}`", self.fname),
                 post.span,
                 goal,
@@ -2136,6 +2136,17 @@ fn project_field(state: &str, field: &str) -> String {
         cur = inner.trim();
     }
     format!("({cur}.{field})")
+}
+
+/// Obligation-name fragment for a clause: its `#[label]` when present,
+/// else the content slug.
+fn cslug(c: &crate::scan::Clause) -> String {
+    c.label.clone().unwrap_or_else(|| slug(&c.text))
+}
+
+/// Hypothesis-name fragment for a clause: label or content hslug.
+fn chslug(c: &crate::scan::Clause) -> String {
+    c.label.clone().unwrap_or_else(|| hslug(&c.text))
 }
 
 fn preprocess_old_self(text: &str) -> String {

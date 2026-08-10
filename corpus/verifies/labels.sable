@@ -1,0 +1,28 @@
+// `#[label(name)]` (design §6's refinement, landed with the ergonomics
+// pass): a short stable name on a contract clause replaces the content
+// slug in the obligation name AND its hypothesis name — so discharges
+// read `zero_all.inv_preserved.prefix_zeroed` and cite
+// `h_inv_prefix_zeroed`, and neither moves when the clause is reworded.
+
+/// pre  #[label(fits)] x < 2147483647
+/// post #[label(bumped)] result = x + 1
+fn bump(i32 x) -> i32 {
+    return x + 1;
+}
+
+/// post #[label(zeroed)] ∀ k, 0 ≤ k → k < a.len → a.get k = 0
+fn zero_all(&mut [i32] a) {
+    u64 n = a.len;
+    /// invariant #[label(prefix_zeroed)] ∀ k, 0 ≤ k → k < i → a.get k = 0
+    for (u64 i : range(n)) {
+        a[i] = 0;
+    }
+}
+
+/// discharge zero_all.inv_preserved.prefix_zeroed by
+///   intro k hk0 hk
+///   by_cases hki : k = i
+///   · simp [Sable.Seq.get_set, hki]
+///   · have h2 := h_inv_prefix_zeroed k hk0 (by omega)
+///     simp [Sable.Seq.get_set, hki]
+///     exact h2

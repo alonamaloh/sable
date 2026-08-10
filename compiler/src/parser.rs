@@ -66,6 +66,7 @@ pub fn parse(
             continue;
         }
         for clause in &block.clauses {
+                validate_clause_label(clause)?;
             match clause.kind {
                 ClauseKind::Discharge => discharges.push(parse_discharge(clause)?),
                 ClauseKind::Defer => defers.push(parse_defer(clause)?),
@@ -122,6 +123,29 @@ fn obligation_name(text: &str) -> (String, &str) {
         .collect();
     let rest = text[name.len()..].trim();
     (name, rest)
+}
+
+/// A contract clause whose text still starts with `#[` carried a
+/// malformed label (well-formed ones are stripped by the scanner).
+pub fn validate_clause_label(clause: &Clause) -> PResult<()> {
+    if matches!(
+        clause.kind,
+        ClauseKind::Pre
+            | ClauseKind::Post
+            | ClauseKind::Invariant
+            | ClauseKind::Variant
+            | ClauseKind::Assert
+    ) && clause.text.starts_with("#[")
+    {
+        return Err(Diagnostic {
+            name: "proof.malformed_label".into(),
+            title: "malformed `#[label(...)]`".into(),
+            span: clause.span,
+            label: "expected `#[label(name)]` with an identifier name".into(),
+            notes: vec![],
+        });
+    }
+    Ok(())
 }
 
 fn parse_defer(clause: &Clause) -> PResult<Defer> {
@@ -582,6 +606,7 @@ impl<'a> Parser<'a> {
             }
             self.consumed[bi] = true;
             for clause in &block.clauses {
+                validate_clause_label(clause)?;
                 if clause.kind == ClauseKind::Invariant {
                     invariants.push(clause.clone());
                 } else {
@@ -618,6 +643,7 @@ impl<'a> Parser<'a> {
     ) -> PResult<()> {
         if let Some(block) = self.take_block_ending_before(item_line) {
             for clause in &block.clauses {
+                validate_clause_label(clause)?;
                 match clause.kind {
                     ClauseKind::Pre => f.pres.push(clause.clone()),
                     ClauseKind::Post => f.posts.push(clause.clone()),
@@ -790,6 +816,7 @@ impl<'a> Parser<'a> {
         // Contract block above `fn`.
         if let Some(block) = self.take_block_ending_before(fn_line) {
             for clause in &block.clauses {
+                validate_clause_label(clause)?;
                 match clause.kind {
                     ClauseKind::Pre => f.pres.push(clause.clone()),
                     ClauseKind::Post => f.posts.push(clause.clone()),
@@ -806,6 +833,7 @@ impl<'a> Parser<'a> {
         }
         if let Some(block) = self.take_block_ending_before(brace_line) {
             for clause in &block.clauses {
+                validate_clause_label(clause)?;
                 match clause.kind {
                     ClauseKind::Variant => set_fn_variant(&mut f, clause)?,
                     other => return Err(bad_clause(other, clause, "the post-signature position",
@@ -868,6 +896,7 @@ impl<'a> Parser<'a> {
             };
             if let Some(block) = self.take_block_ending_before(item_line) {
                 for clause in &block.clauses {
+                validate_clause_label(clause)?;
                     match clause.kind {
                         ClauseKind::Pre => f.pres.push(clause.clone()),
                         ClauseKind::Post => f.posts.push(clause.clone()),
@@ -926,6 +955,7 @@ impl<'a> Parser<'a> {
             };
             if let Some(block) = self.take_block_ending_before(item_line) {
                 for clause in &block.clauses {
+                validate_clause_label(clause)?;
                     match clause.kind {
                         ClauseKind::GhostDef => ghosts.push(GhostItem {
                             keyword: "def",
@@ -972,6 +1002,7 @@ impl<'a> Parser<'a> {
             }
             self.consumed[bi] = true;
             for clause in &block.clauses {
+                validate_clause_label(clause)?;
                 if clause.kind == ClauseKind::GhostDef {
                     ghosts.push(GhostItem {
                         keyword: "def",
@@ -1028,6 +1059,7 @@ impl<'a> Parser<'a> {
         let mut user_invariants = Vec::new();
         if let Some(block) = self.take_block_ending_before(for_line) {
             for clause in &block.clauses {
+                validate_clause_label(clause)?;
                 match clause.kind {
                     ClauseKind::Invariant => user_invariants.push(clause.clone()),
                     ClauseKind::Variant => {
@@ -1119,6 +1151,7 @@ impl<'a> Parser<'a> {
 
         let synth_clause = |text: String, kind: ClauseKind| Clause {
             kind,
+            label: None,
             text,
             span: hi_span,
             line_span: kw_span.join(hi_span),
@@ -1391,6 +1424,7 @@ impl<'a> Parser<'a> {
         let mut variant = None;
         if let Some(block) = self.take_block_ending_before(while_line) {
             for clause in &block.clauses {
+                validate_clause_label(clause)?;
                 match clause.kind {
                     ClauseKind::Invariant => invariants.push(clause.clone()),
                     ClauseKind::Variant => {

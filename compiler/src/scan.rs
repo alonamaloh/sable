@@ -30,6 +30,10 @@ pub enum ClauseKind {
 #[derive(Debug, Clone)]
 pub struct Clause {
     pub kind: ClauseKind,
+    /// `#[label(name)]` — a short stable name for the obligation and
+    /// its hypothesis, replacing the content slug in generated names
+    /// (`fn.post.frame`, `h_inv_frame`). Stripped from `text`.
+    pub label: Option<String>,
     /// Proof-language text after the keyword, verbatim except that a
     /// trailing `-- comment` is stripped (clauses get spliced inside
     /// parentheses in generated Lean, where a line comment would swallow
@@ -164,11 +168,41 @@ fn parse_clause(line: &str, indent: usize, line_offset: usize) -> Clause {
     if let Some(pos) = text.find("--") {
         text.truncate(pos);
     }
-    let text = text.trim_end().to_string();
+    let mut text = text.trim_end().to_string();
 
-    let text_start = line_offset + after_marker_idx + text_rel + text_lead_ws;
+    // `#[label(name)]` on contract clauses: strip a well-formed label;
+    // a malformed `#[...]` stays in `text` for the parser to reject.
+    let mut label = None;
+    let mut label_len = 0;
+    if matches!(
+        kind,
+        ClauseKind::Pre
+            | ClauseKind::Post
+            | ClauseKind::Invariant
+            | ClauseKind::Variant
+            | ClauseKind::Assert
+    ) {
+        if let Some(rest) = text.strip_prefix("#[label(") {
+            if let Some(close) = rest.find(")]") {
+                let name = &rest[..close];
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    label = Some(name.to_string());
+                    let stripped = rest[close + 2..].trim_start();
+                    label_len = text.len() - stripped.len();
+                    text = stripped.to_string();
+                }
+            }
+        }
+    }
+
+    let text_start = line_offset + after_marker_idx + text_rel + text_lead_ws + label_len;
     Clause {
         kind,
+        label,
         span: Span::new(text_start, text_start + text.len()),
         text,
         line_span,
