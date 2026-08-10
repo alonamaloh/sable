@@ -70,10 +70,12 @@ Generated Lean goes to `.sable-out/` (gitignored), one file per module, `import 
 A separate, Lean-free path (design §9): `interp.rs` is a tree-walking
 interpreter with trap semantics (overflow/bounds/division checked exactly
 where the verifier emits VCs), and `speceval.rs` evaluates the
-*monitorable fragment* of the proof language (arithmetic, logic, sequence
-access, `old` — including `(old obj).field` chains, guard-bounded ∀/∃,
-ghost-def expansion with `if … then … else`, option match, `perm` as
-multiset equality). Pres/posts/invariants/variants are
+*monitorable fragment* of the proof language (arithmetic, logic — with
+`↔` at Lean's exact precedence, pinned by a witness clause in the test
+corpus — sequence access, `old` — including `(old obj).field` chains,
+guard-bounded ∀/∃, ghost-def expansion with `if … then … else`, option
+match and the `.is_some`/`.value` accessors, `perm` as multiset
+equality). Pres/posts/invariants/variants are
 checked dynamically; anything outside the fragment is reported as
 skipped, never guessed — this is best-effort dev tooling, not a second
 checker of record. `test_*` functions are its entry points and are never
