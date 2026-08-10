@@ -764,39 +764,35 @@ fn div(&Nat a, &Nat b) -> Nat {
     [u32] zarr = alloc_array<u32>(1, 0);
     [u32] onearr = alloc_array<u32>(1, 1);
     var zero = Nat::from_prefix(&zarr, 0);
+    /// assert #[label(zero_val)] natVal zero.limbs = 0
     var q = Nat::from_prefix(&zarr, 0);
+    /// assert #[label(q0)] natVal q.limbs = 0
     var r = add(&a, &zero);
-    i32 c = cmp(&r, &b);
     /// invariant natVal q.limbs * natVal b.limbs + natVal r.limbs = natVal a.limbs
-    /// invariant (c = -1 ↔ natVal r.limbs < natVal b.limbs)
-    /// invariant c = -1 ∨ c = 0 ∨ c = 1
     /// invariant q.limbs.len ≤ a.limbs.len
     /// invariant r.limbs.len ≤ a.limbs.len
     /// variant   natVal r.limbs
-    while (c >= 0) {
+    while (cmp(&r, &b) >= 0) {
+        /// assert #[label(b_le_r)]  natVal b.limbs ≤ natVal r.limbs
+        /// assert #[label(r_le_a)]  natVal r.limbs ≤ natVal a.limbs
         var d = add(&b, &zero);
         var m = Nat::from_prefix(&onearr, 1);
+        /// assert #[label(one_val)] natVal m.limbs = 1
         var d2 = add(&d, &d);
-        i32 t = cmp(&d2, &r);
         /// invariant natVal d.limbs = natVal b.limbs * natVal m.limbs
         /// invariant natVal b.limbs ≤ natVal d.limbs
         /// invariant natVal d.limbs ≤ natVal r.limbs
         /// invariant natVal d2.limbs = natVal d.limbs + natVal d.limbs
-        /// invariant (t = -1 ↔ natVal d2.limbs < natVal r.limbs)
-        /// invariant (t = 0 ↔ natVal d2.limbs = natVal r.limbs)
-        /// invariant t = -1 ∨ t = 0 ∨ t = 1
         /// invariant d.limbs.len ≤ a.limbs.len
         /// invariant m.limbs.len ≤ a.limbs.len
         /// variant   natVal r.limbs - natVal d.limbs
-        while (t <= 0) {
+        while (cmp(&d2, &r) <= 0) {
             d = add(&d, &d);
             m = add(&m, &m);
             d2 = add(&d, &d);
-            t = cmp(&d2, &r);
         }
         q = add(&q, &m);
         r = sub(&r, &d);
-        c = cmp(&r, &b);
     }
     return q;
 }
@@ -866,20 +862,19 @@ fn rem(&Nat a, &Nat b) -> Nat {
 fn gcd(&Nat a, &Nat b) -> Nat {
     [u32] zarr = alloc_array<u32>(1, 0);
     var zero = Nat::from_prefix(&zarr, 0);
+    /// assert #[label(zero_val)] natVal zero.limbs = 0
     var x = add(&a, &zero);
     var y = add(&b, &zero);
-    i32 c = cmp(&y, &zero);
     /// invariant igcd (natVal x.limbs) (natVal y.limbs) = igcd (natVal a.limbs) (natVal b.limbs)
-    /// invariant (c = 0 ↔ natVal y.limbs = 0)
-    /// invariant c = -1 ∨ c = 0 ∨ c = 1
     /// invariant x.limbs.len ≤ a.limbs.len + b.limbs.len
     /// invariant y.limbs.len ≤ a.limbs.len + b.limbs.len
     /// variant   natVal y.limbs
-    while (c != 0) {
+    while (cmp(&y, &zero) != 0) {
+        /// assert #[label(y_pos)] natVal y.limbs ≥ 1
         var t = rem(&x, &y);
+        /// assert #[label(t_lt)]  natVal t.limbs < natVal y.limbs
         x = add(&y, &zero);
         y = add(&t, &zero);
-        c = cmp(&y, &zero);
     }
     return x;
 }
@@ -1255,81 +1250,63 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 ///   rw [h_out_len, h_stale_alloc2] at h_trim_len_post_value
 ///   omega
 
-// The division discharges: the zero/one value bridges, the doubling
-// and outer steps riding the composition posts, quotient/remainder
-// length domination for the call pres, and the Euclidean uniqueness
-// closers.
+/// discharge rem.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387 by
+///   sable_norm
+///   have han : 0 ≤ natVal a.limbs := valIn_nonneg a.limbs 0 (a.limbs.len)
+///     (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   have h := ediv_le_self_nat (natVal a.limbs) (natVal b.limbs) han (by omega)
+///   have hl : q.limbs.len ≤ a.limbs.len :=
+///     len_le_of_val_le a.limbs q.limbs (by omega) (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_3 k hk1 hk2).1)
+///       (fun h0 => by omega)
+///   omega
 
-/// discharge div.inv_init.natval_q_limbs_natval_b_limbs_natval_r_l by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hq0 : natVal q.limbs = 0 := by omega
-///   rw [hq0, Int.zero_mul]
+/// discharge rem.call_pre.sub.natval_b_limbs_natval_a_limbs by
+///   have han : 0 ≤ natVal a.limbs := valIn_nonneg a.limbs 0 (a.limbs.len)
+///     (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   have h := ediv_mul_le_self (natVal a.limbs) (natVal b.limbs) han (by omega)
+///   rw [h_mul_post_prod, h_div_post_quot]
+///   exact h
+
+/// discharge rem.post.rem by
+///   have h := rem_eq (natVal a.limbs) (natVal b.limbs) (natVal q.limbs)
+///     (natVal p.limbs) h_div_post_quot h_mul_post_prod
+///   rw [h_result]
+///   omega
+// The division and gcd discharges, post-ergonomics: the labeled
+// asserts above carry the shared facts (zero/one values, order and
+// domination bounds), so what remains is the step identities, the
+// length lemma applications, and the Euclidean closers.
+
+/// discharge div.assert.zero_val by
+///   have h := valIn_nil zarr 0 0 (by omega)
 ///   omega
 
 /// discharge div.inv_init.r_limbs_len_a_limbs_len by
 ///   sable_norm
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
 ///   exact len_le_of_val_le a.limbs r.limbs (by omega) (by omega)
 ///     h_field_limbs_elems
 ///     (fun k hk1 hk2 => (h_field_limbs_elems_5 k hk1 hk2).1)
 ///     (fun h0 => by omega)
 
-/// discharge div.inv_init.natval_d_limbs_natval_b_limbs_natval_m_l by
-///   have ho1 : valIn onearr 0 1 = onearr.get 0 + 4294967296 * valIn onearr 1 1 := by
-///     rw [valIn, if_pos (by omega), show (0:Int) + 1 = 1 from by omega]
-///   have ho2 : valIn onearr 1 1 = 0 := valIn_nil onearr 1 1 (by omega)
-///   have ho3 := h_alloc6 0 (by omega) (by omega)
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hm1 : natVal m.limbs = 1 := by omega
-///   have hd : natVal d.limbs = natVal b.limbs := by omega
-///   rw [hd, hm1, Int.mul_one]
-
-/// discharge div.inv_init.natval_b_limbs_natval_d_limbs by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   omega
-
-/// discharge div.inv_init.natval_d_limbs_natval_r_limbs by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   omega
-
-/// discharge div.inv_init.d_limbs_len_a_limbs_len by
-///   sable_norm
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
+/// discharge div.assert.r_le_a by
 ///   have hqn : 0 ≤ natVal q.limbs := valIn_nonneg q.limbs 0 (q.limbs.len)
 ///     (fun k hk1 hk2 => (h_field_limbs_elems_4 k hk1 hk2).1)
 ///   have hbn : 0 ≤ natVal b.limbs := valIn_nonneg b.limbs 0 (b.limbs.len)
 ///     (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
 ///   have hqv := mul_nonneg_atoms (natVal q.limbs) (natVal b.limbs) hqn hbn
-///   exact len_le_of_val_le a.limbs d.limbs (by omega) (by omega)
-///     h_field_limbs_elems
-///     (fun k hk1 hk2 => (h_field_limbs_elems_6 k hk1 hk2).1)
-///     (fun h0 => by omega)
+///   omega
 
-/// discharge div.inv_init.m_limbs_len_a_limbs_len by
-///   sable_norm
+/// discharge div.assert.one_val by
 ///   have ho1 : valIn onearr 0 1 = onearr.get 0 + 4294967296 * valIn onearr 1 1 := by
 ///     rw [valIn, if_pos (by omega), show (0:Int) + 1 = 1 from by omega]
 ///   have ho2 : valIn onearr 1 1 = 0 := valIn_nil onearr 1 1 (by omega)
 ///   have ho3 := h_alloc6 0 (by omega) (by omega)
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hqn : 0 ≤ natVal q.limbs := valIn_nonneg q.limbs 0 (q.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_4 k hk1 hk2).1)
-///   have hbn : 0 ≤ natVal b.limbs := valIn_nonneg b.limbs 0 (b.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
-///   have hqv := mul_nonneg_atoms (natVal q.limbs) (natVal b.limbs) hqn hbn
-///   exact len_le_of_val_le a.limbs m.limbs (by omega) (by omega)
-///     h_field_limbs_elems
-///     (fun k hk1 hk2 => (h_field_limbs_elems_7 k hk1 hk2).1)
-///     (fun h0 => by omega)
+///   omega
 
 /// discharge div.call_pre.add.a_limbs_len_b_limbs_len_4611686018427387.3 by
 ///   sable_norm
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hqn : 0 ≤ natVal q.limbs := valIn_nonneg q.limbs 0 (q.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_4 k hk1 hk2).1)
-///   have hbn : 0 ≤ natVal b.limbs := valIn_nonneg b.limbs 0 (b.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
-///   have hqv := mul_nonneg_atoms (natVal q.limbs) (natVal b.limbs) hqn hbn
 ///   have hl : d.limbs.len ≤ a.limbs.len :=
 ///     len_le_of_val_le a.limbs d.limbs (by omega) (by omega)
 ///       h_field_limbs_elems
@@ -1337,13 +1314,22 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 ///       (fun h0 => by omega)
 ///   omega
 
+/// discharge div.inv_init.d_limbs_len_a_limbs_len by
+///   sable_norm
+///   exact len_le_of_val_le a.limbs d.limbs (by omega) (by omega)
+///     h_field_limbs_elems
+///     (fun k hk1 hk2 => (h_field_limbs_elems_6 k hk1 hk2).1)
+///     (fun h0 => by omega)
+
+/// discharge div.inv_init.m_limbs_len_a_limbs_len by
+///   sable_norm
+///   exact len_le_of_val_le a.limbs m.limbs (by omega) (by omega)
+///     h_field_limbs_elems
+///     (fun k hk1 hk2 => (h_field_limbs_elems_7 k hk1 hk2).1)
+///     (fun h0 => by omega)
+
 /// discharge div.call_pre.add.a_limbs_len_b_limbs_len_4611686018427387.6 by
 ///   sable_norm
-///   have hqn : 0 ≤ natVal q.limbs := valIn_nonneg q.limbs 0 (q.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_4 k hk1 hk2).1)
-///   have hbn : 0 ≤ natVal b.limbs := valIn_nonneg b.limbs 0 (b.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
-///   have hqv := mul_nonneg_atoms (natVal q.limbs) (natVal b.limbs) hqn hbn
 ///   have hl : d_2.limbs.len ≤ a.limbs.len :=
 ///     len_le_of_val_le a.limbs d_2.limbs (by omega) (by omega)
 ///       h_field_limbs_elems
@@ -1356,6 +1342,23 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 ///     h_inv_natval_d_limbs_natval_b
 ///   have hm : natVal m.limbs + natVal m.limbs = natVal m_2.limbs := by omega
 ///   rw [h_add_post_sum, h, hm]
+
+/// discharge div.inv_preserved.d_limbs_len_a_limbs_len by
+///   sable_norm
+///   exact len_le_of_val_le a.limbs d_2.limbs (by omega) (by omega)
+///     h_field_limbs_elems
+///     (fun k hk1 hk2 => (h_field_limbs_elems_9 k hk1 hk2).1)
+///     (fun h0 => by omega)
+
+/// discharge div.inv_preserved.m_limbs_len_a_limbs_len by
+///   sable_norm
+///   have hmn : 0 ≤ natVal m.limbs := valIn_nonneg m.limbs 0 (m.limbs.len)
+///     (fun k hk1 hk2 => (h_field_limbs_elems_8 k hk1 hk2).1)
+///   have h2 := le_self_mul (natVal b.limbs) (natVal m.limbs) (by omega) hmn
+///   exact len_le_of_val_le a.limbs m_2.limbs (by omega) (by omega)
+///     h_field_limbs_elems
+///     (fun k hk1 hk2 => (h_field_limbs_elems_10 k hk1 hk2).1)
+///     (fun h0 => by omega)
 
 /// discharge div.inv_preserved.natval_q_limbs_natval_b_limbs_natval_r_l by
 ///   have h := outer_step (natVal q.limbs) (natVal m.limbs) (natVal b.limbs)
@@ -1381,39 +1384,7 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 
 /// discharge div.inv_preserved.r_limbs_len_a_limbs_len by
 ///   sable_norm
-///   have hqn : 0 ≤ natVal q.limbs := valIn_nonneg q.limbs 0 (q.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_4 k hk1 hk2).1)
-///   have hbn : 0 ≤ natVal b.limbs := valIn_nonneg b.limbs 0 (b.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
-///   have hqv := mul_nonneg_atoms (natVal q.limbs) (natVal b.limbs) hqn hbn
 ///   exact len_le_of_val_le a.limbs r_2.limbs (by omega) (by omega)
-///     h_field_limbs_elems
-///     (fun k hk1 hk2 => (h_field_limbs_elems_10 k hk1 hk2).1)
-///     (fun h0 => by omega)
-
-/// discharge div.inv_preserved.d_limbs_len_a_limbs_len by
-///   sable_norm
-///   have hqn : 0 ≤ natVal q.limbs := valIn_nonneg q.limbs 0 (q.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_4 k hk1 hk2).1)
-///   have hbn : 0 ≤ natVal b.limbs := valIn_nonneg b.limbs 0 (b.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
-///   have hqv := mul_nonneg_atoms (natVal q.limbs) (natVal b.limbs) hqn hbn
-///   exact len_le_of_val_le a.limbs d_2.limbs (by omega) (by omega)
-///     h_field_limbs_elems
-///     (fun k hk1 hk2 => (h_field_limbs_elems_9 k hk1 hk2).1)
-///     (fun h0 => by omega)
-
-/// discharge div.inv_preserved.m_limbs_len_a_limbs_len by
-///   sable_norm
-///   have hqn : 0 ≤ natVal q.limbs := valIn_nonneg q.limbs 0 (q.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_4 k hk1 hk2).1)
-///   have hbn : 0 ≤ natVal b.limbs := valIn_nonneg b.limbs 0 (b.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
-///   have hqv := mul_nonneg_atoms (natVal q.limbs) (natVal b.limbs) hqn hbn
-///   have hmn : 0 ≤ natVal m.limbs := valIn_nonneg m.limbs 0 (m.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_8 k hk1 hk2).1)
-///   have h2 := le_self_mul (natVal b.limbs) (natVal m.limbs) (by omega) hmn
-///   exact len_le_of_val_le a.limbs m_2.limbs (by omega) (by omega)
 ///     h_field_limbs_elems
 ///     (fun k hk1 hk2 => (h_field_limbs_elems_10 k hk1 hk2).1)
 ///     (fun h0 => by omega)
@@ -1426,48 +1397,12 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 ///   rw [h_result]
 ///   omega
 
-/// discharge rem.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387 by
-///   sable_norm
-///   have han : 0 ≤ natVal a.limbs := valIn_nonneg a.limbs 0 (a.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
-///   have h := ediv_le_self_nat (natVal a.limbs) (natVal b.limbs) han (by omega)
-///   have hl : q.limbs.len ≤ a.limbs.len :=
-///     len_le_of_val_le a.limbs q.limbs (by omega) (by omega)
-///       h_field_limbs_elems
-///       (fun k hk1 hk2 => (h_field_limbs_elems_3 k hk1 hk2).1)
-///       (fun h0 => by omega)
-///   omega
-
-/// discharge rem.call_pre.sub.natval_b_limbs_natval_a_limbs by
-///   have han : 0 ≤ natVal a.limbs := valIn_nonneg a.limbs 0 (a.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
-///   have h := ediv_mul_le_self (natVal a.limbs) (natVal b.limbs) han (by omega)
-///   rw [h_mul_post_prod, h_div_post_quot]
-///   exact h
-
-/// discharge rem.post.rem by
-///   have h := rem_eq (natVal a.limbs) (natVal b.limbs) (natVal q.limbs)
-///     (natVal p.limbs) h_div_post_quot h_mul_post_prod
-///   rw [h_result]
-///   omega
-
-// The gcd discharges: Euclid riding rem/cmp/add posts — the igcd
-// step and zero closers, the strict-decrease ghost variant, and
-// length domination through the working pair.
-
-/// discharge gcd.inv_init.igcd_natval_x_limbs_natval_y_limbs_igcd by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hx : natVal x.limbs = natVal a.limbs := by omega
-///   have hy : natVal y.limbs = natVal b.limbs := by omega
-///   rw [hx, hy]
-
-/// discharge gcd.inv_init.c_0_natval_y_limbs_0 by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
+/// discharge gcd.assert.zero_val by
+///   have h := valIn_nil zarr 0 0 (by omega)
 ///   omega
 
 /// discharge gcd.inv_init.x_limbs_len_a_limbs_len_b_limbs_len by
 ///   sable_norm
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
 ///   have hl : x.limbs.len ≤ a.limbs.len :=
 ///     len_le_of_val_le a.limbs x.limbs (by omega) (by omega)
 ///       h_field_limbs_elems
@@ -1477,7 +1412,6 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 
 /// discharge gcd.inv_init.y_limbs_len_a_limbs_len_b_limbs_len by
 ///   sable_norm
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
 ///   have hl : y.limbs.len ≤ b.limbs.len :=
 ///     len_le_of_val_le b.limbs y.limbs (by omega) (by omega)
 ///       h_field_limbs_elems_2
@@ -1485,16 +1419,17 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 ///       (fun h0 => by omega)
 ///   omega
 
-/// discharge gcd.call_pre.rem.natval_b_limbs_1 by
+/// discharge gcd.assert.y_pos by
 ///   have hyn : 0 ≤ natVal y.limbs := valIn_nonneg y.limbs 0 (y.limbs.len)
 ///     (fun k hk1 hk2 => (h_field_limbs_elems_5 k hk1 hk2).1)
 ///   omega
 
+/// discharge gcd.assert.t_lt by
+///   have hm := emod_lt (natVal x.limbs) (natVal y.limbs) (by omega)
+///   omega
+
 /// discharge gcd.call_pre.add.a_limbs_len_b_limbs_len_4611686018427387.4 by
 ///   sable_norm
-///   have hyn : 0 ≤ natVal y.limbs := valIn_nonneg y.limbs 0 (y.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_5 k hk1 hk2).1)
-///   have hm := emod_lt (natVal x.limbs) (natVal y.limbs) (by omega)
 ///   have hl : t.limbs.len ≤ y.limbs.len :=
 ///     len_le_of_val_le y.limbs t.limbs (by omega) (by omega)
 ///       h_field_limbs_elems_5
@@ -1503,22 +1438,14 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 ///   omega
 
 /// discharge gcd.inv_preserved.igcd_natval_x_limbs_natval_y_limbs_igcd by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hyn : 0 ≤ natVal y.limbs := valIn_nonneg y.limbs 0 (y.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_5 k hk1 hk2).1)
 ///   have hx2 : natVal x_2.limbs = natVal y.limbs := by omega
 ///   have hy2 : natVal y_2.limbs = natVal x.limbs % natVal y.limbs := by omega
 ///   have hs := igcd_step (natVal x.limbs) (natVal y.limbs) (by omega)
 ///   rw [hx2, hy2, hs]
 ///   exact h_inv_igcd_natval_x_limbs_natv
 
-/// discharge gcd.inv_preserved.c_0_natval_y_limbs_0 by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   omega
-
 /// discharge gcd.inv_preserved.x_limbs_len_a_limbs_len_b_limbs_len by
 ///   sable_norm
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
 ///   have hl : x_2.limbs.len ≤ y.limbs.len :=
 ///     len_le_of_val_le y.limbs x_2.limbs (by omega) (by omega)
 ///       h_field_limbs_elems_5
@@ -1528,23 +1455,11 @@ fn gcd(&Nat a, &Nat b) -> Nat {
 
 /// discharge gcd.inv_preserved.y_limbs_len_a_limbs_len_b_limbs_len by
 ///   sable_norm
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hyn : 0 ≤ natVal y.limbs := valIn_nonneg y.limbs 0 (y.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_5 k hk1 hk2).1)
-///   have hm := emod_lt (natVal x.limbs) (natVal y.limbs) (by omega)
 ///   have hl : y_2.limbs.len ≤ y.limbs.len :=
 ///     len_le_of_val_le y.limbs y_2.limbs (by omega) (by omega)
 ///       h_field_limbs_elems_5
 ///       (fun k hk1 hk2 => (h_field_limbs_elems_8 k hk1 hk2).1)
 ///       (fun h0 => by omega)
-///   omega
-
-/// discharge gcd.variant_decreases.natval_y_limbs by
-///   have hz : valIn zarr 0 0 = 0 := valIn_nil zarr 0 0 (by omega)
-///   have hyn : 0 ≤ natVal y.limbs := valIn_nonneg y.limbs 0 (y.limbs.len)
-///     (fun k hk1 hk2 => (h_field_limbs_elems_5 k hk1 hk2).1)
-///   have hm := emod_lt (natVal x.limbs) (natVal y.limbs) (by omega)
-///   have hm2 := emod_nonneg' (natVal x.limbs) (natVal y.limbs) (by omega)
 ///   omega
 
 /// discharge gcd.post.gcd by

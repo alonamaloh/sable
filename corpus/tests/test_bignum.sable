@@ -177,39 +177,35 @@ fn div(&Nat a, &Nat b) -> Nat {
     [u32] zarr = alloc_array<u32>(1, 0);
     [u32] onearr = alloc_array<u32>(1, 1);
     var zero = Nat::from_prefix(&zarr, 0);
+    /// assert #[label(zero_val)] natVal zero.limbs = 0
     var q = Nat::from_prefix(&zarr, 0);
+    /// assert #[label(q0)] natVal q.limbs = 0
     var r = add(&a, &zero);
-    i32 c = cmp(&r, &b);
     /// invariant natVal q.limbs * natVal b.limbs + natVal r.limbs = natVal a.limbs
-    /// invariant (c = -1 ↔ natVal r.limbs < natVal b.limbs)
-    /// invariant c = -1 ∨ c = 0 ∨ c = 1
     /// invariant q.limbs.len ≤ a.limbs.len
     /// invariant r.limbs.len ≤ a.limbs.len
     /// variant   natVal r.limbs
-    while (c >= 0) {
+    while (cmp(&r, &b) >= 0) {
+        /// assert #[label(b_le_r)]  natVal b.limbs ≤ natVal r.limbs
+        /// assert #[label(r_le_a)]  natVal r.limbs ≤ natVal a.limbs
         var d = add(&b, &zero);
         var m = Nat::from_prefix(&onearr, 1);
+        /// assert #[label(one_val)] natVal m.limbs = 1
         var d2 = add(&d, &d);
-        i32 t = cmp(&d2, &r);
         /// invariant natVal d.limbs = natVal b.limbs * natVal m.limbs
         /// invariant natVal b.limbs ≤ natVal d.limbs
         /// invariant natVal d.limbs ≤ natVal r.limbs
         /// invariant natVal d2.limbs = natVal d.limbs + natVal d.limbs
-        /// invariant (t = -1 ↔ natVal d2.limbs < natVal r.limbs)
-        /// invariant (t = 0 ↔ natVal d2.limbs = natVal r.limbs)
-        /// invariant t = -1 ∨ t = 0 ∨ t = 1
         /// invariant d.limbs.len ≤ a.limbs.len
         /// invariant m.limbs.len ≤ a.limbs.len
         /// variant   natVal r.limbs - natVal d.limbs
-        while (t <= 0) {
+        while (cmp(&d2, &r) <= 0) {
             d = add(&d, &d);
             m = add(&m, &m);
             d2 = add(&d, &d);
-            t = cmp(&d2, &r);
         }
         q = add(&q, &m);
         r = sub(&r, &d);
-        c = cmp(&r, &b);
     }
     return q;
 }
@@ -242,20 +238,19 @@ fn rem(&Nat a, &Nat b) -> Nat {
 fn gcd(&Nat a, &Nat b) -> Nat {
     [u32] zarr = alloc_array<u32>(1, 0);
     var zero = Nat::from_prefix(&zarr, 0);
+    /// assert #[label(zero_val)] natVal zero.limbs = 0
     var x = add(&a, &zero);
     var y = add(&b, &zero);
-    i32 c = cmp(&y, &zero);
     /// invariant igcd (natVal x.limbs) (natVal y.limbs) = igcd (natVal a.limbs) (natVal b.limbs)
-    /// invariant (c = 0 ↔ natVal y.limbs = 0)
-    /// invariant c = -1 ∨ c = 0 ∨ c = 1
     /// invariant x.limbs.len ≤ a.limbs.len + b.limbs.len
     /// invariant y.limbs.len ≤ a.limbs.len + b.limbs.len
     /// variant   natVal y.limbs
-    while (c != 0) {
+    while (cmp(&y, &zero) != 0) {
+        /// assert #[label(y_pos)] natVal y.limbs ≥ 1
         var t = rem(&x, &y);
+        /// assert #[label(t_lt)]  natVal t.limbs < natVal y.limbs
         x = add(&y, &zero);
         y = add(&t, &zero);
-        c = cmp(&y, &zero);
     }
     return x;
 }
