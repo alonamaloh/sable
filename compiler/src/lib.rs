@@ -34,7 +34,12 @@ pub enum Outcome {
         deferred: Vec<String>,
         /// Obligations taken as audited axioms (unsound escape): (name, reason).
         assumed: Vec<(String, String)>,
+        /// Non-fatal, rendered: automation-budget warnings (an obligation
+        /// verified but leaned on an expensive `grind`).
+        warnings: Vec<String>,
     },
+    /// Failing obligations; any budget warnings are withheld until the
+    /// errors are fixed (they would be noise next to real failures).
     Failed(Vec<Failure>),
 }
 
@@ -44,6 +49,8 @@ pub struct VerifiedInfo {
     pub obligations: usize,
     pub deferred: Vec<String>,
     pub assumed: Vec<(String, String)>,
+    /// Automation-budget warnings (non-fatal), as diagnostics.
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Fast, Lean-free pass over source text: scan → lex → parse → typecheck.
@@ -117,6 +124,11 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
             obligations: info.obligations,
             deferred: info.deferred,
             assumed: info.assumed,
+            warnings: info
+                .warnings
+                .iter()
+                .map(|d| d.render_level("warning", &display_path, &source, &lines))
+                .collect(),
         },
         Err(diags) => Outcome::Failed(
             diags
@@ -313,6 +325,7 @@ pub fn check_file_structured(
                 obligations: vc.obligations.len(),
                 deferred,
                 assumed,
+                warnings: Vec::new(),
             }),
         );
     }
@@ -376,6 +389,8 @@ pub fn check_file_structured(
 
     let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages));
     if diags.is_empty() {
+        let warnings =
+            lean::dedup_by_name(lean::diagnose_warnings(&emitted, &vc, &messages));
         (
             source,
             Ok(VerifiedInfo {
@@ -383,6 +398,7 @@ pub fn check_file_structured(
                 obligations: vc.obligations.len(),
                 deferred,
                 assumed,
+                warnings,
             }),
         )
     } else {

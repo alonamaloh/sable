@@ -60,6 +60,13 @@ pub fn emit(
     e.push("import Sable");
     e.push("open Sable");
     e.push("set_option linter.unusedVariables false");
+    // Test/CI hook: shrink or disable the grind heartbeat budget
+    // without touching source (the option itself lives in the prelude).
+    if let Ok(v) = std::env::var("SABLE_GRIND_HEARTBEATS") {
+        if v.parse::<u64>().is_ok() {
+            e.push(&format!("set_option sable.grindHeartbeats {v}"));
+        }
+    }
     e.push("");
 
     for c in &vc.classes {
@@ -338,6 +345,69 @@ pub fn diagnose(emitted: &Emitted, vc: &VcResult, messages: &[LeanMessage]) -> V
                 label: "this is a bug in the Sable compiler, not in your program".into(),
                 notes: vec![("lean".into(), format!("line {}: {}", msg.line, msg.data))],
             }),
+        }
+    }
+    diags
+}
+
+/// Map the automation-budget warnings (`sable_grind`'s expensive-success
+/// diagnostics) back to obligations. Non-fatal: returned separately from
+/// `diagnose` so callers report them without failing the check. A
+/// `grind?` "Try this:" suggestion at the same position becomes a
+/// ready-to-paste `discharge` note.
+pub fn diagnose_warnings(
+    emitted: &Emitted,
+    vc: &VcResult,
+    messages: &[LeanMessage],
+) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+    for msg in messages {
+        if msg.severity != "warning" || !msg.data.contains("expensive automation") {
+            continue;
+        }
+        let entry = emitted
+            .map
+            .iter()
+            .find(|en| en.first_line <= msg.line && msg.line <= en.last_line);
+        let suggestion = messages.iter().find(|m| {
+            m.severity == "information"
+                && m.data.contains("Try th")
+                && entry.is_some_and(|en| en.first_line <= m.line && m.line <= en.last_line)
+        });
+        let mut notes = vec![("automation".into(), msg.data.clone())];
+        if let Some(sug) = suggestion {
+            // "Try this:"/"Try these:" list alternatives; the first is
+            // grind's own minimization of the successful proof.
+            let tactic = sug
+                .data
+                .lines()
+                .nth(1)
+                .map(|l| l.trim().trim_start_matches("[apply]").trim().to_string())
+                .unwrap_or_default();
+            notes.push(("suggested".into(), format!("discharge <obligation> by {tactic}")));
+        }
+        match entry.map(|en| &en.target) {
+            Some(MapTarget::Obligation(i)) => {
+                let ob: &Obligation = &vc.obligations[*i];
+                if let Some((_, sug)) = notes.iter_mut().find(|(k, _)| k == "suggested") {
+                    *sug = sug.replace("<obligation>", &ob.name);
+                }
+                diags.push(Diagnostic {
+                    name: ob.name.clone(),
+                    title: format!("obligation `{}` leans on expensive automation", ob.name),
+                    span: ob.span,
+                    label: ob.kind_desc.clone(),
+                    notes,
+                });
+            }
+            Some(MapTarget::Discharged { name, span, .. }) => diags.push(Diagnostic {
+                name: name.clone(),
+                title: format!("discharge of `{name}` leans on expensive automation"),
+                span: *span,
+                label: "this tactic script reaches the budgeted grind".into(),
+                notes,
+            }),
+            _ => {}
         }
     }
     diags

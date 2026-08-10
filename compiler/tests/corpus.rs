@@ -68,9 +68,19 @@ fn corpus() {
 
     failures.extend(parallel(sable_files(&corpus_dir("verifies")), |path| {
         match check_file(path, &opts) {
-            Outcome::Verified { obligations, .. } => {
+            Outcome::Verified {
+                obligations,
+                warnings,
+                ..
+            } => {
                 println!("ok: {} ({obligations} obligations)", path.display());
-                vec![]
+                // Warning-clean: an obligation that leans on an expensive
+                // grind must get a discharge script, not linger near the
+                // budget cliff (a toolchain bump could push it over).
+                warnings
+                    .iter()
+                    .map(|w| format!("{} verified with a warning:\n{w}", path.display()))
+                    .collect()
             }
             Outcome::Failed(diags) => vec![format!(
                 "{} should verify but failed:\n{}",

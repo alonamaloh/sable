@@ -167,17 +167,25 @@ fn publish(
     };
     let lines = LineMap::new(text);
     let mut diags = crate::front_diagnostics(text);
+    let mut warnings = Vec::new();
     if full && diags.is_empty() {
         if let Some(path) = uri_path(uri) {
             let (_, result) = crate::check_file_structured(&path, &crate::Options::default());
-            if let Err(mut more) = result {
-                diags.append(&mut more);
+            match result {
+                Err(mut more) => diags.append(&mut more),
+                // Automation-budget warnings surface at WARNING severity.
+                Ok(info) => warnings = info.warnings,
             }
         }
     }
     let lsp_diags: Vec<lsp_types::Diagnostic> = diags
         .iter()
         .map(|d| to_lsp_diag(d, text, &lines))
+        .chain(
+            warnings
+                .iter()
+                .map(|d| to_lsp_diag_sev(d, text, &lines, DiagnosticSeverity::WARNING)),
+        )
         .collect();
     connection.sender.send(Message::Notification(Notification::new(
         PublishDiagnostics::METHOD.to_string(),
@@ -363,6 +371,15 @@ fn uri_path(uri: &Uri) -> Option<PathBuf> {
 }
 
 fn to_lsp_diag(d: &SableDiag, text: &str, lines: &LineMap) -> lsp_types::Diagnostic {
+    to_lsp_diag_sev(d, text, lines, DiagnosticSeverity::ERROR)
+}
+
+fn to_lsp_diag_sev(
+    d: &SableDiag,
+    text: &str,
+    lines: &LineMap,
+    severity: DiagnosticSeverity,
+) -> lsp_types::Diagnostic {
     let mut message = d.title.clone();
     if !d.label.is_empty() {
         message.push_str(&format!("\n{}", d.label));
@@ -375,7 +392,7 @@ fn to_lsp_diag(d: &SableDiag, text: &str, lines: &LineMap) -> lsp_types::Diagnos
             start: offset_to_position(text, lines, d.span.start),
             end: offset_to_position(text, lines, d.span.end),
         },
-        severity: Some(DiagnosticSeverity::ERROR),
+        severity: Some(severity),
         code: Some(NumberOrString::String(d.name.clone())),
         source: Some("sable".into()),
         message,

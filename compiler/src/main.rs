@@ -126,8 +126,12 @@ fn main() -> ExitCode {
             obligations,
             deferred,
             assumed,
+            warnings,
         } => {
             if !opts.emit_lean_only {
+                for w in &warnings {
+                    eprintln!("{w}");
+                }
                 let proved = obligations - deferred.len() - assumed.len();
                 println!(
                     "verified: {} — {obligations} obligation(s) across {functions} function(s): \

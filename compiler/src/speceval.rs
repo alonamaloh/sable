@@ -6,7 +6,9 @@
 //! Fragment: integer arithmetic (ℤ, Euclidean division), comparisons,
 //! ∧ ∨ ¬ →, True/False, `a.len` / `a.get e`, `old a`, `result`, the
 //! `iN.min`/`uN.max` constants, quantifiers over ranges derivable from
-//! their guards, application of non-recursive in-file ghost defs, the
+//! their guards, application of in-file ghost defs (recursion allowed,
+//! depth-capped; exact i128 arithmetic — an overflow reports the clause
+//! as unmonitorable rather than guessing), the
 //! `match result with | some i => .. | none => ..` idiom, and
 //! `Sable.Seq.perm` (checked as multiset equality).
 

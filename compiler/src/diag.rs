@@ -22,9 +22,19 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn render(&self, path: &str, source: &str, lines: &LineMap) -> String {
+        self.render_level("error", path, source, lines)
+    }
+
+    pub fn render_level(
+        &self,
+        level: &str,
+        path: &str,
+        source: &str,
+        lines: &LineMap,
+    ) -> String {
         let (line, col) = lines.line_col(self.span.start);
         let mut out = String::new();
-        out.push_str(&format!("error: {}\n", self.title));
+        out.push_str(&format!("{level}: {}\n", self.title));
         out.push_str(&format!("  --> {path}:{line}:{col}\n"));
 
         let line_span = lines.line_span(line, source);
