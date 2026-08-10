@@ -51,11 +51,15 @@ emit (compiler/src/lean.rs)           one Lean theorem per obligation:
   │                                     binders = params + intermediate symbols,
   │                                     hypotheses = range facts + pres + path conditions,
   │                                     proof = `by sable_auto` (or spliced discharge, M1);
+  │                                   per-module (compiler/src/artifacts.rs, ADR 0018):
+  │                                   imports name dep artifacts, name subtraction
+  │                                   keeps one declaration per DAG;
   │                                   records a source map: lean lines → obligation
   │                                   (name, .sable span, goal text, context)
   ▼
-check                                 `lake env lean --json` on the generated file
-  ▼                                   (prelude oleans built once by `lake build`);
+check                                 `lean --json` on the generated file, LEAN_PATH =
+  ▼                                   workspace + .sable-out/modules
+  │                                   (prelude oleans built once by `lake build`);
   │                                   or, when `sable daemon` is running
   │                                   (socket at .sable-out/daemon.sock), a warm
   │                                   Lean LSP server checks it without the
@@ -69,7 +73,7 @@ diagnose (compiler/src/diag.rs)       lean JSON messages → source map lookup �
                                       .sable span, context, lean excerpt
 ```
 
-Generated Lean goes to `.sable-out/` (gitignored), one file per checked root, `import Sable` / `open Sable` at the top. Verification is whole-DAG in modules v1: a root's imports are re-verified in the same generated file (separate verification via Lean-level `import` is the planned slice 2, ADR 0013).
+Generated Lean goes to `.sable-out/` (gitignored): one stable file per checked root, plus one **content-addressed artifact per module** under `.sable-out/modules/` (`<stem>_<hash>.{lean,olean,ok}`, ADR 0018). Verification is separate: an imported module's obligations verify once into its artifact and importers `import` it — the hash covers the generated content and the prelude, dep names pin transitively, and `.ok` exists only for kernel-checked successes, so cache validity is mere existence. Roots re-verify their own file every check.
 
 ## Key invariants
 

@@ -54,7 +54,8 @@ use lib_pair::{bump};     // import with a checked name list
 - **Verification is whole-DAG**: checking a root re-verifies its
   imports in the same Lean file. Correct, cache-friendly at current
   corpus scale (the daemon's warm checker amortizes the prelude), and
-  honest — nothing is assumed unverified.
+  honest — nothing is assumed unverified. *(Superseded by slice 2 /
+  ADR 0018: imports now verify once into per-module artifacts.)*
 - `sable test` links the same way; trap and monitor reports locate
   through the module set.
 
@@ -72,11 +73,12 @@ use lib_pair::{bump};     // import with a checked name list
   `// expect-skip: <substr>` in a test file allowlists a known
   skip, and a fence matching no actual skip is itself a harness
   failure, so the discipline stays two-sided.
-- **Slice 2 (planned): separate verification.** Emit one Lean file per
-  module with `import` lines, so an imported module's obligations are
-  *not* re-checked per importer — callers consume contracts through
-  Lean's own module system. The source-level design was chosen so this
-  changes only the emitter/checker plumbing, not the language.
+- **Slice 2: separate verification — implemented, see ADR 0018.** One
+  content-addressed Lean artifact per module; an imported module's
+  obligations are *not* re-checked per importer — callers consume
+  contracts through Lean's own module system. The source-level design
+  was chosen so this changed only the emitter/checker plumbing, not the
+  language — and it did.
 - **Deferred with slice 2+**: `pub` visibility (and `use` lists
   becoming restrictive), module subdirectories/paths in source
   (`use a::b;` as a filesystem path), re-exports.
