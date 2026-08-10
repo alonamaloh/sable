@@ -205,6 +205,11 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             program.classes.push(c);
         } else {
             check_bounds_known(&c.type_bounds, &traits, c.name_span)?;
+            // Preserved for template-level verification (ADR 0009
+            // slice 2: unbounded class templates).
+            if c.type_bounds.iter().all(|b| b.is_none()) {
+                program.class_templates.push(c.clone());
+            }
             class_templates.insert(c.name.clone(), c);
         }
     }
@@ -394,6 +399,9 @@ impl Mono {
             let (text_map, bound_calls) =
                 self.subst_maps(&param_names, &bounds, &req.args);
             c.name = mangle(&req.template, &req.args);
+            if bounds.iter().all(|b| b.is_none()) {
+                c.from_template = Some(req.template.clone());
+            }
             for fld in &mut c.fields {
                 subst_ty(&mut fld.ty, &req.args);
             }

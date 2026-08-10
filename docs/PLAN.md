@@ -140,7 +140,9 @@ Layer 1 scope: acceptance soundness only (no completeness claim for rejections),
 
 **Concepts (ADR 0009), slice 1**: Alvaro's design — C++ concepts done right, as *type preconditions*. A template type parameter verifies against an abstract `Sable.IntModel` (`min`/`max` — the entire semantic content of a Sable integer type, which is why this is tractable here and not in C++) satisfying `wf` plus declared `/// requires` clauses; clause text like `T.max ≥ 100` elaborates unchanged via field projection (verbatim splice preserved). **Generic functions without trait bounds are now verified once, at the template**; instantiations owe only the `requires` obligations (numeric facts, automatic), and literals at type `T` become fits-VCs discharged from `wf`/`requires` (`corpus/verifies/concepts.sable`, all-automatic; guards: an under-provisioned instantiation fails `roomy_id_u8.requires.u8_max_1000`, a requires-less literal fails the template's `lit` obligation). Monomorphization is unchanged for code — ADR 0006 stands.
 
-Slices remaining: generic classes (acceptance: `Vec<T>`'s 8-per-instance discharges collapse to one template set), then trait-bounded templates (acceptance: `HashMap`'s 27 collapse). Slice-1 template restrictions (no `/`/`%` on `T` values, no `widen`/`narrow` touching `T`, no generic-to-generic calls) are diagnosed, not silent.
+**Slice 2 (same day): generic classes.** Class templates get their own Lean structure (type-identical across instances — everything is `Int`/`Seq Int`), members verify once against the model with the class invariant machinery unchanged, and instances skip member obligations. **Acceptance passed: `Vec<T>`'s discharges collapsed 8 → 4 (one template set), obligations 151 → 84.** Template restrictions (slices 1–2, diagnosed not silent): no `/`/`%` on `T` values, no `widen`/`narrow` touching `T`, no generic-to-generic calls, no other-class references inside class templates, no class-level `requires` yet.
+
+Slice remaining: trait-bounded templates — abstract spec-function binders, per the probe lemmas' shape (acceptance: `HashMap`'s 27-per-instance discharges collapse).
 
 ## Parallel track (low intensity)
 

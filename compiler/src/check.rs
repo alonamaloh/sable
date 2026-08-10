@@ -382,6 +382,140 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         }
     }
 
+    // Class templates (ADR 0009 slice 2): members typecheck against the
+    // abstract model; TParam flows as an ordinary integer type. Template
+    // bodies may not reference other classes (their metas are not in
+    // scope here) — a slice-2 gate, diagnosed as unknown names.
+    let mut ctemplates = std::mem::take(&mut program.class_templates);
+    {
+        let mut tmetas: Vec<ClassMeta> = Vec::new();
+        for c in &ctemplates {
+            let mut fields = Vec::new();
+            let mut fseen = HashSet::new();
+            for fld in &c.fields {
+                if !fseen.insert(fld.name.clone()) {
+                    return Err(Diagnostic {
+                        name: "type.duplicate_field".into(),
+                        title: format!("duplicate field `{}`", fld.name),
+                        span: fld.span,
+                        label: "already declared".into(),
+                        notes: vec![],
+                    });
+                }
+                fields.push((fld.name.clone(), fld.ty));
+            }
+            tmetas.push(ClassMeta {
+                name: c.name.clone(),
+                fields,
+                inits: c.inits.iter().map(|i| (i.name.clone(), i.params.clone())).collect(),
+                methods: c
+                    .methods
+                    .iter()
+                    .map(|m| (m.f.name.clone(), m.f.params.clone(), m.f.ret, m.self_kind))
+                    .collect(),
+            });
+        }
+        for (ci, class) in ctemplates.iter_mut().enumerate() {
+            let meta = &tmetas[ci];
+            for init in &mut class.inits {
+                let mut ctx = Ctx {
+                    sigs: &sigs,
+                    current_fn: format!("{}::{}", meta.name, init.name),
+                    current_has_variant: false,
+                    in_test: false,
+                    vars: HashMap::new(),
+                    declared: HashSet::new(),
+                    calls: Vec::new(),
+                    in_class: Some((ci, true)),
+                    in_init: true,
+                    class_metas: &tmetas,
+                };
+                for p in &init.params {
+                    ctx.declared.insert(p.name.clone());
+                    ctx.vars.insert(
+                        p.name.clone(),
+                        VarInfo {
+                            ty: p.ty,
+                            initialized: true,
+                        },
+                    );
+                }
+                for (fname, fty) in &meta.fields {
+                    ctx.vars.insert(
+                        format!("self.{fname}"),
+                        VarInfo {
+                            ty: *fty,
+                            initialized: false,
+                        },
+                    );
+                }
+                check_block(&mut ctx, &mut init.body, Ty::Unit)?;
+                for (fname, _) in &meta.fields {
+                    if !ctx.vars[&format!("self.{fname}")].initialized {
+                        return Err(Diagnostic {
+                            name: "type.field_uninitialized".into(),
+                            title: format!(
+                                "`{}::{}` does not initialize field `{fname}` on every path",
+                                meta.name, init.name
+                            ),
+                            span: init.name_span,
+                            label: "every field must be assigned before the init returns"
+                                .into(),
+                            notes: vec![],
+                        });
+                    }
+                }
+            }
+            for m in &mut class.methods {
+                let mut ctx = Ctx {
+                    sigs: &sigs,
+                    current_fn: format!("{}::{}", meta.name, m.f.name),
+                    current_has_variant: false,
+                    in_test: false,
+                    vars: HashMap::new(),
+                    declared: HashSet::new(),
+                    calls: Vec::new(),
+                    in_class: Some((ci, m.self_kind == SelfKind::Mut)),
+                    in_init: false,
+                    class_metas: &tmetas,
+                };
+                for p in &m.f.params {
+                    ctx.declared.insert(p.name.clone());
+                    ctx.vars.insert(
+                        p.name.clone(),
+                        VarInfo {
+                            ty: p.ty,
+                            initialized: true,
+                        },
+                    );
+                }
+                for (fname, fty) in &meta.fields {
+                    ctx.vars.insert(
+                        format!("self.{fname}"),
+                        VarInfo {
+                            ty: *fty,
+                            initialized: true,
+                        },
+                    );
+                }
+                let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
+                if !returns && m.f.ret != Ty::Unit {
+                    return Err(Diagnostic {
+                        name: "type.missing_return".into(),
+                        title: format!(
+                            "not all paths in `{}::{}` return a value",
+                            meta.name, m.f.name
+                        ),
+                        span: m.f.name_span,
+                        label: "this method must return on every path".into(),
+                        notes: vec![],
+                    });
+                }
+            }
+        }
+    }
+    program.class_templates = ctemplates;
+
     // Mutual recursion (self-recursion with a variant is handled inline).
     if let Some(cycle_member) = find_cycle(&call_graph) {
         let f = program.fns.iter().find(|f| f.name == cycle_member).unwrap();

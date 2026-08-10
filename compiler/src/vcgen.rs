@@ -108,17 +108,35 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         obligations: Vec::new(),
     };
 
+    for c in &program.class_templates {
+        result.classes.push(ClassEmit {
+            name: c.name.clone(),
+            fields: c
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
+                .collect(),
+            span: c.name_span,
+        });
+    }
+
     // Class invariant well-formedness defs: binders are the bare fields.
-    for c in &program.classes {
+    for c in program.classes.iter().chain(program.class_templates.iter()) {
         let binders: Vec<(String, String)> = c
             .fields
             .iter()
             .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
             .collect();
         for (i, inv) in c.invariants.iter().enumerate() {
+            let mut wf_binders: Vec<(String, String)> = c
+                .type_params
+                .iter()
+                .map(|t| (t.clone(), "Sable.IntModel".to_string()))
+                .collect();
+            wf_binders.extend(binders.clone());
             result.clause_wfs.push(ClauseWf {
                 def_name: format!("wf_{}_invariant_{}", sanitize(&c.name), i + 1),
-                binders: binders.clone(),
+                binders: wf_binders,
                 text: inv.text.clone(),
                 span: inv.span,
                 desc: format!("class invariant of `{}`", c.name),
@@ -221,7 +239,61 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         }
         generator.run();
     }
+
+    // Class templates (ADR 0009 slice 2): members verified once against
+    // the abstract model — the acceptance test is Vec<T>'s per-instance
+    // discharges collapsing to one template set.
+    for c in &program.class_templates {
+        let members: Vec<(&Fn, String, Cctx)> = c
+            .inits
+            .iter()
+            .map(|i| (i, format!("{}::{}", c.name, i.name), Cctx::Init(c)))
+            .chain(c.methods.iter().map(|m| {
+                (
+                    &m.f,
+                    format!("{}::{}", c.name, m.f.name),
+                    Cctx::Method(c, m.self_kind),
+                )
+            }))
+            .collect();
+        for (f, fname, cctx) in members {
+            let mut generator = Generator {
+                f,
+                fname,
+                cctx,
+                classes: &program.classes,
+                sigs,
+                fn_map: &fn_map,
+                class_map: &class_map,
+                source,
+                binders: Vec::new(),
+                hyps: Vec::new(),
+                context: Vec::new(),
+                env: HashMap::new(),
+                var_tys: HashMap::new(),
+                mut_arrays: HashMap::new(),
+                fresh: 0,
+                tparams: c.type_params.clone(),
+                name_hint: None,
+                name_counts: HashMap::new(),
+                out: &mut result,
+            };
+            for t in &c.type_params {
+                generator.binders.push((t.clone(), "Sable.IntModel".into()));
+                generator
+                    .hyps
+                    .push((format!("h_{t}_wf"), format!("{t}.wf")));
+                generator.context.push(format!("type parameter {t}"));
+            }
+            generator.run();
+        }
+    }
     for c in &program.classes {
+        // Template-verified class instances (ADR 0009 slice 2): the
+        // template's theorems cover their member obligations.
+        if c.from_template.is_some() {
+            continue;
+        }
         for init in &c.inits {
             run_one(
                 init,

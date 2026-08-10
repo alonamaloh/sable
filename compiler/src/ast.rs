@@ -472,6 +472,9 @@ pub struct ClassDecl {
     pub type_params: Vec<String>,
     /// Per-parameter trait bound, parallel to `type_params` (ADR 0007).
     pub type_bounds: Vec<Option<String>>,
+    /// Set by mono on instances of a template-verified generic class
+    /// (ADR 0009 slice 2): members skip their own obligations.
+    pub from_template: Option<String>,
     pub fields: Vec<Field>,
     /// Class invariant clauses — interface blocks (design §7).
     pub invariants: Vec<Clause>,
@@ -485,9 +488,10 @@ pub struct ClassDecl {
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<Fn>,
-    /// Generic fn templates, preserved by mono for template-level
-    /// verification (ADR 0009). Class templates are not yet here.
+    /// Generic templates, preserved by mono for template-level
+    /// verification (ADR 0009).
     pub fn_templates: Vec<Fn>,
+    pub class_templates: Vec<ClassDecl>,
     pub classes: Vec<ClassDecl>,
     /// Consumed entirely by monomorphization (ADR 0007).
     pub traits: Vec<TraitDecl>,
