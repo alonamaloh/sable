@@ -37,9 +37,11 @@ fn svm_differential() {
     files.sort();
     assert!(!files.is_empty(), "no differential subjects in {}", dir.display());
 
-    // (id, Lean term, interpreter outcome) per function, in file order.
-    let mut cases: Vec<(String, String, String)> = Vec::new();
-    for path in &files {
+    // Per file: the program environment (every function, callable) and
+    // the zero-argument subjects that run on both sides.
+    let mut progs: Vec<(usize, String)> = Vec::new();
+    let mut cases: Vec<(String, usize, String, String)> = Vec::new();
+    for (fi, path) in files.iter().enumerate() {
         let (program, mods) = match load_checked(path, &opts) {
             Ok(x) => x,
             Err(fs) => panic!(
@@ -49,23 +51,36 @@ fn svm_differential() {
             ),
         };
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
-        for f in &program.fns {
+        let entries: Vec<String> = program
+            .fns
+            .iter()
+            .map(|f| {
+                sable::svm::lower_fn_entry(f).unwrap_or_else(|e| {
+                    panic!("{stem}::{} is not in the SVM core subset: {e}", f.name)
+                })
+            })
+            .collect();
+        progs.push((fi, entries.join(", ")));
+        for f in program.fns.iter().filter(|f| f.params.is_empty()) {
             let id = format!("{stem}::{}", f.name);
             let term = sable::svm::lower_fn(f)
                 .unwrap_or_else(|e| panic!("{id} is not in the SVM core subset: {e}"));
             let outcome = sable::svm::canonical_outcome(sable::interp::run_fn(
                 &program, &mods, &f.name,
             ));
-            cases.push((id, term, outcome));
+            cases.push((id, fi, term, outcome));
         }
     }
 
     // One generated driver, one Lean invocation for the whole corpus.
     let mut driver = String::from("import Sable.SVMEval\nopen Sable.SVM\n");
-    for (i, (id, term, _)) in cases.iter().enumerate() {
+    for (fi, entries) in &progs {
+        driver.push_str(&format!("def prog{fi} : Prog := Prog.ofList [{entries}]\n"));
+    }
+    for (i, (id, fi, term, _)) in cases.iter().enumerate() {
         driver.push_str(&format!("def p{i} : List Stmt := {term}\n"));
         driver.push_str(&format!(
-            "#eval IO.println (\"{id}\\t\" ++ (run {CAP} {FUEL} (.run p{i} Env.empty)).render)\n"
+            "#eval IO.println (\"{id}\\t\" ++ (run prog{fi} {CAP} {FUEL} (.run p{i} Env.empty [])).render)\n"
         ));
     }
     let driver_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("svm_diff_driver.lean");
@@ -99,7 +114,7 @@ fn svm_differential() {
     let lean_outcomes: HashMap<&str, &str> =
         stdout.lines().filter_map(|l| l.split_once('\t')).collect();
     let mut failures = Vec::new();
-    for (id, _, interp_outcome) in &cases {
+    for (id, _, _, interp_outcome) in &cases {
         match lean_outcomes.get(id.as_str()) {
             None => failures.push(format!("{id}: the Lean driver produced no outcome")),
             Some(lean_outcome) if lean_outcome != interp_outcome => failures.push(format!(

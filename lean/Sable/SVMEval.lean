@@ -454,6 +454,46 @@ theorem Eval.deterministic {cap : Int} {ρ : Env} {e : Expr} {out₁ out₂ : EO
 theorem Eval.total (cap : Int) (ρ : Env) (e : Expr) : ∃ out, Eval cap ρ e out :=
   ⟨_, evalE_eval cap ρ e⟩
 
+/-! ## Argument lists -/
+
+/-- `evalArgs cap ρ es`: the outcome `EvalArgs` relates `es` to —
+computed. -/
+def evalArgs (cap : Int) (ρ : Env) : List Expr → AOut
+  | [] => .ok []
+  | e :: es =>
+      match evalE cap ρ e with
+      | .ok v =>
+          match evalArgs cap ρ es with
+          | .ok vs => .ok (v :: vs)
+          | .abort a => .abort a
+      | .abort a => .abort a
+
+theorem EvalArgs.evalArgs_eq {cap : Int} {ρ : Env} {es : List Expr} {out : AOut}
+    (h : EvalArgs cap ρ es out) : evalArgs cap ρ es = out := by
+  induction h with
+  | nil => rfl
+  | cons_ok h hs ih => simp [evalArgs, h.evalE_eq, ih]
+  | cons_abort h => simp [evalArgs, h.evalE_eq]
+  | cons_abort_tail h hs ih => simp [evalArgs, h.evalE_eq, ih]
+
+theorem evalArgs_evalArgs (cap : Int) (ρ : Env) :
+    ∀ es, EvalArgs cap ρ es (evalArgs cap ρ es) := by
+  intro es
+  induction es with
+  | nil => exact .nil
+  | cons e es ih =>
+      simp only [evalArgs]
+      cases he : evalE cap ρ e with
+      | abort a => exact .cons_abort (he ▸ evalE_eval cap ρ e)
+      | ok v =>
+          cases hes : evalArgs cap ρ es with
+          | ok vs => exact .cons_ok (he ▸ evalE_eval cap ρ e) (hes ▸ ih)
+          | abort a => exact .cons_abort_tail (he ▸ evalE_eval cap ρ e) (hes ▸ ih)
+
+theorem evalArgs_iff {cap : Int} {ρ : Env} {es : List Expr} {out : AOut} :
+    EvalArgs cap ρ es out ↔ evalArgs cap ρ es = out :=
+  ⟨EvalArgs.evalArgs_eq, fun h => h ▸ evalArgs_evalArgs cap ρ es⟩
+
 /-! ## The functional statement stepper -/
 
 /-- Continue a statement with the expression's integer value. -/
@@ -490,35 +530,49 @@ theorem EOut.stepBool_ok_of_ne {v : Val} (f : Bool → Config)
     (hv : ∀ b, v ≠ .bool b) : (EOut.ok v).stepBool f = .undef := by
   cases v <;> first | exact absurd rfl (hv _) | rfl
 
-/-- `stepF cap c`: the configuration `Step` relates `c` to — computed.
+/-- `stepF P cap c`: the configuration `Step` relates `c` to — computed.
 `none` exactly on terminal configurations. -/
-def stepF (cap : Int) : Config → Option Config
-  | .run [] _ => some (.done .unit)
-  | .run (.assign x e :: k) ρ =>
+def stepF (P : Prog) (cap : Int) : Config → Option Config
+  | .run [] _ [] => some (.done .unit)
+  | .run [] _ (fr :: σ) => some (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ)
+  | .run (.assign x e :: k) ρ σ =>
       some (match evalE cap ρ e with
-        | .ok v => .run k (ρ.update x v)
+        | .ok v => .run k (ρ.update x v) σ
         | .abort a => a.toConfig)
-  | .run (.store x ei ev :: k) ρ =>
+  | .run (.store x ei ev :: k) ρ σ =>
       some ((evalE cap ρ ei).stepInt fun n =>
         (evalE cap ρ ev).stepInt fun w =>
           match ρ x with
           | some (.arr a) =>
-              if 0 ≤ n ∧ n < a.len then .run k (ρ.update x (.arr (a.set n w)))
+              if 0 ≤ n ∧ n < a.len then .run k (ρ.update x (.arr (a.set n w))) σ
               else .trapped (.indexOOB n a.len)
           | _ => .undef)
-  | .run (.ite c thn els :: k) ρ =>
+  | .run (.ite c thn els :: k) ρ σ =>
       some ((evalE cap ρ c).stepBool fun b =>
-        if b then .run (thn ++ k) ρ else .run (els ++ k) ρ)
-  | .run (.while c body :: k) ρ =>
+        if b then .run (thn ++ k) ρ σ else .run (els ++ k) ρ σ)
+  | .run (.while c body :: k) ρ σ =>
       some ((evalE cap ρ c).stepBool fun b =>
-        if b then .run (body ++ .while c body :: k) ρ else .run k ρ)
-  | .run (.ret e :: _) ρ =>
+        if b then .run (body ++ .while c body :: k) ρ σ else .run k ρ σ)
+  | .run (.ret e :: _) ρ σ =>
       some (match evalE cap ρ e with
-        | .ok v => .done v
+        | .ok v =>
+            match σ with
+            | [] => .done v
+            | fr :: σ' => .run fr.k (fr.ρ.bindDst fr.dst v) σ'
         | .abort a => a.toConfig)
-  | .run (.check name c :: k) ρ =>
+  | .run (.check name c :: k) ρ σ =>
       some ((evalE cap ρ c).stepBool fun b =>
-        if b then .run k ρ else .trapped (.deferViolation name))
+        if b then .run k ρ σ else .trapped (.deferViolation name))
+  | .run (.call dst f args :: k) ρ σ =>
+      some (match P f with
+        | none => .undef
+        | some fd =>
+            match evalArgs cap ρ args with
+            | .abort a => a.toConfig
+            | .ok vs =>
+                if fd.params.length = vs.length then
+                  .run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ)
+                else .undef)
   | .done _ => none
   | .trapped _ => none
   | .undef => none
@@ -526,8 +580,8 @@ def stepF (cap : Int) : Config → Option Config
 /-! ## Step agreement -/
 
 /-- Every step computes. -/
-theorem Step.stepF_eq {cap : Int} {c c' : Config} (h : Step cap c c') :
-    stepF cap c = some c' := by
+theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c') :
+    stepF P cap c = some c' := by
   cases h with
   | assign_ok h => simp [stepF, h.evalE_eq]
   | assign_abort h => simp [stepF, h.evalE_eq]
@@ -550,20 +604,29 @@ theorem Step.stepF_eq {cap : Int} {c c' : Config} (h : Step cap c c') :
   | while_false h => simp [stepF, h.evalE_eq]
   | while_undef h hv => simp [stepF, h.evalE_eq, EOut.stepBool_ok_of_ne _ hv]
   | while_abort h => simp [stepF, h.evalE_eq]
-  | ret_ok h => simp [stepF, h.evalE_eq]
-  | ret_abort h => simp [stepF, h.evalE_eq]
   | check_pass h => simp [stepF, h.evalE_eq]
   | check_fail h => simp [stepF, h.evalE_eq]
   | check_undef h hv => simp [stepF, h.evalE_eq, EOut.stepBool_ok_of_ne _ hv]
   | check_abort h => simp [stepF, h.evalE_eq]
+  | call_undef_fn hf => simp [stepF, hf]
+  | call_abort hf ha => simp [stepF, hf, ha.evalArgs_eq]
+  | call_undef_arity hf ha hn => simp [stepF, hf, ha.evalArgs_eq, hn]
+  | call_enter hf ha hn => simp [stepF, hf, ha.evalArgs_eq, hn]
+  | ret_ok h => simp [stepF, h.evalE_eq]
+  | ret_pop h => simp [stepF, h.evalE_eq]
+  | ret_abort h =>
+      cases ‹List Frame› with
+      | nil => simp [stepF, h.evalE_eq]
+      | cons fr σ => simp [stepF, h.evalE_eq]
   | nil_ret => rfl
+  | nil_pop => rfl
 
-private theorem step_stepInt {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
+private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Int → Config}
-    (Habort : ∀ a, Eval cap ρ e (.abort a) → Step cap c₀ a.toConfig)
-    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ n, v ≠ .int n) → Step cap c₀ .undef)
-    (Hok : ∀ n, Eval cap ρ e (.ok (.int n)) → Step cap c₀ (f n)) :
-    Step cap c₀ ((evalE cap ρ e).stepInt f) := by
+    (Habort : ∀ a, Eval cap ρ e (.abort a) → Step P cap c₀ a.toConfig)
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ n, v ≠ .int n) → Step P cap c₀ .undef)
+    (Hok : ∀ n, Eval cap ρ e (.ok (.int n)) → Step P cap c₀ (f n)) :
+    Step P cap c₀ ((evalE cap ρ e).stepInt f) := by
   have ih := evalE_eval cap ρ e
   cases ho : evalE cap ρ e with
   | abort a => rw [ho] at ih; simpa using Habort a ih
@@ -576,12 +639,12 @@ private theorem step_stepInt {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     | arr a => simpa [EOut.stepInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepInt] using Hundef _ ih nofun
 
-private theorem step_stepBool {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
+private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Bool → Config}
-    (Habort : ∀ a, Eval cap ρ e (.abort a) → Step cap c₀ a.toConfig)
-    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ b, v ≠ .bool b) → Step cap c₀ .undef)
-    (Hok : ∀ b, Eval cap ρ e (.ok (.bool b)) → Step cap c₀ (f b)) :
-    Step cap c₀ ((evalE cap ρ e).stepBool f) := by
+    (Habort : ∀ a, Eval cap ρ e (.abort a) → Step P cap c₀ a.toConfig)
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ b, v ≠ .bool b) → Step P cap c₀ .undef)
+    (Hok : ∀ b, Eval cap ρ e (.ok (.bool b)) → Step P cap c₀ (f b)) :
+    Step P cap c₀ ((evalE cap ρ e).stepBool f) := by
   have ih := evalE_eval cap ρ e
   cases ho : evalE cap ρ e with
   | abort a => rw [ho] at ih; simpa using Habort a ih
@@ -595,17 +658,22 @@ private theorem step_stepBool {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     | opt o => simpa [EOut.stepBool] using Hundef _ ih nofun
 
 /-- Everything `stepF` computes is a step. -/
-theorem stepF_sound {cap : Int} {c c' : Config}
-    (h : stepF cap c = some c') : Step cap c c' := by
+theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
+    (h : stepF P cap c = some c') : Step P cap c c' := by
   cases c with
   | done v => simp [stepF] at h
   | trapped t => simp [stepF] at h
   | undef => simp [stepF] at h
-  | run k ρ =>
+  | run k ρ σ =>
     cases k with
     | nil =>
-        simp only [stepF, Option.some.injEq] at h
-        exact h ▸ .nil_ret
+        cases σ with
+        | nil =>
+            simp only [stepF, Option.some.injEq] at h
+            exact h ▸ .nil_ret
+        | cons fr σ' =>
+            simp only [stepF, Option.some.injEq] at h
+            exact h ▸ .nil_pop
     | cons s k =>
       cases s with
       | assign x e =>
@@ -648,8 +716,11 @@ theorem stepF_sound {cap : Int} {c c' : Config}
           simp only [stepF, Option.some.injEq] at h
           subst h
           cases ho : evalE cap ρ e with
-          | ok v => exact .ret_ok (ho ▸ evalE_eval cap ρ e)
           | abort a => exact .ret_abort (ho ▸ evalE_eval cap ρ e)
+          | ok v =>
+              cases σ with
+              | nil => exact .ret_ok (ho ▸ evalE_eval cap ρ e)
+              | cons fr σ' => exact .ret_pop (ho ▸ evalE_eval cap ρ e)
       | check name c =>
           simp only [stepF, Option.some.injEq] at h
           subst h
@@ -658,24 +729,40 @@ theorem stepF_sound {cap : Int} {c c' : Config}
           cases b with
           | true => simpa using Step.check_pass hc
           | false => simpa using Step.check_fail hc
+      | call dst f args =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          cases hf : P f with
+          | none => exact .call_undef_fn hf
+          | some fd =>
+              cases ha : evalArgs cap ρ args with
+              | abort a => exact .call_abort hf (ha ▸ evalArgs_evalArgs cap ρ args)
+              | ok vs =>
+                  by_cases hn : fd.params.length = vs.length
+                  · simpa [hn] using
+                      Step.call_enter (P := P) (k := k) (σ := σ) hf
+                        (ha ▸ evalArgs_evalArgs cap ρ args) hn
+                  · simpa [hn] using
+                      Step.call_undef_arity (P := P) (k := k) (σ := σ) (dst := dst) hf
+                        (ha ▸ evalArgs_evalArgs cap ρ args) hn
 
 /-- The two presentations of the machine step agree. -/
-theorem step_iff_stepF {cap : Int} {c c' : Config} :
-    Step cap c c' ↔ stepF cap c = some c' :=
+theorem step_iff_stepF {P : Prog} {cap : Int} {c c' : Config} :
+    Step P cap c c' ↔ stepF P cap c = some c' :=
   ⟨Step.stepF_eq, stepF_sound⟩
 
 /-- The machine is deterministic (§10) — now a theorem, via agreement
 with `stepF`. -/
-theorem Step.deterministic {cap : Int} {c c₁ c₂ : Config}
-    (h₁ : Step cap c c₁) (h₂ : Step cap c c₂) : c₁ = c₂ :=
+theorem Step.deterministic {P : Prog} {cap : Int} {c c₁ c₂ : Config}
+    (h₁ : Step P cap c c₁) (h₂ : Step P cap c c₂) : c₁ = c₂ :=
   Option.some.inj (h₁.stepF_eq.symm.trans h₂.stepF_eq)
 
 /-- Progress: a `run` configuration always steps — with `undef` a
 defined outcome, nothing is stuck (ADR 0005). -/
-theorem Step.progress (cap : Int) (k : List Stmt) (ρ : Env) :
-    ∃ c', Step cap (.run k ρ) c' := by
+theorem Step.progress (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) (σ : List Frame) :
+    ∃ c', Step P cap (.run k ρ σ) c' := by
   cases k with
-  | nil => exact ⟨_, .nil_ret⟩
+  | nil => cases σ <;> exact ⟨_, stepF_sound rfl⟩
   | cons s k => cases s <;> exact ⟨_, stepF_sound rfl⟩
 
 /-! ## The executable oracle -/
@@ -683,20 +770,20 @@ theorem Step.progress (cap : Int) (k : List Stmt) (ρ : Env) :
 /-- Fuel-bounded iteration of `stepF`: the executable machine the
 differential harness runs against `interp.rs`. Stops at the first
 terminal configuration; out of fuel leaves a `run` configuration. -/
-def run (cap : Int) : Nat → Config → Config
+def run (P : Prog) (cap : Int) : Nat → Config → Config
   | 0, c => c
   | fuel + 1, c =>
-      match stepF cap c with
-      | some c' => run cap fuel c'
+      match stepF P cap c with
+      | some c' => run P cap fuel c'
       | none => c
 
 /-- Whatever `run` reaches is really reachable. -/
-theorem run_steps (cap : Int) (fuel : Nat) (c : Config) :
-    Steps cap c (run cap fuel c) := by
+theorem run_steps (P : Prog) (cap : Int) (fuel : Nat) (c : Config) :
+    Steps P cap c (run P cap fuel c) := by
   induction fuel generalizing c with
   | zero => exact .refl
   | succ n ih =>
-      cases hs : stepF cap c with
+      cases hs : stepF P cap c with
       | some c' => simpa [run, hs] using Steps.head (stepF_sound hs) (ih c')
       | none => simp [run, hs]; exact .refl
 

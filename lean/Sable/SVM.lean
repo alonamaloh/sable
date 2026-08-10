@@ -187,7 +187,10 @@ inductive Expr where
 /-- Statements. `while` carries no invariant/variant: loop annotations
 are ghost and erased (§4); the machine runs the loop, the verifier proves
 it. `check` is the compiled form of `defer P` (§9): evaluate the
-monitorable predicate, trap with the obligation's name if false. -/
+monitorable predicate, trap with the obligation's name if false. `call`
+is the A-normal form calls take in the machine (ADR 0005): they exist
+only at statement level — `x = f(args)`, or `f(args)` for a discarded
+result — so expressions stay pure and big-step. -/
 inductive Stmt where
   | assign (x : String) (e : Expr)
   | store  (x : String) (idx : Expr) (val : Expr)
@@ -195,6 +198,7 @@ inductive Stmt where
   | while  (c : Expr) (body : List Stmt)
   | ret    (e : Expr)
   | check  (name : String) (c : Expr)
+  | call   (dst : Option String) (f : String) (args : List Expr)
 
 /-! ## Environments
 
@@ -208,6 +212,38 @@ def Env.empty : Env := fun _ => none
 
 def Env.update (ρ : Env) (x : String) (v : Val) : Env :=
   fun y => if y = x then some v else ρ y
+
+/-- Bind parameters to argument values (left-to-right, later shadows —
+duplicate parameter names are checker duty). -/
+def Env.bind : Env → List String → List Val → Env
+  | ρ, x :: xs, v :: vs => (ρ.update x v).bind xs vs
+  | ρ, _, _ => ρ
+
+/-- Bind a call's result at the destination, if any (`f(args)` as a
+statement discards it). -/
+def Env.bindDst (ρ : Env) (dst : Option String) (v : Val) : Env :=
+  match dst with
+  | some x => ρ.update x v
+  | none => ρ
+
+/-! ## Programs
+
+A function is parameters plus a body; a program maps names to
+functions. Contracts are ghost and erased (§4) — the machine runs
+bodies, the verifier proves the contracts. -/
+
+structure FnDef where
+  params : List String
+  body : List Stmt
+
+def Prog := String → Option FnDef
+
+def Prog.empty : Prog := fun _ => none
+
+/-- Program from an association list (the differential harness's
+constructor; first binding wins, duplicates are checker duty). -/
+def Prog.ofList (l : List (String × FnDef)) : Prog :=
+  fun f => (l.find? (fun p => p.1 = f)).map (·.2)
 
 /-! ## Expression evaluation (big-step) -/
 
@@ -525,15 +561,42 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | noneE {ρ : Env} :
       Eval cap ρ .noneE (.ok (.opt none))
 
+/-- Outcome of evaluating an argument list. -/
+inductive AOut where
+  | ok    (vs : List Val)
+  | abort (a : Abort)
+
+/-- `EvalArgs cap ρ es out`: left-to-right evaluation of a call's
+arguments; the first abnormal outcome wins, and nothing to its right
+is evaluated. -/
+inductive EvalArgs (cap : Int) (ρ : Env) : List Expr → AOut → Prop where
+  | nil : EvalArgs cap ρ [] (.ok [])
+  | cons_ok {e : Expr} {es : List Expr} {v : Val} {vs : List Val}
+      (h : Eval cap ρ e (.ok v)) (hs : EvalArgs cap ρ es (.ok vs)) :
+      EvalArgs cap ρ (e :: es) (.ok (v :: vs))
+  | cons_abort {e : Expr} {es : List Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      EvalArgs cap ρ (e :: es) (.abort a)
+  | cons_abort_tail {e : Expr} {es : List Expr} {v : Val} {a : Abort}
+      (h : Eval cap ρ e (.ok v)) (hs : EvalArgs cap ρ es (.abort a)) :
+      EvalArgs cap ρ (e :: es) (.abort a)
+
 /-! ## Configurations and the small-step relation -/
 
-/-- A configuration: either running (a continuation of statements plus
-one frame of locals — design §10's ⟨code, frames, heap, ghost⟩ with the
-frame stack collapsed to one frame, the heap absorbed into owned array
-values, and the ghost component scoped out), or one of the three
+/-- A suspended caller: where the result goes, what runs next, and the
+caller's locals. -/
+structure Frame where
+  dst : Option String
+  k   : List Stmt
+  ρ   : Env
+
+/-- A configuration: either running (a continuation of statements, the
+current frame's locals, and the stack of suspended callers — design
+§10's ⟨code, frames, heap, ghost⟩ with the heap absorbed into owned
+array values and the ghost component scoped out), or one of the three
 terminal outcomes (ADR 0005): normal termination, a trap, or `undef`. -/
 inductive Config where
-  | run     (k : List Stmt) (ρ : Env)
+  | run     (k : List Stmt) (ρ : Env) (σ : List Frame)
   | done    (v : Val)
   | trapped (t : Trap)
   | undef
@@ -544,103 +607,131 @@ def Abort.toConfig : Abort → Config
   | .undef  => .undef
 
 /--
-`Step cap c c'`: one machine step. Small-step, deterministic, and total
-on `run` configurations (§10, ADR 0005) — determinism and progress are
-theorems (`Sable/SVMEval.lean`), via agreement with the functional
-evaluator.
+`Step P cap c c'`: one machine step of program `P`. Small-step,
+deterministic, and total on `run` configurations (§10, ADR 0005) —
+determinism and progress are theorems (`Sable/SVMEval.lean`), via
+agreement with the functional evaluator.
 
 Normative decisions (ADR 0005):
 - `store`: index evaluated, then value, then the bounds check — the
   value's trap beats the OOB trap, matching `interp.rs`.
 - `while` unfolds to its body plus itself: loops run by unfolding, the
   invariant/variant having been erased.
-- an empty continuation returns `unit` (fall-off-the-end; procedures
-  are blessed, cf. `swap` §5).
+- `call`: callee looked up first (an unknown callee is `undef` before
+  any argument runs), then arguments left-to-right, then the arity
+  check (a mismatch is checker duty, hence `undef`); the callee starts
+  from an empty frame with only its parameters bound.
+- `ret` in a callee pops the caller's frame and binds the destination;
+  at the bottom of the stack it is the program's answer. Falling off
+  the end of a body returns `unit` the same two ways (procedures are
+  blessed, cf. `swap` §5).
 -/
-inductive Step (cap : Int) : Config → Config → Prop where
-  | assign_ok {ρ : Env} {x : String} {e : Expr} {v : Val} {k : List Stmt}
+inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
+  | assign_ok {ρ : Env} {x : String} {e : Expr} {v : Val} {k : List Stmt} {σ : List Frame}
       (h : Eval cap ρ e (.ok v)) :
-      Step cap (.run (.assign x e :: k) ρ) (.run k (ρ.update x v))
-  | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt}
+      Step P cap (.run (.assign x e :: k) ρ σ) (.run k (ρ.update x v) σ)
+  | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame}
       (h : Eval cap ρ e (.abort a)) :
-      Step cap (.run (.assign x e :: k) ρ) a.toConfig
-  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt}
+      Step P cap (.run (.assign x e :: k) ρ σ) a.toConfig
+  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ρ x = some (.arr a)) (h₀ : 0 ≤ n) (h₁ : n < a.len) :
-      Step cap (.run (.store x ei ev :: k) ρ) (.run k (ρ.update x (.arr (a.set n w))))
-  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt}
+      Step P cap (.run (.store x ei ev :: k) ρ σ) (.run k (ρ.update x (.arr (a.set n w))) σ)
+  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ρ x = some (.arr a)) (h : n < 0 ∨ a.len ≤ n) :
-      Step cap (.run (.store x ei ev :: k) ρ) (.trapped (.indexOOB n a.len))
-  | store_abort_idx {ρ : Env} {x : String} {ei ev : Expr} {a : Abort} {k : List Stmt}
+      Step P cap (.run (.store x ei ev :: k) ρ σ) (.trapped (.indexOOB n a.len))
+  | store_abort_idx {ρ : Env} {x : String} {ei ev : Expr} {a : Abort} {k : List Stmt} {σ : List Frame}
       (hi : Eval cap ρ ei (.abort a)) :
-      Step cap (.run (.store x ei ev :: k) ρ) a.toConfig
-  | store_undef_idx {ρ : Env} {x : String} {ei ev : Expr} {v : Val} {k : List Stmt}
+      Step P cap (.run (.store x ei ev :: k) ρ σ) a.toConfig
+  | store_undef_idx {ρ : Env} {x : String} {ei ev : Expr} {v : Val} {k : List Stmt} {σ : List Frame}
       (hi : Eval cap ρ ei (.ok v)) (hv : ∀ n, v ≠ .int n) :
-      Step cap (.run (.store x ei ev :: k) ρ) .undef
-  | store_abort_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {a : Abort} {k : List Stmt}
+      Step P cap (.run (.store x ei ev :: k) ρ σ) .undef
+  | store_abort_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {a : Abort} {k : List Stmt} {σ : List Frame}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.abort a)) :
-      Step cap (.run (.store x ei ev :: k) ρ) a.toConfig
-  | store_undef_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {v : Val} {k : List Stmt}
+      Step P cap (.run (.store x ei ev :: k) ρ σ) a.toConfig
+  | store_undef_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {v : Val} {k : List Stmt} {σ : List Frame}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok v))
       (hw : ∀ m, v ≠ .int m) :
-      Step cap (.run (.store x ei ev :: k) ρ) .undef
-  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {k : List Stmt}
+      Step P cap (.run (.store x ei ev :: k) ρ σ) .undef
+  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {k : List Stmt} {σ : List Frame}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
-      Step cap (.run (.store x ei ev :: k) ρ) .undef
-  | ite_true {ρ : Env} {c : Expr} {thn els k : List Stmt}
+      Step P cap (.run (.store x ei ev :: k) ρ σ) .undef
+  | ite_true {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame}
       (h : Eval cap ρ c (.ok (.bool true))) :
-      Step cap (.run (.ite c thn els :: k) ρ) (.run (thn ++ k) ρ)
-  | ite_false {ρ : Env} {c : Expr} {thn els k : List Stmt}
+      Step P cap (.run (.ite c thn els :: k) ρ σ) (.run (thn ++ k) ρ σ)
+  | ite_false {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame}
       (h : Eval cap ρ c (.ok (.bool false))) :
-      Step cap (.run (.ite c thn els :: k) ρ) (.run (els ++ k) ρ)
-  | ite_undef {ρ : Env} {c : Expr} {thn els k : List Stmt} {v : Val}
+      Step P cap (.run (.ite c thn els :: k) ρ σ) (.run (els ++ k) ρ σ)
+  | ite_undef {ρ : Env} {c : Expr} {thn els k : List Stmt} {v : Val} {σ : List Frame}
       (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
-      Step cap (.run (.ite c thn els :: k) ρ) .undef
-  | ite_abort {ρ : Env} {c : Expr} {thn els k : List Stmt} {a : Abort}
+      Step P cap (.run (.ite c thn els :: k) ρ σ) .undef
+  | ite_abort {ρ : Env} {c : Expr} {thn els k : List Stmt} {a : Abort} {σ : List Frame}
       (h : Eval cap ρ c (.abort a)) :
-      Step cap (.run (.ite c thn els :: k) ρ) a.toConfig
-  | while_true {ρ : Env} {c : Expr} {body k : List Stmt}
+      Step P cap (.run (.ite c thn els :: k) ρ σ) a.toConfig
+  | while_true {ρ : Env} {c : Expr} {body k : List Stmt} {σ : List Frame}
       (h : Eval cap ρ c (.ok (.bool true))) :
-      Step cap (.run (.while c body :: k) ρ) (.run (body ++ .while c body :: k) ρ)
-  | while_false {ρ : Env} {c : Expr} {body k : List Stmt}
+      Step P cap (.run (.while c body :: k) ρ σ) (.run (body ++ .while c body :: k) ρ σ)
+  | while_false {ρ : Env} {c : Expr} {body k : List Stmt} {σ : List Frame}
       (h : Eval cap ρ c (.ok (.bool false))) :
-      Step cap (.run (.while c body :: k) ρ) (.run k ρ)
-  | while_undef {ρ : Env} {c : Expr} {body k : List Stmt} {v : Val}
+      Step P cap (.run (.while c body :: k) ρ σ) (.run k ρ σ)
+  | while_undef {ρ : Env} {c : Expr} {body k : List Stmt} {v : Val} {σ : List Frame}
       (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
-      Step cap (.run (.while c body :: k) ρ) .undef
-  | while_abort {ρ : Env} {c : Expr} {body k : List Stmt} {a : Abort}
+      Step P cap (.run (.while c body :: k) ρ σ) .undef
+  | while_abort {ρ : Env} {c : Expr} {body k : List Stmt} {a : Abort} {σ : List Frame}
       (h : Eval cap ρ c (.abort a)) :
-      Step cap (.run (.while c body :: k) ρ) a.toConfig
+      Step P cap (.run (.while c body :: k) ρ σ) a.toConfig
+  -- compiled `defer` (§9): "true or halt", carrying the obligation name
+  | check_pass {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {σ : List Frame}
+      (h : Eval cap ρ c (.ok (.bool true))) :
+      Step P cap (.run (.check name c :: k) ρ σ) (.run k ρ σ)
+  | check_fail {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {σ : List Frame}
+      (h : Eval cap ρ c (.ok (.bool false))) :
+      Step P cap (.run (.check name c :: k) ρ σ) (.trapped (.deferViolation name))
+  | check_undef {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {v : Val} {σ : List Frame}
+      (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
+      Step P cap (.run (.check name c :: k) ρ σ) .undef
+  | check_abort {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {a : Abort} {σ : List Frame}
+      (h : Eval cap ρ c (.abort a)) :
+      Step P cap (.run (.check name c :: k) ρ σ) a.toConfig
+  -- calls (A-normal, ADR 0005): lookup, then arguments, then arity
+  | call_undef_fn {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {k : List Stmt} {σ : List Frame}
+      (hf : P f = none) :
+      Step P cap (.run (.call dst f args :: k) ρ σ) .undef
+  | call_abort {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {a : Abort} {k : List Stmt} {σ : List Frame}
+      (hf : P f = some fd) (ha : EvalArgs cap ρ args (.abort a)) :
+      Step P cap (.run (.call dst f args :: k) ρ σ) a.toConfig
+  | call_undef_arity {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame}
+      (hf : P f = some fd) (ha : EvalArgs cap ρ args (.ok vs))
+      (hn : fd.params.length ≠ vs.length) :
+      Step P cap (.run (.call dst f args :: k) ρ σ) .undef
+  | call_enter {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame}
+      (hf : P f = some fd) (ha : EvalArgs cap ρ args (.ok vs))
+      (hn : fd.params.length = vs.length) :
+      Step P cap (.run (.call dst f args :: k) ρ σ)
+        (.run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ))
+  -- returns: pop a caller, or answer the program
   | ret_ok {ρ : Env} {e : Expr} {v : Val} {k : List Stmt}
       (h : Eval cap ρ e (.ok v)) :
-      Step cap (.run (.ret e :: k) ρ) (.done v)
-  | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt}
+      Step P cap (.run (.ret e :: k) ρ []) (.done v)
+  | ret_pop {ρ : Env} {e : Expr} {v : Val} {k : List Stmt} {fr : Frame} {σ : List Frame}
+      (h : Eval cap ρ e (.ok v)) :
+      Step P cap (.run (.ret e :: k) ρ (fr :: σ)) (.run fr.k (fr.ρ.bindDst fr.dst v) σ)
+  | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame}
       (h : Eval cap ρ e (.abort a)) :
-      Step cap (.run (.ret e :: k) ρ) a.toConfig
-  -- compiled `defer` (§9): "true or halt", carrying the obligation name
-  | check_pass {ρ : Env} {name : String} {c : Expr} {k : List Stmt}
-      (h : Eval cap ρ c (.ok (.bool true))) :
-      Step cap (.run (.check name c :: k) ρ) (.run k ρ)
-  | check_fail {ρ : Env} {name : String} {c : Expr} {k : List Stmt}
-      (h : Eval cap ρ c (.ok (.bool false))) :
-      Step cap (.run (.check name c :: k) ρ) (.trapped (.deferViolation name))
-  | check_undef {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {v : Val}
-      (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
-      Step cap (.run (.check name c :: k) ρ) .undef
-  | check_abort {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {a : Abort}
-      (h : Eval cap ρ c (.abort a)) :
-      Step cap (.run (.check name c :: k) ρ) a.toConfig
-  -- fall off the end of the body: return unit
+      Step P cap (.run (.ret e :: k) ρ σ) a.toConfig
+  -- fall off the end of a body: return unit
   | nil_ret {ρ : Env} :
-      Step cap (.run [] ρ) (.done .unit)
+      Step P cap (.run [] ρ []) (.done .unit)
+  | nil_pop {ρ : Env} {fr : Frame} {σ : List Frame} :
+      Step P cap (.run [] ρ (fr :: σ)) (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ)
 
 /-- Reflexive-transitive closure of `Step`. -/
-inductive Steps (cap : Int) : Config → Config → Prop where
-  | refl {c : Config} : Steps cap c c
-  | head {c₁ c₂ c₃ : Config} (h : Step cap c₁ c₂) (hs : Steps cap c₂ c₃) :
-      Steps cap c₁ c₃
+inductive Steps (P : Prog) (cap : Int) : Config → Config → Prop where
+  | refl {c : Config} : Steps P cap c c
+  | head {c₁ c₂ c₃ : Config} (h : Step P cap c₁ c₂) (hs : Steps P cap c₂ c₃) :
+      Steps P cap c₁ c₃
 
 /-- Terminal configurations: normal return, trap, or undef. `run`
 configurations are never terminal — the machine is total (progress is a
@@ -652,37 +743,38 @@ def Config.Terminal : Config → Prop
   | .undef => True
 
 /-- Behavior of a function body `k` from locals `ρ`: normal return. -/
-def Returns (cap : Int) (k : List Stmt) (ρ : Env) (v : Val) : Prop :=
-  Steps cap (.run k ρ) (.done v)
+def Returns (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) (v : Val) : Prop :=
+  Steps P cap (.run k ρ []) (.done v)
 
 /-- Behavior: terminal trap. -/
-def TrapsWith (cap : Int) (k : List Stmt) (ρ : Env) (t : Trap) : Prop :=
-  Steps cap (.run k ρ) (.trapped t)
+def TrapsWith (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) (t : Trap) : Prop :=
+  Steps P cap (.run k ρ []) (.trapped t)
 
 /-- Behavior: the undef outcome — what the static semantics must prove
 unreachable for checked programs. -/
-def ReachesUndef (cap : Int) (k : List Stmt) (ρ : Env) : Prop :=
-  Steps cap (.run k ρ) .undef
+def ReachesUndef (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) : Prop :=
+  Steps P cap (.run k ρ []) .undef
 
 /-- Divergence: every reachable configuration can still step. This is
-what `partial fn` (§8) permits and totality forbids. -/
-def Diverges (cap : Int) (c : Config) : Prop :=
-  ∀ c', Steps cap c c' → ∃ c'', Step cap c' c''
+what `partial fn` (§8) permits and totality forbids — and with frames,
+what unbounded recursion exhibits. -/
+def Diverges (P : Prog) (cap : Int) (c : Config) : Prop :=
+  ∀ c', Steps P cap c c' → ∃ c'', Step P cap c' c''
 
 /-! ## Sanity theorems -/
 
 /-- Terminal outcomes really are terminal: `done` has no successor. -/
-theorem done_no_step {cap : Int} {v : Val} {c : Config} :
-    ¬ Step cap (.done v) c := nofun
+theorem done_no_step {P : Prog} {cap : Int} {v : Val} {c : Config} :
+    ¬ Step P cap (.done v) c := nofun
 
 /-- ... and neither does a trap: traps are not recoverable (§9: no
 catching; a `defer` failure halts the machine). -/
-theorem trapped_no_step {cap : Int} {t : Trap} {c : Config} :
-    ¬ Step cap (.trapped t) c := nofun
+theorem trapped_no_step {P : Prog} {cap : Int} {t : Trap} {c : Config} :
+    ¬ Step P cap (.trapped t) c := nofun
 
 /-- ... nor `undef`. -/
-theorem undef_no_step {cap : Int} {c : Config} :
-    ¬ Step cap .undef c := nofun
+theorem undef_no_step {P : Prog} {cap : Int} {c : Config} :
+    ¬ Step P cap .undef c := nofun
 
 /-- The Euclidean remainder is representable whenever the divisor is —
 even at signed extremes (e.g. `i8`: `|b| ≤ 128` gives `a emod b ≤ 127`).
@@ -705,10 +797,11 @@ theorem IntTy.emod_inRange (t : IntTy) {a b : Int}
 /-! ## Smoke tests: tiny derivations exercising the outcome kinds -/
 
 private def ρ₀ : Env := Env.empty
+private def P₀ : Prog := Prog.empty
 
 /-- `x = 1; return x + 1` returns 2. -/
 example :
-    Returns 1000
+    Returns P₀ 1000
       [.assign "x" (.intLit .i32 1),
        .ret (.arith .add .i32 (.var "x") (.intLit .i32 1))]
       ρ₀ (.int 2) := by
@@ -723,21 +816,39 @@ example :
 
 /-- `return 7 / 0` ends in the div-by-zero trap, not a return. -/
 example :
-    TrapsWith 1000 [.ret (.div .i32 (.intLit .i32 7) (.intLit .i32 0))]
+    TrapsWith P₀ 1000 [.ret (.div .i32 (.intLit .i32 7) (.intLit .i32 0))]
       ρ₀ .divByZero :=
   .head (.ret_abort (.div_zero (.intLit (by decide)) (.intLit (by decide)))) .refl
 
 /-- `return (255 + 1 : u8)` ends in the overflow trap. -/
 example :
-    TrapsWith 1000 [.ret (.arith .add .u8 (.intLit .u8 255) (.intLit .u8 1))]
+    TrapsWith P₀ 1000 [.ret (.arith .add .u8 (.intLit .u8 255) (.intLit .u8 1))]
       ρ₀ (.overflow .u8) :=
   .head (.ret_abort (.arith_overflow (.intLit (by decide)) (.intLit (by decide))
     (by decide))) .refl
 
 /-- `return x` with `x` uninitialized ends in `undef`: the ⊥-read has a
 defined outcome (ADR 0005), which checked programs never reach. -/
-example : ReachesUndef 1000 [.ret (.var "x")] ρ₀ :=
+example : ReachesUndef P₀ 1000 [.ret (.var "x")] ρ₀ :=
   .head (.ret_abort (.var_undef rfl)) .refl
+
+/-- `x = id(41); return x + 1` through a one-function program: enter,
+return through the frame, resume the caller. -/
+example :
+    Returns (Prog.ofList [("id", ⟨["a"], [.ret (.var "a")]⟩)]) 1000
+      [.call (some "x") "id" [.intLit .i32 41],
+       .ret (.arith .add .i32 (.var "x") (.intLit .i32 1))]
+      ρ₀ (.int 42) := by
+  have hf : Prog.ofList [("id", ⟨["a"], [.ret (.var "a")]⟩)] "id"
+      = some ⟨["a"], [.ret (.var "a")]⟩ := rfl
+  have hargs : EvalArgs 1000 ρ₀ [.intLit .i32 41] (.ok [.int 41]) :=
+    .cons_ok (.intLit (by decide)) .nil
+  have ha : (Env.empty.bind ["a"] [.int 41]) "a" = some (.int 41) := by
+    simp [Env.bind, Env.update]
+  have hx : (ρ₀.bindDst (some "x") (.int 41)) "x" = some (.int 41) := by
+    simp [Env.bindDst, Env.update]
+  refine .head (.call_enter hf hargs rfl) (.head (.ret_pop (.var ha)) (.head (.ret_ok ?_) .refl))
+  exact .arith_ok (.var hx) (.intLit (by decide)) (by decide)
 
 end SVM
 end Sable

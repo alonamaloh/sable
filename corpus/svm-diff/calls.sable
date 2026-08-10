@@ -1,0 +1,95 @@
+// SVM differential subjects: A-normalized calls (ADR 0005) — argument
+// evaluation order, frames, early returns through the stack,
+// recursion, and procedure calls with discarded results.
+
+fn add3(i64 a, i64 b, i64 c) -> i64 {
+    return a + b + c;
+}
+
+fn pick(i64 take_first, i64 x, i64 y) -> i64 {
+    if (take_first == 1) {
+        return x;
+    }
+    return y;
+}
+
+fn clamp99(i64 v) -> i64 {
+    if (v > 99) {
+        return 99;
+    }
+    return v;
+}
+
+/// variant n
+fn fact(i64 n) -> i64 {
+    if (n < 1) {
+        return 1;
+    }
+    i64 m = fact(n - 1);
+    return n * m;
+}
+
+fn half_opt(i64 v) -> option<i64> {
+    if (v % 2 == 0) {
+        return some(v / 2);
+    }
+    return none;
+}
+
+fn bump(i64 v) {
+    i64 unused = v + 1;
+}
+
+fn call_chain() -> i64 {
+    i64 x = add3(1, 2, 3);
+    i64 y = add3(x, x, x);
+    mut i64 w = 0;
+    w = add3(y, x, 100);
+    return w;
+}
+
+fn call_through_helpers() -> i64 {
+    i64 a = pick(1, 7, 8);
+    i64 b = pick(0, 7, 8);
+    i64 c = clamp99(1234);
+    i64 d = clamp99(42);
+    i64 s = add3(a + b, c, d);
+    return s;
+}
+
+fn call_arg_order_traps() -> i64 {
+    [i64] arr = alloc_array<i64>(3, 5);
+    i64 z = 0;
+    u64 i = 9;
+    i64 x = add3(arr[i], 1 / z, 0);
+    return x;
+}
+
+fn call_second_arg_trap() -> i64 {
+    i64 z = 0;
+    i64 x = add3(1, 5 / z, 0);
+    return x;
+}
+
+fn recursion_fact10() -> i64 {
+    i64 r = fact(10);
+    return r;
+}
+
+fn opt_through_frames() -> option<i64> {
+    i64 v = add3(10, 20, 12);
+    var o = half_opt(v);
+    return o;
+}
+
+fn procedure_discard() -> i64 {
+    bump(5);
+    bump(6);
+    return 11;
+}
+
+fn callee_trap_propagates() -> i64 {
+    i64 big = 9223372036854775807;
+    i64 x = add3(big, 1, 0);
+    return x;
+}

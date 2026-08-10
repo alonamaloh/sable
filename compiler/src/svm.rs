@@ -22,6 +22,31 @@ pub fn lower_fn(f: &Fn) -> Result<String, String> {
     lower_block(&f.body)
 }
 
+/// Lower any function to a `Prog.ofList` entry: `("name", ⟨[params],
+/// body⟩)`. Parameters must be scalars — borrows are outside the
+/// machine (arrays are owned values; `&mut` reflection back to the
+/// caller has no machine analog yet).
+pub fn lower_fn_entry(f: &Fn) -> Result<String, String> {
+    for p in &f.params {
+        match p.ty {
+            Ty::Int(_) | Ty::Bool => {}
+            _ => {
+                return Err(format!(
+                    "parameter `{}`: only scalar parameters are inside the SVM                      core subset (borrows are scoped out)",
+                    p.name
+                ));
+            }
+        }
+    }
+    let params: Vec<String> = f.params.iter().map(|p| format!("\"{}\"", p.name)).collect();
+    Ok(format!(
+        "(\"{}\", ⟨[{}], {}⟩)",
+        f.name,
+        params.join(", "),
+        lower_block(&f.body)?
+    ))
+}
+
 fn lower_block(stmts: &[Stmt]) -> Result<String, String> {
     let mut out = Vec::new();
     for s in stmts {
@@ -41,13 +66,9 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             name,
             init: Some(e),
             ..
-        } => Some(format!("(.assign \"{name}\" {})", lower_expr(e)?)),
-        Stmt::VarDecl { name, init, .. } => {
-            Some(format!("(.assign \"{name}\" {})", lower_expr(init)?))
-        }
-        Stmt::Assign { name, value, .. } => {
-            Some(format!("(.assign \"{name}\" {})", lower_expr(value)?))
-        }
+        } => Some(lower_bind(name, e)?),
+        Stmt::VarDecl { name, init, .. } => Some(lower_bind(name, init)?),
+        Stmt::Assign { name, value, .. } => Some(lower_bind(name, value)?),
         Stmt::Store {
             array,
             index,
@@ -97,9 +118,14 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
         Stmt::Return { value: None, .. } => {
             return Err("bare `return;` has no SVM form (fall off the end instead)".into());
         }
-        Stmt::ExprStmt(_) => {
-            return Err("expression statements (calls) are outside the SVM core subset".into());
-        }
+        // A call for effect: `f(args);` — the discarded-result form of
+        // the machine's A-normal call.
+        Stmt::ExprStmt(e) => match &e.kind {
+            ExprKind::Call { callee, args, .. } => Some(lower_call(&None, callee, args)?),
+            _ => {
+                return Err("expression statements are outside the SVM core subset".into());
+            }
+        },
         Stmt::Assert(_) => {
             return Err("`/// assert` is outside the SVM core subset".into());
         }
@@ -107,6 +133,27 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             return Err("class members are outside the SVM core subset".into());
         }
     })
+}
+
+/// `x = e;` — an assign, or (A-normalized, ADR 0005) a call when `e`
+/// is exactly a call; calls nested deeper stay outside the subset.
+fn lower_bind(name: &str, e: &Expr) -> Result<String, String> {
+    match &e.kind {
+        ExprKind::Call { callee, args, .. } => lower_call(&Some(name.to_string()), callee, args),
+        _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(e)?)),
+    }
+}
+
+fn lower_call(dst: &Option<String>, callee: &str, args: &[Expr]) -> Result<String, String> {
+    let lowered: Result<Vec<String>, String> = args.iter().map(lower_expr).collect();
+    let d = match dst {
+        Some(x) => format!("(some \"{x}\")"),
+        None => "none".into(),
+    };
+    Ok(format!(
+        "(.call {d} \"{callee}\" [{}])",
+        lowered?.join(", ")
+    ))
 }
 
 fn lower_expr(e: &Expr) -> Result<String, String> {
