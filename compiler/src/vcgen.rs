@@ -263,7 +263,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         generator.run();
     }
 
-    // Class templates (ADR 0009 slice 2): members verified once against
+    // Class templates (ADR 0009): members verified once against
     // the abstract model — the acceptance test is Vec<T>'s per-instance
     // discharges collapsing to one template set.
     for c in &program.class_templates {
@@ -323,7 +323,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         }
     }
     for c in &program.classes {
-        // Template-verified class instances (ADR 0009 slice 2): the
+        // Template-verified class instances (ADR 0009): the
         // template's theorems cover their member obligations.
         if c.from_template.is_some() {
             continue;
@@ -344,7 +344,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 &mut result,
             );
         }
-        // deinit bodies are empty in M5 (checked); nothing to verify.
+        // deinit bodies are empty (checked); nothing to verify.
     }
     result
 }
@@ -392,7 +392,7 @@ struct Generator<'a> {
     /// Template mode (ADR 0009): the type-parameter names; `TParam(i)`
     /// ranges render through `tparams[i]` as an `IntModel`.
     tparams: Vec<String>,
-    /// Template mode, slice 3: bounded parameter → its trait (for
+    /// Template mode: bounded parameter → its trait (for
     /// modeling `K::m(...)` calls against the trait's contracts).
     trait_ctx: HashMap<String, &'a TraitDecl>,
     /// Source-name hint for the next call/alloc/ctor result binder:
@@ -420,7 +420,7 @@ impl<'a> Generator<'a> {
     fn init_state_map(&self, class: &ClassDecl) -> (String, HashMap<String, String>) {
         let literal = format!(
             "({}.mk {})",
-            class.name,
+            lean_class_name(&class.name),
             class
                 .fields
                 .iter()
@@ -449,28 +449,31 @@ impl<'a> Generator<'a> {
     /// Per-field representability facts about a class-state binder —
     /// justified the same way havoc facts are: every store is checked.
     fn push_class_state_facts(&mut self, class: &ClassDecl, binder: &str) {
+        // Deduped (`_2` suffixes) like class invariants: two borrowed
+        // arguments of the same class must not shadow each other's facts
+        // (`cmp(&Nat a, &Nat b)` needs both).
         for fld in &class.fields {
             match fld.ty {
                 Ty::Int(it) => {
-                    self.hyps.push((
+                    self.push_hyp_unique(
                         format!("h_field_{}_range", fld.name),
                         self.r_prop(&format!("({binder}.{})", fld.name), it),
-                    ));
+                    );
                 }
                 Ty::Array(elem, _) => {
                     let path = format!("({binder}.{})", fld.name);
-                    self.hyps.push((
+                    self.push_hyp_unique(
                         format!("h_field_{}_len", fld.name),
                         format!("0 ≤ {path}.len ∧ {path}.len ≤ u64.max"),
-                    ));
-                    self.hyps.push((
+                    );
+                    self.push_hyp_unique(
                         format!("h_field_{}_elems", fld.name),
                         format!(
                             "∀ k, 0 ≤ k → k < {path}.len → {} ≤ {path}.get k ∧ {path}.get k ≤ {}",
                             self.t_min(elem),
                             self.t_max(elem)
                         ),
-                    ));
+                    );
                 }
                 _ => {}
             }
@@ -495,7 +498,7 @@ impl<'a> Generator<'a> {
         // (design §7 desugaring); inits start with no self at all.
         if let Cctx::Method(class, _) = self.cctx {
             self.binders
-                .push(("_old_self".to_string(), class.name.clone()));
+                .push(("_old_self".to_string(), lean_class_name(&class.name)));
             self.mut_arrays
                 .insert("self".to_string(), "_old_self".to_string());
             self.push_class_state_facts(class, "_old_self");
@@ -511,7 +514,7 @@ impl<'a> Generator<'a> {
                     // field facts and invariant — the method-entry
                     // treatment, re-aimed.
                     let cd = &self.classes[ci];
-                    self.binders.push((p.name.clone(), cd.name.clone()));
+                    self.binders.push((p.name.clone(), lean_class_name(&cd.name)));
                     self.push_class_state_facts(cd, &p.name);
                     self.push_invariant_hyps(cd, &p.name);
                     self.env
@@ -615,7 +618,7 @@ impl<'a> Generator<'a> {
             // `result → P` splice with no coercion noise.
             Ty::Bool => "Prop".into(),
             // A returned class value is its structure (ADR 0010).
-            Ty::Class(ci) => self.classes[ci].name.clone(),
+            Ty::Class(ci) => lean_class_name(&self.classes[ci].name),
             _ => "Int".into(),
         }
     }
@@ -922,7 +925,7 @@ impl<'a> Generator<'a> {
                         Ty::Bool => Some((name.clone(), "Bool".to_string())),
                         Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
                         Ty::Class(ci) | Ty::ClassRef(ci) => {
-                            Some((name.clone(), self.classes[*ci].name.clone()))
+                            Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
                         }
                         Ty::Option(_) | Ty::Unit => None,
                     }));
@@ -933,10 +936,10 @@ impl<'a> Generator<'a> {
                     scope_binders.push((entry.clone(), "Sable.Seq Int".to_string()));
                 }
                 match self.cctx {
-                    Cctx::Init(c) => scope_binders.push(("self".to_string(), c.name.clone())),
+                    Cctx::Init(c) => scope_binders.push(("self".to_string(), lean_class_name(&c.name))),
                     Cctx::Method(c, _) => {
-                        scope_binders.push(("self".to_string(), c.name.clone()));
-                        scope_binders.push(("_old_self".to_string(), c.name.clone()));
+                        scope_binders.push(("self".to_string(), lean_class_name(&c.name)));
+                        scope_binders.push(("_old_self".to_string(), lean_class_name(&c.name)));
                     }
                     Cctx::None => {}
                 }
@@ -1068,8 +1071,8 @@ impl<'a> Generator<'a> {
         // havocked name with no binder to rename (body-local decls) are
         // dropped as before.
         // Sorted iteration: fresh-number assignment must not depend on
-        // hash order — the M8 CI failure was local-vs-CI divergence in
-        // positional binder numbering.
+        // hash order (it would diverge between machines in positional
+        // binder numbering).
         let mut havoc_names: Vec<&String> = havoc_set.iter().collect();
         havoc_names.sort();
         let mut stale_map: HashMap<String, String> = HashMap::new();
@@ -1126,9 +1129,58 @@ impl<'a> Generator<'a> {
             if name == "self" {
                 if let Cctx::Method(class, _) = self.cctx {
                     let b = self.hinted_sym("_self", Some("_self_loop".to_string()));
-                    self.binders.push((b.clone(), class.name.clone()));
+                    self.binders.push((b.clone(), lean_class_name(&class.name)));
                     self.push_class_state_facts(class, &b);
                     self.env.insert("self".to_string(), Val::Obj(b));
+                    continue;
+                }
+                if let Cctx::Init(class) = self.cctx {
+                    // Init loops mutate fields through `self.<field>` env
+                    // entries (there is no whole-object state yet): version
+                    // each mutated field individually — stores preserve
+                    // length and element ranges, mirroring the owned-array
+                    // treatment. Leaving the chains in place would let the
+                    // pre-loop field value survive the loop (same class of
+                    // bug as must-fail/owned_loop_stale).
+                    for fld in &class.fields {
+                        let key = format!("self.{}", fld.name);
+                        match (fld.ty, self.env.get(&key).cloned()) {
+                            (Ty::Array(elem, _), Some(Val::Arr(chain))) => {
+                                let prior = substitute(&chain, &stale_map, None);
+                                self.fresh += 1;
+                                let b = format!("_self{}_{}", self.fresh, fld.name);
+                                self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                                if !havoc_set.iter().any(|h| {
+                                    !stale_map.contains_key(h) && mentions(&prior, h)
+                                }) {
+                                    self.push_hyp_unique(
+                                        format!("h_self_{}_len", fld.name),
+                                        format!("({b}.len) = ({prior}.len)"),
+                                    );
+                                }
+                                self.push_hyp_unique(
+                                    format!("h_self_{}_elems", fld.name),
+                                    format!(
+                                        "∀ k, 0 ≤ k → k < {b}.len → {} ≤ {b}.get k ∧ {b}.get k ≤ {}",
+                                        self.t_min(elem),
+                                        self.t_max(elem)
+                                    ),
+                                );
+                                self.env.insert(key, Val::Arr(b));
+                            }
+                            (Ty::Int(it), Some(Val::Int(_))) => {
+                                self.fresh += 1;
+                                let b = format!("_self{}_{}", self.fresh, fld.name);
+                                self.binders.push((b.clone(), "Int".into()));
+                                self.push_hyp_unique(
+                                    format!("h_self_{}_range", fld.name),
+                                    self.r_prop(&b, it),
+                                );
+                                self.env.insert(key, Val::Int(b));
+                            }
+                            _ => {}
+                        }
+                    }
                     continue;
                 }
             }
@@ -1154,7 +1206,7 @@ impl<'a> Generator<'a> {
                     // state; the invariant held at each method exit, so it
                     // is sound to assume at the havoc point.
                     let cd = &self.classes[*ci];
-                    self.binders.push((name.clone(), cd.name.clone()));
+                    self.binders.push((name.clone(), lean_class_name(&cd.name)));
                     self.push_class_state_facts(cd, name);
                     self.push_invariant_hyps(cd, name);
                     self.env.insert(name.clone(), Val::Obj(name.clone()));
@@ -1435,13 +1487,14 @@ impl<'a> Generator<'a> {
                 class, init, args, ..
             } => {
                 let hint = self.name_hint.take();
+                // Int args and `&[T]` borrows (shared only — no havoc to
+                // apply): the seq chain substitutes for the param name in
+                // the init's pres/posts exactly like fn-call array args.
                 let arg_vals: Vec<String> = args
                     .iter()
-                    .map(|a| {
-                        let Val::Int(v) = self.eval(a) else {
-                            unreachable!("checked: int args")
-                        };
-                        v
+                    .map(|a| match self.eval(a) {
+                        Val::Int(v) | Val::Arr(v) => v,
+                        _ => unreachable!("checked: int/shared-array ctor args"),
                     })
                     .collect();
                 let cd: &ClassDecl = self.class_map[class.as_str()];
@@ -1478,7 +1531,7 @@ impl<'a> Generator<'a> {
                 // Fresh post-construction state: the class invariant holds
                 // (proved at every init exit) and the init's posts describe it.
                 let b = self.hinted_sym("_obj", hint);
-                self.binders.push((b.clone(), cd.name.clone()));
+                self.binders.push((b.clone(), lean_class_name(&cd.name)));
                 self.push_class_state_facts(cd, &b);
                 self.push_invariant_hyps(cd, &b);
                 let mut post_map = self.class_state_map(cd, &b);
@@ -1628,7 +1681,7 @@ impl<'a> Generator<'a> {
                     // Post-call state named after the receiver (`m_2`,
                     // `m_3`, ...) — stable and readable in discharges.
                     let b = self.hinted_sym("_obj", Some(recv.clone()));
-                    self.binders.push((b.clone(), cd.name.clone()));
+                    self.binders.push((b.clone(), lean_class_name(&cd.name)));
                     self.push_class_state_facts(cd, &b);
                     self.push_invariant_hyps(cd, &b);
                     self.env.insert(recv.clone(), Val::Obj(b.clone()));
@@ -1951,7 +2004,7 @@ impl<'a> Generator<'a> {
                         // and the invariant (the callee proved ret_inv;
                         // ADR 0010).
                         let cd = &self.classes[ci];
-                        self.binders.push((ret_sym.clone(), cd.name.clone()));
+                        self.binders.push((ret_sym.clone(), lean_class_name(&cd.name)));
                         self.push_class_state_facts(cd, &ret_sym);
                         self.push_invariant_hyps(cd, &ret_sym);
                     }
@@ -2147,7 +2200,7 @@ impl<'a> Generator<'a> {
                 Ty::Int(_) => out.push((p.name.clone(), "Int".into())),
                 Ty::Bool => out.push((p.name.clone(), "Bool".into())),
                 Ty::ClassRef(ci) => {
-                    out.push((p.name.clone(), self.classes[ci].name.clone()))
+                    out.push((p.name.clone(), lean_class_name(&self.classes[ci].name)))
                 }
                 Ty::Array(..) => {
                     out.push((p.name.clone(), "Sable.Seq Int".into()));
@@ -2159,10 +2212,10 @@ impl<'a> Generator<'a> {
             }
         }
         match self.cctx {
-            Cctx::Init(c) => out.push(("self".to_string(), c.name.clone())),
+            Cctx::Init(c) => out.push(("self".to_string(), lean_class_name(&c.name))),
             Cctx::Method(c, _) => {
-                out.push(("self".to_string(), c.name.clone()));
-                out.push(("_old_self".to_string(), c.name.clone()));
+                out.push(("self".to_string(), lean_class_name(&c.name)));
+                out.push(("_old_self".to_string(), lean_class_name(&c.name)));
             }
             Cctx::None => {}
         }
@@ -2491,8 +2544,39 @@ pub fn substitute(text: &str, map: &HashMap<String, String>, result: Option<&str
             {
                 i += 1;
             }
-            let word = &text[start..i];
             let after_dot = prev == Some(b'.');
+            // Dotted keys: init contexts track fields as `self.limbs`
+            // env entries, and clauses write `self.limbs.get k` — match
+            // the longest dotted name present in the map so the field
+            // path substitutes as a unit (atoms then align with the
+            // tracked chain, not an unreduced record projection).
+            let mut key_end = i;
+            if !after_dot {
+                let mut j = i;
+                while j < bytes.len()
+                    && bytes[j] == b'.'
+                    && j + 1 < bytes.len()
+                    && (bytes[j + 1].is_ascii_alphabetic() || bytes[j + 1] == b'_')
+                {
+                    let mut k2 = j + 1;
+                    while k2 < bytes.len()
+                        && (bytes[k2].is_ascii_alphanumeric()
+                            || bytes[k2] == b'_'
+                            || bytes[k2] == b'\'')
+                    {
+                        k2 += 1;
+                    }
+                    if map.contains_key(&text[start..k2]) {
+                        key_end = k2;
+                    }
+                    j = k2;
+                }
+            }
+            let word = if key_end > i {
+                &text[start..key_end]
+            } else {
+                &text[start..i]
+            };
             let replacement = if after_dot {
                 None
             } else if word == "result" {
@@ -2501,8 +2585,11 @@ pub fn substitute(text: &str, map: &HashMap<String, String>, result: Option<&str
                 map.get(word).cloned()
             };
             match replacement {
-                Some(r) => out.extend_from_slice(format!("({r})").as_bytes()),
-                None => out.extend_from_slice(word.as_bytes()),
+                Some(r) => {
+                    out.extend_from_slice(format!("({r})").as_bytes());
+                    i = key_end.max(i);
+                }
+                None => out.extend_from_slice(&bytes[start..i]),
             }
             prev = Some(bytes[i - 1]);
             continue;
@@ -2536,6 +2623,16 @@ fn preprocess_old_params(text: &str, params: &[Param]) -> String {
 /// `{ X with f := v }.g` — the projection our chains force omega and
 /// simp to chew through unless we reduce it here: `v` when `f = g`,
 /// `X.g` (recursively) otherwise. Keeps VC goals over stable atoms.
+/// The Lean name of a class's structure. Mangled with a fixed prefix so
+/// user class names can never collide with Lean root-namespace names
+/// (`class Nat` vs core `Nat`). Clauses
+/// never name the class, only values, so the verbatim-splice invariant
+/// is untouched; the prefix shows up only in compiler-built binder types
+/// and `.mk` literals.
+pub fn lean_class_name(name: &str) -> String {
+    format!("SableC_{name}")
+}
+
 fn project_field(state: &str, field: &str) -> String {
     let mut cur = state.trim();
     loop {

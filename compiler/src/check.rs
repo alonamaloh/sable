@@ -1,4 +1,4 @@
-//! Typechecking for the M1 subset: exact-width integer types with no
+//! Typechecking: exact-width integer types with no
 //! implicit conversions (only explicit `widen`), array/option restrictions,
 //! definite initialization, all-paths-return, loop variants required, and
 //! recursion allowed only for self-calls with a declared measure.
@@ -44,7 +44,7 @@ struct Ctx<'a> {
     /// allowed owned arrays / borrows / array-passing (design §9).
     in_test: bool,
     vars: HashMap<String, VarInfo>,
-    /// M1 rule: locals and parameters have pairwise-distinct names
+    /// Locals and parameters have pairwise-distinct names
     /// (keeps path-splitting and havoc in the VC generator scope-free).
     declared: HashSet<String>,
     /// Non-self callees (for mutual-recursion detection).
@@ -54,7 +54,7 @@ struct Ctx<'a> {
     /// Inside an `init`: fields start uninitialized, `return` forbidden.
     in_init: bool,
     class_metas: &'a [ClassMeta],
-    /// Template context (ADR 0009 slice 3): bounded type parameter →
+    /// Template context (ADR 0009): bounded type parameter →
     /// (trait name, parameter index).
     tbounds: HashMap<String, (String, u8)>,
     traits: &'a [TraitDecl],
@@ -106,7 +106,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 name: "type.array_return".into(),
                 title: format!("function `{}` returns an array", f.name),
                 span: f.name_span,
-                label: "arrays are parameters only in M1".into(),
+                label: "arrays are parameters only for now".into(),
                 notes: vec![],
             });
         }
@@ -147,11 +147,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 }
                 fields.push((fld.name.clone(), fld.ty));
             }
-            let scalar_params = |params: &[Param]| -> CResult<()> {
+            let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
                 for p in params {
-                    if !matches!(p.ty, Ty::Int(_)) {
+                    let ok = matches!(p.ty, Ty::Int(_))
+                        || (allow_shared_arrays
+                            && matches!(p.ty, Ty::Array(_, Mutability::Shared)));
+                    if !ok {
                         return Err(Diagnostic {
-                            name: "type.m5_member_param".into(),
+                            name: "type.member_param".into(),
                             title: "init/method parameters must be integers for now".into(),
                             span: p.span,
                             label: format!("this has type `{}`", p.ty.name()),
@@ -163,18 +166,20 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             };
             let mut inits = Vec::new();
             for i in &c.inits {
-                scalar_params(&i.params)?;
+                // Inits additionally take `&[T]` (the bignum from_prefix
+                // shape: build a class value from computed limbs).
+                scalar_params(&i.params, true)?;
                 inits.push((i.name.clone(), i.params.clone()));
             }
             let mut methods = Vec::new();
             for m in &c.methods {
-                scalar_params(&m.f.params)?;
+                scalar_params(&m.f.params, false)?;
                 methods.push((m.f.name.clone(), m.f.params.clone(), m.f.ret, m.self_kind));
             }
             if let Some(d) = &c.deinit {
                 if !d.is_empty() {
                     return Err(Diagnostic {
-                        name: "type.m5_deinit_body".into(),
+                        name: "type.deinit_body".into(),
                         title: "`deinit` bodies must be empty for now".into(),
                         span: c.name_span,
                         label: "owned fields are freed automatically".into(),
@@ -240,10 +245,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             }
             if matches!(p.ty, Ty::Option(_)) {
                 return Err(Diagnostic {
-                    name: "type.m1_option_param".into(),
+                    name: "type.option_param".into(),
                     title: "option-typed parameters are not supported yet".into(),
                     span: p.span,
-                    label: "`option<T>` is a return type in M1".into(),
+                    label: "`option<T>` is a return type for now".into(),
                     notes: vec![],
                 });
             }
@@ -423,10 +428,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         }
     }
 
-    // Class templates (ADR 0009 slice 2): members typecheck against the
+    // Class templates (ADR 0009): members typecheck against the
     // abstract model; TParam flows as an ordinary integer type. Template
     // bodies may not reference other classes (their metas are not in
-    // scope here) — a slice-2 gate, diagnosed as unknown names.
+    // scope here) — diagnosed as unknown names.
     let mut ctemplates = std::mem::take(&mut program.class_templates);
     {
         let mut tmetas: Vec<ClassMeta> = Vec::new();
@@ -607,7 +612,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         label: "already declared in this function".into(),
                         notes: vec![(
                             "note".into(),
-                            "M1 requires all locals in a function to have distinct names".into(),
+                            "all locals in a function must have distinct names".into(),
                         )],
                     });
                 }
@@ -620,7 +625,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         name: "type.owned_array_outside_test".into(),
                         title: "owned arrays exist only in test functions for now".into(),
                         span: *name_span,
-                        label: "allocation design is a scheduled deliverable (goals doc, Tier 2)"
+                        label: "allocation design is a scheduled deliverable (see the goals doc)"
                             .into(),
                         notes: vec![],
                     });
@@ -667,7 +672,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         name: "type.array_assign".into(),
                         title: format!("cannot assign to array `{name}`"),
                         span: *name_span,
-                        label: "borrowed arrays are read-only in M1".into(),
+                        label: "arrays cannot be rebound; element stores use `a[i] = v`".into(),
                         notes: vec![],
                     });
                 }
@@ -1025,8 +1030,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
                 if matches!(v.ty, Ty::Class(_)) {
-                    // The one class-value position slice A allows: moving
-                    // a local out through `return` (ADR 0010).
+                    // The one class-value position allowed: moving a
+                    // local out through `return` (ADR 0010).
                     if matches!(expected, Some(Ty::Class(_))) {
                         return Ok(v.ty);
                     }
@@ -1042,10 +1047,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 if matches!(v.ty, Ty::Array(..)) {
                     return Err(Diagnostic {
-                        name: "type.m1_array_value".into(),
+                        name: "type.array_value".into(),
                         title: format!("array `{name}` used as a value"),
                         span,
-                        label: "arrays support only `a[i]` and `a.len` in M1".into(),
+                        label: "arrays support only `a[i]` and `a.len` here".into(),
                         notes: vec![],
                     });
                 }
@@ -1131,7 +1136,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     title: "`widen`/`narrow` on a type parameter".into(),
                     span,
                     label: "conversions involving type parameters are not yet \
-                            supported in templates (ADR 0009 slice 1)"
+                            supported in templates (ADR 0009)"
                         .into(),
                     notes: vec![],
                 });
@@ -1448,7 +1453,37 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
             for (arg, p) in args.iter_mut().zip(&params) {
-                check_expr(ctx, arg, Some(p.ty))?;
+                match p.ty {
+                    Ty::Array(elem, m) => {
+                        if !matches!(arg.kind, ExprKind::Borrow { .. }) {
+                            return Err(Diagnostic {
+                                name: "type.array_arg_borrow".into(),
+                                title: "array arguments are passed by explicit borrow".into(),
+                                span: arg.span,
+                                label: format!(
+                                    "write `{}name`",
+                                    if m == Mutability::Mut { "&mut " } else { "&" }
+                                ),
+                                notes: vec![],
+                            });
+                        }
+                        let got = check_expr(ctx, arg, None)?;
+                        if got != Ty::Array(elem, m) {
+                            return Err(Diagnostic {
+                                name: "type.mismatch".into(),
+                                title: format!(
+                                    "expected `{}`, found `{}`",
+                                    Ty::Array(elem, m).name(),
+                                    got.name()
+                                ),
+                                span: arg.span,
+                                label: "borrow with the required mutability".into(),
+                                notes: vec![],
+                            });
+                        }
+                    }
+                    _ => check_expr(ctx, arg, Some(p.ty)).map(|_| ())?,
+                }
             }
             ctx.calls.push(format!("{class}::{init}"));
             Ty::Class(ci)
@@ -1527,7 +1562,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         name: "type.owned_array_outside_test".into(),
                         title: "array literals exist only in test functions for now".into(),
                         span,
-                        label: "see docs/PLAN.md (M3)".into(),
+                        label: "see docs/PLAN.md".into(),
                         notes: vec![],
                     });
                 }
@@ -1554,7 +1589,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         name: "class.mut_borrow_deferred".into(),
                         title: "`&mut` class borrows are not supported yet".into(),
                         span,
-                        label: "ADR 0010 slice A: shared borrows only".into(),
+                        label: "shared borrows only (ADR 0010)".into(),
                         notes: vec![],
                     });
                 }
@@ -1590,7 +1625,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             _ => {
                 return Err(Diagnostic {
-                    name: "type.m1_option_position".into(),
+                    name: "type.option_position".into(),
                     title: "`some(...)` outside an option-returning position".into(),
                     span,
                     label: "options are created only where an `option<T>` is expected".into(),
@@ -1602,7 +1637,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             Some(Ty::Option(t)) => Ty::Option(t),
             _ => {
                 return Err(Diagnostic {
-                    name: "type.m1_option_position".into(),
+                    name: "type.option_position".into(),
                     title: "`none` outside an option-returning position".into(),
                     span,
                     label: "options are created only where an `option<T>` is expected".into(),
@@ -1659,7 +1694,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span: op_span,
                         label: "`/`/`%` on `T`-typed values needs signedness \
                                 knowledge; not yet supported in templates \
-                                (ADR 0009 slice 1)"
+                                (ADR 0009)"
                             .into(),
                         notes: vec![],
                     });
@@ -1738,7 +1773,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 match pty {
                     Ty::Bool => {
                         return Err(Diagnostic {
-                            name: "type.m0_bool_arg".into(),
+                            name: "type.bool_arg".into(),
                             title: "bool-typed call arguments are not supported yet".into(),
                             span: arg.span,
                             label: "bool argument".into(),

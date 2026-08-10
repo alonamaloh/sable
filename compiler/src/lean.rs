@@ -64,7 +64,10 @@ pub fn emit(
 
     for c in &vc.classes {
         let first = e.line + 1;
-        e.push(&format!("structure {} where", c.name));
+        e.push(&format!(
+            "structure {} where",
+            crate::vcgen::lean_class_name(&c.name)
+        ));
         for (fname, fty) in &c.fields {
             e.push(&format!("  {fname} : {fty}"));
         }
@@ -316,7 +319,7 @@ pub fn diagnose(emitted: &Emitted, vc: &VcResult, messages: &[LeanMessage]) -> V
                 notes.push((
                     "automation".into(),
                     "`sable_auto` could not discharge this obligation \
-                     (`discharge` blocks land in M1)"
+                     (prove it with a `discharge <obligation> by <tactics>` block)"
                         .into(),
                 ));
                 notes.push(("lean".into(), msg.data.clone()));

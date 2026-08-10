@@ -1,0 +1,20 @@
+// expect-error: type.array_arg_borrow
+// An `&[T]` init parameter takes its argument by explicit borrow, same
+// rule as fn calls — passing the array name bare is diagnosed.
+
+class Holder {
+    [u32] limbs;
+
+    /// pre n ≤ xs.len
+    init from_prefix(&[u32] xs, u64 n) {
+        self.limbs = alloc_array<u32>(n, 0);
+    }
+
+    deinit {
+    }
+}
+
+fn test_bad() {
+    [u32] a = alloc_array<u32>(3, 1);
+    var h = Holder::from_prefix(a, 2);
+}
