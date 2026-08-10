@@ -658,6 +658,9 @@ impl<'a> Interp<'a> {
                     }),
                 }
             }
+            ExprKind::TraitCall { .. } => {
+                unreachable!("trait calls exist only in templates, never executed")
+            }
             ExprKind::Widen { arg, .. } => self.eval(arg, frame),
             ExprKind::Narrow { target, arg } => {
                 let v = self.eval_int(arg, frame)?;

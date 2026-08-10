@@ -84,6 +84,11 @@ enum Cctx<'a> {
 
 pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) -> VcResult {
     let fn_map: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
+    let trait_map: HashMap<&str, &TraitDecl> = program
+        .traits
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
     let class_map: HashMap<&str, &ClassDecl> = program
         .classes
         .iter()
@@ -128,11 +133,17 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             .map(|f| (f.name.clone(), lean_field_ty(f.ty)))
             .collect();
         for (i, inv) in c.invariants.iter().enumerate() {
-            let mut wf_binders: Vec<(String, String)> = c
-                .type_params
-                .iter()
-                .map(|t| (t.clone(), "Sable.IntModel".to_string()))
-                .collect();
+            let mut wf_binders: Vec<(String, String)> = Vec::new();
+            for (ti, t) in c.type_params.iter().enumerate() {
+                wf_binders.push((t.clone(), "Sable.IntModel".to_string()));
+                if let Some(Some(b)) = c.type_bounds.get(ti) {
+                    if let Some(tr) = trait_map.get(b.as_str()) {
+                        for sp in &tr.specs {
+                            wf_binders.push((format!("{t}_{}", sp.name), sp.sig.clone()));
+                        }
+                    }
+                }
+            }
             wf_binders.extend(binders.clone());
             result.clause_wfs.push(ClauseWf {
                 def_name: format!("wf_{}_invariant_{}", sanitize(&c.name), i + 1),
@@ -163,6 +174,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             mut_arrays: HashMap::new(),
             fresh: 0,
             tparams: Vec::new(),
+            trait_ctx: HashMap::new(),
             name_hint: None,
             name_counts: HashMap::new(),
             out: result,
@@ -220,16 +232,27 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             mut_arrays: HashMap::new(),
             fresh: 0,
             tparams: f.type_params.clone(),
+            trait_ctx: HashMap::new(),
             name_hint: None,
             name_counts: HashMap::new(),
             out: &mut result,
         };
-        for t in &f.type_params {
+        for (i, t) in f.type_params.iter().enumerate() {
             generator.binders.push((t.clone(), "Sable.IntModel".into()));
             generator
                 .hyps
                 .push((format!("h_{t}_wf"), format!("{t}.wf")));
             generator.context.push(format!("type parameter {t}"));
+            if let Some(Some(b)) = f.type_bounds.get(i) {
+                let tr = trait_map[b.as_str()];
+                for sp in &tr.specs {
+                    generator
+                        .binders
+                        .push((format!("{t}_{}", sp.name), sp.sig.clone()));
+                }
+                generator.trait_ctx.insert(t.clone(), tr);
+                generator.context.push(format!("bound {t}: {b}"));
+            }
         }
         for req in &f.requires {
             generator
@@ -274,16 +297,27 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 mut_arrays: HashMap::new(),
                 fresh: 0,
                 tparams: c.type_params.clone(),
+                trait_ctx: HashMap::new(),
                 name_hint: None,
                 name_counts: HashMap::new(),
                 out: &mut result,
             };
-            for t in &c.type_params {
+            for (i, t) in c.type_params.iter().enumerate() {
                 generator.binders.push((t.clone(), "Sable.IntModel".into()));
                 generator
                     .hyps
                     .push((format!("h_{t}_wf"), format!("{t}.wf")));
                 generator.context.push(format!("type parameter {t}"));
+                if let Some(Some(b)) = c.type_bounds.get(i) {
+                    let tr = trait_map[b.as_str()];
+                    for sp in &tr.specs {
+                        generator
+                            .binders
+                            .push((format!("{t}_{}", sp.name), sp.sig.clone()));
+                    }
+                    generator.trait_ctx.insert(t.clone(), tr);
+                    generator.context.push(format!("bound {t}: {b}"));
+                }
             }
             generator.run();
         }
@@ -358,6 +392,9 @@ struct Generator<'a> {
     /// Template mode (ADR 0009): the type-parameter names; `TParam(i)`
     /// ranges render through `tparams[i]` as an `IntModel`.
     tparams: Vec<String>,
+    /// Template mode, slice 3: bounded parameter → its trait (for
+    /// modeling `K::m(...)` calls against the trait's contracts).
+    trait_ctx: HashMap<String, &'a TraitDecl>,
     /// Source-name hint for the next call/alloc/ctor result binder:
     /// `u64 p = probe_step(...)` binds `p`, not `_r16`, so discharge
     /// scripts survive unrelated edits (same motivation as
@@ -617,6 +654,7 @@ impl<'a> Generator<'a> {
                         ExprKind::Call { .. }
                             | ExprKind::MethodCall { .. }
                             | ExprKind::CtorCall { .. }
+                            | ExprKind::TraitCall { .. }
                             | ExprKind::AllocArray { .. }
                     ) {
                         self.name_hint = Some(name.clone());
@@ -635,6 +673,7 @@ impl<'a> Generator<'a> {
                     ExprKind::Call { .. }
                         | ExprKind::MethodCall { .. }
                         | ExprKind::CtorCall { .. }
+                        | ExprKind::TraitCall { .. }
                         | ExprKind::AllocArray { .. }
                 ) {
                     self.name_hint = Some(name.clone());
@@ -673,6 +712,7 @@ impl<'a> Generator<'a> {
                     ExprKind::Call { .. }
                         | ExprKind::MethodCall { .. }
                         | ExprKind::CtorCall { .. }
+                        | ExprKind::TraitCall { .. }
                         | ExprKind::AllocArray { .. }
                 ) {
                     self.name_hint = Some(name.clone());
@@ -825,7 +865,17 @@ impl<'a> Generator<'a> {
 
                 // Well-formedness defs so clause elaboration errors map to
                 // the clause span. Binders: everything in scope.
-                let mut scope_binders: Vec<(String, String)> = self
+                let mut scope_binders: Vec<(String, String)> = Vec::new();
+                for t in &self.tparams {
+                    scope_binders.push((t.clone(), "Sable.IntModel".to_string()));
+                    if let Some(tr) = self.trait_ctx.get(t.as_str()) {
+                        for sp in &tr.specs {
+                            scope_binders
+                                .push((format!("{t}_{}", sp.name), sp.sig.clone()));
+                        }
+                    }
+                }
+                scope_binders.extend(self
                     .var_tys
                     .iter()
                     .filter_map(|(name, ty)| match ty {
@@ -836,8 +886,7 @@ impl<'a> Generator<'a> {
                             Some((name.clone(), self.classes[*ci].name.clone()))
                         }
                         Ty::Option(_) | Ty::Unit => None,
-                    })
-                    .collect();
+                    }));
                 for (name, entry) in self.mut_arrays.iter() {
                     if name == "self" {
                         continue; // handled below with the class type
@@ -1372,6 +1421,82 @@ impl<'a> Generator<'a> {
                 }
                 Val::Obj(b)
             }
+            ExprKind::TraitCall {
+                param, method, args, ..
+            } => {
+                let hint = self.name_hint.take();
+                let arg_vals: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        let Val::Int(v) = self.eval(a) else {
+                            unreachable!("checked: int args")
+                        };
+                        v
+                    })
+                    .collect();
+                let tr = self.trait_ctx[param.as_str()];
+                let m = tr
+                    .methods
+                    .iter()
+                    .find(|mm| mm.name == *method)
+                    .expect("checked: trait method exists");
+                // Substitution: trait-method params → arguments;
+                // `Self::spec` → the abstract binder; `Self` → the model.
+                let mut qual: HashMap<String, String> = HashMap::new();
+                for sp in &tr.specs {
+                    qual.insert(
+                        format!("Self::{}", sp.name),
+                        format!("{param}_{}", sp.name),
+                    );
+                }
+                qual.insert("Self".to_string(), param.clone());
+                let mut argmap: HashMap<String, String> = HashMap::new();
+                for (p, v) in m.params.iter().zip(&arg_vals) {
+                    argmap.insert(p.name.clone(), v.clone());
+                }
+                for pre in &m.pres {
+                    let text = crate::mono::subst_clause_text(&pre.text, &qual);
+                    let goal = substitute(&text, &argmap, None);
+                    let ob = self.obligation(
+                        &format!(
+                            "{}.call_pre.{param}_{method}.{}",
+                            self.fname,
+                            cslug(pre)
+                        ),
+                        format!("`pre {}` of `{param}::{method}` must hold", pre.text),
+                        e.span,
+                        goal,
+                    );
+                    self.push_obligation(ob);
+                }
+                let ret_sym = self.hinted_sym("_r", hint);
+                match m.ret {
+                    Ty::Int(it) => {
+                        self.binders.push((ret_sym.clone(), "Int".into()));
+                        let range = if let IntTy::TParam(0) = it {
+                            format!("{param}.min ≤ {ret_sym} ∧ {ret_sym} ≤ {param}.max")
+                        } else {
+                            self.r_prop(&ret_sym, it)
+                        };
+                        self.hyps.push((
+                            format!("h_{}_range", ret_sym.trim_start_matches('_')),
+                            range,
+                        ));
+                    }
+                    _ => unreachable!("trait methods return integers for now"),
+                }
+                for post in &m.posts {
+                    let text = crate::mono::subst_clause_text(&post.text, &qual);
+                    let prop = substitute(&text, &argmap, Some(&ret_sym));
+                    self.push_hyp_unique(
+                        format!("h_{param}_{method}_post_{}", chslug(post)),
+                        format!("({prop})"),
+                    );
+                    self.context
+                        .push(format!("from `{param}::{method}` post: {}", post.text));
+                }
+                Val::Int(ret_sym)
+            }
             ExprKind::MethodCall {
                 recv, method, args, ..
             } => {
@@ -1893,9 +2018,15 @@ impl<'a> Generator<'a> {
     /// `_old_` twin for &mut arrays, so `old a` elaborates).
     fn wf_binders(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        // Template clauses reference `T.min`/`T.max` (ADR 0009).
+        // Template clauses reference `T.min`/`T.max` — and, for
+        // bounded parameters, the abstract spec functions (ADR 0009).
         for t in &self.tparams {
             out.push((t.clone(), "Sable.IntModel".into()));
+            if let Some(tr) = self.trait_ctx.get(t.as_str()) {
+                for sp in &tr.specs {
+                    out.push((format!("{t}_{}", sp.name), sp.sig.clone()));
+                }
+            }
         }
         for p in &self.f.params {
             match p.ty {
@@ -2153,6 +2284,11 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
         | ExprKind::Narrow { arg: operand, .. }
         | ExprKind::IsSome { operand }
         | ExprKind::OptValue { operand } => collect_mut_borrows(operand, out),
+        ExprKind::TraitCall { args, .. } => {
+            for a in args {
+                collect_mut_borrows(a, out);
+            }
+        }
         ExprKind::SomeE(inner) => collect_mut_borrows(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_mut_borrows(lhs, out);

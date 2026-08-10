@@ -291,7 +291,7 @@ fn demo() {
 
 // -------------------------------------------------------- get
 
-/// discharge HashMap_i32_u64::get.inv_preserved.j2_0_j2_j2_j_self_occ_get_probe_h_j2_cap by
+/// discharge HashMap::get.inv_preserved.j2_0_j2_j2_j_self_occ_get_probe_h_j2_cap by
 ///   intro j2 hj20 hj2
 ///   by_cases hjj : j2 = j
 ///   · subst hjj
@@ -301,28 +301,28 @@ fn demo() {
 ///     omega
 ///   · exact h_inv_j2_0_j2_j2_j_self_occ_ge j2 hj20 (by omega)
 
-/// discharge HashMap_i32_u64::get.post.match_result_with_some_v_i_0_i_i_self_oc by
+/// discharge HashMap::get.post.match_result_with_some_v_i_0_i_i_self_oc by
 ///   subst h_result
-///   have hbnd : ∀ x, 0 ≤ Hashable_i32_hash_spec x % ((_old_self.occ).len) ∧ Hashable_i32_hash_spec x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
+///   have hbnd : ∀ x, 0 ≤ K_hash x % ((_old_self.occ).len) ∧ K_hash x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
 ///     intro x
 ///     exact ⟨Int.emod_nonneg _ (by omega), Int.emod_lt_of_pos _ (by omega)⟩
 ///   have hloop := h_inv_j2_0_j2_j2_j_self_occ_ge
-///   rw [h_Hashable_i32_hash_post_result_hashable_i32_hash] at hloop
-///   have hemp : (_old_self.occ).get (probe (Hashable_i32_hash_spec k % ((_old_self.occ).len)) j ((_old_self.occ).len)) ≠ 1 := by
-///     rw [← h_Hashable_i32_hash_post_result_hashable_i32_hash, ← h_probe_step_post_result_probe_h_j_cap]
+///   rw [h_K_hash_post_result_self_hash_x] at hloop
+///   have hemp : (_old_self.occ).get (probe (K_hash k % ((_old_self.occ).len)) j ((_old_self.occ).len)) ≠ 1 := by
+///     rw [← h_K_hash_post_result_self_hash_x, ← h_probe_step_post_result_probe_h_j_cap]
 ///     omega
 ///   exact hash_absent ((_old_self.occ).len) (_old_self.occ) (_old_self.keys)
-///     (fun x => Hashable_i32_hash_spec x % ((_old_self.occ).len)) k j
+///     (fun x => K_hash x % ((_old_self.occ).len)) k j
 ///     hbnd h_cinv_i_0_i_i_occ_len_occ_get_2 hloop h_j_range.1 h_path_j_old_self_occ_len hemp
 
-/// discharge HashMap_i32_u64::get.post.match_result_with_some_v_i_0_i_i_self_oc.2 by
+/// discharge HashMap::get.post.match_result_with_some_v_i_0_i_i_self_oc.2 by
 ///   subst h_result
 ///   refine ⟨p, h_fact_0_p_p_old_self_occ_len.1, h_fact_0_p_p_old_self_occ_len.2, ?_, ?_, rfl⟩
 ///   · have h01 := h_cinv_i_0_i_i_occ_len_occ_get p h_fact_0_p_p_old_self_occ_len.1 h_fact_0_p_p_old_self_occ_len.2
 ///     omega
 ///   · exact h_path_old_self_keys_get_p_k
 
-/// discharge HashMap_i32_u64::get.post.match_result_with_some_v_i_0_i_i_self_oc.3 by
+/// discharge HashMap::get.post.match_result_with_some_v_i_0_i_i_self_oc.3 by
 ///   subst h_result
 ///   intro i hi0 hic hocc
 ///   have hdb := dist_bounds ((hv % ((_old_self.occ).len))) i ((_old_self.occ).len) h_inv_0_h_h_cap.1 h_inv_0_h_h_cap.2 hi0 hic
@@ -333,7 +333,7 @@ fn demo() {
 
 // -------------------------------------------------------- insert
 
-/// discharge HashMap_i32_u64::insert.inv_preserved.j2_0_j2_j2_j_self_occ_get_probe_h_j2_cap by
+/// discharge HashMap::insert.inv_preserved.j2_0_j2_j2_j_self_occ_get_probe_h_j2_cap by
 ///   intro j2 hj20 hj2
 ///   by_cases hjj : j2 = j
 ///   · subst hjj
@@ -343,31 +343,31 @@ fn demo() {
 ///     omega
 ///   · exact h_inv_j2_0_j2_j2_j_self_occ_ge j2 hj20 (by omega)
 
-/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_keys_len by
+/// discharge HashMap::insert.inv_exit.occ_len_keys_len by
 ///   simp only [Sable.Seq.len_set]
 ///   omega
 
-/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_vals_len by
+/// discharge HashMap::insert.inv_exit.occ_len_vals_len by
 ///   simp only [Sable.Seq.len_set]
 ///   omega
 
-/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_vals_len.2 by
+/// discharge HashMap::insert.inv_exit.occ_len_vals_len.2 by
 ///   simp only [Sable.Seq.len_set]
 ///   omega
 
-/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_0 by
+/// discharge HashMap::insert.inv_exit.occ_len_0 by
 ///   simp only [Sable.Seq.len_set]
 ///   omega
 
-/// discharge HashMap_i32_u64::insert.inv_exit.occ_len_4611686018427387904 by
+/// discharge HashMap::insert.inv_exit.occ_len_4611686018427387904 by
 ///   simp only [Sable.Seq.len_set]
 ///   omega
 
-/// discharge HashMap_i32_u64::insert.inv_exit.len_occ_len by
+/// discharge HashMap::insert.inv_exit.len_occ_len by
 ///   simp only [Sable.Seq.len_set]
 ///   omega
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1 by
+/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1 by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
 ///   intro i hi0 hic
 ///   by_cases hip : i = p
@@ -377,67 +377,67 @@ fn demo() {
 ///   · rw [if_neg hip]
 ///     exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.2 by
+/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.2 by
 ///   intro i hi0 hic
 ///   exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.3 by
+/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.3 by
 ///   intro i hi0 hic
 ///   exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d by
-///   have hbnd : ∀ x, 0 ≤ Hashable_i32_hash_spec x % ((_old_self.occ).len) ∧ Hashable_i32_hash_spec x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
+/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d by
+///   have hbnd : ∀ x, 0 ≤ K_hash x % ((_old_self.occ).len) ∧ K_hash x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
 ///     intro x
 ///     exact ⟨Int.emod_nonneg _ (by omega), Int.emod_lt_of_pos _ (by omega)⟩
 ///   have hloop := h_inv_j2_0_j2_j2_j_self_occ_ge
-///   rw [h_Hashable_i32_hash_post_result_hashable_i32_hash] at hloop
-///   have hs : p = probe (Hashable_i32_hash_spec k % ((_old_self.occ).len)) j ((_old_self.occ).len) := by
-///     rw [← h_Hashable_i32_hash_post_result_hashable_i32_hash]
+///   rw [h_K_hash_post_result_self_hash_x] at hloop
+///   have hs : p = probe (K_hash k % ((_old_self.occ).len)) j ((_old_self.occ).len) := by
+///     rw [← h_K_hash_post_result_self_hash_x]
 ///     exact h_probe_step_post_result_probe_h_j_cap
 ///   have hemp : (_self_loop.occ).get p ≠ 1 := by omega
 ///   simp only [Sable.Seq.len_set]
 ///   rw [h_inv_self_occ_len_cap_self_ke.1]
 ///   exact hash_inv_preserved ((_old_self.occ).len) (_self_loop.occ) (_self_loop.keys)
-///     (fun x => Hashable_i32_hash_spec x % ((_old_self.occ).len)) p k j
+///     (fun x => K_hash x % ((_old_self.occ).len)) p k j
 ///     hbnd h_inv_i_0_i_i_cap_self_occ_get_3 hs h_j_range.1 h_path_j_old_self_occ_len hemp hloop
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d.2 by
+/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d.2 by
 ///   rw [h_inv_self_occ_len_cap_self_ke.1]
 ///   exact h_inv_i_0_i_i_cap_self_occ_get_3
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d.3 by
+/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_1_j2_0_j2_j2_d.3 by
 ///   rw [h_inv_self_occ_len_cap_self_ke.1]
 ///   exact h_inv_i_0_i_i_cap_self_occ_get_3
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc by
-///   have hbnd : ∀ x, 0 ≤ Hashable_i32_hash_spec x % ((_old_self.occ).len) ∧ Hashable_i32_hash_spec x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
+/// discharge HashMap::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc by
+///   have hbnd : ∀ x, 0 ≤ K_hash x % ((_old_self.occ).len) ∧ K_hash x % ((_old_self.occ).len) < ((_old_self.occ).len) := by
 ///     intro x
 ///     exact ⟨Int.emod_nonneg _ (by omega), Int.emod_lt_of_pos _ (by omega)⟩
 ///   have hloop := h_inv_j2_0_j2_j2_j_self_occ_ge
-///   rw [h_Hashable_i32_hash_post_result_hashable_i32_hash] at hloop
-///   have hs : p = probe (Hashable_i32_hash_spec k % ((_old_self.occ).len)) j ((_old_self.occ).len) := by
-///     rw [← h_Hashable_i32_hash_post_result_hashable_i32_hash]
+///   rw [h_K_hash_post_result_self_hash_x] at hloop
+///   have hs : p = probe (K_hash k % ((_old_self.occ).len)) j ((_old_self.occ).len) := by
+///     rw [← h_K_hash_post_result_self_hash_x]
 ///     exact h_probe_step_post_result_probe_h_j_cap
 ///   have hemp : (_self_loop.occ).get p ≠ 1 := by omega
 ///   simp only [Sable.Seq.len_set]
 ///   rw [h_inv_self_occ_len_cap_self_ke.1]
 ///   exact hash_nodup_preserved ((_old_self.occ).len) (_self_loop.occ) (_self_loop.keys)
-///     (fun x => Hashable_i32_hash_spec x % ((_old_self.occ).len)) p k j
+///     (fun x => K_hash x % ((_old_self.occ).len)) p k j
 ///     hbnd h_inv_i_0_i_i_cap_self_occ_get_3 h_inv_i1_0_i1_i1_cap_i2_0_i2_i hs h_j_range.1 h_path_j_old_self_occ_len hemp hloop
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc.2 by
+/// discharge HashMap::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc.2 by
 ///   rw [h_inv_self_occ_len_cap_self_ke.1]
 ///   exact h_inv_i1_0_i1_i1_cap_i2_0_i2_i
 
-/// discharge HashMap_i32_u64::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc.3 by
+/// discharge HashMap::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc.3 by
 ///   rw [h_inv_self_occ_len_cap_self_ke.1]
 ///   exact h_inv_i1_0_i1_i1_cap_i2_0_i2_i
 
-/// discharge HashMap_i32_u64::insert.post.self_occ_len_old_self_occ_len by
+/// discharge HashMap::insert.post.self_occ_len_old_self_occ_len by
 ///   simp only [Sable.Seq.len_set]
 ///   omega
 
-/// discharge HashMap_i32_u64::insert.post.result_i_0_i_i_self_occ_len_self_occ_get by
+/// discharge HashMap::insert.post.result_i_0_i_i_self_occ_len_self_occ_get by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
 ///   intro _
 ///   refine ⟨p, h_p_range.1, by omega, ?_, ?_, ?_⟩
@@ -445,7 +445,7 @@ fn demo() {
 ///   · rw [if_pos rfl]
 ///   · rw [if_pos rfl]
 
-/// discharge HashMap_i32_u64::insert.post.result_i_0_i_i_self_occ_len_self_occ_get.2 by
+/// discharge HashMap::insert.post.result_i_0_i_i_self_occ_len_self_occ_get.2 by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
 ///   intro _
 ///   refine ⟨p, h_p_range.1, by omega, ?_, ?_, ?_⟩
@@ -454,11 +454,11 @@ fn demo() {
 ///   · exact h_path_self_loop_keys_get_p_k
 ///   · rw [if_pos rfl]
 
-/// discharge HashMap_i32_u64::insert.post.result_i_0_i_i_self_occ_len_self_occ_get.3 by
+/// discharge HashMap::insert.post.result_i_0_i_i_self_occ_len_self_occ_get.3 by
 ///   intro h
 ///   exact (h_result.mp h).elim
 
-/// discharge HashMap_i32_u64::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i by
+/// discharge HashMap::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
 ///   intro i hi0 hic hold
 ///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
@@ -474,7 +474,7 @@ fn demo() {
 ///       rw [if_neg hip]
 ///       exact hfr.2.2
 
-/// discharge HashMap_i32_u64::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.2 by
+/// discharge HashMap::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.2 by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
 ///   intro i hi0 hic hold
 ///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
@@ -491,7 +491,7 @@ fn demo() {
 ///     · rw [if_neg hip]
 ///       exact hfr.2.2
 
-/// discharge HashMap_i32_u64::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.3 by
+/// discharge HashMap::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.3 by
 ///   intro i hi0 hic hold
 ///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
 ///   refine ⟨?_, ?_, ?_⟩

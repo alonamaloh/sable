@@ -252,6 +252,16 @@ pub enum ExprKind {
         init: String,
         args: Vec<Expr>,
     },
+    /// `K::m(args)` through a trait bound, inside a TEMPLATE body
+    /// (ADR 0009 slice 3): modeled as an opaque call whose posts are the
+    /// trait's contracts over the abstract spec functions. Instances
+    /// never contain this (mono resolves them to concrete calls).
+    TraitCall {
+        param: String,
+        param_span: Span,
+        method: String,
+        args: Vec<Expr>,
+    },
     /// `recv.method(args)` where recv is a class-typed local.
     MethodCall {
         recv: String,
@@ -434,6 +444,9 @@ pub struct Method {
 #[derive(Debug, Clone)]
 pub struct TraitSpecFn {
     pub name: String,
+    /// The Lean type after the `:` (e.g. `int → int`) — the binder type
+    /// for the abstract spec function in template verification.
+    pub sig: String,
     pub span: Span,
 }
 

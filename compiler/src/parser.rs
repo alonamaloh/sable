@@ -236,6 +236,7 @@ fn parse_trait_spec(clause: &Clause) -> PResult<TraitSpecFn> {
     }
     Ok(TraitSpecFn {
         name,
+        sig: rest[1..].trim().to_string(),
         span: clause.span,
     })
 }
@@ -2121,6 +2122,11 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
         ExprKind::Unary { operand, .. } => expr_vars(operand, out),
         ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => expr_vars(arg, out),
         ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => expr_vars(operand, out),
+        ExprKind::TraitCall { args, .. } => {
+            for a in args {
+                expr_vars(a, out);
+            }
+        }
         ExprKind::SomeE(inner) => expr_vars(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             expr_vars(lhs, out);

@@ -142,7 +142,7 @@ Layer 1 scope: acceptance soundness only (no completeness claim for rejections),
 
 **Slice 2 (same day): generic classes.** Class templates get their own Lean structure (type-identical across instances — everything is `Int`/`Seq Int`), members verify once against the model with the class invariant machinery unchanged, and instances skip member obligations. **Acceptance passed: `Vec<T>`'s discharges collapsed 8 → 4 (one template set), obligations 151 → 84.** Template restrictions (slices 1–2, diagnosed not silent): no `/`/`%` on `T` values, no `widen`/`narrow` touching `T`, no generic-to-generic calls, no other-class references inside class templates, no class-level `requires` yet.
 
-Slice remaining: trait-bounded templates — abstract spec-function binders, per the probe lemmas' shape (acceptance: `HashMap`'s 27-per-instance discharges collapse).
+**Slice 3 (same day): trait-bounded templates — concepts complete.** A bound `K: Hashable` contributes, at the template, an abstract spec-function binder (`K_hash : int → int`, typed by the trait's `spec` signature) — exactly the shape of the hand-written probe lemmas — and `K::m(...)` calls in template bodies become `TraitCall`s modeled against the trait's contracts (posts as hypotheses over `K_hash`, pres as obligations). Clause text rewrites `K::hash` → `K_hash` at template save; instances are untouched (mono still resolves them concretely, and ADR 0007's per-impl law verification is what licenses the instantiation). **Acceptance passed: `HashMap`'s 27 per-instance discharges are now one template set** (`HashMap::insert.…`), and `bucket64` verifies at the template too. Every generic declaration in the language is now verified once.
 
 ## Parallel track (low intensity)
 

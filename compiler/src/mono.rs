@@ -191,11 +191,12 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             program.fns.push(f);
         } else {
             check_bounds_known(&f.type_bounds, &traits, f.name_span)?;
-            // Preserved for template-level verification (ADR 0009);
-            // slice 1: fn templates without trait bounds.
-            if f.type_bounds.iter().all(|b| b.is_none()) {
-                program.fn_templates.push(f.clone());
-            }
+            // Preserved for template-level verification (ADR 0009):
+            // bounded templates get `K::spec` → `K_spec` in clause text
+            // and `K::m(...)` calls converted to TraitCall.
+            let mut saved = f.clone();
+            prepare_template_fn(&mut saved, &traits);
+            program.fn_templates.push(saved);
             fn_templates.insert(f.name.clone(), f);
         }
     }
@@ -205,11 +206,9 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             program.classes.push(c);
         } else {
             check_bounds_known(&c.type_bounds, &traits, c.name_span)?;
-            // Preserved for template-level verification (ADR 0009
-            // slice 2: unbounded class templates).
-            if c.type_bounds.iter().all(|b| b.is_none()) {
-                program.class_templates.push(c.clone());
-            }
+            let mut saved = c.clone();
+            prepare_template_class(&mut saved, &traits);
+            program.class_templates.push(saved);
             class_templates.insert(c.name.clone(), c);
         }
     }
@@ -254,6 +253,12 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
         ctx.instantiate(req)?;
     }
 
+    // Traits are retained for template verification (check/vcgen model
+    // trait calls against their contracts).
+    let mut kept: Vec<TraitDecl> = ctx.traits.into_values().collect();
+    kept.sort_by(|a, b| a.name.cmp(&b.name));
+    program.traits = kept;
+
     // Deterministic output order.
     ctx.new_fns.sort_by(|a, b| a.name.cmp(&b.name));
     ctx.new_classes.sort_by(|a, b| a.name.cmp(&b.name));
@@ -291,6 +296,171 @@ struct ImplInfo {
     methods: HashSet<String>,
     /// spec name → mangled ghost-def name (`Hashable_i32_hash_spec`).
     specs: HashMap<String, String>,
+}
+
+/// Template-save preparation (ADR 0009 slice 3): rewrite the qualified
+/// spec references in clause text (`K::hash` → the abstract binder
+/// `K_hash`) and convert bounded-parameter calls into `TraitCall`.
+fn template_qual_map(
+    params: &[String],
+    bounds: &[Option<String>],
+    traits: &HashMap<String, TraitDecl>,
+) -> (HashMap<String, String>, HashSet<String>) {
+    let mut qual = HashMap::new();
+    let mut bound_params = HashSet::new();
+    for (i, p) in params.iter().enumerate() {
+        if let Some(Some(b)) = bounds.get(i) {
+            bound_params.insert(p.clone());
+            if let Some(tr) = traits.get(b) {
+                for sp in &tr.specs {
+                    qual.insert(format!("{p}::{}", sp.name), format!("{p}_{}", sp.name));
+                }
+            }
+        }
+    }
+    (qual, bound_params)
+}
+
+fn prepare_template_fn(f: &mut Fn, traits: &HashMap<String, TraitDecl>) {
+    let (qual, bound_params) = template_qual_map(&f.type_params, &f.type_bounds, traits);
+    if qual.is_empty() && bound_params.is_empty() {
+        return;
+    }
+    for c in f
+        .pres
+        .iter_mut()
+        .chain(f.posts.iter_mut())
+        .chain(f.requires.iter_mut())
+    {
+        c.text = subst_clause_text(&c.text, &qual);
+    }
+    if let Some(v) = &mut f.variant {
+        v.text = subst_clause_text(&v.text, &qual);
+    }
+    prepare_stmts(&mut f.body, &qual, &bound_params);
+}
+
+fn prepare_template_class(c: &mut ClassDecl, traits: &HashMap<String, TraitDecl>) {
+    let (qual, bound_params) = template_qual_map(&c.type_params, &c.type_bounds, traits);
+    if qual.is_empty() && bound_params.is_empty() {
+        return;
+    }
+    for inv in &mut c.invariants {
+        inv.text = subst_clause_text(&inv.text, &qual);
+    }
+    for f in c.inits.iter_mut() {
+        for cl in f.pres.iter_mut().chain(f.posts.iter_mut()) {
+            cl.text = subst_clause_text(&cl.text, &qual);
+        }
+        prepare_stmts(&mut f.body, &qual, &bound_params);
+    }
+    for m in c.methods.iter_mut() {
+        for cl in m.f.pres.iter_mut().chain(m.f.posts.iter_mut()) {
+            cl.text = subst_clause_text(&cl.text, &qual);
+        }
+        if let Some(v) = &mut m.f.variant {
+            v.text = subst_clause_text(&v.text, &qual);
+        }
+        prepare_stmts(&mut m.f.body, &qual, &bound_params);
+    }
+}
+
+fn prepare_stmts(
+    stmts: &mut [Stmt],
+    qual: &HashMap<String, String>,
+    bound_params: &HashSet<String>,
+) {
+    for s in stmts {
+        match s {
+            Stmt::Decl { init: Some(e), .. }
+            | Stmt::Assign { value: e, .. }
+            | Stmt::ExprStmt(e)
+            | Stmt::VarDecl { init: e, .. }
+            | Stmt::FieldAssign { value: e, .. }
+            | Stmt::Return { value: Some(e), .. } => prepare_expr(e, bound_params),
+            Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
+            Stmt::Store { index, value, .. } | Stmt::FieldStore { index, value, .. } => {
+                prepare_expr(index, bound_params);
+                prepare_expr(value, bound_params);
+            }
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                prepare_expr(cond, bound_params);
+                prepare_stmts(then_block, qual, bound_params);
+                if let Some(eb) = else_block {
+                    prepare_stmts(eb, qual, bound_params);
+                }
+            }
+            Stmt::While {
+                cond,
+                invariants,
+                variant,
+                body,
+                ..
+            } => {
+                prepare_expr(cond, bound_params);
+                for inv in invariants.iter_mut() {
+                    inv.text = subst_clause_text(&inv.text, qual);
+                }
+                if let Some(v) = variant {
+                    v.text = subst_clause_text(&v.text, qual);
+                }
+                prepare_stmts(body, qual, bound_params);
+            }
+        }
+    }
+}
+
+fn prepare_expr(e: &mut Expr, bound_params: &HashSet<String>) {
+    match &mut e.kind {
+        ExprKind::CtorCall {
+            class,
+            class_span,
+            type_args,
+            init,
+            args,
+        } if bound_params.contains(class.as_str()) && type_args.is_empty() => {
+            for a in args.iter_mut() {
+                prepare_expr(a, bound_params);
+            }
+            e.kind = ExprKind::TraitCall {
+                param: class.clone(),
+                param_span: *class_span,
+                method: init.clone(),
+                args: std::mem::take(args),
+            };
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::MethodCall { args, .. }
+        | ExprKind::TraitCall { args, .. }
+        | ExprKind::ArrayLit(args) => {
+            for a in args.iter_mut() {
+                prepare_expr(a, bound_params);
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand } => prepare_expr(operand, bound_params),
+        ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => {
+            prepare_expr(arg, bound_params)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            prepare_expr(lhs, bound_params);
+            prepare_expr(rhs, bound_params);
+        }
+        ExprKind::Index { index, .. } | ExprKind::SelfFieldIndex { index, .. } => {
+            prepare_expr(index, bound_params)
+        }
+        ExprKind::AllocArray { len, init, .. } => {
+            prepare_expr(len, bound_params);
+            prepare_expr(init, bound_params);
+        }
+        _ => {}
+    }
 }
 
 fn check_bounds_known(
@@ -399,9 +569,7 @@ impl Mono {
             let (text_map, bound_calls) =
                 self.subst_maps(&param_names, &bounds, &req.args);
             c.name = mangle(&req.template, &req.args);
-            if bounds.iter().all(|b| b.is_none()) {
-                c.from_template = Some(req.template.clone());
-            }
+            c.from_template = Some(req.template.clone());
             for fld in &mut c.fields {
                 subst_ty(&mut fld.ty, &req.args);
             }
@@ -425,9 +593,7 @@ impl Mono {
             f.name = mangle(&req.template, &req.args);
             // Template-verified instances (ADR 0009): skip their own
             // obligations; owe the substituted `requires`.
-            if bounds.iter().all(|b| b.is_none()) {
-                f.from_template = Some(req.template.clone());
-            }
+            f.from_template = Some(req.template.clone());
             for r in f.requires.iter_mut() {
                 r.text = subst_clause_text(&r.text, &text_map);
             }
@@ -795,7 +961,7 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
 
 /// Bare (unparenthesized) token substitution in clause text: `T.max`
 /// must become `i32.max`, not `(i32).max`.
-fn subst_clause_text(text: &str, map: &HashMap<String, String>) -> String {
+pub(crate) fn subst_clause_text(text: &str, map: &HashMap<String, String>) -> String {
     let mut out: Vec<u8> = Vec::with_capacity(text.len());
     let bytes = text.as_bytes();
     let mut i = 0;

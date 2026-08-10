@@ -54,9 +54,28 @@ struct Ctx<'a> {
     /// Inside an `init`: fields start uninitialized, `return` forbidden.
     in_init: bool,
     class_metas: &'a [ClassMeta],
+    /// Template context (ADR 0009 slice 3): bounded type parameter →
+    /// (trait name, parameter index).
+    tbounds: HashMap<String, (String, u8)>,
+    traits: &'a [TraitDecl],
+}
+
+fn tbounds_of(params: &[String], bounds: &[Option<String>]) -> HashMap<String, (String, u8)> {
+    let mut out = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        if let Some(Some(b)) = bounds.get(i) {
+            out.insert(p.clone(), (b.clone(), i as u8));
+        }
+    }
+    out
+}
+
+fn class_tbounds(c: &ClassDecl) -> HashMap<String, (String, u8)> {
+    tbounds_of(&c.type_params, &c.type_bounds)
 }
 
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
+    let traits_c: Vec<TraitDecl> = program.traits.clone();
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for f in &program.fns {
         if sigs.contains_key(&f.name) {
@@ -192,6 +211,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_class: None,
             in_init: false,
             class_metas: &class_metas,
+            tbounds: HashMap::new(),
+            traits: &traits_c,
         };
         for p in &f.params {
             if !ctx.declared.insert(p.name.clone()) {
@@ -249,6 +270,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_class: None,
             in_init: false,
             class_metas: &class_metas,
+            tbounds: tbounds_of(&f.type_params, &f.type_bounds),
+            traits: &traits_c,
         };
         for p in &f.params {
             if !ctx.declared.insert(p.name.clone()) {
@@ -296,6 +319,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_class: Some((ci, true)),
                 in_init: true,
                 class_metas: &class_metas,
+                tbounds: HashMap::new(),
+                traits: &traits_c,
             };
             for p in &init.params {
                 ctx.declared.insert(p.name.clone());
@@ -345,6 +370,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                 in_init: false,
                 class_metas: &class_metas,
+                tbounds: HashMap::new(),
+                traits: &traits_c,
             };
             for p in &m.f.params {
                 ctx.declared.insert(p.name.clone());
@@ -417,6 +444,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         }
         for (ci, class) in ctemplates.iter_mut().enumerate() {
             let meta = &tmetas[ci];
+            let ctb = class_tbounds(class);
             for init in &mut class.inits {
                 let mut ctx = Ctx {
                     sigs: &sigs,
@@ -429,6 +457,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_class: Some((ci, true)),
                     in_init: true,
                     class_metas: &tmetas,
+                    tbounds: ctb.clone(),
+                    traits: &traits_c,
                 };
                 for p in &init.params {
                     ctx.declared.insert(p.name.clone());
@@ -478,6 +508,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                     in_init: false,
                     class_metas: &tmetas,
+                    tbounds: ctb.clone(),
+                    traits: &traits_c,
                 };
                 for p in &m.f.params {
                     ctx.declared.insert(p.name.clone());
@@ -1145,6 +1177,62 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     })
                 }
             }
+        }
+        ExprKind::TraitCall {
+            param,
+            param_span,
+            method,
+            args,
+        } => {
+            let Some((tname, pidx)) = ctx.tbounds.get(param.as_str()).cloned() else {
+                return Err(Diagnostic {
+                    name: "concepts.unbound_trait_call".into(),
+                    title: format!("`{param}` has no trait bound"),
+                    span: *param_span,
+                    label: "trait calls go through a bounded type parameter".into(),
+                    notes: vec![],
+                });
+            };
+            let tr = ctx
+                .traits
+                .iter()
+                .find(|t| t.name == tname)
+                .expect("mono validated the bound");
+            let Some(m) = tr.methods.iter().find(|mm| mm.name == *method) else {
+                return Err(Diagnostic {
+                    name: "concepts.no_trait_method".into(),
+                    title: format!("`{tname}` has no method `{method}`"),
+                    span: *param_span,
+                    label: "not a method of the bounding trait".into(),
+                    notes: vec![],
+                });
+            };
+            // In the trait, `Self` is TParam(0); in this template, the
+            // bounded parameter is TParam(pidx).
+            let remap = |t: Ty| -> Ty {
+                match t {
+                    Ty::Int(IntTy::TParam(0)) => Ty::Int(IntTy::TParam(pidx)),
+                    other => other,
+                }
+            };
+            if args.len() != m.params.len() {
+                return Err(Diagnostic {
+                    name: "type.arity".into(),
+                    title: format!(
+                        "`{param}::{method}` takes {} argument(s), {} given",
+                        m.params.len(),
+                        args.len()
+                    ),
+                    span: *param_span,
+                    label: "wrong number of arguments".into(),
+                    notes: vec![],
+                });
+            }
+            let want: Vec<Ty> = m.params.iter().map(|p| remap(p.ty)).collect();
+            for (a, w) in args.iter_mut().zip(&want) {
+                check_expr(ctx, a, Some(*w))?;
+            }
+            remap(m.ret)
         }
         ExprKind::AllocArray { elem, len, init } => {
             let elem = *elem;
