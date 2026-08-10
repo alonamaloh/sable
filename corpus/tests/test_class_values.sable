@@ -1,0 +1,60 @@
+// Dynamic checks over first-class class values (ADR 0010): borrowed
+// arguments, field reads, class returns — contracts over `a.lo`/
+// `result.hi` monitored per call; invariants checked at RAII drop as
+// always.
+
+class Range {
+    i32 lo;
+    i32 hi;
+
+    /// invariant 0 ≤ lo
+    /// invariant lo ≤ hi
+
+    /// pre  0 ≤ a
+    /// pre  a ≤ b
+    /// post self.lo = a ∧ self.hi = b
+    init make(i32 a, i32 b) {
+        self.lo = a;
+        self.hi = b;
+    }
+}
+
+/// post #[label(width)] result = r.hi - r.lo
+fn width(&Range r) -> i32 {
+    return r.hi - r.lo;
+}
+
+/// post #[label(lo_min)] (result.lo = a.lo ∨ result.lo = b.lo) ∧ result.lo ≤ a.lo ∧ result.lo ≤ b.lo
+/// post #[label(hi_max)] (result.hi = a.hi ∨ result.hi = b.hi) ∧ result.hi ≥ a.hi ∧ result.hi ≥ b.hi
+fn union_of(&Range a, &Range b) -> Range {
+    i32 mn = a.lo;
+    if (b.lo < mn) {
+        mn = b.lo;
+    }
+    i32 mx = a.hi;
+    if (b.hi > mx) {
+        mx = b.hi;
+    }
+    var u = Range::make(mn, mx);
+    return u;
+}
+
+/// post result = 9
+fn demo() -> i32 {
+    var x = Range::make(1, 5);
+    var y = Range::make(3, 10);
+    var u = union_of(&x, &y);
+    return width(&u);
+}
+
+
+fn test_class_values() {
+    var x = Range::make(1, 5);
+    var y = Range::make(3, 10);
+    var u = union_of(&x, &y);
+    width(&x);
+    width(&u);
+    demo();
+    var z = union_of(&x, &x);
+    width(&z);
+}

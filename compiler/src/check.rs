@@ -60,6 +60,20 @@ struct Ctx<'a> {
     traits: &'a [TraitDecl],
 }
 
+/// The class index of a class-typed name (owned local or `&C` param).
+fn class_of(ctx: &Ctx, name: &str, span: Span) -> CResult<usize> {
+    match ctx.vars.get(name).map(|v| v.ty) {
+        Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci)) => Ok(ci),
+        _ => Err(Diagnostic {
+            name: "type.mismatch".into(),
+            title: format!("`{name}` is not a class value"),
+            span,
+            label: "field access needs a class-typed receiver".into(),
+            notes: vec![],
+        }),
+    }
+}
+
 fn tbounds_of(params: &[String], bounds: &[Option<String>]) -> HashMap<String, (String, u8)> {
     let mut out = HashMap::new();
     for (i, p) in params.iter().enumerate() {
@@ -1011,12 +1025,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
                 if matches!(v.ty, Ty::Class(_)) {
+                    // The one class-value position slice A allows: moving
+                    // a local out through `return` (ADR 0010).
+                    if matches!(expected, Some(Ty::Class(_))) {
+                        return Ok(v.ty);
+                    }
                     return Err(Diagnostic {
                         name: "type.class_value".into(),
                         title: format!("class value `{name}` used as a value"),
                         span,
-                        label: "class values cannot be copied or moved yet; call methods on \
-                                them (`{name}.method(...)`)"
+                        label: "class values cannot be copied or moved yet \
+                                (returning a local is the exception — ADR 0010)"
                             .into(),
                         notes: vec![],
                     });
@@ -1066,6 +1085,20 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             Ty::Int(elem)
         }
         ExprKind::Len { array } => {
+            // `a.len` on a class receiver is the FIELD named `len`
+            // (ADR 0010) — rewrite and re-check.
+            if matches!(
+                ctx.vars.get(array.as_str()).map(|v| v.ty),
+                Some(Ty::Class(_)) | Some(Ty::ClassRef(_))
+            ) {
+                let obj = array.clone();
+                e.kind = ExprKind::ClassField {
+                    obj,
+                    obj_span: span,
+                    field: "len".to_string(),
+                };
+                return check_expr(ctx, e, expected);
+            }
             array_elem_ty(ctx, array, span)?;
             Ty::Int(IntTy::U64)
         }
@@ -1177,6 +1210,83 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     })
                 }
             }
+        }
+        ExprKind::ClassField {
+            obj,
+            obj_span,
+            field,
+        } => {
+            let ci = class_of(ctx, obj, *obj_span)?;
+            let meta = &ctx.class_metas[ci];
+            let Some((_, fty)) = meta.fields.iter().find(|(n, _)| n == field) else {
+                return Err(Diagnostic {
+                    name: "type.unknown_field".into(),
+                    title: format!("`{}` has no field `{field}`", meta.name),
+                    span,
+                    label: "unknown field".into(),
+                    notes: vec![],
+                });
+            };
+            match fty {
+                Ty::Int(it) => Ty::Int(*it),
+                Ty::Array(..) => {
+                    return Err(Diagnostic {
+                        name: "type.array_field_value".into(),
+                        title: format!("array field `{field}` used as a value"),
+                        span,
+                        label: format!("use `{obj}.{field}[i]` or `{obj}.{field}.len`"),
+                        notes: vec![],
+                    })
+                }
+                other => {
+                    return Err(Diagnostic {
+                        name: "type.mismatch".into(),
+                        title: format!("field `{field}` has type `{}`", other.name()),
+                        span,
+                        label: "unsupported field read".into(),
+                        notes: vec![],
+                    })
+                }
+            }
+        }
+        ExprKind::ClassFieldLen { obj, field } => {
+            let ci = class_of(ctx, obj, span)?;
+            let meta = &ctx.class_metas[ci];
+            match meta.fields.iter().find(|(n, _)| n == field) {
+                Some((_, Ty::Array(..))) => Ty::Int(IntTy::U64),
+                _ => {
+                    return Err(Diagnostic {
+                        name: "type.mismatch".into(),
+                        title: format!("`.len` needs an array field; `{field}` is not one"),
+                        span,
+                        label: "not an array field".into(),
+                        notes: vec![],
+                    })
+                }
+            }
+        }
+        ExprKind::ClassFieldIndex {
+            obj,
+            obj_span,
+            field,
+            index,
+        } => {
+            let ci = class_of(ctx, obj, *obj_span)?;
+            let meta = &ctx.class_metas[ci];
+            let elem = match meta.fields.iter().find(|(n, _)| n == field) {
+                Some((_, Ty::Array(el, _))) => *el,
+                _ => {
+                    return Err(Diagnostic {
+                        name: "type.mismatch".into(),
+                        title: format!("`{field}` is not an array field"),
+                        span,
+                        label: "not indexable".into(),
+                        notes: vec![],
+                    })
+                }
+            };
+            check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
+            Ty::Int(elem)
         }
         ExprKind::TraitCall {
             param,
@@ -1437,6 +1547,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
         },
         ExprKind::Borrow { array, mutable } => {
+            // `&c` of a class local — a shared class borrow (ADR 0010).
+            if let Some(Ty::Class(ci)) = ctx.vars.get(array.as_str()).map(|v| v.ty) {
+                if *mutable {
+                    return Err(Diagnostic {
+                        name: "class.mut_borrow_deferred".into(),
+                        title: "`&mut` class borrows are not supported yet".into(),
+                        span,
+                        label: "ADR 0010 slice A: shared borrows only".into(),
+                        notes: vec![],
+                    });
+                }
+                return Ok(Ty::ClassRef(ci));
+            }
             let elem = array_elem_ty(ctx, array, span)?;
             let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty) {
                 Some(Ty::Array(_, m)) => m,

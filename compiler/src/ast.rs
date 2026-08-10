@@ -93,6 +93,8 @@ pub enum Ty {
     Bool,
     /// A class value (owned local); index into `Program::classes`.
     Class(usize),
+    /// A shared borrow of a class (`&Nat` parameter — ADR 0010).
+    ClassRef(usize),
     /// Borrowed array of integers: `&[i32]` (shared) or `&mut [i32]`
     /// (unique, mutable). Parameters only.
     Array(IntTy, Mutability),
@@ -119,6 +121,7 @@ impl Ty {
             Ty::Array(t, Mutability::Mut) => format!("&mut [{}]", t.name()),
             Ty::Array(t, Mutability::Owned) => format!("[{}]", t.name()),
             Ty::Class(_) => "class".to_string(),
+            Ty::ClassRef(_) => "&class".to_string(),
             Ty::Option(t) => format!("option<{}>", t.name()),
             Ty::Unit => "()".to_string(),
         }
@@ -251,6 +254,24 @@ pub enum ExprKind {
         type_args: Vec<IntTy>,
         init: String,
         args: Vec<Expr>,
+    },
+    /// `o.f` — int field read on a class-typed name (ADR 0010).
+    ClassField {
+        obj: String,
+        obj_span: Span,
+        field: String,
+    },
+    /// `o.f.len` — array-field length on a class-typed name.
+    ClassFieldLen {
+        obj: String,
+        field: String,
+    },
+    /// `o.f[i]` — array-field element read on a class-typed name.
+    ClassFieldIndex {
+        obj: String,
+        obj_span: Span,
+        field: String,
+        index: Box<Expr>,
     },
     /// `K::m(args)` through a trait bound, inside a TEMPLATE body
     /// (ADR 0009 slice 3): modeled as an opaque call whose posts are the

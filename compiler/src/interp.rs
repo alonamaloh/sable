@@ -661,6 +661,45 @@ impl<'a> Interp<'a> {
             ExprKind::TraitCall { .. } => {
                 unreachable!("trait calls exist only in templates, never executed")
             }
+            ExprKind::ClassField { obj, field, .. } => {
+                let RtVal::Obj { fields, .. } = frame.vars[obj.as_str()].clone() else {
+                    unreachable!("checked: class receiver")
+                };
+                let v = fields.borrow()[field.as_str()].clone();
+                Ok(v)
+            }
+            ExprKind::ClassFieldLen { obj, field } => {
+                let RtVal::Obj { fields, .. } = frame.vars[obj.as_str()].clone() else {
+                    unreachable!("checked: class receiver")
+                };
+                let RtVal::Arr(a) = fields.borrow()[field.as_str()].clone() else {
+                    unreachable!("checked: array field")
+                };
+                let n = a.borrow().len() as i128;
+                Ok(RtVal::Int(n))
+            }
+            ExprKind::ClassFieldIndex {
+                obj, field, index, ..
+            } => {
+                let RtVal::Obj { fields, .. } = frame.vars[obj.as_str()].clone() else {
+                    unreachable!("checked: class receiver")
+                };
+                let RtVal::Arr(a) = fields.borrow()[field.as_str()].clone() else {
+                    unreachable!("checked: array field")
+                };
+                let idx = self.eval_int(index, frame)?;
+                let arr = a.borrow();
+                if idx < 0 || idx as usize >= arr.len() {
+                    return Err(Trap {
+                        message: format!(
+                            "index out of bounds: index {idx}, length {}",
+                            arr.len()
+                        ),
+                        span: e.span,
+                    });
+                }
+                Ok(RtVal::Int(arr[idx as usize]))
+            }
             ExprKind::Widen { arg, .. } => self.eval(arg, frame),
             ExprKind::Narrow { target, arg } => {
                 let v = self.eval_int(arg, frame)?;

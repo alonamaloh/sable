@@ -1,0 +1,15 @@
+// expect-error: class.mut_borrow_deferred
+
+class Box {
+    i32 v;
+
+    /// invariant 0 ≤ v
+
+    init make(i32 x) {
+        self.v = 0;
+    }
+}
+
+fn poke(&mut Box b) -> i32 {
+    return 0;
+}

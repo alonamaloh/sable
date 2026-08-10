@@ -20,6 +20,9 @@ pub struct Parser<'a> {
     text: &'a str,
     /// Type parameters of the generic declaration being parsed.
     tparams: Vec<String>,
+    /// Names of classes declared anywhere in the file (pre-scanned so
+    /// `&Nat` parameters and `-> Nat` returns resolve — ADR 0010).
+    class_names: Vec<String>,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -30,6 +33,18 @@ pub fn parse(
     lines: &LineMap,
     text: &str,
 ) -> PResult<Program> {
+    // Non-generic classes only, in declaration order — this matches
+    // their indices in `program.classes` after monomorphization
+    // (instances are appended after). Borrows of generic instances are
+    // an ADR 0010 deferral.
+    let mut class_names = Vec::new();
+    for w in tokens.windows(3) {
+        if matches!(w[0].tok, Tok::KwClass) && !matches!(w[2].tok, Tok::Lt) {
+            if let Tok::Ident(n) = &w[1].tok {
+                class_names.push(n.clone());
+            }
+        }
+    }
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -38,6 +53,7 @@ pub fn parse(
         lines,
         text,
         tparams: Vec::new(),
+        class_names,
     };
     let mut fns = Vec::new();
     let mut classes = Vec::new();
@@ -486,6 +502,23 @@ impl<'a> Parser<'a> {
             } else {
                 Mutability::Shared
             };
+            // `&Nat` — shared borrow of a class (ADR 0010 slice A).
+            if let Tok::Ident(n) = self.peek() {
+                if let Some(ci) = self.class_names.iter().position(|c| c == n) {
+                    if mutability == Mutability::Mut {
+                        return Err(Diagnostic {
+                            name: "class.mut_borrow_deferred".into(),
+                            title: "`&mut` class borrows are not supported yet".into(),
+                            span: self.peek_span(),
+                            label: "ADR 0010 slice A: shared borrows and returns only"
+                                .into(),
+                            notes: vec![],
+                        });
+                    }
+                    let end = self.bump().span;
+                    return Ok((Ty::ClassRef(ci), start.join(end)));
+                }
+            }
             self.expect(Tok::LBracket)?;
             let (elem, _) = self.int_ty()?;
             let end = self.expect(Tok::RBracket)?.span;
@@ -513,9 +546,13 @@ impl<'a> Parser<'a> {
             })
     }
 
-    /// A return type: scalar or `option<T>`.
+    /// A return type: scalar, `option<T>`, or a class (ADR 0010).
     fn ret_ty(&mut self) -> PResult<Ty> {
         if let Tok::Ident(name) = self.peek() {
+            if let Some(ci) = self.class_names.iter().position(|c| c == name) {
+                self.bump();
+                return Ok(Ty::Class(ci));
+            }
             if name == "option" {
                 self.bump();
                 self.expect(Tok::Lt)?;
@@ -1735,17 +1772,55 @@ impl<'a> Parser<'a> {
                         };
                         continue;
                     }
-                    if field != "len" {
-                        return Err(Diagnostic {
-                            name: "parse.unknown_field".into(),
-                            title: format!("unknown field `.{field}`"),
-                            span: fspan,
-                            label: "`.len` (arrays) and `.method(...)` are the accessors".into(),
-                            notes: vec![],
-                        });
+                    if field == "len" {
+                        // Array length — or a class field named `len`;
+                        // the checker disambiguates by receiver type.
+                        e = Expr {
+                            kind: ExprKind::Len { array: recv },
+                            span: recv_span.join(fspan),
+                            ty: None,
+                        };
+                        continue;
+                    }
+                    // `o.f` — class field read (ADR 0010); may continue
+                    // postfix as `o.f.len` or `o.f[i]`.
+                    if self.at(&Tok::Dot)
+                        && matches!(self.peek2(), Tok::Ident(n) if n == "len")
+                    {
+                        self.bump();
+                        let (_, lspan) = self.ident()?;
+                        e = Expr {
+                            kind: ExprKind::ClassFieldLen {
+                                obj: recv,
+                                field,
+                            },
+                            span: recv_span.join(lspan),
+                            ty: None,
+                        };
+                        continue;
+                    }
+                    if self.at(&Tok::LBracket) {
+                        self.bump();
+                        let index = self.expr()?;
+                        let close = self.expect(Tok::RBracket)?.span;
+                        e = Expr {
+                            kind: ExprKind::ClassFieldIndex {
+                                obj: recv,
+                                obj_span: recv_span,
+                                field,
+                                index: Box::new(index),
+                            },
+                            span: recv_span.join(close),
+                            ty: None,
+                        };
+                        continue;
                     }
                     e = Expr {
-                        kind: ExprKind::Len { array: recv },
+                        kind: ExprKind::ClassField {
+                            obj: recv,
+                            obj_span: recv_span,
+                            field,
+                        },
                         span: recv_span.join(fspan),
                         ty: None,
                     };
@@ -2126,6 +2201,13 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
             for a in args {
                 expr_vars(a, out);
             }
+        }
+        ExprKind::ClassField { obj, .. } | ExprKind::ClassFieldLen { obj, .. } => {
+            out.insert(obj.clone());
+        }
+        ExprKind::ClassFieldIndex { obj, index, .. } => {
+            out.insert(obj.clone());
+            expr_vars(index, out);
         }
         ExprKind::SomeE(inner) => expr_vars(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {

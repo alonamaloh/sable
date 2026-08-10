@@ -452,7 +452,9 @@ fn prepare_expr(e: &mut Expr, bound_params: &HashSet<String>) {
             prepare_expr(lhs, bound_params);
             prepare_expr(rhs, bound_params);
         }
-        ExprKind::Index { index, .. } | ExprKind::SelfFieldIndex { index, .. } => {
+        ExprKind::Index { index, .. }
+        | ExprKind::SelfFieldIndex { index, .. }
+        | ExprKind::ClassFieldIndex { index, .. } => {
             prepare_expr(index, bound_params)
         }
         ExprKind::AllocArray { len, init, .. } => {
@@ -781,7 +783,9 @@ impl Mono {
                 self.rewrite_expr(lhs, depth)?;
                 self.rewrite_expr(rhs, depth)?;
             }
-            ExprKind::Index { index, .. } | ExprKind::SelfFieldIndex { index, .. } => {
+            ExprKind::Index { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. } => {
                 self.rewrite_expr(index, depth)?
             }
             ExprKind::AllocArray { len, init, .. } => {
@@ -946,7 +950,9 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
             subst_expr(lhs, args, bound_calls)?;
             subst_expr(rhs, args, bound_calls)?;
         }
-        ExprKind::Index { index, .. } | ExprKind::SelfFieldIndex { index, .. } => {
+        ExprKind::Index { index, .. }
+        | ExprKind::SelfFieldIndex { index, .. }
+        | ExprKind::ClassFieldIndex { index, .. } => {
             subst_expr(index, args, bound_calls)?
         }
         ExprKind::ArrayLit(elems) => {

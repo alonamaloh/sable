@@ -506,6 +506,17 @@ impl<'a> Generator<'a> {
         for p in &self.f.params {
             self.var_tys.insert(p.name.clone(), p.ty);
             match p.ty {
+                Ty::ClassRef(ci) => {
+                    // `&C` parameter (ADR 0010): the class value with its
+                    // field facts and invariant — the method-entry
+                    // treatment, re-aimed.
+                    let cd = &self.classes[ci];
+                    self.binders.push((p.name.clone(), cd.name.clone()));
+                    self.push_class_state_facts(cd, &p.name);
+                    self.push_invariant_hyps(cd, &p.name);
+                    self.env
+                        .insert(p.name.clone(), Val::Obj(p.name.clone()));
+                }
                 Ty::Int(it) => {
                     self.binders.push((p.name.clone(), "Int".into()));
                     self.hyps
@@ -603,6 +614,8 @@ impl<'a> Generator<'a> {
             // Bool results are Prop-valued in the logic: posts like
             // `result → P` splice with no coercion noise.
             Ty::Bool => "Prop".into(),
+            // A returned class value is its structure (ADR 0010).
+            Ty::Class(ci) => self.classes[ci].name.clone(),
             _ => "Int".into(),
         }
     }
@@ -696,6 +709,32 @@ impl<'a> Generator<'a> {
                         Val::Int(v) => format!("(result = {v})"),
                         Val::Opt(v) => format!("(result = {v})"),
                         Val::Prop(p) => format!("(result ↔ ({p}))"),
+                        Val::Obj(chain) => {
+                            // Returning a class value: the invariant must
+                            // hold of the returned state (ADR 0010's
+                            // ret_inv — closes by assumption, but it is
+                            // an obligation, not a trust step).
+                            if let Ty::Class(ci) = self.f.ret {
+                                let cd = &self.classes[ci];
+                                let map = self.class_state_map(cd, &chain);
+                                for inv in &cd.invariants {
+                                    let goal = substitute(&inv.text, &map, None);
+                                    let ob = self.obligation(
+                                        &format!(
+                                            "{}.ret_inv.{}",
+                                            self.fname,
+                                            cslug(inv)
+                                        ),
+                                        "invariant of the returned class value"
+                                            .to_string(),
+                                        value.span,
+                                        goal,
+                                    );
+                                    self.push_obligation(ob);
+                                }
+                            }
+                            format!("(result = {chain})")
+                        }
                         _ => unreachable!("unit values cannot be returned"),
                     },
                 });
@@ -882,7 +921,7 @@ impl<'a> Generator<'a> {
                         Ty::Int(_) => Some((name.clone(), "Int".to_string())),
                         Ty::Bool => Some((name.clone(), "Bool".to_string())),
                         Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
-                        Ty::Class(ci) => {
+                        Ty::Class(ci) | Ty::ClassRef(ci) => {
                             Some((name.clone(), self.classes[*ci].name.clone()))
                         }
                         Ty::Option(_) | Ty::Unit => None,
@@ -1260,9 +1299,10 @@ impl<'a> Generator<'a> {
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
             }
-            ExprKind::Borrow { array, .. } => {
-                Val::Arr(self.arr_str(array))
-            }
+            ExprKind::Borrow { array, .. } => match self.env.get(array.as_str()) {
+                Some(Val::Obj(chain)) => Val::Obj(chain.clone()),
+                _ => Val::Arr(self.arr_str(array)),
+            },
             ExprKind::ArrayLit(_) => {
                 unreachable!("checked: test-only expression")
             }
@@ -1314,6 +1354,42 @@ impl<'a> Generator<'a> {
                     format!("∀ k, 0 ≤ k → k < {b}.len → {b}.get k = {v0}"),
                 ));
                 Val::Arr(b)
+            }
+            ExprKind::ClassField { obj, field, .. } => {
+                let Val::Obj(chain) = self.env[obj.as_str()].clone() else {
+                    unreachable!("checked: class-typed receiver")
+                };
+                Val::Int(project_field(&chain, field))
+            }
+            ExprKind::ClassFieldLen { obj, field } => {
+                let Val::Obj(chain) = self.env[obj.as_str()].clone() else {
+                    unreachable!("checked: class-typed receiver")
+                };
+                Val::Int(format!("({}.len)", project_field(&chain, field)))
+            }
+            ExprKind::ClassFieldIndex {
+                obj, field, index, ..
+            } => {
+                let Val::Obj(chain) = self.env[obj.as_str()].clone() else {
+                    unreachable!("checked: class-typed receiver")
+                };
+                let Val::Int(i) = self.eval(index) else {
+                    unreachable!()
+                };
+                let arr = project_field(&chain, field);
+                let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
+                let ob = self.obligation(
+                    &format!("{}.bounds.{}", self.fname, slug(self.src(index.span))),
+                    format!(
+                        "index `{}` must be within bounds",
+                        self.src_short(index.span)
+                    ),
+                    e.span,
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                Val::Int(format!("({arr}.get {i})"))
             }
             ExprKind::SelfField { field } => match self.cctx {
                 Cctx::Init(_) => self
@@ -1739,12 +1815,40 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) => v,
-                        _ => unreachable!("checked: int/array args only"),
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) => v,
+                        _ => unreachable!("checked: int/array/class args only"),
                     })
                     .collect();
                 let callee_fn = self.fn_map[callee.as_str()];
                 let sig = &self.sigs[callee.as_str()];
+                // `&C` arguments: the callee assumes the class invariant;
+                // the caller owes it here (closes by assumption — class
+                // locals are init/method post-states — but it is an
+                // obligation, not a trust step; ADR 0010).
+                for (p, aval) in sig.params.iter().zip(&arg_vals) {
+                    if let Ty::ClassRef(ci) = p.ty {
+                        let cd = &self.classes[ci];
+                        let map = self.class_state_map(cd, aval);
+                        for inv in &cd.invariants {
+                            let goal = substitute(&inv.text, &map, None);
+                            let ob = self.obligation(
+                                &format!(
+                                    "{}.borrow_inv.{}.{}",
+                                    self.fname,
+                                    p.name,
+                                    cslug(inv)
+                                ),
+                                format!(
+                                    "invariant of the borrowed `{}` argument",
+                                    cd.name
+                                ),
+                                e.span,
+                                goal,
+                            );
+                            self.push_obligation(ob);
+                        }
+                    }
+                }
                 let mut subst_map: HashMap<String, String> = sig
                     .params
                     .iter()
@@ -1842,6 +1946,15 @@ impl<'a> Generator<'a> {
                     Ty::Bool => {
                         self.binders.push((ret_sym.clone(), "Prop".into()));
                     }
+                    Ty::Class(ci) => {
+                        // A returned class: fresh state with field facts
+                        // and the invariant (the callee proved ret_inv;
+                        // ADR 0010).
+                        let cd = &self.classes[ci];
+                        self.binders.push((ret_sym.clone(), cd.name.clone()));
+                        self.push_class_state_facts(cd, &ret_sym);
+                        self.push_invariant_hyps(cd, &ret_sym);
+                    }
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
@@ -1864,6 +1977,7 @@ impl<'a> Generator<'a> {
                     Ty::Option(_) => Val::Opt(ret_sym),
                     Ty::Unit => Val::Unit,
                     Ty::Bool => Val::Prop(ret_sym),
+                    Ty::Class(_) => Val::Obj(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -2032,6 +2146,9 @@ impl<'a> Generator<'a> {
             match p.ty {
                 Ty::Int(_) => out.push((p.name.clone(), "Int".into())),
                 Ty::Bool => out.push((p.name.clone(), "Bool".into())),
+                Ty::ClassRef(ci) => {
+                    out.push((p.name.clone(), self.classes[ci].name.clone()))
+                }
                 Ty::Array(..) => {
                     out.push((p.name.clone(), "Sable.Seq Int".into()));
                     if let Some(entry) = self.mut_arrays.get(&p.name) {
@@ -2289,6 +2406,8 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
                 collect_mut_borrows(a, out);
             }
         }
+        ExprKind::ClassField { .. } | ExprKind::ClassFieldLen { .. } => {}
+        ExprKind::ClassFieldIndex { index, .. } => collect_mut_borrows(index, out),
         ExprKind::SomeE(inner) => collect_mut_borrows(inner, out),
         ExprKind::Binary { lhs, rhs, .. } => {
             collect_mut_borrows(lhs, out);
