@@ -6,7 +6,7 @@
 //! budget travels through the process environment (SABLE_GRIND_HEARTBEATS
 //! → an emitted `set_option`), so the cases must not run concurrently.
 
-use sable::{check_file, Options, Outcome};
+use sable::{Options, Outcome, check_file};
 use std::path::PathBuf;
 
 /// The post is the pre's product commuted — omega is linear-only and
@@ -46,9 +46,9 @@ fn grind_budget() {
     match with_budget(Some("1")) {
         Outcome::Failed(failures) => {
             assert!(
-                failures.iter().any(|f| f
-                    .rendered
-                    .contains("`grind` exceeded its heartbeat budget")),
+                failures
+                    .iter()
+                    .any(|f| f.rendered.contains("`grind` exceeded its heartbeat budget")),
                 "expected a budget-exceeded failure, got: {:?}",
                 failures.iter().map(|f| &f.name).collect::<Vec<_>>()
             );
@@ -63,7 +63,10 @@ fn grind_budget() {
         Outcome::Verified { warnings, .. } => {
             assert_eq!(warnings.len(), 1, "expected exactly one warning");
             let w = &warnings[0];
-            assert!(w.contains("six.post.result_a_get_1_a_get_0"), "warning must name the obligation:\n{w}");
+            assert!(
+                w.contains("six.post.result_a_get_1_a_get_0"),
+                "warning must name the obligation:\n{w}"
+            );
             assert!(w.contains("expensive automation"), "warning text:\n{w}");
             assert!(
                 w.contains("suggested: discharge six.post.result_a_get_1_a_get_0 by"),
@@ -79,7 +82,10 @@ fn grind_budget() {
     // Default budget: silent success.
     match with_budget(None) {
         Outcome::Verified { warnings, .. } => {
-            assert!(warnings.is_empty(), "default budget must not warn: {warnings:?}");
+            assert!(
+                warnings.is_empty(),
+                "default budget must not warn: {warnings:?}"
+            );
         }
         Outcome::Failed(_) => panic!("default budget should verify"),
     }

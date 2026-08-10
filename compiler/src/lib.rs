@@ -63,8 +63,7 @@ pub fn front_diagnostics(source: &str) -> Vec<Diagnostic> {
         Ok(t) => t,
         Err(d) => return vec![d],
     };
-    let mut program = match parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
-    {
+    let mut program = match parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text) {
         Ok(p) => p,
         Err(d) => return vec![d],
     };
@@ -190,8 +189,7 @@ pub fn check_file_structured(
     // the quantifier-free fragment).
     {
         let find = |name: &str| vc.obligations.iter().find(|ob| ob.name == name);
-        let mut treated: std::collections::HashMap<&str, &str> =
-            std::collections::HashMap::new();
+        let mut treated: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         let conflict_or_orphan = |name: &str, what: &'static str, span: span::Span| {
             if find(name).is_none() {
                 return Some(diag::Diagnostic {
@@ -270,9 +268,7 @@ pub fn check_file_structured(
                 .obligations
                 .iter()
                 .map(|ob| ob.name.as_str())
-                .filter(|n| {
-                    n.split('.').next() == d.name.split('.').next()
-                })
+                .filter(|n| n.split('.').next() == d.name.split('.').next())
                 .collect();
             near.truncate(8);
             let d_diag = diag::Diagnostic {
@@ -281,7 +277,10 @@ pub fn check_file_structured(
                 span: d.span,
                 label: "no obligation with this name exists".into(),
                 notes: if near.is_empty() {
-                    vec![("note".into(), "run `sable check` to list obligation names".into())]
+                    vec![(
+                        "note".into(),
+                        "run `sable check` to list obligation names".into(),
+                    )]
                 } else {
                     vec![("nearby obligations".into(), near.join("\n"))]
                 },
@@ -319,10 +318,9 @@ pub fn check_file_structured(
         );
     }
 
-    let Some(repo_root) = lean::find_repo_root(
-        &path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
-    )
-    .or_else(|| lean::find_repo_root(&std::env::current_dir().ok()?))
+    let Some(repo_root) =
+        lean::find_repo_root(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+            .or_else(|| lean::find_repo_root(&std::env::current_dir().ok()?))
     else {
         return (
             mods,
@@ -367,19 +365,13 @@ pub fn check_file_structured(
         Some(m) => m,
         None => match lean::run_lean(&repo_root, &lean_file) {
             Ok(m) => m,
-            Err(msg) => {
-                return (
-                    mods,
-                    Err(vec![io_diag("internal.lean_invocation", msg)]),
-                )
-            }
+            Err(msg) => return (mods, Err(vec![io_diag("internal.lean_invocation", msg)])),
         },
     };
 
     let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages, &mods));
     if diags.is_empty() {
-        let warnings =
-            lean::dedup_by_name(lean::diagnose_warnings(&emitted, &vc, &messages));
+        let warnings = lean::dedup_by_name(lean::diagnose_warnings(&emitted, &vc, &messages));
         (
             mods,
             Ok(VerifiedInfo {

@@ -1,4 +1,4 @@
-use sable::{check_file, Options, Outcome};
+use sable::{Options, Outcome, check_file};
 use std::path::PathBuf;
 use std::process::ExitCode;
 

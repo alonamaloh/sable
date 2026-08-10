@@ -188,9 +188,7 @@ fn load_file(
     // parser needs line numbers consistent with the shifted block lines,
     // so it gets a line map over the combined prefix.
     let mut scanned = scan::scan(&source);
-    let line_base = loading
-        .set
-        .combined_source[..base]
+    let line_base = loading.set.combined_source[..base]
         .bytes()
         .filter(|b| *b == b'\n')
         .count();
@@ -215,7 +213,10 @@ fn load_file(
     // be known (with their merged indices) when this module's class
     // references resolve. `use` declarations are read off the token
     // stream directly.
-    let dir = canonical.parent().map(Path::to_path_buf).unwrap_or_default();
+    let dir = canonical
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     let uses = scan_uses(&tokens);
     for u in &uses {
         let mut candidates = vec![dir.join(format!("{}.sable", u.module))];
@@ -275,7 +276,11 @@ fn load_file(
         order.sort();
         let mut names = Vec::new();
         for i in order {
-            let (_, p) = loading.programs.iter().find(|(j, _)| *j == i).expect("loaded");
+            let (_, p) = loading
+                .programs
+                .iter()
+                .find(|(j, _)| *j == i)
+                .expect("loaded");
             names.extend(p.classes.iter().map(|c| c.name.clone()));
         }
         names

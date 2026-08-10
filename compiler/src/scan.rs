@@ -38,6 +38,11 @@ pub struct Clause {
     /// its hypothesis, replacing the content slug in generated names
     /// (`fn.post.frame`, `h_inv_frame`). Stripped from `text`.
     pub label: Option<String>,
+    /// `#[unfold]` on a ghost `def` or `theorem`: emit it `@[simp]` so
+    /// automation applies it. On a def this unfolds the definition; on
+    /// a theorem it registers a rewrite (conditional step lemmas whose
+    /// side conditions gate the rewrite). Stripped from `text`.
+    pub unfold: bool,
     /// Proof-language text after the keyword, verbatim except that a
     /// trailing `-- comment` is stripped (clauses get spliced inside
     /// parentheses in generated Lean, where a line comment would swallow
@@ -190,11 +195,7 @@ fn parse_clause(line: &str, indent: usize, line_offset: usize) -> Clause {
         if let Some(rest) = text.strip_prefix("#[label(") {
             if let Some(close) = rest.find(")]") {
                 let name = &rest[..close];
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     label = Some(name.to_string());
                     let stripped = rest[close + 2..].trim_start();
                     label_len = text.len() - stripped.len();
@@ -204,10 +205,23 @@ fn parse_clause(line: &str, indent: usize, line_offset: usize) -> Clause {
         }
     }
 
+    // `#[unfold]` on ghost defs and theorems: strip the flag; anything
+    // malformed stays in `text` for Lean to reject.
+    let mut unfold = false;
+    if kind == ClauseKind::GhostDef || kind == ClauseKind::Theorem {
+        if let Some(rest) = text.strip_prefix("#[unfold]") {
+            unfold = true;
+            let stripped = rest.trim_start();
+            label_len = text.len() - stripped.len();
+            text = stripped.to_string();
+        }
+    }
+
     let text_start = line_offset + after_marker_idx + text_rel + text_lead_ws + label_len;
     Clause {
         kind,
         label,
+        unfold,
         span: Span::new(text_start, text_start + text.len()),
         text,
         line_span,

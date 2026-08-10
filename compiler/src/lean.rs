@@ -13,11 +13,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 enum MapTarget {
-    Clause { span: Span, desc: String },
+    Clause {
+        span: Span,
+        desc: String,
+    },
     Obligation(usize),
     /// Theorem proved by a user discharge script; errors point at the
     /// discharge block.
-    Discharged { name: String, span: Span, goal: String },
+    Discharged {
+        name: String,
+        span: Span,
+        goal: String,
+    },
 }
 
 struct MapEntry {
@@ -93,8 +100,10 @@ pub fn emit(
         let first = e.line + 1;
         // Non-recursive ghost defs get @[simp] so contracts naming them
         // unfold under the portfolio; recursive ones would loop and are
-        // unfolded manually in discharges.
-        let attr = if g.keyword == "def" && !ghost_recursive(&g.text) {
+        // unfolded manually in discharges. `#[unfold]` opts an item in
+        // explicitly — typically a conditional step lemma whose side
+        // conditions gate the rewrite to concrete data.
+        let attr = if g.unfold || (g.keyword == "def" && !ghost_recursive(&g.text)) {
             "@[simp] "
         } else {
             ""
@@ -140,8 +149,16 @@ pub fn emit(
         }
         let discharge = discharges.iter().find(|d| d.name == ob.name);
         let first = e.line + 1;
-        e.push(&format!("/-- `{}` — {} -/", ob.name, doc_safe(&ob.kind_desc)));
-        e.push(&format!("theorem {} {}", ob.thm_name, binder_list(&ob.binders)));
+        e.push(&format!(
+            "/-- `{}` — {} -/",
+            ob.name,
+            doc_safe(&ob.kind_desc)
+        ));
+        e.push(&format!(
+            "theorem {} {}",
+            ob.thm_name,
+            binder_list(&ob.binders)
+        ));
         for (hname, hprop) in &ob.hyps {
             e.push(&format!("    ({hname} : {hprop})"));
         }
@@ -410,7 +427,10 @@ pub fn diagnose_warnings(
                 .nth(1)
                 .map(|l| l.trim().trim_start_matches("[apply]").trim().to_string())
                 .unwrap_or_default();
-            notes.push(("suggested".into(), format!("discharge <obligation> by {tactic}")));
+            notes.push((
+                "suggested".into(),
+                format!("discharge <obligation> by {tactic}"),
+            ));
         }
         match entry.map(|en| &en.target) {
             Some(MapTarget::Obligation(i)) => {

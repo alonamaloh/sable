@@ -208,7 +208,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         let Some(sig) = sigs.get(&ob.fn_name) else {
             return Err(Diagnostic {
                 name: "op.unknown_fn".into(),
-                title: format!("`operator {}` binds unknown function `{}`", ob.op.symbol(), ob.fn_name),
+                title: format!(
+                    "`operator {}` binds unknown function `{}`",
+                    ob.op.symbol(),
+                    ob.fn_name
+                ),
                 span: ob.span,
                 label: "no such function".into(),
                 notes: vec![],
@@ -225,7 +229,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             label: why.to_string(),
             notes: vec![],
         };
-        let (ci_a, ci_b) = match (sig.params.first().map(|p| p.ty), sig.params.get(1).map(|p| p.ty)) {
+        let (ci_a, ci_b) = match (
+            sig.params.first().map(|p| p.ty),
+            sig.params.get(1).map(|p| p.ty),
+        ) {
             (Some(Ty::ClassRef(a)), Some(Ty::ClassRef(b))) if sig.params.len() == 2 => (a, b),
             _ => return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`")),
         };
@@ -246,7 +253,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 }
             }
         }
-        if operators.insert((ob.op, ci_a), ob.fn_name.clone()).is_some() {
+        if operators
+            .insert((ob.op, ci_a), ob.fn_name.clone())
+            .is_some()
+        {
             return Err(Diagnostic {
                 name: "op.duplicate".into(),
                 title: format!(
@@ -271,7 +281,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         {
             return Err(Diagnostic {
                 name: "type.test_shape".into(),
-                title: format!("`{}` is a test but has parameters, a return type, or contracts", f.name),
+                title: format!(
+                    "`{}` is a test but has parameters, a return type, or contracts",
+                    f.name
+                ),
                 span: f.name_span,
                 label: "tests are contract-free procedures: `fn test_x() { ... }`".into(),
                 notes: vec![(
@@ -404,7 +417,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_init: true,
                 class_metas: &class_metas,
                 tbounds: HashMap::new(),
-            operators: &operators,
+                operators: &operators,
                 traits: &traits_c,
             };
             for p in &init.params {
@@ -456,7 +469,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_init: false,
                 class_metas: &class_metas,
                 tbounds: HashMap::new(),
-            operators: &operators,
+                operators: &operators,
                 traits: &traits_c,
             };
             for p in &m.f.params {
@@ -520,7 +533,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             tmetas.push(ClassMeta {
                 name: c.name.clone(),
                 fields,
-                inits: c.inits.iter().map(|i| (i.name.clone(), i.params.clone())).collect(),
+                inits: c
+                    .inits
+                    .iter()
+                    .map(|i| (i.name.clone(), i.params.clone()))
+                    .collect(),
                 methods: c
                     .methods
                     .iter()
@@ -576,8 +593,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                                 meta.name, init.name
                             ),
                             span: init.name_span,
-                            label: "every field must be assigned before the init returns"
-                                .into(),
+                            label: "every field must be assigned before the init returns".into(),
                             notes: vec![],
                         });
                     }
@@ -687,7 +703,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
                 let alloc_init = matches!(
                     init.as_ref().map(|e| &e.kind),
-                    Some(ExprKind::AllocArray { .. })
+                    Some(ExprKind::AllocArray { .. }) | Some(ExprKind::ArrayLit(_))
                 );
                 if matches!(ty, Ty::Array(_, Mutability::Owned)) && !ctx.in_test && !alloc_init {
                     return Err(Diagnostic {
@@ -724,7 +740,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             span: *name_span,
                             label: "not declared".into(),
                             notes: vec![],
-                        })
+                        });
                     }
                 };
                 if matches!(ty, Ty::Class(_)) {
@@ -747,7 +763,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             ),
                             span: *name_span,
                             label: "moves between locals are not supported yet (ADR 0010)".into(),
-                        notes: vec![],
+                            notes: vec![],
                         });
                     }
                     ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
@@ -757,8 +773,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             name: "type.array_assign".into(),
                             title: format!("cannot assign to array `{name}`"),
                             span: *name_span,
-                            label: "arrays cannot be rebound; element stores use `a[i] = v`"
-                                .into(),
+                            label: "arrays cannot be rebound; element stores use `a[i] = v`".into(),
                             notes: vec![],
                         });
                     }
@@ -772,11 +787,17 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 else_block,
             } => {
                 check_expr(ctx, cond, Some(Ty::Bool))?;
-                let before: HashMap<String, bool> =
-                    ctx.vars.iter().map(|(k, v)| (k.clone(), v.initialized)).collect();
+                let before: HashMap<String, bool> = ctx
+                    .vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.initialized))
+                    .collect();
                 let then_ret = check_block(ctx, then_block, ret_ty)?;
-                let after_then: HashMap<String, bool> =
-                    ctx.vars.iter().map(|(k, v)| (k.clone(), v.initialized)).collect();
+                let after_then: HashMap<String, bool> = ctx
+                    .vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.initialized))
+                    .collect();
                 for (name, init) in &before {
                     if let Some(v) = ctx.vars.get_mut(name.as_str()) {
                         v.initialized = *init;
@@ -788,8 +809,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 };
                 // Initialized after the `if` iff initialized on every path
                 // that falls through (returning branches contribute none).
-                let after_else: HashMap<String, bool> =
-                    ctx.vars.iter().map(|(k, v)| (k.clone(), v.initialized)).collect();
+                let after_else: HashMap<String, bool> = ctx
+                    .vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.initialized))
+                    .collect();
                 for (name, v) in ctx.vars.iter_mut() {
                     let was = before.get(name).copied().unwrap_or(false);
                     let mut reaching = Vec::new();
@@ -834,8 +858,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // The body may run zero times: check it against the entry
                 // state, then restore the entry state (body-declared locals
                 // become uninitialized after the loop).
-                let before: HashMap<String, bool> =
-                    ctx.vars.iter().map(|(k, v)| (k.clone(), v.initialized)).collect();
+                let before: HashMap<String, bool> = ctx
+                    .vars
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.initialized))
+                    .collect();
                 let _body_ret = check_block(ctx, body, ret_ty)?;
                 for (name, v) in ctx.vars.iter_mut() {
                     v.initialized = before.get(name).copied().unwrap_or(false);
@@ -860,7 +887,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             span: e.span,
                             label: "remove the value (or declare `-> T`)".into(),
                             notes: vec![],
-                        })
+                        });
                     }
                     (None, _) => {
                         return Err(Diagnostic {
@@ -869,7 +896,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             span: *span,
                             label: "a value is required".into(),
                             notes: vec![],
-                        })
+                        });
                     }
                     (Some(e), _) => {
                         check_expr(ctx, e, Some(ret_ty))?;
@@ -930,36 +957,32 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let mut checked = false;
                 if let Ty::Array(elem, _) = fty {
                     match &value.kind {
-                        ExprKind::Var(name) => {
-                            match ctx.vars.get(name.as_str()).map(|v| v.ty) {
-                                Some(Ty::Array(e2, Mutability::Owned)) if e2 == elem => {
-                                    value.ty = Some(Ty::Array(e2, Mutability::Owned));
-                                    checked = true;
-                                }
-                                _ => {
-                                    return Err(Diagnostic {
-                                        name: "type.field_array_move".into(),
-                                        title: format!(
-                                            "`{name}` cannot move into array field `{field}`"
-                                        ),
-                                        span: value.span,
-                                        label: "needs an owned array of the same element type"
-                                            .into(),
-                                        notes: vec![],
-                                    })
-                                }
+                        ExprKind::Var(name) => match ctx.vars.get(name.as_str()).map(|v| v.ty) {
+                            Some(Ty::Array(e2, Mutability::Owned)) if e2 == elem => {
+                                value.ty = Some(Ty::Array(e2, Mutability::Owned));
+                                checked = true;
                             }
-                        }
+                            _ => {
+                                return Err(Diagnostic {
+                                    name: "type.field_array_move".into(),
+                                    title: format!(
+                                        "`{name}` cannot move into array field `{field}`"
+                                    ),
+                                    span: value.span,
+                                    label: "needs an owned array of the same element type".into(),
+                                    notes: vec![],
+                                });
+                            }
+                        },
                         ExprKind::AllocArray { .. } => {}
                         _ => {
                             return Err(Diagnostic {
                                 name: "type.field_array_move".into(),
                                 title: format!("array field `{field}` needs an owned array"),
                                 span: value.span,
-                                label: "assign a fresh `alloc_array` or move an owned local"
-                                    .into(),
+                                label: "assign a fresh `alloc_array` or move an owned local".into(),
                                 notes: vec![],
-                            })
+                            });
                         }
                     }
                 }
@@ -1011,7 +1034,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             span: *array_span,
                             label: format!("this has type `{}`", v.ty.name()),
                             notes: vec![],
-                        })
+                        });
                     }
                     None => {
                         return Err(Diagnostic {
@@ -1020,7 +1043,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             span: *array_span,
                             label: "not declared".into(),
                             notes: vec![],
-                        })
+                        });
                     }
                 };
                 if mutability == Mutability::Shared {
@@ -1092,7 +1115,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: "integer literal".into(),
                         notes: vec![],
-                    })
+                    });
                 }
                 None => {
                     return Err(Diagnostic {
@@ -1104,7 +1127,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             "note".into(),
                             "give the literal context, e.g. bind it to a typed variable".into(),
                         )],
-                    })
+                    });
                 }
             };
             if !matches!(t, IntTy::TParam(_)) && (*n < t.min() || *n > t.max()) {
@@ -1169,7 +1192,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     span,
                     label: "not declared".into(),
                     notes: vec![],
-                })
+                });
             }
         },
         ExprKind::Index {
@@ -1209,7 +1232,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: "expected an integer".into(),
                         notes: vec![],
-                    })
+                    });
                 }
                 Err(d) => {
                     // Literals need context; widening a literal is pointless
@@ -1267,7 +1290,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: "expected an integer".into(),
                         notes: vec![],
-                    })
+                    });
                 }
                 Err(d) => {
                     if d.name == "type.ambiguous_literal" {
@@ -1289,25 +1312,23 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: "expected an `option<T>` value".into(),
                         notes: vec![],
-                    })
+                    });
                 }
             }
             Ty::Bool
         }
-        ExprKind::OptValue { operand } => {
-            match check_expr(ctx, operand, None)? {
-                Ty::Option(it) => Ty::Int(it),
-                other => {
-                    return Err(Diagnostic {
-                        name: "type.mismatch".into(),
-                        title: format!("`.value` on `{}`", other.name()),
-                        span,
-                        label: "expected an `option<T>` value".into(),
-                        notes: vec![],
-                    })
-                }
+        ExprKind::OptValue { operand } => match check_expr(ctx, operand, None)? {
+            Ty::Option(it) => Ty::Int(it),
+            other => {
+                return Err(Diagnostic {
+                    name: "type.mismatch".into(),
+                    title: format!("`.value` on `{}`", other.name()),
+                    span,
+                    label: "expected an `option<T>` value".into(),
+                    notes: vec![],
+                });
             }
-        }
+        },
         ExprKind::ClassField {
             obj,
             obj_span,
@@ -1333,7 +1354,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: format!("use `{obj}.{field}[i]` or `{obj}.{field}.len`"),
                         notes: vec![],
-                    })
+                    });
                 }
                 other => {
                     return Err(Diagnostic {
@@ -1342,7 +1363,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: "unsupported field read".into(),
                         notes: vec![],
-                    })
+                    });
                 }
             }
         }
@@ -1358,7 +1379,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: "not an array field".into(),
                         notes: vec![],
-                    })
+                    });
                 }
             }
         }
@@ -1379,7 +1400,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span,
                         label: "not indexable".into(),
                         notes: vec![],
-                    })
+                    });
                 }
             };
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
@@ -1598,7 +1619,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span: *recv_span,
                         label: format!("this has type `{}`", v.ty.name()),
                         notes: vec![],
-                    })
+                    });
                 }
                 None => {
                     return Err(Diagnostic {
@@ -1607,7 +1628,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span: *recv_span,
                         label: "not declared".into(),
                         notes: vec![],
-                    })
+                    });
                 }
             };
             let Some((_, params, ret, _)) = ctx.class_metas[ci]
@@ -1618,10 +1639,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             else {
                 return Err(Diagnostic {
                     name: "type.unknown_method".into(),
-                    title: format!(
-                        "`{}` has no method `{method}`",
-                        ctx.class_metas[ci].name
-                    ),
+                    title: format!("`{}` has no method `{method}`", ctx.class_metas[ci].name),
                     span: *method_span,
                     label: "not declared in the class".into(),
                     notes: vec![],
@@ -1649,15 +1667,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::ArrayLit(elems) => match expected {
             Some(Ty::Array(t, Mutability::Owned)) => {
-                if !ctx.in_test {
-                    return Err(Diagnostic {
-                        name: "type.owned_array_outside_test".into(),
-                        title: "array literals exist only in test functions for now".into(),
-                        span,
-                        label: "see docs/PLAN.md".into(),
-                        notes: vec![],
-                    });
-                }
                 for el in elems {
                     check_expr(ctx, el, Some(Ty::Int(t)))?;
                 }
@@ -1670,7 +1679,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     span,
                     label: "write `[i32] a = [ ... ];`".into(),
                     notes: vec![],
-                })
+                });
             }
         },
         ExprKind::Borrow { array, mutable } => {
@@ -1725,7 +1734,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     span,
                     label: "options are created only where an `option<T>` is expected".into(),
                     notes: vec![],
-                })
+                });
             }
         },
         ExprKind::NoneE => match expected {
@@ -1737,7 +1746,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     span,
                     label: "options are created only where an `option<T>` is expected".into(),
                     notes: vec![],
-                })
+                });
             }
         },
         ExprKind::Unary { op, operand } => match op {
@@ -1755,7 +1764,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                                 "note".into(),
                                 "unsigned negation is modular; use `wrap()` when it lands".into(),
                             )],
-                        })
+                        });
                     }
                     _ => {
                         return Err(Diagnostic {
@@ -1764,7 +1773,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             span,
                             label: "expected an integer".into(),
                             notes: vec![],
-                        })
+                        });
                     }
                 }
             }
@@ -1773,7 +1782,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 Ty::Bool
             }
         },
-        ExprKind::Binary { op, op_span, lhs, rhs } => {
+        ExprKind::Binary {
+            op,
+            op_span,
+            lhs,
+            rhs,
+        } => {
             let op = *op;
             let op_span = *op_span;
             // Operator sugar (ADR 0012): both operands are named class
@@ -1816,10 +1830,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 let Some(sym) = sym else {
                     return Err(Diagnostic {
                         name: "op.unbound".into(),
-                        title: format!(
-                            "`{}` is not an overloadable operator",
-                            op.symbol()
-                        ),
+                        title: format!("`{}` is not an overloadable operator", op.symbol()),
                         span: op_span,
                         label: "no operator binding applies".into(),
                         notes: vec![],
@@ -1846,7 +1857,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     });
                 };
                 let borrow = |name: String, span: Span| Expr {
-                    kind: ExprKind::Borrow { array: name, mutable: false },
+                    kind: ExprKind::Borrow {
+                        array: name,
+                        mutable: false,
+                    },
                     span,
                     ty: None,
                 };
@@ -1860,7 +1874,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     e.kind = ExprKind::Binary {
                         op,
                         op_span,
-                        lhs: Box::new(Expr { kind: call, span: e.span, ty: None }),
+                        lhs: Box::new(Expr {
+                            kind: call,
+                            span: e.span,
+                            ty: None,
+                        }),
                         rhs: Box::new(Expr {
                             kind: ExprKind::IntLit(0),
                             span: op_span,
@@ -1919,7 +1937,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         span: *callee_span,
                         label: "not defined in this module".into(),
                         notes: vec![],
-                    })
+                    });
                 }
             };
             if args.len() != sig.params.len() {
@@ -1947,7 +1965,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             if *callee == ctx.current_fn && !ctx.current_has_variant {
                 return Err(Diagnostic {
                     name: "type.recursion_needs_variant".into(),
-                    title: format!("`{callee}` calls itself without a `variant`", ),
+                    title: format!("`{callee}` calls itself without a `variant`",),
                     span: *callee_span,
                     label: "recursion requires a decreasing measure (design §8)".into(),
                     notes: vec![(
@@ -1969,7 +1987,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             span: arg.span,
                             label: "bool argument".into(),
                             notes: vec![],
-                        })
+                        });
                     }
                     Ty::Array(elem, m) => {
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
@@ -2041,10 +2059,7 @@ impl<'a> Ctx<'a> {
             .map(|(_, t)| *t)
             .ok_or_else(|| Diagnostic {
                 name: "type.unknown_field".into(),
-                title: format!(
-                    "`{}` has no field `{field}`",
-                    self.class_metas[ci].name
-                ),
+                title: format!("`{}` has no field `{field}`", self.class_metas[ci].name),
                 span,
                 label: "not declared in the class".into(),
                 notes: vec![],
@@ -2070,7 +2085,8 @@ impl<'a> Ctx<'a> {
 fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<IntTy> {
     match ctx.vars.get(array) {
         Some(VarInfo {
-            ty: Ty::Array(t, _), ..
+            ty: Ty::Array(t, _),
+            ..
         }) => Ok(*t),
         Some(v) => Err(Diagnostic {
             name: "type.not_an_array".into(),
@@ -2146,8 +2162,10 @@ fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<String> {
         InProgress,
         Done,
     }
-    let mut state: HashMap<&str, State> =
-        graph.keys().map(|k| (k.as_str(), State::Unvisited)).collect();
+    let mut state: HashMap<&str, State> = graph
+        .keys()
+        .map(|k| (k.as_str(), State::Unvisited))
+        .collect();
 
     fn dfs<'a>(
         node: &'a str,

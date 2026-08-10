@@ -1,0 +1,19 @@
+// Bare string literals construct `String` values in verified code: the
+// hidden byte temp binds the literal's UTF-8 bytes as concrete facts,
+// and the constructor's validScan pre discharges by simp unfolding
+// alone (the conditional step lemmas in the utf8 module) — no
+// hand-written proof at any literal site.
+
+use string;
+
+/// post result = 3
+fn ascii_len() -> u64 {
+    var s = "Hi!";
+    return s.byte_len();
+}
+
+/// post result = 6
+fn multibyte_len() -> u64 {
+    var s = "héllo";
+    return s.byte_len();
+}

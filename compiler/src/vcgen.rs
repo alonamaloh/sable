@@ -198,9 +198,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 result.obligations.push(Obligation {
                     thm_name: format!("vc_{}_{}", sanitize(&name), i),
                     name,
-                    kind_desc: format!(
-                        "`requires` of template `{tname}` at this instantiation"
-                    ),
+                    kind_desc: format!("`requires` of template `{tname}` at this instantiation"),
                     span: req.span,
                     goal: format!("({})", req.text),
                     binders: Vec::new(),
@@ -244,7 +242,9 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             generator
                 .hyps
                 .push((format!("h_{t}_wf"), format!("{t}.wf")));
-            generator.context.push((format!("type parameter {t}"), Span::new(0, 0)));
+            generator
+                .context
+                .push((format!("type parameter {t}"), Span::new(0, 0)));
             if let Some(Some(b)) = f.type_bounds.get(i) {
                 let tr = trait_map[b.as_str()];
                 for sp in &tr.specs {
@@ -253,14 +253,18 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                         .push((format!("{t}_{}", sp.name), sp.sig.clone()));
                 }
                 generator.trait_ctx.insert(t.clone(), tr);
-                generator.context.push((format!("bound {t}: {b}"), Span::new(0, 0)));
+                generator
+                    .context
+                    .push((format!("bound {t}: {b}"), Span::new(0, 0)));
             }
         }
         for req in &f.requires {
             generator
                 .hyps
                 .push((format!("h_req_{}", chslug(req)), format!("({})", req.text)));
-            generator.context.push((format!("requires {}", req.text), req.line_span));
+            generator
+                .context
+                .push((format!("requires {}", req.text), req.line_span));
         }
         generator.run();
     }
@@ -309,7 +313,9 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 generator
                     .hyps
                     .push((format!("h_{t}_wf"), format!("{t}.wf")));
-                generator.context.push((format!("type parameter {t}"), Span::new(0, 0)));
+                generator
+                    .context
+                    .push((format!("type parameter {t}"), Span::new(0, 0)));
                 if let Some(Some(b)) = c.type_bounds.get(i) {
                     let tr = trait_map[b.as_str()];
                     for sp in &tr.specs {
@@ -318,7 +324,9 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                             .push((format!("{t}_{}", sp.name), sp.sig.clone()));
                     }
                     generator.trait_ctx.insert(t.clone(), tr);
-                    generator.context.push((format!("bound {t}: {b}"), Span::new(0, 0)));
+                    generator
+                        .context
+                        .push((format!("bound {t}: {b}"), Span::new(0, 0)));
                 }
             }
             generator.run();
@@ -476,9 +484,7 @@ impl<'a> Generator<'a> {
             scope_binders.push((entry.clone(), "Sable.Seq Int".to_string()));
         }
         match self.cctx {
-            Cctx::Init(c) => {
-                scope_binders.push(("self".to_string(), lean_class_name(&c.name)))
-            }
+            Cctx::Init(c) => scope_binders.push(("self".to_string(), lean_class_name(&c.name))),
             Cctx::Method(c, _) => {
                 scope_binders.push(("self".to_string(), lean_class_name(&c.name)));
                 scope_binders.push(("_old_self".to_string(), lean_class_name(&c.name)));
@@ -530,7 +536,8 @@ impl<'a> Generator<'a> {
             // Deduped: invariants with a shared slug prefix must not
             // shadow each other (discharges cite these names).
             self.push_hyp_unique(format!("h_cinv_{}", chslug(inv)), format!("({prop})"));
-            self.context.push((format!("class invariant {}", inv.text), inv.line_span));
+            self.context
+                .push((format!("class invariant {}", inv.text), inv.line_span));
         }
     }
 
@@ -556,11 +563,11 @@ impl<'a> Generator<'a> {
                     // field facts and invariant — the method-entry
                     // treatment, re-aimed.
                     let cd = &self.classes[ci];
-                    self.binders.push((p.name.clone(), lean_class_name(&cd.name)));
+                    self.binders
+                        .push((p.name.clone(), lean_class_name(&cd.name)));
                     self.push_class_state_facts(cd, &p.name);
                     self.push_invariant_hyps(cd, &p.name);
-                    self.env
-                        .insert(p.name.clone(), Val::Obj(p.name.clone()));
+                    self.env.insert(p.name.clone(), Val::Obj(p.name.clone()));
                 }
                 Ty::Int(it) => {
                     self.binders.push((p.name.clone(), "Int".into()));
@@ -612,7 +619,8 @@ impl<'a> Generator<'a> {
             let _ = i;
             self.hyps
                 .push((format!("h_pre_{}", chslug(pre)), format!("({hyp})")));
-            self.context.push((format!("pre {}", pre.text), pre.line_span));
+            self.context
+                .push((format!("pre {}", pre.text), pre.line_span));
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
                 def_name: format!("wf_{}_pre_{}", sanitize(&self.fname), i + 1),
@@ -694,8 +702,7 @@ impl<'a> Generator<'a> {
                 );
                 let ob = self.obligation(
                     &format!("{}.variant_decreases.{}", self.fname, cslug(variant)),
-                    "loop variant must be a nonnegative measure that strictly decreases"
-                        .into(),
+                    "loop variant must be a nonnegative measure that strictly decreases".into(),
                     variant.span,
                     goal,
                 );
@@ -714,6 +721,7 @@ impl<'a> Generator<'a> {
                             | ExprKind::CtorCall { .. }
                             | ExprKind::TraitCall { .. }
                             | ExprKind::AllocArray { .. }
+                            | ExprKind::ArrayLit(_)
                     ) {
                         self.name_hint = Some(name.clone());
                     }
@@ -733,6 +741,7 @@ impl<'a> Generator<'a> {
                         | ExprKind::CtorCall { .. }
                         | ExprKind::TraitCall { .. }
                         | ExprKind::AllocArray { .. }
+                        | ExprKind::ArrayLit(_)
                 ) {
                     self.name_hint = Some(name.clone());
                 }
@@ -765,13 +774,8 @@ impl<'a> Generator<'a> {
                                 for inv in &cd.invariants {
                                     let goal = substitute(&inv.text, &map, None);
                                     let ob = self.obligation(
-                                        &format!(
-                                            "{}.ret_inv.{}",
-                                            self.fname,
-                                            cslug(inv)
-                                        ),
-                                        "invariant of the returned class value"
-                                            .to_string(),
+                                        &format!("{}.ret_inv.{}", self.fname, cslug(inv)),
+                                        "invariant of the returned class value".to_string(),
                                         value.span,
                                         goal,
                                     );
@@ -798,6 +802,7 @@ impl<'a> Generator<'a> {
                         | ExprKind::CtorCall { .. }
                         | ExprKind::TraitCall { .. }
                         | ExprKind::AllocArray { .. }
+                        | ExprKind::ArrayLit(_)
                 ) {
                     self.name_hint = Some(name.clone());
                 }
@@ -857,8 +862,7 @@ impl<'a> Generator<'a> {
                 let updated = format!("({arr}.set {i} {v})");
                 match self.cctx {
                     Cctx::Init(_) => {
-                        self.env
-                            .insert(format!("self.{field}"), Val::Arr(updated));
+                        self.env.insert(format!("self.{field}"), Val::Arr(updated));
                     }
                     Cctx::Method(..) => {
                         let chain = self.self_chain();
@@ -913,8 +917,7 @@ impl<'a> Generator<'a> {
                 let snap_hyps = self.hyps.clone();
                 let snap_ctx = self.context.clone();
 
-                self.hyps
-                    .push((format!("h_path_{}", hslug(&p)), p.clone()));
+                self.hyps.push((format!("h_path_{}", hslug(&p)), p.clone()));
                 self.context.push((format!("path {p}"), cond.span));
                 let then_stmts: Vec<&Stmt> =
                     then_block.iter().chain(rest.iter().copied()).collect();
@@ -943,11 +946,7 @@ impl<'a> Generator<'a> {
                 // maps to its own span.
                 self.fresh += 1;
                 self.out.clause_wfs.push(ClauseWf {
-                    def_name: format!(
-                        "wf_{}_assert{}",
-                        sanitize(&self.fname),
-                        self.fresh
-                    ),
+                    def_name: format!("wf_{}_assert{}", sanitize(&self.fname), self.fresh),
                     binders: self.scope_binders(),
                     text: self.preprocess(&clause.text),
                     span: clause.line_span,
@@ -965,11 +964,9 @@ impl<'a> Generator<'a> {
                     goal.clone(),
                 );
                 self.push_obligation(ob);
-                self.push_hyp_unique(
-                    format!("h_assert_{}", chslug(clause)),
-                    format!("({goal})"),
-                );
-                self.context.push((format!("assert {}", clause.text), clause.line_span));
+                self.push_hyp_unique(format!("h_assert_{}", chslug(clause)), format!("({goal})"));
+                self.context
+                    .push((format!("assert {}", clause.text), clause.line_span));
                 self.exec(rest, tail);
             }
             Stmt::While {
@@ -984,15 +981,14 @@ impl<'a> Generator<'a> {
                 // Well-formedness defs so clause elaboration errors map to
                 // the clause span. Binders: everything in scope.
                 let scope_binders = self.scope_binders();
-                for (i, clause) in invariants.iter().chain(std::iter::once(variant)).enumerate() {
+                for (i, clause) in invariants
+                    .iter()
+                    .chain(std::iter::once(variant))
+                    .enumerate()
+                {
                     self.fresh += 1;
                     self.out.clause_wfs.push(ClauseWf {
-                        def_name: format!(
-                            "wf_{}_loop{}_{}",
-                            sanitize(&self.fname),
-                            self.fresh,
-                            i
-                        ),
+                        def_name: format!("wf_{}_loop{}_{}", sanitize(&self.fname), self.fresh, i),
                         binders: scope_binders.clone(),
                         text: self.preprocess(&clause.text),
                         span: clause.span,
@@ -1021,11 +1017,9 @@ impl<'a> Generator<'a> {
                 for inv in invariants.iter() {
                     let text = self.subst_env(&self.preprocess(&inv.text));
                     // Deduped: same-slug invariants must not shadow.
-                    self.push_hyp_unique(
-                        format!("h_inv_{}", chslug(inv)),
-                        format!("({text})"),
-                    );
-                    self.context.push((format!("invariant {}", inv.text), inv.line_span));
+                    self.push_hyp_unique(format!("h_inv_{}", chslug(inv)), format!("({text})"));
+                    self.context
+                        .push((format!("invariant {}", inv.text), inv.line_span));
                 }
                 let p = self.eval_prop(cond);
 
@@ -1043,8 +1037,7 @@ impl<'a> Generator<'a> {
                     format!("h_variant_{}", chslug(variant)),
                     format!("{v0} = ({vtext})"),
                 ));
-                self.hyps
-                    .push((format!("h_path_{}", hslug(&p)), p.clone()));
+                self.hyps.push((format!("h_path_{}", hslug(&p)), p.clone()));
                 self.context.push((format!("path {p}"), cond.span));
                 let body_stmts: Vec<&Stmt> = body.iter().collect();
                 let loop_tail = Tail::Loop {
@@ -1191,9 +1184,10 @@ impl<'a> Generator<'a> {
                                 self.fresh += 1;
                                 let b = format!("_self{}_{}", self.fresh, fld.name);
                                 self.binders.push((b.clone(), "Sable.Seq Int".into()));
-                                if !havoc_set.iter().any(|h| {
-                                    !stale_map.contains_key(h) && mentions(&prior, h)
-                                }) {
+                                if !havoc_set
+                                    .iter()
+                                    .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
+                                {
                                     self.push_hyp_unique(
                                         format!("h_self_{}_len", fld.name),
                                         format!("({b}.len) = ({prior}.len)"),
@@ -1360,10 +1354,7 @@ impl<'a> Generator<'a> {
                 let goal = format!("({o}) ≠ none");
                 let ob = self.obligation(
                     &format!("{}.option.{}", self.fname, slug(self.src(e.span))),
-                    format!(
-                        "`{}` must hold a value here",
-                        self.src_short(e.span)
-                    ),
+                    format!("`{}` must hold a value here", self.src_short(e.span)),
                     e.span,
                     goal.clone(),
                 );
@@ -1398,8 +1389,20 @@ impl<'a> Generator<'a> {
                 Some(Val::Obj(chain)) => Val::Obj(chain.clone()),
                 _ => Val::Arr(self.arr_str(array)),
             },
-            ExprKind::ArrayLit(_) => {
-                unreachable!("checked: test-only expression")
+            ExprKind::ArrayLit(elems) => {
+                let hint = self.name_hint.take();
+                let b = self.hinted_sym("_lit", hint);
+                self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                let h1 = self.fresh_hyp("h_lit");
+                self.hyps.push((h1, format!("({b}.len) = {}", elems.len())));
+                for (i, el) in elems.iter().enumerate() {
+                    let Val::Int(v) = self.eval(el) else {
+                        unreachable!()
+                    };
+                    let h = self.fresh_hyp("h_lit");
+                    self.hyps.push((h, format!("{b}.get {i} = {v}")));
+                }
+                Val::Arr(b)
             }
             ExprKind::Index { array, index, .. } => {
                 let Val::Int(i) = self.eval(index) else {
@@ -1444,10 +1447,8 @@ impl<'a> Generator<'a> {
                 let h1 = self.fresh_hyp("h_alloc");
                 self.hyps.push((h1, format!("({b}.len) = {n}")));
                 let h2 = self.fresh_hyp("h_alloc");
-                self.hyps.push((
-                    h2,
-                    format!("∀ k, 0 ≤ k → k < {b}.len → {b}.get k = {v0}"),
-                ));
+                self.hyps
+                    .push((h2, format!("∀ k, 0 ≤ k → k < {b}.len → {b}.get k = {v0}")));
                 Val::Arr(b)
             }
             ExprKind::ClassField { obj, field, .. } => {
@@ -1492,9 +1493,7 @@ impl<'a> Generator<'a> {
                     .get(&format!("self.{field}"))
                     .cloned()
                     .expect("checked: field initialized"),
-                Cctx::Method(..) => {
-                    Val::Int(project_field(&self.self_chain(), field))
-                }
+                Cctx::Method(..) => Val::Int(project_field(&self.self_chain(), field)),
                 Cctx::None => unreachable!("checked: fields only in members"),
             },
             ExprKind::SelfFieldLen { field } => {
@@ -1555,13 +1554,7 @@ impl<'a> Generator<'a> {
                 for pre in &ifn.pres {
                     let goal = substitute(&pre.text, &subst_map, None);
                     let ob = self.obligation(
-                        &format!(
-                            "{}.call_pre.{}_{}.{}",
-                            self.fname,
-                            class,
-                            init,
-                            cslug(pre)
-                        ),
+                        &format!("{}.call_pre.{}_{}.{}", self.fname, class, init, cslug(pre)),
                         format!(
                             "`pre {}` of `{class}::{init}` must hold at this call",
                             pre.text
@@ -1594,7 +1587,10 @@ impl<'a> Generator<'a> {
                 Val::Obj(b)
             }
             ExprKind::TraitCall {
-                param, method, args, ..
+                param,
+                method,
+                args,
+                ..
             } => {
                 let hint = self.name_hint.take();
                 let arg_vals: Vec<String> = args
@@ -1616,10 +1612,7 @@ impl<'a> Generator<'a> {
                 // `Self::spec` → the abstract binder; `Self` → the model.
                 let mut qual: HashMap<String, String> = HashMap::new();
                 for sp in &tr.specs {
-                    qual.insert(
-                        format!("Self::{}", sp.name),
-                        format!("{param}_{}", sp.name),
-                    );
+                    qual.insert(format!("Self::{}", sp.name), format!("{param}_{}", sp.name));
                 }
                 qual.insert("Self".to_string(), param.clone());
                 let mut argmap: HashMap<String, String> = HashMap::new();
@@ -1630,11 +1623,7 @@ impl<'a> Generator<'a> {
                     let text = crate::mono::subst_clause_text(&pre.text, &qual);
                     let goal = substitute(&text, &argmap, None);
                     let ob = self.obligation(
-                        &format!(
-                            "{}.call_pre.{param}_{method}.{}",
-                            self.fname,
-                            cslug(pre)
-                        ),
+                        &format!("{}.call_pre.{param}_{method}.{}", self.fname, cslug(pre)),
                         format!("`pre {}` of `{param}::{method}` must hold", pre.text),
                         e.span,
                         goal,
@@ -1664,8 +1653,10 @@ impl<'a> Generator<'a> {
                         format!("h_{param}_{method}_post_{}", chslug(post)),
                         format!("({prop})"),
                     );
-                    self.context
-                        .push((format!("from `{param}::{method}` post: {}", post.text), post.line_span));
+                    self.context.push((
+                        format!("from `{param}::{method}` post: {}", post.text),
+                        post.line_span,
+                    ));
                 }
                 Val::Int(ret_sym)
             }
@@ -1773,8 +1764,10 @@ impl<'a> Generator<'a> {
                         ),
                         format!("({prop})"),
                     );
-                    self.context
-                        .push((format!("from `{}::{method}` post: {}", cd.name, post.text), post.line_span));
+                    self.context.push((
+                        format!("from `{}::{method}` post: {}", cd.name, post.text),
+                        post.line_span,
+                    ));
                 }
                 match m.f.ret {
                     Ty::Option(_) => Val::Opt(ret_sym),
@@ -1852,20 +1845,14 @@ impl<'a> Generator<'a> {
                             let goal = format!("{r} ≠ 0");
                             let ob = self.obligation(
                                 &format!("{}.div_zero.{}", self.fname, slug(self.src(e.span))),
-                                format!(
-                                    "divisor `{}` must be nonzero",
-                                    self.src_short(rhs.span)
-                                ),
+                                format!("divisor `{}` must be nonzero", self.src_short(rhs.span)),
                                 rhs.span,
                                 goal.clone(),
                             );
                             self.push_obligation(ob);
                             self.assume_fact(&goal);
                             if it.signed() && *op == BinOp::Div {
-                                let goal = format!(
-                                    "¬({l} = {} ∧ {r} = (-1))",
-                                    it.lean_min()
-                                );
+                                let goal = format!("¬({l} = {} ∧ {r} = (-1))", it.lean_min());
                                 let ob = self.obligation(
                                     &format!(
                                         "{}.div_overflow.{}",
@@ -1889,13 +1876,9 @@ impl<'a> Generator<'a> {
                                 // assumed to spare the portfolio nonlinear
                                 // reasoning (e.g. gcd's descent VC).
                                 if *op == BinOp::Rem {
-                                    self.assume_fact(&format!(
-                                        "0 ≤ {value} ∧ {value} < {r}"
-                                    ));
+                                    self.assume_fact(&format!("0 ≤ {value} ∧ {value} < {r}"));
                                 } else {
-                                    self.assume_fact(&format!(
-                                        "0 ≤ {value} ∧ {value} ≤ {l}"
-                                    ));
+                                    self.assume_fact(&format!("0 ≤ {value} ∧ {value} ≤ {l}"));
                                 }
                             }
                         }
@@ -1928,16 +1911,8 @@ impl<'a> Generator<'a> {
                         for inv in &cd.invariants {
                             let goal = substitute(&inv.text, &map, None);
                             let ob = self.obligation(
-                                &format!(
-                                    "{}.borrow_inv.{}.{}",
-                                    self.fname,
-                                    p.name,
-                                    cslug(inv)
-                                ),
-                                format!(
-                                    "invariant of the borrowed `{}` argument",
-                                    cd.name
-                                ),
+                                &format!("{}.borrow_inv.{}.{}", self.fname, p.name, cslug(inv)),
+                                format!("invariant of the borrowed `{}` argument", cd.name),
                                 e.span,
                                 goal,
                             );
@@ -1955,10 +1930,7 @@ impl<'a> Generator<'a> {
                 // pre-call state.
                 for p in &sig.params {
                     if matches!(p.ty, Ty::Array(_, Mutability::Mut)) {
-                        subst_map.insert(
-                            format!("_old_{}", p.name),
-                            subst_map[&p.name].clone(),
-                        );
+                        subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
                     }
                 }
 
@@ -1980,9 +1952,8 @@ impl<'a> Generator<'a> {
                     let vtext = self.preprocess(&variant.text);
                     let callee_measure = substitute(&vtext, &subst_map, None);
                     let caller_measure = self.subst_env(&vtext);
-                    let goal = format!(
-                        "0 ≤ ({callee_measure}) ∧ ({callee_measure}) < ({caller_measure})"
-                    );
+                    let goal =
+                        format!("0 ≤ ({callee_measure}) ∧ ({callee_measure}) < ({caller_measure})");
                     let ob = self.obligation(
                         &format!("{}.termination.{}", self.fname, cslug(variant)),
                         "recursive call must decrease the function's `variant`".into(),
@@ -2047,7 +2018,8 @@ impl<'a> Generator<'a> {
                         // and the invariant (the callee proved ret_inv;
                         // ADR 0010).
                         let cd = &self.classes[ci];
-                        self.binders.push((ret_sym.clone(), lean_class_name(&cd.name)));
+                        self.binders
+                            .push((ret_sym.clone(), lean_class_name(&cd.name)));
                         self.push_class_state_facts(cd, &ret_sym);
                         self.push_invariant_hyps(cd, &ret_sym);
                     }
@@ -2066,8 +2038,10 @@ impl<'a> Generator<'a> {
                         format!("h_{}_post_{}", sanitize(callee), chslug(post)),
                         format!("({prop})"),
                     );
-                    self.context
-                        .push((format!("from `{callee}` post: {}", post.text), post.line_span));
+                    self.context.push((
+                        format!("from `{callee}` post: {}", post.text),
+                        post.line_span,
+                    ));
                 }
                 match sig.ret {
                     Ty::Option(_) => Val::Opt(ret_sym),
@@ -2323,7 +2297,8 @@ impl<'a> Generator<'a> {
                 goal,
             );
             if f.ret != Ty::Unit {
-                ob.binders.push(("result".to_string(), self.result_lean_ty()));
+                ob.binders
+                    .push(("result".to_string(), self.result_lean_ty()));
             }
             if let Some(eq) = &result_eq {
                 ob.hyps.push(("h_result".to_string(), eq.clone()));
@@ -2679,10 +2654,7 @@ pub fn lean_class_name(name: &str) -> String {
 fn project_field(state: &str, field: &str) -> String {
     let mut cur = state.trim();
     loop {
-        let Some(body) = cur
-            .strip_prefix("{ ")
-            .and_then(|s| s.strip_suffix(" }"))
-        else {
+        let Some(body) = cur.strip_prefix("{ ").and_then(|s| s.strip_suffix(" }")) else {
             break;
         };
         // The ` with ` belonging to THIS level is at brace/paren depth 0.
@@ -2767,7 +2739,11 @@ pub fn sanitize(name: &str) -> String {
 /// so repeated content simply shadows — no counters needed.
 fn hslug(text: &str) -> String {
     let full = slug(text);
-    full.chars().take(24).collect::<String>().trim_end_matches('_').to_string()
+    full.chars()
+        .take(24)
+        .collect::<String>()
+        .trim_end_matches('_')
+        .to_string()
 }
 
 pub fn slug(text: &str) -> String {
@@ -2786,9 +2762,5 @@ pub fn slug(text: &str) -> String {
         }
     }
     let out = out.trim_matches('_').to_string();
-    if out.is_empty() {
-        "e".to_string()
-    } else {
-        out
-    }
+    if out.is_empty() { "e".to_string() } else { out }
 }

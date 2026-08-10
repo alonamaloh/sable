@@ -3,7 +3,7 @@
 //! corpus/must-fail/ must fail with the diagnostic named in its
 //! `// expect-error:` header lines.
 
-use sable::{check_file, Options, Outcome};
+use sable::{Options, Outcome, check_file};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
@@ -12,17 +12,22 @@ use std::thread;
 /// strings. The Lean checks dominate wall clock and the files are
 /// independent, so this is a near-linear speedup.
 fn parallel<T: Send>(items: Vec<T>, work: impl Fn(&T) -> Vec<String> + Sync) -> Vec<String> {
-    let n = thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(8);
+    let n = thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(8);
     let items = Mutex::new(items.into_iter());
     let failures = Mutex::new(Vec::new());
     thread::scope(|s| {
         for _ in 0..n {
-            s.spawn(|| loop {
-                let Some(item) = items.lock().unwrap().next() else {
-                    break;
-                };
-                let fs = work(&item);
-                failures.lock().unwrap().extend(fs);
+            s.spawn(|| {
+                loop {
+                    let Some(item) = items.lock().unwrap().next() else {
+                        break;
+                    };
+                    let fs = work(&item);
+                    failures.lock().unwrap().extend(fs);
+                }
             });
         }
     });
@@ -171,14 +176,12 @@ fn corpus() {
                 let mut matched_fences = vec![false; expected_skips.len()];
                 for r in &reports {
                     if let Err(msg) = &r.outcome {
-                        failures.push(format!(
-                            "{} test {} failed: {msg}",
-                            path.display(),
-                            r.name
-                        ));
+                        failures.push(format!("{} test {} failed: {msg}", path.display(), r.name));
                     }
                     for (clause, why) in &r.skipped {
-                        let fence = expected_skips.iter().position(|s| clause.contains(s.as_str()));
+                        let fence = expected_skips
+                            .iter()
+                            .position(|s| clause.contains(s.as_str()));
                         match fence {
                             Some(i) => matched_fences[i] = true,
                             None => failures.push(format!(

@@ -10,6 +10,7 @@ pub enum Tok {
     Ident(String),
     Int(i128),
     Bytes(Vec<u8>),
+    Str(Vec<u8>),
     KwFn,
     KwReturn,
     KwIf,
@@ -59,6 +60,7 @@ impl Tok {
             Tok::Ident(s) => format!("identifier `{s}`"),
             Tok::Int(n) => format!("integer literal `{n}`"),
             Tok::Bytes(_) => "byte-string literal".to_string(),
+            Tok::Str(_) => "string literal".to_string(),
             Tok::Eof => "end of file".to_string(),
             other => format!("`{}`", other.text()),
         }
@@ -166,7 +168,7 @@ fn lex_byte_string(text: &str, open: usize) -> Result<(Vec<u8>, usize), Diagnost
                             span: Span::new(esc_start, (i + 1).min(bytes.len())),
                             label: "the escapes are `\\n \\r \\t \\0 \\\\ \\\" \\xNN`".into(),
                             notes: vec![],
-                        })
+                        });
                     }
                 }
                 i += 1;
@@ -197,9 +199,9 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
             continue;
         }
         let start = i;
-        // Byte-string literal: b"..." is a [u8] literal of the UTF-8
-        // bytes between the quotes. A bare "..." is reserved for the
-        // String type (ADR 0014).
+        // b"..." is a [u8] literal of the bytes between the quotes; a
+        // bare "..." builds a `String` and must be valid UTF-8
+        // (ADR 0014).
         if b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
             let (value, end) = lex_byte_string(text, i + 1)?;
             tokens.push(Token {
@@ -210,13 +212,25 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
             continue;
         }
         if b == b'"' {
-            return Err(Diagnostic {
-                name: "lex.string_reserved".into(),
-                title: "bare string literal".into(),
-                span: Span::new(i, i + 1),
-                label: "reserved for `String`; a `[u8]` byte literal is written `b\"...\"`".into(),
-                notes: vec![],
+            let (value, end) = lex_byte_string(text, i)?;
+            // A bare literal builds a `String`; its bytes must be valid
+            // UTF-8 (escapes can spell arbitrary bytes — those belong in
+            // a b"..." byte literal).
+            if std::str::from_utf8(&value).is_err() {
+                return Err(Diagnostic {
+                    name: "lex.string_not_utf8".into(),
+                    title: "string literal is not valid UTF-8".into(),
+                    span: Span::new(start, end),
+                    label: "a `String` holds valid UTF-8; raw bytes are written `b\"...\"`".into(),
+                    notes: vec![],
+                });
+            }
+            tokens.push(Token {
+                tok: Tok::Str(value),
+                span: Span::new(start, end),
             });
+            i = end;
+            continue;
         }
         if b.is_ascii_alphabetic() || b == b'_' {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -308,11 +322,14 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
                 _ => {
                     return Err(Diagnostic {
                         name: "lex.unexpected_char".into(),
-                        title: format!("unexpected character `{}`", text[i..].chars().next().unwrap()),
+                        title: format!(
+                            "unexpected character `{}`",
+                            text[i..].chars().next().unwrap()
+                        ),
                         span: Span::new(i, i + 1),
                         label: "not part of the Sable program language".into(),
                         notes: vec![],
-                    })
+                    });
                 }
             },
         };

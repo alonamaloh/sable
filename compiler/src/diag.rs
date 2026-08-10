@@ -25,13 +25,7 @@ impl Diagnostic {
         self.render_level("error", path, source, lines)
     }
 
-    pub fn render_level(
-        &self,
-        level: &str,
-        path: &str,
-        source: &str,
-        lines: &LineMap,
-    ) -> String {
+    pub fn render_level(&self, level: &str, path: &str, source: &str, lines: &LineMap) -> String {
         let (line, col) = lines.line_col(self.span.start);
         let mut out = String::new();
         out.push_str(&format!("{level}: {}\n", self.title));

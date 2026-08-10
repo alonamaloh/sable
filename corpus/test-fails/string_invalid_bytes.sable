@@ -1,0 +1,9 @@
+// expect-test-failure: pre of `String::from_bytes` violated
+// An overlong encoding is not valid UTF-8; the monitored pre rejects it.
+
+use string;
+
+fn test_invalid_bytes() {
+    [u8] bad = b"A\xc0\x80B";
+    var s = String::from_bytes(&bad);
+}

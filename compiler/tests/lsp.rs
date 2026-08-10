@@ -107,7 +107,10 @@ fn broken(bool c) -> i32 {\n\
     let hover = read_message(&mut stdout);
     let value = hover["result"]["contents"]["value"].as_str().unwrap();
     assert!(value.contains("**pre** `b > 0`"), "hover was: {value}");
-    assert!(value.contains("**post** `result = a / b`"), "hover: {value}");
+    assert!(
+        value.contains("**post** `result = a / b`"),
+        "hover: {value}"
+    );
 
     // Semantic tokens: 4 proof lines → 4 line tokens, all interface (=1).
     send(

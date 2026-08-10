@@ -23,7 +23,9 @@ foo.sable
   │  scan: split proof lines (///) from program text; group into blocks;
   │        attach blocks positionally (doc-comment rule)
   ▼
-parse (compiler/src/parser.rs)        handwritten recursive descent, error recovery
+parse (compiler/src/parser.rs)        handwritten recursive descent, error recovery;
+  │                                   bare string literals desugar here to a hidden
+  │                                   [u8] temp + String::from_bytes(&temp) (ADR 0015)
   ▼
 mono (compiler/src/mono.rs)           monomorphization (ADR 0006/0007): expands
   │                                   every generic instantiation (mangled names,

@@ -1,0 +1,9 @@
+// expect-error: string.literal_position
+// Bare literals bind through `var`; other positions are rejected.
+
+fn take(i32 x) {
+}
+
+fn test_f() {
+    take("hi");
+}

@@ -204,6 +204,325 @@ fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
 ///   rw [if_pos h]
 ///   trivial
 
+// `validScan` is the byte-table form of the same property: a forward
+// scan over RFC 3629's lead/continuation ranges, with no existential —
+// so it lies in the monitorable fragment and, on a literal's concrete
+// bytes, discharges by `simp` unfolding alone. `validScan_sound` ties
+// it to the canonical predicate: every scan-accepted buffer is
+// decomposable into scalar encodings. String's class invariant speaks
+// validScan; consumers reach validFrom through the lemma.
+
+/// def validScan (b : Sable.Seq Int) (pos : int) : Prop :=
+///   if b.len ≤ pos then True
+///   else if 0 ≤ b.get pos ∧ b.get pos ≤ 127 then validScan b (pos + 1)
+///   else if 194 ≤ b.get pos ∧ b.get pos ≤ 223 then
+///     pos + 2 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧ validScan b (pos + 2)
+///   else if b.get pos = 224 then
+///     pos + 3 ≤ b.len ∧ 160 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///       128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3)
+///   else if 225 ≤ b.get pos ∧ b.get pos ≤ 236 then
+///     pos + 3 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///       128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3)
+///   else if b.get pos = 237 then
+///     pos + 3 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 159 ∧
+///       128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3)
+///   else if 238 ≤ b.get pos ∧ b.get pos ≤ 239 then
+///     pos + 3 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///       128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3)
+///   else if b.get pos = 240 then
+///     pos + 4 ≤ b.len ∧ 144 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///       128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧
+///       128 ≤ b.get (pos + 3) ∧ b.get (pos + 3) ≤ 191 ∧ validScan b (pos + 4)
+///   else if 241 ≤ b.get pos ∧ b.get pos ≤ 243 then
+///     pos + 4 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///       128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧
+///       128 ≤ b.get (pos + 3) ∧ b.get (pos + 3) ≤ 191 ∧ validScan b (pos + 4)
+///   else if b.get pos = 244 then
+///     pos + 4 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 143 ∧
+///       128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧
+///       128 ≤ b.get (pos + 3) ∧ b.get (pos + 3) ≤ 191 ∧ validScan b (pos + 4)
+///   else False
+/// termination_by (b.len - pos).toNat
+/// decreasing_by all_goals omega
+
+// Conditional step lemmas: simp applies one only when the byte-range
+// side conditions discharge — so a literal's concrete bytes unfold the
+// scan automatically, while an abstract `validScan` hypothesis (a
+// String invariant in scope, say) is left untouched.
+
+/// theorem #[unfold] validScan_done (b : Sable.Seq Int) (pos : int)
+///     (h : b.len ≤ pos) : validScan b pos ↔ True := by
+///   rw [validScan, if_pos h]
+
+/// theorem #[unfold] validScan_ascii (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : 0 ≤ b.get pos) (h2 : b.get pos ≤ 127) :
+///     validScan b pos ↔ validScan b (pos + 1) := by
+///   rw [validScan, if_neg (by omega), if_pos ⟨h1, h2⟩]
+
+/// theorem #[unfold] validScan_two (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : 194 ≤ b.get pos) (h2 : b.get pos ≤ 223) :
+///     validScan b pos ↔
+///       pos + 2 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧ validScan b (pos + 2) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_pos ⟨h1, h2⟩]
+
+/// theorem #[unfold] validScan_e0 (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : b.get pos = 224) :
+///     validScan b pos ↔
+///       pos + 3 ≤ b.len ∧ 160 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///         128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_neg (by omega), if_pos h1]
+
+/// theorem #[unfold] validScan_three (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : 225 ≤ b.get pos) (h2 : b.get pos ≤ 236) :
+///     validScan b pos ↔
+///       pos + 3 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///         128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///      if_pos ⟨h1, h2⟩]
+
+/// theorem #[unfold] validScan_ed (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : b.get pos = 237) :
+///     validScan b pos ↔
+///       pos + 3 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 159 ∧
+///         128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///      if_neg (by omega), if_pos h1]
+
+/// theorem #[unfold] validScan_ee (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : 238 ≤ b.get pos) (h2 : b.get pos ≤ 239) :
+///     validScan b pos ↔
+///       pos + 3 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///         128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧ validScan b (pos + 3) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///      if_neg (by omega), if_neg (by omega), if_pos ⟨h1, h2⟩]
+
+/// theorem #[unfold] validScan_f0 (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : b.get pos = 240) :
+///     validScan b pos ↔
+///       pos + 4 ≤ b.len ∧ 144 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///         128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧
+///         128 ≤ b.get (pos + 3) ∧ b.get (pos + 3) ≤ 191 ∧ validScan b (pos + 4) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///      if_neg (by omega), if_neg (by omega), if_neg (by omega), if_pos h1]
+
+/// theorem #[unfold] validScan_f13 (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : 241 ≤ b.get pos) (h2 : b.get pos ≤ 243) :
+///     validScan b pos ↔
+///       pos + 4 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 191 ∧
+///         128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧
+///         128 ≤ b.get (pos + 3) ∧ b.get (pos + 3) ≤ 191 ∧ validScan b (pos + 4) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///      if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega), if_pos ⟨h1, h2⟩]
+
+/// theorem #[unfold] validScan_f4 (b : Sable.Seq Int) (pos : int)
+///     (hp : pos < b.len) (h1 : b.get pos = 244) :
+///     validScan b pos ↔
+///       pos + 4 ≤ b.len ∧ 128 ≤ b.get (pos + 1) ∧ b.get (pos + 1) ≤ 143 ∧
+///         128 ≤ b.get (pos + 2) ∧ b.get (pos + 2) ≤ 191 ∧
+///         128 ≤ b.get (pos + 3) ∧ b.get (pos + 3) ≤ 191 ∧ validScan b (pos + 4) := by
+///   rw [validScan, if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///      if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///      if_neg (by omega), if_pos h1]
+
+// Congruence: a byte-for-byte copy (on the in-range prefix) preserves
+// the scan. Positions stay ≥ 0, so every read is in range.
+
+/// theorem validScan_congr (a b : Sable.Seq Int) (pos : int)
+///     (hlen : b.len = a.len)
+///     (hget : ∀ k, 0 ≤ k → k < a.len → b.get k = a.get k)
+///     (hpos : 0 ≤ pos)
+///     (h : validScan a pos) : validScan b pos := by
+///   fun_induction validScan a pos
+///   case case1 pos hend => exact (validScan_done b pos (by omega)).mpr trivial
+///   next pos hend hascii ih =>
+///     rw [validScan_ascii b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)
+///       (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ih (by omega) h
+///   next pos hend _ hc ih =>
+///     obtain ⟨hL, h1, h2, hrest⟩ := h
+///     rw [validScan_two b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)
+///       (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ hc ih =>
+///     obtain ⟨hL, h1, h2, h3, h4, hrest⟩ := h
+///     rw [validScan_e0 b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ _ hc ih =>
+///     obtain ⟨hL, h1, h2, h3, h4, hrest⟩ := h
+///     rw [validScan_three b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)
+///       (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ _ _ hc ih =>
+///     obtain ⟨hL, h1, h2, h3, h4, hrest⟩ := h
+///     rw [validScan_ed b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ _ _ _ hc ih =>
+///     obtain ⟨hL, h1, h2, h3, h4, hrest⟩ := h
+///     rw [validScan_ee b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)
+///       (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ _ _ _ _ hc ih =>
+///     obtain ⟨hL, h1, h2, h3, h4, h5, h6, hrest⟩ := h
+///     rw [validScan_f0 b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+3) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+3) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ _ _ _ _ _ hc ih =>
+///     obtain ⟨hL, h1, h2, h3, h4, h5, h6, hrest⟩ := h
+///     rw [validScan_f13 b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)
+///       (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+3) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+3) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ _ _ _ _ _ _ hc ih =>
+///     obtain ⟨hL, h1, h2, h3, h4, h5, h6, hrest⟩ := h
+///     rw [validScan_f4 b pos (by omega) (by rw [hget pos hpos (by omega)]; omega)]
+///     exact ⟨by omega, by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+1) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+2) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+3) (by omega) (by omega)]; omega,
+///       by rw [hget (pos+3) (by omega) (by omega)]; omega, ih (by omega) hrest⟩
+///   next pos hend _ _ _ _ _ _ _ _ _ =>
+///     exact absurd h (by simp)
+
+/// theorem validScan_sound (b : Sable.Seq Int) (pos : int)
+///     (h : validScan b pos) : validFrom b pos := by
+///   fun_induction validScan b pos
+///   case case1 pos hend => exact validFrom_end b pos (by omega)
+///   next pos hend hascii ih =>
+///     have hl : utf8_len (b.get pos) = 1 := by simp [utf8_len]; omega
+///     refine validFrom_step b pos (b.get pos) (by omega) (by simp [scalar]; omega)
+///       (by rw [hl]; omega) (by simp [utf8_b0]; omega)
+///       (by rw [hl]; intro hx; omega) (by rw [hl]; intro hx; omega) (by rw [hl]; intro hx; omega)
+///       ?_
+///     rw [hl]; exact ih h
+///   next pos hend _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hrest⟩ := h
+///     have hl2 : utf8_len ((b.get pos - 192) * 64 + (b.get (pos + 1) - 128)) = 2 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 192) * 64 + (b.get (pos + 1) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl2]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl2]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl2]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl2]; intro _; simp only [utf8_b3]; repeat (first | omega | split))
+///       (by rw [hl2]; exact ih hrest)
+///   next pos hend _ _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hc, hd, hrest⟩ := h
+///     have hl3 : utf8_len ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128)) = 3 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl3]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl3]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl3]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl3]; intro hx; omega)
+///       (by rw [hl3]; exact ih hrest)
+///   next pos hend _ _ _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hc, hd, hrest⟩ := h
+///     have hl4 : utf8_len ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128)) = 3 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl4]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl4]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl4]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl4]; intro hx; omega)
+///       (by rw [hl4]; exact ih hrest)
+///   next pos hend _ _ _ _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hc, hd, hrest⟩ := h
+///     have hl5 : utf8_len ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128)) = 3 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl5]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl5]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl5]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl5]; intro hx; omega)
+///       (by rw [hl5]; exact ih hrest)
+///   next pos hend _ _ _ _ _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hc, hd, hrest⟩ := h
+///     have hl6 : utf8_len ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128)) = 3 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 224) * 4096 + (b.get (pos + 1) - 128) * 64 + (b.get (pos + 2) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl6]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl6]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl6]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl6]; intro hx; omega)
+///       (by rw [hl6]; exact ih hrest)
+///   next pos hend _ _ _ _ _ _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hc, hd, he, hf, hrest⟩ := h
+///     have hl7 : utf8_len ((b.get pos - 240) * 262144 + (b.get (pos + 1) - 128) * 4096 + (b.get (pos + 2) - 128) * 64 + (b.get (pos + 3) - 128)) = 4 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 240) * 262144 + (b.get (pos + 1) - 128) * 4096 + (b.get (pos + 2) - 128) * 64 + (b.get (pos + 3) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl7]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl7]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl7]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl7]; intro _; simp only [utf8_b3]; repeat (first | omega | split))
+///       (by rw [hl7]; exact ih hrest)
+///   next pos hend _ _ _ _ _ _ _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hc, hd, he, hf, hrest⟩ := h
+///     have hl8 : utf8_len ((b.get pos - 240) * 262144 + (b.get (pos + 1) - 128) * 4096 + (b.get (pos + 2) - 128) * 64 + (b.get (pos + 3) - 128)) = 4 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 240) * 262144 + (b.get (pos + 1) - 128) * 4096 + (b.get (pos + 2) - 128) * 64 + (b.get (pos + 3) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl8]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl8]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl8]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl8]; intro _; simp only [utf8_b3]; repeat (first | omega | split))
+///       (by rw [hl8]; exact ih hrest)
+///   next pos hend _ _ _ _ _ _ _ _ hcond ih =>
+///     obtain ⟨hL, ha, hb2, hc, hd, he, hf, hrest⟩ := h
+///     have hl9 : utf8_len ((b.get pos - 240) * 262144 + (b.get (pos + 1) - 128) * 4096 + (b.get (pos + 2) - 128) * 64 + (b.get (pos + 3) - 128)) = 4 := by
+///       simp only [utf8_len]; repeat (first | omega | split)
+///     refine validFrom_step b pos ((b.get pos - 240) * 262144 + (b.get (pos + 1) - 128) * 4096 + (b.get (pos + 2) - 128) * 64 + (b.get (pos + 3) - 128))
+///       (by omega)
+///       (by simp only [scalar]; omega)
+///       (by rw [hl9]; omega)
+///       (by simp only [utf8_b0]; repeat (first | omega | split))
+///       (by rw [hl9]; intro _; simp only [utf8_b1]; repeat (first | omega | split))
+///       (by rw [hl9]; intro _; simp only [utf8_b2]; repeat (first | omega | split))
+///       (by rw [hl9]; intro _; simp only [utf8_b3]; repeat (first | omega | split))
+///       (by rw [hl9]; exact ih hrest)
+///   next pos hend _ _ _ _ _ _ _ _ _ =>
+///     exact absurd h (by simp)
+
 /// pre  pos < b.len
 /// pre  b.len ≤ 4611686018427387904
 /// post result ≤ 4

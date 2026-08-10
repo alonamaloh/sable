@@ -1,0 +1,61 @@
+// Dynamic checks over String: literal construction (bare literals and
+// explicit from_bytes), the monitored validScan invariant (checked at
+// init exit and RAII drops), the lexicographic cmp contract, and the
+// comparison operators bound through `operator cmp`.
+
+use string;
+
+/// pre x = y
+fn expect_eq(i32 x, i32 y) {
+}
+
+/// pre n = m
+fn expect_len(u64 n, u64 m) {
+}
+
+fn test_literals_and_len() {
+    var s = "Hi!";
+    expect_len(s.byte_len(), 3);
+    var t = "héllo";
+    expect_len(t.byte_len(), 6);
+    var e = "";
+    expect_len(e.byte_len(), 0);
+    [u8] bytes = b"caf\xc3\xa9";
+    var c = String::from_bytes(&bytes);
+    expect_len(c.byte_len(), 5);
+}
+
+fn test_cmp() {
+    var a = "abc";
+    var b = "abd";
+    expect_eq(cmp(&a, &b), -1);
+    expect_eq(cmp(&b, &a), 1);
+    var a2 = "abc";
+    expect_eq(cmp(&a, &a2), 0);
+    var prefix = "ab";
+    expect_eq(cmp(&prefix, &a), -1);
+    expect_eq(cmp(&a, &prefix), 1);
+    var empty = "";
+    expect_eq(cmp(&empty, &a), -1);
+}
+
+fn test_operators() {
+    var a = "apple";
+    var b = "banana";
+    if (a < b) {
+        expect_eq(1, 1);
+    } else {
+        expect_eq(1, 2);
+    }
+    var a2 = "apple";
+    if (a == a2) {
+        expect_eq(2, 2);
+    } else {
+        expect_eq(2, 3);
+    }
+    if (b >= a) {
+        expect_eq(3, 3);
+    } else {
+        expect_eq(3, 4);
+    }
+}

@@ -85,6 +85,7 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             let renamed = format!("{mangled}{}", &text[sp.name.len()..]);
             program.ghosts.push(GhostItem {
                 keyword: "def",
+                unfold: false,
                 text: renamed,
                 span: g.span,
             });
@@ -457,9 +458,7 @@ fn prepare_expr(e: &mut Expr, bound_params: &HashSet<String>) {
         }
         ExprKind::Index { index, .. }
         | ExprKind::SelfFieldIndex { index, .. }
-        | ExprKind::ClassFieldIndex { index, .. } => {
-            prepare_expr(index, bound_params)
-        }
+        | ExprKind::ClassFieldIndex { index, .. } => prepare_expr(index, bound_params),
         ExprKind::AllocArray { len, init, .. } => {
             prepare_expr(len, bound_params);
             prepare_expr(init, bound_params);
@@ -529,15 +528,15 @@ impl Mono {
         }
         for (bound, arg) in bounds.iter().zip(args) {
             if let Some(b) = bound {
-                if !self.impls.contains_key(&(b.clone(), arg.name().to_string())) {
+                if !self
+                    .impls
+                    .contains_key(&(b.clone(), arg.name().to_string()))
+                {
                     return Err(Diagnostic {
                         name: "mono.unsatisfied_bound".into(),
                         title: format!("`{}` does not implement `{b}`", arg.name()),
                         span,
-                        label: format!(
-                            "the bound requires `impl {b} for {}`",
-                            arg.name()
-                        ),
+                        label: format!("the bound requires `impl {b} for {}`", arg.name()),
                         notes: vec![],
                     });
                 }
@@ -571,8 +570,7 @@ impl Mono {
             let mut c = template;
             let param_names = std::mem::take(&mut c.type_params);
             let bounds = std::mem::take(&mut c.type_bounds);
-            let (text_map, bound_calls) =
-                self.subst_maps(&param_names, &bounds, &req.args);
+            let (text_map, bound_calls) = self.subst_maps(&param_names, &bounds, &req.args);
             c.name = mangle(&req.template, &req.args);
             c.from_template = Some(req.template.clone());
             for fld in &mut c.fields {
@@ -593,8 +591,7 @@ impl Mono {
             let mut f = template;
             let param_names = std::mem::take(&mut f.type_params);
             let bounds = std::mem::take(&mut f.type_bounds);
-            let (text_map, bound_calls) =
-                self.subst_maps(&param_names, &bounds, &req.args);
+            let (text_map, bound_calls) = self.subst_maps(&param_names, &bounds, &req.args);
             f.name = mangle(&req.template, &req.args);
             // Template-verified instances (ADR 0009): skip their own
             // obligations; owe the substituted `requires`.
@@ -617,7 +614,10 @@ impl Mono {
         param_names: &[String],
         bounds: &[Option<String>],
         args: &[IntTy],
-    ) -> (HashMap<String, String>, HashMap<String, (String, HashSet<String>)>) {
+    ) -> (
+        HashMap<String, String>,
+        HashMap<String, (String, HashSet<String>)>,
+    ) {
         let mut text_map: HashMap<String, String> = HashMap::new();
         let mut bound_calls: HashMap<String, (String, HashSet<String>)> = HashMap::new();
         for (i, p) in param_names.iter().enumerate() {
@@ -678,8 +678,7 @@ impl Mono {
                 Stmt::Decl { init: None, .. }
                 | Stmt::Return { value: None, .. }
                 | Stmt::Assert(_) => {}
-                Stmt::Store { index, value, .. }
-                | Stmt::FieldStore { index, value, .. } => {
+                Stmt::Store { index, value, .. } | Stmt::FieldStore { index, value, .. } => {
                     self.rewrite_expr(index, depth)?;
                     self.rewrite_expr(value, depth)?;
                 }
@@ -790,9 +789,7 @@ impl Mono {
             }
             ExprKind::Index { index, .. }
             | ExprKind::SelfFieldIndex { index, .. }
-            | ExprKind::ClassFieldIndex { index, .. } => {
-                self.rewrite_expr(index, depth)?
-            }
+            | ExprKind::ClassFieldIndex { index, .. } => self.rewrite_expr(index, depth)?,
             ExprKind::AllocArray { len, init, .. } => {
                 self.rewrite_expr(len, depth)?;
                 self.rewrite_expr(init, depth)?;
@@ -960,9 +957,7 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
         }
         ExprKind::Index { index, .. }
         | ExprKind::SelfFieldIndex { index, .. }
-        | ExprKind::ClassFieldIndex { index, .. } => {
-            subst_expr(index, args, bound_calls)?
-        }
+        | ExprKind::ClassFieldIndex { index, .. } => subst_expr(index, args, bound_calls)?,
         ExprKind::ArrayLit(elems) => {
             for el in elems.iter_mut() {
                 subst_expr(el, args, bound_calls)?;
@@ -995,9 +990,7 @@ pub(crate) fn subst_clause_text(text: &str, map: &HashMap<String, String>) -> St
             if !after_dot && i + 2 <= bytes.len() && &bytes[i..i + 2] == b"::" {
                 let qstart = i + 2;
                 let mut j = qstart;
-                while j < bytes.len()
-                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
-                {
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
                     j += 1;
                 }
                 if j > qstart {

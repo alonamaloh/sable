@@ -41,9 +41,9 @@ enum T {
     RParen,
     Comma,
     Bar,
-    Arrow,   // → or ->
+    Arrow,    // → or ->
     FatArrow, // =>
-    Iff,     // ↔ or <->
+    Iff,      // ↔ or <->
     Forall,
     Exists,
     Not,
@@ -242,7 +242,7 @@ fn tokenize(text: &str) -> EResult<Vec<T>> {
             other => {
                 return Err(Unmonitorable(format!(
                     "`{other}` is outside the monitorable fragment"
-                )))
+                )));
             }
         }
     }
@@ -503,7 +503,7 @@ impl P {
             other => {
                 return Err(Unmonitorable(format!(
                     "{other:?} is outside the monitorable fragment"
-                )))
+                )));
             }
         };
         // Postfix `.len` / `.get e` after a parenthesized receiver.
@@ -600,7 +600,11 @@ fn ident_to_expr(name: &str) -> EResult<S> {
             "min" | "max" => {
                 let it = IntTy::from_name(head)
                     .ok_or_else(|| Unmonitorable(format!("unknown constant `{name}`")))?;
-                Ok(S::ConstBound(if field == "min" { it.min() } else { it.max() }))
+                Ok(S::ConstBound(if field == "min" {
+                    it.min()
+                } else {
+                    it.max()
+                }))
             }
             "perm" => Ok(S::App("perm".to_string(), vec![])),
             _ => Ok(S::Field(Box::new(ident_to_expr(head)?), field.to_string())),
@@ -617,7 +621,11 @@ fn oldify(s: S) -> EResult<S> {
         S::Len(x) => S::Len(Box::new(oldify(*x)?)),
         S::Field(x, f) => S::Field(Box::new(oldify(*x)?), f),
         S::Get(x, i) => S::Get(Box::new(oldify(*x)?), i),
-        S::Ite(c, a, b) => S::Ite(Box::new(oldify(*c)?), Box::new(oldify(*a)?), Box::new(oldify(*b)?)),
+        S::Ite(c, a, b) => S::Ite(
+            Box::new(oldify(*c)?),
+            Box::new(oldify(*a)?),
+            Box::new(oldify(*b)?),
+        ),
         S::IsSomeE(x) => S::IsSomeE(Box::new(oldify(*x)?)),
         S::OptValE(x) => S::OptValE(Box::new(oldify(*x)?)),
         _ => return Err(Unmonitorable("`old` applies to a variable or path".into())),
@@ -783,27 +791,23 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             match op {
                 Op::And => {
                     return Ok(SpecVal::Bool(
-                        boolean(eval(l, env, depth + 1)?)?
-                            && boolean(eval(r, env, depth + 1)?)?,
-                    ))
+                        boolean(eval(l, env, depth + 1)?)? && boolean(eval(r, env, depth + 1)?)?,
+                    ));
                 }
                 Op::Or => {
                     return Ok(SpecVal::Bool(
-                        boolean(eval(l, env, depth + 1)?)?
-                            || boolean(eval(r, env, depth + 1)?)?,
-                    ))
+                        boolean(eval(l, env, depth + 1)?)? || boolean(eval(r, env, depth + 1)?)?,
+                    ));
                 }
                 Op::Imp => {
                     return Ok(SpecVal::Bool(
-                        !boolean(eval(l, env, depth + 1)?)?
-                            || boolean(eval(r, env, depth + 1)?)?,
-                    ))
+                        !boolean(eval(l, env, depth + 1)?)? || boolean(eval(r, env, depth + 1)?)?,
+                    ));
                 }
                 Op::Iff => {
                     return Ok(SpecVal::Bool(
-                        boolean(eval(l, env, depth + 1)?)?
-                            == boolean(eval(r, env, depth + 1)?)?,
-                    ))
+                        boolean(eval(l, env, depth + 1)?)? == boolean(eval(r, env, depth + 1)?)?,
+                    ));
                 }
                 _ => {}
             }
@@ -847,8 +851,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                 "sortedRange" if args.len() == 3 => {
                     let a = array(eval(&args[0], env, depth + 1)?)?;
                     let lo = int(eval(&args[1], env, depth + 1)?)?.max(0) as usize;
-                    let hi = (int(eval(&args[2], env, depth + 1)?)?.max(0) as usize)
-                        .min(a.len());
+                    let hi = (int(eval(&args[2], env, depth + 1)?)?.max(0) as usize).min(a.len());
                     return Ok(SpecVal::Bool(
                         lo >= hi || a[lo..hi].windows(2).all(|w| w[0] <= w[1]),
                     ));

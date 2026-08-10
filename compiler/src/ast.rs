@@ -212,19 +212,31 @@ pub enum ExprKind {
         index: Box<Expr>,
     },
     /// `a.len` where `a` names an array parameter.
-    Len { array: String },
+    Len {
+        array: String,
+    },
     /// `widen<T>(e)` — value-preserving widening; no VC, identity in Lean.
-    Widen { target: IntTy, arg: Box<Expr> },
+    Widen {
+        target: IntTy,
+        arg: Box<Expr>,
+    },
     /// `narrow<T>(e)` — conversion to any integer type under a range VC
     /// (`narrow.range`); identity in Lean, trap in `sable test` (ADR 0007).
-    Narrow { target: IntTy, arg: Box<Expr> },
+    Narrow {
+        target: IntTy,
+        arg: Box<Expr>,
+    },
     /// `e.is_some` — option holds a value (ADR 0008; no pattern matching
     /// in the program language, ever).
-    IsSome { operand: Box<Expr> },
+    IsSome {
+        operand: Box<Expr>,
+    },
     /// `e.value` — the option's payload, under an `option.some` VC;
     /// junk-on-none in the model (like `Seq.get` off-range), trap in
     /// `sable test`.
-    OptValue { operand: Box<Expr> },
+    OptValue {
+        operand: Box<Expr>,
+    },
     /// `some(e)` / `none` — return position only for now.
     SomeE(Box<Expr>),
     NoneE,
@@ -238,9 +250,13 @@ pub enum ExprKind {
         init: Box<Expr>,
     },
     /// `self.f` — int/bool field read (methods only).
-    SelfField { field: String },
+    SelfField {
+        field: String,
+    },
     /// `self.f.len` — array-field length (methods only).
-    SelfFieldLen { field: String },
+    SelfFieldLen {
+        field: String,
+    },
     /// `self.f[i]` — array-field element read (methods only).
     SelfFieldIndex {
         field: String,
@@ -421,6 +437,8 @@ pub struct Discharge {
 pub struct GhostItem {
     /// "def" or "theorem".
     pub keyword: &'static str,
+    /// `#[unfold]`: emit `@[simp]` even though the def recurses.
+    pub unfold: bool,
     pub text: String,
     pub span: Span,
 }

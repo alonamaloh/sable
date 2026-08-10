@@ -41,7 +41,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 pub fn socket_path(repo_root: &Path) -> PathBuf {
@@ -230,16 +230,18 @@ impl LeanServer {
         let stdin = child.stdin.take().expect("piped stdin");
         let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         let (tx, incoming) = channel();
-        std::thread::spawn(move || loop {
-            match read_framed(&mut stdout) {
-                Ok(msg) => {
-                    if tx.send(Ok(msg)).is_err() {
+        std::thread::spawn(move || {
+            loop {
+                match read_framed(&mut stdout) {
+                    Ok(msg) => {
+                        if tx.send(Ok(msg)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err));
                         break;
                     }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err));
-                    break;
                 }
             }
         });
@@ -358,8 +360,7 @@ impl LeanServer {
                             "textDocument/didClose",
                             serde_json::json!({ "textDocument": { "uri": uri } }),
                         );
-                        cancel_deadline =
-                            Some(Instant::now() + Duration::from_secs(10));
+                        cancel_deadline = Some(Instant::now() + Duration::from_secs(10));
                     }
                     continue;
                 }
@@ -375,7 +376,9 @@ impl LeanServer {
             if msg["method"] == "$/lean/fileProgress"
                 && msg["params"]["textDocument"]["uri"] == serde_json::Value::String(uri.clone())
             {
-                progress_done = msg["params"]["processing"].as_array().is_some_and(Vec::is_empty);
+                progress_done = msg["params"]["processing"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty);
                 continue;
             }
             if msg["id"] == serde_json::Value::from(wait_id) && msg.get("method").is_none() {
@@ -510,10 +513,7 @@ impl LeanServer {
 
     /// Next server message, or None on timeout (the check loop's poll —
     /// timeouts are when the client socket gets watched).
-    fn receive_timeout(
-        &mut self,
-        timeout: Duration,
-    ) -> Option<Result<serde_json::Value, String>> {
+    fn receive_timeout(&mut self, timeout: Duration) -> Option<Result<serde_json::Value, String>> {
         match self.incoming.recv_timeout(timeout) {
             Ok(msg) => Some(msg),
             Err(RecvTimeoutError::Timeout) => None,
@@ -551,8 +551,7 @@ fn read_framed(stdout: &mut BufReader<ChildStdout>) -> Result<serde_json::Value,
     stdout
         .read_exact(&mut body)
         .map_err(|err| format!("read from lean server failed: {err}"))?;
-    serde_json::from_slice(&body)
-        .map_err(|err| format!("lean server sent invalid JSON: {err}"))
+    serde_json::from_slice(&body).map_err(|err| format!("lean server sent invalid JSON: {err}"))
 }
 
 /// Has the check client gone away? A read on the request socket after the

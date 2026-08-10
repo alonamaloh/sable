@@ -1,0 +1,198 @@
+// A verified UTF-8 string: owned bytes carrying the forward-scan
+// validity invariant from the utf8 module. The invariant is the
+// executable characterization (validScan, monitorable and
+// simp-dischargeable on literals); validScan_sound lifts it to the
+// canonical decomposability predicate validFrom whenever a consumer
+// needs the RFC 3629 grammar itself.
+
+use utf8;
+
+class String {
+    [u8] bytes;
+
+    /// invariant validScan bytes 0
+
+    /// pre  #[label(valid)] validScan xs 0
+    /// post #[label(len)]   self.bytes.len = xs.len
+    /// post #[label(frame)] ∀ k, 0 ≤ k → k < xs.len → self.bytes.get k = xs.get k
+    init from_bytes(&[u8] xs) {
+        self.bytes = alloc_array<u8>(xs.len, 0);
+        /// invariant ∀ k, 0 ≤ k → k < i → self.bytes.get k = xs.get k
+        for (u64 i : range(xs.len)) {
+            self.bytes[i] = xs[i];
+        }
+    }
+
+    /// post result = self.bytes.len
+    fn byte_len(&self) -> u64 {
+        return self.bytes.len;
+    }
+}
+
+// Byte-lexicographic order under the -1/0/1 convention; equality is
+// byte equality, which for valid UTF-8 is exactly codepoint-sequence
+// equality (the encoding is injective).
+/// post #[label(lt)] result = -1 ↔ (∃ k, 0 ≤ k ∧ k ≤ a.bytes.len ∧ k ≤ b.bytes.len ∧
+///      (∀ j, 0 ≤ j → j < k → a.bytes.get j = b.bytes.get j) ∧
+///      (if k = a.bytes.len then k < b.bytes.len else k < b.bytes.len ∧ a.bytes.get k < b.bytes.get k))
+/// post #[label(eq)] result = 0 ↔ (a.bytes.len = b.bytes.len ∧
+///      ∀ j, 0 ≤ j → j < a.bytes.len → a.bytes.get j = b.bytes.get j)
+/// post #[label(range)] result = -1 ∨ result = 0 ∨ result = 1
+fn cmp(&String a, &String b) -> i32 {
+    u64 n = a.bytes.len;
+    if (b.bytes.len < n) {
+        n = b.bytes.len;
+    }
+    /// invariant i ≤ n
+    /// invariant ∀ j, 0 ≤ j → j < i → a.bytes.get j = b.bytes.get j
+    for (u64 i : range(n)) {
+        if (a.bytes[i] < b.bytes[i]) {
+            return -1;
+        }
+        if (a.bytes[i] > b.bytes[i]) {
+            return 1;
+        }
+    }
+    if (a.bytes.len < b.bytes.len) {
+        return -1;
+    }
+    if (a.bytes.len > b.bytes.len) {
+        return 1;
+    }
+    return 0;
+}
+
+operator cmp = cmp;
+
+// ------------------------------ discharges ------------------------------
+
+// The copy-loop frame: the just-written cell is the source byte, the
+// prefix is the invariant.
+/// discharge String::from_bytes.inv_preserved.k_0_k_k_i_self_bytes_get_k_xs_get_k by
+///   intro k hk0 hklt
+///   rw [Sable.Seq.get_set]
+///   split
+///   · next heq => rw [heq]
+///   · next hne => exact h_inv_k_0_k_k_i_self_bytes_get k hk0 (by omega)
+
+// Validity survives the copy: the loop exits with a byte-for-byte
+// image of xs, and validScan_congr transfers the pre.
+/// discharge String::from_bytes.inv_exit.validscan_bytes_0 by
+///   exact validScan_congr xs _self7_bytes 0 (by omega)
+///     (fun k hk0 hklt => h_inv_k_0_k_k_i_self_bytes_get k hk0 (by omega)) (by omega) h_pre_valid
+
+// The -1 return inside the loop: the loop index is the lex witness —
+// equal prefix below it, strictly smaller byte at it.
+/// discharge cmp.post.lt by
+///   refine ⟨fun _ => ⟨i, by omega, by omega, by omega, h_inv_j_0_j_j_i_a_bytes_get_j, ?_⟩,
+///     fun _ => h_result⟩
+///   rw [if_neg (by omega)]
+///   exact ⟨by omega, h_path_a_bytes_get_i_b_bytes_ge⟩
+
+/// discharge cmp.post.lt.6 by
+///   refine ⟨fun _ => ⟨i, by omega, by omega, by omega, h_inv_j_0_j_j_i_a_bytes_get_j, ?_⟩,
+///     fun _ => h_result⟩
+///   rw [if_neg (by omega)]
+///   exact ⟨by omega, h_path_a_bytes_get_i_b_bytes_ge⟩
+
+// The refuting direction of the lex posts on the non(-1) paths: any
+// claimed first-difference witness k lands below the scanned prefix
+// (equal bytes), at the loop index (the difference points the other
+// way), or beyond it (the witness's own prefix contradicts the scan).
+/// discharge cmp.post.lt.2 by
+///   constructor
+///   · intro h
+///     exact ((by omega : False).elim)
+///   · rintro ⟨k, hk0, hka, hkb, hpre, hcond⟩
+///     by_cases hk : k = a.bytes.len
+///     · rw [if_pos hk] at hcond
+///       first
+///       | omega
+///       | (have := hpre i (by omega) (by omega)
+///          omega)
+///     · rw [if_neg hk] at hcond
+///       rcases Int.lt_trichotomy k i with h1 | h1 | h1
+///       · have := h_inv_j_0_j_j_i_a_bytes_get_j k hk0 h1
+///         omega
+///       · rw [h1] at hcond
+///         omega
+///       · have := hpre i (by omega) h1
+///         omega
+
+/// discharge cmp.post.lt.4 by
+///   constructor
+///   · intro h
+///     exact ((by omega : False).elim)
+///   · rintro ⟨k, hk0, hka, hkb, hpre, hcond⟩
+///     by_cases hk : k = a.bytes.len
+///     · rw [if_pos hk] at hcond
+///       first
+///       | omega
+///       | (have := hpre i (by omega) (by omega)
+///          omega)
+///     · rw [if_neg hk] at hcond
+///       rcases Int.lt_trichotomy k i with h1 | h1 | h1
+///       · have := h_inv_j_0_j_j_i_a_bytes_get_j k hk0 h1
+///         omega
+///       · rw [h1] at hcond
+///         omega
+///       · have := hpre i (by omega) h1
+///         omega
+
+/// discharge cmp.post.lt.7 by
+///   constructor
+///   · intro h
+///     exact ((by omega : False).elim)
+///   · rintro ⟨k, hk0, hka, hkb, hpre, hcond⟩
+///     by_cases hk : k = a.bytes.len
+///     · rw [if_pos hk] at hcond
+///       first
+///       | omega
+///       | (have := hpre i (by omega) (by omega)
+///          omega)
+///     · rw [if_neg hk] at hcond
+///       rcases Int.lt_trichotomy k i with h1 | h1 | h1
+///       · have := h_inv_j_0_j_j_i_a_bytes_get_j k hk0 h1
+///         omega
+///       · rw [h1] at hcond
+///         omega
+///       · have := hpre i (by omega) h1
+///         omega
+
+/// discharge cmp.post.lt.10 by
+///   constructor
+///   · intro h
+///     exact ((by omega : False).elim)
+///   · rintro ⟨k, hk0, hka, hkb, hpre, hcond⟩
+///     by_cases hk : k = a.bytes.len
+///     · rw [if_pos hk] at hcond
+///       first
+///       | omega
+///       | (have := hpre i (by omega) (by omega)
+///          omega)
+///     · rw [if_neg hk] at hcond
+///       rcases Int.lt_trichotomy k i with h1 | h1 | h1
+///       · have := h_inv_j_0_j_j_i_a_bytes_get_j k hk0 h1
+///         omega
+///       · rw [h1] at hcond
+///         omega
+///       · have := hpre i (by omega) h1
+///         omega
+
+// The refuting direction of the eq post on the -1 paths: claimed
+// byte-equality contradicts the strict difference at the loop index.
+/// discharge cmp.post.eq.6 by
+///   constructor
+///   · intro h
+///     exact ((by omega : False).elim)
+///   · rintro ⟨hlen, hall⟩
+///     have := hall i (by omega) (by omega)
+///     omega
+
+/// discharge cmp.post.eq.7 by
+///   constructor
+///   · intro h
+///     exact ((by omega : False).elim)
+///   · rintro ⟨hlen, hall⟩
+///     have := hall i (by omega) (by omega)
+///     omega

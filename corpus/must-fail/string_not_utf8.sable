@@ -1,0 +1,6 @@
+// expect-error: lex.string_not_utf8
+// Escapes can spell arbitrary bytes; a bare literal must stay UTF-8.
+
+fn test_f() {
+    var s = "a\xffb";
+}

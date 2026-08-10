@@ -194,8 +194,7 @@ impl<'a> Interp<'a> {
                 span: clause.span,
             }),
             Err(um) => {
-                self.skipped
-                    .push((clause.text.replace('\n', " "), um.0));
+                self.skipped.push((clause.text.replace('\n', " "), um.0));
                 Ok(())
             }
         }
@@ -241,8 +240,7 @@ impl<'a> Interp<'a> {
                 span: clause.span,
             }),
             Err(um) => {
-                self.skipped
-                    .push((clause.text.replace('\n', " "), um.0));
+                self.skipped.push((clause.text.replace('\n', " "), um.0));
                 Ok(())
             }
         }
@@ -310,7 +308,7 @@ impl<'a> Interp<'a> {
                             inv.text.replace('\n', " ")
                         ),
                         span: inv.span,
-                    })
+                    });
                 }
                 Err(um) => {
                     self.skipped.push((inv.text.replace('\n', " "), um.0));
@@ -375,9 +373,7 @@ impl<'a> Interp<'a> {
                 let len = arr.borrow().len() as i128;
                 if idx < 0 || idx >= len {
                     return Err(Trap {
-                        message: format!(
-                            "store index out of bounds: index {idx}, length {len}"
-                        ),
+                        message: format!("store index out of bounds: index {idx}, length {len}"),
                         span: *field_span,
                     });
                 }
@@ -398,9 +394,7 @@ impl<'a> Interp<'a> {
                 let len = a.borrow().len() as i128;
                 if idx < 0 || idx >= len {
                     return Err(Trap {
-                        message: format!(
-                            "store index out of bounds: index {idx}, length {len}"
-                        ),
+                        message: format!("store index out of bounds: index {idx}, length {len}"),
                         span: *array_span,
                     });
                 }
@@ -495,8 +489,7 @@ impl<'a> Interp<'a> {
         match speceval::eval_int_expr(&clause.text, &env) {
             Ok(n) => Some(n),
             Err(um) => {
-                self.skipped
-                    .push((clause.text.replace('\n', " "), um.0));
+                self.skipped.push((clause.text.replace('\n', " "), um.0));
                 None
             }
         }
@@ -529,7 +522,12 @@ impl<'a> Interp<'a> {
             frame.vars.insert(p.name.clone(), v);
         }
         for pre in &ifn.pres {
-            self.check_clause(&frame, pre, None, &format!("pre of `{}::{}`", class.name, ifn.name))?;
+            self.check_clause(
+                &frame,
+                pre,
+                None,
+                &format!("pre of `{}::{}`", class.name, ifn.name),
+            )?;
         }
         self.exec_block(&ifn.body, &mut frame)?;
         for post in &ifn.posts {
@@ -540,7 +538,11 @@ impl<'a> Interp<'a> {
                 &format!("post of `{}::{}`", class.name, ifn.name),
             )?;
         }
-        self.check_invariants_at(&class, &fields, &format!("{}::{} exit", class.name, ifn.name))?;
+        self.check_invariants_at(
+            &class,
+            &fields,
+            &format!("{}::{} exit", class.name, ifn.name),
+        )?;
         Ok(RtVal::Obj { class: ci, fields })
     }
 
@@ -584,7 +586,12 @@ impl<'a> Interp<'a> {
             frame.vars.insert(p.name.clone(), v);
         }
         for pre in &m.f.pres {
-            self.check_clause(&frame, pre, None, &format!("pre of `{}::{method}`", class.name))?;
+            self.check_clause(
+                &frame,
+                pre,
+                None,
+                &format!("pre of `{}::{method}`", class.name),
+            )?;
         }
         let flow = self.exec_block(&m.f.body, &mut frame)?;
         let result = match flow {
@@ -639,10 +646,7 @@ impl<'a> Interp<'a> {
                 let arr = a.borrow();
                 if idx < 0 || idx >= arr.len() as i128 {
                     return Err(Trap {
-                        message: format!(
-                            "index out of bounds: index {idx}, length {}",
-                            arr.len()
-                        ),
+                        message: format!("index out of bounds: index {idx}, length {}", arr.len()),
                         span: e.span,
                     });
                 }
@@ -699,10 +703,7 @@ impl<'a> Interp<'a> {
                 let arr = a.borrow();
                 if idx < 0 || idx as usize >= arr.len() {
                     return Err(Trap {
-                        message: format!(
-                            "index out of bounds: index {idx}, length {}",
-                            arr.len()
-                        ),
+                        message: format!("index out of bounds: index {idx}, length {}", arr.len()),
                         span: e.span,
                     });
                 }
@@ -775,9 +776,7 @@ impl<'a> Interp<'a> {
                 let len = arr.borrow().len() as i128;
                 if idx < 0 || idx >= len {
                     return Err(Trap {
-                        message: format!(
-                            "index out of bounds: index {idx}, length {len}"
-                        ),
+                        message: format!("index out of bounds: index {idx}, length {len}"),
                         span: e.span,
                     });
                 }

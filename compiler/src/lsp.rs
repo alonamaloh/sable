@@ -67,8 +67,8 @@ pub fn run() -> Result<(), Box<dyn Error + Sync + Send>> {
         )),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-        semantic_tokens_provider: Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
                 legend: SemanticTokensLegend {
                     token_types: vec![
                         SemanticTokenType::COMMENT,  // 0: evidence (dimmed)
@@ -78,8 +78,8 @@ pub fn run() -> Result<(), Box<dyn Error + Sync + Send>> {
                 },
                 full: Some(SemanticTokensFullOptions::Bool(true)),
                 ..Default::default()
-            }),
-        ),
+            },
+        )),
         ..Default::default()
     };
 
@@ -198,14 +198,16 @@ fn publish(
                 .map(|d| to_lsp_diag_sev(d, text, &lines, DiagnosticSeverity::WARNING)),
         )
         .collect();
-    connection.sender.send(Message::Notification(Notification::new(
-        PublishDiagnostics::METHOD.to_string(),
-        PublishDiagnosticsParams {
-            uri: uri.clone(),
-            diagnostics: lsp_diags,
-            version: None,
-        },
-    )))?;
+    connection
+        .sender
+        .send(Message::Notification(Notification::new(
+            PublishDiagnostics::METHOD.to_string(),
+            PublishDiagnosticsParams {
+                uri: uri.clone(),
+                diagnostics: lsp_diags,
+                version: None,
+            },
+        )))?;
     Ok(())
 }
 
