@@ -1,0 +1,6 @@
+// expect-error: lex.unterminated_string
+// The literal must close before the end of its line.
+
+fn test_f() {
+    [u8] b = b"abc;
+}

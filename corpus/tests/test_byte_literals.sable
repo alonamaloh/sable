@@ -1,0 +1,40 @@
+// Byte-string literals: b"..." is the [u8] literal of its UTF-8 bytes
+// (ADR 0014). Escapes, raw multibyte text, and the empty literal are
+// checked byte-for-byte against their decimal values.
+
+/// pre x = y
+fn expect_eq(u8 x, u8 y) {
+}
+
+/// pre n = m
+fn expect_len(u64 n, u64 m) {
+}
+
+fn test_escapes() {
+    [u8] esc = b"\n\r\t\0\\\"\xff";
+    expect_len(esc.len, 7);
+    expect_eq(esc[0], 10);
+    expect_eq(esc[1], 13);
+    expect_eq(esc[2], 9);
+    expect_eq(esc[3], 0);
+    expect_eq(esc[4], 92);
+    expect_eq(esc[5], 34);
+    expect_eq(esc[6], 255);
+}
+
+fn test_raw_utf8() {
+    [u8] accented = b"é";
+    expect_len(accented.len, 2);
+    expect_eq(accented[0], 195);
+    expect_eq(accented[1], 169);
+}
+
+fn test_empty_and_ascii() {
+    [u8] empty = b"";
+    expect_len(empty.len, 0);
+    [u8] hi = b"Hi!";
+    expect_len(hi.len, 3);
+    expect_eq(hi[0], 72);
+    expect_eq(hi[1], 105);
+    expect_eq(hi[2], 33);
+}

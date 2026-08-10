@@ -1,0 +1,6 @@
+// expect-error: lex.string_reserved
+// A bare string literal awaits the String type; bytes are written b"...".
+
+fn test_f() {
+    [u8] b = "hi";
+}

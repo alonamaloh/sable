@@ -23,39 +23,39 @@ fn expect_bad(&[u8] b) -> bool {
 }
 
 fn test_valid_documents() {
-    [u8] scalar = [52, 50];
+    [u8] scalar = b"42";
     expect_json(&scalar);
-    [u8] str1 = [34, 104, 101, 108, 108, 111, 34];
+    [u8] str1 = b"\"hello\"";
     expect_json(&str1);
-    [u8] lit = [32, 32, 116, 114, 117, 101, 32, 32];
+    [u8] lit = b"  true  ";
     expect_json(&lit);
-    [u8] obj = [123, 34, 97, 34, 58, 32, 49, 44, 32, 34, 98, 34, 58, 32, 91, 116, 114, 117, 101, 44, 32, 110, 117, 108, 108, 44, 32, 45, 50, 46, 53, 101, 51, 93, 44, 32, 34, 99, 34, 58, 32, 123, 34, 100, 34, 58, 32, 34, 120, 34, 125, 125];
+    [u8] obj = b"{\"a\": 1, \"b\": [true, null, -2.5e3], \"c\": {\"d\": \"x\"}}";
     expect_json(&obj);
-    [u8] arr = [32, 91, 32, 49, 32, 44, 32, 91, 32, 50, 32, 44, 32, 91, 32, 51, 32, 93, 32, 93, 32, 44, 32, 123, 125, 32, 44, 32, 91, 93, 32, 93, 32];
+    [u8] arr = b" [ 1 , [ 2 , [ 3 ] ] , {} , [] ] ";
     expect_json(&arr);
-    [u8] deep = [123, 34, 107, 34, 32, 58, 32, 123, 32, 34, 108, 34, 32, 58, 32, 123, 32, 34, 109, 34, 32, 58, 32, 91, 32, 34, 100, 101, 101, 112, 34, 32, 44, 32, 48, 32, 93, 32, 125, 32, 125, 32, 125];
+    [u8] deep = b"{\"k\" : { \"l\" : { \"m\" : [ \"deep\" , 0 ] } } }";
     expect_json(&deep);
 }
 
 fn test_invalid_documents() {
     [u8] empty = [];
     expect_bad(&empty);
-    [u8] trail = [52, 50, 32, 120];
+    [u8] trail = b"42 x";
     expect_bad(&trail);
-    [u8] unclosed = [123, 34, 97, 34, 58, 32, 49];
+    [u8] unclosed = b"{\"a\": 1";
     expect_bad(&unclosed);
-    [u8] noval = [123, 34, 97, 34, 58, 32, 125];
+    [u8] noval = b"{\"a\": }";
     expect_bad(&noval);
-    [u8] nocolon = [123, 34, 97, 34, 32, 49, 125];
+    [u8] nocolon = b"{\"a\" 1}";
     expect_bad(&nocolon);
-    [u8] barekey = [123, 97, 58, 32, 49, 125];
+    [u8] barekey = b"{a: 1}";
     expect_bad(&barekey);
-    [u8] trailcomma = [91, 49, 44, 32, 50, 44, 93];
+    [u8] trailcomma = b"[1, 2,]";
     expect_bad(&trailcomma);
-    [u8] arrunclosed = [91, 49, 44, 32, 50];
+    [u8] arrunclosed = b"[1, 2";
     expect_bad(&arrunclosed);
-    [u8] badlit = [116, 114, 117];
+    [u8] badlit = b"tru";
     expect_bad(&badlit);
-    [u8] two = [49, 32, 50];
+    [u8] two = b"1 2";
     expect_bad(&two);
 }

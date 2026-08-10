@@ -9,6 +9,7 @@ use crate::span::Span;
 pub enum Tok {
     Ident(String),
     Int(i128),
+    Bytes(Vec<u8>),
     KwFn,
     KwReturn,
     KwIf,
@@ -57,6 +58,7 @@ impl Tok {
         match self {
             Tok::Ident(s) => format!("identifier `{s}`"),
             Tok::Int(n) => format!("integer literal `{n}`"),
+            Tok::Bytes(_) => "byte-string literal".to_string(),
             Tok::Eof => "end of file".to_string(),
             other => format!("`{}`", other.text()),
         }
@@ -114,6 +116,69 @@ pub struct Token {
     pub span: Span,
 }
 
+/// Lex the body of a byte-string literal. `open` is the offset of the
+/// opening quote; returns the bytes and the offset just past the closing
+/// quote. Non-ASCII source characters contribute their UTF-8 bytes
+/// verbatim; escapes are `\n \r \t \0 \\ \" \xNN`.
+fn lex_byte_string(text: &str, open: usize) -> Result<(Vec<u8>, usize), Diagnostic> {
+    let bytes = text.as_bytes();
+    let mut value = Vec::new();
+    let mut i = open + 1;
+    loop {
+        if i >= bytes.len() || bytes[i] == b'\n' {
+            return Err(Diagnostic {
+                name: "lex.unterminated_string".into(),
+                title: "unterminated byte-string literal".into(),
+                span: Span::new(open, i),
+                label: "no closing `\"` before the end of the line".into(),
+                notes: vec![],
+            });
+        }
+        match bytes[i] {
+            b'"' => return Ok((value, i + 1)),
+            b'\\' => {
+                let esc_start = i;
+                i += 1;
+                let e = if i < bytes.len() { bytes[i] } else { b'\n' };
+                match e {
+                    b'n' => value.push(b'\n'),
+                    b'r' => value.push(b'\r'),
+                    b't' => value.push(b'\t'),
+                    b'0' => value.push(0),
+                    b'\\' => value.push(b'\\'),
+                    b'"' => value.push(b'"'),
+                    b'x' => {
+                        let hex = text.get(i + 1..i + 3).unwrap_or("");
+                        let byte = u8::from_str_radix(hex, 16).map_err(|_| Diagnostic {
+                            name: "lex.bad_escape".into(),
+                            title: "malformed `\\x` escape".into(),
+                            span: Span::new(esc_start, (i + 3).min(bytes.len())),
+                            label: "`\\x` takes exactly two hex digits (`\\x00`–`\\xff`)".into(),
+                            notes: vec![],
+                        })?;
+                        value.push(byte);
+                        i += 2;
+                    }
+                    _ => {
+                        return Err(Diagnostic {
+                            name: "lex.bad_escape".into(),
+                            title: "unknown escape in byte-string literal".into(),
+                            span: Span::new(esc_start, (i + 1).min(bytes.len())),
+                            label: "the escapes are `\\n \\r \\t \\0 \\\\ \\\" \\xNN`".into(),
+                            notes: vec![],
+                        })
+                    }
+                }
+                i += 1;
+            }
+            _ => {
+                value.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+}
+
 pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
@@ -132,6 +197,27 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
             continue;
         }
         let start = i;
+        // Byte-string literal: b"..." is a [u8] literal of the UTF-8
+        // bytes between the quotes. A bare "..." is reserved for the
+        // String type (ADR 0014).
+        if b == b'b' && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+            let (value, end) = lex_byte_string(text, i + 1)?;
+            tokens.push(Token {
+                tok: Tok::Bytes(value),
+                span: Span::new(start, end),
+            });
+            i = end;
+            continue;
+        }
+        if b == b'"' {
+            return Err(Diagnostic {
+                name: "lex.string_reserved".into(),
+                title: "bare string literal".into(),
+                span: Span::new(i, i + 1),
+                label: "reserved for `String`; a `[u8]` byte literal is written `b\"...\"`".into(),
+                notes: vec![],
+            });
+        }
         if b.is_ascii_alphabetic() || b == b'_' {
             while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;

@@ -26,33 +26,33 @@ fn expect_lex_bad(&[u8] b) -> bool {
 fn test_valid_json() {
     [u8] empty = [];
     expect_lex_ok(&empty);
-    [u8] obj = [123, 34, 107, 101, 121, 34, 58, 32, 91, 49, 44, 32, 50, 46, 53, 101, 45, 51, 44, 32, 116, 114, 117, 101, 44, 32, 110, 117, 108, 108, 93, 44, 32, 34, 98, 34, 58, 32, 34, 97, 92, 117, 48, 48, 52, 49, 98, 34, 125];
+    [u8] obj = b"{\"key\": [1, 2.5e-3, true, null], \"b\": \"a\\u0041b\"}";
     expect_lex_ok(&obj);
-    [u8] nums = [91, 48, 44, 32, 45, 49, 44, 32, 49, 50, 46, 55, 53, 44, 32, 49, 101, 49, 48, 44, 32, 50, 69, 43, 56, 44, 32, 45, 48, 46, 53, 101, 45, 50, 93];
+    [u8] nums = b"[0, -1, 12.75, 1e10, 2E+8, -0.5e-2]";
     expect_lex_ok(&nums);
-    [u8] esc = [34, 97, 92, 110, 32, 98, 92, 116, 32, 99, 92, 92, 32, 100, 92, 34, 32, 101, 47, 34];
+    [u8] esc = b"\"a\\n b\\t c\\\\ d\\\" e/\"";
     expect_lex_ok(&esc);
-    [u8] ws = [32, 32, 91, 32, 116, 114, 117, 101, 32, 44, 32, 102, 97, 108, 115, 101, 32, 93, 32, 32];
+    [u8] ws = b"  [ true , false ]  ";
     expect_lex_ok(&ws);
 }
 
 fn test_invalid_json() {
-    [u8] unterminated = [34, 97, 98, 99];
+    [u8] unterminated = b"\"abc";
     expect_lex_bad(&unterminated);
-    [u8] badesc = [34, 97, 92, 113, 98, 34];
+    [u8] badesc = b"\"a\\qb\"";
     expect_lex_bad(&badesc);
-    [u8] badhex = [34, 92, 117, 49, 50, 71, 52, 34];
+    [u8] badhex = b"\"\\u12G4\"";
     expect_lex_bad(&badhex);
-    [u8] ctrl = [34, 7, 34];
+    [u8] ctrl = b"\"\x07\"";
     expect_lex_bad(&ctrl);
-    [u8] trunclit = [116, 114, 117, 93];
+    [u8] trunclit = b"tru]";
     expect_lex_bad(&trunclit);
-    [u8] badexp = [49, 101, 43];
+    [u8] badexp = b"1e+";
     expect_lex_bad(&badexp);
-    [u8] plus = [43, 49];
+    [u8] plus = b"+1";
     expect_lex_bad(&plus);
-    [u8] dot = [46, 53];
+    [u8] dot = b".5";
     expect_lex_bad(&dot);
-    [u8] bare = [120];
+    [u8] bare = b"x";
     expect_lex_bad(&bare);
 }

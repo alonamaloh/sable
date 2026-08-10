@@ -20,7 +20,7 @@ fn test_round_trip() {
 // Valid lowercase hex text decodes; the conditional post is exercised
 // with result = true. "deadbeef" -> [222, 173, 190, 239].
 fn test_decode_valid() {
-    [u8] hex = [100, 101, 97, 100, 98, 101, 101, 102];
+    [u8] hex = b"deadbeef";
     [u8] out = alloc_array<u8>(4, 0);
     hex_decode(&hex, &mut out);
 }
@@ -29,13 +29,13 @@ fn test_decode_valid() {
 // lowercase hex digits — every return-false branch class is hit, and the
 // vacuous decode post still checks. Empty input round-trips too.
 fn test_decode_invalid_and_empty() {
-    [u8] bad1 = [103, 48];
+    [u8] bad1 = b"g0";
     [u8] out1 = alloc_array<u8>(1, 0);
     hex_decode(&bad1, &mut out1);
-    [u8] bad2 = [48, 65];
+    [u8] bad2 = b"0A";
     [u8] out2 = alloc_array<u8>(1, 0);
     hex_decode(&bad2, &mut out2);
-    [u8] bad3 = [58, 57];
+    [u8] bad3 = b":9";
     [u8] out3 = alloc_array<u8>(1, 0);
     hex_decode(&bad3, &mut out3);
     [u8] empty = [];

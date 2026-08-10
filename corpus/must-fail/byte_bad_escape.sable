@@ -1,0 +1,6 @@
+// expect-error: lex.bad_escape
+// \q is not an escape.
+
+fn test_f() {
+    [u8] b = b"a\qb";
+}

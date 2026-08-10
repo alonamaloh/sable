@@ -1958,6 +1958,23 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            // b"..." is sugar for the array literal of its bytes.
+            Tok::Bytes(bs) => {
+                self.bump();
+                Ok(Expr {
+                    kind: ExprKind::ArrayLit(
+                        bs.iter()
+                            .map(|b| Expr {
+                                kind: ExprKind::IntLit(i128::from(*b)),
+                                span,
+                                ty: None,
+                            })
+                            .collect(),
+                    ),
+                    span,
+                    ty: None,
+                })
+            }
             Tok::KwTrue => {
                 self.bump();
                 Ok(Expr {
