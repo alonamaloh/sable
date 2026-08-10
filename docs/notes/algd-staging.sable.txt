@@ -1,0 +1,1009 @@
+// Algorithm D staging module: fast long division against bignum's Nat.
+// Development staging for the div rewrite; verified pieces migrate into
+// corpus/verifies/bignum.sable when complete.
+
+use bignum;
+
+// ---- division-fact toolbox (validated in docs/notes/algd-probe.lean) ----
+
+/// theorem ediv_decomp (a b : int) (hb : 1 ≤ b) :
+///     (a / b) * b + a % b = a ∧ 0 ≤ a % b ∧ a % b < b := by
+///   obtain ⟨h1, h2, h3⟩ :=
+///     (Int.ediv_emod_unique (by omega : (0:Int) < b)).mp ⟨rfl, rfl⟩
+///   refine ⟨?_, h2, h3⟩
+///   rw [Int.mul_comm] at h1
+///   omega
+
+/// theorem le_of_mul_sandwich (a b p q : int) (hb : 1 ≤ b)
+///     (hq : q * b ≤ a) (hp : a < (p + 1) * b) : q ≤ p := by
+///   by_cases h : q ≤ p
+///   · exact h
+///   · exfalso
+///     have h1 : p + 1 ≤ q := by omega
+///     have h2 : (p + 1) * b ≤ q * b :=
+///       Int.mul_le_mul_of_nonneg_right h1 (by omega)
+///     omega
+
+/// theorem ediv_lt_of_lt_mul (a b c : int) (hb : 1 ≤ b) (_ha : 0 ≤ a)
+///     (h : a < c * b) : a / b < c := by
+///   obtain ⟨hdec, hr0, hrb⟩ := ediv_decomp a b hb
+///   have := le_of_mul_sandwich a b (c - 1) (a / b) hb (by omega)
+///     (by rw [show c - 1 + 1 = c from by omega]; exact h)
+///   omega
+
+/// theorem qhat_ge (w rtop2 Rlow R V Vlow k qh : int)
+///     (hw : 1 ≤ w) (_hk : 0 ≤ k)
+///     (hV : V = w * pw k + Vlow) (hVl : 0 ≤ Vlow) (_hVh : Vlow < pw k)
+///     (hR : R = rtop2 * pw k + Rlow) (hRl : 0 ≤ Rlow) (hRh : Rlow < pw k)
+///     (hr2 : 0 ≤ rtop2)
+///     (hRB : R < 4294967296 * V)
+///     (hqh : (qh = rtop2 / w ∧ rtop2 / w ≤ 4294967295)
+///          ∨ (qh = 4294967295 ∧ 4294967295 ≤ rtop2 / w)) :
+///     R / V ≤ qh := by
+///   have hpw := pw_pos k
+///   have hV1 : 1 ≤ V := by
+///     have : 1 * pw k ≤ w * pw k := Int.mul_le_mul_of_nonneg_right hw (by omega)
+///     omega
+///   have hR0 : 0 ≤ R := by
+///     have : 0 * pw k ≤ rtop2 * pw k := Int.mul_le_mul_of_nonneg_right hr2 (by omega)
+///     omega
+///   obtain ⟨hRdec, hRr0, hRrb⟩ := ediv_decomp R V hV1
+///   rcases hqh with ⟨hq, _⟩ | ⟨hq, _⟩
+///   · obtain ⟨hdec, hr0, hrb⟩ := ediv_decomp rtop2 w hw
+///     have hql : qh * w ≤ rtop2 := by rw [hq]; omega
+///     have hqu : rtop2 < qh * w + w := by rw [hq]; omega
+///     have hq0 : 0 ≤ qh := by
+///       rw [hq]
+///       by_cases h : 0 ≤ rtop2 / w
+///       · exact h
+///       · exfalso
+///         have : rtop2 / w ≤ -1 := by omega
+///         have h2 : (rtop2 / w) * w ≤ (-1) * w :=
+///           Int.mul_le_mul_of_nonneg_right this (by omega)
+///         omega
+///     have step1 : rtop2 * pw k ≤ (qh * w + w - 1) * pw k :=
+///       Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///     have step2 : (qh + 1) * (w * pw k) ≤ (qh + 1) * V := by
+///       have h1 : w * pw k ≤ V := by omega
+///       exact Int.mul_le_mul_of_nonneg_left h1 (by omega)
+///     have expand : (qh * w + w - 1) * pw k + pw k = (qh + 1) * (w * pw k) := by
+///       have e1 : (qh * w + w - 1) * pw k = (qh * w + w) * pw k - 1 * pw k :=
+///         Int.sub_mul _ _ _
+///       have e2 : (qh * w + w) * pw k = qh * w * pw k + w * pw k :=
+///         Int.add_mul _ _ _
+///       have e3 : (qh + 1) * (w * pw k) = qh * (w * pw k) + 1 * (w * pw k) :=
+///         Int.add_mul _ _ _
+///       have e4 : qh * (w * pw k) = qh * w * pw k := (Int.mul_assoc _ _ _).symm
+///       omega
+///     have hRlt : R < (qh + 1) * V := by omega
+///     exact le_of_mul_sandwich R V qh (R / V) hV1 (by omega) hRlt
+///   · rw [hq]
+///     have := ediv_lt_of_lt_mul R V 4294967296 hV1 hR0 hRB
+///     omega
+
+/// theorem qhat_le4 (w rtop2 Rlow R V Vlow k qh : int)
+///     (hw : 1073741824 < w) (_hk : 0 ≤ k)
+///     (hV : V = w * pw k + Vlow) (_hVl : 0 ≤ Vlow) (hVh : Vlow < pw k)
+///     (hR : R = rtop2 * pw k + Rlow) (hRl : 0 ≤ Rlow) (_hRh : Rlow < pw k)
+///     (hR0 : 0 ≤ R) (hRB : R < 4294967296 * V)
+///     (hlow : qh * w ≤ rtop2) (hqB : qh ≤ 4294967295) :
+///     qh ≤ R / V + 4 := by
+///   have hpw := pw_pos k
+///   have hV1 : 1 ≤ V := by
+///     have : 1 * pw k ≤ w * pw k := Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///     omega
+///   obtain ⟨hRdec, hRr0, hRrb⟩ := ediv_decomp R V hV1
+///   have hq0 : 0 ≤ R / V := by
+///     by_cases h : 0 ≤ R / V
+///     · exact h
+///     · exfalso
+///       have h1 : R / V ≤ -1 := by omega
+///       have h2 : R / V * V ≤ (-1) * V := Int.mul_le_mul_of_nonneg_right h1 (by omega)
+///       omega
+///   have hqB2 : R / V ≤ 4294967295 := by
+///     have := ediv_lt_of_lt_mul R V 4294967296 hV1 hR0 hRB
+///     omega
+///   have hRup : R < (R / V + 1) * V := by
+///     have e : (R / V + 1) * V = R / V * V + 1 * V := Int.add_mul _ _ _
+///     omega
+///   have hVup : V < (w + 1) * pw k := by
+///     have e : (w + 1) * pw k = w * pw k + 1 * pw k := Int.add_mul _ _ _
+///     omega
+///   have hRlo : qh * w * pw k ≤ R := by
+///     have h1 : qh * w * pw k ≤ rtop2 * pw k :=
+///       Int.mul_le_mul_of_nonneg_right hlow (by omega)
+///     omega
+///   have hchain : qh * w * pw k < (R / V + 1) * ((w + 1) * pw k) := by
+///     have h1 : (R / V + 1) * V ≤ (R / V + 1) * ((w + 1) * pw k - 1) :=
+///       Int.mul_le_mul_of_nonneg_left (by omega) (by omega)
+///     have h2 : (R / V + 1) * ((w + 1) * pw k - 1)
+///         = (R / V + 1) * ((w + 1) * pw k) - (R / V + 1) * 1 := Int.mul_sub _ _ _
+///     omega
+///   have hcancel : qh * w < (R / V + 1) * (w + 1) := by
+///     have e : (R / V + 1) * ((w + 1) * pw k) = (R / V + 1) * (w + 1) * pw k :=
+///       (Int.mul_assoc _ _ _).symm
+///     rw [e] at hchain
+///     by_cases h : qh * w < (R / V + 1) * (w + 1)
+///     · exact h
+///     · exfalso
+///       have h1 : (R / V + 1) * (w + 1) * pw k ≤ qh * w * pw k :=
+///         Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///       omega
+///   by_cases hfar : qh ≤ R / V + 4
+///   · exact hfar
+///   · exfalso
+///     have h5 : (R / V + 5) * w ≤ qh * w :=
+///       Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///     have e1 : (R / V + 5) * w = R / V * w + 5 * w := Int.add_mul _ _ _
+///     have e2 : (R / V + 1) * (w + 1) = R / V * (w + 1) + 1 * (w + 1) :=
+///       Int.add_mul _ _ _
+///     have e3 : R / V * (w + 1) = R / V * w + R / V * 1 := Int.mul_add _ _ _
+///     omega
+
+/// theorem valIn_shift (out r : Sable.Seq Int) (i n : int)
+///     (h : ∀ k, i ≤ k → k < n → out.get (k + 1) = r.get k) :
+///     valIn out (i + 1) (n + 1) = valIn r i n := by
+///   revert h
+///   fun_induction valIn r i n with
+///   | case1 i hc ih =>
+///       intro h
+///       have h1 : valIn out (i + 1) (n + 1)
+///           = out.get (i + 1) + 4294967296 * valIn out (i + 1 + 1) (n + 1) := by
+///         rw [valIn, if_pos (by omega)]
+///       have h2 := ih (fun k hk1 hk2 => h k (by omega) hk2)
+///       have h3 := h i (by omega) hc
+///       rw [h1, h2, h3]
+///   | case2 i hc =>
+///       intro _
+///       rw [valIn, if_neg (by omega)]
+
+/// theorem top2_decomp (r : Sable.Seq Int) (n : int)
+///     (hn : 1 ≤ n) (_hlen0 : 0 ≤ r.len) (hlen : r.len ≤ n + 1)
+///     (hb : ∀ k, 0 ≤ k → k < r.len → 0 ≤ r.get k ∧ r.get k ≤ 4294967295) :
+///     ∃ low, natVal r
+///         = ((if n < r.len then r.get n else 0) * 4294967296
+///            + (if n - 1 < r.len then r.get (n - 1) else 0)) * pw (n - 1) + low
+///       ∧ 0 ≤ low ∧ low < pw (n - 1) := by
+///   have hpw := pw_pos (n - 1)
+///   by_cases hc1 : r.len ≤ n - 1
+///   · refine ⟨natVal r, ?_, ?_, ?_⟩
+///     · rw [if_neg (by omega), if_neg (by omega)]
+///       omega
+///     · exact valIn_nonneg r 0 r.len (fun k hk1 hk2 => (hb k hk1 hk2).1)
+///     · have h1 := valIn_lt_pw r 0 r.len hb
+///       have h2 : pw (r.len - 0) ≤ pw (n - 1) := pw_mono _ _ (by omega)
+///       simp only [natVal]
+///       omega
+///   · by_cases hc2 : r.len = n
+///     · have hs := valIn_snoc r 0 (n - 1) (by omega)
+///       rw [show n - 1 + 1 = n from by omega, show n - 1 - 0 = n - 1 from by omega] at hs
+///       refine ⟨valIn r 0 (n - 1), ?_, ?_, ?_⟩
+///       · rw [if_neg (by omega), if_pos (by omega)]
+///         simp only [natVal, hc2]
+///         rw [hs, Int.zero_mul, Int.zero_add]
+///         omega
+///       · exact valIn_nonneg r 0 (n - 1) (fun k hk1 hk2 => (hb k hk1 (by omega)).1)
+///       · have h1 := valIn_lt_pw r 0 (n - 1) (fun k hk1 hk2 => hb k hk1 (by omega))
+///         rw [show n - 1 - 0 = n - 1 from by omega] at h1
+///         exact h1
+///     · have hc3 : r.len = n + 1 := by omega
+///       have hs1 := valIn_snoc r 0 n (by omega)
+///       rw [show n - 0 = n from by omega] at hs1
+///       have hs2 := valIn_snoc r 0 (n - 1) (by omega)
+///       rw [show n - 1 + 1 = n from by omega, show n - 1 - 0 = n - 1 from by omega] at hs2
+///       have hpwn : pw n = 4294967296 * pw (n - 1) := by
+///         have := pw_succ (n - 1) (by omega)
+///         rw [show n - 1 + 1 = n from by omega] at this
+///         exact this
+///       refine ⟨valIn r 0 (n - 1), ?_, ?_, ?_⟩
+///       · rw [if_pos (by omega), if_pos (by omega)]
+///         simp only [natVal, hc3]
+///         rw [hs1, hs2, hpwn]
+///         have e : r.get n * (4294967296 * pw (n - 1))
+///                = r.get n * 4294967296 * pw (n - 1) := (Int.mul_assoc _ _ _).symm
+///         rw [e, Int.add_mul]
+///         omega
+///       · exact valIn_nonneg r 0 (n - 1) (fun k hk1 hk2 => (hb k hk1 (by omega)).1)
+///       · have h1 := valIn_lt_pw r 0 (n - 1) (fun k hk1 hk2 => hb k hk1 (by omega))
+///         rw [show n - 1 - 0 = n - 1 from by omega] at h1
+///         exact h1
+
+/// theorem top_limb_lb (v : Sable.Seq Int) (c : int)
+///     (hlen : 1 ≤ v.len)
+///     (hb : ∀ k, 0 ≤ k → k < v.len → 0 ≤ v.get k ∧ v.get k ≤ 4294967295)
+///     (hval : c * pw (v.len - 1) ≤ natVal v) :
+///     c ≤ v.get (v.len - 1) := by
+///   have hpw := pw_pos (v.len - 1)
+///   have hs := valIn_snoc v 0 (v.len - 1) (by omega)
+///   rw [show v.len - 1 + 1 = v.len from by omega,
+///       show v.len - 1 - 0 = v.len - 1 from by omega] at hs
+///   have hlow := valIn_lt_pw v 0 (v.len - 1) (fun k hk1 hk2 => hb k hk1 (by omega))
+///   rw [show v.len - 1 - 0 = v.len - 1 from by omega] at hlow
+///   have hlow0 := valIn_nonneg v 0 (v.len - 1) (fun k hk1 hk2 => (hb k hk1 (by omega)).1)
+///   have hup : natVal v < (v.get (v.len - 1) + 1) * pw (v.len - 1) := by
+///     simp only [natVal]
+///     rw [hs, Int.add_mul]
+///     omega
+///   by_cases h : c ≤ v.get (v.len - 1)
+///   · exact h
+///   · exfalso
+///     have h1 : v.get (v.len - 1) + 1 ≤ c := by omega
+///     have h2 : (v.get (v.len - 1) + 1) * pw (v.len - 1) ≤ c * pw (v.len - 1) :=
+///       Int.mul_le_mul_of_nonneg_right h1 (by omega)
+///     omega
+
+/// theorem val_range_len (v : Sable.Seq Int) (k : int)
+///     (_hk : 1 ≤ k) (_hlen0 : 0 ≤ v.len)
+///     (hb : ∀ j, 0 ≤ j → j < v.len → 0 ≤ v.get j ∧ v.get j ≤ 4294967295)
+///     (htop : 0 < v.len → 1 ≤ v.get (v.len - 1))
+///     (hlo : pw (k - 1) ≤ natVal v) (hhi : natVal v < pw k) :
+///     v.len = k := by
+///   simp only [natVal] at hlo hhi
+///   have hup := valIn_lt_pw v 0 v.len hb
+///   rw [show v.len - 0 = v.len from by omega] at hup
+///   have hlen1 : 0 < v.len := by
+///     by_cases h : 0 < v.len
+///     · exact h
+///     · exfalso
+///       have hz : valIn v 0 v.len = 0 := valIn_nil v 0 v.len (by omega)
+///       have := pw_pos (k - 1)
+///       omega
+///   have hge := valIn_ge_pw v 0 v.len (fun j h1 h2 => (hb j h1 h2).1)
+///     (htop hlen1) (by omega)
+///   rw [show v.len - 1 - 0 = v.len - 1 from by omega] at hge
+///   have h1 : k - 1 < v.len := by
+///     by_cases h : k - 1 < v.len
+///     · exact h
+///     · exfalso
+///       have := pw_mono v.len (k - 1) (by omega)
+///       omega
+///   have h2 : v.len - 1 < k := by
+///     by_cases h : v.len - 1 < k
+///     · exact h
+///     · exfalso
+///       have := pw_mono k (v.len - 1) (by omega)
+///       omega
+///   omega
+
+/// theorem len_le_of_val_lt_pw (v : Sable.Seq Int) (k : int)
+///     (hk : 0 ≤ k) (hlen0 : 0 ≤ v.len)
+///     (hb : ∀ j, 0 ≤ j → j < v.len → 0 ≤ v.get j)
+///     (htop : 0 < v.len → 1 ≤ v.get (v.len - 1))
+///     (hhi : natVal v < pw k) :
+///     v.len ≤ k := by
+///   simp only [natVal] at hhi
+///   by_cases h : v.len ≤ k
+///   · exact h
+///   · exfalso
+///     have hlen1 : 0 < v.len := by omega
+///     have hge := valIn_ge_pw v 0 v.len hb (htop hlen1) (by omega)
+///     rw [show v.len - 1 - 0 = v.len - 1 from by omega] at hge
+///     have := pw_mono k (v.len - 1) (by omega)
+///     omega
+
+/// theorem digit_step (S S2 Q Q2 R R2 R3 V uj qd : int)
+///     (hopen : S = uj + 4294967296 * S2)
+///     (hinv : S2 = Q * V + R)
+///     (hshift : R2 = 4294967296 * R + uj)
+///     (hQ : Q2 = 4294967296 * Q + qd)
+///     (hsub : R3 = R2 - qd * V) :
+///     S = Q2 * V + R3 := by
+///   subst hopen hinv hshift hQ hsub
+///   have e1 : (4294967296 * Q + qd) * V = 4294967296 * Q * V + qd * V :=
+///     Int.add_mul _ _ _
+///   have e2 : 4294967296 * (Q * V + R) = 4294967296 * (Q * V) + 4294967296 * R :=
+///     Int.mul_add _ _ _
+///   have e3 : 4294967296 * (Q * V) = 4294967296 * Q * V := (Int.mul_assoc _ _ _).symm
+///   omega
+
+/// theorem digit_exact (R2 VN qd : int) (hVN : 1 ≤ VN)
+///     (hlo : qd * VN ≤ R2) (hhi : R2 < (qd + 1) * VN) : qd = R2 / VN := by
+///   refine div_unique R2 VN qd (R2 - qd * VN) hVN (by omega) (by omega) ?_
+///   rw [Int.add_mul] at hhi
+///   omega
+
+/// theorem denorm_quot (A V Q R m : int) (hm : 1 ≤ m) (hV : 1 ≤ V)
+///     (heq : A * m = Q * (V * m) + R) (hR0 : 0 ≤ R) (hRm : R < V * m) :
+///     Q = A / V := by
+///   have hRm2 : R = (A - Q * V) * m := by
+///     have e : Q * (V * m) = Q * V * m := (Int.mul_assoc _ _ _).symm
+///     rw [e] at heq
+///     rw [Int.sub_mul]
+///     omega
+///   have hd0 : 0 ≤ A - Q * V := by
+///     by_cases h : 0 ≤ A - Q * V
+///     · exact h
+///     · exfalso
+///       have h1 : A - Q * V ≤ -1 := by omega
+///       have h2 : (A - Q * V) * m ≤ (-1) * m :=
+///         Int.mul_le_mul_of_nonneg_right h1 (by omega)
+///       omega
+///   have hdV : A - Q * V < V := by
+///     by_cases h : A - Q * V < V
+///     · exact h
+///     · exfalso
+///       have h1 : V * m ≤ (A - Q * V) * m :=
+///         Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///       omega
+///   exact div_unique A V Q (A - Q * V) hV (by omega) (by omega) hdV
+
+/// theorem shift_stays_bounded (R VN uj : int)
+///     (hR : R < VN) (hu0 : 0 ≤ uj) (huB : uj ≤ 4294967295) :
+///     4294967296 * R + uj < 4294967296 * VN := by
+///   have h1 : 4294967296 * (R + 1) ≤ 4294967296 * VN :=
+///     Int.mul_le_mul_of_nonneg_left (by omega) (by omega)
+///   rw [Int.mul_add] at h1
+///   omega
+
+/// theorem window_open (a : Sable.Seq Int) (j n : int) (h : j < n) :
+///     valIn a j n = a.get j + 4294967296 * valIn a (j + 1) n := by
+///   rw [valIn, if_pos h]
+
+// ------------------------------- helpers --------------------------------
+
+// Single-limb constructor.
+/// post #[label(value)] natVal result.limbs = d
+/// post #[label(len)]   result.limbs.len ≤ 1
+fn nat1(u32 d) -> Nat {
+    mut [u32] xs = alloc_array<u32>(1, 0);
+    xs[0] = d;
+    if (d == 0) {
+        return Nat::from_prefix(&xs, 0);
+    }
+    return Nat::from_prefix(&xs, 1);
+}
+
+// R' = B·R + d: shift the limbs up one position and drop `d` in at the
+// bottom.
+/// pre  r.limbs.len ≤ 4611686018427387904
+/// post #[label(value)] natVal result.limbs
+///          = 4294967296 * natVal r.limbs + d
+/// post #[label(len)]   result.limbs.len ≤ r.limbs.len + 1
+fn shift_in(&Nat r, u32 d) -> Nat {
+    u64 rl = r.limbs.len;
+    if (rl == 0) {
+        return nat1(d);
+    }
+    mut [u32] xs = alloc_array<u32>(rl + 1, 0);
+    xs[0] = d;
+    /// invariant ∀ k, 0 ≤ k → k < i → xs.get (k + 1) = r.limbs.get k
+    /// invariant xs.get 0 = d
+    for (u64 i : range(rl)) {
+        xs[i + 1] = r.limbs[i];
+    }
+    return Nat::from_prefix(&xs, rl + 1);
+}
+
+// Normalization factor: the doubling loop with the relaxed guard
+// (`t + m ≤ 2^31`), giving quarter-normalization — see the deviation
+// note in docs/notes/algd-probe.lean.
+/// pre  1 ≤ t0
+/// pre  t0 ≤ 4294967295
+/// post #[label(lo)]  1073741824 < t0 * result
+/// post #[label(hi)]  t0 * result + result ≤ 4294967296
+/// post #[label(pos)] 1 ≤ result
+/// post #[label(cap)] result ≤ 2147483648
+fn norm_factor(u64 t0) -> u64 {
+    mut u64 t = t0;
+    mut u64 m = 1;
+    /// invariant t = t0 * m
+    /// invariant 1 ≤ m
+    /// invariant t + m ≤ 4294967296
+    /// variant   4294967296 - t
+    while (t + m <= 2147483648) {
+        t = t + t;
+        m = m + m;
+    }
+    return m;
+}
+
+// ------------------------- the division itself --------------------------
+
+/// pre  natVal b.limbs ≥ 1
+/// pre  a.limbs.len + b.limbs.len ≤ 2305843009213693952
+/// post #[label(quot)] natVal result.limbs = natVal a.limbs / natVal b.limbs
+fn div_fast(&Nat a, &Nat b) -> Nat {
+    u64 n = b.limbs.len;
+    /// assert #[label(n_pos)] 1 ≤ n
+    u64 mfac = norm_factor(widen<u64>(b.limbs[n - 1]));
+    var mn = nat1(narrow<u32>(mfac));
+    /// assert #[label(mn_val)] natVal mn.limbs = mfac
+    var vn = b * mn;
+    /// assert #[label(vn_val)]  natVal vn.limbs = natVal b.limbs * mfac
+    /// assert #[label(vn_pos)]  1 ≤ natVal vn.limbs
+    /// assert #[label(vn_len)]  vn.limbs.len = n
+    /// assert #[label(vn_top)]  1073741824 < vn.limbs.get (n - 1)
+    var u = a * mn;
+    /// assert #[label(u_val)]   natVal u.limbs = natVal a.limbs * mfac
+    /// assert #[label(u_len)]   u.limbs.len ≤ a.limbs.len + 1
+    var mut q = nat1(0);
+    var mut r = nat1(0);
+    /// assert #[label(q0)] natVal q.limbs = 0
+    /// assert #[label(r0)] natVal r.limbs = 0
+    mut u64 j = u.limbs.len;
+    /// invariant j ≤ u.limbs.len
+    /// invariant natVal q.limbs * natVal vn.limbs + natVal r.limbs
+    ///             = valIn u.limbs j u.limbs.len
+    /// invariant natVal r.limbs < natVal vn.limbs
+    /// invariant q.limbs.len ≤ u.limbs.len - j + 1
+    /// variant   j
+    while (j > 0) {
+        j = j - 1;
+        var r2 = shift_in(&r, u.limbs[j]);
+        /// assert #[label(r2_val)] natVal r2.limbs
+        ///           = 4294967296 * natVal r.limbs + u.limbs.get j
+        /// assert #[label(r2_bound)] natVal r2.limbs
+        ///           < 4294967296 * natVal vn.limbs
+        /// assert #[label(r2_len)] r2.limbs.len ≤ n + 1
+        u64 rt2 = widen<u64>(limb_or0(&r2, n)) * 4294967296
+                + widen<u64>(limb_or0(&r2, n - 1));
+        u64 vt = widen<u64>(vn.limbs[n - 1]);
+        mut u64 e = rt2 / vt;
+        if (e > 4294967295) {
+            e = 4294967295;
+        }
+        u64 e0 = e;
+        /// assert #[label(e_ge)] natVal r2.limbs / natVal vn.limbs ≤ e
+        /// assert #[label(e_le)] e ≤ natVal r2.limbs / natVal vn.limbs + 4
+        var en = nat1(narrow<u32>(e));
+        var mut dd = vn * en;
+        /// assert #[label(dd_val)] natVal dd.limbs = e * natVal vn.limbs
+        mut u64 c = 0;
+        /// invariant natVal dd.limbs = e * natVal vn.limbs
+        /// invariant natVal r2.limbs / natVal vn.limbs ≤ e
+        /// invariant natVal r2.limbs < (e + 1) * natVal vn.limbs
+        /// invariant e + c = e0
+        /// variant   e
+        while (r2 < dd) {
+            e = e - 1;
+            dd = dd - vn;
+            c = c + 1;
+        }
+        // The roadmap's qhat_bound, materialized: the estimate needed at
+        // most four corrections (quarter-normalization, qhat_le4).
+        /// assert #[label(qhat_bound)] c ≤ 4
+        /// assert #[label(sand_lo)] natVal dd.limbs ≤ natVal r2.limbs
+        /// assert #[label(e_cap)] e ≤ 4294967295
+        q = shift_in(&q, narrow<u32>(e));
+        r = r2 - dd;
+    }
+    /// assert #[label(close)] natVal q.limbs * natVal vn.limbs + natVal r.limbs
+    ///           = natVal a.limbs * mfac
+    return q;
+}
+
+
+// ---- discharges (scripts developed against the emitted Lean) ----
+
+/// discharge div_fast.assert.close by
+///   have hj0 : j = 0 := by omega
+///   rw [hj0] at h_inv_natval_q_limbs_natval_vn
+///   have hnu : natVal u.limbs = valIn (u.limbs) 0 ((u.limbs).len) := by
+///     simp only [natVal]
+///   omega
+
+/// discharge div_fast.assert.dd_val.2 by
+///   rw [h_mul_post_prod_3, h_nat1_post_value_2]
+///   exact Int.mul_comm _ _
+
+/// discharge div_fast.assert.e_ge by
+///   obtain ⟨low, hdec, hlow0, hlowlt⟩ := top2_decomp (r2.limbs) (((b.limbs).len))
+///     (by omega) (by omega) (by omega) h_field_limbs_elems_8
+///   rw [← h_limb_or0_post_sel, ← h_limb_or0_post_sel_2] at hdec
+///   have hs := valIn_snoc (vn.limbs) 0 (((b.limbs).len) - 1) (by omega)
+///   rw [show ((b.limbs).len) - 1 + 1 = ((b.limbs).len) from by omega,
+///       show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hs
+///   have hVlow0 := valIn_nonneg (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_4 k hh1 (by omega)).1)
+///   have hVlowlt := valIn_lt_pw (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => h_field_limbs_elems_4 k hh1 (by omega))
+///   rw [show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hVlowlt
+///   have hnv : natVal vn.limbs = valIn (vn.limbs) 0 (((b.limbs).len)) := by
+///     simp only [natVal]
+///     rw [h_assert_vn_len]
+///   have hr20 : 0 ≤ natVal r2.limbs := by
+///     simp only [natVal]
+///     exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///   have hmain := qhat_ge ((vn.limbs).get (((b.limbs).len) - 1)) ((_r29 * 4294967296) + _r30) low
+///     (natVal r2.limbs) (natVal vn.limbs) (valIn (vn.limbs) 0 (((b.limbs).len) - 1)) (((b.limbs).len) - 1)
+///     4294967295
+///     (by omega) (by omega)
+///     (by rw [hnv]; omega)
+///     hVlow0 hVlowlt
+///     (by omega) hlow0 hlowlt
+///     (by omega)
+///     (by omega)
+///     (Or.inr ⟨rfl, by omega⟩)
+///   exact hmain
+
+/// discharge div_fast.assert.e_ge.2 by
+///   obtain ⟨low, hdec, hlow0, hlowlt⟩ := top2_decomp (r2.limbs) (((b.limbs).len))
+///     (by omega) (by omega) (by omega) h_field_limbs_elems_8
+///   rw [← h_limb_or0_post_sel, ← h_limb_or0_post_sel_2] at hdec
+///   have hs := valIn_snoc (vn.limbs) 0 (((b.limbs).len) - 1) (by omega)
+///   rw [show ((b.limbs).len) - 1 + 1 = ((b.limbs).len) from by omega,
+///       show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hs
+///   have hVlow0 := valIn_nonneg (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_4 k hh1 (by omega)).1)
+///   have hVlowlt := valIn_lt_pw (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => h_field_limbs_elems_4 k hh1 (by omega))
+///   rw [show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hVlowlt
+///   have hnv : natVal vn.limbs = valIn (vn.limbs) 0 (((b.limbs).len)) := by
+///     simp only [natVal]
+///     rw [h_assert_vn_len]
+///   have hr20 : 0 ≤ natVal r2.limbs := by
+///     simp only [natVal]
+///     exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///   have hmain := qhat_ge ((vn.limbs).get (((b.limbs).len) - 1)) ((_r29 * 4294967296) + _r30) low
+///     (natVal r2.limbs) (natVal vn.limbs) (valIn (vn.limbs) 0 (((b.limbs).len) - 1)) (((b.limbs).len) - 1)
+///     ((((_r29 * 4294967296) + _r30) / ((vn.limbs).get (((b.limbs).len) - 1))))
+///     (by omega) (by omega)
+///     (by rw [hnv]; omega)
+///     hVlow0 hVlowlt
+///     (by omega) hlow0 hlowlt
+///     (by omega)
+///     (by omega)
+///     (Or.inl ⟨rfl, by omega⟩)
+///   exact hmain
+
+/// discharge div_fast.assert.e_le by
+///   obtain ⟨low, hdec, hlow0, hlowlt⟩ := top2_decomp (r2.limbs) (((b.limbs).len))
+///     (by omega) (by omega) (by omega) h_field_limbs_elems_8
+///   rw [← h_limb_or0_post_sel, ← h_limb_or0_post_sel_2] at hdec
+///   have hs := valIn_snoc (vn.limbs) 0 (((b.limbs).len) - 1) (by omega)
+///   rw [show ((b.limbs).len) - 1 + 1 = ((b.limbs).len) from by omega,
+///       show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hs
+///   have hVlow0 := valIn_nonneg (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_4 k hh1 (by omega)).1)
+///   have hVlowlt := valIn_lt_pw (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => h_field_limbs_elems_4 k hh1 (by omega))
+///   rw [show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hVlowlt
+///   have hnv : natVal vn.limbs = valIn (vn.limbs) 0 (((b.limbs).len)) := by
+///     simp only [natVal]
+///     rw [h_assert_vn_len]
+///   have hr20 : 0 ≤ natVal r2.limbs := by
+///     simp only [natVal]
+///     exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///   obtain ⟨hdd, hdr0, hdrb⟩ := ediv_decomp ((_r29 * 4294967296) + _r30) ((vn.limbs).get (((b.limbs).len) - 1)) (by omega)
+///   have h1 : (4294967296:Int) * ((vn.limbs).get (((b.limbs).len) - 1)) ≤ ((((_r29 * 4294967296) + _r30) / ((vn.limbs).get (((b.limbs).len) - 1)))) * ((vn.limbs).get (((b.limbs).len) - 1)) :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   have e1 : (4294967295:Int) * ((vn.limbs).get (((b.limbs).len) - 1)) = 4294967296 * ((vn.limbs).get (((b.limbs).len) - 1)) - 1 * ((vn.limbs).get (((b.limbs).len) - 1)) := by
+///     have := Int.sub_mul (4294967296:Int) 1 ((vn.limbs).get (((b.limbs).len) - 1))
+///     omega
+///
+///   have hmain := qhat_le4 ((vn.limbs).get (((b.limbs).len) - 1)) ((_r29 * 4294967296) + _r30) low
+///     (natVal r2.limbs) (natVal vn.limbs) (valIn (vn.limbs) 0 (((b.limbs).len) - 1)) (((b.limbs).len) - 1)
+///     4294967295
+///     (by omega) (by omega)
+///     (by rw [hnv]; omega)
+///     hVlow0 hVlowlt
+///     (by omega) hlow0 hlowlt
+///     hr20
+///     (by omega)
+///     (by omega)
+///     (by omega)
+///   exact hmain
+
+/// discharge div_fast.assert.e_le.2 by
+///   obtain ⟨low, hdec, hlow0, hlowlt⟩ := top2_decomp (r2.limbs) (((b.limbs).len))
+///     (by omega) (by omega) (by omega) h_field_limbs_elems_8
+///   rw [← h_limb_or0_post_sel, ← h_limb_or0_post_sel_2] at hdec
+///   have hs := valIn_snoc (vn.limbs) 0 (((b.limbs).len) - 1) (by omega)
+///   rw [show ((b.limbs).len) - 1 + 1 = ((b.limbs).len) from by omega,
+///       show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hs
+///   have hVlow0 := valIn_nonneg (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_4 k hh1 (by omega)).1)
+///   have hVlowlt := valIn_lt_pw (vn.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => h_field_limbs_elems_4 k hh1 (by omega))
+///   rw [show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hVlowlt
+///   have hnv : natVal vn.limbs = valIn (vn.limbs) 0 (((b.limbs).len)) := by
+///     simp only [natVal]
+///     rw [h_assert_vn_len]
+///   have hr20 : 0 ≤ natVal r2.limbs := by
+///     simp only [natVal]
+///     exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///   obtain ⟨hdd, hdr0, hdrb⟩ := ediv_decomp ((_r29 * 4294967296) + _r30) ((vn.limbs).get (((b.limbs).len) - 1)) (by omega)
+///
+///   have hmain := qhat_le4 ((vn.limbs).get (((b.limbs).len) - 1)) ((_r29 * 4294967296) + _r30) low
+///     (natVal r2.limbs) (natVal vn.limbs) (valIn (vn.limbs) 0 (((b.limbs).len) - 1)) (((b.limbs).len) - 1)
+///     ((((_r29 * 4294967296) + _r30) / ((vn.limbs).get (((b.limbs).len) - 1))))
+///     (by omega) (by omega)
+///     (by rw [hnv]; omega)
+///     hVlow0 hVlowlt
+///     (by omega) hlow0 hlowlt
+///     hr20
+///     (by omega)
+///     (by omega)
+///     (by omega)
+///   exact hmain
+
+/// discharge div_fast.assert.n_pos by
+///   by_cases h : 1 ≤ (b.limbs).len
+///   · omega
+///   · exfalso
+///     have hz := valIn_nil (b.limbs) 0 ((b.limbs).len) (by omega)
+///     simp only [natVal] at h_pre_natval_b_limbs_1
+///     omega
+
+/// discharge div_fast.assert.r2_bound by
+///   have hu := h_field_limbs_elems_5 (j - 1) (by omega) (by omega)
+///   have hmax : (u32.max : Int) = 4294967295 := rfl
+///   have hb := shift_stays_bounded (natVal r.limbs) (natVal vn.limbs) ((u.limbs).get (j - 1))
+///     h_inv_natval_r_limbs_natval_vn hu.1 (by omega)
+///   omega
+
+/// discharge div_fast.assert.r2_len by
+///   have hvnlt := valIn_lt_pw (vn.limbs) 0 ((vn.limbs).len) h_field_limbs_elems_4
+///   rw [show (vn.limbs).len - 0 = (vn.limbs).len from by omega, h_assert_vn_len] at hvnlt
+///   have hnv : natVal vn.limbs = valIn (vn.limbs) 0 (((b.limbs).len)) := by
+///     simp only [natVal]
+///     rw [h_assert_vn_len]
+///   have hmul : 4294967296 * natVal vn.limbs ≤ 4294967296 * (pw (((b.limbs).len)) - 1) :=
+///     Int.mul_le_mul_of_nonneg_left (by omega) (by omega)
+///   have e1 : (4294967296:Int) * (pw (((b.limbs).len)) - 1) = 4294967296 * pw (((b.limbs).len)) - 4294967296 * 1 :=
+///     Int.mul_sub _ _ _
+///   have hpsucc := pw_succ (((b.limbs).len)) (by omega)
+///   have hfin : natVal r2.limbs < pw (((b.limbs).len) + 1) := by omega
+///   exact len_le_of_val_lt_pw (r2.limbs) (((b.limbs).len) + 1) (by omega) (by omega)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///     (fun hl => by
+///       rcases h_cinv_limbs_len_0_limbs_get_li_8 with h | h
+///       · omega
+///       · exact h)
+///     hfin
+
+/// discharge div_fast.assert.u_len by
+///   have halt := valIn_lt_pw (a.limbs) 0 ((a.limbs).len) h_field_limbs_elems
+///   rw [show (a.limbs).len - 0 = (a.limbs).len from by omega] at halt
+///   have hpw := pw_pos ((a.limbs).len)
+///   have h1 : natVal a.limbs * mfac ≤ (pw ((a.limbs).len) - 1) * mfac :=
+///     Int.mul_le_mul_of_nonneg_right (by simp only [natVal]; omega) (by omega)
+///   have e1 : (pw ((a.limbs).len) - 1) * mfac = pw ((a.limbs).len) * mfac - 1 * mfac :=
+///     Int.sub_mul _ _ _
+///   have h2 : pw ((a.limbs).len) * mfac ≤ pw ((a.limbs).len) * 4294967296 :=
+///     Int.mul_le_mul_of_nonneg_left (by omega) (by omega)
+///   have hpsucc := pw_succ ((a.limbs).len) (by omega)
+///   have e2 : pw ((a.limbs).len) * 4294967296 = 4294967296 * pw ((a.limbs).len) :=
+///     Int.mul_comm _ _
+///   have hfin : natVal u.limbs < pw ((a.limbs).len + 1) := by
+///     rw [h_assert_u_val]
+///     omega
+///   exact len_le_of_val_lt_pw (u.limbs) ((a.limbs).len + 1) (by omega) (by omega)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_5 k hh1 hh2).1)
+///     (fun hl => by
+///       rcases h_cinv_limbs_len_0_limbs_get_li_5 with h | h
+///       · omega
+///       · exact h)
+///     hfin
+
+/// discharge div_fast.assert.vn_len by
+///   have hsplitb := valIn_snoc (b.limbs) 0 (((b.limbs).len) - 1) (by omega)
+///   rw [show ((b.limbs).len) - 1 + 1 = ((b.limbs).len) from by omega,
+///       show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hsplitb
+///   have hblow0 := valIn_nonneg (b.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_2 k hh1 (by omega)).1)
+///   have hpwb := pw_pos (((b.limbs).len) - 1)
+///   have hblo : (b.limbs).get (((b.limbs).len) - 1) * pw (((b.limbs).len) - 1) ≤ natVal b.limbs := by
+///     simp only [natVal]
+///     omega
+///   have h2 : ((b.limbs).get (((b.limbs).len) - 1) * pw (((b.limbs).len) - 1)) * mfac ≤ natVal b.limbs * mfac :=
+///     Int.mul_le_mul_of_nonneg_right hblo (by omega)
+///   have h3 : ((b.limbs).get (((b.limbs).len) - 1) * pw (((b.limbs).len) - 1)) * mfac
+///       = ((b.limbs).get (((b.limbs).len) - 1) * mfac) * pw (((b.limbs).len) - 1) :=
+///     Int.mul_right_comm _ _ _
+///   have h4 : 1 * pw (((b.limbs).len) - 1) ≤ ((b.limbs).get (((b.limbs).len) - 1) * mfac) * pw (((b.limbs).len) - 1) :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   have hlo : pw (((b.limbs).len) - 1) ≤ natVal vn.limbs := by
+///     rw [h_assert_vn_val]
+///     omega
+///   have hblowlt := valIn_lt_pw (b.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => h_field_limbs_elems_2 k hh1 (by omega))
+///   rw [show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hblowlt
+///   have hbhi : natVal b.limbs < ((b.limbs).get (((b.limbs).len) - 1) + 1) * pw (((b.limbs).len) - 1) := by
+///     simp only [natVal]
+///     have e := Int.add_mul ((b.limbs).get (((b.limbs).len) - 1)) 1 (pw (((b.limbs).len) - 1))
+///     omega
+///   have h5 : natVal b.limbs * mfac ≤ (((b.limbs).get (((b.limbs).len) - 1) + 1) * pw (((b.limbs).len) - 1) - 1) * mfac :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   have e8 : (((b.limbs).get (((b.limbs).len) - 1) + 1) * pw (((b.limbs).len) - 1) - 1) * mfac
+///       = (((b.limbs).get (((b.limbs).len) - 1) + 1) * pw (((b.limbs).len) - 1)) * mfac - 1 * mfac :=
+///     Int.sub_mul _ _ _
+///   have e5 : (((b.limbs).get (((b.limbs).len) - 1) + 1) * pw (((b.limbs).len) - 1)) * mfac
+///       = (((b.limbs).get (((b.limbs).len) - 1) + 1) * mfac) * pw (((b.limbs).len) - 1) :=
+///     Int.mul_right_comm _ _ _
+///   have e6 : ((b.limbs).get (((b.limbs).len) - 1) + 1) * mfac
+///       = (b.limbs).get (((b.limbs).len) - 1) * mfac + 1 * mfac := Int.add_mul _ _ _
+///   have h7 : (((b.limbs).get (((b.limbs).len) - 1) + 1) * mfac) * pw (((b.limbs).len) - 1)
+///       ≤ 4294967296 * pw (((b.limbs).len) - 1) :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   have hpsucc := pw_succ (((b.limbs).len) - 1) (by omega)
+///   rw [show ((b.limbs).len) - 1 + 1 = ((b.limbs).len) from by omega] at hpsucc
+///   have hhi : natVal vn.limbs < pw (((b.limbs).len)) := by
+///     rw [h_assert_vn_val]
+///     omega
+///   exact val_range_len (vn.limbs) (((b.limbs).len)) (by omega) (by omega)
+///     h_field_limbs_elems_4
+///     (fun hl => by
+///       rcases h_cinv_limbs_len_0_limbs_get_li_4 with h | h
+///       · omega
+///       · exact h)
+///     hlo hhi
+
+/// discharge div_fast.assert.vn_pos by
+///   have h1 : (1:Int) * 1 ≤ natVal b.limbs * mfac :=
+///     Int.mul_le_mul (by omega) (by omega) (by omega) (by omega)
+///   omega
+
+/// discharge div_fast.assert.vn_top by
+///   have hsplitb := valIn_snoc (b.limbs) 0 (((b.limbs).len) - 1) (by omega)
+///   rw [show ((b.limbs).len) - 1 + 1 = ((b.limbs).len) from by omega,
+///       show ((b.limbs).len) - 1 - 0 = ((b.limbs).len) - 1 from by omega] at hsplitb
+///   have hblow0 := valIn_nonneg (b.limbs) 0 (((b.limbs).len) - 1)
+///     (fun k hh1 hh2 => (h_field_limbs_elems_2 k hh1 (by omega)).1)
+///   have hpwb := pw_pos (((b.limbs).len) - 1)
+///   have hblo : (b.limbs).get (((b.limbs).len) - 1) * pw (((b.limbs).len) - 1) ≤ natVal b.limbs := by
+///     simp only [natVal]
+///     omega
+///   have h2 : ((b.limbs).get (((b.limbs).len) - 1) * pw (((b.limbs).len) - 1)) * mfac ≤ natVal b.limbs * mfac :=
+///     Int.mul_le_mul_of_nonneg_right hblo (by omega)
+///   have h3 : ((b.limbs).get (((b.limbs).len) - 1) * pw (((b.limbs).len) - 1)) * mfac
+///       = ((b.limbs).get (((b.limbs).len) - 1) * mfac) * pw (((b.limbs).len) - 1) :=
+///     Int.mul_right_comm _ _ _
+///   have h4 : 1073741825 * pw (((b.limbs).len) - 1) ≤ ((b.limbs).get (((b.limbs).len) - 1) * mfac) * pw (((b.limbs).len) - 1) :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   have hkey : (1073741825:Int) * pw ((vn.limbs).len - 1) ≤ natVal vn.limbs := by
+///     rw [h_assert_vn_len, h_assert_vn_val]
+///     omega
+///   have hres := top_limb_lb (vn.limbs) 1073741825
+///     (by rw [h_assert_vn_len]; omega) h_field_limbs_elems_4 hkey
+///   rw [h_assert_vn_len] at hres
+///   omega
+
+/// discharge div_fast.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387 by
+///   omega
+
+/// discharge div_fast.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387.2 by
+///   omega
+
+/// discharge div_fast.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387.3 by
+///   omega
+
+/// discharge div_fast.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387.4 by
+///   omega
+
+/// discharge div_fast.call_pre.shift_in.r_limbs_len_4611686018427387904 by
+///   have h1 := len_le_of_val_le (vn.limbs) (r.limbs) (by omega)
+///     (by omega) h_field_limbs_elems_4
+///     (fun k hh1 hh2 => (h_field_limbs_elems_7 k hh1 hh2).1)
+///     (fun hl => by
+///       rcases h_cinv_limbs_len_0_limbs_get_li_7 with h | h
+///       · omega
+///       · exact h)
+///   omega
+
+/// discharge div_fast.call_pre.sub.natval_b_limbs_natval_a_limbs by
+///   have hr20 : 0 ≤ natVal r2.limbs := by
+///     simp only [natVal]
+///     exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///   have hlt : natVal (r2).limbs < natVal (dd).limbs := h_cmp_post_lt.mp (by omega)
+///   have he1 : 1 ≤ e := by
+///     by_cases he : 1 ≤ e
+///     · exact he
+///     · exfalso
+///       have hz : e * natVal vn.limbs ≤ 0 * natVal vn.limbs :=
+///         Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///       have hz0 : (0:Int) * natVal vn.limbs = 0 := Int.zero_mul _
+///       omega
+///   have h1 : 1 * natVal vn.limbs ≤ e * natVal vn.limbs :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   omega
+
+/// discharge div_fast.call_pre.sub.natval_b_limbs_natval_a_limbs.3 by
+///   have hr20 : 0 ≤ natVal r2.limbs := by
+///     simp only [natVal]
+///     exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///   have hlt : natVal (r2).limbs < natVal (dd).limbs := h_cmp_post_lt.mp (by omega)
+///   have he1 : 1 ≤ e := by
+///     by_cases he : 1 ≤ e
+///     · exact he
+///     · exfalso
+///       have hz : e * natVal vn.limbs ≤ 0 * natVal vn.limbs :=
+///         Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///       have hz0 : (0:Int) * natVal vn.limbs = 0 := Int.zero_mul _
+///       omega
+///   have h1 : 1 * natVal vn.limbs ≤ e * natVal vn.limbs :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   omega
+
+/// discharge div_fast.inv_init.natval_q_limbs_natval_vn_limbs_natval_r by
+///   have hz := valIn_nil (u.limbs) (((u.limbs).len)) ((u.limbs).len) (by omega)
+///   have h1 : natVal q.limbs * natVal vn.limbs = 0 := by
+///     rw [h_assert_q0]
+///     exact Int.zero_mul _
+///   omega
+
+/// discharge div_fast.inv_init.natval_r2_limbs_e_1_natval_vn_limbs.2 by
+///   obtain ⟨hd, hr0, hrb⟩ := ediv_decomp (natVal r2.limbs) (natVal vn.limbs) (by omega)
+///   have h1 : (natVal r2.limbs / natVal vn.limbs + 1) * natVal vn.limbs
+///       ≤ (((((_r29 * 4294967296) + _r30) / ((vn.limbs).get (((b.limbs).len) - 1)))) + 1) * natVal vn.limbs :=
+///     Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   have e1 : (natVal r2.limbs / natVal vn.limbs + 1) * natVal vn.limbs
+///       = (natVal r2.limbs / natVal vn.limbs) * natVal vn.limbs + 1 * natVal vn.limbs :=
+///     Int.add_mul _ _ _
+///   omega
+
+/// discharge div_fast.inv_preserved.natval_dd_limbs_e_natval_vn_limbs by
+///   have e1 : (e - 1) * natVal vn.limbs = e * natVal vn.limbs - 1 * natVal vn.limbs :=
+///     Int.sub_mul _ _ _
+///   omega
+
+/// discharge div_fast.inv_preserved.natval_dd_limbs_e_natval_vn_limbs.2 by
+///   have e1 : (e - 1) * natVal vn.limbs = e * natVal vn.limbs - 1 * natVal vn.limbs :=
+///     Int.sub_mul _ _ _
+///   omega
+
+/// discharge div_fast.inv_preserved.natval_q_limbs_natval_vn_limbs_natval_r by
+///   have hop := window_open (u.limbs) (j - 1) ((u.limbs).len) (by omega)
+///   rw [show j - 1 + 1 = j from by omega] at hop
+///   have hstep := digit_step (valIn (u.limbs) (j - 1) ((u.limbs).len))
+///     (valIn (u.limbs) j ((u.limbs).len))
+///     (natVal q.limbs) (natVal (q_2).limbs) (natVal r.limbs) (natVal r2.limbs)
+///     (natVal (r_2).limbs) (natVal vn.limbs) ((u.limbs).get (j - 1)) e
+///     (by omega) (by omega) (by omega) (by omega) (by omega)
+///   omega
+
+/// discharge div_fast.inv_preserved.natval_q_limbs_natval_vn_limbs_natval_r.2 by
+///   have hop := window_open (u.limbs) (j - 1) ((u.limbs).len) (by omega)
+///   rw [show j - 1 + 1 = j from by omega] at hop
+///   have hstep := digit_step (valIn (u.limbs) (j - 1) ((u.limbs).len))
+///     (valIn (u.limbs) j ((u.limbs).len))
+///     (natVal q.limbs) (natVal (q_3).limbs) (natVal r.limbs) (natVal r2.limbs)
+///     (natVal (r_3).limbs) (natVal vn.limbs) ((u.limbs).get (j - 1)) e
+///     (by omega) (by omega) (by omega) (by omega) (by omega)
+///   omega
+
+/// discharge div_fast.inv_preserved.natval_r2_limbs_natval_vn_limbs_e by
+///   obtain ⟨hd, hr0, hrb⟩ := ediv_decomp (natVal r2.limbs) (natVal vn.limbs) (by omega)
+///   have hlt : natVal (r2).limbs < natVal (dd).limbs := h_cmp_post_lt.mp (by omega)
+///   by_cases hqe : natVal r2.limbs / natVal vn.limbs ≤ e - 1
+///   · exact hqe
+///   · exfalso
+///     have h1 : e * natVal vn.limbs ≤ (natVal r2.limbs / natVal vn.limbs) * natVal vn.limbs :=
+///       Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///     omega
+
+/// discharge div_fast.inv_preserved.natval_r2_limbs_natval_vn_limbs_e.2 by
+///   obtain ⟨hd, hr0, hrb⟩ := ediv_decomp (natVal r2.limbs) (natVal vn.limbs) (by omega)
+///   have hlt : natVal (r2).limbs < natVal (dd).limbs := h_cmp_post_lt.mp (by omega)
+///   by_cases hqe : natVal r2.limbs / natVal vn.limbs ≤ e - 1
+///   · exact hqe
+///   · exfalso
+///     have h1 : e * natVal vn.limbs ≤ (natVal r2.limbs / natVal vn.limbs) * natVal vn.limbs :=
+///       Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///     omega
+
+/// discharge div_fast.inv_preserved.natval_r_limbs_natval_vn_limbs by
+///   have e1 : (e + 1) * natVal vn.limbs = e * natVal vn.limbs + 1 * natVal vn.limbs :=
+///     Int.add_mul _ _ _
+///   omega
+
+/// discharge div_fast.inv_preserved.natval_r_limbs_natval_vn_limbs.2 by
+///   have e1 : (e + 1) * natVal vn.limbs = e * natVal vn.limbs + 1 * natVal vn.limbs :=
+///     Int.add_mul _ _ _
+///   omega
+
+/// discharge div_fast.overflow.e_1.2 by
+///   have hr20 : 0 ≤ natVal r2.limbs := by
+///     simp only [natVal]
+///     exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_8 k hh1 hh2).1)
+///   have hlt : natVal (r2).limbs < natVal (dd).limbs := h_cmp_post_lt.mp (by omega)
+///   have he1 : 1 ≤ e := by
+///     by_cases he : 1 ≤ e
+///     · exact he
+///     · exfalso
+///       have hz : e * natVal vn.limbs ≤ 0 * natVal vn.limbs :=
+///         Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///       have hz0 : (0:Int) * natVal vn.limbs = 0 := Int.zero_mul _
+///       omega
+///   omega
+
+/// discharge div_fast.post.quot by
+///   rw [h_result]
+///   have h := denorm_quot (natVal a.limbs) (natVal b.limbs) (natVal q.limbs) (natVal r.limbs) mfac
+///     (by omega) (by omega)
+///     (by rw [← h_assert_vn_val]; omega)
+///     (by simp only [natVal]
+///         exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_7 k hh1 hh2).1))
+///     (by rw [← h_assert_vn_val]; omega)
+///   omega
+
+/// discharge nat1.post.value by
+///   subst h_result
+///   have h := valIn_nil (xs.set 0 d) 0 0 (by omega)
+///   omega
+
+/// discharge nat1.post.value.2 by
+///   subst h_result
+///   have h1 := window_open (xs.set 0 d) 0 1 (by omega)
+///   have h2 := valIn_nil (xs.set 0 d) (0 + 1) 1 (by omega)
+///   have h3 : (xs.set 0 d).get 0 = d := by
+///     rw [Sable.Seq.get_set, if_pos rfl]
+///   omega
+
+/// discharge norm_factor.inv_preserved.t_t0_m by
+///   have e1 : t0 * (m + m) = t0 * m + t0 * m := Int.mul_add _ _ _
+///   omega
+
+/// discharge norm_factor.post.cap by
+///   rw [h_result]
+///   have h1 : 1 * m ≤ t0 * m := Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   omega
+
+/// discharge norm_factor.post.lo by
+///   rw [h_result]
+///   have h1 : 1 * m ≤ t0 * m := Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   omega
+
+/// discharge norm_factor.variant_decreases.4294967296_t by
+///   have h1 : 1 * m ≤ t0 * m := Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
+///   omega
+
+/// discharge shift_in.call_pre.Nat_from_prefix.n_0_xs_get_n_1_1 by
+///   have hlen1 : 1 ≤ (r.limbs).len := by omega
+///   have h1 := h_inv_k_0_k_k_i_xs_get_k_1_r_l ((r.limbs).len - 1) (by omega) (by omega)
+///   rw [show (r.limbs).len - 1 + 1 = (r.limbs).len from by omega] at h1
+///   right
+///   rw [show (r.limbs).len + 1 - 1 = (r.limbs).len from by omega]
+///   rcases h_cinv_limbs_len_0_limbs_get_li with h | h
+///   · omega
+///   · omega
+
+/// discharge shift_in.inv_preserved.k_0_k_k_i_xs_get_k_1_r_limbs_get_k by
+///   intro k hk0 hki
+///   by_cases hk : k = i
+///   · rw [hk, Sable.Seq.get_set, if_pos rfl]
+///   · have h1 := h_inv_k_0_k_k_i_xs_get_k_1_r_l k (by omega) (by omega)
+///     rw [Sable.Seq.get_set, if_neg (by omega)]
+///     exact h1
+
+/// discharge shift_in.post.len by
+///   subst h_result
+///   omega
+
+/// discharge shift_in.post.value by
+///   subst h_result
+///   have hz : valIn (r.limbs) 0 ((r.limbs).len) = 0 := valIn_nil _ _ _ (by omega)
+///   simp only [natVal] at h_nat1_post_value ⊢
+///   omega
+
+/// discharge shift_in.post.value.2 by
+///   subst h_result
+///   have hop := window_open xs 0 ((r.limbs).len + 1) (by omega)
+///   have hsh := valIn_shift xs (r.limbs) 0 ((r.limbs).len)
+///     (fun k hk0 hkr => h_inv_k_0_k_k_i_xs_get_k_1_r_l k hk0 (by omega))
+///   simp only [natVal] at h_Nat_from_prefix_post_value ⊢
+///   omega
+
+// ------------------------------ smoke tests -----------------------------
+
+fn test_div_fast_small() {
+    mut [u32] xa = [1000000007];
+    mut [u32] xb = [30011];
+    var na = Nat::from_prefix(&xa, 1);
+    var nb = Nat::from_prefix(&xb, 1);
+    var nq = div_fast(&na, &nb);
+    /// assert natVal nq.limbs = 33321
+}
+
+fn test_div_fast_multi() {
+    // a = 3·2^64 + 5·2^32 + 7, b = 2^32 + 11
+    mut [u32] xa = [7, 5, 3];
+    mut [u32] xb = [11, 1];
+    var na = Nat::from_prefix(&xa, 3);
+    var nb = Nat::from_prefix(&xb, 2);
+    var nq = div_fast(&na, &nb);
+    var np = nq * nb;
+    var nr = na - np;
+    /// assert natVal nr.limbs < natVal nb.limbs
+    /// assert natVal np.limbs + natVal nr.limbs = natVal na.limbs
+}

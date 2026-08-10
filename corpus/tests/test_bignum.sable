@@ -6,6 +6,15 @@
 // and class-local reassignment drops. Limb counts stay small so the
 // monitor's exact evaluation of pw/valIn never leaves i128.
 
+// The multi-limb division tests drive add/sub/mul on values whose
+// weighted loop invariants exceed the monitor's i128 ghost width;
+// those subject clauses are deliberately unmonitorable at this
+// magnitude (the verifier has proven them; the fences keep the
+// zero-skip harness two-sided).
+// expect-skip: valIn out 0 i + carry * pw i
+// expect-skip: valIn out 0 n + carry * pw (i + j)
+// expect-skip: valIn out 0 i - borrow * pw i
+
 use bignum;
 
 // Monitored assertion: the pre is the check.
@@ -186,4 +195,51 @@ fn test_gcd_coprime_and_multilimb() {
     [u32] es = [ 0, 2 ];
     var e = Nat::from_prefix(&es, 2);
     expect_eq(cmp(&g2, &e), 0);
+}
+
+fn test_div_multilimb_small_top() {
+    // Divisor with a tiny top limb maximizes normalization (the q̂
+    // estimate path); quotient and remainder reconstruct the dividend.
+    [u32] xs = [ 4054939, 2882400001, 305419896 ];
+    var a = Nat::from_prefix(&xs, 3);
+    [u32] ys = [ 4294967295, 1 ];
+    var b = Nat::from_prefix(&ys, 2);
+    var q = a / b;
+    var r = a % b;
+    var p = q * b;
+    var s = p + r;
+    expect_eq(cmp(&s, &a), 0);
+    expect_eq(cmp(&r, &b), -1);
+}
+
+fn test_div_near_multiple() {
+    // Dividend one below and one above a multiple of the divisor.
+    [u32] xs = [ 1000000007 ];
+    var b = Nat::from_prefix(&xs, 1);
+    [u32] os = [ 1 ];
+    var one = Nat::from_prefix(&os, 1);
+    var m = b * b;
+    var lo = m - one;
+    var hi = m + one;
+    var qlo = lo / b;
+    var qhi = hi / b;
+    var d = b - one;
+    expect_eq(cmp(&qlo, &d), 0);
+    expect_eq(cmp(&qhi, &b), 0);
+    var rlo = lo % b;
+    expect_eq(cmp(&rlo, &d), 0);
+}
+
+fn test_div_wide_by_two_limbs() {
+    // 4-limb by 2-limb schoolbook path, several digit iterations.
+    [u32] xs = [ 3735928559, 3405691582, 2596069104, 39 ];
+    var a = Nat::from_prefix(&xs, 4);
+    [u32] ys = [ 2882343476, 76 ];
+    var b = Nat::from_prefix(&ys, 2);
+    var q = a / b;
+    var r = a % b;
+    var p = q * b;
+    var s = p + r;
+    expect_eq(cmp(&s, &a), 0);
+    expect_eq(cmp(&r, &b), -1);
 }
