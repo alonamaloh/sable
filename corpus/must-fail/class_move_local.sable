@@ -1,0 +1,24 @@
+// expect-error: class.move_deferred
+// A class local can be reassigned only from a call or constructor (a
+// fresh owned value moving in); local-to-local moves would leave a
+// moved-from name behind and stay deferred.
+
+class Box {
+    i32 v;
+
+    /// invariant v ≥ 0
+
+    /// pre x ≥ 0
+    init make(i32 x) {
+        self.v = x;
+    }
+
+    deinit {
+    }
+}
+
+fn shuffle() {
+    var a = Box::make(1);
+    var b = Box::make(2);
+    a = b;
+}

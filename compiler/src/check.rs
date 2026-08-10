@@ -659,13 +659,26 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     }
                 };
                 if matches!(ty, Ty::Class(_)) {
-                    return Err(Diagnostic {
-                        name: "type.class_assign".into(),
-                        title: format!("cannot assign to class value `{name}`"),
-                        span: *name_span,
-                        label: "class values cannot be reassigned".into(),
-                        notes: vec![],
-                    });
+                    // Reassignment of a class local is a move-in from a
+                    // fresh owned value (the old value is dropped, with
+                    // its RAII invariant check). Only call results and
+                    // constructions move in; local-to-local moves would
+                    // leave a moved-from name behind and stay deferred
+                    // (ADR 0010).
+                    if !matches!(
+                        value.kind,
+                        ExprKind::Call { .. } | ExprKind::CtorCall { .. }
+                    ) {
+                        return Err(Diagnostic {
+                            name: "class.move_deferred".into(),
+                            title: format!(
+                                "class value `{name}` can only be reassigned from a call or constructor"
+                            ),
+                            span: *name_span,
+                            label: "moves between locals are not supported yet (ADR 0010)".into(),
+                            notes: vec![],
+                        });
+                    }
                 }
                 if matches!(ty, Ty::Array(..)) {
                     return Err(Diagnostic {

@@ -1,9 +1,10 @@
 // Dynamic checks for the bignum layer: the natVal contracts of
-// cmp/add/sub/mul monitored per call, loop invariants (weighted carry
-// and borrow sums over pw, the schoolbook accumulator) checked per
-// iteration, and the normalization invariant at init exits and RAII
-// drops. Limb counts stay small so the monitor's exact evaluation of
-// pw/valIn never leaves i128.
+// cmp/add/sub/mul/div/rem monitored per call, loop invariants (weighted
+// carry and borrow sums, the schoolbook accumulator, the double-and-
+// subtract quotient relation with its ghost natVal variant) checked per
+// iteration, and the normalization invariant at init exits, RAII drops,
+// and class-local reassignment drops. Limb counts stay small so the
+// monitor's exact evaluation of pw/valIn never leaves i128.
 
 /// def pw (n : int) : int := if 0 < n then 4294967296 * pw (n - 1) else 1
 /// termination_by n.toNat
@@ -73,6 +74,7 @@ fn trim_len(&[u32] xs) -> u64 {
 /// post #[label(lt)] result = -1 ↔ natVal a.limbs < natVal b.limbs
 /// post #[label(eq)] result = 0 ↔ natVal a.limbs = natVal b.limbs
 /// post #[label(gt)] result = 1 ↔ natVal b.limbs < natVal a.limbs
+/// post #[label(range)] result = -1 ∨ result = 0 ∨ result = 1
 fn cmp(&Nat a, &Nat b) -> i32 {
     if (a.limbs.len < b.limbs.len) {
         return -1;
@@ -162,6 +164,69 @@ fn mul(&Nat a, &Nat b) -> Nat {
     var r = Nat::from_prefix(&out, rl);
     return r;
 }
+
+// Double-and-subtract long division, composed entirely from the verified
+// operations above: d = b·m doubles until it overshoots the remainder,
+// then q += m, r -= d. The outer invariant IS the specification; the
+// Euclidean uniqueness lemma turns the exit facts into `/` and `%`.
+
+/// pre  natVal b.limbs ≥ 1
+/// pre  a.limbs.len + b.limbs.len ≤ 2305843009213693952
+/// post #[label(quot)] natVal result.limbs = natVal a.limbs / natVal b.limbs
+fn div(&Nat a, &Nat b) -> Nat {
+    [u32] zarr = alloc_array<u32>(1, 0);
+    [u32] onearr = alloc_array<u32>(1, 1);
+    var zero = Nat::from_prefix(&zarr, 0);
+    var q = Nat::from_prefix(&zarr, 0);
+    var r = add(&a, &zero);
+    i32 c = cmp(&r, &b);
+    /// invariant natVal q.limbs * natVal b.limbs + natVal r.limbs = natVal a.limbs
+    /// invariant (c = -1 ↔ natVal r.limbs < natVal b.limbs)
+    /// invariant c = -1 ∨ c = 0 ∨ c = 1
+    /// invariant q.limbs.len ≤ a.limbs.len
+    /// invariant r.limbs.len ≤ a.limbs.len
+    /// variant   natVal r.limbs
+    while (c >= 0) {
+        var d = add(&b, &zero);
+        var m = Nat::from_prefix(&onearr, 1);
+        var d2 = add(&d, &d);
+        i32 t = cmp(&d2, &r);
+        /// invariant natVal d.limbs = natVal b.limbs * natVal m.limbs
+        /// invariant natVal b.limbs ≤ natVal d.limbs
+        /// invariant natVal d.limbs ≤ natVal r.limbs
+        /// invariant natVal d2.limbs = natVal d.limbs + natVal d.limbs
+        /// invariant (t = -1 ↔ natVal d2.limbs < natVal r.limbs)
+        /// invariant (t = 0 ↔ natVal d2.limbs = natVal r.limbs)
+        /// invariant t = -1 ∨ t = 0 ∨ t = 1
+        /// invariant d.limbs.len ≤ a.limbs.len
+        /// invariant m.limbs.len ≤ a.limbs.len
+        /// variant   natVal r.limbs - natVal d.limbs
+        while (t <= 0) {
+            d = add(&d, &d);
+            m = add(&m, &m);
+            d2 = add(&d, &d);
+            t = cmp(&d2, &r);
+        }
+        q = add(&q, &m);
+        r = sub(&r, &d);
+        c = cmp(&r, &b);
+    }
+    return q;
+}
+
+/// pre  natVal b.limbs ≥ 1
+/// pre  a.limbs.len + b.limbs.len ≤ 2305843009213693952
+/// post #[label(rem)] natVal result.limbs = natVal a.limbs % natVal b.limbs
+fn rem(&Nat a, &Nat b) -> Nat {
+    var q = div(&a, &b);
+    var p = mul(&q, &b);
+    var r = sub(&a, &p);
+    return r;
+}
+// ------------------------------ discharges ------------------------------
+// The value-level reasoning: normalization at init exit, the trim
+// step, and the cmp closers (first-difference, shorter-is-smaller,
+// pointwise-equal-means-equal), all through the in-file lemmas.
 
 // Monitored assertion: the pre is the check.
 /// pre x = y
@@ -254,4 +319,46 @@ fn test_mul_zero() {
     expect_eq(cmp(&p, &z), 0);
     var q = mul(&z, &a);
     expect_eq(cmp(&q, &z), 0);
+}
+
+fn test_div_exact_and_rounding() {
+    [u32] xs = [ 4294967295, 4294967295 ];
+    var a = Nat::from_prefix(&xs, 2);
+    [u32] ys = [ 3 ];
+    var b = Nat::from_prefix(&ys, 1);
+    var q = div(&a, &b);
+    var m = rem(&a, &b);
+    var p = mul(&q, &b);
+    var s = add(&p, &m);
+    expect_eq(cmp(&s, &a), 0);
+    var q2 = div(&a, &a);
+    [u32] os = [ 1 ];
+    var one = Nat::from_prefix(&os, 1);
+    expect_eq(cmp(&q2, &one), 0);
+}
+
+fn test_div_small_by_large() {
+    [u32] xs = [ 7 ];
+    var a = Nat::from_prefix(&xs, 1);
+    [u32] ys = [ 1, 1 ];
+    var b = Nat::from_prefix(&ys, 2);
+    var q = div(&a, &b);
+    [u32] zs = [ 1 ];
+    var z = Nat::from_prefix(&zs, 0);
+    expect_eq(cmp(&q, &z), 0);
+    var m = rem(&a, &b);
+    expect_eq(cmp(&m, &a), 0);
+}
+
+fn test_div_by_one() {
+    [u32] xs = [ 123456789, 42 ];
+    var a = Nat::from_prefix(&xs, 2);
+    [u32] os = [ 1 ];
+    var one = Nat::from_prefix(&os, 1);
+    var q = div(&a, &one);
+    expect_eq(cmp(&q, &a), 0);
+    var m = rem(&a, &one);
+    [u32] zs = [ 1 ];
+    var z = Nat::from_prefix(&zs, 0);
+    expect_eq(cmp(&m, &z), 0);
 }

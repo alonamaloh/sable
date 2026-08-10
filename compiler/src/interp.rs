@@ -333,6 +333,11 @@ impl<'a> Interp<'a> {
             }
             Stmt::Assign { name, value, .. } => {
                 let v = self.eval(value, frame)?;
+                // Reassigning a class local drops the old value: its
+                // invariant is checked exactly as at scope-end RAII.
+                if let Some(RtVal::Obj { class, fields }) = frame.vars.get(name).cloned() {
+                    self.check_invariants_at(&self.classes[class].clone(), &fields, name)?;
+                }
                 frame.vars.insert(name.clone(), v);
                 Ok(Flow::Normal)
             }

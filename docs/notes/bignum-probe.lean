@@ -638,4 +638,57 @@ theorem mul_bound (x y : Int)
       _ ≤ 4294967295 * 4294967295 := Int.mul_le_mul_of_nonneg_right hx.2 (by omega)
       _ = 18446744065119617025 := by decide
 
+-- ---------------------------------------------------------------- div
+
+/-- The uniqueness closer: double-and-subtract's exit facts pin the
+    Euclidean quotient. -/
+theorem div_unique (a b q r : Int) (hb : 1 ≤ b)
+    (h : q * b + r = a) (hr0 : 0 ≤ r) (hrb : r < b) : q = a / b := by
+  have h2 := (Int.ediv_emod_unique (a := a) (b := b) (r := r) (q := q)
+      (by omega : (0:Int) < b)).mpr
+    ⟨by rw [Int.mul_comm b q]; omega, hr0, hrb⟩
+  omega
+
+/-- rem as composition: r = a − (a/b)·b is the Euclidean remainder. -/
+theorem rem_eq (a b q p : Int) (hq : q = a / b) (hp : p = q * b) :
+    a - p = a % b := by
+  rw [hp, hq, Int.mul_comm]
+  have := Int.emod_def a b
+  omega
+
+/-- The doubling step keeps d = b·m. -/
+theorem double_mul (v m d : Int) (h : d = v * m) : d + d = v * (m + m) := by
+  rw [h, Int.mul_add]
+
+/-- The outer step keeps q·b + r = a when (q+m)·b absorbs d = b·m. -/
+theorem outer_step (q m v r d a : Int)
+    (hinv : q * v + r = a) (hd : d = v * m) :
+    (q + m) * v + (r - d) = a := by
+  rw [Int.add_mul, hd, Int.mul_comm v m]
+  omega
+
+/-- m stays under d = v·m when the divisor is nonzero: bound for the
+    inner call-pre lengths. -/
+theorem le_self_mul (v m : Int) (hv : 1 ≤ v) (hm : 0 ≤ m) : m ≤ v * m := by
+  have h := Int.mul_le_mul_of_nonneg_right hv hm
+  rw [Int.one_mul] at h
+  omega
+
+/-- q·v ≥ 0: lets omega read r ≤ a off the outer invariant. -/
+theorem mul_nonneg_atoms (q v : Int) (hq : 0 ≤ q) (hv : 0 ≤ v) :
+    0 ≤ q * v := Int.mul_nonneg hq hv
+
+/-- The quotient is dominated by the dividend (nonneg, divisor ≥ 1):
+    bound for rem's mul call-pre lengths. -/
+theorem ediv_le_self_nat (a b : Int) (ha : 0 ≤ a) (_hb : 1 ≤ b) :
+    a / b ≤ a := Int.ediv_le_self b ha
+
+/-- (a/b)·b ≤ a: sub's pre in rem's composition. -/
+theorem ediv_mul_le_self (a b : Int) (_ha : 0 ≤ a) (hb : 1 ≤ b) :
+    a / b * b ≤ a := by
+  have := Int.emod_def a b
+  have := Int.emod_nonneg a (by omega : b ≠ 0)
+  rw [Int.mul_comm]
+  omega
+
 end BignumProbe

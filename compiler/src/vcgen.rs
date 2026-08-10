@@ -1202,9 +1202,11 @@ impl<'a> Generator<'a> {
                     self.env.insert(name.clone(), Val::Opt(name.clone()));
                 }
                 Some(Ty::Class(ci)) => {
-                    // A loop body called &mut methods on this local: fresh
-                    // state; the invariant held at each method exit, so it
-                    // is sound to assume at the havoc point.
+                    // A loop body called &mut methods on this local or
+                    // reassigned it from a call result: fresh state; the
+                    // invariant held at each method exit (and ret_inv at
+                    // each returning call), so it is sound to assume at
+                    // the havoc point.
                     let cd = &self.classes[*ci];
                     self.binders.push((name.clone(), lean_class_name(&cd.name)));
                     self.push_class_state_facts(cd, name);

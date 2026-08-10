@@ -59,3 +59,10 @@ Moves and copies (classes are affine; passing by value is a move),
 fresh-state call-site treatment arrays get), class-valued fields (drop
 order), methods taking/returning classes, borrows of generic class
 instances.
+
+**Landed since (forced by bignum division):** shared re-borrow of `&C`
+parameters (passing a borrow along to a callee), and class-local
+reassignment from call/constructor results — a move-in; the old value is
+dropped with its RAII invariant check, and loop havoc assumes the class
+invariant for reassigned locals (sound: every source carried `ret_inv`).
+Local-to-local moves remain deferred (`class.move_deferred`).

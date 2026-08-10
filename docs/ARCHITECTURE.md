@@ -77,7 +77,9 @@ where the verifier emits VCs), and `speceval.rs` evaluates the
 *monitorable fragment* of the proof language (arithmetic, logic — with
 `↔` at Lean's exact precedence, pinned by a witness clause in the test
 corpus — sequence access, `old` — including `(old obj).field` chains,
-guard-bounded ∀/∃, ghost-def expansion with `if … then … else`, option
+guard-bounded ∀/∃, ghost-def expansion — recursive defs included,
+depth-capped, in exact i128 arithmetic (an overflow reports the clause
+as unmonitorable rather than guessing) — with `if … then … else`, option
 match and the `.is_some`/`.value` accessors, `perm` as multiset
 equality). Pres/posts/invariants/variants are
 checked dynamically; anything outside the fragment is reported as
