@@ -1,0 +1,846 @@
+// Tier 2, the JSON parser: structural validation against the RFC 8259
+// value grammar. The grammar is ONE mode-encoded well-founded ghost
+// predicate (`jgram`: 0 value / 1 object-interior / 4 object-tail /
+// 2 array-interior / 6 array-tail — ghost defs splice as single defs,
+// so the mutual grammar is mode-dispatched), with every recursive call
+// ite-guarded so the single span measure decreases. The parser is one
+// self-recursive `json_value_end` (mutual recursion is not a thing in
+// Sable; objects and arrays are interior loops carrying ∀-implication
+// forward-scan invariants over the tail modes). `json_valid` returning
+// true is a kernel-checked proof the buffer is one JSON value in
+// optional whitespace. String/number lexing and their proofs are the
+// M10 artifacts, carried verbatim.
+//
+// Layer 2 (next): duplicate object keys via the verified hash map.
+
+/// def isWs (c : int) : Prop := c = 32 ∨ c = 9 ∨ c = 10 ∨ c = 13
+
+/// def digitc (c : int) : Prop := 48 ≤ c ∧ c ≤ 57
+
+/// def hexd (c : int) : Prop := (48 ≤ c ∧ c ≤ 57) ∨ (65 ≤ c ∧ c ≤ 70) ∨ (97 ≤ c ∧ c ≤ 102)
+
+/// def escc (c : int) : Prop := c = 34 ∨ c = 92 ∨ c = 47 ∨ c = 98 ∨ c = 102 ∨ c = 110 ∨ c = 114 ∨ c = 116
+
+/// def strTail (b : Sable.Seq Int) (i j : int) : Prop :=
+///   if j ≤ i then False
+///   else if b.get i = 34 then j = i + 1
+///   else if b.get i = 92 then
+///     (escc (b.get (i + 1)) ∧ strTail b (i + 2) j) ∨
+///     (b.get (i + 1) = 117 ∧ hexd (b.get (i + 2)) ∧ hexd (b.get (i + 3)) ∧
+///       hexd (b.get (i + 4)) ∧ hexd (b.get (i + 5)) ∧ strTail b (i + 6) j)
+///   else 32 ≤ b.get i ∧ strTail b (i + 1) j
+/// termination_by (j - i).toNat
+/// decreasing_by
+///   all_goals omega
+
+/// def jstring (b : Sable.Seq Int) (i j : int) : Prop := b.get i = 34 ∧ strTail b (i + 1) j
+
+/// def digits (b : Sable.Seq Int) (i j : int) : Prop := i < j ∧ ∀ k, i ≤ k → k < j → digitc (b.get k)
+
+/// def jint (b : Sable.Seq Int) (i j : int) : Prop := (b.get i = 48 ∧ j = i + 1) ∨ (49 ≤ b.get i ∧ b.get i ≤ 57 ∧ digits b i j)
+
+/// def jfrac (b : Sable.Seq Int) (i j : int) : Prop := i = j ∨ (b.get i = 46 ∧ digits b (i + 1) j)
+
+/// def jexp (b : Sable.Seq Int) (i j : int) : Prop := i = j ∨ ((b.get i = 101 ∨ b.get i = 69) ∧ (digits b (i + 1) j ∨ ((b.get (i + 1) = 43 ∨ b.get (i + 1) = 45) ∧ digits b (i + 2) j)))
+
+/// def jnumber (b : Sable.Seq Int) (i j : int) : Prop := ∃ p q, ((b.get i = 45 ∧ jint b (i + 1) p) ∨ (b.get i ≠ 45 ∧ jint b i p)) ∧ jfrac b p q ∧ jexp b q j ∧ i < p ∧ p ≤ q ∧ q ≤ j
+
+/// def wsTo (b : Sable.Seq Int) (i p : int) : Prop := i ≤ p ∧ ∀ k, i ≤ k → k < p → isWs (b.get k)
+
+/// def jtrue (b : Sable.Seq Int) (i j : int) : Prop := b.get i = 116 ∧ b.get (i + 1) = 114 ∧ b.get (i + 2) = 117 ∧ b.get (i + 3) = 101 ∧ j = i + 4
+
+/// def jfalse (b : Sable.Seq Int) (i j : int) : Prop := b.get i = 102 ∧ b.get (i + 1) = 97 ∧ b.get (i + 2) = 108 ∧ b.get (i + 3) = 115 ∧ b.get (i + 4) = 101 ∧ j = i + 5
+
+/// def jnull (b : Sable.Seq Int) (i j : int) : Prop := b.get i = 110 ∧ b.get (i + 1) = 117 ∧ b.get (i + 2) = 108 ∧ b.get (i + 3) = 108 ∧ j = i + 4
+
+/// def jgram (b : Sable.Seq Int) (m i j : int) : Prop :=
+///   if j ≤ i then False
+///   else if m = 0 then
+///     ∃ p, wsTo b i p ∧
+///       (jstring b p j ∨ jnumber b p j ∨ jtrue b p j ∨ jfalse b p j ∨
+///         jnull b p j ∨
+///         (b.get p = 123 ∧ jgram b 1 (if i < p + 1 then p + 1 else i + 1) j) ∨
+///         (b.get p = 91 ∧ jgram b 2 (if i < p + 1 then p + 1 else i + 1) j))
+///   else if m = 1 then
+///     (∃ q, wsTo b i q ∧ b.get q = 125 ∧ j = q + 1) ∨
+///     (∃ q r s e, wsTo b i q ∧ jstring b q r ∧ wsTo b r s ∧ b.get s = 58 ∧
+///       jgram b 0 (if i < s + 1 then s + 1 else i + 1) (if e ≤ j then e else j) ∧
+///       jgram b 4 (if i < e then e else i + 1) j)
+///   else if m = 4 then
+///     (∃ q, wsTo b i q ∧ b.get q = 125 ∧ j = q + 1) ∨
+///     (∃ q q2 r s e, wsTo b i q ∧ b.get q = 44 ∧ wsTo b (q + 1) q2 ∧
+///       jstring b q2 r ∧ wsTo b r s ∧ b.get s = 58 ∧
+///       jgram b 0 (if i < s + 1 then s + 1 else i + 1) (if e ≤ j then e else j) ∧
+///       jgram b 4 (if i < e then e else i + 1) j)
+///   else if m = 2 then
+///     (∃ q, wsTo b i q ∧ b.get q = 93 ∧ j = q + 1) ∨
+///     (∃ e, jgram b 0 i (if e < j then e else j - 1) ∧
+///       jgram b 6 (if i < e then e else i + 1) j)
+///   else if m = 6 then
+///     (∃ q, wsTo b i q ∧ b.get q = 93 ∧ j = q + 1) ∨
+///     (∃ q e, wsTo b i q ∧ b.get q = 44 ∧
+///       jgram b 0 (if i < q + 1 then q + 1 else i + 1) (if e ≤ j then e else j) ∧
+///       jgram b 6 (if i < e then e else i + 1) j)
+///   else False
+/// termination_by (j - i).toNat
+/// decreasing_by
+///   all_goals first | omega | (split <;> first | omega | (split <;> omega))
+
+/// theorem strTail_close (b : Sable.Seq Int) (i : int) (h : b.get i = 34) :
+///     strTail b i (i + 1) := by
+///   rw [strTail]
+///   rw [if_neg (by omega), if_pos h]
+
+/// theorem strTail_char (b : Sable.Seq Int) (i j : int)
+///     (hq : b.get i ≠ 34) (he : b.get i ≠ 92) (hlo : 32 ≤ b.get i)
+///     (hj : i < j)
+///     (hrest : strTail b (i + 1) j) : strTail b i j := by
+///   rw [strTail]
+///   rw [if_neg (by omega), if_neg hq, if_neg he]
+///   exact ⟨hlo, hrest⟩
+
+/// theorem strTail_esc (b : Sable.Seq Int) (i j : int)
+///     (hq : b.get i ≠ 34) (he : b.get i = 92) (hesc : escc (b.get (i + 1)))
+///     (hj : i < j)
+///     (hrest : strTail b (i + 2) j) : strTail b i j := by
+///   rw [strTail]
+///   rw [if_neg (by omega), if_neg hq, if_pos he]
+///   exact Or.inl ⟨hesc, hrest⟩
+
+/// theorem strTail_hex (b : Sable.Seq Int) (i j : int)
+///     (hq : b.get i ≠ 34) (he : b.get i = 92) (hu : b.get (i + 1) = 117)
+///     (h2 : hexd (b.get (i + 2))) (h3 : hexd (b.get (i + 3)))
+///     (h4 : hexd (b.get (i + 4))) (h5 : hexd (b.get (i + 5)))
+///     (hj : i < j)
+///     (hrest : strTail b (i + 6) j) : strTail b i j := by
+///   rw [strTail]
+///   rw [if_neg (by omega), if_neg hq, if_pos he]
+///   exact Or.inr ⟨hu, h2, h3, h4, h5, hrest⟩
+
+/// theorem strTail_lt (b : Sable.Seq Int) (i j : int) (h : strTail b i j) : i < j := by
+///   rw [strTail] at h
+///   split at h
+///   · exact h.elim
+///   · omega
+
+/// theorem jgram_lt (b : Sable.Seq Int) (m i j : int) (h : jgram b m i j) :
+///     i < j := by
+///   rw [jgram] at h
+///   split at h
+///   · exact h.elim
+///   · omega
+
+/// theorem jgram_val_tok (b : Sable.Seq Int) (i p j : int)
+///     (hw : wsTo b i p)
+///     (ht : jstring b p j ∨ jnumber b p j ∨ jtrue b p j ∨ jfalse b p j ∨
+///       jnull b p j)
+///     (hij : i < j) : jgram b 0 i j := by
+///   rw [jgram]
+///   rw [if_neg (by omega), if_pos rfl]
+///   refine ⟨p, hw, ?_⟩
+///   exact ht.elim (fun h => Or.inl h) (fun h2 => h2.elim
+///     (fun h => Or.inr (Or.inl h)) (fun h3 => h3.elim
+///       (fun h => Or.inr (Or.inr (Or.inl h))) (fun h4 => h4.elim
+///         (fun h => Or.inr (Or.inr (Or.inr (Or.inl h))))
+///         (fun h => Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h))))))))
+
+/// theorem jgram_val_obj (b : Sable.Seq Int) (i p j : int)
+///     (hw : wsTo b i p) (hb : b.get p = 123)
+///     (hrest : jgram b 1 (p + 1) j) : jgram b 0 i j := by
+///   have hij : i < j := by
+///     have := jgram_lt b 1 (p + 1) j hrest
+///     have hp := hw.1
+///     omega
+///   rw [jgram]
+///   rw [if_neg (by omega), if_pos rfl]
+///   refine ⟨p, hw, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl ⟨hb, ?_⟩)))))⟩
+///   rw [if_pos (by have := hw.1; omega)]
+///   exact hrest
+
+/// theorem jgram_val_arr (b : Sable.Seq Int) (i p j : int)
+///     (hw : wsTo b i p) (hb : b.get p = 91)
+///     (hrest : jgram b 2 (p + 1) j) : jgram b 0 i j := by
+///   have hij : i < j := by
+///     have := jgram_lt b 2 (p + 1) j hrest
+///     have hp := hw.1
+///     omega
+///   rw [jgram]
+///   rw [if_neg (by omega), if_pos rfl]
+///   refine ⟨p, hw, Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr ⟨hb, ?_⟩)))))⟩
+///   rw [if_pos (by have := hw.1; omega)]
+///   exact hrest
+
+/// theorem jgram_obj_empty (b : Sable.Seq Int) (i q : int)
+///     (hw : wsTo b i q) (hb : b.get q = 125) : jgram b 1 i (q + 1) := by
+///   rw [jgram]
+///   rw [if_neg (by have := hw.1; omega), if_pos rfl]
+///   exact Or.inl ⟨q, hw, hb, rfl⟩
+
+/// theorem jgram_obj_member (b : Sable.Seq Int) (i q r s e j : int)
+///     (hw : wsTo b i q) (hs : jstring b q r) (hw2 : wsTo b r s)
+///     (hc : b.get s = 58)
+///     (hv : jgram b 0 (s + 1) e) (htail : jgram b 4 e j)
+///     (hiq : i ≤ q) (hqs : q ≤ s) : jgram b 1 i j := by
+///   have hse : s + 1 < e := jgram_lt b 0 (s + 1) e hv
+///   have hej : e < j := jgram_lt b 4 e j htail
+///   rw [jgram]
+///   rw [if_neg (by omega), if_pos rfl]
+///   refine Or.inr ⟨q, r, s, e, hw, hs, hw2, hc, ?_, ?_⟩
+///   · rw [if_pos (by omega), if_pos (by omega)]
+///     exact hv
+///   · rw [if_pos (by omega)]
+///     exact htail
+
+/// theorem jgram_objtail_close (b : Sable.Seq Int) (i q : int)
+///     (hw : wsTo b i q) (hb : b.get q = 125) : jgram b 4 i (q + 1) := by
+///   rw [jgram]
+///   rw [if_neg (by have := hw.1; omega), if_neg (by omega), if_neg (by omega),
+///     if_pos rfl]
+///   exact Or.inl ⟨q, hw, hb, rfl⟩
+
+/// theorem jgram_objtail_member (b : Sable.Seq Int) (i q q2 r s e j : int)
+///     (hw : wsTo b i q) (hb : b.get q = 44) (hw1 : wsTo b (q + 1) q2)
+///     (hs : jstring b q2 r)
+///     (hw2 : wsTo b r s) (hc : b.get s = 58)
+///     (hv : jgram b 0 (s + 1) e) (htail : jgram b 4 e j)
+///     (hiq : i ≤ q) (hqs : q ≤ s) : jgram b 4 i j := by
+///   have hse : s + 1 < e := jgram_lt b 0 (s + 1) e hv
+///   have hej : e < j := jgram_lt b 4 e j htail
+///   rw [jgram]
+///   rw [if_neg (by omega), if_neg (by omega), if_neg (by omega), if_pos rfl]
+///   refine Or.inr ⟨q, q2, r, s, e, hw, hb, hw1, hs, hw2, hc, ?_, ?_⟩
+///   · rw [if_pos (by omega), if_pos (by omega)]
+///     exact hv
+///   · rw [if_pos (by omega)]
+///     exact htail
+
+/// theorem jgram_arr_empty (b : Sable.Seq Int) (i q : int)
+///     (hw : wsTo b i q) (hb : b.get q = 93) : jgram b 2 i (q + 1) := by
+///   rw [jgram]
+///   rw [if_neg (by have := hw.1; omega), if_neg (by omega), if_neg (by omega),
+///     if_neg (by omega), if_pos rfl]
+///   exact Or.inl ⟨q, hw, hb, rfl⟩
+
+/// theorem jgram_arr_elem (b : Sable.Seq Int) (i e j : int)
+///     (hv : jgram b 0 i e) (htail : jgram b 6 e j) : jgram b 2 i j := by
+///   have hie : i < e := jgram_lt b 0 i e hv
+///   have hej : e < j := jgram_lt b 6 e j htail
+///   rw [jgram]
+///   rw [if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///     if_neg (by omega), if_pos rfl]
+///   refine Or.inr ⟨e, ?_, ?_⟩
+///   · rw [if_pos (by omega)]
+///     exact hv
+///   · rw [if_pos (by omega)]
+///     exact htail
+
+/// theorem jgram_arrtail_close (b : Sable.Seq Int) (i q : int)
+///     (hw : wsTo b i q) (hb : b.get q = 93) : jgram b 6 i (q + 1) := by
+///   rw [jgram]
+///   rw [if_neg (by have := hw.1; omega), if_neg (by omega), if_neg (by omega),
+///     if_neg (by omega), if_neg (by omega), if_pos rfl]
+///   exact Or.inl ⟨q, hw, hb, rfl⟩
+
+/// theorem jgram_arrtail_elem (b : Sable.Seq Int) (i q e j : int)
+///     (hw : wsTo b i q) (hb : b.get q = 44)
+///     (hv : jgram b 0 (q + 1) e) (htail : jgram b 6 e j)
+///     (hiq : i ≤ q) : jgram b 6 i j := by
+///   have hqe : q + 1 < e := jgram_lt b 0 (q + 1) e hv
+///   have hej : e < j := jgram_lt b 6 e j htail
+///   rw [jgram]
+///   rw [if_neg (by omega), if_neg (by omega), if_neg (by omega),
+///     if_neg (by omega), if_neg (by omega), if_pos rfl]
+///   refine Or.inr ⟨q, e, hw, hb, ?_, ?_⟩
+///   · rw [if_pos (by omega), if_pos (by omega)]
+///     exact hv
+///   · rw [if_pos (by omega)]
+///     exact htail
+
+// ------------------------------------------------------- phase helpers
+
+/// pre  i ≤ b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post i ≤ result ∧ result ≤ b.len
+/// post ∀ k, i ≤ k → k < result → digitc (b.get k)
+/// post result < b.len → ¬digitc (b.get result)
+/// post i < b.len → digitc (b.get i) → i < result
+fn digit_run(&[u8] b, u64 i) -> u64 {
+    u64 j = i;
+    u64 n = b.len;
+    /// invariant i ≤ j ∧ j ≤ n
+    /// invariant ∀ k, i ≤ k → k < j → digitc (b.get k)
+    /// variant   n - j
+    while (j < n) {
+        u8 c = b[j];
+        if (c < 48 || c > 57) {
+            return j;
+        }
+        j = j + 1;
+    }
+    return j;
+}
+
+/// post result ↔ hexd c
+fn hexd_ok(u8 c) -> bool {
+    if (c >= 48 && c <= 57) {
+        return true;
+    }
+    if (c >= 65 && c <= 70) {
+        return true;
+    }
+    if (c >= 97 && c <= 102) {
+        return true;
+    }
+    return false;
+}
+
+// `jint_scan` consumes `-? (0 | [1-9][0-9]*)` starting at `pos`;
+// `jfrac_scan`/`jexp_scan` consume an OPTIONAL fraction/exponent
+// (returning their start unchanged when absent). All return 0 on a
+// malformed phase.
+
+/// pre  pos < b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ ((b.get pos = 45 ∧ jint b (pos + 1) result) ∨ (b.get pos ≠ 45 ∧ jint b pos result))
+fn jint_scan(&[u8] b, u64 pos) -> u64 {
+    u64 n = b.len;
+    u64 i = pos;
+    if (b[i] == 45) {
+        i = i + 1;
+        if (i >= n) {
+            return 0;
+        }
+    }
+    u8 c0 = b[i];
+    if (c0 == 48) {
+        return i + 1;
+    }
+    if (c0 < 49 || c0 > 57) {
+        return 0;
+    }
+    u64 e = digit_run(&b, i);
+    return e;
+}
+
+/// pre  i ≤ b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post result ≠ 0 → i ≤ result ∧ result ≤ b.len ∧ jfrac b i result
+fn jfrac_scan(&[u8] b, u64 i) -> u64 {
+    u64 n = b.len;
+    if (i >= n) {
+        return i;
+    }
+    if (b[i] != 46) {
+        return i;
+    }
+    u64 d = i + 1;
+    if (d >= n) {
+        return 0;
+    }
+    if (b[d] < 48 || b[d] > 57) {
+        return 0;
+    }
+    u64 e = digit_run(&b, d);
+    return e;
+}
+
+/// pre  i ≤ b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post result ≠ 0 → i ≤ result ∧ result ≤ b.len ∧ jexp b i result
+fn jexp_scan(&[u8] b, u64 i) -> u64 {
+    u64 n = b.len;
+    if (i >= n) {
+        return i;
+    }
+    if (b[i] != 101 && b[i] != 69) {
+        return i;
+    }
+    u64 d = i + 1;
+    if (d >= n) {
+        return 0;
+    }
+    if (b[d] == 43 || b[d] == 45) {
+        u64 d2 = d + 1;
+        if (d2 >= n) {
+            return 0;
+        }
+        if (b[d2] < 48 || b[d2] > 57) {
+            return 0;
+        }
+        u64 e2 = digit_run(&b, d2);
+        return e2;
+    }
+    if (b[d] < 48 || b[d] > 57) {
+        return 0;
+    }
+    u64 e = digit_run(&b, d);
+    return e;
+}
+
+// --------------------------------------------------------- the lexemes
+
+/// pre  pos < b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ jnumber b pos result
+fn json_number_end(&[u8] b, u64 pos) -> u64 {
+    u64 a1 = jint_scan(&b, pos);
+    if (a1 == 0) {
+        return 0;
+    }
+    u64 a2 = jfrac_scan(&b, a1);
+    if (a2 == 0) {
+        return 0;
+    }
+    u64 a3 = jexp_scan(&b, a2);
+    if (a3 == 0) {
+        return 0;
+    }
+    return a3;
+}
+
+/// pre  pos < b.len
+/// pre  b.len ≤ 4611686018427387904
+/// pre  b.get pos = 34
+/// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ jstring b pos result
+fn json_string_end(&[u8] b, u64 pos) -> u64 {
+    u64 n = b.len;
+    u64 i = pos + 1;
+    /// invariant pos < i ∧ i ≤ n
+    /// invariant ∀ e2, strTail b i e2 → strTail b (pos + 1) e2
+    /// variant   n - i
+    while (i < n) {
+        u8 c = b[i];
+        if (c == 34) {
+            return i + 1;
+        }
+        if (c == 92) {
+            if (i + 1 >= n) {
+                return 0;
+            }
+            u8 e = b[i + 1];
+            if (e == 117) {
+                if (i + 5 >= n) {
+                    return 0;
+                }
+                bool h2 = hexd_ok(b[i + 2]);
+                bool h3 = hexd_ok(b[i + 3]);
+                bool h4 = hexd_ok(b[i + 4]);
+                bool h5 = hexd_ok(b[i + 5]);
+                if (!h2 || !h3 || !h4 || !h5) {
+                    return 0;
+                }
+                i = i + 6;
+            } else {
+                if (e != 34 && e != 92 && e != 47 && e != 98 && e != 102 && e != 110 && e != 114 && e != 116) {
+                    return 0;
+                }
+                i = i + 2;
+            }
+        } else {
+            if (c < 32) {
+                return 0;
+            }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+
+/// pre  i ≤ b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post i ≤ result ∧ result ≤ b.len
+/// post wsTo b i result
+/// post result < b.len → ¬isWs (b.get result)
+fn ws_run(&[u8] b, u64 i) -> u64 {
+    u64 j = i;
+    u64 n = b.len;
+    /// invariant i ≤ j ∧ j ≤ n
+    /// invariant ∀ k, i ≤ k → k < j → isWs (b.get k)
+    /// variant   n - j
+    while (j < n) {
+        u8 c = b[j];
+        if (c != 32 && c != 9 && c != 10 && c != 13) {
+            return j;
+        }
+        j = j + 1;
+    }
+    return j;
+}
+
+// One self-recursive function; objects and arrays are interior loops.
+// Every success return is a `jgram` construction through the step
+// lemmas; every 0 return is a rejection (no completeness claim in
+// layer 1).
+
+/// pre  pos ≤ b.len
+/// pre  b.len ≤ 4611686018427387904
+/// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ jgram b 0 pos result
+fn json_value_end(&[u8] b, u64 pos) -> u64
+/// variant b.len - pos
+{
+    u64 n = b.len;
+    u64 p = ws_run(&b, pos);
+    if (p >= n) {
+        return 0;
+    }
+    u8 c = b[p];
+    if (c == 34) {
+        u64 es = json_string_end(&b, p);
+        return es;
+    }
+    if (c == 45 || (c >= 48 && c <= 57)) {
+        u64 en = json_number_end(&b, p);
+        return en;
+    }
+    if (c == 116) {
+        if (p + 3 >= n) {
+            return 0;
+        }
+        if (b[p + 1] == 114 && b[p + 2] == 117 && b[p + 3] == 101) {
+            return p + 4;
+        }
+        return 0;
+    }
+    if (c == 102) {
+        if (p + 4 >= n) {
+            return 0;
+        }
+        if (b[p + 1] == 97 && b[p + 2] == 108 && b[p + 3] == 115 && b[p + 4] == 101) {
+            return p + 5;
+        }
+        return 0;
+    }
+    if (c == 110) {
+        if (p + 3 >= n) {
+            return 0;
+        }
+        if (b[p + 1] == 117 && b[p + 2] == 108 && b[p + 3] == 108) {
+            return p + 4;
+        }
+        return 0;
+    }
+    if (c == 123) {
+        u64 q = ws_run(&b, p + 1);
+        if (q >= n) {
+            return 0;
+        }
+        if (b[q] == 125) {
+            return q + 1;
+        }
+        if (b[q] != 34) {
+            return 0;
+        }
+        u64 r = json_string_end(&b, q);
+        if (r == 0) {
+            return 0;
+        }
+        u64 s = ws_run(&b, r);
+        if (s >= n) {
+            return 0;
+        }
+        if (b[s] != 58) {
+            return 0;
+        }
+        u64 e = json_value_end(&b, s + 1);
+        if (e == 0) {
+            return 0;
+        }
+        u64 cur = e;
+        /// invariant pos < cur ∧ cur ≤ n
+        /// invariant ∀ e2, jgram b 4 cur e2 → jgram b 1 (p + 1) e2
+        /// variant   n - cur
+        while (cur < n) {
+            u64 t = ws_run(&b, cur);
+            if (t >= n) {
+                return 0;
+            }
+            if (b[t] == 125) {
+                return t + 1;
+            }
+            if (b[t] != 44) {
+                return 0;
+            }
+            u64 q2 = ws_run(&b, t + 1);
+            if (q2 >= n) {
+                return 0;
+            }
+            if (b[q2] != 34) {
+                return 0;
+            }
+            u64 r2 = json_string_end(&b, q2);
+            if (r2 == 0) {
+                return 0;
+            }
+            u64 s2 = ws_run(&b, r2);
+            if (s2 >= n) {
+                return 0;
+            }
+            if (b[s2] != 58) {
+                return 0;
+            }
+            u64 e2v = json_value_end(&b, s2 + 1);
+            if (e2v == 0) {
+                return 0;
+            }
+            cur = e2v;
+        }
+        return 0;
+    }
+    if (c == 91) {
+        u64 qa = ws_run(&b, p + 1);
+        if (qa >= n) {
+            return 0;
+        }
+        if (b[qa] == 93) {
+            return qa + 1;
+        }
+        u64 ea = json_value_end(&b, p + 1);
+        if (ea == 0) {
+            return 0;
+        }
+        u64 cura = ea;
+        /// invariant pos < cura ∧ cura ≤ n
+        /// invariant ∀ e2, jgram b 6 cura e2 → jgram b 2 (p + 1) e2
+        /// variant   n - cura
+        while (cura < n) {
+            u64 ta = ws_run(&b, cura);
+            if (ta >= n) {
+                return 0;
+            }
+            if (b[ta] == 93) {
+                return ta + 1;
+            }
+            if (b[ta] != 44) {
+                return 0;
+            }
+            u64 e2va = json_value_end(&b, ta + 1);
+            if (e2va == 0) {
+                return 0;
+            }
+            cura = e2va;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+// The capstone: `true` is a kernel-checked proof that the buffer is one
+// JSON value surrounded by optional whitespace.
+
+/// pre  b.len ≤ 4611686018427387904
+/// post result → (∃ e, jgram b 0 0 e ∧ wsTo b e b.len)
+fn json_valid(&[u8] b) -> bool {
+    u64 e = json_value_end(&b, 0);
+    if (e == 0) {
+        return false;
+    }
+    u64 p = ws_run(&b, e);
+    if (p >= b.len) {
+        return true;
+    }
+    return false;
+}
+
+
+// ---------------- discharges carried from the M10 lexer ----------------
+
+/// discharge digit_run.inv_preserved.k_i_k_k_j_digitc_b_get_k by
+///   intro k hk1 hk2
+///   by_cases hkj : k = j
+///   · subst hkj
+///     simp only [digitc]
+///     omega
+///   · exact h_inv_k_i_k_k_j_digitc_b_get_k k hk1 (by omega)
+
+/// discharge digit_run.post.i_b_len_digitc_b_get_i_i_result by
+///   intro hlen hdig
+///   simp only [digitc] at hdig
+///   by_cases hji : j = i
+///   · rw [hji] at h_path_b_get_j_48_b_get_j_57
+///     omega
+///   · omega
+
+/// discharge jexp_scan.post.result_0_i_result_result_b_len_jexp_b_i.6 by
+///   intro hnz
+///   have hne := h_digit_run_post_i_b_len_digitc_b_get_i_i (by omega) (by simp only [digitc]; omega)
+///   refine ⟨by omega, by omega, Or.inr ⟨by omega, Or.inr ⟨by omega, by omega, ?_⟩⟩⟩
+///   intro k hk1 hk2
+///   exact h_digit_run_post_k_i_k_k_result_digitc_b k (by omega) (by omega)
+
+/// discharge json_number_end.post.result_0_pos_result_result_b_len_jnumber.4 by
+///   intro hnz
+///   have h1 := h_jint_scan_post_result_0_pos_result_resu (by omega)
+///   have h2 := h_jfrac_scan_post_result_0_i_result_result (by omega)
+///   have h3 := h_jexp_scan_post_result_0_i_result_result (by omega)
+///   refine ⟨by omega, by omega, a1, a2, h1.2.2, h2.2.2, ?_, by omega, by omega, by omega⟩
+///   rw [h_result]
+///   exact h3.2.2
+
+/// discharge json_string_end.inv_preserved.e2_strtail_b_i_e2_strtail_b_pos_1_e2 by
+///   intro e2 hst
+///   have hlt := strTail_lt b (i + 6) e2 hst
+///   have hh := h_path_not_h2_h3_h4_h5
+///   simp only [not_or, Classical.not_not] at hh
+///   apply h_inv_e2_strtail_b_i_e2_strtai e2
+///   exact strTail_hex b i e2 (by omega) (by omega) (by omega)
+///     (h_hexd_ok_post_result_hexd_c.mp hh.1.1.1)
+///     (h_hexd_ok_post_result_hexd_c_2.mp hh.1.1.2)
+///     (h_hexd_ok_post_result_hexd_c_3.mp hh.1.2)
+///     (h_hexd_ok_post_result_hexd_c_4.mp hh.2)
+///     (by omega) hst
+
+/// discharge json_string_end.inv_preserved.e2_strtail_b_i_e2_strtail_b_pos_1_e2.2 by
+///   intro e2 hst
+///   have hlt := strTail_lt b (i + 2) e2 hst
+///   apply h_inv_e2_strtail_b_i_e2_strtai e2
+///   refine strTail_esc b i e2 (by omega) (by omega) ?_ (by omega) hst
+///   simp only [escc]
+///   omega
+
+/// discharge json_string_end.inv_preserved.e2_strtail_b_i_e2_strtail_b_pos_1_e2.3 by
+///   intro e2 hst
+///   have hlt := strTail_lt b (i + 1) e2 hst
+///   apply h_inv_e2_strtail_b_i_e2_strtai e2
+///   exact strTail_char b i e2 (by omega) (by omega) (by omega) (by omega) hst
+
+/// discharge json_string_end.post.result_0_pos_result_result_b_len_jstring by
+///   intro _
+///   rw [h_result]
+///   refine ⟨by omega, by omega, h_pre_b_get_pos_34, ?_⟩
+///   exact h_inv_e2_strtail_b_i_e2_strtai (i + 1) (strTail_close b i (by omega))
+
+// ---------------------- the parser's own discharges ----------------------
+
+/// discharge ws_run.inv_preserved.k_i_k_k_j_isws_b_get_k by
+///   intro k hk1 hk2
+///   by_cases hkj : k = j
+///   · subst hkj
+///     simp only [isWs]
+///     omega
+///   · exact h_inv_k_i_k_k_j_isws_b_get_k k hk1 (by omega)
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.2 by
+///   intro hnz
+///   have hs := h_json_string_end_post_result_0_pos_result_resu (by omega)
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   refine ⟨by have := hw.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   exact jgram_val_tok b pos p es hw (Or.inl hs.2.2) (by have := hw.1; omega)
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.3 by
+///   intro hnz
+///   have hn := h_json_number_end_post_result_0_pos_result_resu (by omega)
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   refine ⟨by have := hw.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   exact jgram_val_tok b pos p en hw (Or.inr (Or.inl hn.2.2)) (by have := hw.1; omega)
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.5 by
+///   intro _
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   refine ⟨by have := hw.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   refine jgram_val_tok b pos p (p + 4) hw (Or.inr (Or.inr (Or.inl ?_))) (by have := hw.1; omega)
+///   exact ⟨by omega, by omega, by omega, by omega, rfl⟩
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.8 by
+///   intro _
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   refine ⟨by have := hw.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   refine jgram_val_tok b pos p (p + 5) hw (Or.inr (Or.inr (Or.inr (Or.inl ?_)))) (by have := hw.1; omega)
+///   exact ⟨by omega, by omega, by omega, by omega, by omega, rfl⟩
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.11 by
+///   intro _
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   refine ⟨by have := hw.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   refine jgram_val_tok b pos p (p + 4) hw (Or.inr (Or.inr (Or.inr (Or.inr ?_)))) (by have := hw.1; omega)
+///   exact ⟨by omega, by omega, by omega, by omega, rfl⟩
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.14 by
+///   intro _
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   have hw2 := h_ws_run_post_wsto_b_i_result_2
+///   refine ⟨by have := hw.1; have := hw2.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   exact jgram_val_obj b pos p (q + 1) hw (by omega)
+///     (jgram_obj_empty b (p + 1) q hw2 (by omega))
+
+/// discharge json_value_end.inv_init.e2_jgram_b_4_cur_e2_jgram_b_1_p_1_e2 by
+///   intro e2 ht
+///   have hw2 := h_ws_run_post_wsto_b_i_result_2
+///   have hw3 := h_ws_run_post_wsto_b_i_result_3
+///   have hs := h_json_string_end_post_result_0_pos_result_resu (by omega)
+///   have hv := h_json_value_end_post_result_0_pos_result_resu (by omega)
+///   exact jgram_obj_member b (p + 1) q r s e e2 hw2 hs.2.2 hw3 (by omega) hv.2.2 ht
+///     (by have := hw2.1; omega) (by have := hw3.1; have := hs.1; omega)
+
+/// discharge json_value_end.inv_preserved.e2_jgram_b_4_cur_e2_jgram_b_1_p_1_e2 by
+///   intro e2 ht
+///   apply h_inv_e2_jgram_b_4_cur_e2_jgra e2
+///   have hw4 := h_ws_run_post_wsto_b_i_result_4
+///   have hw5 := h_ws_run_post_wsto_b_i_result_5
+///   have hw6 := h_ws_run_post_wsto_b_i_result_6
+///   have hs := h_json_string_end_post_result_0_pos_result_resu_2 (by omega)
+///   have hv := h_json_value_end_post_result_0_pos_result_resu_2 (by omega)
+///   exact jgram_objtail_member b cur t q2 r2 s2 e2v e2 hw4 (by omega) hw5 hs.2.2 hw6
+///     (by omega) hv.2.2 ht (by have := hw4.1; omega)
+///     (by have := hw5.1; have := hw6.1; have := hs.1; omega)
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.21 by
+///   intro _
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   have hw4 := h_ws_run_post_wsto_b_i_result_4
+///   refine ⟨by have := hw.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   apply jgram_val_obj b pos p (t + 1) hw (by omega)
+///   apply h_inv_e2_jgram_b_4_cur_e2_jgra (t + 1)
+///   exact jgram_objtail_close b cur t hw4 (by omega)
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.31 by
+///   intro _
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   have hw2 := h_ws_run_post_wsto_b_i_result_2
+///   refine ⟨by have := hw.1; have := hw2.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   exact jgram_val_arr b pos p (qa + 1) hw (by omega)
+///     (jgram_arr_empty b (p + 1) qa hw2 (by omega))
+
+/// discharge json_value_end.inv_init.e2_jgram_b_6_cura_e2_jgram_b_2_p_1_e2 by
+///   intro e2 ht
+///   have hv := h_json_value_end_post_result_0_pos_result_resu (by omega)
+///   exact jgram_arr_elem b (p + 1) ea e2 hv.2.2 ht
+
+/// discharge json_value_end.inv_preserved.e2_jgram_b_6_cura_e2_jgram_b_2_p_1_e2 by
+///   intro e2 ht
+///   apply h_inv_e2_jgram_b_6_cura_e2_jgr e2
+///   have hw3 := h_ws_run_post_wsto_b_i_result_3
+///   have hv := h_json_value_end_post_result_0_pos_result_resu_2 (by omega)
+///   exact jgram_arrtail_elem b cura ta e2va e2 hw3 (by omega) hv.2.2 ht
+///     (by have := hw3.1; omega)
+
+/// discharge json_value_end.post.result_0_pos_result_result_b_len_jgram_b.34 by
+///   intro _
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   have hw3 := h_ws_run_post_wsto_b_i_result_3
+///   refine ⟨by have := hw.1; omega, by omega, ?_⟩
+///   rw [h_result]
+///   apply jgram_val_arr b pos p (ta + 1) hw (by omega)
+///   apply h_inv_e2_jgram_b_6_cura_e2_jgr (ta + 1)
+///   exact jgram_arrtail_close b cura ta hw3 (by omega)
+
+/// discharge json_valid.post.result_e_jgram_b_0_0_e_wsto_b_e_b_len by
+///   intro h
+///   exact (h_result.mp h).elim
+
+/// discharge json_valid.post.result_e_jgram_b_0_0_e_wsto_b_e_b_len.2 by
+///   intro _
+///   have hv := h_json_value_end_post_result_0_pos_result_resu (by omega)
+///   have hw := h_ws_run_post_wsto_b_i_result
+///   have hpl : p = b.len := by have := h_ws_run_post_i_result_result_b_len; omega
+///   refine ⟨e, hv.2.2, ?_⟩
+///   rw [← hpl]
+///   exact hw
