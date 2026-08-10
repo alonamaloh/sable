@@ -13,7 +13,7 @@ fn pick(u64 x, u64 y) -> u64 {
 
 /// post result ≤ 10
 fn clamp_down(u64 n) -> u64 {
-    u64 k = n;
+    mut u64 k = n;
     /// variant k
     while (pick(k, 10) > 10) {
         k = k - 1;

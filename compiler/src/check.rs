@@ -34,6 +34,9 @@ type CResult<T> = Result<T, Diagnostic>;
 struct VarInfo {
     ty: Ty,
     initialized: bool,
+    /// Declared `mut` (ADR 0016). Params are immutable; `self.f`
+    /// pseudo-vars are governed by the receiver kind instead.
+    mutable: bool,
 }
 
 struct Ctx<'a> {
@@ -334,6 +337,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 VarInfo {
                     ty: p.ty,
                     initialized: true,
+                    mutable: false,
                 },
             );
         }
@@ -385,6 +389,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 VarInfo {
                     ty: p.ty,
                     initialized: true,
+                    mutable: false,
                 },
             );
         }
@@ -427,6 +432,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: p.ty,
                         initialized: true,
+                        mutable: false,
                     },
                 );
             }
@@ -436,6 +442,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: *fty,
                         initialized: false,
+                        mutable: true,
                     },
                 );
             }
@@ -479,6 +486,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: p.ty,
                         initialized: true,
+                        mutable: false,
                     },
                 );
             }
@@ -488,6 +496,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: *fty,
                         initialized: true,
+                        mutable: true,
                     },
                 );
             }
@@ -571,6 +580,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: p.ty,
                             initialized: true,
+                            mutable: false,
                         },
                     );
                 }
@@ -580,6 +590,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: *fty,
                             initialized: false,
+                            mutable: true,
                         },
                     );
                 }
@@ -622,6 +633,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: p.ty,
                             initialized: true,
+                            mutable: false,
                         },
                     );
                 }
@@ -631,6 +643,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: *fty,
                             initialized: true,
+                            mutable: true,
                         },
                     );
                 }
@@ -688,6 +701,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 name,
                 name_span,
                 init,
+                mutable,
             } => {
                 if !ctx.declared.insert(name.clone()) {
                     return Err(Diagnostic {
@@ -723,6 +737,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     VarInfo {
                         ty: *ty,
                         initialized: init.is_some(),
+                        mutable: *mutable,
                     },
                 );
             }
@@ -731,8 +746,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 name_span,
                 value,
             } => {
-                let ty = match ctx.vars.get(name.as_str()) {
-                    Some(v) => v.ty,
+                let (ty, was_mutable) = match ctx.vars.get(name.as_str()) {
+                    Some(v) => (v.ty, v.mutable),
                     None => {
                         return Err(Diagnostic {
                             name: "type.unknown_variable".into(),
@@ -743,6 +758,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
+                if !was_mutable {
+                    return Err(Diagnostic {
+                        name: "mut.assign_immutable".into(),
+                        title: format!("assignment to immutable local `{name}`"),
+                        span: *name_span,
+                        label: "declare it `mut` to allow assignment".into(),
+                        notes: vec![],
+                    });
+                }
                 if matches!(ty, Ty::Class(_)) {
                     // Reassignment of a class local is a move-in from a
                     // fresh owned value (the old value is dropped, with
@@ -911,6 +935,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 name,
                 name_span,
                 init,
+                mutable,
                 ty,
             } => {
                 if !ctx.declared.insert(name.clone()) {
@@ -938,6 +963,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     VarInfo {
                         ty: t,
                         initialized: true,
+                        mutable: *mutable,
                     },
                 );
             }
@@ -1022,11 +1048,12 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 index,
                 value,
             } => {
-                let (elem, mutability) = match ctx.vars.get(array.as_str()) {
+                let (elem, mutability, arr_mutable) = match ctx.vars.get(array.as_str()) {
                     Some(VarInfo {
                         ty: Ty::Array(t, m),
+                        mutable,
                         ..
-                    }) => (*t, *m),
+                    }) => (*t, *m, *mutable),
                     Some(v) => {
                         return Err(Diagnostic {
                             name: "type.not_an_array".into(),
@@ -1046,6 +1073,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
+                if mutability == Mutability::Owned && !arr_mutable {
+                    return Err(Diagnostic {
+                        name: "mut.store_immutable".into(),
+                        title: format!("store into immutable local `{array}`"),
+                        span: *array_span,
+                        label: "declare it `mut` to allow element stores".into(),
+                        notes: vec![],
+                    });
+                }
                 if mutability == Mutability::Shared {
                     return Err(Diagnostic {
                         name: "type.store_shared".into(),
@@ -1631,7 +1667,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     });
                 }
             };
-            let Some((_, params, ret, _)) = ctx.class_metas[ci]
+            let Some((_, params, ret, self_kind)) = ctx.class_metas[ci]
                 .methods
                 .iter()
                 .find(|(n, _, _, _)| n == method)
@@ -1655,6 +1691,21 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     ),
                     span,
                     label: "wrong number of arguments".into(),
+                    notes: vec![],
+                });
+            }
+            if self_kind == SelfKind::Mut
+                && matches!(
+                    ctx.vars.get(recv.as_str()).map(|v| v.ty),
+                    Some(Ty::Class(_))
+                )
+                && !ctx.vars.get(recv.as_str()).is_some_and(|v| v.mutable)
+            {
+                return Err(Diagnostic {
+                    name: "mut.method_immutable".into(),
+                    title: format!("`&mut` method on immutable local `{recv}`"),
+                    span: *recv_span,
+                    label: format!("`{method}` mutates its receiver; declare `{recv}` `mut`"),
                     notes: vec![],
                 });
             }
@@ -1704,6 +1755,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 Some(Ty::Array(_, m)) => m,
                 _ => unreachable!("array_elem_ty checked"),
             };
+            if *mutable
+                && src_mut == Mutability::Owned
+                && !ctx.vars.get(array.as_str()).is_some_and(|v| v.mutable)
+            {
+                return Err(Diagnostic {
+                    name: "mut.borrow_immutable".into(),
+                    title: format!("`&mut` borrow of immutable local `{array}`"),
+                    span,
+                    label: "declare it `mut` to allow mutable borrows".into(),
+                    notes: vec![],
+                });
+            }
             if *mutable && src_mut == Mutability::Shared {
                 return Err(Diagnostic {
                     name: "type.mut_borrow_shared".into(),

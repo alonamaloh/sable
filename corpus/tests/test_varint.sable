@@ -6,7 +6,7 @@
 use varint;
 
 fn test_encode_small_values() {
-    [u64] out = alloc_array<u64>(10, 0);
+    mut [u64] out = alloc_array<u64>(10, 0);
     u64 n0 = varint_encode(&mut out, 0);
     varint_decode(&out, n0);
     u64 n1 = varint_encode(&mut out, 127);
@@ -14,7 +14,7 @@ fn test_encode_small_values() {
 }
 
 fn test_encode_boundaries() {
-    [u64] buf = alloc_array<u64>(10, 0);
+    mut [u64] buf = alloc_array<u64>(10, 0);
     u64 a = varint_encode(&mut buf, 128);
     varint_decode(&buf, a);
     u64 b = varint_encode(&mut buf, 16383);
@@ -26,7 +26,7 @@ fn test_encode_boundaries() {
 }
 
 fn test_decode_edges() {
-    [u64] src = alloc_array<u64>(3, 0);
+    mut [u64] src = alloc_array<u64>(3, 0);
     varint_decode(&src, 0);
     src[0] = 5;
     varint_decode(&src, 1);

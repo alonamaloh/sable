@@ -20,7 +20,7 @@ impl Hashable for u64 {
 // into the map's loops.
 
 fn test_insert_get_roundtrip() {
-    var m = HashMap<i32, u64>::with_capacity(8);
+    var mut m = HashMap<i32, u64>::with_capacity(8);
     m.insert(1, 10);
     m.insert(2, 20);
     m.get(1);
@@ -30,7 +30,7 @@ fn test_insert_get_roundtrip() {
 }
 
 fn test_collisions_and_overwrite() {
-    var m = HashMap<i32, u64>::with_capacity(8);
+    var mut m = HashMap<i32, u64>::with_capacity(8);
     m.insert(1, 100);
     m.insert(9, 900);
     m.insert(17, 1700);
@@ -42,7 +42,7 @@ fn test_collisions_and_overwrite() {
 }
 
 fn test_wraparound() {
-    var m = HashMap<i32, u64>::with_capacity(4);
+    var mut m = HashMap<i32, u64>::with_capacity(4);
     m.insert(3, 30);
     m.insert(7, 70);
     m.insert(2, 22);
@@ -53,7 +53,7 @@ fn test_wraparound() {
 }
 
 fn test_u64_instance() {
-    var m = HashMap<u64, u64>::with_capacity(4);
+    var mut m = HashMap<u64, u64>::with_capacity(4);
     m.insert(5, 55);
     m.insert(9, 99);
     m.get(5);

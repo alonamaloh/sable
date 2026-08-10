@@ -4,7 +4,7 @@
 /// pre  n < 100
 /// post result ≥ 0
 fn drift(u64 n, u64 i) -> u64 {
-    u64 x = 0;
+    mut u64 x = 0;
     /// invariant x ≤ n
     /// variant   n - i
     while (x < n) {

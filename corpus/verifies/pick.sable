@@ -4,7 +4,7 @@
 /// post b = true -> result = 1
 /// post b = false -> result = 2
 fn pick(bool b) -> i32 {
-    i32 x;
+    mut i32 x;
     if (b) { x = 1; } else { x = 2; }
     return x;
 }

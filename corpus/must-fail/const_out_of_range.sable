@@ -1,0 +1,7 @@
+// expect-error: const.out_of_range
+
+const u8 BIG = 300;
+
+fn f() -> u64 {
+    return BIG;
+}

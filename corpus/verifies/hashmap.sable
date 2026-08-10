@@ -211,7 +211,7 @@ class HashMap<K: Hashable, V> {
         u64 cap = self.occ.len;
         u64 hv = K::hash(k);
         u64 h = hv % cap;
-        u64 j = 0;
+        mut u64 j = 0;
         /// invariant j ≤ cap
         /// invariant 0 ≤ h ∧ h < cap
         /// invariant ∀ j2, 0 ≤ j2 → j2 < j → self.occ.get (probe h j2 cap) = 1 ∧ self.keys.get (probe h j2 cap) ≠ k
@@ -238,7 +238,7 @@ class HashMap<K: Hashable, V> {
         u64 cap = self.occ.len;
         u64 hv = K::hash(k);
         u64 h = hv % cap;
-        u64 j = 0;
+        mut u64 j = 0;
         /// invariant j ≤ cap
         /// invariant 0 ≤ h ∧ h < cap
         /// invariant self.occ.len = cap ∧ self.keys.len = cap ∧ self.vals.len = cap
@@ -272,7 +272,7 @@ class HashMap<K: Hashable, V> {
 }
 
 fn demo() {
-    var m = HashMap<i32, u64>::with_capacity(8);
+    var mut m = HashMap<i32, u64>::with_capacity(8);
     m.insert(1, 10);
     m.insert(2, 20);
     m.get(1);

@@ -39,7 +39,7 @@ class String {
 ///      ∀ j, 0 ≤ j → j < a.bytes.len → a.bytes.get j = b.bytes.get j)
 /// post #[label(range)] result = -1 ∨ result = 0 ∨ result = 1
 fn cmp(&String a, &String b) -> i32 {
-    u64 n = a.bytes.len;
+    mut u64 n = a.bytes.len;
     if (b.bytes.len < n) {
         n = b.bytes.len;
     }

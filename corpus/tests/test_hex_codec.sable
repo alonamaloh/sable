@@ -11,9 +11,9 @@ use hex_codec;
 
 fn test_round_trip() {
     [u8] src = [0, 15, 16, 171, 255];
-    [u8] enc = alloc_array<u8>(10, 0);
+    mut [u8] enc = alloc_array<u8>(10, 0);
     hex_encode(&src, &mut enc);
-    [u8] dec = alloc_array<u8>(5, 0);
+    mut [u8] dec = alloc_array<u8>(5, 0);
     hex_decode(&enc, &mut dec);
 }
 
@@ -21,7 +21,7 @@ fn test_round_trip() {
 // with result = true. "deadbeef" -> [222, 173, 190, 239].
 fn test_decode_valid() {
     [u8] hex = b"deadbeef";
-    [u8] out = alloc_array<u8>(4, 0);
+    mut [u8] out = alloc_array<u8>(4, 0);
     hex_decode(&hex, &mut out);
 }
 
@@ -30,16 +30,16 @@ fn test_decode_valid() {
 // vacuous decode post still checks. Empty input round-trips too.
 fn test_decode_invalid_and_empty() {
     [u8] bad1 = b"g0";
-    [u8] out1 = alloc_array<u8>(1, 0);
+    mut [u8] out1 = alloc_array<u8>(1, 0);
     hex_decode(&bad1, &mut out1);
     [u8] bad2 = b"0A";
-    [u8] out2 = alloc_array<u8>(1, 0);
+    mut [u8] out2 = alloc_array<u8>(1, 0);
     hex_decode(&bad2, &mut out2);
     [u8] bad3 = b":9";
-    [u8] out3 = alloc_array<u8>(1, 0);
+    mut [u8] out3 = alloc_array<u8>(1, 0);
     hex_decode(&bad3, &mut out3);
-    [u8] empty = [];
-    [u8] eout = alloc_array<u8>(0, 0);
+    mut [u8] empty = [];
+    mut [u8] eout = alloc_array<u8>(0, 0);
     hex_encode(&empty, &mut eout);
     hex_decode(&eout, &mut empty);
 }

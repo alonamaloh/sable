@@ -396,6 +396,7 @@ fn merge(loading: Loading) -> Result<(Program, ModuleSet), (Diagnostic, ModuleSe
         merged.defers.extend(p.defers);
         merged.assumes.extend(p.assumes);
         merged.operators.extend(p.operators);
+        merged.consts.extend(p.consts);
     }
     Ok((merged, loading.set))
 }

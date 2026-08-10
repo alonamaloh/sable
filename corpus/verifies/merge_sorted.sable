@@ -11,9 +11,9 @@
 fn merge(&[i32] xs, &[i32] ys, &mut [i32] out) {
     u64 n = xs.len;
     u64 m = ys.len;
-    u64 i = 0;
-    u64 j = 0;
-    u64 k = 0;
+    mut u64 i = 0;
+    mut u64 j = 0;
+    mut u64 k = 0;
     /// invariant i ≤ xs.len
     /// invariant j ≤ ys.len
     /// invariant k = i + j

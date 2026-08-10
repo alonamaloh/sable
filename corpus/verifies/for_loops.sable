@@ -4,7 +4,7 @@
 
 /// post result = n
 fn count_for(u64 n) -> u64 {
-    u64 total = 0;
+    mut u64 total = 0;
     /// invariant total = i
     for (u64 i : range(n)) {
         total = total + 1;
@@ -15,7 +15,7 @@ fn count_for(u64 n) -> u64 {
 /// pre  lo ≤ hi
 /// post result = hi - lo
 fn span_len(u32 lo, u32 hi) -> u32 {
-    u32 count = 0;
+    mut u32 count = 0;
     /// invariant count = i - lo
     for (u32 i : range(lo, hi)) {
         count = count + 1;

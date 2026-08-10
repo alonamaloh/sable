@@ -1,0 +1,8 @@
+// expect-error: mut.assign_immutable
+// Locals are immutable unless declared `mut`.
+
+fn f() -> u64 {
+    u64 x = 1;
+    x = 2;
+    return x;
+}

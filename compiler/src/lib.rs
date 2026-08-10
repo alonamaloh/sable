@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod check;
+pub mod consts;
 pub mod daemon;
 pub mod diag;
 pub mod interp;
@@ -67,6 +68,9 @@ pub fn front_diagnostics(source: &str) -> Vec<Diagnostic> {
         Ok(p) => p,
         Err(d) => return vec![d],
     };
+    if let Err(d) = consts::apply(&mut program) {
+        return vec![d];
+    }
     if let Err(d) = mono::monomorphize(&mut program) {
         return vec![d];
     }
@@ -115,6 +119,7 @@ pub fn test_file(path: &Path, opts: &Options) -> Result<Vec<interp::TestReport>,
         name: d.name.clone(),
         rendered: mods.render(d),
     };
+    consts::apply(&mut program).map_err(|d| vec![render(&d)])?;
     mono::monomorphize(&mut program).map_err(|d| vec![render(&d)])?;
     check::check(&mut program).map_err(|d| vec![render(&d)])?;
     Ok(interp::run_tests(&program, &mods))
@@ -172,6 +177,9 @@ pub fn check_file_structured(
     };
     let _ = display_path;
     let source = mods.combined_source.clone();
+    if let Err(d) = consts::apply(&mut program) {
+        return (mods, Err(vec![d]));
+    }
     if let Err(d) = mono::monomorphize(&mut program) {
         return (mods, Err(vec![d]));
     }

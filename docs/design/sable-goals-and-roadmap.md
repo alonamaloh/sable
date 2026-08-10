@@ -119,7 +119,7 @@ Four workstreams close the gap, each with standalone artifacts:
 ## Sequencing summary
 
 ```
-sorts → Vec → bignum M1 (add/sub/cmp)          ← next steps; each feeds the next
+sorts → Vec → bignum (complete through gcd)    ← done; each fed the next
       ↘ hash map (forces generics design)
 codecs → UTF-8 → JSON parser → DEFLATE          ← breadth track, parallelizable
 crypto kernels (ChaCha20/SHA-256)               ← independent; prototypes `secret`

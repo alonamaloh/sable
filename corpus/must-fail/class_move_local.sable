@@ -18,7 +18,7 @@ class Box {
 }
 
 fn shuffle() {
-    var a = Box::make(1);
+    var mut a = Box::make(1);
     var b = Box::make(2);
     a = b;
 }

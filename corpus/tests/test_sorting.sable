@@ -8,21 +8,21 @@ use insertion_sort;
 use binary_search;
 
 fn test_sort_then_search() {
-    [i32] a = [5, 3, 8, 1, 9, 2, 7];
+    mut [i32] a = [5, 3, 8, 1, 9, 2, 7];
     insertion_sort(&mut a);
     binary_search(&a, 8);
     binary_search(&a, 4);
 }
 
 fn test_sort_empty_and_single() {
-    [i32] e = [];
+    mut [i32] e = [];
     insertion_sort(&mut e);
-    [i32] s = [42];
+    mut [i32] s = [42];
     insertion_sort(&mut s);
 }
 
 fn test_sort_already_sorted() {
-    [i32] a = [1, 2, 3, 4];
+    mut [i32] a = [1, 2, 3, 4];
     insertion_sort(&mut a);
     binary_search(&a, 1);
     binary_search(&a, 4);

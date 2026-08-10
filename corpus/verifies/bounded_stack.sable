@@ -37,7 +37,7 @@ class BoundedStack {
 }
 
 fn demo() {
-    var s = BoundedStack::with_capacity(4);
+    var mut s = BoundedStack::with_capacity(4);
     s.push(7);
     s.pop();
 }

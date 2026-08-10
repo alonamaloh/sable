@@ -3,7 +3,7 @@
 
 /// post result >= 0
 fn pick_bad(bool b) -> i32 {
-    i32 x;
+    mut i32 x;
     if (b) { x = 1; }
     return x;
 }

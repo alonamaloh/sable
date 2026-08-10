@@ -16,7 +16,7 @@ fn zero_out(&mut [i32] a) {
 
 /// post result = 5
 fn caller() -> i32 {
-    [i32] b = alloc_array<i32>(3, 5);
+    mut [i32] b = alloc_array<i32>(3, 5);
     zero_out(&mut b);
     return b[0];
 }

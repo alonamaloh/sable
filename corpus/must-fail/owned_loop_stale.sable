@@ -5,7 +5,7 @@
 
 /// post result = 5
 fn caller() -> i32 {
-    [i32] b = alloc_array<i32>(3, 5);
+    mut [i32] b = alloc_array<i32>(3, 5);
     u64 n = b.len;
     /// invariant ∀ k, 0 ≤ k → k < i → b.get k = 0
     for (u64 i : range(n)) {

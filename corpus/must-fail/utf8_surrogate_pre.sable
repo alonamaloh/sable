@@ -35,6 +35,6 @@ fn encode_utf8(u32 cp, &mut [u8] out) -> u64 {
 }
 
 fn demo() {
-    [u8] buf = alloc_array<u8>(4, 0);
+    mut [u8] buf = alloc_array<u8>(4, 0);
     encode_utf8(55296, &mut buf);
 }

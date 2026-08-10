@@ -329,6 +329,9 @@ pub enum Stmt {
         name: String,
         name_span: Span,
         init: Option<Expr>,
+        /// Declared `mut` — assignment, stores, and `&mut` borrows are
+        /// only legal on mutable locals (ADR 0016).
+        mutable: bool,
     },
     Assign {
         name: String,
@@ -356,6 +359,8 @@ pub enum Stmt {
         name: String,
         name_span: Span,
         init: Expr,
+        /// Declared `var mut` (ADR 0016).
+        mutable: bool,
         /// Filled by the checker.
         ty: Option<Ty>,
     },
@@ -541,6 +546,18 @@ pub struct ClassDecl {
     pub span: Span,
 }
 
+/// `const u64 NAME = <literal>;` — a named compile-time value
+/// (ADR 0016), substituted into program expressions and clause text
+/// before any later stage runs.
+#[derive(Debug, Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub ty: IntTy,
+    pub value: i128,
+    pub span: Span,
+}
+
 /// The symbol slot of an `operator` binding declaration (ADR 0012).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OpSym {
@@ -607,4 +624,6 @@ pub struct Program {
     pub operators: Vec<OpBind>,
     /// Imports (ADR 0013), consumed by the module loader.
     pub uses: Vec<UseDecl>,
+    /// Named constants (ADR 0016), consumed by the const pass.
+    pub consts: Vec<ConstDecl>,
 }

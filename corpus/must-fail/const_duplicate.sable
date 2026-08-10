@@ -1,0 +1,8 @@
+// expect-error: const.duplicate
+
+const u64 LIMIT = 10;
+const u64 LIMIT = 20;
+
+fn f() -> u64 {
+    return LIMIT;
+}

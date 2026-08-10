@@ -2,7 +2,7 @@
 
 /// post result = n
 fn count(u64 n) -> u64 {
-    u64 i = 0;
+    mut u64 i = 0;
     /// invariant i < 3
     /// variant   n - i
     while (i < n) {

@@ -7,24 +7,24 @@
 use quicksort;
 
 fn test_quicksort_mixed() {
-    [i32] a = [5, 3, 8, 1, 9, 2, 7, 3, 0, 6];
+    mut [i32] a = [5, 3, 8, 1, 9, 2, 7, 3, 0, 6];
     quicksort(&mut a);
 }
 
 fn test_quicksort_edges() {
-    [i32] e = [];
+    mut [i32] e = [];
     quicksort(&mut e);
-    [i32] s = [42];
+    mut [i32] s = [42];
     quicksort(&mut s);
-    [i32] d = [7, 7, 7, 7];
+    mut [i32] d = [7, 7, 7, 7];
     quicksort(&mut d);
 }
 
 fn test_quicksort_adversarial() {
-    [i32] r = [9, 8, 7, 6, 5, 4, 3, 2, 1];
+    mut [i32] r = [9, 8, 7, 6, 5, 4, 3, 2, 1];
     quicksort(&mut r);
-    [i32] a = [1, 2, 3, 4, 5];
+    mut [i32] a = [1, 2, 3, 4, 5];
     quicksort(&mut a);
-    [i32] m = [2, 1, 2, 1, 2, 1];
+    mut [i32] m = [2, 1, 2, 1, 2, 1];
     quicksort(&mut m);
 }

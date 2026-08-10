@@ -145,7 +145,7 @@ fn sum(&[i32] a) -> i64 {
 ///   if lo ≥ hi then 0 else (a.get lo : int) + spec_sum a (lo+1) hi
 ```
 
-Collapse the `///` lines and the function reads as plain C with a two-line contract. The third invariant is representative of verified programming in practice: the compiler forces you to state *why* nothing overflows, and the bound lives with the proof, not the interface. Invariants change constantly during proof development; because those edits are `///`-only, the executable program has zero diff noise.
+Collapse the `///` lines and the function reads as plain C with a two-line contract. *(v0.4+: locals are immutable unless declared `mut` — ADR 0016; the older examples below predate the marker and should be read with it implied on mutated locals.)* The third invariant is representative of verified programming in practice: the compiler forces you to state *why* nothing overflows, and the bound lives with the proof, not the interface. Invariants change constantly during proof development; because those edits are `///`-only, the executable program has zero diff noise.
 
 **Counted loops are sugar.** `for (u64 i : range(n))` and `for (T i : range(lo, hi))` desugar to the `while` above with the bounds invariant (`lo ≤ i ∧ i ≤ hi`), the variant (`hi - i`), and the increment synthesized — the simplest loops carry zero annotation. Extra `invariant` clauses attach above the `for` as usual; the body may not assign the index or any variable the bounds mention (bounds must be loop-invariant), and `range(lo, hi)` obliges `lo ≤ hi` at entry.
 
@@ -184,8 +184,8 @@ An `unsafe` sublanguage (raw regions, manufacturing ownership from bytes) is del
 ///      | some i => 0 ≤ i ∧ i < a.len ∧ a.get i = key
 ///      | none   => ∀ k, 0 ≤ k → k < a.len → a.get k ≠ key
 fn binary_search(&[i32] a, i32 key) -> option<u64> {
-    u64 lo = 0;
-    u64 hi = a.len;
+    mut u64 lo = 0;
+    mut u64 hi = a.len;
     /// invariant hi ≤ a.len
     /// invariant ∀ k, 0 ≤ k → k < lo → a.get k < key
     /// invariant ∀ k, hi ≤ k → k < a.len → key < a.get k

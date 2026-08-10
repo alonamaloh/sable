@@ -18,6 +18,8 @@ pub struct Parser<'a> {
     /// hidden byte-array temp behind a bare string literal); the block
     /// splices them in just before the statement that produced them.
     pending: Vec<Stmt>,
+    /// A `mut` marker was just parsed; the next declaration consumes it.
+    pending_mut: bool,
     str_temps: usize,
     blocks: &'a [ProofBlock],
     consumed: Vec<bool>,
@@ -67,6 +69,7 @@ pub fn parse_module(
         tokens,
         pos: 0,
         pending: Vec::new(),
+        pending_mut: false,
         str_temps: 0,
         blocks,
         consumed: vec![false; blocks.len()],
@@ -81,6 +84,7 @@ pub fn parse_module(
     let mut impls = Vec::new();
     let mut operators = Vec::new();
     let mut uses = Vec::new();
+    let mut consts = Vec::new();
     while !parser.at(&Tok::Eof) {
         if matches!(parser.peek(), Tok::Ident(n) if n == "use") {
             uses.push(parser.parse_use()?);
@@ -94,6 +98,8 @@ pub fn parse_module(
             impls.push(parser.parse_impl()?);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "operator") {
             operators.push(parser.parse_operator()?);
+        } else if matches!(parser.peek(), Tok::Ident(n) if n == "const") {
+            consts.push(parser.parse_const()?);
         } else {
             fns.push(parser.parse_fn()?);
         }
@@ -161,6 +167,7 @@ pub fn parse_module(
         assumes,
         operators,
         uses,
+        consts,
     })
 }
 
@@ -768,6 +775,37 @@ impl<'a> Parser<'a> {
     }
 
     /// `operator + = add;` (ADR 0012).
+    /// `const u64 NAME = 123;` — a named compile-time value
+    /// (ADR 0016). The value is an integer literal (optionally
+    /// negated); the const pass checks the range and substitutes uses.
+    fn parse_const(&mut self) -> PResult<crate::ast::ConstDecl> {
+        let kw = self.bump().span; // `const`
+        let (ty, _) = self.int_ty()?;
+        let (name, name_span) = self.ident()?;
+        if is_reserved_name(&name) {
+            return Err(reserved_name_error(&name, name_span, "constant"));
+        }
+        self.expect(Tok::Assign)?;
+        let neg = if self.at(&Tok::Minus) {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        let Tok::Int(v) = self.peek().clone() else {
+            return Err(self.error_expected("an integer literal"));
+        };
+        self.bump();
+        let end = self.expect(Tok::Semi)?.span;
+        Ok(crate::ast::ConstDecl {
+            name,
+            name_span,
+            ty,
+            value: if neg { -v } else { v },
+            span: kw.join(end),
+        })
+    }
+
     fn parse_operator(&mut self) -> PResult<crate::ast::OpBind> {
         let start = self.peek_span();
         self.pos += 1; // `operator`
@@ -1415,6 +1453,7 @@ impl<'a> Parser<'a> {
                 name: index,
                 name_span: index_span,
                 init: Some(init),
+                mutable: true,
             },
             Stmt::While {
                 cond,
@@ -1428,6 +1467,23 @@ impl<'a> Parser<'a> {
 
     fn stmt(&mut self) -> PResult<Stmt> {
         match self.peek().clone() {
+            // `mut <decl>` — the declared local is mutable (ADR 0016).
+            Tok::Ident(m) if m == "mut" && !self.pending_mut => {
+                let mut_span = self.bump().span;
+                self.pending_mut = true;
+                let s = self.stmt()?;
+                if self.pending_mut {
+                    self.pending_mut = false;
+                    return Err(Diagnostic {
+                        name: "mut.not_a_declaration".into(),
+                        title: "`mut` must prefix a declaration".into(),
+                        span: mut_span,
+                        label: "only local declarations take a mutability marker".into(),
+                        notes: vec![],
+                    });
+                }
+                Ok(s)
+            }
             Tok::KwReturn => {
                 let kw = self.bump().span;
                 let value = if self.at(&Tok::Semi) {
@@ -1444,6 +1500,12 @@ impl<'a> Parser<'a> {
             Tok::KwIf => self.if_stmt(),
             Tok::KwVar => {
                 self.bump();
+                // `var mut s = ...;` — the marker sits between `var`
+                // and the name (ADR 0016).
+                if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
+                    self.bump();
+                    self.pending_mut = true;
+                }
                 let (name, name_span) = self.ident()?;
                 if is_reserved_name(&name) {
                     return Err(reserved_name_error(&name, name_span, "variable"));
@@ -1475,10 +1537,12 @@ impl<'a> Parser<'a> {
                             span: lit_span,
                             ty: None,
                         }),
+                        mutable: false,
                     });
                     return Ok(Stmt::VarDecl {
                         name,
                         name_span,
+                        mutable: std::mem::take(&mut self.pending_mut),
                         init: Expr {
                             kind: ExprKind::CtorCall {
                                 class: "String".into(),
@@ -1506,6 +1570,7 @@ impl<'a> Parser<'a> {
                     name,
                     name_span,
                     init,
+                    mutable: std::mem::take(&mut self.pending_mut),
                     ty: None,
                 })
             }
@@ -1527,6 +1592,7 @@ impl<'a> Parser<'a> {
                     name,
                     name_span,
                     init: Some(init),
+                    mutable: std::mem::take(&mut self.pending_mut),
                 })
             }
             Tok::Ident(first) if first == "option" && self.peek2() == &Tok::Lt => {
@@ -1548,6 +1614,7 @@ impl<'a> Parser<'a> {
                     name,
                     name_span,
                     init: Some(init),
+                    mutable: std::mem::take(&mut self.pending_mut),
                 })
             }
             Tok::Ident(first) if first == "self" && self.peek2() == &Tok::Dot => {
@@ -1612,6 +1679,7 @@ impl<'a> Parser<'a> {
                         name,
                         name_span,
                         init,
+                        mutable: std::mem::take(&mut self.pending_mut),
                     })
                 } else if self.peek2() == &Tok::LParen {
                     let e = self.expr()?;

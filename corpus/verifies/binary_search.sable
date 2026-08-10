@@ -9,8 +9,8 @@
 ///      | some i => 0 ≤ i ∧ i < a.len ∧ a.get i = key
 ///      | none   => ∀ k, 0 ≤ k → k < a.len → a.get k ≠ key
 fn binary_search(&[i32] a, i32 key) -> option<u64> {
-    u64 lo = 0;
-    u64 hi = a.len;
+    mut u64 lo = 0;
+    mut u64 hi = a.len;
     /// invariant hi ≤ a.len
     /// invariant ∀ k, 0 ≤ k → k < lo → a.get k < key
     /// invariant ∀ k, hi ≤ k → k < a.len → key < a.get k

@@ -1,0 +1,7 @@
+// expect-error: mut.store_immutable
+// Element stores need a `mut` local too.
+
+fn test_f() {
+    [u8] b = b"abc";
+    b[0] = 100;
+}

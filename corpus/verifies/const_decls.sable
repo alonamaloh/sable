@@ -1,0 +1,18 @@
+// Named compile-time constants (ADR 0016): substituted into program
+// expressions and clause text before any later stage runs, so a
+// constant is indistinguishable downstream from the literal it names.
+
+const u64 CAPACITY = 100;
+const i32 SENTINEL = -7;
+
+/// pre  n ≤ CAPACITY
+/// post result = n + 1
+fn below_capacity(u64 n) -> u64 {
+    return n + 1;
+}
+
+/// post result = SENTINEL
+fn sentinel() -> i32 {
+    i32 x = SENTINEL;
+    return x;
+}

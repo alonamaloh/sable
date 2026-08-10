@@ -4,7 +4,7 @@
 use vec;
 
 fn test_push_get_growth() {
-    var v = Vec<i32>::with_capacity(2);
+    var mut v = Vec<i32>::with_capacity(2);
     v.push(10);
     v.push(20);
     v.push(30);
@@ -16,7 +16,7 @@ fn test_push_get_growth() {
 }
 
 fn test_set_and_pop() {
-    var v = Vec<i32>::with_capacity(1);
+    var mut v = Vec<i32>::with_capacity(1);
     v.push(7);
     v.push(8);
     v.set(0, 99);
@@ -26,7 +26,7 @@ fn test_set_and_pop() {
 }
 
 fn test_u8_instance() {
-    var v = Vec<u8>::with_capacity(4);
+    var mut v = Vec<u8>::with_capacity(4);
     v.push(255);
     v.pop();
     v.pop();

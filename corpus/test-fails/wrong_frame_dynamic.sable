@@ -22,6 +22,6 @@ class Cell {
 }
 
 fn test_clobber() {
-    var c = Cell::make();
+    var mut c = Cell::make();
     c.clobber();
 }

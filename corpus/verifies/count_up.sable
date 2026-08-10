@@ -3,7 +3,7 @@
 
 /// post result = n
 fn count_up(u64 n) -> u64 {
-    u64 i = 0;
+    mut u64 i = 0;
     /// invariant i ≤ n
     /// variant   n - i
     while (i < n) {

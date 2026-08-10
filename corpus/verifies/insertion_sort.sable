@@ -11,7 +11,7 @@ fn insertion_sort(&mut [i32] a) {
     /// invariant ∀ p q, 0 ≤ p → p < q → q < i → a.get p ≤ a.get q
     /// invariant perm a (old a)
     for (u64 i : range(n)) {
-        u64 j = i;
+        mut u64 j = i;
         /// invariant j ≤ i
         /// invariant ∀ p q, 0 ≤ p → p < q → q ≤ i → q ≠ j → a.get p ≤ a.get q
         /// invariant perm a (old a)

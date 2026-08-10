@@ -1,0 +1,6 @@
+// expect-error: mut.not_a_declaration
+// `mut` prefixes declarations only.
+
+fn f() -> u64 {
+    mut return 3;
+}

@@ -30,7 +30,7 @@ fn use_it(i32 x) -> i32 {
 
 /// post result.is_some → 0 ≤ result.value
 fn first_nonneg(&[i32] a) -> option<u64> {
-    u64 i = 0;
+    mut u64 i = 0;
     u64 n = a.len;
     /// invariant i ≤ n
     /// variant   n - i

@@ -16,7 +16,7 @@ fn copy_into(&[i32] src, &mut [i32] dst) {
 /// post result = 5
 fn caller() -> i32 {
     [i32] a = alloc_array<i32>(3, 5);
-    [i32] b = alloc_array<i32>(3, 0);
+    mut [i32] b = alloc_array<i32>(3, 0);
     copy_into(&a, &mut b);
     return b[0];
 }

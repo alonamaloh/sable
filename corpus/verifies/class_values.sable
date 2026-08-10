@@ -29,11 +29,11 @@ fn width(&Range r) -> i32 {
 /// post #[label(lo_min)] (result.lo = a.lo ∨ result.lo = b.lo) ∧ result.lo ≤ a.lo ∧ result.lo ≤ b.lo
 /// post #[label(hi_max)] (result.hi = a.hi ∨ result.hi = b.hi) ∧ result.hi ≥ a.hi ∧ result.hi ≥ b.hi
 fn union_of(&Range a, &Range b) -> Range {
-    i32 mn = a.lo;
+    mut i32 mn = a.lo;
     if (b.lo < mn) {
         mn = b.lo;
     }
-    i32 mx = a.hi;
+    mut i32 mx = a.hi;
     if (b.hi > mx) {
         mx = b.hi;
     }

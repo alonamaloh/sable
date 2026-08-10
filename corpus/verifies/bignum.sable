@@ -515,7 +515,7 @@ fn max_len(u64 x, u64 y) -> u64 {
 /// post #[label(top)]   result = 0 ∨ xs.get (result - 1) ≥ 1
 /// post #[label(value)] valIn xs 0 result = valIn xs 0 xs.len
 fn trim_len(&[u32] xs) -> u64 {
-    u64 rl = xs.len;
+    mut u64 rl = xs.len;
     /// invariant rl ≤ xs.len
     /// invariant valIn xs 0 rl = valIn xs 0 xs.len
     /// variant   rl
@@ -538,7 +538,7 @@ fn cmp(&Nat a, &Nat b) -> i32 {
     if (b.limbs.len < a.limbs.len) {
         return 1;
     }
-    u64 i = a.limbs.len;
+    mut u64 i = a.limbs.len;
     /// invariant i ≤ a.limbs.len
     /// invariant ∀ k, i ≤ k → k < a.limbs.len → a.limbs.get k = b.limbs.get k
     /// variant   i
@@ -562,8 +562,8 @@ fn add(&Nat a, &Nat b) -> Nat {
     u64 la = a.limbs.len;
     u64 lb = b.limbs.len;
     u64 n = max_len(la, lb) + 1;
-    [u32] out = alloc_array<u32>(n, 0);
-    u64 carry = 0;
+    mut [u32] out = alloc_array<u32>(n, 0);
+    mut u64 carry = 0;
     /// invariant carry ≤ 1
     /// invariant valIn out 0 i + carry * pw i = valIn a.limbs 0 (if i ≤ la then i else la) + valIn b.limbs 0 (if i ≤ lb then i else lb)
     for (u64 i : range(n)) {
@@ -584,8 +584,8 @@ fn add(&Nat a, &Nat b) -> Nat {
 /// post #[label(diff)] natVal result.limbs = natVal a.limbs - natVal b.limbs
 fn sub(&Nat a, &Nat b) -> Nat {
     u64 la = a.limbs.len;
-    [u32] out = alloc_array<u32>(la, 0);
-    u64 borrow = 0;
+    mut [u32] out = alloc_array<u32>(la, 0);
+    mut u64 borrow = 0;
     /// invariant borrow ≤ 1
     /// invariant valIn out 0 i - borrow * pw i = valIn a.limbs 0 i - valIn b.limbs 0 (if i ≤ b.limbs.len then i else b.limbs.len)
     for (u64 i : range(la)) {
@@ -689,11 +689,11 @@ fn mul(&Nat a, &Nat b) -> Nat {
     u64 la = a.limbs.len;
     u64 lb = b.limbs.len;
     u64 n = la + lb;
-    [u32] out = alloc_array<u32>(n, 0);
+    mut [u32] out = alloc_array<u32>(n, 0);
     /// invariant valIn out 0 n = valIn a.limbs 0 i * valIn b.limbs 0 lb
     /// invariant ∀ k, i + lb ≤ k → k < n → out.get k = 0
     for (u64 i : range(la)) {
-        u64 carry = 0;
+        mut u64 carry = 0;
         /// invariant carry ≤ 4294967295
         /// invariant valIn out 0 n + carry * pw (i + j) = valIn a.limbs 0 i * valIn b.limbs 0 lb + a.limbs.get i * valIn b.limbs 0 j * pw i
         /// invariant ∀ k, i + lb ≤ k → k < n → out.get k = 0
@@ -765,9 +765,9 @@ fn div(&Nat a, &Nat b) -> Nat {
     [u32] onearr = alloc_array<u32>(1, 1);
     var zero = Nat::from_prefix(&zarr, 0);
     /// assert #[label(zero_val)] natVal zero.limbs = 0
-    var q = Nat::from_prefix(&zarr, 0);
+    var mut q = Nat::from_prefix(&zarr, 0);
     /// assert #[label(q0)] natVal q.limbs = 0
-    var r = a + zero;
+    var mut r = a + zero;
     /// invariant natVal q.limbs * natVal b.limbs + natVal r.limbs = natVal a.limbs
     /// invariant q.limbs.len ≤ a.limbs.len
     /// invariant r.limbs.len ≤ a.limbs.len
@@ -775,10 +775,10 @@ fn div(&Nat a, &Nat b) -> Nat {
     while (r >= b) {
         /// assert #[label(b_le_r)]  natVal b.limbs ≤ natVal r.limbs
         /// assert #[label(r_le_a)]  natVal r.limbs ≤ natVal a.limbs
-        var d = b + zero;
-        var m = Nat::from_prefix(&onearr, 1);
+        var mut d = b + zero;
+        var mut m = Nat::from_prefix(&onearr, 1);
         /// assert #[label(one_val)] natVal m.limbs = 1
-        var d2 = d + d;
+        var mut d2 = d + d;
         /// invariant natVal d.limbs = natVal b.limbs * natVal m.limbs
         /// invariant natVal b.limbs ≤ natVal d.limbs
         /// invariant natVal d.limbs ≤ natVal r.limbs
@@ -876,8 +876,8 @@ fn gcd(&Nat a, &Nat b) -> Nat {
     [u32] zarr = alloc_array<u32>(1, 0);
     var zero = Nat::from_prefix(&zarr, 0);
     /// assert #[label(zero_val)] natVal zero.limbs = 0
-    var x = a + zero;
-    var y = b + zero;
+    var mut x = a + zero;
+    var mut y = b + zero;
     /// invariant igcd (natVal x.limbs) (natVal y.limbs) = igcd (natVal a.limbs) (natVal b.limbs)
     /// invariant x.limbs.len ≤ a.limbs.len + b.limbs.len
     /// invariant y.limbs.len ≤ a.limbs.len + b.limbs.len

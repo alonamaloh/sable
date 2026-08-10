@@ -12,13 +12,13 @@
 
 use utf8;
 
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result
 fn expect_valid(&[u8] b) -> bool {
     return validate_utf8(&b);
 }
 
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post ¬result
 fn expect_invalid(&[u8] b) -> bool {
     return validate_utf8(&b);
@@ -46,14 +46,14 @@ fn test_validate() {
 // each call. (Array literals live in test functions; wrappers borrow.)
 
 /// pre  b.len ≥ 1
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result = none
 fn expect_reject(&[u8] b) -> option<u32> {
     return decode_utf8(&b, 0);
 }
 
 /// pre  b.len ≥ 1
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result = some want
 fn expect_cp(&[u8] b, u32 want) -> option<u32> {
     return decode_utf8(&b, 0);

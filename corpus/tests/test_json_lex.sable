@@ -11,13 +11,13 @@
 
 use json_lex;
 
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result
 fn expect_lex_ok(&[u8] b) -> bool {
     return json_lex_ok(&b);
 }
 
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post ¬result
 fn expect_lex_bad(&[u8] b) -> bool {
     return json_lex_ok(&b);

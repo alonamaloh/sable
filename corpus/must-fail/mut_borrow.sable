@@ -1,0 +1,12 @@
+// expect-error: mut.borrow_immutable
+// A `&mut` borrow is mutation; the local must be `mut`.
+
+/// pre b.len ≥ 1
+fn bump(&mut [u8] b) {
+    b[0] = 1;
+}
+
+fn test_f() {
+    [u8] b = b"abc";
+    bump(&mut b);
+}

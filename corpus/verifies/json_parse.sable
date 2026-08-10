@@ -13,6 +13,10 @@
 //
 // Layer 2 (next): duplicate object keys via the verified hash map.
 
+// The array-length ceiling (2^62): every buffer contract is
+// stated against it.
+const u64 MAX_BYTES = 4611686018427387904;
+
 /// def isWs (c : int) : Prop := c = 32 ∨ c = 9 ∨ c = 10 ∨ c = 13
 
 /// def digitc (c : int) : Prop := 48 ≤ c ∧ c ≤ 57
@@ -259,13 +263,13 @@
 // ------------------------------------------------------- phase helpers
 
 /// pre  i ≤ b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post i ≤ result ∧ result ≤ b.len
 /// post ∀ k, i ≤ k → k < result → digitc (b.get k)
 /// post result < b.len → ¬digitc (b.get result)
 /// post i < b.len → digitc (b.get i) → i < result
 fn digit_run(&[u8] b, u64 i) -> u64 {
-    u64 j = i;
+    mut u64 j = i;
     u64 n = b.len;
     /// invariant i ≤ j ∧ j ≤ n
     /// invariant ∀ k, i ≤ k → k < j → digitc (b.get k)
@@ -300,11 +304,11 @@ fn hexd_ok(u8 c) -> bool {
 // malformed phase.
 
 /// pre  pos < b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ ((b.get pos = 45 ∧ jint b (pos + 1) result) ∨ (b.get pos ≠ 45 ∧ jint b pos result))
 fn jint_scan(&[u8] b, u64 pos) -> u64 {
     u64 n = b.len;
-    u64 i = pos;
+    mut u64 i = pos;
     if (b[i] == 45) {
         i = i + 1;
         if (i >= n) {
@@ -323,7 +327,7 @@ fn jint_scan(&[u8] b, u64 pos) -> u64 {
 }
 
 /// pre  i ≤ b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result ≠ 0 → i ≤ result ∧ result ≤ b.len ∧ jfrac b i result
 fn jfrac_scan(&[u8] b, u64 i) -> u64 {
     u64 n = b.len;
@@ -345,7 +349,7 @@ fn jfrac_scan(&[u8] b, u64 i) -> u64 {
 }
 
 /// pre  i ≤ b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result ≠ 0 → i ≤ result ∧ result ≤ b.len ∧ jexp b i result
 fn jexp_scan(&[u8] b, u64 i) -> u64 {
     u64 n = b.len;
@@ -380,7 +384,7 @@ fn jexp_scan(&[u8] b, u64 i) -> u64 {
 // --------------------------------------------------------- the lexemes
 
 /// pre  pos < b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ jnumber b pos result
 fn json_number_end(&[u8] b, u64 pos) -> u64 {
     u64 a1 = jint_scan(&b, pos);
@@ -399,12 +403,12 @@ fn json_number_end(&[u8] b, u64 pos) -> u64 {
 }
 
 /// pre  pos < b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// pre  b.get pos = 34
 /// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ jstring b pos result
 fn json_string_end(&[u8] b, u64 pos) -> u64 {
     u64 n = b.len;
-    u64 i = pos + 1;
+    mut u64 i = pos + 1;
     /// invariant pos < i ∧ i ≤ n
     /// invariant ∀ e2, strTail b i e2 → strTail b (pos + 1) e2
     /// variant   n - i
@@ -448,12 +452,12 @@ fn json_string_end(&[u8] b, u64 pos) -> u64 {
 
 
 /// pre  i ≤ b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post i ≤ result ∧ result ≤ b.len
 /// post wsTo b i result
 /// post result < b.len → ¬isWs (b.get result)
 fn ws_run(&[u8] b, u64 i) -> u64 {
-    u64 j = i;
+    mut u64 j = i;
     u64 n = b.len;
     /// invariant i ≤ j ∧ j ≤ n
     /// invariant ∀ k, i ≤ k → k < j → isWs (b.get k)
@@ -473,7 +477,7 @@ fn ws_run(&[u8] b, u64 i) -> u64 {
 // lemmas; every 0 return is a rejection (no completeness claim).
 
 /// pre  pos ≤ b.len
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result ≠ 0 → pos < result ∧ result ≤ b.len ∧ jgram b 0 pos result
 fn json_value_end(&[u8] b, u64 pos) -> u64
 /// variant b.len - pos
@@ -545,7 +549,7 @@ fn json_value_end(&[u8] b, u64 pos) -> u64
         if (e == 0) {
             return 0;
         }
-        u64 cur = e;
+        mut u64 cur = e;
         /// invariant pos < cur ∧ cur ≤ n
         /// invariant ∀ e2, jgram b 4 cur e2 → jgram b 1 (p + 1) e2
         /// variant   n - cur
@@ -598,7 +602,7 @@ fn json_value_end(&[u8] b, u64 pos) -> u64
         if (ea == 0) {
             return 0;
         }
-        u64 cura = ea;
+        mut u64 cura = ea;
         /// invariant pos < cura ∧ cura ≤ n
         /// invariant ∀ e2, jgram b 6 cura e2 → jgram b 2 (p + 1) e2
         /// variant   n - cura
@@ -627,7 +631,7 @@ fn json_value_end(&[u8] b, u64 pos) -> u64
 // The capstone: `true` is a kernel-checked proof that the buffer is one
 // JSON value surrounded by optional whitespace.
 
-/// pre  b.len ≤ 4611686018427387904
+/// pre  b.len ≤ MAX_BYTES
 /// post result → (∃ e, jgram b 0 0 e ∧ wsTo b e b.len)
 fn json_valid(&[u8] b) -> bool {
     u64 e = json_value_end(&b, 0);

@@ -72,7 +72,7 @@ fn div(u32 a, u32 b) -> u32 {\n\
 \n\
 /// post result >= 0\n\
 fn broken(bool c) -> i32 {\n\
-    i32 x;\n\
+    mut i32 x;\n\
     if (c) { x = 1; }\n\
     return x;\n\
 }\n";

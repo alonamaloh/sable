@@ -15,7 +15,7 @@
 fn partition(&mut [i32] a, u64 lo, u64 hi) -> u64 {
     u64 h = hi - 1;
     i32 pivot = a[h];
-    u64 i = lo;
+    mut u64 i = lo;
     /// invariant lo ≤ i ∧ i ≤ j
     /// invariant a.get h = pivot
     /// invariant ∀ k, lo ≤ k → k < i → a.get k < pivot

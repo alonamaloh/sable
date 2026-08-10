@@ -1,0 +1,16 @@
+// Dynamic checks over const declarations: an imported module's
+// constants substitute in the importer, in program text and contracts.
+
+use const_decls;
+
+/// pre x = y
+fn expect_eq(i32 x, i32 y) {
+}
+
+fn test_consts() {
+    u64 r = below_capacity(CAPACITY);
+    if (r != 101) {
+        expect_eq(1, 2);
+    }
+    expect_eq(sentinel(), SENTINEL);
+}
