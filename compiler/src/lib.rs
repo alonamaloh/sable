@@ -16,6 +16,7 @@ pub mod parser;
 pub mod scan;
 pub mod span;
 pub mod speceval;
+pub mod svm;
 pub mod vcgen;
 
 use diag::Diagnostic;
@@ -97,18 +98,13 @@ impl Default for Options {
     }
 }
 
-/// Run the front end and the dynamic test interpreter (`sable test`).
-/// Never invokes Lean; contracts are checked dynamically (design §9).
-pub fn test_file(path: &Path, opts: &Options) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
-    let display_path = path.display().to_string();
-    let source = std::fs::read_to_string(path).map_err(|err| {
-        vec![Failure {
-            name: "io.read".into(),
-            rendered: format!("error: cannot read `{display_path}`: {err}\n"),
-        }]
-    })?;
-    let lines = LineMap::new(&source);
-    let _ = (&display_path, &source, &lines);
+/// Lean-free front end over a file and its imports: load, expand
+/// consts and generics, and typecheck, returning the typed program —
+/// the shared entry for `sable test` and the SVM differential harness.
+pub fn load_checked(
+    path: &Path,
+    opts: &Options,
+) -> Result<(ast::Program, modules::ModuleSet), Vec<Failure>> {
     let (mut program, mods) = modules::load(path, &opts.module_paths).map_err(|(d, partial)| {
         vec![Failure {
             name: d.name.clone(),
@@ -122,6 +118,13 @@ pub fn test_file(path: &Path, opts: &Options) -> Result<Vec<interp::TestReport>,
     consts::apply(&mut program).map_err(|d| vec![render(&d)])?;
     mono::monomorphize(&mut program).map_err(|d| vec![render(&d)])?;
     check::check(&mut program).map_err(|d| vec![render(&d)])?;
+    Ok((program, mods))
+}
+
+/// Run the front end and the dynamic test interpreter (`sable test`).
+/// Never invokes Lean; contracts are checked dynamically (design §9).
+pub fn test_file(path: &Path, opts: &Options) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
+    let (program, mods) = load_checked(path, opts)?;
     Ok(interp::run_tests(&program, &mods))
 }
 

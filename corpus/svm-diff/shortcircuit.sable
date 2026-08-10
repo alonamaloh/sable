@@ -1,0 +1,36 @@
+// SVM differential subjects: `&&` / `||` short-circuit normatively
+// (ADR 0005) — the guarded-RHS idiom must not evaluate the guard's
+// right operand, and an un-guarded right operand's trap must fire.
+
+fn guard_and() -> bool {
+    [i32] a = alloc_array<i32>(3, 7);
+    u64 i = 5;
+    return i < a.len && a[i] > 0;
+}
+
+fn guard_or() -> i32 {
+    i32 z = 0;
+    if (z == 0 || 1 / z == 1) {
+        return 1;
+    }
+    return 2;
+}
+
+fn and_rhs_runs() -> bool {
+    [i32] a = alloc_array<i32>(3, 7);
+    u64 i = 2;
+    return i < a.len && a[i] > 5;
+}
+
+fn and_lhs_trap() -> bool {
+    i32 z = 0;
+    bool t = true;
+    return 1 / z == 1 && t;
+}
+
+fn or_rhs_trap() -> bool {
+    [i32] a = alloc_array<i32>(2, 0);
+    u64 i = 9;
+    bool f = false;
+    return f || a[i] == 0;
+}

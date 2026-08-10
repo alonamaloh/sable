@@ -1,0 +1,11 @@
+// SVM differential subjects: option construction in return position
+// (the machine's options carry integer payloads).
+
+fn opt_some() -> option<u64> {
+    u64 x = 7;
+    return some(x * x);
+}
+
+fn opt_none() -> option<i32> {
+    return none;
+}

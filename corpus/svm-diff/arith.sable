@@ -1,0 +1,86 @@
+// SVM differential subjects: checked arithmetic, Euclidean division,
+// and conversions. Every zero-argument function here runs on both
+// trusted executables — the interpreter and the Lean SVM evaluator
+// (compiler/tests/svm_diff.rs) — and the outcomes must agree exactly.
+// Traps are expected outcomes, not failures.
+
+fn arith_ok() -> i64 {
+    i64 a = 40;
+    i64 b = 2;
+    return a * b + a / b - a % 7;
+}
+
+fn add_overflow() -> u8 {
+    u8 a = 255;
+    u8 b = 1;
+    return a + b;
+}
+
+fn sub_underflow() -> u32 {
+    u32 a = 3;
+    u32 b = 5;
+    return a - b;
+}
+
+fn mul_overflow() -> i16 {
+    i16 a = 200;
+    return a * a;
+}
+
+fn neg_overflow() -> i8 {
+    i8 m = 0 - 127 - 1;
+    return -m;
+}
+
+fn div_by_zero() -> i32 {
+    i32 z = 0;
+    return 7 / z;
+}
+
+fn div_min_overflow() -> i32 {
+    i32 m = 0 - 2147483647 - 1;
+    i32 neg1 = 0 - 1;
+    return m / neg1;
+}
+
+fn mod_min_ok() -> i32 {
+    i32 m = 0 - 2147483647 - 1;
+    i32 neg1 = 0 - 1;
+    return m % neg1;
+}
+
+fn div_euclidean() -> i32 {
+    i32 a = 0 - 7;
+    return a / 2;
+}
+
+fn mod_euclidean() -> i32 {
+    i32 a = 0 - 7;
+    return a % 2;
+}
+
+fn cmp_chain() -> bool {
+    i32 a = 3;
+    i32 b = 5;
+    return a < b && b <= 5 && a != b && !(a == b) && b > a && a >= 3;
+}
+
+fn widen_sum() -> u64 {
+    u8 small = 250;
+    return widen<u64>(small) + 6;
+}
+
+fn narrow_ok() -> u8 {
+    u64 big = 200;
+    return narrow<u8>(big);
+}
+
+fn narrow_trap() -> u8 {
+    u64 big = 300;
+    return narrow<u8>(big);
+}
+
+fn narrow_signed_trap() -> u8 {
+    i32 neg = 0 - 5;
+    return narrow<u8>(neg);
+}

@@ -76,6 +76,28 @@ pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<Tes
         .collect()
 }
 
+/// Run one zero-argument function, returning its value or the raw trap
+/// message (no source location) — the interpreter side of the SVM
+/// differential harness.
+pub fn run_fn(
+    program: &Program,
+    mods: &crate::modules::ModuleSet,
+    name: &str,
+) -> Result<RtVal, String> {
+    let ghosts = GhostDefs::from_items(&program.ghosts);
+    let fns: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
+    let f = fns[name];
+    let mut interp = Interp {
+        fns: &fns,
+        classes: &program.classes,
+        ghosts: &ghosts,
+        source: mods.combined_source.as_str(),
+        fuel: FUEL,
+        skipped: Vec::new(),
+    };
+    interp.call(f, Vec::new()).map_err(|trap| trap.message)
+}
+
 enum Flow {
     Normal,
     Return(RtVal),

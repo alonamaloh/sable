@@ -1,0 +1,51 @@
+// SVM differential subjects: allocation, loads, stores, and the
+// normative evaluation-order decisions (ADR 0005) — for a store the
+// index is evaluated, then the value, then the bounds check, so the
+// value's trap beats the OOB trap and the index's trap beats both.
+
+fn read_write() -> i32 {
+    mut [i32] a = alloc_array<i32>(4, 7);
+    a[2] = 41;
+    a[0] = a[2] + 1;
+    return a[0] - a[3];
+}
+
+fn len_of() -> u64 {
+    [u8] a = alloc_array<u8>(9, 0);
+    return a.len;
+}
+
+fn oob_load_beats_div() -> i32 {
+    [i32] a = alloc_array<i32>(3, 1);
+    i32 z = 0;
+    u64 i = 10;
+    return a[i] + 1 / z;
+}
+
+fn oob_store() -> i32 {
+    mut [i32] a = alloc_array<i32>(3, 1);
+    u64 i = 10;
+    a[i] = 5;
+    return 0;
+}
+
+fn store_value_trap_beats_oob() -> i32 {
+    mut [i32] a = alloc_array<i32>(3, 1);
+    i32 z = 0;
+    u64 i = 10;
+    a[i] = 1 / z;
+    return 0;
+}
+
+fn store_index_trap_beats_value_trap() -> i32 {
+    mut [i32] a = alloc_array<i32>(3, 1);
+    i32 z = 0;
+    u64 big = 18446744073709551615;
+    a[big + 1573] = 1 / z;
+    return 0;
+}
+
+fn alloc_oom() -> i32 {
+    [i32] a = alloc_array<i32>(50000001, 0);
+    return a[0];
+}

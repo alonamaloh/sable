@@ -1,0 +1,60 @@
+// SVM differential subjects: while loops (the machine unfolds them,
+// annotations erased), early return out of a loop, a trap surfacing
+// mid-loop, branching, and the fall-off-the-end unit return.
+
+fn sum_to_100() -> i64 {
+    mut i64 s = 0;
+    mut i64 i = 0;
+    /// variant 100 - i
+    while (i < 100) {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+
+fn fill_then_scan() -> u64 {
+    mut [i32] a = alloc_array<i32>(10, 0);
+    mut u64 j = 0;
+    /// variant 10 - j
+    while (j < 10) {
+        a[j] = narrow<i32>(j * 5);
+        j = j + 1;
+    }
+    mut u64 k = 0;
+    /// variant 10 - k
+    while (k < 10) {
+        if (a[k] > 30) {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 999;
+}
+
+fn loop_overflow() -> u16 {
+    mut u16 x = 3;
+    mut i64 n = 0;
+    /// variant 50 - n
+    while (n < 50) {
+        x = x * 2;
+        n = n + 1;
+    }
+    return x;
+}
+
+fn classify() -> i32 {
+    i64 v = 17;
+    if (v < 10) {
+        return 1;
+    } else if (v < 20) {
+        return 2;
+    } else {
+        return 3;
+    }
+}
+
+fn procedure_falls_off() {
+    mut i64 x = 1;
+    x = x + 41;
+}
