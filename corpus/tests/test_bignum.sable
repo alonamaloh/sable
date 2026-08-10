@@ -1,0 +1,198 @@
+// Dynamic checks for the bignum layer: the natVal contracts of
+// cmp/add/sub monitored per call, loop invariants (weighted carry and
+// borrow sums over pw) checked per iteration, and the normalization
+// invariant at init exits and RAII drops. Limb counts stay small so the
+// monitor's exact evaluation of pw/valIn never leaves i128.
+
+
+/// def pw (n : int) : int := if 0 < n then 4294967296 * pw (n - 1) else 1
+/// termination_by n.toNat
+/// decreasing_by omega
+
+/// def valIn (a : Sable.Seq Int) (i n : int) : int := if i < n then a.get i + 4294967296 * valIn a (i + 1) n else 0
+/// termination_by (n - i).toNat
+/// decreasing_by omega
+
+/// def natVal (a : Sable.Seq Int) : int := valIn a 0 a.len
+
+class Nat {
+    [u32] limbs;
+
+    /// invariant limbs.len = 0 ∨ limbs.get (limbs.len - 1) ≥ 1
+
+    /// pre  n ≤ xs.len
+    /// pre  n = 0 ∨ xs.get (n - 1) ≥ 1
+    /// post #[label(len)]   self.limbs.len = n
+    /// post #[label(value)] natVal self.limbs = valIn xs 0 n
+    init from_prefix(&[u32] xs, u64 n) {
+        self.limbs = alloc_array<u32>(n, 0);
+        /// invariant ∀ k, 0 ≤ k → k < i → self.limbs.get k = xs.get k
+        for (u64 i : range(n)) {
+            self.limbs[i] = xs[i];
+        }
+    }
+
+    deinit {
+    }
+}
+
+// Limb selector: reading past the top yields 0, so mixed-length loops
+// have no path split in their bodies.
+/// post #[label(sel)] result = (if i < x.limbs.len then x.limbs.get i else 0)
+fn limb_or0(&Nat x, u64 i) -> u32 {
+    if (i < x.limbs.len) {
+        return x.limbs[i];
+    }
+    return 0;
+}
+
+/// post #[label(pick)] result = (if x < y then y else x)
+fn max_len(u64 x, u64 y) -> u64 {
+    if (x < y) {
+        return y;
+    }
+    return x;
+}
+
+// Normalization: the length after dropping leading zero limbs. The value
+// is unchanged, and what remains has a nonzero top limb.
+/// post #[label(le)]    result ≤ xs.len
+/// post #[label(top)]   result = 0 ∨ xs.get (result - 1) ≥ 1
+/// post #[label(value)] valIn xs 0 result = valIn xs 0 xs.len
+fn trim_len(&[u32] xs) -> u64 {
+    u64 rl = xs.len;
+    /// invariant rl ≤ xs.len
+    /// invariant valIn xs 0 rl = valIn xs 0 xs.len
+    /// variant   rl
+    while (rl > 0 && xs[rl - 1] == 0) {
+        rl = rl - 1;
+    }
+    return rl;
+}
+
+/// post #[label(lt)] result = -1 ↔ natVal a.limbs < natVal b.limbs
+/// post #[label(eq)] result = 0 ↔ natVal a.limbs = natVal b.limbs
+/// post #[label(gt)] result = 1 ↔ natVal b.limbs < natVal a.limbs
+fn cmp(&Nat a, &Nat b) -> i32 {
+    if (a.limbs.len < b.limbs.len) {
+        return -1;
+    }
+    if (b.limbs.len < a.limbs.len) {
+        return 1;
+    }
+    u64 i = a.limbs.len;
+    /// invariant i ≤ a.limbs.len
+    /// invariant ∀ k, i ≤ k → k < a.limbs.len → a.limbs.get k = b.limbs.get k
+    /// variant   i
+    while (i > 0) {
+        i = i - 1;
+        if (a.limbs[i] < b.limbs[i]) {
+            return -1;
+        }
+        if (b.limbs[i] < a.limbs[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/// pre  a.limbs.len + b.limbs.len ≤ 4611686018427387904
+/// post #[label(sum)] natVal result.limbs = natVal a.limbs + natVal b.limbs
+fn add(&Nat a, &Nat b) -> Nat {
+    u64 la = a.limbs.len;
+    u64 lb = b.limbs.len;
+    u64 n = max_len(la, lb) + 1;
+    [u32] out = alloc_array<u32>(n, 0);
+    u64 carry = 0;
+    /// invariant carry ≤ 1
+    /// invariant valIn out 0 i + carry * pw i = valIn a.limbs 0 (if i ≤ la then i else la) + valIn b.limbs 0 (if i ≤ lb then i else lb)
+    for (u64 i : range(n)) {
+        u64 x = widen<u64>(limb_or0(&a, i));
+        u64 y = widen<u64>(limb_or0(&b, i));
+        u64 s = carry + x + y;
+        out[i] = narrow<u32>(s % 4294967296);
+        carry = s / 4294967296;
+    }
+    u64 rl = trim_len(&out);
+    var r = Nat::from_prefix(&out, rl);
+    return r;
+}
+
+/// pre  natVal b.limbs ≤ natVal a.limbs
+/// post #[label(diff)] natVal result.limbs = natVal a.limbs - natVal b.limbs
+fn sub(&Nat a, &Nat b) -> Nat {
+    u64 la = a.limbs.len;
+    [u32] out = alloc_array<u32>(la, 0);
+    u64 borrow = 0;
+    /// invariant borrow ≤ 1
+    /// invariant valIn out 0 i - borrow * pw i = valIn a.limbs 0 i - valIn b.limbs 0 (if i ≤ b.limbs.len then i else b.limbs.len)
+    for (u64 i : range(la)) {
+        u64 y = widen<u64>(limb_or0(&b, i));
+        u64 s = widen<u64>(a.limbs[i]) + 4294967296 - y - borrow;
+        out[i] = narrow<u32>(s % 4294967296);
+        borrow = 1 - s / 4294967296;
+    }
+    u64 rl = trim_len(&out);
+    var r = Nat::from_prefix(&out, rl);
+    return r;
+}
+
+// Monitored assertion: the pre is the check.
+/// pre x = y
+fn expect_eq(i32 x, i32 y) {
+}
+
+fn test_cmp_orderings() {
+    [u32] xs = [ 7, 9 ];
+    var a = Nat::from_prefix(&xs, 2);
+    [u32] ys = [ 5 ];
+    var b = Nat::from_prefix(&ys, 1);
+    expect_eq(cmp(&b, &a), -1);
+    expect_eq(cmp(&a, &b), 1);
+    [u32] zs = [ 8, 9 ];
+    var c = Nat::from_prefix(&zs, 2);
+    expect_eq(cmp(&a, &c), -1);
+    expect_eq(cmp(&c, &a), 1);
+    expect_eq(cmp(&a, &a), 0);
+}
+
+fn test_add_carry_chain() {
+    [u32] xs = [ 4294967295, 4294967295 ];
+    var a = Nat::from_prefix(&xs, 2);
+    [u32] ys = [ 1 ];
+    var b = Nat::from_prefix(&ys, 1);
+    var c = add(&a, &b);
+    [u32] es = [ 0, 0, 1 ];
+    var e = Nat::from_prefix(&es, 3);
+    expect_eq(cmp(&c, &e), 0);
+}
+
+fn test_add_zero() {
+    [u32] xs = [ 123456789, 42 ];
+    var a = Nat::from_prefix(&xs, 2);
+    [u32] ys = [ 1 ];
+    var z = Nat::from_prefix(&ys, 0);
+    var c = add(&a, &z);
+    expect_eq(cmp(&c, &a), 0);
+}
+
+fn test_sub_roundtrip() {
+    [u32] xs = [ 4294967295, 4294967295 ];
+    var a = Nat::from_prefix(&xs, 2);
+    [u32] ys = [ 4294967290, 1 ];
+    var b = Nat::from_prefix(&ys, 2);
+    var c = add(&a, &b);
+    var d = sub(&c, &b);
+    expect_eq(cmp(&d, &a), 0);
+}
+
+fn test_sub_to_zero() {
+    [u32] xs = [ 17, 3 ];
+    var a = Nat::from_prefix(&xs, 2);
+    var d = sub(&a, &a);
+    [u32] ys = [ 1 ];
+    var z = Nat::from_prefix(&ys, 0);
+    expect_eq(cmp(&d, &z), 0);
+    var s = add(&d, &a);
+    expect_eq(cmp(&s, &a), 0);
+}

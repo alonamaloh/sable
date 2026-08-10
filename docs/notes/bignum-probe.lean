@@ -614,4 +614,28 @@ theorem mul_fits (a b : Sable.Seq Int) (la lb : Int)
     omega
   omega
 
+/-- An all-zero range denotes zero: the freshly allocated accumulator. -/
+theorem valIn_zeros (a : Sable.Seq Int) (i n : Int)
+    (hz : ∀ k, i ≤ k → k < n → a.get k = 0) : valIn a i n = 0 := by
+  revert hz
+  fun_induction valIn a i n with
+  | case1 i h ih =>
+      intro hz
+      have h1 := ih (fun k hk1 hk2 => hz k (by omega) hk2)
+      have h2 := hz i (by omega) h
+      omega
+  | case2 i h =>
+      intro _
+      omega
+
+/-- The u64 headroom of a limb product: schoolbook mul's operation VCs. -/
+theorem mul_bound (x y : Int)
+    (hx : 0 ≤ x ∧ x ≤ 4294967295) (hy : 0 ≤ y ∧ y ≤ 4294967295) :
+    0 ≤ x * y ∧ x * y ≤ 18446744065119617025 := by
+  constructor
+  · exact Int.mul_nonneg hx.1 hy.1
+  · calc x * y ≤ x * 4294967295 := Int.mul_le_mul_of_nonneg_left hy.2 hx.1
+      _ ≤ 4294967295 * 4294967295 := Int.mul_le_mul_of_nonneg_right hx.2 (by omega)
+      _ = 18446744065119617025 := by decide
+
 end BignumProbe

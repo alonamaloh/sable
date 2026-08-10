@@ -1582,8 +1582,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
         },
         ExprKind::Borrow { array, mutable } => {
-            // `&c` of a class local — a shared class borrow (ADR 0010).
-            if let Some(Ty::Class(ci)) = ctx.vars.get(array.as_str()).map(|v| v.ty) {
+            // `&c` of a class local, or a shared re-borrow of a `&C`
+            // parameter passed along to a callee (ADR 0010).
+            if let Some(Ty::Class(ci) | Ty::ClassRef(ci)) =
+                ctx.vars.get(array.as_str()).map(|v| v.ty)
+            {
                 if *mutable {
                     return Err(Diagnostic {
                         name: "class.mut_borrow_deferred".into(),

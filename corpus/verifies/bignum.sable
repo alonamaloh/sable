@@ -1,0 +1,900 @@
+// The bignum pillar: Nat over [u32] limbs, little-endian, with
+// the normalization invariant (no leading zero limb) making equal values
+// have equal representations. The entire specification is one abstraction
+// function — natVal, defined by recursion over the limbs — and one line
+// per operation: cmp decides the natVal order, add's post is
+// `natVal result.limbs = natVal a.limbs + natVal b.limbs`, sub's the
+// difference under a natVal precondition. Base 2^32 keeps every program
+// value inside u64 exactly. Probe-first: docs/notes/bignum-probe.lean.
+
+/// def pw (n : int) : int := if 0 < n then 4294967296 * pw (n - 1) else 1
+/// termination_by n.toNat
+/// decreasing_by omega
+
+/// def valIn (a : Sable.Seq Int) (i n : int) : int := if i < n then a.get i + 4294967296 * valIn a (i + 1) n else 0
+/// termination_by (n - i).toNat
+/// decreasing_by omega
+
+/// def natVal (a : Sable.Seq Int) : int := valIn a 0 a.len
+
+// ---- the lemma library (validated in docs/notes/bignum-probe.lean) ----
+
+/// theorem pw_nonpos (n : int) (h : n ≤ 0) : pw n = 1 := by
+///   rw [pw, if_neg (by omega)]
+
+/// theorem pw_pos (n : int) : 0 < pw n := by
+///   fun_induction pw n with
+///   | case1 n h ih => omega
+///   | case2 n h => omega
+
+/// theorem pw_succ (n : int) (h : 0 ≤ n) : pw (n + 1) = 4294967296 * pw n := by
+///   rw [pw, if_pos (by omega)]
+///   have e : n + 1 - 1 = n := by omega
+///   rw [e]
+
+/// theorem pw_add (m n : int) (hm : 0 ≤ m) (hn : 0 ≤ n) :
+///     pw (m + n) = pw m * pw n := by
+///   revert hm
+///   fun_induction pw m with
+///   | case1 m h ih =>
+///       intro hm
+///       have h1 : pw (m + n) = 4294967296 * pw (m - 1 + n) := by
+///         rw [pw, if_pos (by omega)]
+///         have e : m + n - 1 = m - 1 + n := by omega
+///         rw [e]
+///       rw [h1, ih (by omega)]
+///       exact (Int.mul_assoc _ _ _).symm
+///   | case2 m h =>
+///       intro hm
+///       have e : m = 0 := by omega
+///       subst e
+///       rw [Int.zero_add, Int.one_mul]
+
+/// theorem pw_mono (m n : int) (h : m ≤ n) : pw m ≤ pw n := by
+///   revert h
+///   fun_induction pw n with
+///   | case1 n hn ih =>
+///       intro h
+///       by_cases hmn : m = n
+///       · rw [hmn, pw, if_pos hn]
+///         omega
+///       · have h1 := ih (by omega)
+///         have h2 := pw_pos (n - 1)
+///         omega
+///   | case2 n hn =>
+///       intro h
+///       rw [pw_nonpos m (by omega)]
+///       omega
+
+/// theorem valIn_nil (a : Sable.Seq Int) (i n : int) (h : n ≤ i) :
+///     valIn a i n = 0 := by
+///   rw [valIn, if_neg (by omega)]
+
+/// theorem valIn_nonneg (a : Sable.Seq Int) (i n : int)
+///     (hb : ∀ k, i ≤ k → k < n → 0 ≤ a.get k) : 0 ≤ valIn a i n := by
+///   revert hb
+///   fun_induction valIn a i n with
+///   | case1 i h ih =>
+///       intro hb
+///       have h1 := ih (fun k hk1 hk2 => hb k (by omega) hk2)
+///       have h2 := hb i (by omega) h
+///       omega
+///   | case2 i h =>
+///       intro _
+///       omega
+
+/// theorem valIn_lt_pw (a : Sable.Seq Int) (i n : int)
+///     (hb : ∀ k, i ≤ k → k < n → 0 ≤ a.get k ∧ a.get k ≤ 4294967295) :
+///     valIn a i n < pw (n - i) := by
+///   revert hb
+///   fun_induction valIn a i n with
+///   | case1 i h ih =>
+///       intro hb
+///       have h1 := ih (fun k hk1 hk2 => hb k (by omega) hk2)
+///       have h2 := hb i (by omega) h
+///       have h3 : pw (n - i) = 4294967296 * pw (n - (i + 1)) := by
+///         rw [pw, if_pos (by omega)]
+///         have e : n - i - 1 = n - (i + 1) := by omega
+///         rw [e]
+///       rw [h3]
+///       omega
+///   | case2 i h =>
+///       intro _
+///       exact pw_pos _
+
+/// theorem valIn_ge_pw (a : Sable.Seq Int) (i n : int)
+///     (hb : ∀ k, i ≤ k → k < n → 0 ≤ a.get k)
+///     (htop : 1 ≤ a.get (n - 1)) (hin : i < n) :
+///     pw (n - 1 - i) ≤ valIn a i n := by
+///   revert hb hin
+///   fun_induction valIn a i n with
+///   | case1 i h ih =>
+///       intro hb hin
+///       by_cases hlast : i = n - 1
+///       · have hz : valIn a (i + 1) n = 0 := by rw [valIn, if_neg (by omega)]
+///         have ht : 1 ≤ a.get i := by rw [hlast]; exact htop
+///         rw [hz, show n - 1 - i = 0 from by omega, pw_nonpos 0 (by omega)]
+///         omega
+///       · have h1 := ih (fun k hk1 hk2 => hb k (by omega) hk2) (by omega)
+///         have h2 := hb i (by omega) h
+///         have h3 : pw (n - 1 - i) = 4294967296 * pw (n - 1 - (i + 1)) := by
+///           rw [pw, if_pos (by omega)]
+///           have e : n - 1 - i - 1 = n - 1 - (i + 1) := by omega
+///           rw [e]
+///         rw [h3]
+///         omega
+///   | case2 i h =>
+///       intro _ hin
+///       omega
+
+/// theorem valIn_congr (a b : Sable.Seq Int) (i n : int)
+///     (h : ∀ k, i ≤ k → k < n → a.get k = b.get k) :
+///     valIn a i n = valIn b i n := by
+///   revert h
+///   fun_induction valIn a i n with
+///   | case1 i hc ih =>
+///       intro h
+///       have hab := h i (by omega) hc
+///       have ht := ih (fun k hk1 hk2 => h k (by omega) hk2)
+///       have hbu : valIn b i n = b.get i + 4294967296 * valIn b (i + 1) n := by
+///         rw [valIn, if_pos hc]
+///       rw [hbu]
+///       omega
+///   | case2 i hc =>
+///       intro _
+///       have hbu : valIn b i n = 0 := by rw [valIn, if_neg hc]
+///       rw [hbu]
+
+/// theorem valIn_snoc (a : Sable.Seq Int) (i n : int) (h : i ≤ n) :
+///     valIn a i (n + 1) = valIn a i n + a.get n * pw (n - i) := by
+///   revert h
+///   fun_induction valIn a i n with
+///   | case1 i hc ih =>
+///       intro h
+///       have h1 : valIn a i (n + 1)
+///           = a.get i + 4294967296 * valIn a (i + 1) (n + 1) := by
+///         rw [valIn, if_pos (by omega)]
+///       have h2 := ih (by omega)
+///       have h3 : pw (n - i) = 4294967296 * pw (n - (i + 1)) := by
+///         rw [pw, if_pos (by omega)]
+///         have e : n - i - 1 = n - (i + 1) := by omega
+///         rw [e]
+///       rw [h1, h2, h3]
+///       have e : a.get n * (4294967296 * pw (n - (i + 1)))
+///              = 4294967296 * (a.get n * pw (n - (i + 1))) :=
+///         Int.mul_left_comm _ _ _
+///       rw [e, Int.mul_add]
+///       omega
+///   | case2 i hc =>
+///       intro h
+///       have hin : i = n := by omega
+///       have h1 : valIn a i (n + 1)
+///           = a.get i + 4294967296 * valIn a (i + 1) (n + 1) := by
+///         rw [valIn, if_pos (by omega)]
+///       have h2 : valIn a (i + 1) (n + 1) = 0 := by
+///         rw [valIn, if_neg (by omega)]
+///       rw [h1, h2, ← hin, show i - i = 0 from by omega, pw_nonpos 0 (by omega)]
+///       omega
+
+/// theorem valIn_set (a : Sable.Seq Int) (i n p v : int)
+///     (hpn : p < n) (hip : i ≤ p) :
+///     valIn (a.set p v) i n = valIn a i n + (v - a.get p) * pw (p - i) := by
+///   revert hip
+///   fun_induction valIn a i n with
+///   | case1 i hc ih =>
+///       intro hip
+///       by_cases hpi : i = p
+///       · have h1 : valIn (a.set p v) i n
+///             = v + 4294967296 * valIn (a.set p v) (i + 1) n := by
+///           rw [valIn, if_pos hc, Sable.Seq.get_set, if_pos hpi]
+///         have h2 : valIn (a.set p v) (i + 1) n = valIn a (i + 1) n :=
+///           valIn_congr _ _ _ _ (fun k hk1 hk2 => by
+///             rw [Sable.Seq.get_set, if_neg (by omega)])
+///         rw [h1, h2, show p - i = 0 from by omega, pw_nonpos 0 (by omega),
+///             ← hpi]
+///         omega
+///       · have h1 : valIn (a.set p v) i n
+///             = a.get i + 4294967296 * valIn (a.set p v) (i + 1) n := by
+///           rw [valIn, if_pos hc, Sable.Seq.get_set, if_neg (by omega)]
+///         have h2 := ih (by omega)
+///         have h3 : pw (p - i) = 4294967296 * pw (p - (i + 1)) := by
+///           rw [pw, if_pos (by omega)]
+///           have e : p - i - 1 = p - (i + 1) := by omega
+///           rw [e]
+///         rw [h1, h2, h3]
+///         have e : (v - a.get p) * (4294967296 * pw (p - (i + 1)))
+///                = 4294967296 * ((v - a.get p) * pw (p - (i + 1))) :=
+///           Int.mul_left_comm _ _ _
+///         rw [e, Int.mul_add]
+///         omega
+///   | case2 i hc =>
+///       intro hip
+///       omega
+
+/// theorem valIn_lt_down (a b : Sable.Seq Int) (i j n : int)
+///     (hjn : j < n)
+///     (h : valIn a j n < valIn b j n)
+///     (hb1 : ∀ k, i ≤ k → k < j → 0 ≤ a.get k ∧ a.get k ≤ 4294967295)
+///     (hb2 : ∀ k, i ≤ k → k < j → 0 ≤ b.get k)
+///     (hij : i ≤ j) :
+///     valIn a i n < valIn b i n := by
+///   revert hb1 hb2 hij
+///   fun_induction valIn a i n with
+///   | case1 i hc ih =>
+///       intro hb1 hb2 hij
+///       by_cases hje : i = j
+///       · have hau : valIn a i n = a.get i + 4294967296 * valIn a (i + 1) n := by
+///           rw [valIn, if_pos hc]
+///         rw [← hau, hje]
+///         exact h
+///       · have step := ih (fun k hk1 hk2 => hb1 k (by omega) hk2)
+///                         (fun k hk1 hk2 => hb2 k (by omega) hk2) (by omega)
+///         have ha := hb1 i (by omega) (by omega)
+///         have hbi := hb2 i (by omega) (by omega)
+///         have hbu : valIn b i n = b.get i + 4294967296 * valIn b (i + 1) n := by
+///           rw [valIn, if_pos hc]
+///         rw [hbu]
+///         omega
+///   | case2 i hc =>
+///       intro _ _ hij
+///       omega
+
+/// theorem cmp_first_diff (a b : Sable.Seq Int) (j n : int)
+///     (hj : 0 ≤ j) (hjn : j < n)
+///     (heq : ∀ k, j < k → k < n → a.get k = b.get k)
+///     (hlt : a.get j < b.get j)
+///     (hb1 : ∀ k, 0 ≤ k → k < n → 0 ≤ a.get k ∧ a.get k ≤ 4294967295)
+///     (hb2 : ∀ k, 0 ≤ k → k < n → 0 ≤ b.get k) :
+///     valIn a 0 n < valIn b 0 n := by
+///   have htail : valIn a (j + 1) n = valIn b (j + 1) n :=
+///     valIn_congr _ _ _ _ (fun k hk1 hk2 => heq k (by omega) hk2)
+///   have hj' : valIn a j n < valIn b j n := by
+///     rw [valIn, if_pos hjn]
+///     have hbu : valIn b j n = b.get j + 4294967296 * valIn b (j + 1) n := by
+///       rw [valIn, if_pos hjn]
+///     rw [hbu, htail]
+///     omega
+///   exact valIn_lt_down a b 0 j n hjn hj'
+///     (fun k hk1 hk2 => hb1 k hk1 (by omega))
+///     (fun k hk1 hk2 => hb2 k hk1 (by omega)) hj
+
+/// theorem natVal_lt_of_len_lt (a b : Sable.Seq Int)
+///     (hlen : a.len < b.len) (halen : 0 ≤ a.len)
+///     (hb1 : ∀ k, 0 ≤ k → k < a.len → 0 ≤ a.get k ∧ a.get k ≤ 4294967295)
+///     (hb2 : ∀ k, 0 ≤ k → k < b.len → 0 ≤ b.get k)
+///     (htop : 1 ≤ b.get (b.len - 1)) :
+///     natVal a < natVal b := by
+///   have h1 := valIn_lt_pw a 0 a.len hb1
+///   have h2 := valIn_ge_pw b 0 b.len hb2 htop (by omega)
+///   have h3 : pw (a.len - 0) ≤ pw (b.len - 1 - 0) := pw_mono _ _ (by omega)
+///   simp only [natVal]
+///   omega
+
+/// theorem len_le_of_val_le (a b : Sable.Seq Int)
+///     (hle : natVal b ≤ natVal a) (halen : 0 ≤ a.len)
+///     (hb1 : ∀ k, 0 ≤ k → k < a.len → 0 ≤ a.get k ∧ a.get k ≤ 4294967295)
+///     (hb2 : ∀ k, 0 ≤ k → k < b.len → 0 ≤ b.get k)
+///     (htop : 0 < b.len → 1 ≤ b.get (b.len - 1)) :
+///     b.len ≤ a.len := by
+///   by_cases h : b.len ≤ a.len
+///   · exact h
+///   · have := natVal_lt_of_len_lt a b (by omega) halen hb1 hb2 (htop (by omega))
+///     omega
+
+/// theorem trim_top_zero (xs : Sable.Seq Int) (rl : int) (h0 : 0 < rl)
+///     (hz : xs.get (rl - 1) = 0) :
+///     valIn xs 0 rl = valIn xs 0 (rl - 1) := by
+///   have h := valIn_snoc xs 0 (rl - 1) (by omega)
+///   rw [show rl - 1 + 1 = rl from by omega] at h
+///   rw [h, hz]
+///   omega
+
+/// theorem prefix_val (s xs : Sable.Seq Int) (rl : int)
+///     (hlen : s.len = rl)
+///     (hcopy : ∀ k, 0 ≤ k → k < rl → s.get k = xs.get k) :
+///     natVal s = valIn xs 0 rl := by
+///   simp only [natVal, hlen]
+///   exact valIn_congr _ _ _ _ (fun k hk1 hk2 => hcopy k (by omega) hk2)
+
+/// theorem carry_split (s P : int) :
+///     s % 4294967296 * P + s / 4294967296 * (4294967296 * P) = s * P := by
+///   have h : s % 4294967296 + 4294967296 * (s / 4294967296) = s := by
+///     omega
+///   calc s % 4294967296 * P + s / 4294967296 * (4294967296 * P)
+///       = s % 4294967296 * P + s / 4294967296 * 4294967296 * P := by
+///         rw [Int.mul_assoc]
+///     _ = (s % 4294967296 + 4294967296 * (s / 4294967296)) * P := by
+///         rw [Int.add_mul, Int.mul_comm (s / 4294967296) 4294967296]
+///     _ = s * P := by rw [h]
+
+/// theorem add_step (out a b : Sable.Seq Int) (i la lb carry x y : int)
+///     (hi : 0 ≤ i)
+///     (hx : x = if i < la then a.get i else 0)
+///     (hy : y = if i < lb then b.get i else 0)
+///     (hinv : valIn out 0 i + carry * pw i
+///           = valIn a 0 (if i ≤ la then i else la)
+///           + valIn b 0 (if i ≤ lb then i else lb)) :
+///     valIn (out.set i ((carry + x + y) % 4294967296)) 0 (i + 1)
+///         + (carry + x + y) / 4294967296 * pw (i + 1)
+///       = valIn a 0 (if i + 1 ≤ la then i + 1 else la)
+///       + valIn b 0 (if i + 1 ≤ lb then i + 1 else lb) := by
+///   have h1 : valIn (out.set i ((carry + x + y) % 4294967296)) 0 (i + 1)
+///       = valIn out 0 i + (carry + x + y) % 4294967296 * pw i := by
+///     have hsn := valIn_snoc (out.set i ((carry + x + y) % 4294967296)) 0 i (by omega)
+///     have hgi : (out.set i ((carry + x + y) % 4294967296)).get i
+///         = (carry + x + y) % 4294967296 := by
+///       rw [Sable.Seq.get_set, if_pos rfl]
+///     have hcg : valIn (out.set i ((carry + x + y) % 4294967296)) 0 i
+///         = valIn out 0 i :=
+///       valIn_congr _ _ _ _ (fun k hk1 hk2 => by
+///         rw [Sable.Seq.get_set, if_neg (by omega)])
+///     rw [hsn, hgi, hcg, show i - 0 = i from by omega]
+///   have hp1 : pw (i + 1) = 4294967296 * pw i := pw_succ i hi
+///   have hkey : valIn (out.set i ((carry + x + y) % 4294967296)) 0 (i + 1)
+///       + (carry + x + y) / 4294967296 * pw (i + 1)
+///       = valIn out 0 i + (carry + x + y) * pw i := by
+///     rw [h1, hp1, Int.add_assoc, carry_split]
+///   rw [hkey, hx, hy, Int.add_mul, Int.add_mul]
+///   by_cases hia : i < la
+///   · have hsa : valIn a 0 (i + 1) = valIn a 0 i + a.get i * pw i := by
+///       have h := valIn_snoc a 0 i (by omega)
+///       rw [show i - 0 = i from by omega] at h
+///       exact h
+///     by_cases hib : i < lb
+///     · have hsb : valIn b 0 (i + 1) = valIn b 0 i + b.get i * pw i := by
+///         have h := valIn_snoc b 0 i (by omega)
+///         rw [show i - 0 = i from by omega] at h
+///         exact h
+///       rw [if_pos hia, if_pos hib,
+///           if_pos (show i + 1 ≤ la from by omega),
+///           if_pos (show i + 1 ≤ lb from by omega), hsa, hsb]
+///       rw [if_pos (show i ≤ la from by omega),
+///           if_pos (show i ≤ lb from by omega)] at hinv
+///       omega
+///     · have hsb : (if i + 1 ≤ lb then i + 1 else lb) = lb := by
+///         split <;> omega
+///       have hsb2 : (if i ≤ lb then i else lb) = lb := by
+///         split <;> omega
+///       rw [if_pos hia, if_neg hib,
+///           if_pos (show i + 1 ≤ la from by omega), hsb, hsa]
+///       rw [if_pos (show i ≤ la from by omega), hsb2] at hinv
+///       omega
+///   · have hsa : (if i + 1 ≤ la then i + 1 else la) = la := by
+///       split <;> omega
+///     have hsa2 : (if i ≤ la then i else la) = la := by
+///       split <;> omega
+///     by_cases hib : i < lb
+///     · have hsb : valIn b 0 (i + 1) = valIn b 0 i + b.get i * pw i := by
+///         have h := valIn_snoc b 0 i (by omega)
+///         rw [show i - 0 = i from by omega] at h
+///         exact h
+///       rw [if_neg hia, if_pos hib, hsa,
+///           if_pos (show i + 1 ≤ lb from by omega), hsb]
+///       rw [hsa2, if_pos (show i ≤ lb from by omega)] at hinv
+///       omega
+///     · have hsb : (if i + 1 ≤ lb then i + 1 else lb) = lb := by
+///         split <;> omega
+///       have hsb2 : (if i ≤ lb then i else lb) = lb := by
+///         split <;> omega
+///       rw [if_neg hia, if_neg hib, hsa, hsb]
+///       rw [hsa2, hsb2] at hinv
+///       omega
+
+/// theorem add_carry_zero (out a b : Sable.Seq Int) (n la lb carry : int)
+///     (hla : 0 ≤ la) (hlb : 0 ≤ lb)
+///     (hn : la < n ∧ lb < n)
+///     (hcb : 0 ≤ carry ∧ carry ≤ 1)
+///     (hbo : ∀ k, 0 ≤ k → k < n → 0 ≤ out.get k)
+///     (hba : ∀ k, 0 ≤ k → k < la → 0 ≤ a.get k ∧ a.get k ≤ 4294967295)
+///     (hbb : ∀ k, 0 ≤ k → k < lb → 0 ≤ b.get k ∧ b.get k ≤ 4294967295)
+///     (hinv : valIn out 0 n + carry * pw n = valIn a 0 la + valIn b 0 lb) :
+///     carry = 0 := by
+///   have h1 := valIn_lt_pw a 0 la hba
+///   have h2 := valIn_lt_pw b 0 lb hbb
+///   have h3 := valIn_nonneg out 0 n hbo
+///   have h4 : pw (la - 0) ≤ pw (n - 1) := pw_mono _ _ (by omega)
+///   have h5 : pw (lb - 0) ≤ pw (n - 1) := pw_mono _ _ (by omega)
+///   have h6 : pw n = 4294967296 * pw (n - 1) := by
+///     rw [pw, if_pos (by omega)]
+///   rcases (show carry = 0 ∨ carry = 1 from by omega) with h | h
+///   · exact h
+///   · exfalso
+///     rw [h, Int.one_mul, h6] at hinv
+///     have := pw_pos (n - 1)
+///     omega
+
+/// theorem sub_step (out a b : Sable.Seq Int) (i lb borrow y : int)
+///     (hi : 0 ≤ i)
+///     (hy : y = if i < lb then b.get i else 0)
+///     (hinv : valIn out 0 i - borrow * pw i
+///           = valIn a 0 i - valIn b 0 (if i ≤ lb then i else lb)) :
+///     valIn (out.set i ((a.get i + 4294967296 - y - borrow) % 4294967296)) 0 (i + 1)
+///         - (1 - (a.get i + 4294967296 - y - borrow) / 4294967296) * pw (i + 1)
+///       = valIn a 0 (i + 1)
+///       - valIn b 0 (if i + 1 ≤ lb then i + 1 else lb) := by
+///   have h1 : valIn (out.set i ((a.get i + 4294967296 - y - borrow) % 4294967296)) 0 (i + 1)
+///       = valIn out 0 i + (a.get i + 4294967296 - y - borrow) % 4294967296 * pw i := by
+///     have hsn := valIn_snoc (out.set i ((a.get i + 4294967296 - y - borrow) % 4294967296)) 0 i (by omega)
+///     have hgi : (out.set i ((a.get i + 4294967296 - y - borrow) % 4294967296)).get i
+///         = (a.get i + 4294967296 - y - borrow) % 4294967296 := by
+///       rw [Sable.Seq.get_set, if_pos rfl]
+///     have hcg : valIn (out.set i ((a.get i + 4294967296 - y - borrow) % 4294967296)) 0 i
+///         = valIn out 0 i :=
+///       valIn_congr _ _ _ _ (fun k hk1 hk2 => by
+///         rw [Sable.Seq.get_set, if_neg (by omega)])
+///     rw [hsn, hgi, hcg, show i - 0 = i from by omega]
+///   have hp1 : pw (i + 1) = 4294967296 * pw i := pw_succ i hi
+///   have hkey : valIn (out.set i ((a.get i + 4294967296 - y - borrow) % 4294967296)) 0 (i + 1)
+///       - (1 - (a.get i + 4294967296 - y - borrow) / 4294967296) * pw (i + 1)
+///       = valIn out 0 i + (a.get i + 4294967296 - y - borrow) * pw i - pw (i + 1) := by
+///     have hc := carry_split (a.get i + 4294967296 - y - borrow) (pw i)
+///     rw [h1, hp1, Int.sub_mul, Int.one_mul]
+///     omega
+///   have hsa : valIn a 0 (i + 1) = valIn a 0 i + a.get i * pw i := by
+///     have h := valIn_snoc a 0 i (by omega)
+///     rw [show i - 0 = i from by omega] at h
+///     exact h
+///   rw [hkey, hy, hsa, hp1, Int.sub_mul, Int.sub_mul, Int.add_mul]
+///   by_cases hib : i < lb
+///   · have hsb : valIn b 0 (i + 1) = valIn b 0 i + b.get i * pw i := by
+///       have h := valIn_snoc b 0 i (by omega)
+///       rw [show i - 0 = i from by omega] at h
+///       exact h
+///     rw [if_pos hib, if_pos (show i + 1 ≤ lb from by omega), hsb]
+///     rw [if_pos (show i ≤ lb from by omega)] at hinv
+///     omega
+///   · have hsb : (if i + 1 ≤ lb then i + 1 else lb) = lb := by
+///       split <;> omega
+///     have hsb2 : (if i ≤ lb then i else lb) = lb := by
+///       split <;> omega
+///     rw [if_neg hib, hsb]
+///     rw [hsb2] at hinv
+///     omega
+
+/// theorem sub_borrow_zero (out a b : Sable.Seq Int) (la lb borrow : int)
+///     (hbw : 0 ≤ borrow ∧ borrow ≤ 1)
+///     (hbo : ∀ k, 0 ≤ k → k < la → 0 ≤ out.get k ∧ out.get k ≤ 4294967295)
+///     (hle : valIn b 0 lb ≤ valIn a 0 la)
+///     (hinv : valIn out 0 la - borrow * pw la
+///           = valIn a 0 la - valIn b 0 lb) :
+///     borrow = 0 := by
+///   have h1 := valIn_lt_pw out 0 la hbo
+///   rw [show la - 0 = la from by omega] at h1
+///   rcases (show borrow = 0 ∨ borrow = 1 from by omega) with h | h
+///   · exact h
+///   · exfalso
+///     rw [h, Int.one_mul] at hinv
+///     omega
+
+// ------------------------------- the class -------------------------------
+
+class Nat {
+    [u32] limbs;
+
+    /// invariant limbs.len = 0 ∨ limbs.get (limbs.len - 1) ≥ 1
+
+    /// pre  n ≤ xs.len
+    /// pre  n = 0 ∨ xs.get (n - 1) ≥ 1
+    /// post #[label(len)]   self.limbs.len = n
+    /// post #[label(value)] natVal self.limbs = valIn xs 0 n
+    init from_prefix(&[u32] xs, u64 n) {
+        self.limbs = alloc_array<u32>(n, 0);
+        /// invariant ∀ k, 0 ≤ k → k < i → self.limbs.get k = xs.get k
+        for (u64 i : range(n)) {
+            self.limbs[i] = xs[i];
+        }
+    }
+
+    deinit {
+    }
+}
+
+// --------------------------- phase functions ----------------------------
+
+// Limb selector: reading past the top yields 0, so mixed-length loops
+// have no path split in their bodies.
+/// post #[label(sel)] result = (if i < x.limbs.len then x.limbs.get i else 0)
+fn limb_or0(&Nat x, u64 i) -> u32 {
+    if (i < x.limbs.len) {
+        return x.limbs[i];
+    }
+    return 0;
+}
+
+/// post #[label(pick)] result = (if x < y then y else x)
+fn max_len(u64 x, u64 y) -> u64 {
+    if (x < y) {
+        return y;
+    }
+    return x;
+}
+
+// Normalization: the length after dropping leading zero limbs. The value
+// is unchanged, and what remains has a nonzero top limb.
+/// post #[label(le)]    result ≤ xs.len
+/// post #[label(top)]   result = 0 ∨ xs.get (result - 1) ≥ 1
+/// post #[label(value)] valIn xs 0 result = valIn xs 0 xs.len
+fn trim_len(&[u32] xs) -> u64 {
+    u64 rl = xs.len;
+    /// invariant rl ≤ xs.len
+    /// invariant valIn xs 0 rl = valIn xs 0 xs.len
+    /// variant   rl
+    while (rl > 0 && xs[rl - 1] == 0) {
+        rl = rl - 1;
+    }
+    return rl;
+}
+
+// ------------------------------ comparison ------------------------------
+
+/// post #[label(lt)] result = -1 ↔ natVal a.limbs < natVal b.limbs
+/// post #[label(eq)] result = 0 ↔ natVal a.limbs = natVal b.limbs
+/// post #[label(gt)] result = 1 ↔ natVal b.limbs < natVal a.limbs
+fn cmp(&Nat a, &Nat b) -> i32 {
+    if (a.limbs.len < b.limbs.len) {
+        return -1;
+    }
+    if (b.limbs.len < a.limbs.len) {
+        return 1;
+    }
+    u64 i = a.limbs.len;
+    /// invariant i ≤ a.limbs.len
+    /// invariant ∀ k, i ≤ k → k < a.limbs.len → a.limbs.get k = b.limbs.get k
+    /// variant   i
+    while (i > 0) {
+        i = i - 1;
+        if (a.limbs[i] < b.limbs[i]) {
+            return -1;
+        }
+        if (b.limbs[i] < a.limbs[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// ------------------------------- addition -------------------------------
+
+/// pre  a.limbs.len + b.limbs.len ≤ 4611686018427387904
+/// post #[label(sum)] natVal result.limbs = natVal a.limbs + natVal b.limbs
+fn add(&Nat a, &Nat b) -> Nat {
+    u64 la = a.limbs.len;
+    u64 lb = b.limbs.len;
+    u64 n = max_len(la, lb) + 1;
+    [u32] out = alloc_array<u32>(n, 0);
+    u64 carry = 0;
+    /// invariant carry ≤ 1
+    /// invariant valIn out 0 i + carry * pw i = valIn a.limbs 0 (if i ≤ la then i else la) + valIn b.limbs 0 (if i ≤ lb then i else lb)
+    for (u64 i : range(n)) {
+        u64 x = widen<u64>(limb_or0(&a, i));
+        u64 y = widen<u64>(limb_or0(&b, i));
+        u64 s = carry + x + y;
+        out[i] = narrow<u32>(s % 4294967296);
+        carry = s / 4294967296;
+    }
+    u64 rl = trim_len(&out);
+    var r = Nat::from_prefix(&out, rl);
+    return r;
+}
+
+// ------------------------------ subtraction -----------------------------
+
+/// pre  natVal b.limbs ≤ natVal a.limbs
+/// post #[label(diff)] natVal result.limbs = natVal a.limbs - natVal b.limbs
+fn sub(&Nat a, &Nat b) -> Nat {
+    u64 la = a.limbs.len;
+    [u32] out = alloc_array<u32>(la, 0);
+    u64 borrow = 0;
+    /// invariant borrow ≤ 1
+    /// invariant valIn out 0 i - borrow * pw i = valIn a.limbs 0 i - valIn b.limbs 0 (if i ≤ b.limbs.len then i else b.limbs.len)
+    for (u64 i : range(la)) {
+        u64 y = widen<u64>(limb_or0(&b, i));
+        u64 s = widen<u64>(a.limbs[i]) + 4294967296 - y - borrow;
+        out[i] = narrow<u32>(s % 4294967296);
+        borrow = 1 - s / 4294967296;
+    }
+    u64 rl = trim_len(&out);
+    var r = Nat::from_prefix(&out, rl);
+    return r;
+}
+
+// ------------------------------ discharges ------------------------------
+// The value-level reasoning: normalization at init exit, the trim
+// step, and the cmp closers (first-difference, shorter-is-smaller,
+// pointwise-equal-means-equal), all through the in-file lemmas.
+
+/// discharge Nat::from_prefix.inv_preserved.k_0_k_k_i_self_limbs_get_k_xs_get_k by
+///   intro k hk1 hk2
+///   by_cases hki : k = i
+///   · rw [hki, Sable.Seq.get_set, if_pos rfl]
+///   · rw [Sable.Seq.get_set, if_neg hki]
+///     exact h_inv_k_0_k_k_i_self_limbs_get k hk1 (by omega)
+
+/// discharge Nat::from_prefix.inv_exit.limbs_len_0_limbs_get_limbs_len_1_1 by
+///   by_cases h0 : n = 0
+///   · left
+///     omega
+///   · right
+///     have hc := h_inv_k_0_k_k_i_self_limbs_get (n - 1) (by omega) (by omega)
+///     have hl : _self7_limbs.len = n := by omega
+///     rw [hl]
+///     omega
+
+/// discharge Nat::from_prefix.post.value by
+///   apply prefix_val
+///   · show _self7_limbs.len = n
+///     omega
+///   · intro k hk1 hk2
+///     show _self7_limbs.get k = xs.get k
+///     exact h_inv_k_0_k_k_i_self_limbs_get k hk1 (by omega)
+
+/// discharge trim_len.inv_preserved.valin_xs_0_rl_valin_xs_0_xs_len by
+///   have h := trim_top_zero xs rl (by omega) (by omega)
+///   omega
+
+/// discharge trim_len.post.top by
+///   rw [h_result]
+///   by_cases h0 : rl = 0
+///   · omega
+///   · have h := h_xs_elems (rl - 1) (by omega) (by omega)
+///     omega
+
+/// discharge cmp.post.lt by
+///   sable_norm
+///   have hv : natVal a.limbs < natVal b.limbs :=
+///     natVal_lt_of_len_lt a.limbs b.limbs (by omega) (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
+///       (by omega)
+///   omega
+
+/// discharge cmp.post.eq by
+///   sable_norm
+///   have hv : natVal a.limbs < natVal b.limbs :=
+///     natVal_lt_of_len_lt a.limbs b.limbs (by omega) (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
+///       (by omega)
+///   omega
+
+/// discharge cmp.post.gt by
+///   sable_norm
+///   have hv : natVal a.limbs < natVal b.limbs :=
+///     natVal_lt_of_len_lt a.limbs b.limbs (by omega) (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
+///       (by omega)
+///   omega
+
+/// discharge cmp.post.lt.2 by
+///   sable_norm
+///   have hv : natVal b.limbs < natVal a.limbs :=
+///     natVal_lt_of_len_lt b.limbs a.limbs (by omega) (by omega)
+///       h_field_limbs_elems_2
+///       (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///       (by omega)
+///   omega
+
+/// discharge cmp.post.eq.2 by
+///   sable_norm
+///   have hv : natVal b.limbs < natVal a.limbs :=
+///     natVal_lt_of_len_lt b.limbs a.limbs (by omega) (by omega)
+///       h_field_limbs_elems_2
+///       (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///       (by omega)
+///   omega
+
+/// discharge cmp.post.gt.2 by
+///   sable_norm
+///   have hv : natVal b.limbs < natVal a.limbs :=
+///     natVal_lt_of_len_lt b.limbs a.limbs (by omega) (by omega)
+///       h_field_limbs_elems_2
+///       (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///       (by omega)
+///   omega
+
+/// discharge cmp.post.lt.3 by
+///   sable_norm
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn a.limbs 0 ((a.limbs).len) < valIn b.limbs 0 ((a.limbs).len) :=
+///     cmp_first_diff a.limbs b.limbs (i - 1) ((a.limbs).len) (by omega) (by omega)
+///       (fun k hk1 hk2 => h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2)
+///       (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 (by omega)).1)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.eq.3 by
+///   sable_norm
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn a.limbs 0 ((a.limbs).len) < valIn b.limbs 0 ((a.limbs).len) :=
+///     cmp_first_diff a.limbs b.limbs (i - 1) ((a.limbs).len) (by omega) (by omega)
+///       (fun k hk1 hk2 => h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2)
+///       (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 (by omega)).1)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.gt.3 by
+///   sable_norm
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn a.limbs 0 ((a.limbs).len) < valIn b.limbs 0 ((a.limbs).len) :=
+///     cmp_first_diff a.limbs b.limbs (i - 1) ((a.limbs).len) (by omega) (by omega)
+///       (fun k hk1 hk2 => h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2)
+///       (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 (by omega)).1)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.lt.4 by
+///   sable_norm
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn b.limbs 0 ((a.limbs).len) < valIn a.limbs 0 ((a.limbs).len) :=
+///     cmp_first_diff b.limbs a.limbs (i - 1) ((a.limbs).len) (by omega) (by omega)
+///       (fun k hk1 hk2 => (h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2).symm)
+///       (by omega)
+///       (fun k hk1 hk2 => h_field_limbs_elems_2 k hk1 (by omega))
+///       (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.eq.4 by
+///   sable_norm
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn b.limbs 0 ((a.limbs).len) < valIn a.limbs 0 ((a.limbs).len) :=
+///     cmp_first_diff b.limbs a.limbs (i - 1) ((a.limbs).len) (by omega) (by omega)
+///       (fun k hk1 hk2 => (h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2).symm)
+///       (by omega)
+///       (fun k hk1 hk2 => h_field_limbs_elems_2 k hk1 (by omega))
+///       (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.gt.4 by
+///   sable_norm
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn b.limbs 0 ((a.limbs).len) < valIn a.limbs 0 ((a.limbs).len) :=
+///     cmp_first_diff b.limbs a.limbs (i - 1) ((a.limbs).len) (by omega) (by omega)
+///       (fun k hk1 hk2 => (h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2).symm)
+///       (by omega)
+///       (fun k hk1 hk2 => h_field_limbs_elems_2 k hk1 (by omega))
+///       (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.lt.5 by
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn a.limbs 0 ((a.limbs).len) = valIn b.limbs 0 ((a.limbs).len) :=
+///     valIn_congr a.limbs b.limbs 0 ((a.limbs).len)
+///       (fun k hk1 hk2 => h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.eq.5 by
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn a.limbs 0 ((a.limbs).len) = valIn b.limbs 0 ((a.limbs).len) :=
+///     valIn_congr a.limbs b.limbs 0 ((a.limbs).len)
+///       (fun k hk1 hk2 => h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.post.gt.5 by
+///   have hlen : (b.limbs).len = (a.limbs).len := by omega
+///   have hv : valIn a.limbs 0 ((a.limbs).len) = valIn b.limbs 0 ((a.limbs).len) :=
+///     valIn_congr a.limbs b.limbs 0 ((a.limbs).len)
+///       (fun k hk1 hk2 => h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2)
+///   simp only [natVal]
+///   rw [hlen]
+///   omega
+
+/// discharge cmp.inv_preserved.k_i_k_k_a_limbs_len_a_limbs_get_k_b_limb by
+///   intro k hk1 hk2
+///   by_cases hki : k = i - 1
+///   · rw [hki]
+///     omega
+///   · exact h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2
+
+// The add/sub discharges: zero-prefix base cases, the carry/borrow
+// step lemmas, and the exit compositions (carry/borrow vanish, the
+// trimmed prefix carries the exact value into from_prefix).
+
+/// discharge add.inv_init.valin_out_0_i_carry_pw_i_valin_a_limbs_0 by
+///   have e1 : (if (0:Int) ≤ a.limbs.len then (0:Int) else a.limbs.len) = 0 := by
+///     split <;> omega
+///   have e2 : (if (0:Int) ≤ b.limbs.len then (0:Int) else b.limbs.len) = 0 := by
+///     split <;> omega
+///   rw [e1, e2, valIn_nil out 0 0 (by omega), valIn_nil a.limbs 0 0 (by omega),
+///       valIn_nil b.limbs 0 0 (by omega)]
+///   omega
+
+/// discharge add.inv_preserved.valin_out_0_i_carry_pw_i_valin_a_limbs_0 by
+///   exact add_step out a.limbs b.limbs i a.limbs.len b.limbs.len carry _r11 _r12
+///     (by omega) h_limb_or0_post_sel h_limb_or0_post_sel_2
+///     h_inv_valin_out_0_i_carry_pw_i
+
+/// discharge add.post.sum by
+///   sable_norm
+///   have e1 : (if i ≤ a.limbs.len then i else a.limbs.len) = a.limbs.len := by
+///     split <;> omega
+///   have e2 : (if i ≤ b.limbs.len then i else b.limbs.len) = b.limbs.len := by
+///     split <;> omega
+///   rw [e1, e2] at h_inv_valin_out_0_i_carry_pw_i
+///   have hin : i = _r1 + 1 := by omega
+///   rw [hin] at h_inv_valin_out_0_i_carry_pw_i
+///   have hc : carry = 0 :=
+///     add_carry_zero out a.limbs b.limbs (_r1 + 1) a.limbs.len b.limbs.len carry
+///       (by omega) (by omega) (by omega) (by omega)
+///       (fun k hk1 hk2 => (h_out_elems k hk1 (by omega)).1)
+///       h_field_limbs_elems h_field_limbs_elems_2
+///       h_inv_valin_out_0_i_carry_pw_i
+///   rw [hc] at h_inv_valin_out_0_i_carry_pw_i
+///   rw [h_result]
+///   simp only [natVal] at *
+///   rw [h_out_len, h_stale_alloc3] at h_trim_len_post_value
+///   omega
+
+/// discharge sub.inv_init.valin_out_0_i_borrow_pw_i_valin_a_limbs by
+///   have e2 : (if (0:Int) ≤ b.limbs.len then (0:Int) else b.limbs.len) = 0 := by
+///     split <;> omega
+///   rw [e2, valIn_nil out 0 0 (by omega), valIn_nil a.limbs 0 0 (by omega),
+///       valIn_nil b.limbs 0 0 (by omega)]
+///   omega
+
+/// discharge sub.inv_preserved.valin_out_0_i_borrow_pw_i_valin_a_limbs by
+///   exact sub_step out a.limbs b.limbs i b.limbs.len borrow _r10 (by omega)
+///     h_limb_or0_post_sel h_inv_valin_out_0_i_borrow_pw
+
+/// discharge sub.overflow.widen_u64_a_limbs_i_4294967296 by
+///   sable_norm
+///   have h := h_field_limbs_elems i (by omega) (by omega)
+///   omega
+
+/// discharge sub.overflow.widen_u64_a_limbs_i_4294967296_y by
+///   sable_norm
+///   have h := h_field_limbs_elems i (by omega) (by omega)
+///   omega
+
+/// discharge sub.overflow.widen_u64_a_limbs_i_4294967296_y_borrow by
+///   sable_norm
+///   have h := h_field_limbs_elems i (by omega) (by omega)
+///   omega
+
+/// discharge sub.overflow.1_s_4294967296 by
+///   sable_norm
+///   have h := h_field_limbs_elems i (by omega) (by omega)
+///   omega
+
+/// discharge sub.post.diff by
+///   sable_norm
+///   have hll : b.limbs.len ≤ a.limbs.len :=
+///     len_le_of_val_le a.limbs b.limbs h_pre_natval_b_limbs_natval_a (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_2 k hk1 hk2).1)
+///       (fun h0 => by omega)
+///   have hin : i = a.limbs.len := by omega
+///   have e : (if i ≤ b.limbs.len then i else b.limbs.len) = b.limbs.len := by
+///     split <;> omega
+///   rw [e, hin] at h_inv_valin_out_0_i_borrow_pw
+///   simp only [natVal] at h_pre_natval_b_limbs_natval_a
+///   have hb0 : borrow = 0 :=
+///     sub_borrow_zero out a.limbs b.limbs a.limbs.len b.limbs.len borrow
+///       (by omega)
+///       (fun k hk1 hk2 => h_out_elems k hk1 (by omega))
+///       h_pre_natval_b_limbs_natval_a
+///       h_inv_valin_out_0_i_borrow_pw
+///   rw [hb0] at h_inv_valin_out_0_i_borrow_pw
+///   rw [h_result]
+///   simp only [natVal] at *
+///   rw [h_out_len, h_stale_alloc2] at h_trim_len_post_value
+///   omega
