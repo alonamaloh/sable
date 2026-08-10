@@ -1,0 +1,27 @@
+// expect-error: op.duplicate
+// One binding per (operator, class).
+
+class Box {
+    i32 v;
+
+    /// invariant v ≥ 0
+
+    /// pre x ≥ 0
+    /// post self.v = x
+    init make(i32 x) {
+        self.v = x;
+    }
+
+    deinit {
+    }
+}
+
+/// pre  a.v + b.v ≤ 1000
+/// post result.v = a.v + b.v
+fn padd(&Box a, &Box b) -> Box {
+    var s = Box::make(a.v + b.v);
+    return s;
+}
+
+operator + = padd;
+operator + = padd;

@@ -180,18 +180,18 @@ fn div(&Nat a, &Nat b) -> Nat {
     /// assert #[label(zero_val)] natVal zero.limbs = 0
     var q = Nat::from_prefix(&zarr, 0);
     /// assert #[label(q0)] natVal q.limbs = 0
-    var r = add(&a, &zero);
+    var r = a + zero;
     /// invariant natVal q.limbs * natVal b.limbs + natVal r.limbs = natVal a.limbs
     /// invariant q.limbs.len ≤ a.limbs.len
     /// invariant r.limbs.len ≤ a.limbs.len
     /// variant   natVal r.limbs
-    while (cmp(&r, &b) >= 0) {
+    while (r >= b) {
         /// assert #[label(b_le_r)]  natVal b.limbs ≤ natVal r.limbs
         /// assert #[label(r_le_a)]  natVal r.limbs ≤ natVal a.limbs
-        var d = add(&b, &zero);
+        var d = b + zero;
         var m = Nat::from_prefix(&onearr, 1);
         /// assert #[label(one_val)] natVal m.limbs = 1
-        var d2 = add(&d, &d);
+        var d2 = d + d;
         /// invariant natVal d.limbs = natVal b.limbs * natVal m.limbs
         /// invariant natVal b.limbs ≤ natVal d.limbs
         /// invariant natVal d.limbs ≤ natVal r.limbs
@@ -199,13 +199,13 @@ fn div(&Nat a, &Nat b) -> Nat {
         /// invariant d.limbs.len ≤ a.limbs.len
         /// invariant m.limbs.len ≤ a.limbs.len
         /// variant   natVal r.limbs - natVal d.limbs
-        while (cmp(&d2, &r) <= 0) {
-            d = add(&d, &d);
-            m = add(&m, &m);
-            d2 = add(&d, &d);
+        while (d2 <= r) {
+            d = d + d;
+            m = m + m;
+            d2 = d + d;
         }
-        q = add(&q, &m);
-        r = sub(&r, &d);
+        q = q + m;
+        r = r - d;
     }
     return q;
 }
@@ -214,9 +214,9 @@ fn div(&Nat a, &Nat b) -> Nat {
 /// pre  a.limbs.len + b.limbs.len ≤ 2305843009213693952
 /// post #[label(rem)] natVal result.limbs = natVal a.limbs % natVal b.limbs
 fn rem(&Nat a, &Nat b) -> Nat {
-    var q = div(&a, &b);
-    var p = mul(&q, &b);
-    var r = sub(&a, &p);
+    var q = a / b;
+    var p = q * b;
+    var r = a - p;
     return r;
 }
 
@@ -226,6 +226,17 @@ fn rem(&Nat a, &Nat b) -> Nat {
 ///   have h1 := Int.emod_nonneg a (by omega : b ≠ 0)
 ///   have h2 := Int.emod_lt_of_pos a (by omega : 0 < b)
 ///   omega
+
+// ADR 0012: pure front-end sugar — after the checker's rewrite every
+// stage sees the ordinary contracted call, and the proof-language `+`
+// on ghost values (natVal …) is Lean's own, untouched.
+
+operator +   = add;
+operator -   = sub;
+operator *   = mul;
+operator /   = div;
+operator %   = rem;
+operator cmp = cmp;
 
 // Euclid, riding entirely on rem's contract: the invariant carries the
 // gcd of the working pair back to the inputs through igcd_step, the
@@ -239,18 +250,18 @@ fn gcd(&Nat a, &Nat b) -> Nat {
     [u32] zarr = alloc_array<u32>(1, 0);
     var zero = Nat::from_prefix(&zarr, 0);
     /// assert #[label(zero_val)] natVal zero.limbs = 0
-    var x = add(&a, &zero);
-    var y = add(&b, &zero);
+    var x = a + zero;
+    var y = b + zero;
     /// invariant igcd (natVal x.limbs) (natVal y.limbs) = igcd (natVal a.limbs) (natVal b.limbs)
     /// invariant x.limbs.len ≤ a.limbs.len + b.limbs.len
     /// invariant y.limbs.len ≤ a.limbs.len + b.limbs.len
     /// variant   natVal y.limbs
-    while (cmp(&y, &zero) != 0) {
+    while (y != zero) {
         /// assert #[label(y_pos)] natVal y.limbs ≥ 1
-        var t = rem(&x, &y);
+        var t = x % y;
         /// assert #[label(t_lt)]  natVal t.limbs < natVal y.limbs
-        x = add(&y, &zero);
-        y = add(&t, &zero);
+        x = y + zero;
+        y = t + zero;
     }
     return x;
 }

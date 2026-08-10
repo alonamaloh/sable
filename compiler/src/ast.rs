@@ -523,6 +523,42 @@ pub struct ClassDecl {
     pub span: Span,
 }
 
+/// The symbol slot of an `operator` binding declaration (ADR 0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OpSym {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    /// `operator cmp = f;` — unlocks all six comparisons via the
+    /// −1/0/1 convention (`a < b` ⇒ `f(&a,&b) < 0`, …).
+    Cmp,
+}
+
+impl OpSym {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            OpSym::Add => "+",
+            OpSym::Sub => "-",
+            OpSym::Mul => "*",
+            OpSym::Div => "/",
+            OpSym::Rem => "%",
+            OpSym::Cmp => "cmp",
+        }
+    }
+}
+
+/// `operator + = add;` — binds an operator to a contracted function for
+/// the class its signature names. Pure front-end sugar: after the
+/// checker's rewrite, every downstream stage sees the ordinary call.
+#[derive(Debug, Clone)]
+pub struct OpBind {
+    pub op: OpSym,
+    pub fn_name: String,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub fns: Vec<Fn>,
@@ -538,4 +574,6 @@ pub struct Program {
     pub ghosts: Vec<GhostItem>,
     pub defers: Vec<Defer>,
     pub assumes: Vec<Assume>,
+    /// Operator bindings (ADR 0012), resolved by the checker.
+    pub operators: Vec<OpBind>,
 }

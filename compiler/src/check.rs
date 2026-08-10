@@ -57,6 +57,9 @@ struct Ctx<'a> {
     /// Template context (ADR 0009): bounded type parameter →
     /// (trait name, parameter index).
     tbounds: HashMap<String, (String, u8)>,
+    /// Operator bindings (ADR 0012): (symbol, class meta index) → the
+    /// bound function's name.
+    operators: &'a HashMap<(OpSym, usize), String>,
     traits: &'a [TraitDecl],
 }
 
@@ -197,6 +200,66 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
     }
 
     let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
+    // Operator bindings (ADR 0012): validate each binding's target and
+    // signature, and build the (symbol, class) → fn resolution table the
+    // Binary rewrite consults.
+    let mut operators: HashMap<(OpSym, usize), String> = HashMap::new();
+    for ob in &program.operators {
+        let Some(sig) = sigs.get(&ob.fn_name) else {
+            return Err(Diagnostic {
+                name: "op.unknown_fn".into(),
+                title: format!("`operator {}` binds unknown function `{}`", ob.op.symbol(), ob.fn_name),
+                span: ob.span,
+                label: "no such function".into(),
+                notes: vec![],
+            });
+        };
+        let bad_sig = |why: &str| Diagnostic {
+            name: "op.bad_signature".into(),
+            title: format!(
+                "`{}` cannot be bound to `operator {}`",
+                ob.fn_name,
+                ob.op.symbol()
+            ),
+            span: ob.span,
+            label: why.to_string(),
+            notes: vec![],
+        };
+        let (ci_a, ci_b) = match (sig.params.first().map(|p| p.ty), sig.params.get(1).map(|p| p.ty)) {
+            (Some(Ty::ClassRef(a)), Some(Ty::ClassRef(b))) if sig.params.len() == 2 => (a, b),
+            _ => return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`")),
+        };
+        if ci_a != ci_b {
+            return Err(bad_sig("both operands must be the same class"));
+        }
+        match ob.op {
+            OpSym::Cmp => {
+                if sig.ret != Ty::Int(IntTy::I32) {
+                    return Err(bad_sig(
+                        "`operator cmp` needs an `i32` result (the −1/0/1 convention)",
+                    ));
+                }
+            }
+            _ => {
+                if sig.ret != Ty::Class(ci_a) {
+                    return Err(bad_sig("arithmetic operators return the operand class"));
+                }
+            }
+        }
+        if operators.insert((ob.op, ci_a), ob.fn_name.clone()).is_some() {
+            return Err(Diagnostic {
+                name: "op.duplicate".into(),
+                title: format!(
+                    "`operator {}` is bound twice for the same class",
+                    ob.op.symbol()
+                ),
+                span: ob.span,
+                label: "second binding here".into(),
+                notes: vec![],
+            });
+        }
+    }
+
     for f in &mut program.fns {
         let is_test = f.name.starts_with("test_");
         if is_test
@@ -231,6 +294,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_init: false,
             class_metas: &class_metas,
             tbounds: HashMap::new(),
+            operators: &operators,
             traits: &traits_c,
         };
         for p in &f.params {
@@ -290,6 +354,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_init: false,
             class_metas: &class_metas,
             tbounds: tbounds_of(&f.type_params, &f.type_bounds),
+            operators: &operators,
             traits: &traits_c,
         };
         for p in &f.params {
@@ -339,6 +404,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_init: true,
                 class_metas: &class_metas,
                 tbounds: HashMap::new(),
+            operators: &operators,
                 traits: &traits_c,
             };
             for p in &init.params {
@@ -390,6 +456,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_init: false,
                 class_metas: &class_metas,
                 tbounds: HashMap::new(),
+            operators: &operators,
                 traits: &traits_c,
             };
             for p in &m.f.params {
@@ -477,6 +544,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_init: true,
                     class_metas: &tmetas,
                     tbounds: ctb.clone(),
+                    operators: &operators,
                     traits: &traits_c,
                 };
                 for p in &init.params {
@@ -528,6 +596,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_init: false,
                     class_metas: &tmetas,
                     tbounds: ctb.clone(),
+                    operators: &operators,
                     traits: &traits_c,
                 };
                 for p in &m.f.params {
@@ -661,10 +730,12 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 if matches!(ty, Ty::Class(_)) {
                     // Reassignment of a class local is a move-in from a
                     // fresh owned value (the old value is dropped, with
-                    // its RAII invariant check). Only call results and
-                    // constructions move in; local-to-local moves would
-                    // leave a moved-from name behind and stay deferred
-                    // (ADR 0010).
+                    // its RAII invariant check). Check first: operator
+                    // sugar may rewrite a Binary RHS into the bound call
+                    // (ADR 0012). Only call results and constructions
+                    // move in; local-to-local moves would leave a
+                    // moved-from name behind and stay deferred (ADR 0010).
+                    check_expr(ctx, value, Some(ty))?;
                     if !matches!(
                         value.kind,
                         ExprKind::Call { .. } | ExprKind::CtorCall { .. }
@@ -676,21 +747,24 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             ),
                             span: *name_span,
                             label: "moves between locals are not supported yet (ADR 0010)".into(),
+                        notes: vec![],
+                        });
+                    }
+                    ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
+                } else {
+                    if matches!(ty, Ty::Array(..)) {
+                        return Err(Diagnostic {
+                            name: "type.array_assign".into(),
+                            title: format!("cannot assign to array `{name}`"),
+                            span: *name_span,
+                            label: "arrays cannot be rebound; element stores use `a[i] = v`"
+                                .into(),
                             notes: vec![],
                         });
                     }
+                    check_expr(ctx, value, Some(ty))?;
+                    ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
                 }
-                if matches!(ty, Ty::Array(..)) {
-                    return Err(Diagnostic {
-                        name: "type.array_assign".into(),
-                        title: format!("cannot assign to array `{name}`"),
-                        span: *name_span,
-                        label: "arrays cannot be rebound; element stores use `a[i] = v`".into(),
-                        notes: vec![],
-                    });
-                }
-                check_expr(ctx, value, Some(ty))?;
-                ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
             }
             Stmt::If {
                 cond,
@@ -1702,6 +1776,102 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Binary { op, op_span, lhs, rhs } => {
             let op = *op;
             let op_span = *op_span;
+            // Operator sugar (ADR 0012): both operands are named class
+            // values → rewrite to the bound call (comparisons via the
+            // cmp binding against 0) and re-infer. Downstream stages
+            // only ever see the ordinary call.
+            let class_of = |ctx: &Ctx, e: &Expr| match &e.kind {
+                ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty) {
+                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci)) => Some((n.clone(), ci)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let lc = class_of(ctx, lhs);
+            let rc = class_of(ctx, rhs);
+            if let (Some((ln, lci)), Some((rn, rci))) = (lc, rc) {
+                if lci != rci {
+                    return Err(Diagnostic {
+                        name: "op.operand_mismatch".into(),
+                        title: "operator on values of different classes".into(),
+                        span: op_span,
+                        label: format!(
+                            "`{}` vs `{}`",
+                            ctx.class_metas[lci].name, ctx.class_metas[rci].name
+                        ),
+                        notes: vec![],
+                    });
+                }
+                let sym = match op {
+                    BinOp::Add => Some(OpSym::Add),
+                    BinOp::Sub => Some(OpSym::Sub),
+                    BinOp::Mul => Some(OpSym::Mul),
+                    BinOp::Div => Some(OpSym::Div),
+                    BinOp::Rem => Some(OpSym::Rem),
+                    BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => {
+                        Some(OpSym::Cmp)
+                    }
+                    BinOp::And | BinOp::Or => None,
+                };
+                let Some(sym) = sym else {
+                    return Err(Diagnostic {
+                        name: "op.unbound".into(),
+                        title: format!(
+                            "`{}` is not an overloadable operator",
+                            op.symbol()
+                        ),
+                        span: op_span,
+                        label: "no operator binding applies".into(),
+                        notes: vec![],
+                    });
+                };
+                let Some(callee) = ctx.operators.get(&(sym, lci)).cloned() else {
+                    return Err(Diagnostic {
+                        name: "op.unbound".into(),
+                        title: format!(
+                            "no `operator {}` bound for class `{}`",
+                            sym.symbol(),
+                            ctx.class_metas[lci].name
+                        ),
+                        span: op_span,
+                        label: "declare one at module level".into(),
+                        notes: vec![(
+                            "note".into(),
+                            format!(
+                                "`operator {} = <fn>;` binds it to a `fn (&{c}, &{c})` function",
+                                sym.symbol(),
+                                c = ctx.class_metas[lci].name
+                            ),
+                        )],
+                    });
+                };
+                let borrow = |name: String, span: Span| Expr {
+                    kind: ExprKind::Borrow { array: name, mutable: false },
+                    span,
+                    ty: None,
+                };
+                let call = ExprKind::Call {
+                    callee,
+                    callee_span: op_span,
+                    type_args: Vec::new(),
+                    args: vec![borrow(ln, lhs.span), borrow(rn, rhs.span)],
+                };
+                if sym == OpSym::Cmp {
+                    e.kind = ExprKind::Binary {
+                        op,
+                        op_span,
+                        lhs: Box::new(Expr { kind: call, span: e.span, ty: None }),
+                        rhs: Box::new(Expr {
+                            kind: ExprKind::IntLit(0),
+                            span: op_span,
+                            ty: None,
+                        }),
+                    };
+                } else {
+                    e.kind = call;
+                }
+                return infer_expr(ctx, e, expected);
+            }
             if op.is_arith() {
                 let expected_int = match expected {
                     Some(Ty::Int(_)) => expected,

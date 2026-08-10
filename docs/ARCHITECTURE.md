@@ -26,7 +26,10 @@ mono (compiler/src/mono.rs)           monomorphization (ADR 0006/0007): expands
   │                                   bounds checked here (mono.unsatisfied_bound).
   │                                   No later stage sees a type variable.
   ▼
-typecheck (compiler/src/check.rs)     types, definite initialization, call graph
+typecheck (compiler/src/check.rs)     types, definite initialization, call
+  │                                   graph; operator-binding rewrite
+  │                                   (ADR 0012: `a + b` on class values
+  │                                   becomes the bound contracted call)
   ▼
 vcgen (compiler/src/vcgen.rs)         forward symbolic execution over the AST;
   │                                   values are Lean `Int` expression strings;

@@ -1,0 +1,23 @@
+// expect-error: op.bad_signature
+// Arithmetic operators bind functions of shape `fn (&C, &C) -> C`.
+
+class Box {
+    i32 v;
+
+    /// invariant v ≥ 0
+
+    /// pre x ≥ 0
+    init make(i32 x) {
+        self.v = x;
+    }
+
+    deinit {
+    }
+}
+
+/// post result = a.v
+fn first_v(&Box a, &Box b) -> i32 {
+    return a.v;
+}
+
+operator + = first_v;

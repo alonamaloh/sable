@@ -59,6 +59,7 @@ pub fn parse(
     let mut classes = Vec::new();
     let mut traits = Vec::new();
     let mut impls = Vec::new();
+    let mut operators = Vec::new();
     while !parser.at(&Tok::Eof) {
         if parser.at(&Tok::KwClass) {
             classes.push(parser.parse_class()?);
@@ -66,6 +67,8 @@ pub fn parse(
             traits.push(parser.parse_trait()?);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "impl") {
             impls.push(parser.parse_impl()?);
+        } else if matches!(parser.peek(), Tok::Ident(n) if n == "operator") {
+            operators.push(parser.parse_operator()?);
         } else {
             fns.push(parser.parse_fn()?);
         }
@@ -130,6 +133,7 @@ pub fn parse(
         ghosts,
         defers,
         assumes,
+        operators,
     })
 }
 
@@ -705,6 +709,30 @@ impl<'a> Parser<'a> {
     }
 
     /// `init name(params) { ... }` — a named constructor (Unit-"returning").
+    /// `operator + = add;` (ADR 0012).
+    fn parse_operator(&mut self) -> PResult<crate::ast::OpBind> {
+        let start = self.peek_span();
+        self.pos += 1; // `operator`
+        let op = match self.peek().clone() {
+            Tok::Plus => crate::ast::OpSym::Add,
+            Tok::Minus => crate::ast::OpSym::Sub,
+            Tok::Star => crate::ast::OpSym::Mul,
+            Tok::Slash => crate::ast::OpSym::Div,
+            Tok::Percent => crate::ast::OpSym::Rem,
+            Tok::Ident(n) if n == "cmp" => crate::ast::OpSym::Cmp,
+            _ => return Err(self.error_expected("an operator symbol (`+ - * / %` or `cmp`)")),
+        };
+        self.pos += 1;
+        self.expect(Tok::Assign)?;
+        let (fn_name, _) = self.ident()?;
+        let end = self.expect(Tok::Semi)?.span;
+        Ok(crate::ast::OpBind {
+            op,
+            fn_name,
+            span: start.join(end),
+        })
+    }
+
     fn parse_init(&mut self) -> PResult<Fn> {
         let start = self.expect(Tok::KwInit)?.span;
         let (name, name_span) = self.ident()?;

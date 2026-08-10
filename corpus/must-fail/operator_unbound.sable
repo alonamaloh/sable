@@ -1,0 +1,22 @@
+// expect-error: op.unbound
+// `+` on class values needs a declared binding.
+
+class Box {
+    i32 v;
+
+    /// invariant v ≥ 0
+
+    /// pre x ≥ 0
+    init make(i32 x) {
+        self.v = x;
+    }
+
+    deinit {
+    }
+}
+
+fn demo() {
+    var a = Box::make(1);
+    var b = Box::make(2);
+    var c = a + b;
+}
