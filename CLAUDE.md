@@ -9,7 +9,7 @@ cd compiler && cargo build            # build the compiler
 cd compiler && cargo test             # unit tests + full corpus (runs Lean; slow-ish)
 cd lean && lake build                 # build the Sable prelude (needed once; cached)
 compiler/target/debug/sable check corpus/verifies/div_round_up.sable
-compiler/target/debug/sable test corpus/tests/test_sorting.sable   # dynamic contract checks, no Lean
+compiler/target/debug/sable test -M corpus/verifies corpus/tests/test_sorting.sable   # dynamic checks, no Lean; -M resolves `use` imports
 compiler/target/debug/sable daemon &   # optional: warm checker (~10x faster sable check)
 ```
 
@@ -25,7 +25,7 @@ Lean is pinned by `lean/lean-toolchain`; elan fetches it automatically. Never up
 
 ## Conventions
 
-- Every new diagnostic gets a `corpus/must-fail/` program with an `// expect-error: <name>` first line; every new feature gets `corpus/verifies/` programs, and dynamic behavior gets `corpus/tests/` (must pass with zero skipped clauses) or `corpus/test-fails/` (`// expect-test-failure: <substr>`). The corpus is executable documentation.
+- Every new diagnostic gets a `corpus/must-fail/` program with an `// expect-error: <name>` first line; every new feature gets `corpus/verifies/` programs, and dynamic behavior gets `corpus/tests/` (must pass with zero skipped clauses; a deliberately-unmonitorable subject clause needs an `// expect-skip: <substr>` fence, and stale fences are failures) or `corpus/test-fails/` (`// expect-test-failure: <substr>`). The corpus is executable documentation.
 - Commit early and often; push after each commit (repo is private). Substantive decisions get an ADR in `docs/decisions/`.
 - **No development-history references in code, corpus, or diagnostics.** Comments, diagnostic names, and user-facing messages describe the present design — never milestones ("M6"), slices, layers, tiers, or "found by X" stories; that history lives in git and `docs/PLAN.md`. Citing an ADR or a design-doc section is fine (those are normative documents); citing when or in what order something landed is not.
 - Keep `docs/PLAN.md` status and `docs/ARCHITECTURE.md` current when the code moves under them.

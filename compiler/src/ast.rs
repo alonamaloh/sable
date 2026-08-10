@@ -549,6 +549,17 @@ impl OpSym {
     }
 }
 
+/// `use bignum;` / `use bignum::{gcd, Nat};` — imports a module
+/// (ADR 0013). v1: everything a module declares is exported; a listed
+/// import additionally validates the names exist.
+#[derive(Debug, Clone)]
+pub struct UseDecl {
+    pub module: String,
+    /// None = glob (`use m;`); Some = the listed names.
+    pub names: Option<Vec<String>>,
+    pub span: Span,
+}
+
 /// `operator + = add;` — binds an operator to a contracted function for
 /// the class its signature names. Pure front-end sugar: after the
 /// checker's rewrite, every downstream stage sees the ordinary call.
@@ -576,4 +587,6 @@ pub struct Program {
     pub assumes: Vec<Assume>,
     /// Operator bindings (ADR 0012), resolved by the checker.
     pub operators: Vec<OpBind>,
+    /// Imports (ADR 0013), consumed by the module loader.
+    pub uses: Vec<UseDecl>,
 }

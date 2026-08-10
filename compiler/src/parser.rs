@@ -33,11 +33,24 @@ pub fn parse(
     lines: &LineMap,
     text: &str,
 ) -> PResult<Program> {
+    parse_module(tokens, blocks, lines, text, &[])
+}
+
+/// Parse one module. `extern_classes` are classes from already-loaded
+/// imports (ADR 0013), in merged-index order: this module's own classes
+/// get indices after them, matching the loader's merge.
+pub fn parse_module(
+    tokens: &[Token],
+    blocks: &[ProofBlock],
+    lines: &LineMap,
+    text: &str,
+    extern_classes: &[String],
+) -> PResult<Program> {
     // Non-generic classes only, in declaration order — this matches
     // their indices in `program.classes` after monomorphization
     // (instances are appended after). Borrows of generic instances are
     // an ADR 0010 deferral.
-    let mut class_names = Vec::new();
+    let mut class_names: Vec<String> = extern_classes.to_vec();
     for w in tokens.windows(3) {
         if matches!(w[0].tok, Tok::KwClass) && !matches!(w[2].tok, Tok::Lt) {
             if let Tok::Ident(n) = &w[1].tok {
@@ -60,7 +73,12 @@ pub fn parse(
     let mut traits = Vec::new();
     let mut impls = Vec::new();
     let mut operators = Vec::new();
+    let mut uses = Vec::new();
     while !parser.at(&Tok::Eof) {
+        if matches!(parser.peek(), Tok::Ident(n) if n == "use") {
+            uses.push(parser.parse_use()?);
+            continue;
+        }
         if parser.at(&Tok::KwClass) {
             classes.push(parser.parse_class()?);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "trait") {
@@ -134,6 +152,7 @@ pub fn parse(
         defers,
         assumes,
         operators,
+        uses,
     })
 }
 
@@ -709,6 +728,37 @@ impl<'a> Parser<'a> {
     }
 
     /// `init name(params) { ... }` — a named constructor (Unit-"returning").
+    /// `use m;` / `use m::{a, b};` (ADR 0013).
+    fn parse_use(&mut self) -> PResult<crate::ast::UseDecl> {
+        let start = self.peek_span();
+        self.pos += 1; // `use`
+        let (module, _) = self.ident()?;
+        let names = if self.at(&Tok::ColonColon) {
+            self.pos += 1;
+            self.expect(Tok::LBrace)?;
+            let mut names = Vec::new();
+            loop {
+                let (n, _) = self.ident()?;
+                names.push(n);
+                if self.at(&Tok::Comma) {
+                    self.pos += 1;
+                    continue;
+                }
+                break;
+            }
+            self.expect(Tok::RBrace)?;
+            Some(names)
+        } else {
+            None
+        };
+        let end = self.expect(Tok::Semi)?.span;
+        Ok(crate::ast::UseDecl {
+            module,
+            names,
+            span: start.join(end),
+        })
+    }
+
     /// `operator + = add;` (ADR 0012).
     fn parse_operator(&mut self) -> PResult<crate::ast::OpBind> {
         let start = self.peek_span();

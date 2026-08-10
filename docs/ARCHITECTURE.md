@@ -12,6 +12,14 @@ There is **no external SMT solver**. Routine obligations are discharged by an au
 
 ```
 foo.sable
+  │  load (compiler/src/modules.rs)   resolve `use` imports (ADR 0013): DFS over the
+  │                                   module DAG (cycle-checked, canonical-path dedup),
+  │                                   each file scanned/lexed in place within a
+  │                                   combined source string; imported class names
+  │                                   seed dependent parses; flat merge → ONE Program.
+  │                                   Every later stage is module-oblivious;
+  │                                   ModuleSet.locate maps any span back to its
+  │                                   (file, line, col) for rendering.
   │  scan: split proof lines (///) from program text; group into blocks;
   │        attach blocks positionally (doc-comment rule)
   ▼
@@ -59,7 +67,7 @@ diagnose (compiler/src/diag.rs)       lean JSON messages → source map lookup �
                                       .sable span, context, lean excerpt
 ```
 
-Generated Lean goes to `.sable-out/` (gitignored), one file per module, `import Sable` / `open Sable` at the top.
+Generated Lean goes to `.sable-out/` (gitignored), one file per checked root, `import Sable` / `open Sable` at the top. Verification is whole-DAG in modules v1: a root's imports are re-verified in the same generated file (separate verification via Lean-level `import` is the planned slice 2, ADR 0013).
 
 ## Key invariants
 
@@ -102,7 +110,10 @@ compiler/          Rust package `sable` (single crate until it hurts; split when
 lean/              Lake package: Sable prelude; pinned via lean-toolchain
 corpus/verifies/   programs that must verify (status: fully verified)
 corpus/must-fail/  programs annotated with the exact diagnostic that must fire
-corpus/tests/      dynamic-test programs: sable test must pass, zero skipped clauses
+corpus/tests/      dynamic-test programs (import subjects from corpus/verifies via
+                   `sable test -M corpus/verifies …`): must pass, zero skipped clauses
+                   (known-unmonitorable subject clauses fenced by `// expect-skip:`;
+                   a fence matching no skip is itself a failure)
 corpus/test-fails/ dynamic tests that must be caught, annotated with the message
 docs/notes/        probe files and audit notes (SVM draft findings, class encoding)
 editors/           Neovim setup + VS Code extension

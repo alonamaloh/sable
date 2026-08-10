@@ -9,6 +9,7 @@ pub mod interp;
 pub mod lean;
 pub mod lexer;
 pub mod lsp;
+pub mod modules;
 pub mod mono;
 pub mod parser;
 pub mod scan;
@@ -79,19 +80,23 @@ pub fn front_diagnostics(source: &str) -> Vec<Diagnostic> {
 pub struct Options {
     /// Print the generated Lean file to stdout instead of checking it.
     pub emit_lean_only: bool,
+    /// Directories searched for `use` imports, after the importing
+    /// file's own directory (ADR 0013).
+    pub module_paths: Vec<std::path::PathBuf>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
             emit_lean_only: false,
+            module_paths: Vec::new(),
         }
     }
 }
 
 /// Run the front end and the dynamic test interpreter (`sable test`).
 /// Never invokes Lean; contracts are checked dynamically (design §9).
-pub fn test_file(path: &Path) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
+pub fn test_file(path: &Path, opts: &Options) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
     let display_path = path.display().to_string();
     let source = std::fs::read_to_string(path).map_err(|err| {
         vec![Failure {
@@ -100,24 +105,25 @@ pub fn test_file(path: &Path) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
         }]
     })?;
     let lines = LineMap::new(&source);
+    let _ = (&display_path, &source, &lines);
+    let (mut program, mods) = modules::load(path, &opts.module_paths).map_err(|(d, partial)| {
+        vec![Failure {
+            name: d.name.clone(),
+            rendered: partial.render(&d),
+        }]
+    })?;
     let render = |d: &Diagnostic| Failure {
         name: d.name.clone(),
-        rendered: d.render(&display_path, &source, &lines),
+        rendered: mods.render(d),
     };
-    let scanned = scan::scan(&source);
-    let tokens = lexer::lex(&scanned.program_text).map_err(|d| vec![render(&d)])?;
-    let mut program = parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
-        .map_err(|d| vec![render(&d)])?;
     mono::monomorphize(&mut program).map_err(|d| vec![render(&d)])?;
     check::check(&mut program).map_err(|d| vec![render(&d)])?;
-    Ok(interp::run_tests(&program, &source, &display_path))
+    Ok(interp::run_tests(&program, &mods))
 }
 
 /// Rendered-output wrapper around `check_file_structured`.
 pub fn check_file(path: &Path, opts: &Options) -> Outcome {
-    let display_path = path.display().to_string();
-    let (source, result) = check_file_structured(path, opts);
-    let lines = LineMap::new(&source);
+    let (mods, result) = check_file_structured(path, opts);
     match result {
         Ok(info) => Outcome::Verified {
             functions: info.functions,
@@ -127,7 +133,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
             warnings: info
                 .warnings
                 .iter()
-                .map(|d| d.render_level("warning", &display_path, &source, &lines))
+                .map(|d| mods.render_level("warning", d))
                 .collect(),
         },
         Err(diags) => Outcome::Failed(
@@ -135,7 +141,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
                 .iter()
                 .map(|d| Failure {
                     name: d.name.clone(),
-                    rendered: d.render(&display_path, &source, &lines),
+                    rendered: mods.render(d),
                 })
                 .collect(),
         ),
@@ -157,39 +163,22 @@ fn io_diag(name: &str, message: String) -> Diagnostic {
 pub fn check_file_structured(
     path: &Path,
     opts: &Options,
-) -> (String, Result<VerifiedInfo, Vec<Diagnostic>>) {
+) -> (modules::ModuleSet, Result<VerifiedInfo, Vec<Diagnostic>>) {
     let display_path = path.display().to_string();
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(err) => {
-            return (
-                String::new(),
-                Err(vec![io_diag(
-                    "io.read",
-                    format!("cannot read `{display_path}`: {err}"),
-                )]),
-            )
-        }
+    // Loader: the root file plus its `use` DAG, merged with combined-
+    // source spans (ADR 0013).
+    let (mut program, mods) = match modules::load(path, &opts.module_paths) {
+        Ok(ok) => ok,
+        Err((d, partial)) => return (partial, Err(vec![d])),
     };
-    let lines = LineMap::new(&source);
-    let render = |d: &Diagnostic| d.clone();
-
-    // Front end.
-    let scanned = scan::scan(&source);
-    let tokens = match lexer::lex(&scanned.program_text) {
-        Ok(t) => t,
-        Err(d) => return (source, Err(vec![render(&d)])),
-    };
-    let mut program = match parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text) {
-        Ok(p) => p,
-        Err(d) => return (source, Err(vec![render(&d)])),
-    };
+    let _ = display_path;
+    let source = mods.combined_source.clone();
     if let Err(d) = mono::monomorphize(&mut program) {
-        return (source, Err(vec![render(&d)]));
+        return (mods, Err(vec![d]));
     }
     let checked = match check::check(&mut program) {
         Ok(c) => c,
-        Err(d) => return (source, Err(vec![render(&d)])),
+        Err(d) => return (mods, Err(vec![d])),
     };
 
     // Verification conditions → Lean.
@@ -220,7 +209,7 @@ pub fn check_file_structured(
         };
         for d in &program.defers {
             if let Some(diag) = conflict_or_orphan(&d.name, "defer", d.span) {
-                return (source, Err(vec![diag]));
+                return (mods, Err(vec![diag]));
             }
             let goal = &find(&d.name).unwrap().goal;
             if goal.contains('∀') || goal.contains('∃') {
@@ -240,13 +229,13 @@ pub fn check_file_structured(
                         ),
                     ],
                 };
-                return (source, Err(vec![diag]));
+                return (mods, Err(vec![diag]));
             }
             treated.insert(d.name.as_str(), "defer");
         }
         for a in &program.assumes {
             if let Some(diag) = conflict_or_orphan(&a.name, "assume", a.span) {
-                return (source, Err(vec![diag]));
+                return (mods, Err(vec![diag]));
             }
             if let Some(prev) = treated.insert(a.name.as_str(), "assume") {
                 let diag = diag::Diagnostic {
@@ -256,7 +245,7 @@ pub fn check_file_structured(
                     label: "one obligation, one treatment".into(),
                     notes: vec![],
                 };
-                return (source, Err(vec![diag]));
+                return (mods, Err(vec![diag]));
             }
         }
         for d in &program.discharges {
@@ -268,7 +257,7 @@ pub fn check_file_structured(
                     label: "one obligation, one treatment".into(),
                     notes: vec![],
                 };
-                return (source, Err(vec![diag]));
+                return (mods, Err(vec![diag]));
             }
         }
     }
@@ -297,7 +286,7 @@ pub fn check_file_structured(
                     vec![("nearby obligations".into(), near.join("\n"))]
                 },
             };
-            return (source, Err(vec![d_diag]));
+            return (mods, Err(vec![d_diag]));
         }
     }
 
@@ -319,7 +308,7 @@ pub fn check_file_structured(
     if opts.emit_lean_only {
         print!("{}", emitted.lean_source);
         return (
-            source,
+            mods,
             Ok(VerifiedInfo {
                 functions: program.fns.len(),
                 obligations: vc.obligations.len(),
@@ -336,7 +325,7 @@ pub fn check_file_structured(
     .or_else(|| lean::find_repo_root(&std::env::current_dir().ok()?))
     else {
         return (
-            source,
+            mods,
             Err(vec![io_diag(
                 "internal.no_lean_dir",
                 "cannot locate the Sable Lean prelude (no ancestor directory \
@@ -349,7 +338,7 @@ pub fn check_file_structured(
     let out_dir = repo_root.join(".sable-out");
     if let Err(err) = std::fs::create_dir_all(&out_dir) {
         return (
-            source,
+            mods,
             Err(vec![io_diag(
                 "io.out_dir",
                 format!("cannot create {}: {err}", out_dir.display()),
@@ -363,7 +352,7 @@ pub fn check_file_structured(
     let lean_file = out_dir.join(format!("{stem}.lean"));
     if let Err(err) = std::fs::write(&lean_file, &emitted.lean_source) {
         return (
-            source,
+            mods,
             Err(vec![io_diag(
                 "io.write",
                 format!("cannot write {}: {err}", lean_file.display()),
@@ -380,19 +369,19 @@ pub fn check_file_structured(
             Ok(m) => m,
             Err(msg) => {
                 return (
-                    source,
+                    mods,
                     Err(vec![io_diag("internal.lean_invocation", msg)]),
                 )
             }
         },
     };
 
-    let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages, &lines));
+    let diags = lean::dedup_by_name(lean::diagnose(&emitted, &vc, &messages, &mods));
     if diags.is_empty() {
         let warnings =
             lean::dedup_by_name(lean::diagnose_warnings(&emitted, &vc, &messages));
         (
-            source,
+            mods,
             Ok(VerifiedInfo {
                 functions: program.fns.len(),
                 obligations: vc.obligations.len(),
@@ -402,6 +391,6 @@ pub fn check_file_structured(
             }),
         )
     } else {
-        (source, Err(diags))
+        (mods, Err(diags))
     }
 }

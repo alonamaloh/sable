@@ -1,0 +1,13 @@
+// Helper module: two exported functions, used by the collision and
+// unknown-name guards.
+
+/// pre  x < 100
+/// post result = x + 1
+fn bump(i32 x) -> i32 {
+    return x + 1;
+}
+
+/// post result = x
+fn same(i32 x) -> i32 {
+    return x;
+}

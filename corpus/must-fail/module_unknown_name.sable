@@ -1,0 +1,8 @@
+// expect-error: module.unknown_name
+// The listed import names nothing lib_pair defines.
+
+use lib_pair::{bump, no_such_fn};
+
+fn main_fn() -> i32 {
+    return 0;
+}

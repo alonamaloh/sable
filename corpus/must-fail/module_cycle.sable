@@ -1,0 +1,8 @@
+// expect-error: module.cycle
+// cyc_a imports cyc_b, which imports cyc_a back.
+
+use cyc_a;
+
+fn main_fn() -> i32 {
+    return 0;
+}

@@ -94,6 +94,13 @@ fn corpus() {
         }
     }));
 
+    // Module-diagnostic guards resolve their helper imports from
+    // must-fail/mods (kept out of the top-level scan so the helpers
+    // aren't themselves treated as cases).
+    let must_fail_opts = Options {
+        module_paths: vec![corpus_dir("must-fail").join("mods")],
+        ..Options::default()
+    };
     failures.extend(parallel(sable_files(&corpus_dir("must-fail")), |path| {
         let expected = expected_errors(path);
         assert!(
@@ -101,7 +108,7 @@ fn corpus() {
             "{} has no `// expect-error:` header",
             path.display()
         );
-        match check_file(path, &opts) {
+        match check_file(path, &must_fail_opts) {
             Outcome::Verified { .. } => vec![format!(
                 "{} should FAIL (expected {:?}) but verified",
                 path.display(),
@@ -130,9 +137,27 @@ fn corpus() {
 
     // Dynamic-test corpus: corpus/tests must pass with no skipped
     // clauses (the whole contract corpus is inside the monitorable
-    // fragment — a regression here means the fragment shrank).
+    // fragment — a regression here means the fragment shrank). Test
+    // files import their subjects from corpus/verifies (ADR 0013), so
+    // a subject clause that is deliberately outside the fragment (an
+    // unbounded ∃, say) is fenced by an `// expect-skip: <substr>`
+    // header — every skip must match a fence, and every fence must
+    // match a skip, so stale fences are failures too.
+    let test_opts = Options {
+        module_paths: vec![corpus_dir("verifies")],
+        ..Options::default()
+    };
     for path in sable_files(&corpus_dir("tests")) {
-        match sable::test_file(&path) {
+        let expected_skips: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("// expect-skip:")
+                    .map(|s| s.trim().to_string())
+            })
+            .collect();
+        match sable::test_file(&path, &test_opts) {
             Err(diags) => failures.push(format!(
                 "{} failed the front end:\n{}",
                 path.display(),
@@ -143,6 +168,7 @@ fn corpus() {
                     .join("\n")
             )),
             Ok(reports) => {
+                let mut matched_fences = vec![false; expected_skips.len()];
                 for r in &reports {
                     if let Err(msg) = &r.outcome {
                         failures.push(format!(
@@ -152,10 +178,22 @@ fn corpus() {
                         ));
                     }
                     for (clause, why) in &r.skipped {
+                        let fence = expected_skips.iter().position(|s| clause.contains(s.as_str()));
+                        match fence {
+                            Some(i) => matched_fences[i] = true,
+                            None => failures.push(format!(
+                                "{} test {} skipped a clause (fragment regression): {clause} — {why}",
+                                path.display(),
+                                r.name
+                            )),
+                        }
+                    }
+                }
+                for (i, fence) in expected_skips.iter().enumerate() {
+                    if !matched_fences[i] {
                         failures.push(format!(
-                            "{} test {} skipped a clause (fragment regression): {clause} — {why}",
-                            path.display(),
-                            r.name
+                            "{} has a stale `expect-skip` fence (no clause skipped matching it): {fence}",
+                            path.display()
                         ));
                     }
                 }
@@ -181,7 +219,7 @@ fn corpus() {
             "{} has no `// expect-test-failure:` header",
             path.display()
         );
-        match sable::test_file(&path) {
+        match sable::test_file(&path, &test_opts) {
             Err(diags) => failures.push(format!(
                 "{} failed the front end:\n{}",
                 path.display(),

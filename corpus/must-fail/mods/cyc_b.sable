@@ -1,0 +1,6 @@
+// Helper for module_cycle.sable: closes the cycle with cyc_a.
+use cyc_a;
+
+fn b_fn() -> i32 {
+    return 2;
+}

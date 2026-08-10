@@ -1,0 +1,9 @@
+// expect-error: module.name_collision
+// The importer defines `bump`, which lib_pair also exports.
+
+use lib_pair;
+
+/// post result = x
+fn bump(i32 x) -> i32 {
+    return x;
+}

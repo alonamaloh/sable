@@ -7,6 +7,7 @@ Usage:
   sable check <file.sable>           verify a Sable source file
   sable check --emit-lean <file>     print the generated Lean instead of checking
   sable test  <file.sable>           run test_* functions with dynamic contract checks
+  sable ... -M <dir>                 add a directory to the `use` module search path
   sable lsp                          run the language server on stdio
   sable daemon                       keep a warm Lean server for fast checks
                                      (socket: .sable-out/daemon.sock)
@@ -18,7 +19,13 @@ fn main() -> ExitCode {
     let mut command = None;
     let mut file = None;
 
+    let mut expect_module_path = false;
     for arg in &args {
+        if expect_module_path {
+            opts.module_paths.push(PathBuf::from(arg));
+            expect_module_path = false;
+            continue;
+        }
         match arg.as_str() {
             "check" if command.is_none() => command = Some("check"),
             "test" if command.is_none() => command = Some("test"),
@@ -28,6 +35,7 @@ fn main() -> ExitCode {
             // does, among others); stdio is our only transport, so accept it.
             "--stdio" if command == Some("lsp") => {}
             "--emit-lean" => opts.emit_lean_only = true,
+            "-M" | "--module-path" => expect_module_path = true,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -81,7 +89,7 @@ fn main() -> ExitCode {
     };
 
     if command == "test" {
-        return match sable::test_file(&file) {
+        return match sable::test_file(&file, &opts) {
             Err(failures) => {
                 for f in &failures {
                     eprintln!("{}", f.rendered);

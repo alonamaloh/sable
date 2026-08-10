@@ -293,7 +293,7 @@ pub fn diagnose(
     emitted: &Emitted,
     vc: &VcResult,
     messages: &[LeanMessage],
-    lines: &crate::span::LineMap,
+    mods: &crate::modules::ModuleSet,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for msg in messages {
@@ -327,7 +327,9 @@ pub fn diagnose(
                 let mut notes = vec![("goal".into(), ob.goal.clone())];
                 if !ob.context.is_empty() {
                     // Each entry carries the line its fact came from, so
-                    // the provenance of every hypothesis is traceable.
+                    // the provenance of every hypothesis is traceable —
+                    // cross-module facts name their file.
+                    let ob_file = mods.locate(ob.span.start).0.to_string();
                     let rendered: Vec<String> = ob
                         .context
                         .iter()
@@ -335,8 +337,13 @@ pub fn diagnose(
                             if span.start == 0 && span.end == 0 {
                                 text.clone()
                             } else {
-                                let (line, _) = lines.line_col(span.start);
-                                format!("{text}   (line {line})")
+                                let (file, line, _) = mods.locate(span.start);
+                                if file == ob_file {
+                                    format!("{text}   (line {line})")
+                                } else {
+                                    let short = file.rsplit('/').next().unwrap_or(file);
+                                    format!("{text}   ({short}:{line})")
+                                }
                             }
                         })
                         .collect();

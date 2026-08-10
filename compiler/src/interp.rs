@@ -9,7 +9,6 @@
 //! verification claim, and test functions are never verified.
 
 use crate::ast::*;
-use crate::span::LineMap;
 use crate::speceval::{self, GhostDefs, SpecEnv, SpecVal};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -45,8 +44,8 @@ type IResult<T> = Result<T, Trap>;
 
 const FUEL: u64 = 50_000_000;
 
-pub fn run_tests(program: &Program, source: &str, path: &str) -> Vec<TestReport> {
-    let lines = LineMap::new(source);
+pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<TestReport> {
+    let source = mods.combined_source.as_str();
     let ghosts = GhostDefs::from_items(&program.ghosts);
     let fns: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let classes = &program.classes;
@@ -65,8 +64,8 @@ pub fn run_tests(program: &Program, source: &str, path: &str) -> Vec<TestReport>
                 skipped: Vec::new(),
             };
             let outcome = interp.call(test, Vec::new()).map(|_| ()).map_err(|trap| {
-                let (line, col) = lines.line_col(trap.span.start);
-                format!("{} ({path}:{line}:{col})", trap.message)
+                let (file, line, col) = mods.locate(trap.span.start);
+                format!("{} ({file}:{line}:{col})", trap.message)
             });
             TestReport {
                 name: test.name.clone(),

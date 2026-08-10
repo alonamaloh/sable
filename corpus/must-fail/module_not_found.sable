@@ -1,0 +1,8 @@
+// expect-error: module.not_found
+// `use` names a module that exists on no search path.
+
+use no_such_module;
+
+fn main_fn() -> i32 {
+    return 0;
+}

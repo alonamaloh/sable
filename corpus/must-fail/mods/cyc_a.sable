@@ -1,0 +1,6 @@
+// Helper for module_cycle.sable: imports cyc_b, which imports back.
+use cyc_b;
+
+fn a_fn() -> i32 {
+    return 1;
+}

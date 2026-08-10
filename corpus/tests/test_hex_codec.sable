@@ -4,64 +4,11 @@
 // are arithmetic, not if-then-else, precisely so speceval can expand
 // them) — zero skipped clauses expected.
 
-/// def hex_digit (d : int) : int := 48 + d + 39 * (d / 10)
-/// def unhex (c : int) : int := c - 48 - 39 * (c / 97)
-
-/// pre  d < 16
-/// post result = hex_digit d
-fn nibble_char(u8 d) -> u8 {
-    if (d < 10) { return 48 + d; }
-    return 87 + d;
-}
-
-/// pre  (48 ≤ c ∧ c ≤ 57) ∨ (97 ≤ c ∧ c ≤ 102)
-/// post result = unhex c
-fn unhex_char(u8 c) -> u8 {
-    if (c < 58) { return c - 48; }
-    return c - 87;
-}
-
-/// pre  src.len ≤ 1000000
-/// pre  dst.len = 2 * src.len
-/// post ∀ k, 0 ≤ k → k < src.len →
-///      dst.get (2 * k) = hex_digit (src.get k / 16) ∧
-///      dst.get (2 * k + 1) = hex_digit (src.get k % 16)
-fn hex_encode(&[u8] src, &mut [u8] dst) {
-    u64 n = src.len;
-    /// invariant ∀ k, 0 ≤ k → k < i →
-    ///           dst.get (2 * k) = hex_digit (src.get k / 16) ∧
-    ///           dst.get (2 * k + 1) = hex_digit (src.get k % 16)
-    for (u64 i : range(n)) {
-        u8 b = src[i];
-        u8 c1 = nibble_char(b / 16);
-        u8 c2 = nibble_char(b % 16);
-        dst[2 * i] = c1;
-        dst[2 * i + 1] = c2;
-    }
-}
-
-/// pre  dst.len ≤ 1000000
-/// pre  src.len = 2 * dst.len
-/// post result → ∀ k, 0 ≤ k → k < dst.len →
-///      dst.get k = 16 * unhex (src.get (2 * k)) + unhex (src.get (2 * k + 1))
-fn hex_decode(&[u8] src, &mut [u8] dst) -> bool {
-    u64 n = dst.len;
-    /// invariant ∀ k, 0 ≤ k → k < i →
-    ///           dst.get k = 16 * unhex (src.get (2 * k)) + unhex (src.get (2 * k + 1))
-    for (u64 i : range(n)) {
-        u8 c1 = src[2 * i];
-        u8 c2 = src[2 * i + 1];
-        if (c1 < 48 || (c1 > 57 && c1 < 97) || c1 > 102) { return false; }
-        if (c2 < 48 || (c2 > 57 && c2 < 97) || c2 > 102) { return false; }
-        u8 d1 = unhex_char(c1);
-        u8 d2 = unhex_char(c2);
-        dst[i] = 16 * d1 + d2;
-    }
-    return true;
-}
+use hex_codec;
 
 // Round trip over the byte-value corners: 0x00, 0x0f, 0x10, 0xab, 0xff
 // (encodes to "000f10abff"; both nibble branches on both sides).
+
 fn test_round_trip() {
     [u8] src = [0, 15, 16, 171, 255];
     [u8] enc = alloc_array<u8>(10, 0);

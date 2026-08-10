@@ -170,11 +170,22 @@ fn publish(
     let mut warnings = Vec::new();
     if full && diags.is_empty() {
         if let Some(path) = uri_path(uri) {
-            let (_, result) = crate::check_file_structured(&path, &crate::Options::default());
+            let (mods, result) = crate::check_file_structured(&path, &crate::Options::default());
+            // Only diagnostics in the root module belong to this uri
+            // (imports carry combined-source spans past the root's end).
+            let root_len = mods.modules.first().map(|m| m.len).unwrap_or(usize::MAX);
             match result {
-                Err(mut more) => diags.append(&mut more),
+                Err(more) => {
+                    diags.extend(more.into_iter().filter(|d| d.span.start < root_len));
+                }
                 // Automation-budget warnings surface at WARNING severity.
-                Ok(info) => warnings = info.warnings,
+                Ok(info) => {
+                    warnings = info
+                        .warnings
+                        .into_iter()
+                        .filter(|d| d.span.start < root_len)
+                        .collect();
+                }
             }
         }
     }

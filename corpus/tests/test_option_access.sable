@@ -2,26 +2,7 @@
 // contracts are fully monitorable — `.is_some`/`.value` in clause text
 // evaluate with the same junk-on-none convention as the model.
 
-/// pre  x < 2147483647
-/// post result.is_some ↔ 0 ≤ x
-/// post result.is_some → result.value = x + 1
-fn incr_nonneg(i32 x) -> option<i32> {
-    if (x >= 0) {
-        return some(x + 1);
-    }
-    return none;
-}
-
-/// pre  0 ≤ x
-/// pre  x ≤ 1000
-/// post result = x + 1
-fn use_it(i32 x) -> i32 {
-    option<i32> r = incr_nonneg(x);
-    if (r.is_some) {
-        return r.value;
-    }
-    return 0;
-}
+use option_access;
 
 fn test_option_roundtrip() {
     use_it(0);
