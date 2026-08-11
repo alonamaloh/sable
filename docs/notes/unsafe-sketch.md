@@ -1,16 +1,25 @@
-# Unsafe Sable — a design sketch
+# Unsafe Sable — the design argument
 
 *Companion to design §5 (the boundary as adoption gate), §9 (the escape
 ladder), §11 (profiles and machine models), and the goals document's
 allocator benchmark ("the real deliverable is the design of unsafe
-Sable"). Nothing here is implemented; this note exists to be argued
-with.*
+Sable").*
 
-*Provenance: a first draft argued from systems examples; an external
-design review (GPT-5.6) proposed the affine-resource architecture,
-which is better than what the first draft had and is adopted here as
-the spine. This version is the synthesis, including the places the two
-disagree — those are flagged, not smoothed over.*
+*This is the **argument** half of a pair. It says what the problem is,
+why this decomposition rather than another, and what is still open to
+taste. The **specification** — resource types, syntax, machine changes,
+milestones U1–U10, corpus, exit criteria — is
+`docs/notes/unsafe-plan.md`. Read this one to disagree with the design;
+read that one to build it. Neither is implemented; when the U1 probe
+concludes, the chosen interpretation becomes an ADR that supersedes both
+on the points it decides.*
+
+*Provenance: a first draft argued from systems examples (Claude); an
+external design review (GPT-5.6) proposed the affine-resource
+architecture, which was better than the first draft and is the spine
+here; a synthesis; then a specification round and a review of it. Where
+the rounds disagreed, the disagreement is recorded rather than smoothed
+over.*
 
 ## Six examples, and what each actually needs
 
@@ -56,7 +65,9 @@ architecture with Sable in place of C.
 sequential and no boundary construct papers over that. Named so its
 absence is a decision: concurrency is its own machine extension (§12),
 and atomics will follow the same contracted-intrinsic pattern as
-everything else — but the machine grows first.
+everything else — but the machine grows first. The first concurrent
+benchmark should be an SPSC queue, not a spinlock smuggled into a
+sequential model.
 
 ## Rust's `unsafe` is three things wearing one keyword
 
@@ -73,11 +84,18 @@ is a named, audited, tallied axiom. So the design problem is (1) and
 (2) — and the central claim of this note is that (2) should be *typed*,
 not trusted.
 
+This classification answers "why does systems code reach for `unsafe`."
+It is orthogonal to, and does not replace, the question "which Sable
+mechanism is involved" — verified unsafe code, machine intrinsic, or
+external contract. Both classifications earn their keep; the plan
+carries the second, this note carries the first.
+
 ## The spine: a verified resource sublanguage
 
 > A raw pointer says **where**.
-> A resource says **what memory you own and what state it is in**.
-> A contract says **how an operation transforms that resource**.
+> A resource says **what authority the program owns and what state it
+> is in**.
+> A contract says **how an operation transforms that authority**.
 > `unsafe` marks the audit surface and confers **no** logical authority.
 > `extern` and `assume` are where trust actually enters.
 
@@ -91,89 +109,91 @@ resource value   erased, affine
 
 A resource cannot be copied or fabricated. It is moved, borrowed,
 split, joined, or transformed by operations whose resource contracts
-are checked. Core resources:
+are checked. Core resources: ownership of raw bytes, ownership of one
+typed location, authority to release a root allocation, and — the
+refinement the allocator forces — an allocator-specific *lease* for a
+suballocated block, which is emphatically not a free token.
 
-```text
-RawSpan(p, n, bytes)          ownership of n raw bytes at p
-PointsTo<T>(p, state)         ownership of one typed location
-Dealloc(allocation, layout)   authority to release an allocation
-```
+Splitting deallocation authority from contents is load-bearing: an
+allocation may be carved into many subregions, and none of them may
+thereby acquire permission to free itself. Verus's `vstd::raw_ptr`
+library independently arrives at nearly the same factoring — separate
+typed and raw access permissions, initialization state in the
+permission rather than the pointer, a distinct deallocation permission
+returned alongside memory authority at allocation. That is
+corroboration rather than proof, but two designs reaching the same
+split from different starting points is evidence it is forced by the
+problem rather than chosen by taste.
 
-Splitting `Dealloc` from contents is load-bearing: an allocation may be
-carved into many subregions, and none of them may thereby acquire
-permission to free itself. (Verus's raw-pointer library converged on
-the same decomposition; treat that as evidence the factoring is
-forced, not stylistic.)
-
-`unsafe { … }` makes raw intrinsics *available*; it does not make them
-*legal*. `read_copy(p, cell)` is legal because the caller holds a
-`PointsTo` whose `ptr` is `p` and whose state is initialized — an
-ordinary precondition, discharged the ordinary way. Consequently
-`unsafe` must never permit an `assume`, fabricate a resource, suppress
-a VC, or turn an invalid access into unchecked native behavior.
+**Affine, not linear.** A resource may be abandoned; that leaks, and a
+leak is not a safety failure. Memory safety must not depend on
+mandatory cleanup. `#[must_consume]` can diagnose leaks later as a
+separate, weaker guarantee — the two must not be conflated.
 
 **A package with verified unsafe code and no assumptions is fully
 verified.** Unsafe is an audit surface, not a trust gap; the status
-line should say so, and separate the categories:
-
-```text
-unsafe blocks:       14  (all resource obligations proved)
-unsafe interfaces:    3
-external contracts:   2  (audited assumptions, listed)
-assumes:              0
-defers:               0
-```
+line should say so, and separate the categories — unsafe blocks,
+unsafe interfaces, external contracts, assumes, defers — so that
+"fully verified" never appears next to an unproved extern contract.
 
 Raw pointers carry no ownership and one type, `raw<T>`: read/write
 authority comes from the accompanying resource, so the pointer itself
 is freely copyable and harmless. It denotes **provenance + offset**,
 not an address — two pointers may share a machine address and refer to
-different allocations after reuse. v1 restrictions: no
-integer-to-pointer round trip, arithmetic preserves provenance,
-comparison requires a common allocation, `option<raw<T>>` instead of
-null, `raw<u8> → raw<T>` requires alignment/size plus a resource
-transformation, and **creating a pointer never creates a resource**.
+different allocations after reuse. Creating a pointer never creates a
+resource.
 
 ## Affinity without separation logic in the evidence layer
 
-This is the piece the review flagged as "prototype this first," and I
-think it has a cleaner answer than a Lean separation-logic
+This is the piece the review flagged as "prototype this first," and the
+answer it converged on is cleaner than a Lean separation-logic
 embedding — clean enough to be the design's main bet.
 
-**Affinity is a checker property; provability is a Lean property. They
-never meet.** Resources are checked affine by the Rust-side
-typechecker, and they *do not appear in Lean as hypotheses at all*.
-What appears in contracts is a resource's **view**: ordinary pure
-projections (`cell.ptr`, `cell.initialized`, `cell.value`,
-`span.bytes`). Lean sees opaque values with fields and reasons about
-them with the mathematics it already has. There is no `PointsTo p v`
+> **Authority is a checker property. Resource state is a Lean value.
+> The soundness theorem connects them.**
+
+An earlier draft of this note said something stronger and wrong —
+"affinity and provability never meet." They do meet, in the
+metatheorem, and the sharper statement matters because the wrong one
+implies an implementation the architecture forbids. The checker
+maintains an affine context of live authorities. Lean never receives
+those authorities as propositions; it receives each resource's **view**
+— ordinary pure projections (`span.ptr`, `span.bytes`, `cell.state`,
+`lease.allocator`). Facts about a view are knowledge, and knowledge is
+freely duplicable: copying the fact that a cell is initialized does not
+copy the authority to touch it. So there is no `PointsTo p v`
 proposition, no `*`, no frame rule, no bunched implication in any
 clause a user writes or reads.
 
-This works because the dangerous inference — *using the same ownership
-twice* — is impossible to express, not merely false: to state it you
-would need to mention a resource variable twice, and the checker
-rejects that before Lean is invoked. Disjointness facts arrive as
-*consequences of the affine discipline*, not as proof obligations.
+The division of labor is exact, and it has to be, because Sable's
+central invariant is that proof text is spliced verbatim and the Rust
+side never interprets it. **The compiler rejects repeated consuming
+*program* uses of a resource token. It does not, and must not, police
+how often `span` appears on a `///` line.** The first draft claimed the
+dangerous inference was "impossible to express" because the checker
+would reject mentioning a resource twice — that would require the Rust
+side to parse Lean, which it does not do and should never do. What is
+impossible is *obtaining* the second authority, not *writing* the
+second occurrence.
 
 The substrate exists. `check.rs` already runs a flow-sensitive
-per-variable state machine (`VarInfo { ty, initialized, mutable }`) for
-definite initialization; affine tracking adds one state (*consumed*)
-and the rule that consuming a resource variable requires it live and
-leaves it dead. Every diagnostic in the negative corpus below
-(duplicate a `PointsTo`, use after deallocation, read after `take`) is
-then a *typechecker* error with a source span and a name — not a failed
-SMT query, and not a Lean goal about a global heap.
+per-place state machine for definite initialization and affinity (ADR
+0020/0021), and every negative example below is a *typechecker* error
+with a source span and a name — not a failed SMT query, and not a Lean
+goal about a global heap. What does not yet exist is a real engine: the
+current `moved` bit is adequate for whole local class values and
+nothing more, which is why the plan builds a place-and-borrow engine on
+ordinary classes before resources need it.
 
 Where does it break? A statically unknown *number* of resources — the
 intrusive list's per-node permissions. The answer is not to reach for
 separation logic but to make the aggregate a **single affine token
-holding a Lean `Map`**, with `take`/`put` as the only way in and out.
-Interior disjointness is then a consequence of the map being a function
-— ordinary Lean mathematics, no new logic. The intrusive-list benchmark
-exists precisely to test whether that holds up; if extraction and
-reinsertion turn into a wall of rearrangement, that is the signal to
-improve the resource layer, not to paper over it with tactics.
+holding a Lean map**, with sealed `take`/`put`/`borrow` as the only way
+in and out. But note the honest correction: interior disjointness does
+**not** follow merely from the map being a function. It follows from
+the hidden interpretation of the aggregate token as the valid
+composition of the resources it contains. That is where the separating
+structure lives, and it lives there invisibly.
 
 Separation logic still exists — in the **soundness metatheorem**
 relating the resource discipline to the raw heap, where `*` belongs.
@@ -181,21 +201,29 @@ Users never write it. Evidence blocks never contain it. This is the
 same division of labor that makes safe Sable readable: ownership is a
 type-system fact, and the logic reasons about values.
 
+**The place this bet is most likely to fail is loops.** At a loop head
+Sable's havoc discards facts and re-establishes only the invariants, so
+nothing in the goal says two live tokens still describe disjoint
+authority on the second iteration. That has to follow from shape
+equality at the backedge preserving the interpretation — which makes it
+a theorem to prove, not a rule to assert. A carving loop is therefore
+part of the first probe, not a later refinement.
+
 ## What the machine grows
 
-The SVM gains a **raw heap** alongside the existing value world:
+The SVM gains a **raw heap** alongside the existing value world, with
+allocations carrying id, size, alignment, liveness, and initialization
+state; `raw<T>` is (allocation id, offset); freeing marks an allocation
+dead so a stale pointer keeps its old provenance and can never alias a
+later reuse. Every existing safe rule frames the raw heap unchanged —
+the same absorb-without-disturbing extension the machine took twice
+already (capacity; frames), each time with agreement, determinism, and
+progress re-proven.
 
-```text
-Config = code × frames × rawHeap × trace × …
-```
-
-with allocations carrying id, size, alignment, liveness, and
-initialization state; `raw<T>` is `(allocation id, offset)`; freeing
-marks an allocation dead so a stale pointer keeps its old provenance
-and can never alias a later reuse. Every existing safe rule simply
-frames the raw heap unchanged — the same absorb-without-disturbing
-extension the machine took twice already (capacity; frames), each time
-with agreement/determinism/progress re-proven.
+Raw storage is not a `seq u8`. Uninitialized is a distinct byte state,
+and for typed storage `uninit | init(T)` must not be encoded as
+`option<T>`: an initialized `option<U>` holding `none` has to stay
+distinguishable from storage that was never written.
 
 **Resources are erased, so they are not in the configuration at all.**
 The machine has a heap; the resource layer is a static discipline; the
@@ -220,7 +248,7 @@ Two further extensions, both reusing precedent:
   soundness quantifies over the oracle. Driver correctness then becomes
   a *trace predicate* — example 1's "emits exactly this sequence" is a
   short, device-independent `post`. A device register is emphatically
-  **not** a `PointsTo<u32>` with a volatile flag.
+  **not** a typed cell with a volatile flag.
 
 Every raw operation stays total: it succeeds or reaches `trapped`/
 `undef`, and verified programs prove the bad outcomes unreachable. The
@@ -232,27 +260,33 @@ the negative corpus stays honest.
 ## Trust, and where it is visible
 
 `extern` declarations carry full contracts plus a mandatory audit
-payload (the `assume` precedent: the reason string is not optional) and
-an explicit frame clause; call sites owe the pres and gain the posts,
-using the call machinery that already exists. Foreign pointer arguments
-are `noescape` by default, so the compiler can expose a safe slice for
-the duration of the call and reclaim it immediately after.
+payload (the `assume` precedent: the reason string is not optional).
+Crucially, effects are stated **structurally, through resource
+parameters**, not as a free-form global `modifies` clause: only passed
+mutable resources may change, and a foreign function that touches
+global state must receive an explicit world capability. The foreign
+implementation is trusted to respect an ownership-shaped contract —
+which is a much smaller thing to trust than an arbitrary frame formula.
+Foreign pointer arguments are `noescape` by default, so the compiler
+can expose a safe slice for the duration of the call and reclaim it
+immediately after.
 
 Because contracts are machine objects, the compiler can compute, per
-exported function, the transitive set of boundary axioms its
-verification rests on — a **trust manifest**. `unsafe` is the *local*
-audit marker; the manifest is the *global* one, and only the manifest
-answers "what does this export actually depend on." For a language
-where LLMs write most of the code, the manifest is the artifact the
-human reviews.
+module, the transitive set of boundary axioms its verification rests
+on — a **trust manifest**. `unsafe` is the *local* audit marker; the
+manifest is the *global* one, and only the manifest answers "what does
+this export actually depend on." For a language where LLMs write most
+of the code, the manifest is the artifact the human reviews. It has to
+be hashed into the content-addressed artifact rather than stored
+beside it (ADR 0018): an artifact must not outlive a change to what it
+trusted.
 
 Trust also gets an alternative to itself: `extern` contracts are
 assumptions *unless the foreign implementation ships an imported
 proof*, which is the hook for verified-library interop later.
 
 Resources are more general than memory, and file descriptors are the
-cheap demonstration: `class File { i32 fd; /// resource open : OpenFile fd }`,
-where `close` consumes the resource and the destructor invokes it
+cheap demonstration — an affine `OpenFile` that `close` consumes
 exactly once.
 
 ## Monitorability
@@ -270,97 +304,45 @@ be able to check it, and native code cannot track provenance without
 shadow state it should not be made to pay for. Sanitizer-detectable ≠
 release-monitorable, and the ladder should keep the distinction sharp.
 
-## Prerequisites — the sequencing finding
+## What the probes are meant to falsify
 
-The resource design is written in a Sable that does not exist yet.
-`class Box<T> { raw<T> ptr; /// resource cell : … }` needs **class-valued
-fields**; `split(region) -> pair<Region, Region>` needs **moves** and a
-product type; `RawRegion` methods that consume `self` need **by-value
-class parameters**. All of these are ADR 0010's explicitly deferred
-slice B (moves, `&mut C`, class-valued fields).
+The architecture is a bet, and these are the specific ways it could
+lose. Each is an exit criterion in the plan, phrased here as the
+failure it is looking for.
 
-So: **unsafe v1 is blocked on finishing first-class class values**, and
-the deep reason is one thing, not three — ownership must mature from
-*locals* to *places* (sub-parts of owned things, with their own
-ownership, transferable independently). Resource carving is that same
-notion at byte granularity. Whichever lands first digs the foundation
-the other builds on, and class values is the one with a milestone
-(`Integer`) already waiting on it.
+1. **View contracts are not concise.** If stating what `split_off` does
+   takes a paragraph of view algebra, the abstraction is not paying for
+   itself.
+2. **Separation leaks into user clauses.** If the hidden interpretation
+   cannot establish disjointness without `*` appearing somewhere a user
+   reads, the main bet has failed.
+3. **Loops leak it too.** If a carving loop's invariants have to
+   restate hidden separation facts, the bet fails in the place most
+   real allocator code lives.
+4. **Aggregates only work for hand-picked finite lists.** The intrusive
+   list is the exam; a wall of explicit resource rearrangement is the
+   failing grade.
+5. **`copy_prefix` is proof-noisy.** The smallest useful vertical slice
+   should have a two-line value-level spec and no user-visible heap
+   predicate. If it does not, nothing above it will.
 
-## The ladder
-
-Ordering differs from the review's in one deliberate place, flagged
-below.
-
-0. **Class values slice B** (moves, class-valued fields, `&mut C`) — the
-   prerequisite above.
-1. **Lean prototype of the resource layer.** A tiny raw heap,
-   `RawSpan`/`PointsTo`/`Dealloc`, and the split/join/read/write/init/
-   free rules, proven before compiler work — the probe-first rule that
-   has paid every time (bignum, hashmap, Algorithm D). The specific
-   question it must answer: do resource *views* generate tractable
-   goals, and does the affine-token-plus-`Map` trick hold for
-   aggregates?
-2. **Safe buffer split + copy.** `copy_prefix(&[u8] src, &mut [u8] dst)`
-   implemented through lexical exposure. Tests exposure, provenance,
-   splitting, read-vs-write authority, nonoverlap, frame conditions,
-   reconstruction, and nonescape — all in one small example with a
-   two-line spec. Do not proceed until it is clean.
-3. **FFI: `read`/`write`/`close` with safe wrappers.** *(Moved up from
-   the review's #5.)* It needs only exposure plus extern contracts — no
-   `Dealloc`, no typed `PointsTo`, no allocator — and design §5 calls
-   the FFI boundary the gate between research artifact and usable
-   language. Making the adoption gate wait behind three substantial
-   verification projects is the wrong risk order.
-4. **Static bump arena.** Program-lifetime region, so arena-outlives-
-   allocation never arises. Invariant: `allocated prefix * unused suffix
-   = original region`. Design criterion: *if the arena has to sit inside
-   one large unsafe block, the resource API is too weak* — only root
-   acquisition, typed conversion, and raw loads/stores should be
-   visibly unsafe.
-5. **In-band free-list allocator.** Metadata inside free blocks, not an
-   auxiliary safe vector: bytes changing roles between allocator
-   metadata, uninitialized storage, and typed objects is the
-   informative part. This is what justifies separate `Dealloc`
-   authority, provenance, and joining rules.
-6. **Intrusive doubly linked list.** The aggregate-resource exam
-   described above; the go/no-go for the affine-token design.
-7. **MMIO and privileged state**, as a semantic layer (trace + oracle),
-   not as heap access.
-
-Excluded from v1, deliberately: integer-to-pointer conversion, escaping
-pointers to movable locals, general `transmute`, unions/packed structs,
-bytewise copies of pointer-containing values, retained foreign pointers
-and callbacks, atomics/DMA/shared raw memory, and `defer` for
-liveness/provenance/ownership obligations.
-
-Negative corpus (each must be a *named diagnostic*, most of them from
-the typechecker): duplicate a `PointsTo`; read before initialization;
-read after `take`; use a pointer after deallocation; deallocate a
-subregion; free through the wrong allocator; join nonadjacent regions;
-overlapping `copy_nonoverlapping`; return a pointer from `expose`;
-construct ownership from an integer.
-
-## Layout as law-carrying concepts
-
-Raw memory forces an explicit layout interface, and ADR 0009's concepts
-are the right shape for it: `size_of`, `align_of`, and
-`represents : seq u8 → T → Prop` as spec functions, with laws (align is
-a nonzero power of two; representations have length `size_of`;
-representation is functional). Separate concepts for separate powers —
-`RawStorable`, `BitwiseCopyable`, `FromBytes`, `Zeroable`, `CRepr` —
-because they are different mathematical claims. v1 supports integers,
-arrays of supported elements, and explicitly laid-out records; not
-arbitrary classes, references, destructor-bearing values, unions, or
-packed structs.
+The response to any of these is to simplify or strengthen the resource
+abstraction — not to expose general separation logic prematurely, and
+not to widen `assume`.
 
 ## Open questions (taste, explicitly)
 
-1. **Is `unsafe {}` worth writing if it grants nothing?** Position
-   taken: yes, as a local audit marker, paired with the derived global
-   manifest. The counterargument — a marker that confers no authority
-   is a lint, and lints should be derived so they cannot lie — is not
-   obviously wrong.
+1. **Is `unsafe {}` worth writing if it grants nothing logical?**
+   Settled: `unsafe` grants no authority and waives no obligation. Not
+   settled: whether the lexical marker earns its weight, or whether the
+   unsafe surface should be derived entirely. Position taken, and
+   provisional through the FFI milestone — keep the block, because it
+   does grant something operational (access to a restricted
+   vocabulary), while deriving everything that could go stale (unsafe
+   interfaces from signatures, trust dependencies from the call graph,
+   unnecessary blocks from their contents). The counterargument stands:
+   a marker that confers nothing is a lint, and lints should be derived
+   so they cannot lie.
 2. **Trust payload shape**: reason string only (the `assume`
    precedent), or structured fields (ABI, layout, alignment,
    provenance) that tooling can act on?
@@ -370,5 +352,27 @@ packed structs.
 4. **How much of the trace is contract-visible.** Full event lists
    compose awkwardly; drivers likely want trace *projections* ("the
    writes to UART0 are…") as ghost functions over the trace — unproven.
-5. **Alignment in the model.** Regions are byte arrays; alignment is a
-   lowering concern until it is a proof concern. Where does it enter?
+5. **Pointer equality across allocations.** Ordering and subtraction
+   need common provenance; live cross-allocation equality is the open
+   one, and the intrusive list is what should decide it. Restricting
+   the first list to nodes carved from one arena sidesteps it, which
+   may be the right v1 answer or may be hiding the question.
+6. **Mandatory cleanup.** Affine authority buys safety; linear or
+   `#[must_consume]` buys leak freedom. Which resources deserve the
+   stronger discipline is unresolved, and the two must not be
+   conflated into one keyword.
+
+## The bottom line
+
+> **Make raw pointers useless without affine erased resources, and make
+> those resources visible to Lean only through pure views.**
+
+The repository has already validated the first half of the checker
+story at a smaller scale: affine moves are source-level flow facts with
+spans, and the logic reasons about the same class value whether it
+arrived by borrow or by move (ADR 0020), with the flow facts precise
+enough to follow control flow (ADR 0021). The next argument should be
+executable. Start with the concrete Lean probe — including the loop —
+then the place engine, then a byte-only vertical slice, and stop at
+`copy_prefix` long enough to judge whether the abstraction really
+preserves Sable's readability.
