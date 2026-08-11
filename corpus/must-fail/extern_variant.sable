@@ -1,0 +1,7 @@
+// expect-error: extern.variant
+// There is no recursion here to measure: an extern has no body, so a
+// decreasing measure has nothing to decrease over.
+
+/// variant n
+extern "C" #[audit(id := "test.v.v1", reason := "no body")]
+fn c_v(u64 n);

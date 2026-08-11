@@ -1,0 +1,6 @@
+// expect-error: extern.param_abi
+// Extern parameters are integers, raw pointers, and resources. A safe
+// array would need a layout guarantee Sable does not make yet.
+
+extern "C" #[audit(id := "test.arr.v1", reason := "no layout")]
+fn c_take(&[u8] a);

@@ -1,0 +1,6 @@
+// expect-error: extern.abi
+// One ABI for now. Naming another would be a promise about calling
+// conventions the compiler cannot keep.
+
+extern "C++" #[audit(id := "test.x.v1", reason := "unsupported")]
+fn c_x(u64 n);

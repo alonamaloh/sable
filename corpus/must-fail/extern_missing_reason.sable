@@ -1,0 +1,7 @@
+// expect-error: extern.missing_audit
+// An extern declaration needs audit metadata. A trusted contract with no
+// recorded reason is an unsourced axiom, and the manifest exists so that a
+// reader can find every one of them.
+
+extern "C" #[audit(id := "test.thing.v1")]
+fn c_thing(u64 n);

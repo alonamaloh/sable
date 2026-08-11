@@ -1,0 +1,20 @@
+// expect-test-failure: no test shim for audited extern
+// An extern with no test shim fails loudly. Running its empty body as a
+// no-op would let the contract appear to hold because nothing happened,
+// which is the one outcome a monitor must never produce.
+
+/// pre  n ≤ mem.len
+/// post mem.len = (old mem).len
+extern "C" #[audit(id := "test.absent.v1", reason := "declared, deliberately unimplemented")]
+fn c_absent(raw<u8> p, u64 n, resource &mut RawSpan mem);
+
+pub fn use_it(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        c_absent(p, a.len, &mut m);
+    }
+}
+
+fn test_absent() {
+    mut [u8] a = [1];
+    use_it(&mut a);
+}

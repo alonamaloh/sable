@@ -98,7 +98,8 @@ pub fn parse_module(
             parser.bump();
             if !(parser.at(&Tok::KwClass)
                 || matches!(parser.peek(), Tok::Ident(n) if n == "trait" || n == "const" || n == "fn")
-                || parser.at(&Tok::KwFn))
+                || parser.at(&Tok::KwFn)
+                || parser.at(&Tok::KwExtern))
             {
                 return Err(Diagnostic {
                     name: "module.bad_pub".into(),
@@ -131,6 +132,10 @@ pub fn parse_module(
             let mut c = parser.parse_const()?;
             c.is_pub = is_pub;
             consts.push(c);
+        } else if parser.at(&Tok::KwExtern) {
+            let mut f = parser.parse_extern()?;
+            f.is_pub = is_pub;
+            fns.push(f);
         } else {
             let mut f = parser.parse_fn()?;
             f.is_pub = is_pub;
@@ -958,6 +963,7 @@ impl<'a> Parser<'a> {
         let end = self.tokens[self.pos.saturating_sub(1)].span;
         Ok(Fn {
             is_pub: false,
+            extern_info: None,
             name,
             name_span,
             type_params: Vec::new(),
@@ -1009,6 +1015,7 @@ impl<'a> Parser<'a> {
             self_kind,
             f: Fn {
                 is_pub: false,
+                extern_info: None,
                 name,
                 name_span,
                 type_params: Vec::new(),
@@ -1051,8 +1058,131 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
+    /// `extern "C" #[audit(id := "...", reason := "...")] fn f(params);`
+    ///
+    /// The audit metadata is mandatory. A trusted contract with no
+    /// recorded reason is an unsourced axiom, and the manifest exists so a
+    /// reader can find every one of them (ADR 0027).
+    fn parse_extern(&mut self) -> PResult<Fn> {
+        let decl_line = self.peek_line();
+        let start = self.expect(Tok::KwExtern)?.span;
+        let abi = match self.peek().clone() {
+            Tok::Str(bytes) => {
+                self.bump();
+                String::from_utf8(bytes).map_err(|_| Diagnostic {
+                    name: "extern.abi".into(),
+                    title: "ABI string is not UTF-8".into(),
+                    span: start,
+                    label: "expected `\"C\"`".into(),
+                    notes: vec![],
+                })?
+            }
+            _ => return Err(self.error_expected("an ABI string, e.g. `\"C\"`")),
+        };
+        if abi != "C" {
+            return Err(Diagnostic {
+                name: "extern.abi".into(),
+                title: format!("unsupported ABI `{abi}`"),
+                span: start,
+                label: "only `\"C\"` for now".into(),
+                notes: vec![],
+            });
+        }
+        // `#[audit(id := "...", reason := "...")]`
+        self.expect(Tok::Hash)?;
+        self.expect(Tok::LBracket)?;
+        let (attr, attr_span) = self.ident()?;
+        if attr != "audit" {
+            return Err(Diagnostic {
+                name: "extern.missing_audit".into(),
+                title: format!("expected `audit`, found `{attr}`"),
+                span: attr_span,
+                label: "an extern declaration needs audit metadata".into(),
+                notes: vec![],
+            });
+        }
+        self.expect(Tok::LParen)?;
+        let mut audit_id = None;
+        let mut reason = None;
+        loop {
+            let (key, key_span) = self.ident()?;
+            self.expect(Tok::Colon)?;
+            self.expect(Tok::Assign)?;
+            let value = match self.peek().clone() {
+                Tok::Str(bytes) => {
+                    self.bump();
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+                _ => return Err(self.error_expected("a string")),
+            };
+            match key.as_str() {
+                "id" => audit_id = Some(value),
+                "reason" => reason = Some(value),
+                _ => {
+                    return Err(Diagnostic {
+                        name: "extern.missing_audit".into(),
+                        title: format!("unknown audit key `{key}`"),
+                        span: key_span,
+                        label: "expected `id` or `reason`".into(),
+                        notes: vec![],
+                    });
+                }
+            }
+            if self.at(&Tok::Comma) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        self.expect(Tok::RParen)?;
+        self.expect(Tok::RBracket)?;
+        let (Some(audit_id), Some(reason)) = (audit_id, reason) else {
+            return Err(Diagnostic {
+                name: "extern.missing_audit".into(),
+                title: "`audit` needs both `id` and `reason`".into(),
+                span: attr_span,
+                label: "an unsourced trusted contract is an unsourced axiom".into(),
+                notes: vec![(
+                    "note".into(),
+                    "the id is what invalidates artifacts when the contract changes; \
+                     the reason is what a reader of the manifest gets"
+                        .into(),
+                )],
+            });
+        };
+        let mut f = self.parse_fn_inner(Some(decl_line))?;
+        // Rejected here rather than in the checker: monomorphization drops
+        // an uninstantiated template before the checker sees it, and
+        // substitutes the parameters away on an instantiated one — so by
+        // then there is no generic extern left to reject.
+        if !f.type_params.is_empty() {
+            return Err(Diagnostic {
+                name: "extern.generic".into(),
+                title: format!("`{}` may not be generic", f.name),
+                span: f.name_span,
+                label: "an extern has one ABI, not a family of them".into(),
+                notes: vec![],
+            });
+        }
+        f.extern_info = Some(ExternInfo {
+            abi,
+            audit_id,
+            reason,
+            span: start,
+        });
+        Ok(f)
+    }
+
     fn parse_fn(&mut self) -> PResult<Fn> {
-        let fn_line = self.peek_line();
+        self.parse_fn_inner(None)
+    }
+
+    /// `decl_line` is `Some(line)` for a declaration whose contract block
+    /// sits above something other than `fn` — an `extern` header — and
+    /// which therefore has no body (ADR 0027).
+    fn parse_fn_inner(&mut self, decl_line: Option<usize>) -> PResult<Fn> {
+        let fn_line = decl_line.unwrap_or_else(|| self.peek_line());
+        let is_extern = decl_line.is_some();
         let start = self.expect(Tok::KwFn)?.span;
         let (name, name_span) = self.ident()?;
         if is_reserved_name(&name) {
@@ -1092,6 +1222,7 @@ impl<'a> Parser<'a> {
 
         let mut f = Fn {
             is_pub: false,
+            extern_info: None,
             name,
             name_span,
             type_params,
@@ -1139,6 +1270,23 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+        }
+        // An extern has no body: its contract is the whole of what is
+        // known about it, and there is nothing to check it against.
+        if is_extern {
+            if f.variant.is_some() {
+                return Err(Diagnostic {
+                    name: "extern.variant".into(),
+                    title: "an extern declaration has no `variant`".into(),
+                    span: f.span,
+                    label: "there is no recursion here to measure".into(),
+                    notes: vec![],
+                });
+            }
+            let end = self.expect(Tok::Semi)?.span;
+            self.tparams.clear();
+            f.span = start.join(end);
+            return Ok(f);
         }
         // Post-signature block (design §8: `fn gcd(...) -> u64` / `/// variant b` / `{`).
         let brace_line = self.peek_line();
@@ -1203,6 +1351,7 @@ impl<'a> Parser<'a> {
             let end = self.expect(Tok::Semi)?.span;
             let mut f = Fn {
             is_pub: false,
+            extern_info: None,
                 name: mname,
                 name_span: mspan,
                 type_params: Vec::new(),
@@ -1303,6 +1452,7 @@ impl<'a> Parser<'a> {
             let end = self.tokens[self.pos.saturating_sub(1)].span;
             fns.push(Fn {
                 is_pub: false,
+                extern_info: None,
                 name: mname,
                 name_span: mspan,
                 type_params: Vec::new(),

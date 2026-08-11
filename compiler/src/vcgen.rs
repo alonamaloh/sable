@@ -57,6 +57,18 @@ pub struct VcResult {
     pub classes: Vec<ClassEmit>,
     pub clause_wfs: Vec<ClauseWf>,
     pub obligations: Vec<Obligation>,
+    /// What this module trusts (ADR 0027). Emitted into the generated
+    /// Lean as a comment header so it lands inside the artifact hash: an
+    /// artifact must not survive a change to what it trusted, and the
+    /// hash is over bytes, so a comment is enough.
+    pub trust: TrustManifest,
+}
+
+/// Everything a reader must take on faith to believe this module.
+#[derive(Debug, Clone, Default)]
+pub struct TrustManifest {
+    /// Audited extern contracts, as `(audit id, reason, name)`, sorted.
+    pub externs: Vec<(String, String, String)>,
 }
 
 /// A class as the Lean emitter needs it: `structure name where fields`.
@@ -84,6 +96,61 @@ enum Cctx<'a> {
     None,
     Init(&'a ClassDecl),
     Method(&'a ClassDecl, SelfKind),
+}
+
+/// Well-formedness defs for an audited extern's clauses. Its parameters
+/// bind exactly as a verified function's do, plus the `_old_` twin of each
+/// `&mut` resource so `old mem` elaborates.
+fn emit_extern_clause_wfs(
+    f: &Fn,
+    program: &Program,
+    trait_map: &HashMap<&str, &TraitDecl>,
+    result: &mut VcResult,
+) {
+    let _ = trait_map;
+    let mut binders: Vec<(String, String)> = Vec::new();
+    for p in &f.params {
+        match p.ty {
+            Ty::Int(_) => binders.push((p.name.clone(), "Int".into())),
+            Ty::Bool => binders.push((p.name.clone(), "Bool".into())),
+            Ty::Raw(_) => binders.push((p.name.clone(), "Sable.RawPtr".into())),
+            Ty::Res(k) | Ty::ResRef(k, _) => {
+                binders.push((p.name.clone(), k.view_ty().into()));
+                if matches!(p.ty, Ty::ResRef(_, Mutability::Mut)) {
+                    binders.push((format!("_old_{}", p.name), k.view_ty().into()));
+                }
+            }
+            Ty::Array(..) => binders.push((p.name.clone(), "Sable.Seq Int".into())),
+            Ty::Class(ci) | Ty::ClassRef(ci, _) => {
+                binders.push((p.name.clone(), lean_class_name(&program.classes[ci].name)))
+            }
+            Ty::Option(_) | Ty::Unit => {}
+        }
+    }
+    for (i, c) in f.pres.iter().enumerate() {
+        result.clause_wfs.push(ClauseWf {
+            def_name: format!("wf_{}_pre_{}", sanitize(&f.name), i + 1),
+            binders: binders.clone(),
+            text: preprocess_old_params(&c.text, &f.params),
+            span: c.span,
+            desc: format!("`pre` of extern `{}`", f.name),
+            result_ty: "Prop",
+        });
+    }
+    let mut post_binders = binders.clone();
+    if f.ret != Ty::Unit {
+        post_binders.push(("result".to_string(), "Int".to_string()));
+    }
+    for (i, c) in f.posts.iter().enumerate() {
+        result.clause_wfs.push(ClauseWf {
+            def_name: format!("wf_{}_post_{}", sanitize(&f.name), i + 1),
+            binders: post_binders.clone(),
+            text: preprocess_old_params(&c.text, &f.params),
+            span: c.span,
+            desc: format!("`post` of extern `{}`", f.name),
+            result_ty: "Prop",
+        });
+    }
 }
 
 pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) -> VcResult {
@@ -115,6 +182,27 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             .collect(),
         clause_wfs: Vec::new(),
         obligations: Vec::new(),
+        trust: TrustManifest {
+            externs: {
+                // Sorted, so the artifact hash is stable across the
+                // module map's iteration order. Imports are already in
+                // `program.fns` after the flat merge, so a dependency's
+                // audited boundary is in the importer's manifest without
+                // any union step.
+                let mut v: Vec<(String, String, String)> = program
+                    .fns
+                    .iter()
+                    .filter_map(|f| {
+                        f.extern_info.as_ref().map(|x| {
+                            (x.audit_id.clone(), x.reason.clone(), f.name.clone())
+                        })
+                    })
+                    .collect();
+                v.sort();
+                v.dedup();
+                v
+            },
+        },
     };
 
     for c in &program.class_templates {
@@ -189,6 +277,15 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
     for f in &program.fns {
         // Tests are dynamic-only (design §9): never verified.
         if f.name.starts_with("test_") {
+            continue;
+        }
+        // An extern's contract is *audited*, not proved: there is no body
+        // to check it against, so it owes no obligations. Its clauses
+        // still get well-formedness defs — a trusted contract that does
+        // not even elaborate is not a contract, and the manifest is what
+        // makes the trust visible instead (ADR 0027).
+        if f.extern_info.is_some() {
+            emit_extern_clause_wfs(f, program, &trait_map, &mut result);
             continue;
         }
         // Template-verified instances (ADR 0009): the template theorems
@@ -2389,8 +2486,8 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
-                        _ => unreachable!("checked: int/array/class/resource args only"),
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) | Val::Ptr(v) => v,
+                        _ => unreachable!("checked: int/array/class/resource/pointer args"),
                     })
                     .collect();
                 let Some(Ty::Class(ci) | Ty::ClassRef(ci, _)) =
@@ -2642,8 +2739,8 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
-                        _ => unreachable!("checked: int/array/class/resource args only"),
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) | Val::Ptr(v) => v,
+                        _ => unreachable!("checked: int/array/class/resource/pointer args"),
                     })
                     .collect();
                 let callee_fn = self.fn_map[callee.as_str()];

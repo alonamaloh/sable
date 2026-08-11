@@ -10,6 +10,10 @@ use unsafe_copy;
 fn expect_eq(u8 x, u8 y) {
 }
 
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
 fn test_copy_prefix() {
     mut [u8] src = [1, 2, 3];
     mut [u8] dst = [9, 9, 9, 9, 9];
@@ -35,6 +39,29 @@ fn test_copy_edges() {
     copy_prefix(&full, &mut dst);
     expect_eq(dst[0], 7);
     expect_eq(dst[1], 8);
+}
+
+// The audited extern, through its safe wrapper. `sable test` supplies the
+// shim, keyed on the audit id — the name of the contract version the
+// program was verified against.
+fn test_fill_all() {
+    mut [u8] a = [1, 2, 3];
+    fill_all(&mut a, 6);
+    expect_eq(a[0], 6);
+    expect_eq(a[1], 6);
+    expect_eq(a[2], 6);
+    mut [u8] empty = [];
+    fill_all(&mut empty, 6);
+}
+
+// A shared resource parameter frames itself: the bytes come back untouched,
+// and the wrapper's contract says so.
+fn test_checksum_all() {
+    mut [u8] a = [1, 2, 3];
+    expect_eq_u64(checksum_all(&mut a), 6);
+    expect_eq(a[0], 1);
+    expect_eq(a[1], 2);
+    expect_eq(a[2], 3);
 }
 
 fn test_load_and_store() {

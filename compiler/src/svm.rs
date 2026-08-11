@@ -38,6 +38,15 @@ pub fn lower_fn_entry(f: &Fn) -> Result<String, String> {
             }
         }
     }
+    // An extern has no body: the machine would run it as a no-op, which
+    // is a silent divergence from whatever the interpreter's shim does.
+    // Unsupported means a hard failure, not a quiet one (ADR 0017).
+    if f.extern_info.is_some() {
+        return Err(format!(
+            "`{}` is an audited extern: the machine has no semantics for a foreign call",
+            f.name
+        ));
+    }
     let params: Vec<String> = f.params.iter().map(|p| format!("\"{}\"", p.name)).collect();
     Ok(format!(
         "(\"{}\", ⟨[{}], {}⟩)",

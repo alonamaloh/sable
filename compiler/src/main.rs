@@ -133,6 +133,7 @@ fn main() -> ExitCode {
             functions,
             obligations,
             unsafe_regions,
+            externs,
             deferred,
             assumed,
             warnings,
@@ -161,14 +162,26 @@ fn main() -> ExitCode {
                 if unsafe_regions > 0 {
                     println!("  unsafe regions: {unsafe_regions}");
                 }
-                if deferred.is_empty() && assumed.is_empty() {
-                    println!("status: fully verified");
-                } else {
+                // An audited extern contract is an axiom nobody proved.
+                // Saying "fully verified" while trusting one would be a
+                // lie, so the status names the boundary and lists it
+                // (ADR 0027).
+                if !externs.is_empty() {
+                    println!("  extern assumptions: {}", externs.len());
+                    for (id, reason, name) in &externs {
+                        println!("    - {id} ({name}): {reason}");
+                    }
+                }
+                if !deferred.is_empty() || !assumed.is_empty() {
                     println!(
                         "status: verified with escapes (defers: {}, assumes: {})",
                         deferred.len(),
                         assumed.len()
                     );
+                } else if !externs.is_empty() {
+                    println!("status: verified relative to audited boundary");
+                } else {
+                    println!("status: fully verified");
                 }
             }
             ExitCode::SUCCESS

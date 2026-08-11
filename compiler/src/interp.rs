@@ -178,6 +178,79 @@ struct Frame {
 }
 
 impl<'a> Interp<'a> {
+    /// The deterministic test shims. An extern has no Sable body, so
+    /// `sable test` has to supply one — and it is keyed on the *audit id*,
+    /// not the name, because the id is what names the contract version the
+    /// program was verified against (ADR 0027).
+    ///
+    /// An unknown id traps. Running the body as a no-op would let a
+    /// contract appear to hold because nothing happened, which is the one
+    /// outcome a monitor must never produce.
+    fn call_extern(&mut self, f: &'a Fn, args: Vec<RtVal>, span: crate::span::Span)
+        -> IResult<RtVal> {
+        let info = f.extern_info.as_ref().expect("checked: extern");
+        match info.audit_id.as_str() {
+            "test.fill.v1" => {
+                let (RtVal::Ptr(a, off), RtVal::Int(n), RtVal::Int(v)) =
+                    (args[0].clone(), args[1].clone(), args[2].clone())
+                else {
+                    unreachable!("checked: (raw<u8>, u64, u8)")
+                };
+                for i in 0..n {
+                    if self.raw.live_at(a, off + i).is_none() {
+                        return Err(Trap {
+                            undef: true,
+                            message: format!(
+                                "`{}` writes out of bounds: {a}+{}",
+                                f.name,
+                                off + i
+                            ),
+                            span,
+                        });
+                    }
+                    self.raw
+                        .allocs
+                        .get_mut(&a)
+                        .expect("live_at checked")
+                        .bytes[(off + i) as usize] = Some(v);
+                }
+                Ok(RtVal::Unit)
+            }
+            "test.checksum.v1" => {
+                let (RtVal::Ptr(a, off), RtVal::Int(n)) = (args[0].clone(), args[1].clone())
+                else {
+                    unreachable!("checked: (raw<u8>, u64)")
+                };
+                let mut sum: i128 = 0;
+                for i in 0..n {
+                    match self.raw.live_at(a, off + i).map(|al| al.bytes[(off + i) as usize]) {
+                        Some(Some(b)) => sum += b,
+                        _ => {
+                            return Err(Trap {
+                                undef: true,
+                                message: format!(
+                                    "`{}` reads out of bounds or uninitialized: {a}+{}",
+                                    f.name,
+                                    off + i
+                                ),
+                                span,
+                            });
+                        }
+                    }
+                }
+                Ok(RtVal::Int(sum))
+            }
+            other => Err(Trap {
+                undef: false,
+                message: format!(
+                    "no test shim for audited extern `{}` (audit id `{other}`)",
+                    f.name
+                ),
+                span,
+            }),
+        }
+    }
+
     fn call(&mut self, f: &'a Fn, args: Vec<RtVal>) -> IResult<RtVal> {
         let mut frame = Frame {
             vars: HashMap::new(),
@@ -1206,6 +1279,11 @@ impl<'a> Interp<'a> {
                         continue;
                     }
                     vals.push(self.eval(a, frame)?);
+                }
+                if f.extern_info.is_some() {
+                    // The foreign implementation receives only ABI values:
+                    // resources were already dropped above.
+                    return self.call_extern(f, vals, e.span);
                 }
                 self.call(f, vals)
             }

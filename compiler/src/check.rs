@@ -118,6 +118,47 @@ fn class_tbounds(c: &ClassDecl) -> HashMap<String, (String, u8)> {
     tbounds_of(&c.type_params, &c.type_bounds)
 }
 
+/// An extern's signature must be ABI-representable and must not be able
+/// to hand storage back: retained pointers and ownership transfer to
+/// foreign code are out of scope for v1, so the *signature* forbids them
+/// rather than a rule about what the foreign code does (ADR 0027).
+fn check_extern_signature(f: &Fn) -> CResult<()> {
+    if matches!(f.ret, Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..)) {
+        return Err(Diagnostic {
+            name: "extern.returns_storage".into(),
+            title: format!("`{}` may not return `{}`", f.name, f.ret.name()),
+            span: f.name_span,
+            label: "an extern cannot hand storage back".into(),
+            notes: vec![(
+                "note".into(),
+                "retained pointers and ownership transfer to foreign code are out of \
+                 scope; forbidding them in the signature is what lets a caller pass \
+                 borrowed storage to an extern at all"
+                    .into(),
+            )],
+        });
+    }
+    for p in &f.params {
+        let ok = matches!(p.ty, Ty::Int(_) | Ty::Raw(_) | Ty::ResRef(..) | Ty::Res(_));
+        if !ok {
+            return Err(Diagnostic {
+                name: "extern.param_abi".into(),
+                title: format!("`{}` is not an ABI type", p.ty.name()),
+                span: p.span,
+                label: "extern parameters are integers, raw pointers, and resources".into(),
+                notes: vec![(
+                    "note".into(),
+                    "resources are erased from the ABI, so the foreign function receives \
+                     the pointer and the length and nothing else; a safe array or class \
+                     would need a layout guarantee Sable does not make yet"
+                        .into(),
+                )],
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
     let mut unsafe_regions = 0usize;
     let traits_c: Vec<TraitDecl> = program.traits.clone();
@@ -320,6 +361,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
     }
 
     for f in &mut program.fns {
+        // An extern has no body to check: its contract is the whole of
+        // what is known about it, and the signature is what confines the
+        // trust (ADR 0027).
+        if f.extern_info.is_some() {
+            check_extern_signature(f)?;
+            continue;
+        }
         let is_test = f.name.starts_with("test_");
         if is_test
             && (f.ret != Ty::Unit
@@ -2120,6 +2168,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
             for (arg, p) in args.iter_mut().zip(&params) {
+                // A constructor returns a class, which cannot hold raw or
+                // resource storage; the brand cannot leave through one.
                 reject_brand_escape(ctx, arg, "be passed to a constructor", arg.span)?;
                 match p.ty {
                     Ty::Array(elem, m) => {
@@ -2772,8 +2822,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty).collect();
             let ret = sig.ret;
+            // A callee that cannot give a branded value back cannot retain
+            // one either: Sable has no globals and no raw- or
+            // resource-typed fields, so a pointer handed to a function
+            // dies with its frame. Only a signature that *returns* storage
+            // can launder the brand out (ADR 0027).
+            let launders = matches!(ret, Ty::Raw(_) | Ty::Res(_));
             for (arg, pty) in args.iter_mut().zip(param_tys) {
-                reject_brand_escape(ctx, arg, "be passed to a function", arg.span)?;
+                if launders {
+                    reject_brand_escape(ctx, arg, "be passed to a function", arg.span)?;
+                }
                 match pty {
                     Ty::Bool => {
                         return Err(Diagnostic {

@@ -587,6 +587,10 @@ pub struct Fn {
     /// Exported to importers (`pub fn`, ADR 0019). Methods, inits,
     /// and trait signatures ignore this (class visibility governs).
     pub is_pub: bool,
+    /// `extern "C"`: a foreign function with no body. Its contract is
+    /// *audited*, not proved — the boundary the build status has to be
+    /// honest about (ADR 0027).
+    pub extern_info: Option<ExternInfo>,
     pub name: String,
     pub name_span: Span,
     /// Generic type parameters (`fn swap<T>(...)`). Non-empty only
@@ -608,6 +612,22 @@ pub struct Fn {
     /// Termination measure for self-recursive functions.
     pub variant: Option<Clause>,
     pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+/// An audited foreign declaration. The metadata is mandatory: a trusted
+/// contract with no recorded reason is an unsourced axiom, and the whole
+/// point of the manifest is that a reader can find every one of them
+/// (ADR 0027).
+#[derive(Debug, Clone)]
+pub struct ExternInfo {
+    /// The ABI string; `"C"` for now.
+    pub abi: String,
+    /// A stable identifier for *this version* of the contract. Changing
+    /// it invalidates every artifact that trusted the old one.
+    pub audit_id: String,
+    /// Why this boundary is trusted, in the author's words.
+    pub reason: String,
     pub span: Span,
 }
 

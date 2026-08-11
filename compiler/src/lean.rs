@@ -112,6 +112,17 @@ pub fn emit(
             e.push(&format!("set_option sable.grindHeartbeats {v}"));
         }
     }
+    // The trust manifest, inside the hashed content. Changing an audit id
+    // or adding an extern has to invalidate the artifact exactly as
+    // changing a proof does, and an artifact's validity is mere existence
+    // of its `.ok` file — so this must be part of the bytes, not a file
+    // beside them (ADR 0027).
+    if !vc.trust.externs.is_empty() {
+        e.push("-- trusted boundary: audited extern contracts");
+        for (id, reason, name) in &vc.trust.externs {
+            e.push(&format!("--   {id} ({name}): {reason}"));
+        }
+    }
     e.push("");
 
     for c in &vc.classes {

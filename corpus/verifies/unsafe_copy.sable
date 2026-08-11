@@ -77,3 +77,61 @@ pub fn split_write_join(&mut [u8] a) {
         m = whole;
     }
 }
+
+// ------------------------- the audited boundary --------------------------
+//
+// An `extern "C"` declaration's contract is *audited*, not proved: there
+// is no body to check it against, so it owes no obligations and the build
+// status has to say so — `verified relative to audited boundary`, never
+// `fully verified` (ADR 0027).
+//
+// Effects are stated *structurally*, through the resource parameters.
+// Only a passed mutable resource may change; everything else is framed by
+// the caller's ownership discipline, so there is no free-form `modifies`
+// clause anywhere. Resources are erased from the ABI: the foreign
+// function receives the pointer, the length, and the byte.
+
+/// pre  #[label(names)] p.alloc = mem.alloc ∧ p.off = mem.off
+/// pre  #[label(fits)]  n ≤ mem.len
+/// post #[label(shape)] mem.alloc = (old mem).alloc ∧ mem.off = (old mem).off
+///          ∧ mem.len = (old mem).len
+/// post #[label(set)]   ∀ k, 0 ≤ k → k < n → mem.bytes.get k = Sable.ByteState.init value
+/// post #[label(kept)]  ∀ k, n ≤ k → mem.bytes.get k = (old mem).bytes.get k
+pub extern "C" #[audit(id := "test.fill.v1",
+                       reason := "deterministic test shim: writes n bytes at p and nothing else")]
+fn c_fill(raw<u8> p, u64 n, u8 value, resource &mut RawSpan mem);
+
+// The safe wrapper. Its contract is one line of value-level arithmetic;
+// the exposure's exit obligation is now *proved from the extern's post*
+// rather than assumed, which is what makes trusting a boundary different
+// from trusting the compiler.
+/// post ∀ i, 0 ≤ i → i < a.len → a.get i = v
+pub fn fill_all(&mut [u8] a, u8 v) {
+    unsafe expose &mut a as (p, resource m) {
+        c_fill(p, a.len, v, &mut m);
+    }
+}
+
+// Effects are structural, so *undeclared mutation is impossible at the
+// call boundary*. `c_checksum` takes its span as `resource &RawSpan` —
+// shared — so the caller's view of the bytes survives the call untouched,
+// and nothing in the extern's contract could say otherwise. There is no
+// `modifies` clause to get wrong: what a foreign function may change is
+// exactly what it was handed mutably.
+/// pre  #[label(names)] p.alloc = mem.alloc ∧ p.off = mem.off
+/// pre  #[label(fits)]  n ≤ mem.len
+/// post #[label(range)] 0 ≤ result
+pub extern "C" #[audit(id := "test.checksum.v1",
+                       reason := "deterministic test shim: reads n bytes, writes nothing")]
+fn c_checksum(raw<u8> p, u64 n, resource &RawSpan mem) -> u64;
+
+// The array comes back byte for byte, and that is proved, not assumed:
+// the shared borrow is what frames it.
+/// post ∀ i, 0 ≤ i → i < a.len → a.get i = (old a).get i
+pub fn checksum_all(&mut [u8] a) -> u64 {
+    mut u64 s = 0;
+    unsafe expose &mut a as (p, resource m) {
+        s = c_checksum(p, a.len, &m);
+    }
+    return s;
+}

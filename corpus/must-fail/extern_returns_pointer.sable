@@ -1,0 +1,7 @@
+// expect-error: extern.returns_storage
+// An extern may not hand storage back: retained pointers and ownership
+// transfer to foreign code are out of scope, and forbidding them in the
+// signature is what lets a caller pass borrowed storage to one at all.
+
+extern "C" #[audit(id := "test.mk.v1", reason := "would retain")]
+fn c_make() -> raw<u8>;

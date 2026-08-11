@@ -1,0 +1,5 @@
+// expect-error: extern.generic
+// An extern has one ABI, not a family of them.
+
+extern "C" #[audit(id := "test.g.v1", reason := "one abi")]
+fn c_g<T>(T n);

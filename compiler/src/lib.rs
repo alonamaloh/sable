@@ -35,6 +35,7 @@ pub enum Outcome {
         functions: usize,
         obligations: usize,
         unsafe_regions: usize,
+        externs: Vec<(String, String, String)>,
         /// Obligations compiled to runtime traps (sound escape).
         deferred: Vec<String>,
         /// Obligations taken as audited axioms (unsound escape): (name, reason).
@@ -57,6 +58,11 @@ pub struct VerifiedInfo {
     /// the program, and burying it would defeat having a boundary
     /// (ADR 0026).
     pub unsafe_regions: usize,
+    /// Audited extern contracts this module (or anything it imports)
+    /// trusts: `(audit id, reason, name)`. Non-empty means the build is
+    /// verified *relative to* a boundary, and the status must say so
+    /// (ADR 0027).
+    pub externs: Vec<(String, String, String)>,
     pub deferred: Vec<String>,
     pub assumed: Vec<(String, String)>,
     /// Automation-budget warnings (non-fatal), as diagnostics.
@@ -143,6 +149,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
             functions: info.functions,
             obligations: info.obligations,
             unsafe_regions: info.unsafe_regions,
+            externs: info.externs,
             deferred: info.deferred,
             assumed: info.assumed,
             warnings: info
@@ -213,6 +220,7 @@ pub fn check_file_structured(
     let functions = prep.program.fns.len();
     let obligations = prep.emitted.names.thms.len();
     let unsafe_regions = prep.unsafe_regions;
+    let externs = prep.vc.trust.externs.clone();
 
     if opts.emit_lean_only {
         print!("{}", prep.emitted.lean_source);
@@ -222,6 +230,7 @@ pub fn check_file_structured(
                 functions,
                 obligations,
                 unsafe_regions,
+                externs,
                 deferred,
                 assumed,
                 warnings: Vec::new(),
@@ -289,6 +298,7 @@ pub fn check_file_structured(
                 functions,
                 obligations,
                 unsafe_regions,
+                externs,
                 deferred,
                 assumed,
                 warnings,
