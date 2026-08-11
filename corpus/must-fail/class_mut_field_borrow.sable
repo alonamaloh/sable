@@ -1,0 +1,45 @@
+// expect-error: class.mut_field_borrow
+// A field borrow is shared. `&mut h.c` would hand a callee unique access
+// to part of `h` while `h`'s own invariant constrains that part against
+// its siblings — and the callee, which has never heard of `Holder`,
+// cannot re-establish it. Mutation goes through a method of `h`.
+
+class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+}
+
+class Holder {
+    Counter c;
+    u64 seen;
+
+    /// invariant seen ≤ c.n
+
+    /// post self.seen = 0
+    init make() {
+        self.c = Counter::zero();
+        self.seen = 0;
+    }
+}
+
+/// pre  c.n < 100
+fn poke(&mut Counter c) {
+    c.bump();
+}
+
+fn break_holder() {
+    var mut h = Holder::make();
+    poke(&mut h.c);
+}

@@ -1,0 +1,34 @@
+// expect-error: borrow.conflict
+// A mutable class borrow must not overlap another borrow in the same
+// call: the callee's contract frames `x` and `y` as distinct storage, and
+// the caller's post-call havoc refreshes only `x`.
+
+class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+}
+
+/// pre  x.n < 100
+/// post result = y.n
+fn bump_and_read(&mut Counter x, &Counter y) -> u64 {
+    x.bump();
+    return y.n;
+}
+
+fn caller() -> u64 {
+    var mut c = Counter::zero();
+    u64 r = bump_and_read(&mut c, &c);
+    return r;
+}

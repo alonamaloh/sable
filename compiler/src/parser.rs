@@ -569,7 +569,7 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// A parameter type: scalar, `&[T]`, or `&mut [T]`.
+    /// A parameter type: scalar, `&C`, `&mut C`, `&[T]`, or `&mut [T]`.
     fn param_ty(&mut self) -> PResult<(Ty, Span)> {
         if self.at(&Tok::Amp) {
             let start = self.bump().span;
@@ -579,20 +579,11 @@ impl<'a> Parser<'a> {
             } else {
                 Mutability::Shared
             };
-            // `&Nat` — shared borrow of a class (ADR 0010).
+            // `&Nat` (ADR 0010) or `&mut Nat` (ADR 0023) — a class borrow.
             if let Tok::Ident(n) = self.peek() {
                 if let Some(ci) = self.class_names.iter().position(|c| c == n) {
-                    if mutability == Mutability::Mut {
-                        return Err(Diagnostic {
-                            name: "class.mut_borrow_deferred".into(),
-                            title: "`&mut` class borrows are not supported yet".into(),
-                            span: self.peek_span(),
-                            label: "shared borrows and returns only (ADR 0010)".into(),
-                            notes: vec![],
-                        });
-                    }
                     let end = self.bump().span;
-                    return Ok((Ty::ClassRef(ci), start.join(end)));
+                    return Ok((Ty::ClassRef(ci, mutability), start.join(end)));
                 }
             }
             self.expect(Tok::LBracket)?;

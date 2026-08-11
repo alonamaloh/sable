@@ -17,6 +17,21 @@ fn test_class_values() {
     width(&z);
 }
 
+// Mutable class borrows (ADR 0023): the caller's value changes, and
+// `old c` in the callee's post is monitored against the entry state.
+fn test_class_mut_borrow() {
+    var mut c = Counter::zero();
+    bump_twice(&mut c);
+    peek(&c);
+    bump_then_read(&mut c);
+    mutate_local();
+    bump_in_loop();
+    var mut d = Counter::zero();
+    count_to_five(&mut d);
+    peek(&d);
+    drive_once();
+}
+
 // Class-valued fields, moves, and field borrows (ADR 0020).
 fn test_class_fields() {
     var i = Inner::make(7);

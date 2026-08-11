@@ -38,7 +38,8 @@ Three additions, chosen as the minimum that makes places real:
 
 `&mut C` remains deferred (nothing forces it yet — `Integer`'s
 arithmetic returns fresh values, like `Nat`'s), as do local-to-local
-moves outside argument position.
+moves outside argument position. **Both landed in ADR 0023**, on the
+place engine this ADR argued for.
 
 ## The verification model, and why it was cheap
 
@@ -67,12 +68,15 @@ demonstrated one level up. Where nothing new was needed at all:
   parser's field-access path is single-level; generalizing it to paths
   is a contained follow-up, not a model question — clause text already
   writes `self.inner.v` freely, because Lean projections nest.
-- `&mut C`, local-to-local moves, class-valued fields *of generic*
-  classes, and drop-order interactions beyond reverse-declaration are
-  untouched.
+- `&mut C` and local-to-local moves are untouched here and land in
+  ADR 0023; class-valued fields *of generic* classes and drop-order
+  interactions beyond reverse-declaration remain untouched.
 - The interpreter shares `Rc`s for both borrows and moves; since no
   construct can mutate through a class borrow yet, the distinction is
-  not yet observable at runtime.
+  not yet observable at runtime. (ADR 0023's `&mut C` makes mutation
+  through a borrow observable, and sharing the `Rc` is then exactly the
+  right runtime meaning; a *move* remains indistinguishable, which is
+  why borrow-after-move is a checker rule and not a runtime failure.)
 
 ## Guards
 

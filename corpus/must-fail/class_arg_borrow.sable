@@ -1,0 +1,31 @@
+// expect-error: type.class_arg_borrow
+// Handing an owned class value to a borrow is written at the call site,
+// with its mutability, so a reader sees where access is given up. A bare
+// name would read like a move.
+
+class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+}
+
+/// pre  c.n < 100
+fn poke(&mut Counter c) {
+    c.bump();
+}
+
+fn caller() {
+    var mut c = Counter::zero();
+    poke(c);
+}

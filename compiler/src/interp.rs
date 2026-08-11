@@ -132,14 +132,24 @@ impl<'a> Interp<'a> {
             self_ctx: None,
         };
         for (p, v) in f.params.iter().zip(args) {
-            if let RtVal::Arr(a) = &v {
-                if matches!(p.ty, Ty::Array(_, Mutability::Mut)) {
+            match (&v, p.ty) {
+                (RtVal::Arr(a), Ty::Array(_, Mutability::Mut)) => {
                     frame
                         .olds
                         .insert(p.name.clone(), SpecVal::Arr(a.borrow().clone()));
                 }
-            } else {
-                frame.entry_scalars.insert(p.name.clone(), v.clone());
+                // `&mut C`: the borrow shares storage with the caller, so
+                // the bare name reads the current state and `old p` needs
+                // the value it had at entry. `spec_of` copies.
+                (obj @ RtVal::Obj { .. }, Ty::ClassRef(_, Mutability::Mut)) => {
+                    if let Some(sv) = spec_of(obj) {
+                        frame.olds.insert(p.name.clone(), sv);
+                    }
+                }
+                (RtVal::Arr(_), _) => {}
+                _ => {
+                    frame.entry_scalars.insert(p.name.clone(), v.clone());
+                }
             }
             frame.vars.insert(p.name.clone(), v);
         }
@@ -540,7 +550,16 @@ impl<'a> Interp<'a> {
             self_ctx: Some((ci, fields.clone())),
         };
         for (p, v) in ifn.params.iter().zip(args) {
-            frame.entry_scalars.insert(p.name.clone(), v.clone());
+            match (&v, p.ty) {
+                (obj @ RtVal::Obj { .. }, Ty::ClassRef(_, Mutability::Mut)) => {
+                    if let Some(sv) = spec_of(obj) {
+                        frame.olds.insert(p.name.clone(), sv);
+                    }
+                }
+                _ => {
+                    frame.entry_scalars.insert(p.name.clone(), v.clone());
+                }
+            }
             frame.vars.insert(p.name.clone(), v);
         }
         for pre in &ifn.pres {
@@ -604,7 +623,18 @@ impl<'a> Interp<'a> {
             frame.olds.insert("self".into(), sv);
         }
         for (p, v) in m.f.params.iter().zip(args) {
-            frame.entry_scalars.insert(p.name.clone(), v.clone());
+            match (&v, p.ty) {
+                // `&mut C`: the borrow shares storage with the caller, so
+                // `old p` needs the value it had at entry. `spec_of` copies.
+                (obj @ RtVal::Obj { .. }, Ty::ClassRef(_, Mutability::Mut)) => {
+                    if let Some(sv) = spec_of(obj) {
+                        frame.olds.insert(p.name.clone(), sv);
+                    }
+                }
+                _ => {
+                    frame.entry_scalars.insert(p.name.clone(), v.clone());
+                }
+            }
             frame.vars.insert(p.name.clone(), v);
         }
         for pre in &m.f.pres {

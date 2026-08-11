@@ -58,6 +58,25 @@ fn test_negate_and_abs() {
     expect_eq(int_cmp(&an, &p), 0);
 }
 
+// In-place negation through `&mut Integer`: the caller's value changes,
+// no magnitude is copied, and the class invariant is monitored at the
+// receiver's method exit. `old x` in the contract is the entry state, so
+// the two-flip round trip is a real check and not a tautology.
+fn test_negate_in_place() {
+    var mut p = small(7, 0);
+    var n = small(7, 1);
+    negate_in_place(&mut p);
+    expect_eq(int_cmp(&p, &n), 0);
+    negate_in_place(&mut p);
+    var q = small(7, 0);
+    expect_eq(int_cmp(&p, &q), 0);
+    // Zero stays positive zero; the invariant monitor checks that half.
+    var mut z = zero();
+    negate_in_place(&mut z);
+    var z2 = zero();
+    expect_eq(int_cmp(&z, &z2), 0);
+}
+
 fn test_add_like_signs() {
     var a = small(7, 0);
     var b = small(5, 0);

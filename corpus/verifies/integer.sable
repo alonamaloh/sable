@@ -112,6 +112,22 @@ pub class Integer {
         self.mag = m;
         self.neg = s;
     }
+
+    // Flipping the sign in place. The precondition is what keeps the
+    // representation unique: only a nonzero magnitude may become
+    // negative, and the class invariant is re-established here — which
+    // is why a caller holding `&mut Integer` may assume it again after
+    // the call (ADR 0023).
+    /// pre  natVal self.mag.limbs ≥ 1
+    /// post #[label(sign)] self.neg = 1 - old self.neg
+    /// post #[label(mag)]  self.mag = old self.mag
+    fn flip_sign(&mut self) {
+        if (self.neg == 1) {
+            self.neg = 0;
+            return;
+        }
+        self.neg = 1;
+    }
 }
 
 /// discharge Integer::make.inv_exit.0_natval_mag_limbs by
@@ -161,6 +177,19 @@ pub fn negate(&Integer x) -> Integer {
     }
     var n = Integer::make(copy_nat(&x.mag), 1);
     return n;
+}
+
+// The same operation without the copy: `&mut Integer` mutates the value
+// the caller owns instead of building a fresh one. Zero has no other
+// representation to flip to, so it is left alone.
+/// post #[label(val)] intVal x.neg x.mag.limbs
+///          = 0 - intVal (old x).neg (old x).mag.limbs
+/// post #[label(len)] x.mag.limbs.len = (old x).mag.limbs.len
+pub fn negate_in_place(&mut Integer x) {
+    if (nat_is_zero(&x.mag) == 1) {
+        return;
+    }
+    x.flip_sign();
 }
 
 // ------------------------------ comparison -------------------------------

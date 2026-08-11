@@ -93,8 +93,10 @@ pub enum Ty {
     Bool,
     /// A class value (owned local); index into `Program::classes`.
     Class(usize),
-    /// A shared borrow of a class (`&Nat` parameter — ADR 0010).
-    ClassRef(usize),
+    /// A borrow of a class: `&Nat` (shared — ADR 0010) or `&mut Nat`
+    /// (unique, mutable through the class's own `&mut self` methods —
+    /// ADR 0023). Parameters only.
+    ClassRef(usize, Mutability),
     /// Borrowed array of integers: `&[i32]` (shared) or `&mut [i32]`
     /// (unique, mutable). Parameters only.
     Array(IntTy, Mutability),
@@ -121,7 +123,8 @@ impl Ty {
             Ty::Array(t, Mutability::Mut) => format!("&mut [{}]", t.name()),
             Ty::Array(t, Mutability::Owned) => format!("[{}]", t.name()),
             Ty::Class(_) => "class".to_string(),
-            Ty::ClassRef(_) => "&class".to_string(),
+            Ty::ClassRef(_, Mutability::Mut) => "&mut class".to_string(),
+            Ty::ClassRef(..) => "&class".to_string(),
             Ty::Option(t) => format!("option<{}>", t.name()),
             Ty::Unit => "()".to_string(),
         }

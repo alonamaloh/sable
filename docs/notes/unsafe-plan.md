@@ -1220,42 +1220,68 @@ top. `VarInfo { initialized, mutable, moved }` is a bit-set adequate for whole
 local class values; it is not an engine, and resource work should not extend it
 further.
 
-#### U2a — general place/borrow engine (safe side) *(started 2026-08-11)*
+#### U2a — general place/borrow engine (safe side) *(done 2026-08-11)*
 
-The safe-side test surface paid before the engine was even finished. Building
-`Place` (root plus field path) and asking what it would catch turned up two real
-holes, both now closed with guards: a mutable borrow overlapping another borrow
-in the same call was **unsound** (vcgen havocs the mutable argument and keeps the
-shared argument's pre-call symbol — a verified program returned the wrong answer
-and the monitor caught it), and a borrow of a moved-out place was accepted
-because `use_after_move` only guarded the name-read path, not the borrow path.
-The second is latent rather than live today — the interpreter shares `Rc`s, so
-nothing is destroyed at a move — and becomes unsound the moment a move actually
-transfers, which is what resources do. This is the argument for U2a in one
-paragraph.
+The safe-side test surface paid before the engine was even finished, and kept
+paying. Building `Place` (root plus field path) and asking what it would catch
+turned up **three** holes, all now closed with guards:
 
+- a mutable borrow overlapping another borrow in the same call was **unsound**
+  (vcgen havocs the mutable argument and keeps the shared argument's pre-call
+  symbol — a verified program returned the wrong answer and the monitor caught
+  it);
+- a borrow of a moved-out place was accepted, because `use_after_move` only
+  guarded the name-read path, not the borrow path. Latent rather than live today
+  — the interpreter shares `Rc`s, so nothing is destroyed at a move — and
+  unsound the moment a move actually transfers, which is what resources do;
+- a `&mut self` method call in a *declaration initializer* did not put its
+  receiver in the loop's havoc set, and `Stmt::VarDecl` initializers were not
+  scanned at all. `while (...) { u64 t = c.bump(); ... }` kept `c`'s pre-loop
+  state at the loop head; `post result = 0` verified on a function returning 3.
+  **Unsound**, and again caught by the monitor.
 
-- a reusable `Place` AST: `local | self | Place.field`, with room for later
-  projections;
-- checker state per place: `live | moved | shared-borrowed(n) | mutably-borrowed
-  | partially-moved`;
-- branch and loop joins over that state (ADR 0021's rule generalized: a
-  returning branch reaches nothing);
-- the ordinary-class features that ADR 0020 deferred and that this engine makes
-  cheap — local-to-local class moves, general `&mut C`;
-- named diagnostics, replacing the ad hoc `moved` bit.
+Two more came out of `&mut C` itself: class-borrow arguments on *methods* were
+accepted by the checker and hit an `unreachable!` in vcgen (an ICE reachable
+from ordinary source, `&C` included), and construction assumed a borrowed
+argument's class invariant without owing `borrow_inv` for it — the one call form
+that skipped ADR 0010's obligation. This is the argument for U2a in one section.
 
-`&mut C` is the point of doing this first: it is a safe-side consumer with an
-existing corpus to shake the engine out on (`Integer`'s arithmetic could mutate
-in place instead of returning fresh values), and it isolates the ownership work
-from the raw-memory model. Nothing forces `&mut C` on its own — building it
-here is paying for a test surface, and that is the honest reason.
+What landed:
 
-Exit criteria:
+- a reusable `Place` (root plus field path, with `contains`/`overlaps`), keying
+  a move set on `Ctx` — the ad hoc `VarInfo.moved` bit is gone;
+- branch joins over that state (ADR 0021's rule generalized: a returning branch
+  reaches nothing);
+- local-to-local class moves (`a = b;`, `var d = a;`), including reviving a
+  moved-from local by moving a new value in;
+- general `&mut C` on functions, methods, and inits, with ADR 0023 fixing what
+  it means: mutation only through the class's own `&mut self` methods, which is
+  what makes the caller's post-call invariant assumption sound;
+- one entry-state map (`entry_states`) shared by `&mut [T]`, `&mut C`, and the
+  `self` of a `&mut self` method, and one pair of helpers
+  (`push_borrow_invs`, `havoc_mut_class_args`) shared by all three call forms;
+- named diagnostics with spans for every rejection: `borrow.conflict`,
+  `class.use_after_move`, `class.mut_field_borrow`, `type.mut_borrow_shared`,
+  `mut.method_shared_borrow`, `mut.borrow_immutable`, `type.class_arg_borrow`,
+  `type.class_borrow_mutability`.
 
-- local-to-local moves and `&mut C` verify on corpus subjects;
-- borrow conflicts and use-after-move are named diagnostics with spans;
-- existing class affinity tests remain green, with the `moved` bit gone.
+`&mut C` was the point of doing this first: a safe-side consumer with an existing
+corpus to shake the engine out on, isolated from the raw-memory model. Nothing
+forced it on its own — it was paying for a test surface, and three soundness bugs
+is what the surface returned. `Integer::negate_in_place` is the first library
+operation that mutates instead of allocating.
+
+Deferred with reasons, not silence: mutable *field* borrows (`&mut a.f`), because
+no party can re-establish the base object's invariant — the place machinery
+supports the borrow, the invariant discipline does not (ADR 0023); and partial
+moves out of fields, which stay U7a (`Ctx::is_partially_moved` exists and nothing
+produces field moves yet).
+
+The one piece of the sketched lattice that did **not** need building: per-place
+`shared-borrowed(n) | mutably-borrowed` state. A borrow is an argument, not a
+value — no borrow-typed locals, returns, or fields — so borrow state never has to
+survive a statement, and overlap is decided within a single call. U2b should
+check whether resources change that before adding the counters.
 
 #### U2b — resource category on the same engine
 

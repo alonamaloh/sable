@@ -175,7 +175,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             context: Vec::new(),
             env: HashMap::new(),
             var_tys: HashMap::new(),
-            mut_arrays: HashMap::new(),
+            entry_states: HashMap::new(),
             fresh: 0,
             tparams: Vec::new(),
             trait_ctx: HashMap::new(),
@@ -231,7 +231,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             context: Vec::new(),
             env: HashMap::new(),
             var_tys: HashMap::new(),
-            mut_arrays: HashMap::new(),
+            entry_states: HashMap::new(),
             fresh: 0,
             tparams: f.type_params.clone(),
             trait_ctx: HashMap::new(),
@@ -302,7 +302,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 context: Vec::new(),
                 env: HashMap::new(),
                 var_tys: HashMap::new(),
-                mut_arrays: HashMap::new(),
+                entry_states: HashMap::new(),
                 fresh: 0,
                 tparams: c.type_params.clone(),
                 trait_ctx: HashMap::new(),
@@ -398,8 +398,10 @@ struct Generator<'a> {
     context: Vec<(String, Span)>,
     env: HashMap<String, Val>,
     var_tys: HashMap<String, Ty>,
-    /// &mut array params: source name → entry-state binder (`_old_a`).
-    mut_arrays: HashMap<String, String>,
+    /// Params whose clauses have an `old` twin: source name → entry-state
+    /// binder (`_old_a`). `&mut [T]` arrays, `&mut C` classes, and the
+    /// `self` of a `&mut self` method all live here.
+    entry_states: HashMap<String, String>,
     fresh: usize,
     /// Template mode (ADR 0009): the type-parameter names; `TParam(i)`
     /// ranges render through `tparams[i]` as an `IntModel`.
@@ -460,6 +462,18 @@ impl<'a> Generator<'a> {
         (literal, map)
     }
 
+    /// The Lean binder type of a local or parameter.
+    fn lean_ty_of(&self, name: &str) -> String {
+        match self.var_tys.get(name) {
+            Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => {
+                lean_class_name(&self.classes[*ci].name)
+            }
+            Some(Ty::Int(_)) => "Int".to_string(),
+            Some(Ty::Bool) => "Bool".to_string(),
+            _ => "Sable.Seq Int".to_string(),
+        }
+    }
+
     /// Everything in scope, as Lean binders — the environment for clause
     /// well-formedness defs (loop annotations, inline asserts).
     fn scope_binders(&self) -> Vec<(String, String)> {
@@ -481,7 +495,7 @@ impl<'a> Generator<'a> {
                 Ty::Int(_) => Some((name.clone(), "Int".to_string())),
                 Ty::Bool => Some((name.clone(), "Bool".to_string())),
                 Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
-                Ty::Class(ci) | Ty::ClassRef(ci) => {
+                Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                     Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
                 }
                 Ty::Option(_) | Ty::Unit => None,
@@ -490,10 +504,10 @@ impl<'a> Generator<'a> {
         vars.sort();
         scope_binders.extend(vars);
         let mut olds: Vec<(String, String)> = self
-            .mut_arrays
+            .entry_states
             .iter()
             .filter(|(name, _)| *name != "self") // handled below with the class type
-            .map(|(_, entry)| (entry.clone(), "Sable.Seq Int".to_string()))
+            .map(|(name, entry)| (entry.clone(), self.lean_ty_of(name)))
             .collect();
         olds.sort();
         scope_binders.extend(olds);
@@ -563,6 +577,73 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// A borrowed class argument carries its invariant into the callee, so
+    /// the caller owes it here (ADR 0010). Closes by assumption — class
+    /// values are init/method post-states — but it is an obligation, not
+    /// a trust step.
+    fn push_borrow_invs(&mut self, params: &[Param], arg_vals: &[String], span: Span) {
+        let borrowed: Vec<(String, usize, String)> = params
+            .iter()
+            .zip(arg_vals.iter())
+            .filter_map(|(p, aval)| match p.ty {
+                Ty::ClassRef(aci, _) => Some((p.name.clone(), aci, aval.clone())),
+                _ => None,
+            })
+            .collect();
+        for (pname, aci, aval) in borrowed {
+            let acd = &self.classes[aci];
+            let aname = acd.name.clone();
+            let map = self.class_state_map(acd, &aval);
+            let goals: Vec<(String, String)> = acd
+                .invariants
+                .iter()
+                .map(|inv| (cslug(inv), substitute(&inv.text, &map, None)))
+                .collect();
+            for (slug, goal) in goals {
+                let ob = self.obligation(
+                    &format!("{}.borrow_inv.{pname}.{slug}", self.fname),
+                    format!("invariant of the borrowed `{aname}` argument"),
+                    span,
+                    goal,
+                );
+                self.push_obligation(ob);
+            }
+        }
+    }
+
+    /// `&mut C` arguments come back in a fresh state — the callee may have
+    /// mutated them within its posts, and keeping the pre-call symbol
+    /// would assert those posts over storage the callee changed. Assuming
+    /// the class invariant of the fresh state is sound for the reason the
+    /// `&mut self` receiver rule gives: a callee can only mutate through
+    /// the class's own methods, each of which re-establishes it (ADR 0023).
+    ///
+    /// Returns param name → post-call state, for the callee's posts.
+    fn havoc_mut_class_args(&mut self, params: &[Param], args: &[Expr]) -> Vec<(String, String)> {
+        let targets: Vec<(String, String, usize)> = params
+            .iter()
+            .zip(args.iter())
+            .filter_map(|(p, arg)| match (p.ty, &arg.kind) {
+                (Ty::ClassRef(aci, Mutability::Mut), ExprKind::Borrow { array, .. }) => {
+                    Some((p.name.clone(), array.clone(), aci))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut out = Vec::new();
+        for (pname, array, aci) in targets {
+            let aname = self.classes[aci].name.clone();
+            let b = self.hinted_sym("_obj", Some(array.clone()));
+            self.binders.push((b.clone(), lean_class_name(&aname)));
+            let acd = &self.classes[aci];
+            self.push_class_state_facts(acd, &b);
+            self.push_invariant_hyps(acd, &b);
+            self.env.insert(array, Val::Obj(b.clone()));
+            out.push((pname, b));
+        }
+        out
+    }
+
     fn run(&mut self) {
         // Class-member setup: methods get the entry-state binder
         // `_old_self` with field facts and the class invariant assumed
@@ -570,7 +651,7 @@ impl<'a> Generator<'a> {
         if let Cctx::Method(class, _) = self.cctx {
             self.binders
                 .push(("_old_self".to_string(), lean_class_name(&class.name)));
-            self.mut_arrays
+            self.entry_states
                 .insert("self".to_string(), "_old_self".to_string());
             self.push_class_state_facts(class, "_old_self");
             self.push_invariant_hyps(class, "_old_self");
@@ -580,18 +661,32 @@ impl<'a> Generator<'a> {
         for p in &self.f.params {
             self.var_tys.insert(p.name.clone(), p.ty);
             match p.ty {
-                Ty::Class(ci) | Ty::ClassRef(ci) => {
-                    // `&C` parameter (ADR 0010) or a class taken by
-                    // value (ADR 0020): the class value with its field
-                    // facts and invariant — the method-entry treatment,
-                    // re-aimed. A move and a borrow differ in the affine
-                    // discipline and at runtime, not in the logic.
+                Ty::Class(ci) | Ty::ClassRef(ci, _) => {
+                    // A class borrow (ADR 0010, ADR 0023) or a class
+                    // taken by value (ADR 0020): the class value with its
+                    // field facts and invariant — the method-entry
+                    // treatment, re-aimed. A move and a borrow differ in
+                    // the affine discipline and at runtime, not in the
+                    // logic.
+                    //
+                    // A `&mut C`'s binder is the *entry* state `_old_p`,
+                    // exactly as a `&mut` array's is: the current state
+                    // lives in the symbolic env and is replaced whenever
+                    // a `&mut self` method is called on it, and `old p`
+                    // in clauses resolves to the binder.
                     let cd = &self.classes[ci];
+                    let binder = if p.ty == Ty::ClassRef(ci, Mutability::Mut) {
+                        let b = format!("_old_{}", p.name);
+                        self.entry_states.insert(p.name.clone(), b.clone());
+                        b
+                    } else {
+                        p.name.clone()
+                    };
                     self.binders
-                        .push((p.name.clone(), lean_class_name(&cd.name)));
-                    self.push_class_state_facts(cd, &p.name);
-                    self.push_invariant_hyps(cd, &p.name);
-                    self.env.insert(p.name.clone(), Val::Obj(p.name.clone()));
+                        .push((binder.clone(), lean_class_name(&cd.name)));
+                    self.push_class_state_facts(cd, &binder);
+                    self.push_invariant_hyps(cd, &binder);
+                    self.env.insert(p.name.clone(), Val::Obj(binder));
                 }
                 Ty::Int(it) => {
                     self.binders.push((p.name.clone(), "Int".into()));
@@ -627,7 +722,7 @@ impl<'a> Generator<'a> {
                         ),
                     ));
                     if mutability == Mutability::Mut {
-                        self.mut_arrays.insert(p.name.clone(), binder.clone());
+                        self.entry_states.insert(p.name.clone(), binder.clone());
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
@@ -1104,7 +1199,7 @@ impl<'a> Generator<'a> {
             };
             let resolver = |recv: &str, method: &str| {
                 let cd = match var_tys.get(recv) {
-                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci)) => Some(&classes[*ci]),
+                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Some(&classes[*ci]),
                     _ if recv == "self" => cctx_class,
                     _ => None,
                 };
@@ -1284,12 +1379,14 @@ impl<'a> Generator<'a> {
                     self.binders.push((name.clone(), "Option Int".into()));
                     self.env.insert(name.clone(), Val::Opt(name.clone()));
                 }
-                Some(Ty::Class(ci)) => {
-                    // A loop body called &mut methods on this local or
-                    // reassigned it from a call result: fresh state; the
-                    // invariant held at each method exit (and ret_inv at
-                    // each returning call), so it is sound to assume at
-                    // the havoc point.
+                // A loop body called &mut methods on this class value (or,
+                // for a local, reassigned it from a call result): fresh
+                // state. The invariant held at each method exit (and
+                // ret_inv at each returning call), so it is sound to
+                // assume at the havoc point. A `&mut C` parameter is the
+                // same story: the loop may only rebind its *view*, never
+                // the borrow itself.
+                Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, Mutability::Mut)) => {
                     let cd = &self.classes[*ci];
                     self.binders.push((name.clone(), lean_class_name(&cd.name)));
                     self.push_class_state_facts(cd, name);
@@ -1336,7 +1433,7 @@ impl<'a> Generator<'a> {
                     // element ranges by construction, so both facts are
                     // sound to assume at havoc.
                     let elem = *elem;
-                    let entry = self.mut_arrays[name.as_str()].clone();
+                    let entry = self.entry_states[name.as_str()].clone();
                     self.binders.push((name.clone(), "Sable.Seq Int".into()));
                     self.hyps.push((
                         format!("h_{name}_len"),
@@ -1620,12 +1717,24 @@ impl<'a> Generator<'a> {
                     .iter()
                     .find(|i| i.name == *init)
                     .expect("checked: init exists");
-                let subst_map: HashMap<String, String> = ifn
-                    .params
+                let iparams = ifn.params.clone();
+                let mut subst_map: HashMap<String, String> = iparams
                     .iter()
                     .map(|p| p.name.clone())
                     .zip(arg_vals.iter().cloned())
                     .collect();
+                for p in &iparams {
+                    if matches!(p.ty, Ty::ClassRef(_, Mutability::Mut)) {
+                        subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
+                    }
+                }
+                self.push_borrow_invs(&iparams, &arg_vals, e.span);
+                let cd: &ClassDecl = self.class_map[class.as_str()];
+                let ifn = cd
+                    .inits
+                    .iter()
+                    .find(|i| i.name == *init)
+                    .expect("checked: init exists");
                 for pre in &ifn.pres {
                     let goal = substitute(&pre.text, &subst_map, None);
                     let ob = self.obligation(
@@ -1639,6 +1748,15 @@ impl<'a> Generator<'a> {
                     );
                     self.push_obligation(ob);
                 }
+                for (pname, fresh) in self.havoc_mut_class_args(&iparams, args) {
+                    subst_map.insert(pname, fresh);
+                }
+                let cd: &ClassDecl = self.class_map[class.as_str()];
+                let ifn = cd
+                    .inits
+                    .iter()
+                    .find(|i| i.name == *init)
+                    .expect("checked: init exists");
                 // Fresh post-construction state: the class invariant holds
                 // (proved at every init exit) and the init's posts describe it.
                 let b = self.hinted_sym("_obj", hint);
@@ -1648,7 +1766,8 @@ impl<'a> Generator<'a> {
                 let mut post_map = self.class_state_map(cd, &b);
                 post_map.extend(subst_map);
                 for post in ifn.posts.iter() {
-                    let prop = substitute(&post.text, &post_map, None);
+                    let text = preprocess_old_params(&post.text, &iparams);
+                    let prop = substitute(&text, &post_map, None);
                     self.push_hyp_unique(
                         format!(
                             "h_{}_{}_post_{}",
@@ -1658,6 +1777,10 @@ impl<'a> Generator<'a> {
                         ),
                         format!("({prop})"),
                     );
+                    self.context.push((
+                        format!("from `{class}::{init}` post: {}", post.text),
+                        post.line_span,
+                    ));
                 }
                 Val::Obj(b)
             }
@@ -1741,16 +1864,24 @@ impl<'a> Generator<'a> {
                 let hint = self.name_hint.take();
                 let arg_vals: Vec<String> = args
                     .iter()
-                    .map(|a| {
-                        let Val::Int(v) = self.eval(a) else {
-                            unreachable!("checked: int args")
-                        };
-                        v
+                    .map(|a| match self.eval(a) {
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) => v,
+                        _ => unreachable!("checked: int/array/class args only"),
                     })
                     .collect();
-                let Some(Ty::Class(ci)) = self.var_tys.get(recv.as_str()).copied() else {
+                let Some(Ty::Class(ci) | Ty::ClassRef(ci, _)) =
+                    self.var_tys.get(recv.as_str()).copied()
+                else {
                     unreachable!("checked: class receiver")
                 };
+                let cd = &self.classes[ci];
+                let m = cd
+                    .methods
+                    .iter()
+                    .find(|m| m.f.name == *method)
+                    .expect("checked: method exists");
+                let mparams = m.f.params.clone();
+                self.push_borrow_invs(&mparams, &arg_vals, e.span);
                 let cd = &self.classes[ci];
                 let m = cd
                     .methods
@@ -1815,15 +1946,30 @@ impl<'a> Generator<'a> {
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
+                let fresh_args = self.havoc_mut_class_args(&mparams, args);
+                let cd = &self.classes[ci];
+                let m = cd
+                    .methods
+                    .iter()
+                    .find(|m| m.f.name == *method)
+                    .expect("checked: method exists");
                 let mut post_map = self.class_state_map(cd, &final_state);
                 for (p, a) in m.f.params.iter().zip(arg_vals.iter()) {
                     post_map.insert(p.name.clone(), a.clone());
+                    // `old p` of a `&mut` argument is its pre-call state.
+                    if matches!(p.ty, Ty::ClassRef(_, Mutability::Mut)) {
+                        post_map.insert(format!("_old_{}", p.name), a.clone());
+                    }
+                }
+                for (pname, fresh) in fresh_args {
+                    post_map.insert(pname, fresh);
                 }
                 // `old self` in the callee's posts is the receiver's
                 // pre-call state.
                 post_map.insert("_old_self".to_string(), cur.clone());
                 for post in m.f.posts.iter() {
-                    let text = preprocess_old_self(&post.text);
+                    let text =
+                        preprocess_old_params(&preprocess_old_self(&post.text), &m.f.params);
                     let ret_ref = if m.f.ret == Ty::Unit {
                         None
                     } else {
@@ -1975,26 +2121,9 @@ impl<'a> Generator<'a> {
                     .collect();
                 let callee_fn = self.fn_map[callee.as_str()];
                 let sig = &self.sigs[callee.as_str()];
-                // `&C` arguments: the callee assumes the class invariant;
-                // the caller owes it here (closes by assumption — class
-                // locals are init/method post-states — but it is an
-                // obligation, not a trust step; ADR 0010).
-                for (p, aval) in sig.params.iter().zip(&arg_vals) {
-                    if let Ty::ClassRef(ci) = p.ty {
-                        let cd = &self.classes[ci];
-                        let map = self.class_state_map(cd, aval);
-                        for inv in &cd.invariants {
-                            let goal = substitute(&inv.text, &map, None);
-                            let ob = self.obligation(
-                                &format!("{}.borrow_inv.{}.{}", self.fname, p.name, cslug(inv)),
-                                format!("invariant of the borrowed `{}` argument", cd.name),
-                                e.span,
-                                goal,
-                            );
-                            self.push_obligation(ob);
-                        }
-                    }
-                }
+                let params = sig.params.clone();
+                self.push_borrow_invs(&params, &arg_vals, e.span);
+                let sig = &self.sigs[callee.as_str()];
                 let mut subst_map: HashMap<String, String> = sig
                     .params
                     .iter()
@@ -2004,7 +2133,10 @@ impl<'a> Generator<'a> {
                 // `old p` in the callee's contracts means the argument's
                 // pre-call state.
                 for p in &sig.params {
-                    if matches!(p.ty, Ty::Array(_, Mutability::Mut)) {
+                    if matches!(
+                        p.ty,
+                        Ty::Array(_, Mutability::Mut) | Ty::ClassRef(_, Mutability::Mut)
+                    ) {
                         subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
                     }
                 }
@@ -2072,6 +2204,11 @@ impl<'a> Generator<'a> {
                     self.env.insert(array.clone(), Val::Arr(b.clone()));
                     subst_map.insert(p.name.clone(), b);
                 }
+
+                for (pname, fresh) in self.havoc_mut_class_args(&params, args) {
+                    subst_map.insert(pname, fresh);
+                }
+                let sig = &self.sigs[callee.as_str()];
 
                 let ret_sym = self.hinted_sym("_r", hint);
                 match sig.ret {
@@ -2231,7 +2368,7 @@ impl<'a> Generator<'a> {
                     rest = &after_trim[ident.len()..];
                     continue;
                 }
-                if let Some(entry) = self.mut_arrays.get(&ident) {
+                if let Some(entry) = self.entry_states.get(&ident) {
                     out.push_str(&rest[..pos]);
                     out.push_str(entry);
                     rest = &after_trim[ident.len()..];
@@ -2273,8 +2410,17 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Current symbolic state of a `&mut` param — an array chain or a
+    /// class-state symbol.
+    fn state_str(&self, name: &str) -> String {
+        match self.env.get(name) {
+            Some(Val::Arr(s)) | Some(Val::Obj(s)) => s.clone(),
+            _ => unreachable!("checked: &mut param in scope"),
+        }
+    }
+
     /// Binders for clause well-formedness defs: source names (plus the
-    /// `_old_` twin for &mut arrays, so `old a` elaborates).
+    /// `_old_` twin for `&mut` params, so `old a` elaborates).
     fn wf_binders(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         // Template clauses reference `T.min`/`T.max` — and, for
@@ -2291,12 +2437,16 @@ impl<'a> Generator<'a> {
             match p.ty {
                 Ty::Int(_) => out.push((p.name.clone(), "Int".into())),
                 Ty::Bool => out.push((p.name.clone(), "Bool".into())),
-                Ty::Class(ci) | Ty::ClassRef(ci) => {
-                    out.push((p.name.clone(), lean_class_name(&self.classes[ci].name)))
+                Ty::Class(ci) | Ty::ClassRef(ci, _) => {
+                    let lean = lean_class_name(&self.classes[ci].name);
+                    out.push((p.name.clone(), lean.clone()));
+                    if let Some(entry) = self.entry_states.get(&p.name) {
+                        out.push((entry.clone(), lean));
+                    }
                 }
                 Ty::Array(..) => {
                     out.push((p.name.clone(), "Sable.Seq Int".into()));
-                    if let Some(entry) = self.mut_arrays.get(&p.name) {
+                    if let Some(entry) = self.entry_states.get(&p.name) {
                         out.push((entry.clone(), "Sable.Seq Int".into()));
                     }
                 }
@@ -2316,14 +2466,14 @@ impl<'a> Generator<'a> {
 
     /// Postcondition obligations for the current path. In post goals,
     /// by-value parameters mean their *entry* values (verbatim binders) but
-    /// &mut arrays mean their *final* state — substituted here.
+    /// `&mut` params mean their *final* state — substituted here.
     fn emit_posts(&mut self, result_eq: Option<String>) {
         let f = self.f;
         let mut mut_map: HashMap<String, String> = self
-            .mut_arrays
+            .entry_states
             .keys()
             .filter(|n| n.as_str() != "self")
-            .map(|name| (name.clone(), self.arr_str(name)))
+            .map(|name| (name.clone(), self.state_str(name)))
             .collect();
         // Class-member exits: the invariant is an obligation at every exit
         // of an init or &mut-self method (design §7 desugaring), and posts
@@ -2722,7 +2872,10 @@ pub fn substitute(text: &str, map: &HashMap<String, String>, result: Option<&str
 fn preprocess_old_params(text: &str, params: &[Param]) -> String {
     let mut out = text.to_string();
     for p in params {
-        if !matches!(p.ty, Ty::Array(_, Mutability::Mut)) {
+        if !matches!(
+            p.ty,
+            Ty::Array(_, Mutability::Mut) | Ty::ClassRef(_, Mutability::Mut)
+        ) {
             continue;
         }
         // Token-aware replace of the two-token sequence `old <name>`.

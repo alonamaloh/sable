@@ -392,7 +392,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 .map(|pa| (&pa.ty, pa.span))
                 .chain(std::iter::once((&f.ret, f.name_span)))
             {
-                if let Ty::Class(ci) | Ty::ClassRef(ci) = ty {
+                if let Ty::Class(ci) | Ty::ClassRef(ci, _) = ty {
                     if let Some(name) = externs.get(*ci) {
                         refs.push((name.clone(), span));
                     }
@@ -417,7 +417,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 walk_stmts(d, &mut refs, &consts);
             }
             for fi in &c.fields {
-                if let Ty::Class(ci) | Ty::ClassRef(ci) = fi.ty {
+                if let Ty::Class(ci) | Ty::ClassRef(ci, _) = fi.ty {
                     if let Some(name) = externs.get(ci) {
                         refs.push((name.clone(), fi.span));
                     }

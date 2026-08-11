@@ -48,3 +48,138 @@ pub fn demo() -> i32 {
     var u = union_of(&x, &y);
     return width(&u);
 }
+
+// -------------------------- mutable borrows ---------------------------
+//
+// `&mut C` (ADR 0023) is the same logical treatment as `&C` plus one
+// move: the argument comes back in a fresh state, with the class
+// invariant assumed. What makes that sound is that a callee can only
+// mutate through the class's own `&mut self` methods, and each of those
+// re-establishes the invariant at its exit. `old r` in a contract is the
+// state the argument had at entry.
+
+pub class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+
+    /// post result = self.n
+    fn get(&self) -> u64 {
+        return self.n;
+    }
+}
+
+/// pre  c.n + 2 ≤ 100
+/// post c.n = old c.n + 2
+pub fn bump_twice(&mut Counter c) {
+    c.bump();
+    c.bump();
+}
+
+// Re-borrowing: unique access can be handed on as unique (`&mut c`) or
+// narrowed to shared (`&c`), never the other way.
+/// pre  c.n + 2 ≤ 100
+/// post #[label(bumped)] c.n = old c.n + 2
+/// post #[label(result)] result = c.n
+pub fn bump_then_read(&mut Counter c) -> u64 {
+    bump_twice(&mut c);
+    u64 r = peek(&c);
+    return r;
+}
+
+/// post result = c.n
+pub fn peek(&Counter c) -> u64 {
+    u64 r = c.get();
+    return r;
+}
+
+/// post result = 2
+pub fn mutate_local() -> u64 {
+    var mut c = Counter::zero();
+    bump_twice(&mut c);
+    u64 r = c.get();
+    return r;
+}
+
+// A loop that mutates a borrowed class: the borrow itself survives the
+// backedge, its view does not, and the invariant is what carries the
+// view across.
+/// pre  c.n = 0
+/// post c.n = 5
+pub fn count_to_five(&mut Counter c) {
+    mut u64 i = 0;
+    /// invariant i ≤ 5
+    /// invariant c.n = i
+    /// variant 5 - i
+    while (i < 5) {
+        c.bump();
+        i = i + 1;
+    }
+}
+
+// A method may borrow another class value too, shared or mutably, and
+// the argument is treated exactly as at a function call: its invariant is
+// owed going in, and a `&mut` one comes back fresh.
+pub class Driver {
+    u64 runs;
+
+    /// invariant runs ≤ 100
+
+    /// post self.runs = 0
+    init idle() {
+        self.runs = 0;
+    }
+
+    /// post result = self.runs + c.n
+    fn total_with(&self, &Counter c) -> u64 {
+        return self.runs + c.n;
+    }
+
+    /// pre  self.runs < 100
+    /// pre  c.n < 100
+    /// post #[label(runs)]  self.runs = old self.runs + 1
+    /// post #[label(other)] c.n = old c.n + 1
+    fn drive(&mut self, &mut Counter c) {
+        self.runs = self.runs + 1;
+        c.bump();
+    }
+}
+
+/// post result = 1
+pub fn drive_once() -> u64 {
+    var mut d = Driver::idle();
+    var mut c = Counter::zero();
+    u64 before = d.total_with(&c);
+    d.drive(&mut c);
+    u64 after = c.get();
+    /// assert #[label(before)] before = 0
+    return after;
+}
+
+// The call-site havoc and the loop havoc composed: a `&mut` argument
+// passed to a function *inside* a loop body.
+/// post result = 6
+pub fn bump_in_loop() -> u64 {
+    var mut c = Counter::zero();
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant c.n = 2 * i
+    /// variant 3 - i
+    while (i < 3) {
+        bump_twice(&mut c);
+        i = i + 1;
+    }
+    u64 r = c.get();
+    return r;
+}

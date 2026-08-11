@@ -1,0 +1,31 @@
+// expect-error: type.mut_borrow_shared
+// A shared borrow cannot be upgraded. `&mut c` inside a function that
+// only holds `&Counter` would manufacture unique access the caller never
+// gave up.
+
+class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+}
+
+/// pre  c.n < 100
+fn poke(&mut Counter c) {
+    c.bump();
+}
+
+/// pre  c.n < 100
+fn sneak(&Counter c) {
+    poke(&mut c);
+}

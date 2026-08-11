@@ -1,6 +1,7 @@
 # ADR 0010 — First-class class values, slice A: shared borrows and returns
 
-Date: 2026-08-10. Status: accepted (slice A); moves/`&mut`/class fields deferred.
+Date: 2026-08-10. Status: accepted (slice A); slice B landed in ADR 0020
+and ADR 0023.
 
 ## Context
 
@@ -62,9 +63,15 @@ instances.
 
 **Slice B, partly landed — see ADR 0020**: class-valued fields, by-value class parameters (moves), and borrowing a class field. `&mut C`, local-to-local moves, and generic-class field borrows remain deferred.
 
+**Slice B completed — see ADR 0023**: `&mut C` and local-to-local moves,
+on the place engine. Mutable *field* borrows (`&mut a.f`) stay deferred
+there on an invariant argument rather than a machinery one; generic-class
+field borrows are still deferred.
+
 **Landed since (forced by bignum division):** shared re-borrow of `&C`
 parameters (passing a borrow along to a callee), and class-local
 reassignment from call/constructor results — a move-in; the old value is
 dropped with its RAII invariant check, and loop havoc assumes the class
 invariant for reassigned locals (sound: every source carried `ret_inv`).
-Local-to-local moves remain deferred (`class.move_deferred`).
+Local-to-local moves landed later with the place engine (ADR 0023);
+`class.move_deferred` is gone.

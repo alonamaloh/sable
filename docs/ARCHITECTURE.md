@@ -42,6 +42,11 @@ typecheck (compiler/src/check.rs)     types, call graph, and one flow-sensitive
   │                                   iff every reaching branch initialized it,
   │                                   moved iff any reaching branch moved it —
   │                                   a branch that returns reaches nothing);
+  │                                   ownership is keyed by `Place` (root + field
+  │                                   path) with `contains`/`overlaps`, so a field
+  │                                   is a place in its own right and a mutable
+  │                                   borrow overlapping another in one call is
+  │                                   rejected (ADR 0022/0023);
   │                                   operator-binding rewrite (ADR 0012: `a + b`
   │                                   on class values becomes the bound
   │                                   contracted call)
@@ -50,7 +55,11 @@ vcgen (compiler/src/vcgen.rs)         forward symbolic execution over the AST;
   │                                   values are Lean `Int` expression strings;
   │                                   path-splitting at `if`; per-operation VCs;
   │                                   call sites: callee pres become obligations,
-  │                                   callee posts become hypotheses on a fresh symbol
+  │                                   callee posts become hypotheses on a fresh symbol;
+  │                                   `&mut` arguments (arrays, classes, `&mut self`)
+  │                                   are havocked at the call and at every loop
+  │                                   head, with the entry state kept for `old p`
+  │                                   (ADR 0023)
   ▼
 emit (compiler/src/lean.rs)           one Lean theorem per obligation:
   │                                     binders = params + intermediate symbols,

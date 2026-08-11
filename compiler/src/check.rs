@@ -70,10 +70,11 @@ struct Ctx<'a> {
     traits: &'a [TraitDecl],
 }
 
-/// The class index of a class-typed name (owned local or `&C` param).
+/// The class index of a class-typed name (owned local or class-borrow
+/// param).
 fn class_of(ctx: &Ctx, name: &str, span: Span) -> CResult<usize> {
     match ctx.vars.get(name).map(|v| v.ty) {
-        Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci)) => Ok(ci),
+        Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Ok(ci),
         _ => Err(Diagnostic {
             name: "type.mismatch".into(),
             title: format!("`{name}` is not a class value"),
@@ -159,9 +160,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             }
             let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
                 for p in params {
-                    // Class parameters: by value (moved in) or shared
-                    // borrow (ADR 0020).
-                    let ok = matches!(p.ty, Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(_))
+                    // Class parameters: by value (moved in) or
+                    // borrowed (ADR 0020, ADR 0023).
+                    let ok = matches!(p.ty, Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(..))
                         || (allow_shared_arrays
                             && matches!(p.ty, Ty::Array(_, Mutability::Shared)));
                     if !ok {
@@ -242,7 +243,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             sig.params.first().map(|p| p.ty),
             sig.params.get(1).map(|p| p.ty),
         ) {
-            (Some(Ty::ClassRef(a)), Some(Ty::ClassRef(b))) if sig.params.len() == 2 => (a, b),
+            (Some(Ty::ClassRef(a, Mutability::Shared)), Some(Ty::ClassRef(b, Mutability::Shared)))
+                if sig.params.len() == 2 =>
+            {
+                (a, b)
+            }
             _ => return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`")),
         };
         if ci_a != ci_b {
@@ -1314,7 +1319,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // (ADR 0010) — rewrite and re-check.
             if matches!(
                 ctx.vars.get(array.as_str()).map(|v| v.ty),
-                Some(Ty::Class(_)) | Some(Ty::ClassRef(_))
+                Some(Ty::Class(_)) | Some(Ty::ClassRef(..))
             ) {
                 let obj = array.clone();
                 e.kind = ExprKind::ClassField {
@@ -1704,10 +1709,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         check_expr(ctx, arg, Some(p.ty))?;
                         mark_moved(ctx, arg)?;
                     }
+                    Ty::ClassRef(..) => {
+                        require_explicit_borrow(ctx, arg, p.ty)?;
+                        check_expr(ctx, arg, Some(p.ty))?;
+                    }
                     _ => check_expr(ctx, arg, Some(p.ty)).map(|_| ())?,
                 }
             }
-            check_borrow_conflicts(args, None)?;
+            check_borrow_conflicts(ctx, args, None)?;
             ctx.calls.push(format!("{class}::{init}"));
             Ty::Class(ci)
         }
@@ -1718,10 +1727,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             method_span,
             args,
         } => {
-            let ci = match ctx.vars.get(recv.as_str()) {
+            // The receiver is an owned local or a class borrow; a shared
+            // borrow only receives `&self` methods (checked below).
+            let (ci, recv_mut, recv_owned) = match ctx.vars.get(recv.as_str()) {
                 Some(VarInfo {
-                    ty: Ty::Class(ci), ..
-                }) => *ci,
+                    ty: Ty::Class(ci),
+                    mutable,
+                    ..
+                }) => (*ci, *mutable, true),
+                Some(VarInfo {
+                    ty: Ty::ClassRef(ci, m),
+                    ..
+                }) => (*ci, *m == Mutability::Mut, false),
                 Some(v) => {
                     return Err(Diagnostic {
                         name: "type.not_a_class".into(),
@@ -1768,25 +1785,37 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            if self_kind == SelfKind::Mut
-                && matches!(
-                    ctx.vars.get(recv.as_str()).map(|v| v.ty),
-                    Some(Ty::Class(_))
-                )
-                && !ctx.vars.get(recv.as_str()).is_some_and(|v| v.mutable)
-            {
-                return Err(Diagnostic {
-                    name: "mut.method_immutable".into(),
-                    title: format!("`&mut` method on immutable local `{recv}`"),
-                    span: *recv_span,
-                    label: format!("`{method}` mutates its receiver; declare `{recv}` `mut`"),
-                    notes: vec![],
-                });
+            if self_kind == SelfKind::Mut && !recv_mut {
+                return if recv_owned {
+                    Err(Diagnostic {
+                        name: "mut.method_immutable".into(),
+                        title: format!("`&mut` method on immutable local `{recv}`"),
+                        span: *recv_span,
+                        label: format!("`{method}` mutates its receiver; declare `{recv}` `mut`"),
+                        notes: vec![],
+                    })
+                } else {
+                    Err(Diagnostic {
+                        name: "mut.method_shared_borrow".into(),
+                        title: format!("`&mut` method on the shared borrow `{recv}`"),
+                        span: *recv_span,
+                        label: format!("`{method}` mutates its receiver"),
+                        notes: vec![(
+                            "note".into(),
+                            format!(
+                                "take the parameter as `&mut {}` to mutate through it \
+                                 (ADR 0023)",
+                                ctx.class_metas[ci].name
+                            ),
+                        )],
+                    })
+                };
             }
             for (arg, p) in args.iter_mut().zip(&params) {
                 check_expr(ctx, arg, Some(p.ty))?;
             }
             check_borrow_conflicts(
+                ctx,
                 args,
                 Some((
                     Place::local(recv),
@@ -1849,16 +1878,23 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             if let Some(fname) = field {
                 if *mutable {
                     return Err(Diagnostic {
-                        name: "class.mut_borrow_deferred".into(),
-                        title: "`&mut` class borrows are not supported yet".into(),
+                        name: "class.mut_field_borrow".into(),
+                        title: format!("cannot mutably borrow the field `{array}.{fname}`"),
                         span,
-                        label: "shared borrows only (ADR 0010)".into(),
-                        notes: vec![],
+                        label: "field borrows are shared".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "a callee handed `&mut a.f` could not re-establish the \
+                             invariant of `a`, which may constrain `f` alongside its \
+                             other fields; mutate through a method of `a` instead \
+                             (ADR 0023)"
+                                .into(),
+                        )],
                     });
                 }
                 let base = if array == "self" {
                     match ctx.in_class {
-                        Some((ci, _)) => Ty::ClassRef(ci),
+                        Some((ci, _)) => Ty::ClassRef(ci, Mutability::Shared),
                         None => {
                             return Err(Diagnostic {
                                 name: "type.self_outside_class".into(),
@@ -1883,7 +1919,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         }
                     }
                 };
-                let (Ty::Class(bci) | Ty::ClassRef(bci)) = base else {
+                let (Ty::Class(bci) | Ty::ClassRef(bci, _)) = base else {
                     return Err(Diagnostic {
                         name: "type.not_a_class".into(),
                         title: format!("`{array}` is not a class value"),
@@ -1904,7 +1940,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     })?;
                 return match fld.1 {
-                    Ty::Class(fci) => Ok(Ty::ClassRef(fci)),
+                    Ty::Class(fci) => Ok(Ty::ClassRef(fci, Mutability::Shared)),
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
                     Ty::Array(elem, _) => Ok(Ty::Array(elem, Mutability::Shared)),
@@ -1917,21 +1953,47 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     }),
                 };
             }
-            // `&c` of a class local, or a shared re-borrow of a `&C`
-            // parameter passed along to a callee (ADR 0010).
-            if let Some(Ty::Class(ci) | Ty::ClassRef(ci)) =
-                ctx.vars.get(array.as_str()).map(|v| v.ty)
-            {
-                if *mutable {
-                    return Err(Diagnostic {
-                        name: "class.mut_borrow_deferred".into(),
-                        title: "`&mut` class borrows are not supported yet".into(),
-                        span,
-                        label: "shared borrows only (ADR 0010)".into(),
-                        notes: vec![],
-                    });
+            // `&c` / `&mut c` of a class local, or a re-borrow of a class
+            // parameter passed along to a callee (ADR 0010, ADR 0023).
+            // A shared re-borrow of a `&mut C` is fine; the other
+            // direction would manufacture unique access out of shared.
+            if let Some(v) = ctx.vars.get(array.as_str()) {
+                if let Ty::Class(ci) | Ty::ClassRef(ci, _) = v.ty {
+                    let (src_mut, is_local) = match v.ty {
+                        Ty::ClassRef(_, m) => (m, false),
+                        _ => (Mutability::Mut, true),
+                    };
+                    let declared_mut = v.mutable;
+                    if *mutable {
+                        if src_mut != Mutability::Mut {
+                            return Err(Diagnostic {
+                                name: "type.mut_borrow_shared".into(),
+                                title: format!("cannot mutably borrow `{array}` through `&{}`",
+                                    ctx.class_metas[ci].name),
+                                span,
+                                label: "this parameter is a shared borrow".into(),
+                                notes: vec![],
+                            });
+                        }
+                        if is_local && !declared_mut {
+                            return Err(Diagnostic {
+                                name: "mut.borrow_immutable".into(),
+                                title: format!("`&mut` borrow of immutable local `{array}`"),
+                                span,
+                                label: "declare it `mut` to allow mutable borrows".into(),
+                                notes: vec![],
+                            });
+                        }
+                    }
+                    return Ok(Ty::ClassRef(
+                        ci,
+                        if *mutable {
+                            Mutability::Mut
+                        } else {
+                            Mutability::Shared
+                        },
+                    ));
                 }
-                return Ok(Ty::ClassRef(ci));
             }
             let elem = array_elem_ty(ctx, array, span)?;
             let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty) {
@@ -2042,7 +2104,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // only ever see the ordinary call.
             let class_of = |ctx: &Ctx, e: &Expr| match &e.kind {
                 ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty) {
-                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci)) => Some((n.clone(), ci)),
+                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Some((n.clone(), ci)),
                     _ => None,
                 },
                 _ => None,
@@ -2268,10 +2330,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         check_expr(ctx, arg, Some(pty))?;
                         mark_moved(ctx, arg)?;
                     }
+                    Ty::ClassRef(..) => {
+                        require_explicit_borrow(ctx, arg, pty)?;
+                        check_expr(ctx, arg, Some(pty))?;
+                    }
                     _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }
             }
-            check_borrow_conflicts(args, None)?;
+            check_borrow_conflicts(ctx, args, None)?;
             if *callee != ctx.current_fn {
                 ctx.calls.push(callee.clone());
             }
@@ -2323,21 +2389,28 @@ impl Place {
     }
 }
 
-/// The place an argument borrows, and whether the borrow is mutable.
-fn borrow_place(arg: &Expr) -> Option<(Place, bool)> {
-    let ExprKind::Borrow {
-        array,
-        field,
-        mutable,
-    } = &arg.kind
-    else {
-        return None;
-    };
-    let mut p = Place::local(array);
-    if let Some(f) = field {
-        p.fields.push(f.clone());
+/// The place an argument borrows, and whether the borrow is mutable. A
+/// bare name that is already a class borrow counts too: it hands the
+/// borrowed place on without an `&` at the call site.
+fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
+    match &arg.kind {
+        ExprKind::Borrow {
+            array,
+            field,
+            mutable,
+        } => {
+            let mut p = Place::local(array);
+            if let Some(f) = field {
+                p.fields.push(f.clone());
+            }
+            Some((p, *mutable))
+        }
+        ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty) {
+            Some(Ty::ClassRef(_, m)) => Some((Place::local(n), m == Mutability::Mut)),
+            _ => None,
+        },
+        _ => None,
     }
-    Some((p, *mutable))
 }
 
 /// Within one call, a mutable borrow must not overlap any other borrow.
@@ -2346,6 +2419,7 @@ fn borrow_place(arg: &Expr) -> Option<(Place, bool)> {
 /// the caller assume a contract framed over storage the callee actually
 /// changed — unsound, not merely imprecise.
 fn check_borrow_conflicts(
+    ctx: &Ctx,
     args: &[Expr],
     receiver: Option<(Place, bool, Span)>,
 ) -> CResult<()> {
@@ -2354,7 +2428,7 @@ fn check_borrow_conflicts(
         borrows.push(r);
     }
     for a in args {
-        if let Some((p, m)) = borrow_place(a) {
+        if let Some((p, m)) = borrow_place(ctx, a) {
             borrows.push((p, m, a.span));
         }
     }
@@ -2379,6 +2453,68 @@ fn check_borrow_conflicts(
         }
     }
     Ok(())
+}
+
+/// Handing a class *value* over to a borrow is written at the call site,
+/// with its mutability, so a reader sees where access — and, for
+/// `&mut C`, unique access — is given up. This is the rule array borrows
+/// already follow (ADR 0023). Passing along a borrow already held at the
+/// same mutability hands over nothing new and needs no `&`.
+fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
+    let Ty::ClassRef(ci, m) = pty else {
+        return Ok(());
+    };
+    // Passing along a *shared* borrow already held under the same type:
+    // nothing is handed over that the caller did not already have, and
+    // no `&` announces anything. Unique access is different — `&mut` is
+    // always written, so every mutable class argument is a visible
+    // borrow at the call site (which conflict detection and the caller's
+    // post-call havoc both rely on).
+    if m == Mutability::Shared {
+        if let ExprKind::Var(n) = &arg.kind {
+            if ctx.vars.get(n.as_str()).map(|v| v.ty) == Some(Ty::ClassRef(ci, m)) {
+                return Ok(());
+            }
+        }
+    }
+    let want = if m == Mutability::Mut { "&mut " } else { "&" };
+    match arg.kind {
+        ExprKind::Borrow { mutable, .. } if mutable == (m == Mutability::Mut) => Ok(()),
+        ExprKind::Borrow { .. } => Err(Diagnostic {
+            name: "type.class_borrow_mutability".into(),
+            title: format!(
+                "expected `{}`, found `{}`",
+                Ty::ClassRef(ci, m).name(),
+                Ty::ClassRef(
+                    ci,
+                    if m == Mutability::Mut {
+                        Mutability::Shared
+                    } else {
+                        Mutability::Mut
+                    }
+                )
+                .name()
+            ),
+            span: arg.span,
+            label: format!("write `{want}name`"),
+            notes: vec![(
+                "note".into(),
+                "a borrow's mutability is written at the call site, not \
+                 inferred from the parameter"
+                    .into(),
+            )],
+        }),
+        _ => Err(Diagnostic {
+            name: "type.class_arg_borrow".into(),
+            title: "class borrows are passed explicitly".into(),
+            span: arg.span,
+            label: format!("write `{want}name`"),
+            notes: vec![(
+                "note".into(),
+                format!("`{}` is borrowed here, not moved", ctx.class_metas[ci].name),
+            )],
+        }),
+    }
 }
 
 /// A class value passed by value is moved out of the local that named

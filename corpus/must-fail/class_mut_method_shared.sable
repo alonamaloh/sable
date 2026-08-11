@@ -1,0 +1,25 @@
+// expect-error: mut.method_shared_borrow
+// The only way to mutate through a class borrow is a `&mut self` method,
+// and a shared borrow does not admit one.
+
+class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+}
+
+/// pre  c.n < 100
+fn poke(&Counter c) {
+    c.bump();
+}
