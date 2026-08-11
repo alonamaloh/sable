@@ -1,4 +1,4 @@
-// expect-error: type.class_arg_borrow
+// expect-error: type.arg_borrow
 // Handing an owned class value to a borrow is written at the call site,
 // with its mutability, so a reader sees where access is given up. A bare
 // name would read like a move.

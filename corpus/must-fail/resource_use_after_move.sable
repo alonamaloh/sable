@@ -1,0 +1,25 @@
+// expect-error: resource.use_after_move
+// Resources are affine: passing one by value hands over the authority
+// itself, so the moved-from name is dead.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource RawSpan s) -> u64 {
+    resource RawSpan t = identity(s);
+    u64 n = nonempty(&s);
+    return n;
+}

@@ -370,6 +370,9 @@ enum Val {
     Arr(String),
     /// Symbolic class value: a binder or a `{ _ with f := v }` chain.
     Obj(String),
+    /// Symbolic resource *view*: a binder or a transformation of one.
+    /// The token it belongs to is not represented — that is the point.
+    View(String),
     Unit,
 }
 
@@ -468,6 +471,7 @@ impl<'a> Generator<'a> {
             Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => {
                 lean_class_name(&self.classes[*ci].name)
             }
+            Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) => k.view_ty().to_string(),
             Some(Ty::Int(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             _ => "Sable.Seq Int".to_string(),
@@ -497,6 +501,11 @@ impl<'a> Generator<'a> {
                 Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
                 Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                     Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
+                }
+                // A resource binds its *view*; the authority it names is
+                // a checker property and appears nowhere in Lean.
+                Ty::Res(k) | Ty::ResRef(k, _) => {
+                    Some((name.clone(), k.view_ty().to_string()))
                 }
                 Ty::Option(_) | Ty::Unit => None,
             })
@@ -618,28 +627,59 @@ impl<'a> Generator<'a> {
     /// `&mut self` receiver rule gives: a callee can only mutate through
     /// the class's own methods, each of which re-establishes it (ADR 0023).
     ///
+    /// A `resource &mut R` argument is the same move with a view instead
+    /// of a class state, and one difference that matters: what comes back
+    /// fresh is the *view*. The token is the same token — that is what
+    /// the caller still owns after the call, and what a loop's shape check
+    /// preserves across a backedge (ADR 0024).
+    ///
     /// Returns param name → post-call state, for the callee's posts.
-    fn havoc_mut_class_args(&mut self, params: &[Param], args: &[Expr]) -> Vec<(String, String)> {
-        let targets: Vec<(String, String, usize)> = params
+    fn havoc_mut_borrow_args(&mut self, params: &[Param], args: &[Expr]) -> Vec<(String, String)> {
+        enum Target {
+            Class(usize),
+            View(ResKind),
+        }
+        let targets: Vec<(String, String, Target)> = params
             .iter()
             .zip(args.iter())
-            .filter_map(|(p, arg)| match (p.ty, &arg.kind) {
-                (Ty::ClassRef(aci, Mutability::Mut), ExprKind::Borrow { array, .. }) => {
-                    Some((p.name.clone(), array.clone(), aci))
+            .filter_map(|(p, arg)| {
+                let ExprKind::Borrow { array, .. } = &arg.kind else {
+                    return None;
+                };
+                match p.ty {
+                    Ty::ClassRef(aci, Mutability::Mut) => {
+                        Some((p.name.clone(), array.clone(), Target::Class(aci)))
+                    }
+                    Ty::ResRef(k, Mutability::Mut) => {
+                        Some((p.name.clone(), array.clone(), Target::View(k)))
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             .collect();
         let mut out = Vec::new();
-        for (pname, array, aci) in targets {
-            let aname = self.classes[aci].name.clone();
-            let b = self.hinted_sym("_obj", Some(array.clone()));
-            self.binders.push((b.clone(), lean_class_name(&aname)));
-            let acd = &self.classes[aci];
-            self.push_class_state_facts(acd, &b);
-            self.push_invariant_hyps(acd, &b);
-            self.env.insert(array, Val::Obj(b.clone()));
-            out.push((pname, b));
+        for (pname, array, target) in targets {
+            match target {
+                Target::Class(aci) => {
+                    let aname = self.classes[aci].name.clone();
+                    let b = self.hinted_sym("_obj", Some(array.clone()));
+                    self.binders.push((b.clone(), lean_class_name(&aname)));
+                    let acd = &self.classes[aci];
+                    self.push_class_state_facts(acd, &b);
+                    self.push_invariant_hyps(acd, &b);
+                    self.env.insert(array, Val::Obj(b.clone()));
+                    out.push((pname, b));
+                }
+                Target::View(k) => {
+                    let b = self.hinted_sym("_view", Some(array.clone()));
+                    self.binders.push((b.clone(), k.view_ty().into()));
+                    for (h, prop) in view_wf_hyps(k, &array, &b) {
+                        self.push_hyp_unique(h, prop);
+                    }
+                    self.env.insert(array, Val::View(b.clone()));
+                    out.push((pname, b));
+                }
+            }
         }
         out
     }
@@ -687,6 +727,25 @@ impl<'a> Generator<'a> {
                     self.push_class_state_facts(cd, &binder);
                     self.push_invariant_hyps(cd, &binder);
                     self.env.insert(p.name.clone(), Val::Obj(binder));
+                }
+                // A resource parameter binds its *view* and nothing
+                // else: the authority it carries is a checker property,
+                // and no generated VC ever mentions it (ADR 0022/0024).
+                // A `resource &mut R` follows the `&mut` array rule —
+                // entry state as the binder, current state in the env.
+                Ty::Res(k) | Ty::ResRef(k, _) => {
+                    let binder = if matches!(p.ty, Ty::ResRef(_, Mutability::Mut)) {
+                        let b = format!("_old_{}", p.name);
+                        self.entry_states.insert(p.name.clone(), b.clone());
+                        b
+                    } else {
+                        p.name.clone()
+                    };
+                    self.binders.push((binder.clone(), k.view_ty().into()));
+                    for (h, prop) in view_wf_hyps(k, &p.name, &binder) {
+                        self.hyps.push((h, prop));
+                    }
+                    self.env.insert(p.name.clone(), Val::View(binder));
                 }
                 Ty::Int(it) => {
                     self.binders.push((p.name.clone(), "Int".into()));
@@ -788,6 +847,9 @@ impl<'a> Generator<'a> {
             Ty::Bool => "Prop".into(),
             // A returned class value is its structure (ADR 0010).
             Ty::Class(ci) => lean_class_name(&self.classes[ci].name),
+            // A returned resource is its view: the authority moves, and
+            // the logic sees only what the view says (ADR 0024).
+            Ty::Res(k) | Ty::ResRef(k, _) => k.view_ty().into(),
             _ => "Int".into(),
         }
     }
@@ -903,6 +965,11 @@ impl<'a> Generator<'a> {
                             }
                             format!("(result = {chain})")
                         }
+                        // Returning a resource returns its authority; in
+                        // the logic that is just its view. There is no
+                        // `ret_inv` analogue — a view carries its own
+                        // well-formedness, not a user invariant.
+                        Val::View(chain) => format!("(result = {chain})"),
                         _ => unreachable!("unit values cannot be returned"),
                     },
                 });
@@ -1219,7 +1286,7 @@ impl<'a> Generator<'a> {
                     continue;
                 }
                 let s = match val {
-                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) | Val::Obj(s) => s,
+                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s) => s,
                     Val::Prop(s) => s,
                     Val::Unit => continue,
                 };
@@ -1393,6 +1460,19 @@ impl<'a> Generator<'a> {
                     self.push_invariant_hyps(cd, name);
                     self.env.insert(name.clone(), Val::Obj(name.clone()));
                 }
+                // A loop body transformed this resource's view. The
+                // *token* is what the backedge shape check preserves; the
+                // view is havocked like any other mutated state, and the
+                // loop invariant is what carries it across. Confusing the
+                // two would make every loop drop the authority it carries.
+                Some(Ty::Res(k)) | Some(Ty::ResRef(k, Mutability::Mut)) => {
+                    let k = *k;
+                    self.binders.push((name.clone(), k.view_ty().into()));
+                    for (h, prop) in view_wf_hyps(k, name, name) {
+                        self.hyps.push((h, prop));
+                    }
+                    self.env.insert(name.clone(), Val::View(name.clone()));
+                }
                 Some(Ty::Array(elem, Mutability::Owned)) => {
                     // Owned local mutated by the loop body: fresh state.
                     // Stores preserve length, so equate to the pre-havoc
@@ -1531,6 +1611,12 @@ impl<'a> Generator<'a> {
                 unreachable!("checked: options only in return position")
             }
             ExprKind::Borrow { array, field, .. } => {
+                // Borrowing a resource passes its view along unchanged;
+                // what the borrow transfers is authority, and authority
+                // is not in the logic (ADR 0024).
+                if let Some(Val::View(v)) = self.env.get(array.as_str()) {
+                    return Val::View(v.clone());
+                }
                 let base = match self.env.get(array.as_str()) {
                     Some(Val::Obj(chain)) => Some(chain.clone()),
                     _ => None,
@@ -1706,7 +1792,7 @@ impl<'a> Generator<'a> {
                     .map(|a| match self.eval(a) {
                         // Class args (by value or borrowed) substitute
                         // as their symbolic structure value (ADR 0020).
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) => v,
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
                         Val::Prop(p) => format!("(decide {p})"),
                         _ => unreachable!("checked: ctor args"),
                     })
@@ -1724,7 +1810,10 @@ impl<'a> Generator<'a> {
                     .zip(arg_vals.iter().cloned())
                     .collect();
                 for p in &iparams {
-                    if matches!(p.ty, Ty::ClassRef(_, Mutability::Mut)) {
+                    if matches!(
+                        p.ty,
+                        Ty::ClassRef(_, Mutability::Mut) | Ty::ResRef(_, Mutability::Mut)
+                    ) {
                         subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
                     }
                 }
@@ -1748,7 +1837,7 @@ impl<'a> Generator<'a> {
                     );
                     self.push_obligation(ob);
                 }
-                for (pname, fresh) in self.havoc_mut_class_args(&iparams, args) {
+                for (pname, fresh) in self.havoc_mut_borrow_args(&iparams, args) {
                     subst_map.insert(pname, fresh);
                 }
                 let cd: &ClassDecl = self.class_map[class.as_str()];
@@ -1865,8 +1954,8 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) => v,
-                        _ => unreachable!("checked: int/array/class args only"),
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
+                        _ => unreachable!("checked: int/array/class/resource args only"),
                     })
                     .collect();
                 let Some(Ty::Class(ci) | Ty::ClassRef(ci, _)) =
@@ -1946,7 +2035,7 @@ impl<'a> Generator<'a> {
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
-                let fresh_args = self.havoc_mut_class_args(&mparams, args);
+                let fresh_args = self.havoc_mut_borrow_args(&mparams, args);
                 let cd = &self.classes[ci];
                 let m = cd
                     .methods
@@ -1957,7 +2046,10 @@ impl<'a> Generator<'a> {
                 for (p, a) in m.f.params.iter().zip(arg_vals.iter()) {
                     post_map.insert(p.name.clone(), a.clone());
                     // `old p` of a `&mut` argument is its pre-call state.
-                    if matches!(p.ty, Ty::ClassRef(_, Mutability::Mut)) {
+                    if matches!(
+                        p.ty,
+                        Ty::ClassRef(_, Mutability::Mut) | Ty::ResRef(_, Mutability::Mut)
+                    ) {
                         post_map.insert(format!("_old_{}", p.name), a.clone());
                     }
                 }
@@ -2115,8 +2207,8 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) => v,
-                        _ => unreachable!("checked: int/array/class args only"),
+                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
+                        _ => unreachable!("checked: int/array/class/resource args only"),
                     })
                     .collect();
                 let callee_fn = self.fn_map[callee.as_str()];
@@ -2135,7 +2227,9 @@ impl<'a> Generator<'a> {
                 for p in &sig.params {
                     if matches!(
                         p.ty,
-                        Ty::Array(_, Mutability::Mut) | Ty::ClassRef(_, Mutability::Mut)
+                        Ty::Array(_, Mutability::Mut)
+                            | Ty::ClassRef(_, Mutability::Mut)
+                            | Ty::ResRef(_, Mutability::Mut)
                     ) {
                         subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
                     }
@@ -2205,7 +2299,7 @@ impl<'a> Generator<'a> {
                     subst_map.insert(p.name.clone(), b);
                 }
 
-                for (pname, fresh) in self.havoc_mut_class_args(&params, args) {
+                for (pname, fresh) in self.havoc_mut_borrow_args(&params, args) {
                     subst_map.insert(pname, fresh);
                 }
                 let sig = &self.sigs[callee.as_str()];
@@ -2235,6 +2329,15 @@ impl<'a> Generator<'a> {
                         self.push_class_state_facts(cd, &ret_sym);
                         self.push_invariant_hyps(cd, &ret_sym);
                     }
+                    // A returned resource: a fresh view binder. The
+                    // authority that came with it is the checker's
+                    // business, and appears nowhere here (ADR 0024).
+                    Ty::Res(k) | Ty::ResRef(k, _) => {
+                        self.binders.push((ret_sym.clone(), k.view_ty().into()));
+                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym) {
+                            self.push_hyp_unique(h, prop);
+                        }
+                    }
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
@@ -2260,6 +2363,7 @@ impl<'a> Generator<'a> {
                     Ty::Unit => Val::Unit,
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
+                    Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -2334,7 +2438,7 @@ impl<'a> Generator<'a> {
             .env
             .iter()
             .filter_map(|(name, val)| match val {
-                Val::Int(s) | Val::Arr(s) | Val::Obj(s) if s != name => {
+                Val::Int(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s) if s != name => {
                     Some((name.clone(), s.clone()))
                 }
                 _ => None,
@@ -2414,7 +2518,7 @@ impl<'a> Generator<'a> {
     /// class-state symbol.
     fn state_str(&self, name: &str) -> String {
         match self.env.get(name) {
-            Some(Val::Arr(s)) | Some(Val::Obj(s)) => s.clone(),
+            Some(Val::Arr(s)) | Some(Val::Obj(s)) | Some(Val::View(s)) => s.clone(),
             _ => unreachable!("checked: &mut param in scope"),
         }
     }
@@ -2448,6 +2552,12 @@ impl<'a> Generator<'a> {
                     out.push((p.name.clone(), "Sable.Seq Int".into()));
                     if let Some(entry) = self.entry_states.get(&p.name) {
                         out.push((entry.clone(), "Sable.Seq Int".into()));
+                    }
+                }
+                Ty::Res(k) | Ty::ResRef(k, _) => {
+                    out.push((p.name.clone(), k.view_ty().into()));
+                    if let Some(entry) = self.entry_states.get(&p.name) {
+                        out.push((entry.clone(), k.view_ty().into()));
                     }
                 }
                 Ty::Option(_) | Ty::Unit => {}
@@ -2755,6 +2865,18 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mu
     }
 }
 
+/// The well-formedness a resource view carries at every binding site.
+/// This is the shape of the *value*, not a claim about authority: a span
+/// has a nonnegative length its byte sequence covers.
+fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)> {
+    match kind {
+        ResKind::RawSpan => vec![(
+            format!("h_{name}_wf"),
+            format!("0 ≤ {binder}.len ∧ {binder}.len ≤ {binder}.bytes.len"),
+        )],
+    }
+}
+
 fn range_prop(value: &str, it: IntTy) -> String {
     format!("{} ≤ {value} ∧ {value} ≤ {}", it.lean_min(), it.lean_max())
 }
@@ -2874,7 +2996,9 @@ fn preprocess_old_params(text: &str, params: &[Param]) -> String {
     for p in params {
         if !matches!(
             p.ty,
-            Ty::Array(_, Mutability::Mut) | Ty::ClassRef(_, Mutability::Mut)
+            Ty::Array(_, Mutability::Mut)
+                | Ty::ClassRef(_, Mutability::Mut)
+                | Ty::ResRef(_, Mutability::Mut)
         ) {
             continue;
         }

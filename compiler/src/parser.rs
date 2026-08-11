@@ -569,8 +569,12 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// A parameter type: scalar, `&C`, `&mut C`, `&[T]`, or `&mut [T]`.
+    /// A parameter type: scalar, `&C`, `&mut C`, `&[T]`, `&mut [T]`, or a
+    /// resource — `resource R`, `resource &R`, `resource &mut R`.
     fn param_ty(&mut self) -> PResult<(Ty, Span)> {
+        if self.at(&Tok::KwResource) {
+            return self.resource_ty();
+        }
         if self.at(&Tok::Amp) {
             let start = self.bump().span;
             let mutability = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
@@ -602,6 +606,45 @@ impl<'a> Parser<'a> {
         self.scalar_ty()
     }
 
+    /// `resource R` (owned, moved), `resource &R`, or `resource &mut R`.
+    /// The category is written before the borrow marker so that a reader
+    /// sees "this is authority" before anything else about the type.
+    fn resource_ty(&mut self) -> PResult<(Ty, Span)> {
+        let start = self.expect(Tok::KwResource)?.span;
+        let mutability = if self.at(&Tok::Amp) {
+            self.bump();
+            if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
+                self.bump();
+                Some(Mutability::Mut)
+            } else {
+                Some(Mutability::Shared)
+            }
+        } else {
+            None
+        };
+        let (name, name_span) = self.ident()?;
+        let Some(kind) = ResKind::from_name(&name) else {
+            return Err(Diagnostic {
+                name: "resource.unknown_type".into(),
+                title: format!("unknown resource type `{name}`"),
+                span: name_span,
+                label: "expected `RawSpan`".into(),
+                notes: vec![(
+                    "note".into(),
+                    "resource types are compiler-defined; a program may not declare \
+                     one, because it must not be able to fabricate authority by \
+                     constructing a view-shaped value"
+                        .into(),
+                )],
+            });
+        };
+        let ty = match mutability {
+            Some(m) => Ty::ResRef(kind, m),
+            None => Ty::Res(kind),
+        };
+        Ok((ty, start.join(name_span)))
+    }
+
     fn scalar_ty(&mut self) -> PResult<(Ty, Span)> {
         let (name, span) = self.ident()?;
         if name == "bool" {
@@ -621,8 +664,12 @@ impl<'a> Parser<'a> {
             })
     }
 
-    /// A return type: scalar, `option<T>`, or a class (ADR 0010).
+    /// A return type: scalar, `option<T>`, a class (ADR 0010), or an
+    /// owned resource (ADR 0024).
     fn ret_ty(&mut self) -> PResult<Ty> {
+        if self.at(&Tok::KwResource) {
+            return Ok(self.resource_ty()?.0);
+        }
         if let Tok::Ident(name) = self.peek() {
             if let Some(ci) = self.class_names.iter().position(|c| c == name) {
                 self.bump();
@@ -1621,6 +1668,43 @@ impl<'a> Parser<'a> {
                     init,
                     mutable: std::mem::take(&mut self.pending_mut),
                     ty: None,
+                })
+            }
+            Tok::KwResource => {
+                // `resource RawSpan tail = split_off(...);` — an owned
+                // resource local. The category is spelled out at every
+                // binding site: authority is erased at runtime, so a
+                // reader must not have to infer it from a callee's
+                // signature (ADR 0024).
+                let (ty, _) = self.resource_ty()?;
+                if let Ty::ResRef(..) = ty {
+                    return Err(Diagnostic {
+                        name: "resource.borrow_local".into(),
+                        title: "a resource borrow cannot be a local".into(),
+                        span: self.peek_span(),
+                        label: "declare `resource RawSpan` and borrow it at the call".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "borrows are arguments, not values: they live for one call, \
+                             which is what keeps borrow state out of the checker's \
+                             per-statement bookkeeping"
+                                .into(),
+                        )],
+                    });
+                }
+                let (name, name_span) = self.ident()?;
+                if is_reserved_name(&name) {
+                    return Err(reserved_name_error(&name, name_span, "variable"));
+                }
+                self.expect(Tok::Assign)?;
+                let init = self.expr()?;
+                self.expect(Tok::Semi)?;
+                Ok(Stmt::Decl {
+                    ty,
+                    name,
+                    name_span,
+                    init: Some(init),
+                    mutable: std::mem::take(&mut self.pending_mut),
                 })
             }
             Tok::LBracket => {

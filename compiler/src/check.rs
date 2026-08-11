@@ -73,6 +73,7 @@ struct Ctx<'a> {
 /// The class index of a class-typed name (owned local or class-borrow
 /// param).
 fn class_of(ctx: &Ctx, name: &str, span: Span) -> CResult<usize> {
+    reject_view_read(ctx, name, span)?;
     match ctx.vars.get(name).map(|v| v.ty) {
         Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Ok(ci),
         _ => Err(Diagnostic {
@@ -160,6 +161,21 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             }
             let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
                 for p in params {
+                    if matches!(p.ty, Ty::Res(_) | Ty::ResRef(..)) {
+                        return Err(Diagnostic {
+                            name: "resource.in_class".into(),
+                            title: "class members do not take resources yet".into(),
+                            span: p.span,
+                            label: format!("this has type `{}`", p.ty.name()),
+                            notes: vec![(
+                                "note".into(),
+                                "resources live in free functions for now; putting \
+                                 authority inside a class needs destruction semantics \
+                                 first, which is a scheduled deliverable"
+                                    .into(),
+                            )],
+                        });
+                    }
                     // Class parameters: by value (moved in) or
                     // borrowed (ADR 0020, ADR 0023).
                     let ok = matches!(p.ty, Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(..))
@@ -748,6 +764,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
                 if let Some(e) = init {
                     check_expr(ctx, e, Some(*ty))?;
+                    // `resource RawSpan t = s;` — a local-to-local move,
+                    // the same rule classes follow (ADR 0020/0024).
+                    if matches!(ty, Ty::Res(_)) {
+                        mark_moved(ctx, e)?;
+                    }
                 }
                 ctx.vars.insert(
                     name.clone(),
@@ -784,12 +805,14 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         notes: vec![],
                     });
                 }
-                if matches!(ty, Ty::Class(_)) {
+                if matches!(ty, Ty::Class(_) | Ty::Res(_)) {
                     // Reassignment of a class local is a move-in of an
                     // owned value; the old value is dropped, with its
                     // RAII invariant check. Check first: operator sugar
                     // may rewrite a Binary RHS into the bound call
-                    // (ADR 0012).
+                    // (ADR 0012). A resource local follows the same rule,
+                    // and dropping the old token discards its authority
+                    // rather than running anything (ADR 0024).
                     check_expr(ctx, value, Some(ty))?;
                     // A bare name is a local-to-local move: the source
                     // place dies here (ADR 0020). Every other class-typed
@@ -880,6 +903,37 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             .all(|m| m.get(name).copied().unwrap_or(was))
                     };
                 }
+                // Resource shape must agree across reaching branches
+                // (ADR 0024): a token moved on one path and not the other
+                // is a leak on one of them, and the checker should say so
+                // rather than quietly taking the dead union. Ordinary
+                // class values take the union — dropping one runs its
+                // deinit and costs nothing but the value.
+                if reaching_moved.len() > 1 {
+                    let (first, rest) = reaching_moved.split_first().expect("checked: len > 1");
+                    for other in rest {
+                        let differ = first
+                            .symmetric_difference(other)
+                            .find(|p| ctx.is_resource_place(p));
+                        if let Some(p) = differ {
+                            return Err(Diagnostic {
+                                name: "resource.branch_shape".into(),
+                                title: format!(
+                                    "`{}` is consumed on one branch but not the other",
+                                    p.render()
+                                ),
+                                span: cond.span,
+                                label: "the branches leave different resources live".into(),
+                                notes: vec![(
+                                    "note".into(),
+                                    "every fall-through branch must leave the same resources \
+                                     live; consume it on both paths or on neither"
+                                        .into(),
+                                )],
+                            });
+                        }
+                    }
+                }
                 // Moved on any reaching path means dead below.
                 ctx.moved = if reaching_moved.is_empty() {
                     before_moved
@@ -917,7 +971,34 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     .iter()
                     .map(|(k, v)| (k.clone(), v.initialized))
                     .collect();
+                let before_moved = ctx.moved.clone();
                 let _body_ret = check_block(ctx, body, ret_ty)?;
+                // Resource shape must be preserved at the backedge
+                // (ADR 0024): a token consumed by the body is not there
+                // for the second iteration, and a token created per
+                // iteration and never consumed leaks one per turn. Views
+                // may change freely — that is what the loop invariant is
+                // for; the *shape* is what must come back.
+                if let Some(p) = ctx
+                    .moved
+                    .symmetric_difference(&before_moved)
+                    .find(|p| ctx.is_resource_place(p))
+                {
+                    return Err(Diagnostic {
+                        name: "resource.loop_shape".into(),
+                        title: format!("the loop body consumes `{}`", p.render()),
+                        span: *kw_span,
+                        label: "the second iteration would not have it".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "a loop must leave the same resources live at the backedge as \
+                             at the head; the invariant carries their views, not their \
+                             existence"
+                                .into(),
+                        )],
+                    });
+                }
+                ctx.moved = before_moved;
                 for (name, v) in ctx.vars.iter_mut() {
                     v.initialized = before.get(name).copied().unwrap_or(false);
                 }
@@ -1229,14 +1310,37 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
                 if ctx.is_moved(&Place::local(name)) {
+                    return Err(moved_out(ctx, &Place::local(name), span, "read"));
+                }
+                if let Ty::Res(got) = v.ty {
+                    // Resources are affine: a bare name is a move, and
+                    // there is nowhere else a resource-typed expression
+                    // may appear (ADR 0024).
+                    if let Some(Ty::Res(want)) = expected {
+                        if want != got {
+                            return Err(Diagnostic {
+                                name: "type.mismatch".into(),
+                                title: format!(
+                                    "expected `resource {}`, found `resource {}`",
+                                    want.name(),
+                                    got.name()
+                                ),
+                                span,
+                                label: "different resource type".into(),
+                                notes: vec![],
+                            });
+                        }
+                        return Ok(v.ty);
+                    }
                     return Err(Diagnostic {
-                        name: "class.use_after_move".into(),
-                        title: format!("`{name}` has been moved out"),
+                        name: "resource.not_a_value".into(),
+                        title: format!("resource `{name}` used as a value"),
                         span,
-                        label: "the value was passed by value earlier".into(),
+                        label: "a resource may only be moved, borrowed, or returned".into(),
                         notes: vec![(
                             "note".into(),
-                            "classes are affine: a by-value argument consumes the local                              (ADR 0020); borrow with `&` to keep it"
+                            "a resource is authority, not data; what the proof language \
+                             reads is its view, written `s.len` in a clause"
                                 .into(),
                         )],
                     });
@@ -1709,9 +1813,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         check_expr(ctx, arg, Some(p.ty))?;
                         mark_moved(ctx, arg)?;
                     }
-                    Ty::ClassRef(..) => {
+                    Ty::ClassRef(..) | Ty::ResRef(..) => {
                         require_explicit_borrow(ctx, arg, p.ty)?;
                         check_expr(ctx, arg, Some(p.ty))?;
+                    }
+                    Ty::Res(_) => {
+                        check_expr(ctx, arg, Some(p.ty))?;
+                        mark_moved(ctx, arg)?;
                     }
                     _ => check_expr(ctx, arg, Some(p.ty)).map(|_| ())?,
                 }
@@ -1858,18 +1966,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     p.fields.push(f.clone());
                 }
                 if ctx.is_moved(&p) {
-                    return Err(Diagnostic {
-                        name: "class.use_after_move".into(),
-                        title: format!("`{}` has been moved out", p.render()),
-                        span,
-                        label: "borrowing a moved-from place".into(),
-                        notes: vec![(
-                            "note".into(),
-                            "classes are affine: a by-value argument consumes the \
-                             local (ADR 0020), and a borrow of it is a use"
-                                .into(),
-                        )],
-                    });
+                    return Err(moved_out(ctx, &p, span, "borrow"));
                 }
             }
             // `&x.f` / `&self.f` — borrowing a field as a place
@@ -1952,6 +2049,50 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     }),
                 };
+            }
+            // `&s` / `&mut s` of a resource local or parameter, or a
+            // re-borrow of one passed along to a callee (ADR 0024). The
+            // rules are the class rules: unique access is only ever
+            // narrowed, and a mutable borrow needs a `mut` local.
+            if let Some(v) = ctx.vars.get(array.as_str()) {
+                if let Ty::Res(k) | Ty::ResRef(k, _) = v.ty {
+                    let (src_mut, is_local) = match v.ty {
+                        Ty::ResRef(_, m) => (m, false),
+                        _ => (Mutability::Mut, true),
+                    };
+                    let declared_mut = v.mutable;
+                    if *mutable {
+                        if src_mut != Mutability::Mut {
+                            return Err(Diagnostic {
+                                name: "type.mut_borrow_shared".into(),
+                                title: format!(
+                                    "cannot mutably borrow `{array}` through `resource &{}`",
+                                    k.name()
+                                ),
+                                span,
+                                label: "this parameter is a shared borrow".into(),
+                                notes: vec![],
+                            });
+                        }
+                        if is_local && !declared_mut {
+                            return Err(Diagnostic {
+                                name: "mut.borrow_immutable".into(),
+                                title: format!("`&mut` borrow of immutable local `{array}`"),
+                                span,
+                                label: "declare it `mut` to allow mutable borrows".into(),
+                                notes: vec![],
+                            });
+                        }
+                    }
+                    return Ok(Ty::ResRef(
+                        k,
+                        if *mutable {
+                            Mutability::Mut
+                        } else {
+                            Mutability::Shared
+                        },
+                    ));
+                }
             }
             // `&c` / `&mut c` of a class local, or a re-borrow of a class
             // parameter passed along to a callee (ADR 0010, ADR 0023).
@@ -2330,9 +2471,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         check_expr(ctx, arg, Some(pty))?;
                         mark_moved(ctx, arg)?;
                     }
-                    Ty::ClassRef(..) => {
+                    Ty::ClassRef(..) | Ty::ResRef(..) => {
                         require_explicit_borrow(ctx, arg, pty)?;
                         check_expr(ctx, arg, Some(pty))?;
+                    }
+                    Ty::Res(_) => {
+                        check_expr(ctx, arg, Some(pty))?;
+                        mark_moved(ctx, arg)?;
                     }
                     _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }
@@ -2406,7 +2551,9 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
             Some((p, *mutable))
         }
         ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty) {
-            Some(Ty::ClassRef(_, m)) => Some((Place::local(n), m == Mutability::Mut)),
+            Some(Ty::ClassRef(_, m)) | Some(Ty::ResRef(_, m)) => {
+                Some((Place::local(n), m == Mutability::Mut))
+            }
             _ => None,
         },
         _ => None,
@@ -2455,24 +2602,30 @@ fn check_borrow_conflicts(
     Ok(())
 }
 
-/// Handing a class *value* over to a borrow is written at the call site,
-/// with its mutability, so a reader sees where access — and, for
-/// `&mut C`, unique access — is given up. This is the rule array borrows
-/// already follow (ADR 0023). Passing along a borrow already held at the
-/// same mutability hands over nothing new and needs no `&`.
+/// Handing a *value* over to a borrow is written at the call site, with
+/// its mutability, so a reader sees where access — and, for `&mut`,
+/// unique access — is given up. This is the rule array borrows already
+/// follow (ADR 0023, ADR 0024). Passing along a borrow already held at
+/// the same mutability hands over nothing new and needs no `&`.
 fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
-    let Ty::ClassRef(ci, m) = pty else {
-        return Ok(());
+    let (m, owner, flipped) = match pty {
+        Ty::ClassRef(ci, m) => (
+            m,
+            ctx.class_metas[ci].name.clone(),
+            Ty::ClassRef(ci, flip(m)),
+        ),
+        Ty::ResRef(k, m) => (m, k.name().to_string(), Ty::ResRef(k, flip(m))),
+        _ => return Ok(()),
     };
     // Passing along a *shared* borrow already held under the same type:
     // nothing is handed over that the caller did not already have, and
     // no `&` announces anything. Unique access is different — `&mut` is
-    // always written, so every mutable class argument is a visible
-    // borrow at the call site (which conflict detection and the caller's
-    // post-call havoc both rely on).
+    // always written, so every mutable borrow argument is visible at the
+    // call site (which conflict detection and the caller's post-call
+    // havoc both rely on).
     if m == Mutability::Shared {
         if let ExprKind::Var(n) = &arg.kind {
-            if ctx.vars.get(n.as_str()).map(|v| v.ty) == Some(Ty::ClassRef(ci, m)) {
+            if ctx.vars.get(n.as_str()).map(|v| v.ty) == Some(pty) {
                 return Ok(());
             }
         }
@@ -2481,20 +2634,8 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
     match arg.kind {
         ExprKind::Borrow { mutable, .. } if mutable == (m == Mutability::Mut) => Ok(()),
         ExprKind::Borrow { .. } => Err(Diagnostic {
-            name: "type.class_borrow_mutability".into(),
-            title: format!(
-                "expected `{}`, found `{}`",
-                Ty::ClassRef(ci, m).name(),
-                Ty::ClassRef(
-                    ci,
-                    if m == Mutability::Mut {
-                        Mutability::Shared
-                    } else {
-                        Mutability::Mut
-                    }
-                )
-                .name()
-            ),
+            name: "type.borrow_mutability".into(),
+            title: format!("expected `{}`, found `{}`", pty.name(), flipped.name()),
             span: arg.span,
             label: format!("write `{want}name`"),
             notes: vec![(
@@ -2505,15 +2646,24 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
             )],
         }),
         _ => Err(Diagnostic {
-            name: "type.class_arg_borrow".into(),
-            title: "class borrows are passed explicitly".into(),
+            name: "type.arg_borrow".into(),
+            title: format!("`{owner}` is borrowed here, not moved"),
             span: arg.span,
             label: format!("write `{want}name`"),
             notes: vec![(
                 "note".into(),
-                format!("`{}` is borrowed here, not moved", ctx.class_metas[ci].name),
+                "a borrow is written at the call site, so a reader sees where \
+                 access is given up"
+                    .into(),
             )],
         }),
+    }
+}
+
+fn flip(m: Mutability) -> Mutability {
+    match m {
+        Mutability::Mut => Mutability::Shared,
+        _ => Mutability::Mut,
     }
 }
 
@@ -2525,7 +2675,7 @@ fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
         if ctx
             .vars
             .get(name.as_str())
-            .is_some_and(|v| matches!(v.ty, Ty::Class(_)))
+            .is_some_and(|v| matches!(v.ty, Ty::Class(_) | Ty::Res(_)))
         {
             ctx.moved.insert(Place::local(name));
         }
@@ -2534,6 +2684,14 @@ fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
 }
 
 impl<'a> Ctx<'a> {
+    /// Whether this place names a resource (root type only for now —
+    /// resource fields are a scheduled deliverable).
+    fn is_resource_place(&self, p: &Place) -> bool {
+        self.vars
+            .get(p.root.as_str())
+            .is_some_and(|v| v.ty.is_resource())
+    }
+
     /// A place is dead if it, or anything containing it, has been moved
     /// out: moving `o` kills `o.inner` too.
     fn is_moved(&self, p: &Place) -> bool {
@@ -2600,7 +2758,72 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Use of a place whose value has moved away. Classes and resources are
+/// both affine and both land here; they get different diagnostic names
+/// because the consequence differs — a class you can rebuild, a resource
+/// is authority somebody else now holds.
+fn moved_out(ctx: &Ctx, p: &Place, span: Span, how: &str) -> Diagnostic {
+    let label = match how {
+        "borrow" => "borrowing a moved-from place",
+        _ => "the value was passed by value earlier",
+    }
+    .to_string();
+    if ctx.is_resource_place(p) {
+        return Diagnostic {
+            name: "resource.use_after_move".into(),
+            title: format!("`{}` has been moved out", p.render()),
+            span,
+            label,
+            notes: vec![(
+                "note".into(),
+                "resources are affine: passing one by value hands over the authority \
+                 itself (ADR 0024); borrow with `&` to keep it"
+                    .into(),
+            )],
+        };
+    }
+    Diagnostic {
+        name: "class.use_after_move".into(),
+        title: format!("`{}` has been moved out", p.render()),
+        span,
+        label,
+        notes: vec![(
+            "note".into(),
+            "classes are affine: a by-value argument consumes the local \
+             (ADR 0020), and a borrow of it is a use"
+                .into(),
+        )],
+    }
+}
+
+/// A resource's *view* is ghost: clauses read `s.len`, program code does
+/// not. That separation is what makes erasure real — a program able to
+/// read the view would need it at runtime, and then the authority would
+/// have a representation to forge (ADR 0024).
+fn reject_view_read(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
+    let Some(v) = ctx.vars.get(name) else {
+        return Ok(());
+    };
+    let (Ty::Res(k) | Ty::ResRef(k, _)) = v.ty else {
+        return Ok(());
+    };
+    Err(Diagnostic {
+        name: "resource.view_is_ghost".into(),
+        title: format!("`{name}` is a resource; its view is not program data"),
+        span,
+        label: format!("`{}` has no readable fields here", k.name()),
+        notes: vec![(
+            "note".into(),
+            format!(
+                "a clause may say `{name}.len`; program code may not, because \
+                 resources are erased at runtime and carry nothing to read"
+            ),
+        )],
+    })
+}
+
 fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<IntTy> {
+    reject_view_read(ctx, array, span)?;
     match ctx.vars.get(array) {
         Some(VarInfo {
             ty: Ty::Array(t, _),

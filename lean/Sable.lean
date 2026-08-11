@@ -2,6 +2,7 @@ import Sable.Bounds
 import Sable.IntModel
 import Sable.Auto
 import Sable.Seq
+import Sable.Raw
 import Sable.OptionAcc
 import Sable.Ghost
 import Sable.Perm

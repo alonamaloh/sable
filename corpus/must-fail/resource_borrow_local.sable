@@ -1,0 +1,14 @@
+// expect-error: resource.borrow_local
+// A borrow is an argument, not a value: it lives for one call. Keeping
+// borrow state out of the checker's per-statement bookkeeping is what
+// lets ownership be decided per place rather than per lifetime.
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource RawSpan s) -> u64 {
+    resource &RawSpan b = identity(s);
+    return 0;
+}

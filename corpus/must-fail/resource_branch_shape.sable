@@ -1,0 +1,29 @@
+// expect-error: resource.branch_shape
+// Every fall-through branch must leave the same resources live. Here one
+// branch consumes `s` and the other does not, so what is live below
+// depends on the path — a leak on one of them.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource RawSpan s, u64 t) -> u64 {
+    if (t == 0) {
+        resource RawSpan d = identity(s);
+        u64 a = nonempty(&d);
+    }
+    u64 b = nonempty(&s);
+    return b;
+}

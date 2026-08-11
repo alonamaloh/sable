@@ -1,0 +1,8 @@
+// expect-error: resource.unknown_type
+// Resource types are compiler-defined: a program may not declare one,
+// because it must not be able to fabricate authority by constructing a
+// view-shaped value.
+
+fn caller(resource FileHandle h) -> u64 {
+    return 0;
+}

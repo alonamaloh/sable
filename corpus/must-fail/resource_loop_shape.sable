@@ -1,0 +1,31 @@
+// expect-error: resource.loop_shape
+// A loop must leave the same resources live at the backedge as at the
+// head. This body consumes the span it was given, so the second
+// iteration would not have it.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource RawSpan s) -> u64 {
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// variant 3 - i
+    while (i < 3) {
+        resource RawSpan d = identity(s);
+        i = i + 1;
+    }
+    return 0;
+}

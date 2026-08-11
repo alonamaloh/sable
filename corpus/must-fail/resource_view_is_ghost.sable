@@ -1,0 +1,23 @@
+// expect-error: resource.view_is_ghost
+// A resource's view is what the proof language reads. Program code
+// cannot: resources are erased at runtime and carry nothing to read.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource RawSpan s) -> u64 {
+    return s.len;
+}

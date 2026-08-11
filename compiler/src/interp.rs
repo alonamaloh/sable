@@ -131,7 +131,7 @@ impl<'a> Interp<'a> {
             olds: HashMap::new(),
             self_ctx: None,
         };
-        for (p, v) in f.params.iter().zip(args) {
+        for (p, v) in f.params.iter().filter(|p| !p.ty.is_resource()).zip(args) {
             match (&v, p.ty) {
                 (RtVal::Arr(a), Ty::Array(_, Mutability::Mut)) => {
                     frame
@@ -958,8 +958,16 @@ impl<'a> Interp<'a> {
             }
             ExprKind::Call { callee, args, .. } => {
                 let f = self.fns[callee.as_str()];
+                // Resource arguments are erased: authority is a static
+                // notion, so it has no runtime representation to pass and
+                // the callee's runtime signature does not have the
+                // parameter at all (ADR 0024). Both sides drop the same
+                // positions, so the remaining ones still line up.
                 let mut vals = Vec::with_capacity(args.len());
-                for a in args {
+                for (a, p) in args.iter().zip(&f.params) {
+                    if p.ty.is_resource() {
+                        continue;
+                    }
                     vals.push(self.eval(a, frame)?);
                 }
                 self.call(f, vals)

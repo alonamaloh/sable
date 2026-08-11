@@ -1283,36 +1283,64 @@ value — no borrow-typed locals, returns, or fields — so borrow state never h
 survive a statement, and overlap is decided within a single call. U2b should
 check whether resources change that before adding the counters.
 
-#### U2b — resource category on the same engine
+#### U2b — resource category on the same engine *(first slice done 2026-08-11)*
 
-- parser/AST support for resource locals, parameters, returns, and borrows;
-- `Ty::Raw` and resource-type identities;
-- resource liveness and borrow state, reusing U2a's lattice unchanged;
-- resource-shape checks at branch joins and loop backedges;
-- erasure from runtime signatures;
-- pure resource-view binders in Lean emission, versioned separately from token
-  identity.
+The category exists, on U2a's engine and nothing else. ADR 0024 records the
+decisions; the load-bearing one is that **the view is ghost** — a clause may say
+`s.len`, program code may not. That single line is what makes erasure real
+rather than aspirational: a program able to read the view would need it at
+runtime, and a runtime view is a thing a program could construct, which is the
+authority forgery the category exists to prevent.
 
-Keep scope narrow:
+Landed:
 
-- built-in `RawSpan` only;
-- no resource fields yet;
-- no user-defined resource types;
-- no raw machine operations yet;
-- no partial move from ordinary class fields.
+- `Ty::Res(k)` / `Ty::ResRef(k, m)`, spelled `resource RawSpan`,
+  `resource &RawSpan`, `resource &mut RawSpan`, at parameters, returns, and
+  locals — the category written at every binding site, borrow marker inside it;
+- `lean/Sable/Raw.lean`: `ByteState` and `SpanView` with `take`/`drop`/`cat`
+  and their length and byte lemmas. The *views* graduate from the probe, as
+  ADR 0022 said they would when the compiler emits against them; `Own`, `Cap`,
+  and the preservation theorems stay in `unsafe-probe.lean` until raw operations
+  exist to be justified;
+- moves, borrows, borrow conflicts, and use-after-move: the same `Place` set and
+  the same `check_borrow_conflicts` U2a built, plus a type test. No second
+  ownership system, which was the exit criterion that mattered;
+- shape checks at branch joins and loop backedges, *stricter* than the class
+  rule: a resource moved on one reaching branch and not the other is rejected,
+  and a loop body that consumes a resource live at the head is rejected. Not for
+  soundness — dropping is permitted — but because with authority the difference
+  between a deliberate release and a forgotten path is worth a diagnostic;
+- view binders in Lean emission, versioned separately from token identity: the
+  loop havocs the *view* and preserves the *token*, and the corpus subject
+  demonstrates both halves (`framed_loop` verifies only with the view invariant;
+  without it the post fails);
+- erasure from interpreter call arguments and runtime parameter lists;
+- eleven named diagnostics, each with a `must-fail` guard.
 
-A checker-only corpus should establish moves, borrows, branches, loops, returns,
-and compile-fail behavior before raw memory arrives.
+`resource &mut R` needed **no new vcgen machinery at all**: it is the `&mut`
+array rule with a view instead of a sequence, so the `entry_states` map and
+`havoc_mut_borrow_args` that U2a generalized already covered it. That is the
+strongest evidence so far for the sketch's central claim — the logic does not
+know resources are special, because in the logic they are not.
 
-Exit criteria:
+Still narrow, deliberately: built-in `RawSpan` only, no resource fields, no
+user-defined resource types, no raw machine operations, no partial move from
+class fields. Class members may not take resources at all
+(`resource.in_class`) — authority inside a class needs destruction semantics,
+an unbuilt prerequisite rather than a default to pick silently.
 
-- a resource can be passed by value and returned;
-- shared and mutable resource borrows are checked;
-- duplicate use and conflicting borrows are source diagnostics;
-- fall-through branch mismatch is rejected;
-- a loop must preserve resource shape while its views change;
-- resource parameters do not appear in interpreter/native runtime arguments;
-- no second ownership system exists anywhere in the compiler.
+**One exit criterion is implemented but not demonstrated.** "Resource parameters
+do not appear in interpreter/native runtime arguments" is true of the code —
+both sides drop the same positions by the same filter — but no test reaches it,
+because nothing can *create* a `RawSpan` yet. Allocation is U3. Recorded rather
+than claimed.
+
+Remaining before U2b closes:
+
+- `split_off` and `join` as sealed transformations with generated contracts;
+  `SpanView.take`/`.drop`/`.cat` and their lemmas are already in the prelude, so
+  what is left is the operations and the carving-loop corpus subject that the
+  U1 probe's `own_carve_step` was proved for.
 
 ### U3 — byte raw heap in the formal SVM
 

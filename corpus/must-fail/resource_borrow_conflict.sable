@@ -1,0 +1,29 @@
+// expect-error: borrow.conflict
+// A mutable resource borrow must not overlap another borrow in the same
+// call: the callee's contract frames them as distinct authority.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+/// pre  a.len ≥ 1
+fn both(resource &mut RawSpan a, resource &RawSpan b) -> u64 {
+    return 1;
+}
+
+fn caller(resource &mut RawSpan s) -> u64 {
+    u64 n = both(&mut s, &s);
+    return n;
+}

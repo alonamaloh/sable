@@ -1,0 +1,24 @@
+// expect-error: resource.not_a_value
+// A resource is authority, not data. It may be moved, borrowed, or
+// returned — never used as a value.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource RawSpan s) -> u64 {
+    u64 n = nonempty(&s);
+    return n + s;
+}

@@ -1,0 +1,24 @@
+// expect-error: type.mut_borrow_shared
+// Shared access cannot become unique: `&mut s` inside a function holding
+// only a shared borrow would manufacture authority the caller never gave
+// up.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource &RawSpan s) {
+    touch(&mut s);
+}

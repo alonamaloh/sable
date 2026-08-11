@@ -1,0 +1,120 @@
+// The third value category: resources (ADR 0024).
+//
+// A resource is *authority* — the right to touch something — and the
+// checker keeps it affine. What the proof language sees is the
+// resource's **view**: an ordinary value whose facts are duplicable
+// knowledge, exactly like the `Seq` a borrowed array lifts to. Nothing
+// about ownership reaches Lean, and no generated VC mentions a heap.
+//
+// The split shows up in the two languages disagreeing about `s.len`:
+// a clause may read it, program code may not. That is what makes
+// erasure real — a program able to read the view would need it at
+// runtime, and a runtime view is a thing you could forge.
+//
+// There is no way to *create* a `RawSpan` here; every function below
+// receives one. Allocation and the raw operations arrive with the
+// machine model.
+
+// ---------------------------- shared borrows ----------------------------
+
+// A shared borrow reads the view and cannot change it. Any number may
+// coexist, and the owner is frozen while they do.
+/// pre  s.len ≥ 1
+/// post result = 1
+pub fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+// Two shared borrows of two different spans in one call: no conflict,
+// and both views are readable in the contract.
+/// pre  #[label(a)] a.len ≥ 1
+/// pre  #[label(b)] b.len ≥ 1
+/// post result = 1
+pub fn both_nonempty(resource &RawSpan a, resource &RawSpan b) -> u64 {
+    return 1;
+}
+
+// ---------------------------- mutable borrows ---------------------------
+
+// `resource &mut R` is unique: no shared or second mutable borrow may
+// overlap it. It may change the view, and the contract says how — `old s`
+// is the view at entry, exactly as for a `&mut` array.
+/// post s.len = old s.len
+pub fn touch(resource &mut RawSpan s) {
+}
+
+// Passing unique access along, and narrowing it to shared. The other
+// direction is rejected: shared access cannot become unique.
+/// pre  s.len ≥ 1
+/// post #[label(len)]  s.len = old s.len
+/// post #[label(seen)] result = 1
+pub fn reborrow(resource &mut RawSpan s) -> u64 {
+    touch(&mut s);
+    u64 r = nonempty(&s);
+    return r;
+}
+
+// -------------------------------- moves ---------------------------------
+
+// A resource passed by value moves: the caller's name is dead, and the
+// authority is the callee's. Returning it moves it back out.
+/// post result.len = s.len
+pub fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+// Local-to-local, then out. The place engine is the same one class
+// values use; `t` owns what `s` owned, and `s` is dead.
+/// post result.len = s.len
+pub fn rebind(resource RawSpan s) -> resource RawSpan {
+    resource RawSpan t = s;
+    return t;
+}
+
+// Borrowing an owned resource, then moving it: a borrow ends at the
+// call, so the move afterwards is fine.
+/// pre  s.len ≥ 1
+/// post result.len = s.len
+pub fn borrow_then_move(resource RawSpan s) -> resource RawSpan {
+    u64 n = nonempty(&s);
+    resource RawSpan t = identity(s);
+    /// assert #[label(seen)] n = 1
+    return t;
+}
+
+// ------------------------------- branches -------------------------------
+
+// Affinity is per path, and a branch that returns reaches nothing — so
+// consuming `s` on a returning branch leaves it live below. This is
+// ADR 0021's rule, unchanged, applied to the new category.
+/// pre  s.len ≥ 1
+/// post result = 1
+pub fn move_on_returning_branch(resource RawSpan s, u64 t) -> u64 {
+    if (t == 0) {
+        resource RawSpan d = identity(s);
+        u64 a = nonempty(&d);
+        return a;
+    }
+    u64 b = nonempty(&s);
+    return b;
+}
+
+// -------------------------------- loops ---------------------------------
+
+// The loop rule in one function. The *token* survives the backedge —
+// that is the shape check, and it is a checker property with no VC. The
+// *view* does not: it is havocked at the loop head like any other
+// mutated state, and what the code below knows is what the invariant
+// says. Confusing the two would make every loop drop the authority it
+// carries.
+/// post s.len = old s.len
+pub fn framed_loop(resource &mut RawSpan s) {
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant s.len = old s.len
+    /// variant 3 - i
+    while (i < 3) {
+        touch(&mut s);
+        i = i + 1;
+    }
+}

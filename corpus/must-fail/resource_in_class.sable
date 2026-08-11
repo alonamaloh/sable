@@ -1,0 +1,18 @@
+// expect-error: resource.in_class
+// Authority inside a class needs destruction semantics first: a class
+// holding a resource must say what happens to it at drop, and the answer
+// is a scheduled deliverable, not a default.
+
+class Holder {
+    u64 n;
+
+    /// post self.n = 0
+    init empty() {
+        self.n = 0;
+    }
+
+    /// post result = 1
+    fn absorb(&self, resource RawSpan s) -> u64 {
+        return 1;
+    }
+}

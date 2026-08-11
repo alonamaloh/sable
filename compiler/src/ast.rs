@@ -102,8 +102,43 @@ pub enum Ty {
     Array(IntTy, Mutability),
     /// `option<u64>` etc. Return types only.
     Option(IntTy),
+    /// An owned resource: affine authority, erased at runtime, with a
+    /// pure view the proof language reads (ADR 0024).
+    Res(ResKind),
+    /// `resource &R` / `resource &mut R` — a borrow of that authority.
+    ResRef(ResKind, Mutability),
     /// No return value (procedures like in-place sorts).
     Unit,
+}
+
+/// The resource types. Compiler-defined for now: a program may not
+/// declare one, because it must not be able to fabricate authority by
+/// constructing a view-shaped value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResKind {
+    RawSpan,
+}
+
+impl ResKind {
+    pub fn from_name(name: &str) -> Option<ResKind> {
+        match name {
+            "RawSpan" => Some(ResKind::RawSpan),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ResKind::RawSpan => "RawSpan",
+        }
+    }
+
+    /// The Lean type of this resource's view.
+    pub fn view_ty(self) -> &'static str {
+        match self {
+            ResKind::RawSpan => "Sable.SpanView",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +150,12 @@ pub enum Mutability {
 }
 
 impl Ty {
+    /// Resources are erased from runtime signatures and layout: authority
+    /// is a static notion with no value to pass (ADR 0024).
+    pub fn is_resource(self) -> bool {
+        matches!(self, Ty::Res(_) | Ty::ResRef(..))
+    }
+
     pub fn name(self) -> String {
         match self {
             Ty::Int(t) => t.name().to_string(),
@@ -125,6 +166,9 @@ impl Ty {
             Ty::Class(_) => "class".to_string(),
             Ty::ClassRef(_, Mutability::Mut) => "&mut class".to_string(),
             Ty::ClassRef(..) => "&class".to_string(),
+            Ty::Res(k) => format!("resource {}", k.name()),
+            Ty::ResRef(k, Mutability::Mut) => format!("resource &mut {}", k.name()),
+            Ty::ResRef(k, _) => format!("resource &{}", k.name()),
             Ty::Option(t) => format!("option<{}>", t.name()),
             Ty::Unit => "()".to_string(),
         }

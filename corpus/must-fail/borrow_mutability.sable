@@ -1,4 +1,4 @@
-// expect-error: type.class_borrow_mutability
+// expect-error: type.borrow_mutability
 // The mutability of a borrow is written, not inferred from the callee's
 // signature.
 

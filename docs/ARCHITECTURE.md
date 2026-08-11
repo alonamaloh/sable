@@ -46,7 +46,11 @@ typecheck (compiler/src/check.rs)     types, call graph, and one flow-sensitive
   │                                   path) with `contains`/`overlaps`, so a field
   │                                   is a place in its own right and a mutable
   │                                   borrow overlapping another in one call is
-  │                                   rejected (ADR 0022/0023);
+  │                                   rejected (ADR 0022/0023); the same engine
+  │                                   tracks resources — authority the checker
+  │                                   keeps affine, whose *view* is all the logic
+  │                                   sees and which the runtime never sees at
+  │                                   all (ADR 0024);
   │                                   operator-binding rewrite (ADR 0012: `a + b`
   │                                   on class values becomes the bound
   │                                   contracted call)
@@ -96,6 +100,7 @@ Generated Lean goes to `.sable-out/` (gitignored): one stable file per checked r
 - **Class structures are emitted under mangled names** (`SableC_<name>`) so user class names can never collide with Lean root-namespace names (`class Nat` vs core `Nat`). Clauses never name the class — only values — so the verbatim-splice invariant is untouched; the prefix appears only in compiler-built binder types and `.mk` literals.
 - **Binders carry source names.** A call/alloc/ctor result bound to a local binds under the local's name (`u64 p = probe_step(...)` → binder `p`, hypothesis `h_p_range`), not a positional `_r16`; a `&mut` method call rebinds the receiver's name (`m_2`); the mid-loop self state is `_self_loop`. Same motivation as content-anchored hypotheses: discharge scripts must survive unrelated edits.
 - **Havoc is SSA-style versioning.** At a loop head, binders holding havocked names are renamed to stale versions (`_oldN_x`) and surviving hypotheses are *rewritten* to the stale names under `h_stale_*` — facts about pre-loop values (e.g. alloc facts) stay available instead of being dropped; fresh loop-invariant hypotheses keep the content-anchored names. Mid-method `self` havoc keeps *only* the loop invariants (the class invariant is not in force mid-method, design §7): a self-mutating loop states its full working payload — lengths, element facts, and a frame invariant against `old self` — as loop invariants. Record-field projections through update chains are reduced at generation time (`{ x with vals := v }.occ` → `x.occ`), so goals stay over stable atoms omega can use.
+- **A resource is authority, and only its *view* reaches Lean.** `resource RawSpan` / `resource &RawSpan` / `resource &mut RawSpan` are affine in the checker and erased from runtime signatures; vcgen binds a `Sable.SpanView` and nothing else, so no generated VC mentions a heap, a capability, or disjointness (ADR 0022/0024). The split is enforced by the two languages disagreeing: a clause may read `s.len`, program code may not (`resource.view_is_ghost`) — a program that could read the view would need it at runtime, and a runtime view is forgeable. `resource &mut R` reuses the `&mut` array machinery unchanged: entry state as the binder, current state in the env, `old s` resolving to the binder.
 - **Values are exact integers.** Program integers are represented in Lean as `Int`; per-operation VCs guarantee representability, so symbolic values never wrap. `wrap()` etc. (later) get explicit `mod 2^n` semantics.
 - **The prelude depends on Lean core only** — no mathlib. Cold-start and toolchain churn stay controlled; the multiset library (M2) is written in-repo.
 - **The specification vocabulary lives in the prelude** (`lean/Sable/Specs.lean`): `sorted`, `sortedRange`, `perm`, `contains`, `count` — reducible abbrevs (discharge scripts apply their hypotheses directly), `@[simp]` where unfolding helps automation (`perm` stays opaque behind its lemma library), each with a native evaluator in the monitorable fragment. Program identifiers may shadow these names; the program binding wins in clauses.

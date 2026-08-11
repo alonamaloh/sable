@@ -1,0 +1,24 @@
+// expect-error: mut.borrow_immutable
+// Handing out unique access to a resource local is mutation of what it
+// names, so the local must be `mut` — the same rule classes follow.
+
+// A shared borrow reads the view; a mutable one may change it.
+/// pre  s.len ≥ 1
+/// post result = 1
+fn nonempty(resource &RawSpan s) -> u64 {
+    return 1;
+}
+
+/// post s.len = old s.len
+fn touch(resource &mut RawSpan s) {
+}
+
+/// post result.len = s.len
+fn identity(resource RawSpan s) -> resource RawSpan {
+    return s;
+}
+
+fn caller(resource RawSpan s) {
+    resource RawSpan t = identity(s);
+    touch(&mut t);
+}

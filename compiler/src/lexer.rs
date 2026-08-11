@@ -23,6 +23,7 @@ pub enum Tok {
     KwInit,
     KwDeinit,
     KwVar,
+    KwResource,
     LParen,
     RParen,
     LBrace,
@@ -79,6 +80,7 @@ impl Tok {
             Tok::KwInit => "init",
             Tok::KwDeinit => "deinit",
             Tok::KwVar => "var",
+            Tok::KwResource => "resource",
             Tok::LParen => "(",
             Tok::RParen => ")",
             Tok::LBrace => "{",
@@ -260,6 +262,7 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
                 "init" => Tok::KwInit,
                 "deinit" => Tok::KwDeinit,
                 "var" => Tok::KwVar,
+                "resource" => Tok::KwResource,
                 _ => Tok::Ident(word.to_string()),
             };
             tokens.push(Token { tok, span });
