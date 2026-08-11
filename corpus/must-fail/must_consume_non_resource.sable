@@ -1,0 +1,12 @@
+// expect-error: resource.must_consume_non_resource
+// The marker says a field's *authority* must be handed on. A number has
+// none.
+
+class Holder {
+    #[must_consume] u64 n;
+
+    /// post self.n = x
+    init hold(u64 x) {
+        self.n = x;
+    }
+}

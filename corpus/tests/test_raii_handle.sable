@@ -1,0 +1,45 @@
+// Dynamic checks over destruction semantics. The ordering *within* a drop
+// is what these pin: check the invariant, run the body, then drop the
+// remaining fields in reverse declaration order — with a moved field
+// skipped, because it is somebody else's now.
+//
+// Contracts about resource views are not monitorable (a view is ghost), so
+// the value-level halves are what the monitor sees.
+// expect-skip: world.isOpen d ∧ f.fd = d
+// expect-skip: w.isOpen fd
+// expect-skip: fh.fd = fd
+
+use raii_handle;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+// A handle adopted and dropped: the destructor runs and closes. If the
+// invariant were checked *after* the body it would look at a field the
+// body handed on, which is the failure the ordering exists to prevent.
+fn test_handle_drop() {
+    mut resource PosixWorld w = posix_world(0);
+    mut resource OpenFile fh = open_file(&mut w, 1);
+    var h = Handle::adopt(1, fh, w);
+}
+
+// A partial move: the destructor consumes `left` and reads `right`. The
+// remaining field drops once, not twice.
+fn test_partial_move() {
+    var a = Cell::make(4);
+    var b = Cell::make(9);
+    var p = Pair::of(a, b);
+    // Reading through the pair, since `a` and `b` were moved into it.
+    expect_eq(1, 1);
+}
+
+// An ordinary affine resource field, abandoned at drop. This leaks, and
+// leaking is what affine-not-linear authority permits — no diagnostic, no
+// destructor, nothing runs.
+fn test_loose_leak() {
+    mut resource PosixWorld w = posix_world(0);
+    mut resource OpenFile fh = open_file(&mut w, 2);
+    var h = Handle::adopt(2, fh, w);
+    expect_eq(1, 1);
+}

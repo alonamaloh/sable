@@ -1,0 +1,16 @@
+// expect-error: resource.abandoned
+// `#[must_consume]` says a field's authority has to be handed on. An
+// ordinary affine field may be abandoned — that is a leak, which
+// affine-not-linear authority permits — but this one may not.
+
+class Holder {
+    #[must_consume] resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+
+    deinit {
+    }
+}

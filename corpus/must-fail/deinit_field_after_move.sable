@@ -1,0 +1,23 @@
+// expect-error: resource.use_after_move
+// A destructor may hand one field on, and then that field is gone: the
+// *field* is the place that dies, and reading it afterwards is a use after
+// move even though its siblings are still fine.
+
+/// pre  s.len ≥ 0
+fn consume(resource RawSpan s) -> u64 {
+    return 0;
+}
+
+class Holder {
+    #[must_consume] resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+
+    deinit {
+        u64 a = consume(self.span);
+        u64 b = consume(self.span);
+    }
+}

@@ -1,0 +1,102 @@
+// Destruction semantics: a class that owns authority (ADR 0029).
+//
+// A `deinit` differs from a method in exactly the ways "the value ceases
+// to exist" implies. The class invariant holds on **entry** and is *not*
+// re-established, because there is nothing left to hold it. The body may
+// move fields out — that is how a resource-owning class hands its
+// authority on — and a moved field is not dropped again; the rest drop in
+// reverse declaration order.
+//
+// `#[must_consume]` says a field's authority has to go somewhere. An
+// ordinary affine field may be abandoned, which is a leak, and
+// affine-not-linear authority permits leaks.
+
+// One audited contract per boundary: `posix_close` is declared once, and
+// its audit id travels with it into every importer's manifest.
+use posix_read;
+
+pub class Handle {
+    i32 fd;
+    #[must_consume] resource OpenFile fh;
+    resource PosixWorld w;
+
+    /// invariant 0 ≤ fd
+    /// invariant w.isOpen fd
+    /// invariant fh.fd = fd
+
+    /// pre  #[label(nonneg)] 0 ≤ d
+    /// pre  #[label(open)]   world.isOpen d ∧ f.fd = d
+    /// post #[label(fd)]     self.fd = d
+    init adopt(i32 d, resource OpenFile f, resource PosixWorld world) {
+        self.fd = d;
+        self.fh = f;
+        self.w = world;
+    }
+
+    // The destructor hands the descriptor's authority on. `&mut self.w` is
+    // legal *here and nowhere else*: a mutable field borrow was deferred
+    // because a callee could not re-establish the base's invariant, and in
+    // a destructor there is no invariant left to break.
+    deinit {
+        i32 r = posix_close(self.fd, self.fh, &mut self.w);
+    }
+}
+
+// A second class with an ordinary affine resource field and no marker: it
+// abandons the authority at drop, which leaks and is permitted.
+pub class Loose {
+    resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+}
+
+// -------------------------- partial moves ---------------------------
+//
+// A destructor may hand one field on and still read another: the *field*
+// is the place that dies, not the object, and its untouched siblings stay
+// readable. That is what `partially-moved` means in the place engine.
+
+pub class Cell {
+    u64 v;
+
+    /// invariant v ≤ 100
+
+    /// pre  x ≤ 100
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+/// post result = c.v
+pub fn peek(&Cell c) -> u64 {
+    return c.v;
+}
+
+/// post result = c.v
+pub fn consume(Cell c) -> u64 {
+    u64 r = peek(&c);
+    return r;
+}
+
+pub class Pair {
+    Cell left;
+    Cell right;
+
+    /// pre  #[label(l)] a.v ≤ 100
+    init of(Cell a, Cell b) {
+        self.left = a;
+        self.right = b;
+    }
+
+    // `left` is handed on; `right` is only read. After the move the object
+    // is partially moved, and reading the sibling is still fine — while
+    // reading `left` would be a use after move.
+    deinit {
+        u64 gone = consume(self.left);
+        u64 kept = peek(&self.right);
+    }
+}

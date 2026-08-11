@@ -1,0 +1,12 @@
+// expect-error: resource.abandoned
+// Without a destructor there is nowhere to hand the authority on, so every
+// value of the class would abandon it.
+
+class Holder {
+    #[must_consume] resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+}

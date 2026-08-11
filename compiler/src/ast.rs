@@ -707,6 +707,11 @@ pub struct Field {
     pub name: String,
     pub ty: Ty,
     pub span: Span,
+    /// `#[must_consume]` — this field's authority has to be handed on by
+    /// the class's `deinit`, or abandoning it is a diagnostic rather than
+    /// a permitted leak (ADR 0029). Only resource fields may carry it: an
+    /// ordinary value has nothing to hand on.
+    pub must_consume: bool,
 }
 
 /// A class method: an ordinary `Fn` whose first parameter is `&self` /

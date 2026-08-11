@@ -572,15 +572,54 @@ impl<'a> Interp<'a> {
             }
         }
         // RAII: drop block-local class values in reverse declaration
-        // order; the class invariant is assumed at deinit entry
-        // (design §7) — check it dynamically here.
+        // order. The order *within* a drop is fixed and load-bearing
+        // (ADR 0029): check the invariant, then run the destructor body,
+        // then drop the remaining fields. Checking after the body would
+        // evaluate the invariant over a hole the body just made.
         for name in class_locals.iter().rev() {
             if let Some(RtVal::Obj { class, fields }) = frame.vars.get(name).cloned() {
-                self.check_invariants_at(&self.classes[class].clone(), &fields, name)?;
+                self.drop_value(class, &fields, name)?;
                 frame.vars.remove(name);
             }
         }
         Ok(out)
+    }
+
+    /// Drop one class value: invariant, body, then the remaining fields in
+    /// reverse declaration order. A field the body moved out is *not*
+    /// dropped again — a moved field is somebody else's now, and dropping
+    /// it twice is the failure the affine discipline exists to prevent.
+    fn drop_value(
+        &mut self,
+        class: usize,
+        fields: &Rc<RefCell<HashMap<String, RtVal>>>,
+        what: &str,
+    ) -> IResult<()> {
+        let cd = self.classes[class].clone();
+        self.check_invariants_at(&cd, fields, what)?;
+        if let Some(body) = cd.deinit.clone() {
+            let mut frame = Frame {
+                vars: HashMap::new(),
+                entry_scalars: HashMap::new(),
+                olds: HashMap::new(),
+                self_ctx: Some((class, fields.clone())),
+            };
+            self.exec_block(&body, &mut frame)?;
+        }
+        // The remaining fields, in reverse declaration order. A field the
+        // body handed on is gone from the map, which is exactly the record
+        // of "already somebody else's".
+        for f in cd.fields.iter().rev() {
+            let held = fields.borrow().get(f.name.as_str()).cloned();
+            if let Some(RtVal::Obj {
+                class: fc,
+                fields: ff,
+            }) = held
+            {
+                self.drop_value(fc, &ff, &format!("{what}.{}", f.name))?;
+            }
+        }
+        Ok(())
     }
 
     fn check_invariants_at(
@@ -1436,6 +1475,27 @@ impl<'a> Interp<'a> {
                         continue;
                     }
                     vals.push(self.eval(a, frame)?);
+                }
+                // A by-value class argument is a *move*: the source place
+                // stops holding it, so nothing drops it here as well as at
+                // its new owner. Harmless while destructors were empty —
+                // the invariant check was merely repeated — and a real
+                // double drop now that bodies run (ADR 0029).
+                for (a, p) in args.iter().zip(&f.params) {
+                    if !matches!(p.ty, Ty::Class(_)) {
+                        continue;
+                    }
+                    match &a.kind {
+                        ExprKind::Var(n) => {
+                            frame.vars.remove(n.as_str());
+                        }
+                        ExprKind::SelfField { field } => {
+                            if let Some((_, fields)) = &frame.self_ctx {
+                                fields.borrow_mut().remove(field.as_str());
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 if f.extern_info.is_some() {
                     // The foreign implementation receives only ABI values:

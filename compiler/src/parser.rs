@@ -765,6 +765,57 @@ impl<'a> Parser<'a> {
                         });
                     }
                 }
+                Tok::Hash => {
+                    // `#[must_consume] resource R f;` — the attribute goes
+                    // before the field, and only a resource may carry it.
+                    self.bump();
+                    self.expect(Tok::LBracket)?;
+                    let (attr, aspan) = self.ident()?;
+                    if attr != "must_consume" {
+                        return Err(Diagnostic {
+                            name: "parse.unknown_field_attr".into(),
+                            title: format!("unknown field attribute `{attr}`"),
+                            span: aspan,
+                            label: "expected `must_consume`".into(),
+                            notes: vec![],
+                        });
+                    }
+                    self.expect(Tok::RBracket)?;
+                    if !self.at(&Tok::KwResource) {
+                        return Err(Diagnostic {
+                            name: "resource.must_consume_non_resource".into(),
+                            title: "`#[must_consume]` applies to a resource field".into(),
+                            span: aspan,
+                            label: "an ordinary value has nothing to hand on".into(),
+                            notes: vec![(
+                                "note".into(),
+                                "the marker says this field's *authority* must be handed \
+                                 on by `deinit`; a number or an array has none"
+                                    .into(),
+                            )],
+                        });
+                    }
+                    let (ty, _) = self.resource_ty()?;
+                    let (fname, fspan) = self.ident()?;
+                    self.expect(Tok::Semi)?;
+                    fields.push(Field {
+                        name: fname,
+                        ty,
+                        span: fspan,
+                        must_consume: true,
+                    });
+                }
+                Tok::KwResource => {
+                    let (ty, _) = self.resource_ty()?;
+                    let (fname, fspan) = self.ident()?;
+                    self.expect(Tok::Semi)?;
+                    fields.push(Field {
+                        name: fname,
+                        ty,
+                        span: fspan,
+                        must_consume: false,
+                    });
+                }
                 Tok::LBracket => {
                     self.bump();
                     let (elem, _) = self.int_ty()?;
@@ -775,6 +826,7 @@ impl<'a> Parser<'a> {
                         name: fname,
                         ty: Ty::Array(elem, Mutability::Owned),
                         span: fspan,
+                        must_consume: false,
                     });
                 }
                 Tok::Ident(n) => {
@@ -793,6 +845,7 @@ impl<'a> Parser<'a> {
                         name: fname,
                         ty,
                         span: fspan,
+                        must_consume: false,
                     });
                 }
                 _ => return Err(self.error_expected("a field, `init`, `fn`, or `deinit`")),

@@ -78,6 +78,11 @@ struct Ctx<'a> {
     in_class: Option<(usize, bool)>,
     /// Inside an `init`: fields start uninitialized, `return` forbidden.
     in_init: bool,
+    /// Inside a destructor. The class invariant holds on entry and is not
+    /// re-established, which is precisely the premise `class.mut_field_borrow`
+    /// was deferred on — so a mutable field borrow is legitimate here and
+    /// nowhere else (ADR 0029).
+    in_deinit: bool,
     class_metas: &'a [ClassMeta],
     /// Template context (ADR 0009): bounded type parameter →
     /// (trait name, parameter index).
@@ -221,24 +226,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             }
             let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
                 for p in params {
-                    if matches!(p.ty, Ty::Res(_) | Ty::ResRef(..)) {
-                        return Err(Diagnostic {
-                            name: "resource.in_class".into(),
-                            title: "class members do not take resources yet".into(),
-                            span: p.span,
-                            label: format!("this has type `{}`", p.ty.name()),
-                            notes: vec![(
-                                "note".into(),
-                                "resources live in free functions for now; putting \
-                                 authority inside a class needs destruction semantics \
-                                 first, which is a scheduled deliverable"
-                                    .into(),
-                            )],
-                        });
-                    }
-                    // Class parameters: by value (moved in) or
-                    // borrowed (ADR 0020, ADR 0023).
-                    let ok = matches!(p.ty, Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(..))
+                    // Class parameters: by value (moved in) or borrowed
+                    // (ADR 0020, ADR 0023), and resources — a class that
+                    // owns authority takes it in through an init
+                    // (ADR 0029).
+                    let ok = matches!(
+                        p.ty,
+                        Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(..) | Ty::Res(_) | Ty::ResRef(..)
+                    )
                         || (allow_shared_arrays
                             && matches!(p.ty, Ty::Array(_, Mutability::Shared)));
                     if !ok {
@@ -265,14 +260,19 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 scalar_params(&m.f.params, false)?;
                 methods.push((m.f.name.clone(), m.f.params.clone(), m.f.ret, m.self_kind));
             }
-            if let Some(d) = &c.deinit {
-                if !d.is_empty() {
+            if c.deinit.is_none() {
+                if let Some(f) = c.fields.iter().find(|f| f.must_consume) {
                     return Err(Diagnostic {
-                        name: "type.deinit_body".into(),
-                        title: "`deinit` bodies must be empty for now".into(),
-                        span: c.name_span,
-                        label: "owned fields are freed automatically".into(),
-                        notes: vec![],
+                        name: "resource.abandoned".into(),
+                        title: format!("`{}` has no `deinit` to consume `{}`", c.name, f.name),
+                        span: f.span,
+                        label: "this field is `#[must_consume]`".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "without a destructor there is nowhere to hand the authority \
+                             on, so every value of this class would abandon it"
+                                .into(),
+                        )],
                     });
                 }
             }
@@ -405,6 +405,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             calls: Vec::new(),
             in_class: None,
             in_init: false,
+            in_deinit: false,
             class_metas: &class_metas,
             tbounds: HashMap::new(),
             operators: &operators,
@@ -471,6 +472,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             calls: Vec::new(),
             in_class: None,
             in_init: false,
+            in_deinit: false,
             class_metas: &class_metas,
             tbounds: tbounds_of(&f.type_params, &f.type_bounds),
             operators: &operators,
@@ -527,6 +529,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 calls: Vec::new(),
                 in_class: Some((ci, true)),
                 in_init: true,
+            in_deinit: false,
                 class_metas: &class_metas,
                 tbounds: HashMap::new(),
                 operators: &operators,
@@ -587,6 +590,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 calls: Vec::new(),
                 in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                 in_init: false,
+            in_deinit: false,
                 class_metas: &class_metas,
                 tbounds: HashMap::new(),
                 operators: &operators,
@@ -628,6 +632,89 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     label: "this method must return on every path".into(),
                     notes: vec![],
                 });
+            }
+            call_graph.insert(ctx.current_fn.clone(), ctx.calls);
+        }
+        // `deinit` — the destructor. Its semantics differ from a method in
+        // exactly the ways the value ceasing to exist implies (ADR 0029):
+        //
+        //   * the class invariant holds on entry and need **not** be
+        //     re-established, because there is nothing left to hold it;
+        //   * the body may move fields out, which is how a resource-owning
+        //     class hands its authority on;
+        //   * a moved field is not dropped again, and the rest drop in
+        //     reverse declaration order.
+        if let Some(body) = &mut class.deinit {
+            let mut ctx = Ctx {
+                sigs: &sigs,
+                current_fn: format!("{}::deinit", meta.name),
+                current_has_variant: false,
+                in_test: false,
+                vars: HashMap::new(),
+                declared: HashSet::new(),
+                moved: HashSet::new(),
+                in_unsafe: false,
+                unsafe_blocks: 0,
+                calls: Vec::new(),
+                // `&mut self`-like: the body owns the value outright.
+                in_class: Some((ci, true)),
+                in_init: false,
+                in_deinit: true,
+                class_metas: &class_metas,
+                tbounds: HashMap::new(),
+                operators: &operators,
+                traits: &traits_c,
+            };
+            for (fname, fty) in &meta.fields {
+                ctx.vars.insert(
+                    format!("self.{fname}"),
+                    VarInfo {
+                        ty: *fty,
+                        initialized: true,
+                        mutable: true,
+                        branded: false,
+                    },
+                );
+            }
+            let returns = check_block(&mut ctx, body, Ty::Unit)?;
+            unsafe_regions += ctx.unsafe_blocks;
+            if returns {
+                return Err(Diagnostic {
+                    name: "type.return_in_deinit".into(),
+                    title: "`return` is not allowed inside `deinit`".into(),
+                    span: class.name_span,
+                    label: "a destructor runs to the end of its body".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "leaving early would skip the drops that follow the body".into(),
+                    )],
+                });
+            }
+            // `#[must_consume]`: the field's authority has to be handed on.
+            // An ordinary affine field may be abandoned — that is a leak,
+            // and affine-not-linear authority permits leaks.
+            for f in &class.fields {
+                if !f.must_consume {
+                    continue;
+                }
+                let place = Place {
+                    root: "self".to_string(),
+                    fields: vec![f.name.clone()],
+                };
+                if !ctx.is_moved(&place) {
+                    return Err(Diagnostic {
+                        name: "resource.abandoned".into(),
+                        title: format!("`deinit` abandons `self.{}`", f.name),
+                        span: f.span,
+                        label: "this field is `#[must_consume]`".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "hand the authority on — pass it by value to something that \
+                             consumes it — or drop the marker and accept the leak"
+                                .into(),
+                        )],
+                    });
+                }
             }
             call_graph.insert(ctx.current_fn.clone(), ctx.calls);
         }
@@ -687,6 +774,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     calls: Vec::new(),
                     in_class: Some((ci, true)),
                     in_init: true,
+            in_deinit: false,
                     class_metas: &tmetas,
                     tbounds: ctb.clone(),
                     operators: &operators,
@@ -747,6 +835,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     calls: Vec::new(),
                     in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                     in_init: false,
+            in_deinit: false,
                     class_metas: &tmetas,
                     tbounds: ctb.clone(),
                     operators: &operators,
@@ -2204,9 +2293,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
             for (arg, p) in args.iter_mut().zip(&params) {
-                // A constructor returns a class, which cannot hold raw or
-                // resource storage; the brand cannot leave through one.
-                reject_brand_escape(ctx, arg, "be passed to a constructor", arg.span)?;
+                // A constructor returns a class, and a class may hold
+                // resource fields (ADR 0029) — so it is exactly a container
+                // a brand could leave in.
+                if class_holds_storage(ctx.class_metas, ci, 0) {
+                    reject_brand_escape(ctx, arg, "be passed to a constructor", arg.span)?;
+                }
                 match p.ty {
                     Ty::Array(elem, m) => {
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
@@ -2403,7 +2495,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // (ADR 0020). The base must name a class; the field is
             // either class-typed or array-typed.
             if let Some(fname) = field {
-                if *mutable {
+                // A destructor is the one place a mutable field borrow is
+                // sound: the invariant holds on entry and is not
+                // re-established, so there is nothing for the callee to
+                // break (ADR 0029). Everywhere else this stays deferred,
+                // and the reason is exactly that invariant.
+                if *mutable && !(ctx.in_deinit && array == "self") {
                     return Err(Diagnostic {
                         name: "class.mut_field_borrow".into(),
                         title: format!("cannot mutably borrow the field `{array}.{fname}`"),
@@ -2468,6 +2565,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     })?;
                 return match fld.1 {
                     Ty::Class(fci) => Ok(Ty::ClassRef(fci, Mutability::Shared)),
+                    // A resource field is a place too. Its mutability is
+                    // the borrow's: shared anywhere, and unique only in a
+                    // destructor, where the invariant it could break no
+                    // longer has to hold (ADR 0029).
+                    Ty::Res(k) => Ok(Ty::ResRef(
+                        k,
+                        if *mutable {
+                            Mutability::Mut
+                        } else {
+                            Mutability::Shared
+                        },
+                    )),
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
                     Ty::Array(elem, _) => Ok(Ty::Array(elem, Mutability::Shared)),
@@ -2859,11 +2968,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty).collect();
             let ret = sig.ret;
             // A callee that cannot give a branded value back cannot retain
-            // one either: Sable has no globals and no raw- or
-            // resource-typed fields, so a pointer handed to a function
-            // dies with its frame. Only a signature that *returns* storage
-            // can launder the brand out (ADR 0027).
-            let launders = matches!(ret, Ty::Raw(_) | Ty::Res(_));
+            // one either: Sable has no globals, so a pointer handed to a
+            // function dies with its frame. Only a signature that *returns*
+            // storage can launder the brand out — and since ADR 0029 a
+            // class counts, because it may have resource fields.
+            let launders = match ret {
+                Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
+                Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
+                _ => false,
+            };
             for (arg, pty) in args.iter_mut().zip(param_tys) {
                 if launders {
                     reject_brand_escape(ctx, arg, "be passed to a function", arg.span)?;
@@ -3113,14 +3226,27 @@ fn flip(m: Mutability) -> Mutability {
 /// it (ADR 0020). Only a plain name can be moved: a borrow keeps the
 /// value, and a call result is already a temporary.
 fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
-    if let ExprKind::Var(name) = &arg.kind {
-        if ctx
-            .vars
-            .get(name.as_str())
-            .is_some_and(|v| matches!(v.ty, Ty::Class(_) | Ty::Res(_)))
-        {
-            ctx.moved.insert(Place::local(name));
+    match &arg.kind {
+        ExprKind::Var(name) => {
+            if ctx
+                .vars
+                .get(name.as_str())
+                .is_some_and(|v| matches!(v.ty, Ty::Class(_) | Ty::Res(_)))
+            {
+                ctx.moved.insert(Place::local(name));
+            }
         }
+        // `self.f` handed on by value: the *field* is the place that dies,
+        // not the object. The object becomes partially moved, which is what
+        // lets a `deinit` pass one field on and still read another
+        // (ADR 0029).
+        ExprKind::SelfField { field } => {
+            ctx.moved.insert(Place {
+                root: "self".to_string(),
+                fields: vec![field.clone()],
+            });
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -3129,24 +3255,25 @@ impl<'a> Ctx<'a> {
     /// Whether this place names a resource (root type only for now —
     /// resource fields are a scheduled deliverable).
     fn is_resource_place(&self, p: &Place) -> bool {
-        self.vars
-            .get(p.root.as_str())
-            .is_some_and(|v| v.ty.is_resource())
+        match p.fields.as_slice() {
+            [] => self
+                .vars
+                .get(p.root.as_str())
+                .is_some_and(|v| v.ty.is_resource()),
+            // A field place: `self.f` is recorded as a pseudo-var, which is
+            // where a resource field's type lives.
+            [f] => self
+                .vars
+                .get(format!("{}.{}", p.root, f).as_str())
+                .is_some_and(|v| v.ty.is_resource()),
+            _ => false,
+        }
     }
 
     /// A place is dead if it, or anything containing it, has been moved
     /// out: moving `o` kills `o.inner` too.
     fn is_moved(&self, p: &Place) -> bool {
         self.moved.iter().any(|m| m.contains(p))
-    }
-
-    /// Some strict sub-place has been moved out. The whole can no
-    /// longer move or be borrowed, but the untouched siblings are
-    /// still readable. Nothing produces field moves yet (U7a); the
-    /// query exists so the joins are already right when they do.
-    #[allow(dead_code)]
-    fn is_partially_moved(&self, p: &Place) -> bool {
-        self.moved.iter().any(|m| p.contains(m) && m != p)
     }
 
     /// Type of `self.field`; `mutating` additionally requires an
@@ -3169,6 +3296,17 @@ impl<'a> Ctx<'a> {
                 label: "take `&mut self` to write".into(),
                 notes: vec![],
             });
+        }
+        // A field whose value was moved out is dead, and so is the whole
+        // object; its untouched siblings are still readable. This is what
+        // `partially-moved` means, and it is what a `deinit` body that
+        // hands one field on and reads another needs (ADR 0029).
+        let place = Place {
+            root: "self".to_string(),
+            fields: vec![field.to_string()],
+        };
+        if self.is_moved(&place) {
+            return Err(moved_out(self, &place, span, "read"));
         }
         self.class_metas[ci]
             .fields
@@ -3198,6 +3336,25 @@ impl<'a> Ctx<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether values of this class can *hold* raw or resource storage,
+/// directly or through a class field.
+///
+/// This is what decides whether a signature can launder a loan brand.
+/// ADR 0027 argued that only a raw or resource return type could, because
+/// Sable had no storage-typed fields — resource fields (ADR 0029) made that
+/// false, and a class is now a container a brand can leave in.
+fn class_holds_storage(metas: &[ClassMeta], ci: usize, depth: usize) -> bool {
+    if depth > 16 {
+        // Cyclic or absurdly deep: assume the worst rather than recurse.
+        return true;
+    }
+    metas[ci].fields.iter().any(|(_, ty)| match ty {
+        Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
+        Ty::Class(fci) => class_holds_storage(metas, *fci, depth + 1),
+        _ => false,
+    })
 }
 
 /// Whether an expression's value inherits a loan brand. Provenance is

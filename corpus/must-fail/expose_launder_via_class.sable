@@ -1,0 +1,26 @@
+// expect-error: expose.brand_escapes
+// A class may hold resource fields, so it is a container a loan brand can
+// leave in: a function returning one can launder borrowed storage out of an
+// exposure. Resource fields are what made this reachable — before them, no
+// signature that did not literally return storage could retain it.
+
+class Keeper {
+    resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+}
+
+/// pre  s.len ≥ 0
+fn wrap(resource RawSpan s) -> Keeper {
+    var k = Keeper::hold(s);
+    return k;
+}
+
+fn smuggle(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        var escaped = wrap(m);
+    }
+}

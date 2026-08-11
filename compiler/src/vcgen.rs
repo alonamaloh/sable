@@ -86,6 +86,11 @@ fn lean_field_ty(ty: Ty, classes: &[ClassDecl]) -> String {
         Ty::Array(..) => "Sable.Seq Int".into(),
         // A class-valued field is a nested structure (ADR 0020).
         Ty::Class(ci) => lean_class_name(&classes[ci].name),
+        // A resource field contributes its *view* to the structure. The
+        // authority it carries stays a checker property, so the class
+        // gains a value and no obligation (ADR 0024/0029).
+        Ty::Res(k) | Ty::ResRef(k, _) => k.view_ty().into(),
+        Ty::Raw(_) => "Sable.RawPtr".into(),
         _ => unreachable!("checked: field types"),
     }
 }
@@ -96,6 +101,10 @@ enum Cctx<'a> {
     None,
     Init(&'a ClassDecl),
     Method(&'a ClassDecl, SelfKind),
+    /// A destructor. It owns `self` outright and the invariant holds on
+    /// entry, but it is **not** re-established at exit: the value ceases to
+    /// exist, so there is nothing left to hold it (ADR 0029).
+    Deinit(&'a ClassDecl),
 }
 
 /// Well-formedness defs for an audited extern's clauses. Its parameters
@@ -431,6 +440,9 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             generator.run();
         }
     }
+    // Destructor bodies are collected first and run after, because the
+    // synthesized `Fn` each needs must outlive the generator that reads it.
+    let mut deinit_fns: Vec<(Fn, &ClassDecl)> = Vec::new();
     for c in &program.classes {
         // Template-verified class instances (ADR 0009): the
         // template's theorems cover their member obligations.
@@ -453,7 +465,39 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 &mut result,
             );
         }
-        // deinit bodies are empty (checked); nothing to verify.
+        // A destructor's body is verified like any other: its statements
+        // owe their own obligations. What it does *not* owe is the class
+        // invariant at exit (ADR 0029).
+        if let Some(body) = &c.deinit {
+            if !body.is_empty() {
+                let synth = Fn {
+                    is_pub: false,
+                    extern_info: None,
+                    name: "deinit".to_string(),
+                    name_span: c.name_span,
+                    type_params: Vec::new(),
+                    type_bounds: Vec::new(),
+                    requires: Vec::new(),
+                    from_template: None,
+                    params: Vec::new(),
+                    ret: Ty::Unit,
+                    pres: Vec::new(),
+                    posts: Vec::new(),
+                    variant: None,
+                    body: body.clone(),
+                    span: c.span,
+                };
+                deinit_fns.push((synth, c));
+            }
+        }
+    }
+    for (f, c) in &deinit_fns {
+        run_one(
+            f,
+            format!("{}::deinit", c.name),
+            Cctx::Deinit(c),
+            &mut result,
+        );
     }
     result
 }
@@ -557,9 +601,11 @@ impl<'a> Generator<'a> {
                 .iter()
                 .map(|fld| {
                     match self.env.get(&format!("self.{}", fld.name)) {
-                        Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) => {
-                            format!("{s}")
-                        }
+                        Some(Val::Int(s))
+                        | Some(Val::Arr(s))
+                        | Some(Val::Obj(s))
+                        | Some(Val::View(s))
+                        | Some(Val::Ptr(s)) => format!("{s}"),
                         Some(Val::Prop(p)) => format!("(decide {p})"),
                         _ => "0".to_string(), // unreachable: checked init
                     }
@@ -570,8 +616,11 @@ impl<'a> Generator<'a> {
         let mut map = HashMap::new();
         map.insert("self".to_string(), literal.clone());
         for fld in &class.fields {
-            if let Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) =
-                self.env.get(&format!("self.{}", fld.name))
+            if let Some(Val::Int(s))
+            | Some(Val::Arr(s))
+            | Some(Val::Obj(s))
+            | Some(Val::View(s))
+            | Some(Val::Ptr(s)) = self.env.get(&format!("self.{}", fld.name))
             {
                 map.insert(fld.name.clone(), s.clone());
             }
@@ -641,6 +690,9 @@ impl<'a> Generator<'a> {
             Cctx::Method(c, _) => {
                 scope_binders.push(("self".to_string(), lean_class_name(&c.name)));
                 scope_binders.push(("_old_self".to_string(), lean_class_name(&c.name)));
+            }
+            Cctx::Deinit(c) => {
+                scope_binders.push(("self".to_string(), lean_class_name(&c.name)))
             }
             Cctx::None => {}
         }
@@ -755,47 +807,82 @@ impl<'a> Generator<'a> {
             Class(usize),
             View(ResKind),
         }
-        let targets: Vec<(String, String, Target)> = params
+        // The borrowed *place*, which may be a field: `&mut self.w` names
+        // `w` inside `self`, so the fresh state has to be written back into
+        // the object rather than replacing it. Getting this wrong replaced
+        // `self` with a view and lost the whole self-chain.
+        let targets: Vec<(String, String, Option<String>, Target)> = params
             .iter()
             .zip(args.iter())
             .filter_map(|(p, arg)| {
-                let ExprKind::Borrow { array, .. } = &arg.kind else {
+                let ExprKind::Borrow { array, field, .. } = &arg.kind else {
                     return None;
                 };
                 match p.ty {
-                    Ty::ClassRef(aci, Mutability::Mut) => {
-                        Some((p.name.clone(), array.clone(), Target::Class(aci)))
-                    }
-                    Ty::ResRef(k, Mutability::Mut) => {
-                        Some((p.name.clone(), array.clone(), Target::View(k)))
-                    }
+                    Ty::ClassRef(aci, Mutability::Mut) => Some((
+                        p.name.clone(),
+                        array.clone(),
+                        field.clone(),
+                        Target::Class(aci),
+                    )),
+                    Ty::ResRef(k, Mutability::Mut) => Some((
+                        p.name.clone(),
+                        array.clone(),
+                        field.clone(),
+                        Target::View(k),
+                    )),
                     _ => None,
                 }
             })
             .collect();
         let mut out = Vec::new();
-        for (pname, array, target) in targets {
-            match target {
+        for (pname, array, field, target) in targets {
+            let hint = match &field {
+                Some(f) => format!("{array}_{f}"),
+                None => array.clone(),
+            };
+            let b = match target {
                 Target::Class(aci) => {
                     let aname = self.classes[aci].name.clone();
-                    let b = self.hinted_sym("_obj", Some(array.clone()));
+                    let b = self.hinted_sym("_obj", Some(hint));
                     self.binders.push((b.clone(), lean_class_name(&aname)));
                     let acd = &self.classes[aci];
                     self.push_class_state_facts(acd, &b);
                     self.push_invariant_hyps(acd, &b);
-                    self.env.insert(array, Val::Obj(b.clone()));
-                    out.push((pname, b));
+                    b
                 }
                 Target::View(k) => {
-                    let b = self.hinted_sym("_view", Some(array.clone()));
+                    let b = self.hinted_sym("_view", Some(hint));
                     self.binders.push((b.clone(), k.view_ty().into()));
                     for (h, prop) in view_wf_hyps(k, &array, &b) {
                         self.push_hyp_unique(h, prop);
                     }
-                    self.env.insert(array, Val::View(b.clone()));
-                    out.push((pname, b));
+                    b
+                }
+            };
+            match field {
+                // A whole place: the name now holds the fresh state.
+                None => {
+                    let v = match target {
+                        Target::Class(_) => Val::Obj(b.clone()),
+                        Target::View(_) => Val::View(b.clone()),
+                    };
+                    self.env.insert(array, v);
+                }
+                // A field place: write the fresh state back into the base,
+                // leaving every sibling where it was.
+                Some(f) => {
+                    let base = match self.env.get(array.as_str()) {
+                        Some(Val::Obj(chain)) => chain.clone(),
+                        _ => array.clone(),
+                    };
+                    self.env.insert(
+                        array,
+                        Val::Obj(format!("{{ {base} with {f} := {b} }}")),
+                    );
                 }
             }
+            out.push((pname, b));
         }
         out
     }
@@ -813,6 +900,16 @@ impl<'a> Generator<'a> {
             self.push_invariant_hyps(class, "_old_self");
             self.env
                 .insert("self".to_string(), Val::Obj("_old_self".to_string()));
+        }
+        if let Cctx::Deinit(class) = self.cctx {
+            // No `_old_self` twin: a destructor has no "after" to compare
+            // against, so `old self` would name nothing.
+            self.binders
+                .push(("self".to_string(), lean_class_name(&class.name)));
+            self.push_class_state_facts(class, "self");
+            self.push_invariant_hyps(class, "self");
+            self.env
+                .insert("self".to_string(), Val::Obj("self".to_string()));
         }
         for p in &self.f.params {
             self.var_tys.insert(p.name.clone(), p.ty);
@@ -1274,7 +1371,11 @@ impl<'a> Generator<'a> {
                     Cctx::Init(_) => {
                         self.env.insert(format!("self.{field}"), v);
                     }
-                    Cctx::Method(..) => {
+                    // A destructor may write a field too — it owns the
+                    // value — and the update is the same chain a method's
+                    // is; nothing downstream reads it, since the value is
+                    // about to cease to exist.
+                    Cctx::Method(..) | Cctx::Deinit(_) => {
                         let vs = match v {
                             Val::Int(s) | Val::Arr(s) | Val::Obj(s) => s,
                             Val::Prop(p) => format!("(decide {p})"),
@@ -1320,7 +1421,7 @@ impl<'a> Generator<'a> {
                     Cctx::Init(_) => {
                         self.env.insert(format!("self.{field}"), Val::Arr(updated));
                     }
-                    Cctx::Method(..) => {
+                    Cctx::Method(..) | Cctx::Deinit(_) => {
                         let chain = self.self_chain();
                         self.env.insert(
                             "self".to_string(),
@@ -1530,7 +1631,7 @@ impl<'a> Generator<'a> {
             let classes = self.classes;
             let var_tys = &self.var_tys;
             let cctx_class = match self.cctx {
-                Cctx::Init(c) | Cctx::Method(c, _) => Some(c),
+                Cctx::Init(c) | Cctx::Method(c, _) | Cctx::Deinit(c) => Some(c),
                 Cctx::None => None,
             };
             let resolver = |recv: &str, method: &str| {
@@ -2325,7 +2426,20 @@ impl<'a> Generator<'a> {
                     .get(&format!("self.{field}"))
                     .cloned()
                     .expect("checked: field initialized"),
-                Cctx::Method(..) => Val::Int(project_field(&self.self_chain(), field)),
+                // The field's *kind* decides the symbolic value: a resource
+                // field projects to its view, a class field to its
+                // structure. This is what lets a destructor hand a resource
+                // field on to something that consumes it (ADR 0029).
+                Cctx::Method(..) | Cctx::Deinit(_) => {
+                    let projected = project_field(&self.self_chain(), field);
+                    match e.ty {
+                        Some(Ty::Res(_)) | Some(Ty::ResRef(..)) => Val::View(projected),
+                        Some(Ty::Class(_)) | Some(Ty::ClassRef(..)) => Val::Obj(projected),
+                        Some(Ty::Raw(_)) => Val::Ptr(projected),
+                        Some(Ty::Array(..)) => Val::Arr(projected),
+                        _ => Val::Int(projected),
+                    }
+                }
                 Cctx::None => unreachable!("checked: fields only in members"),
             },
             ExprKind::SelfFieldLen { field } => {
@@ -3080,7 +3194,7 @@ impl<'a> Generator<'a> {
                 Some(Val::Arr(s)) => s.clone(),
                 _ => unreachable!("checked: field initialized"),
             },
-            Cctx::Method(..) => project_field(&self.self_chain(), field),
+            Cctx::Method(..) | Cctx::Deinit(_) => project_field(&self.self_chain(), field),
             Cctx::None => unreachable!("checked: fields only in members"),
         }
     }
@@ -3152,7 +3266,9 @@ impl<'a> Generator<'a> {
             }
         }
         match self.cctx {
-            Cctx::Init(c) => out.push(("self".to_string(), lean_class_name(&c.name))),
+            Cctx::Init(c) | Cctx::Deinit(c) => {
+                out.push(("self".to_string(), lean_class_name(&c.name)))
+            }
             Cctx::Method(c, _) => {
                 out.push(("self".to_string(), lean_class_name(&c.name)));
                 out.push(("_old_self".to_string(), lean_class_name(&c.name)));
@@ -3207,6 +3323,14 @@ impl<'a> Generator<'a> {
                     }
                 }
                 mut_map.extend(map);
+            }
+            // A destructor owes no invariant at exit: the value ceases to
+            // exist, so there is nothing left to hold it (ADR 0029). Its
+            // field states still substitute, because its own body's
+            // obligations speak about them.
+            Cctx::Deinit(class) => {
+                let chain = self.self_chain();
+                mut_map.extend(self.class_state_map(class, &chain));
             }
             Cctx::None => {}
         }
