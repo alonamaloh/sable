@@ -163,6 +163,12 @@ fn lower_expr(e: &Expr) -> Result<String, String> {
         }
         ExprKind::BoolLit(b) => format!("(.boolLit {b})"),
         ExprKind::Var(x) => format!("(.var \"{x}\")"),
+        ExprKind::ResOp { op, .. } => {
+            return Err(format!(
+                "`{}` has no machine semantics yet: the raw heap is not in the SVM",
+                op.name()
+            ));
+        }
         ExprKind::Unary { op, operand } => match op {
             UnOp::Not => format!("(.not {})", lower_expr(operand)?),
             UnOp::Neg => format!(

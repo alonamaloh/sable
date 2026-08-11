@@ -1,0 +1,10 @@
+// expect-error: rejoin.join
+// `join` needs two adjacent spans of one allocation. Nothing in the
+// checker knows where a span sits, so nonadjacency is a failed VC — the
+// same treatment `split_off`'s bound gets.
+
+/// post result.len = a.len + b.len
+fn rejoin(resource RawSpan a, resource RawSpan b) -> resource RawSpan {
+    resource RawSpan whole = join(a, b);
+    return whole;
+}

@@ -1,0 +1,8 @@
+// expect-error: type.arg_borrow
+// `split_off` borrows its span mutably, and the borrow is written at the
+// call site: a bare name would read like a move.
+
+fn carve(resource RawSpan s) -> resource RawSpan {
+    resource RawSpan tail = split_off(s, 1);
+    return tail;
+}

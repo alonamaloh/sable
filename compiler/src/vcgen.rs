@@ -1610,6 +1610,86 @@ impl<'a> Generator<'a> {
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
             }
+            // The sealed resource transformations. Their contracts are
+            // generated here rather than written in a prelude, because
+            // each states a rule about who owns what and the rules are
+            // the compiler's (ADR 0024). Neither touches memory: they
+            // redistribute authority, and in the logic that is a fact
+            // about how views relate.
+            ExprKind::ResOp { op, args, .. } => {
+                let hint = self.name_hint.take();
+                match op {
+                    // `split_off(&mut whole, n)`: the prefix stays, the
+                    // suffix leaves. `whole` is rebound to the prefix
+                    // view, exactly as any `&mut` argument is rebound.
+                    ResOp::SplitOff => {
+                        let Val::View(whole) = self.eval(&args[0]) else {
+                            unreachable!("checked: span borrow")
+                        };
+                        let Val::Int(n) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 count")
+                        };
+                        let goal = format!("0 ≤ {n} ∧ {n} ≤ ({whole}).len");
+                        let ob = self.obligation(
+                            &format!("{}.split_off.{}", self.fname, slug(&n)),
+                            "`split_off` must not carve past the end of the span".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: borrow arg")
+                        };
+                        let prefix = self.hinted_sym("_view", Some(array.clone()));
+                        self.binders
+                            .push((prefix.clone(), ResKind::RawSpan.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{array}_prefix"),
+                            format!("{prefix} = ({whole}).take {n}"),
+                        );
+                        self.env.insert(array.clone(), Val::View(prefix));
+                        let suffix = self.hinted_sym("_view", hint);
+                        self.binders
+                            .push((suffix.clone(), ResKind::RawSpan.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_suffix", suffix.trim_start_matches('_')),
+                            format!("{suffix} = ({whole}).drop {n}"),
+                        );
+                        Val::View(suffix)
+                    }
+                    // `join(a, b)`: both tokens are consumed. Adjacency
+                    // is a precondition, so a nonadjacent join is a
+                    // failed VC and not a checker error — the checker has
+                    // no idea where a span sits.
+                    ResOp::Join => {
+                        let Val::View(a) = self.eval(&args[0]) else {
+                            unreachable!("checked: span value")
+                        };
+                        let Val::View(b) = self.eval(&args[1]) else {
+                            unreachable!("checked: span value")
+                        };
+                        let goal =
+                            format!("({a}).alloc = ({b}).alloc ∧ ({a}).off + ({a}).len = ({b}).off");
+                        let ob = self.obligation(
+                            &format!("{}.join.{}", self.fname, slug(&format!("{a}_{b}"))),
+                            "`join` needs two adjacent spans of one allocation".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let whole = self.hinted_sym("_view", hint);
+                        self.binders
+                            .push((whole.clone(), ResKind::RawSpan.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_join", whole.trim_start_matches('_')),
+                            format!("{whole} = ({a}).cat ({b})"),
+                        );
+                        Val::View(whole)
+                    }
+                }
+            }
             ExprKind::Borrow { array, field, .. } => {
                 // Borrowing a resource passes its view along unchanged;
                 // what the borrow transfers is authority, and authority

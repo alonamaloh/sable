@@ -1283,7 +1283,7 @@ value — no borrow-typed locals, returns, or fields — so borrow state never h
 survive a statement, and overlap is decided within a single call. U2b should
 check whether resources change that before adding the counters.
 
-#### U2b — resource category on the same engine *(first slice done 2026-08-11)*
+#### U2b — resource category on the same engine *(done 2026-08-11)*
 
 The category exists, on U2a's engine and nothing else. ADR 0024 records the
 decisions; the load-bearing one is that **the view is ghost** — a clause may say
@@ -1335,12 +1335,25 @@ both sides drop the same positions by the same filter — but no test reaches it
 because nothing can *create* a `RawSpan` yet. Allocation is U3. Recorded rather
 than claimed.
 
-Remaining before U2b closes:
+`split_off` and `join` landed as compiler-known sealed transformations, not
+library functions: each states a rule about who owns what, and those rules are
+the compiler's. `split_off(&mut whole, n)` leaves the prefix in the borrowed
+token and returns the suffix — **no product type was needed**, which was the
+open question; one side goes back through the borrow. Bounds and adjacency are
+*failed VCs, never checker errors*: the checker tracks tokens, not geometry, and
+that division is the whole architecture in one rule.
 
-- `split_off` and `join` as sealed transformations with generated contracts;
-  `SpanView.take`/`.drop`/`.cat` and their lemmas are already in the prelude, so
-  what is left is the operations and the carving-loop corpus subject that the
-  U1 probe's `own_carve_step` was proved for.
+The corpus subject that matters is `carve_one_at_a_time`: one byte carved off
+the front per iteration and joined onto the processed prefix, two tokens live
+across the backedge with both views changing every turn. That is the shape the
+U1 probe's `own_carve_step` was proved for, now a verified program — 23
+obligations, zero discharge scripts. It also found a hole in the loop-shape rule
+as first written (a resource declared *and* consumed inside the body was flagged,
+though it is per-iteration scratch the backedge does not owe) and a hole in
+`join`'s argument handling: moving both arguments in a second pass accepts
+`join(a, a)`, and the adjacency VC does **not** catch it, because an empty span
+is adjacent to itself. A zero-length token duplicated out of nothing is exactly
+the failure the category exists to prevent, and it survived about ten minutes.
 
 ### U3 — byte raw heap in the formal SVM
 

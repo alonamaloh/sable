@@ -2276,6 +2276,30 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::Ident(name) if ResOp::from_name(&name).is_some() => {
+                let op = ResOp::from_name(&name).expect("checked");
+                self.bump();
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                while !self.at(&Tok::RParen) {
+                    args.push(self.expr()?);
+                    if self.at(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::ResOp {
+                        op,
+                        op_span: span,
+                        args,
+                    },
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
             Tok::Ident(name) if name == "alloc_array" => {
                 self.bump();
                 self.expect(Tok::Lt)?;
@@ -2614,6 +2638,9 @@ fn is_reserved_name(name: &str) -> bool {
         "True",
         "False",
         "len",
+        "alloc_array",
+        "split_off",
+        "join",
     ];
     RESERVED.contains(&name) || IntTy::from_name(name).is_some() || name == "bool"
 }
@@ -2639,6 +2666,11 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
     match &e.kind {
         ExprKind::Var(n) => {
             out.insert(n.clone());
+        }
+        ExprKind::ResOp { args, .. } => {
+            for a in args {
+                expr_vars(a, out);
+            }
         }
         ExprKind::Index { array, index, .. } => {
             out.insert(array.clone());

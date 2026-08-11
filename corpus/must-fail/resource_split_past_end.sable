@@ -1,0 +1,9 @@
+// expect-error: carve.split_off
+// `split_off` may not carve past the end of the span. This is a failed
+// VC, not a checker error: how long a span is is a fact about its view,
+// and the checker does not read views.
+
+fn carve(resource &mut RawSpan s) -> resource RawSpan {
+    resource RawSpan tail = split_off(&mut s, 4);
+    return tail;
+}

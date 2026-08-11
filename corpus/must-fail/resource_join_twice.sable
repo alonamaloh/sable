@@ -1,0 +1,8 @@
+// expect-error: resource.use_after_move
+// `join` consumes both spans. Naming the same one twice would join a
+// span to itself — authority duplicated out of nothing.
+
+fn rejoin(resource RawSpan a) -> resource RawSpan {
+    resource RawSpan whole = join(a, a);
+    return whole;
+}

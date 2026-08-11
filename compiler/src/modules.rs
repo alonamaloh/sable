@@ -260,6 +260,11 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
         const_names: &HashMap<&str, (usize, bool)>,
     ) {
         match &e.kind {
+            ExprKind::ResOp { args, .. } => {
+                for a in args {
+                    walk_expr(a, refs, const_names);
+                }
+            }
             ExprKind::Call {
                 callee,
                 callee_span,

@@ -153,6 +153,11 @@ fn subst_expr(e: &mut Expr, values: &HashMap<String, i128>) {
                 e.kind = ExprKind::IntLit(*v);
             }
         }
+        ExprKind::ResOp { args, .. } => {
+            for a in args {
+                subst_expr(a, values);
+            }
+        }
         ExprKind::Unary { operand, .. }
         | ExprKind::Widen { arg: operand, .. }
         | ExprKind::Narrow { arg: operand, .. }

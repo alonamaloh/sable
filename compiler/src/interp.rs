@@ -684,6 +684,10 @@ impl<'a> Interp<'a> {
             ExprKind::IntLit(n) => Ok(RtVal::Int(*n)),
             ExprKind::BoolLit(b) => Ok(RtVal::Bool(*b)),
             ExprKind::Var(name) => Ok(frame.vars[name.as_str()].clone()),
+            // Resource transformations redistribute authority, which is
+            // a static notion: at runtime there is nothing to move and
+            // nothing to return (ADR 0024).
+            ExprKind::ResOp { .. } => Ok(RtVal::Unit),
             ExprKind::Len { array } => {
                 let RtVal::Arr(a) = &frame.vars[array.as_str()] else {
                     unreachable!()

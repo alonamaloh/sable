@@ -119,6 +119,37 @@ pub enum ResKind {
     RawSpan,
 }
 
+/// The sealed transformations of resource authority. These are not
+/// library functions: a program may not define one, because each is a
+/// rule about who owns what, and the rules are the compiler's to state
+/// (ADR 0024).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResOp {
+    /// `split_off(&mut whole, n)` — leaves the first `n` bytes in the
+    /// borrowed token and returns authority over the rest.
+    SplitOff,
+    /// `join(a, b)` — consumes two adjacent spans of one allocation and
+    /// returns authority over their concatenation.
+    Join,
+}
+
+impl ResOp {
+    pub fn from_name(name: &str) -> Option<ResOp> {
+        match name {
+            "split_off" => Some(ResOp::SplitOff),
+            "join" => Some(ResOp::Join),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ResOp::SplitOff => "split_off",
+            ResOp::Join => "join",
+        }
+    }
+}
+
 impl ResKind {
     pub fn from_name(name: &str) -> Option<ResKind> {
         match name {
@@ -261,6 +292,13 @@ pub enum ExprKind {
     /// `a.len` where `a` names an array parameter.
     Len {
         array: String,
+    },
+    /// A sealed resource transformation: `split_off(&mut s, n)`,
+    /// `join(a, b)`. Its contract is generated, not written (ADR 0024).
+    ResOp {
+        op: ResOp,
+        op_span: Span,
+        args: Vec<Expr>,
     },
     /// `widen<T>(e)` — value-preserving widening; no VC, identity in Lean.
     Widen {

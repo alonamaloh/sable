@@ -912,9 +912,12 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 if reaching_moved.len() > 1 {
                     let (first, rest) = reaching_moved.split_first().expect("checked: len > 1");
                     for other in rest {
+                        // Only resources that existed before the branch
+                        // are part of its shape: one declared and
+                        // consumed inside a branch never outlives it.
                         let differ = first
                             .symmetric_difference(other)
-                            .find(|p| ctx.is_resource_place(p));
+                            .find(|p| ctx.is_resource_place(p) && before.contains_key(&p.root));
                         if let Some(p) = differ {
                             return Err(Diagnostic {
                                 name: "resource.branch_shape".into(),
@@ -979,10 +982,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // iteration and never consumed leaks one per turn. Views
                 // may change freely — that is what the loop invariant is
                 // for; the *shape* is what must come back.
+                // Only resources live at the loop head are part of the
+                // shape. One declared and consumed inside the body is
+                // per-iteration scratch, not something the backedge owes.
                 if let Some(p) = ctx
                     .moved
                     .symmetric_difference(&before_moved)
-                    .find(|p| ctx.is_resource_place(p))
+                    .find(|p| ctx.is_resource_place(p) && before.contains_key(&p.root))
                 {
                     return Err(Diagnostic {
                         name: "resource.loop_shape".into(),
@@ -1675,6 +1681,60 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 check_expr(ctx, a, Some(*w))?;
             }
             remap(m.ret)
+        }
+        ExprKind::ResOp { op, op_span, args } => {
+            let op = *op;
+            let op_span = *op_span;
+            let arity = match op {
+                ResOp::SplitOff => 2,
+                ResOp::Join => 2,
+            };
+            if args.len() != arity {
+                return Err(Diagnostic {
+                    name: "type.arity".into(),
+                    title: format!(
+                        "`{}` takes {arity} argument(s), {} given",
+                        op.name(),
+                        args.len()
+                    ),
+                    span: op_span,
+                    label: "wrong number of arguments".into(),
+                    notes: vec![],
+                });
+            }
+            match op {
+                // `split_off(&mut whole, n)` — the prefix stays in the
+                // borrowed token, the suffix leaves in the returned one.
+                // No product type is needed: one side is written back
+                // through the borrow (ADR 0024).
+                ResOp::SplitOff => {
+                    let want = Ty::ResRef(ResKind::RawSpan, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], want)?;
+                    let got = check_expr(ctx, &mut args[0], Some(want))?;
+                    debug_assert_eq!(got, want);
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::RawSpan)
+                }
+                // `join(a, b)` — both are consumed; the result owns their
+                // concatenation. Adjacency is a precondition, so a
+                // nonadjacent join is a failed VC, not a checker error.
+                ResOp::Join => {
+                    let want = Ty::Res(ResKind::RawSpan);
+                    // Each argument moves as it is checked, so
+                    // `join(a, a)` is a use-after-move on the second
+                    // occurrence. Deferring the moves to a second pass
+                    // would accept it — and an empty span *is* adjacent
+                    // to itself, so the adjacency VC would not catch it
+                    // either: the token would be duplicated out of
+                    // nothing.
+                    for arg in args.iter_mut() {
+                        check_expr(ctx, arg, Some(want))?;
+                        mark_moved(ctx, arg)?;
+                    }
+                    want
+                }
+            }
         }
         ExprKind::AllocArray { elem, len, init } => {
             let elem = *elem;
