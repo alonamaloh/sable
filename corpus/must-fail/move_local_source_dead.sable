@@ -1,0 +1,30 @@
+// expect-error: class.use_after_move
+// A local-to-local move consumes the source: `a = b;` leaves `b` dead,
+// exactly as passing `b` by value would.
+
+class Box {
+    i32 v;
+
+    /// invariant v ≥ 0
+
+    /// pre x ≥ 0
+    init make(i32 x) {
+        self.v = x;
+    }
+
+    deinit {
+    }
+}
+
+/// post result = b.v
+fn peek(&Box b) -> i32 {
+    return b.v;
+}
+
+fn shuffle() -> i32 {
+    var mut a = Box::make(1);
+    var b = Box::make(2);
+    a = b;
+    i32 r = peek(&b);
+    return r;
+}

@@ -780,28 +780,23 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     });
                 }
                 if matches!(ty, Ty::Class(_)) {
-                    // Reassignment of a class local is a move-in from a
-                    // fresh owned value (the old value is dropped, with
-                    // its RAII invariant check). Check first: operator
-                    // sugar may rewrite a Binary RHS into the bound call
-                    // (ADR 0012). Only call results and constructions
-                    // move in; local-to-local moves would leave a
-                    // moved-from name behind and stay deferred (ADR 0010).
+                    // Reassignment of a class local is a move-in of an
+                    // owned value; the old value is dropped, with its
+                    // RAII invariant check. Check first: operator sugar
+                    // may rewrite a Binary RHS into the bound call
+                    // (ADR 0012).
                     check_expr(ctx, value, Some(ty))?;
-                    if !matches!(
-                        value.kind,
-                        ExprKind::Call { .. } | ExprKind::CtorCall { .. }
-                    ) {
-                        return Err(Diagnostic {
-                            name: "class.move_deferred".into(),
-                            title: format!(
-                                "class value `{name}` can only be reassigned from a call or constructor"
-                            ),
-                            span: *name_span,
-                            label: "moves between locals are not supported yet (ADR 0010)".into(),
-                            notes: vec![],
-                        });
+                    // A bare name is a local-to-local move: the source
+                    // place dies here (ADR 0020). Every other class-typed
+                    // expression is a call or a construction — a fresh
+                    // owned value that nothing else names.
+                    if matches!(value.kind, ExprKind::Var(_)) {
+                        mark_moved(ctx, value)?;
                     }
+                    // The destination owns a value again even if it had
+                    // been moved out earlier.
+                    let dest = Place::local(name);
+                    ctx.moved.retain(|m| !dest.contains(m));
                     ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
                 } else {
                     if matches!(ty, Ty::Array(..)) {
@@ -977,7 +972,25 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         notes: vec![],
                     });
                 }
-                let t = check_expr(ctx, init, None)?;
+                // `var d = c;` — a local-to-local move (ADR 0020). A bare
+                // name is not otherwise a class-typed expression, so the
+                // expected type has to be supplied here for the move to
+                // be legal at all.
+                let moved_from = match &init.kind {
+                    ExprKind::Var(src) => match ctx.vars.get(src.as_str()).map(|v| v.ty) {
+                        Some(Ty::Class(ci)) => Some(ci),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let t = match moved_from {
+                    Some(ci) => {
+                        check_expr(ctx, init, Some(Ty::Class(ci)))?;
+                        mark_moved(ctx, init)?;
+                        Ty::Class(ci)
+                    }
+                    None => check_expr(ctx, init, None)?,
+                };
                 if t == Ty::Unit {
                     return Err(Diagnostic {
                         name: "type.unit_binding".into(),
@@ -1223,10 +1236,23 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         )],
                     });
                 }
-                if matches!(v.ty, Ty::Class(_)) {
-                    // Class values move: out through `return`, or into
-                    // a by-value parameter (ADR 0010/0020).
-                    if matches!(expected, Some(Ty::Class(_))) {
+                if let Ty::Class(got) = v.ty {
+                    // Class values move: out through `return`, into a
+                    // by-value parameter, or into another local
+                    // (ADR 0010/0020).
+                    if let Some(Ty::Class(want)) = expected {
+                        if want != got {
+                            return Err(Diagnostic {
+                                name: "type.mismatch".into(),
+                                title: format!(
+                                    "expected `{}`, found `{}`",
+                                    ctx.class_metas[want].name, ctx.class_metas[got].name
+                                ),
+                                span,
+                                label: "different class".into(),
+                                notes: vec![],
+                            });
+                        }
                         return Ok(v.ty);
                     }
                     return Err(Diagnostic {

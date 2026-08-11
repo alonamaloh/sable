@@ -1,0 +1,24 @@
+// expect-error: class.use_after_move
+// `var d = a;` is the other spelling of the same move, and it kills `a`
+// just as thoroughly. Naming a value twice is what affinity forbids.
+
+class Box {
+    i32 v;
+
+    /// invariant v ≥ 0
+
+    /// pre x ≥ 0
+    init make(i32 x) {
+        self.v = x;
+    }
+
+    deinit {
+    }
+}
+
+fn rebind() -> i32 {
+    var a = Box::make(1);
+    var d = a;
+    var e = a;
+    return 0;
+}

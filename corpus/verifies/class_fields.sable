@@ -104,6 +104,34 @@ pub fn borrowed_array_field() -> u32 {
     return r;
 }
 
+// A move does not need a call to carry it. `var d = i;` and `d = e;`
+// transfer ownership between locals, and the source place dies at the
+// move — the same rule a by-value argument obeys, with no function in
+// the middle.
+/// post result = 4
+pub fn move_between_locals() -> u64 {
+    var i = Inner::make(4);
+    var d = i;
+    u64 r = read_inner(&d);
+    return r;
+}
+
+// Moving into an existing local drops what was there, and a local that
+// has been moved out of owns a value again as soon as one is moved back
+// in — a moved-from name is dead, not permanently unusable.
+/// post result = 9
+pub fn move_and_revive() -> u64 {
+    var mut a = Inner::make(1);
+    var b = Inner::make(6);
+    a = b;
+    var c = a;
+    a = Inner::make(9);
+    u64 seen = read_inner(&c);
+    u64 r = read_inner(&a);
+    /// assert #[label(dropped)] seen = 6
+    return r;
+}
+
 // Affinity is per path: a move on a branch that returns never reaches
 // the code after the branch, so `i` is still live below.
 /// post result = 5
