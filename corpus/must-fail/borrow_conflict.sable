@@ -1,0 +1,19 @@
+// expect-error: borrow.conflict
+// A mutable borrow must not overlap another borrow in the same call.
+// VCgen havocs the mutable argument and keeps the shared argument's
+// pre-call symbol, so overlapping borrows let the caller assume a
+// contract framed over storage the callee actually changed.
+
+/// pre  a.len ≥ 2
+/// pre  b.len ≥ 2
+/// post #[label(q)] a.get 1 = b.get 0
+fn shift(&mut [u8] a, &[u8] b) {
+    a[0] = 9;
+    a[1] = b[0];
+}
+
+fn caller() -> u8 {
+    mut [u8] x = [ 3, 0 ];
+    shift(&mut x, &x);
+    return x[1];
+}

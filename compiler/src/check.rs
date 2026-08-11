@@ -1667,6 +1667,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     _ => check_expr(ctx, arg, Some(p.ty)).map(|_| ())?,
                 }
             }
+            check_borrow_conflicts(args, None)?;
             ctx.calls.push(format!("{class}::{init}"));
             Ty::Class(ci)
         }
@@ -1745,6 +1746,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             for (arg, p) in args.iter_mut().zip(&params) {
                 check_expr(ctx, arg, Some(p.ty))?;
             }
+            check_borrow_conflicts(
+                args,
+                Some((
+                    Place::local(recv),
+                    self_kind == SelfKind::Mut,
+                    *recv_span,
+                )),
+            )?;
             ctx.calls
                 .push(format!("{}::{method}", ctx.class_metas[ci].name));
             ret
@@ -2199,6 +2208,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }
             }
+            check_borrow_conflicts(args, None)?;
             if *callee != ctx.current_fn {
                 ctx.calls.push(callee.clone());
             }
@@ -2207,6 +2217,102 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     };
     e.ty = Some(ty);
     Ok(ty)
+}
+
+/// A place: a local (or `self`), optionally projected through fields.
+/// Ownership and borrowing are questions about places, not names — a
+/// field is a place in its own right (ADR 0020, ADR 0022).
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Place {
+    root: String,
+    fields: Vec<String>,
+}
+
+impl Place {
+    fn local(name: &str) -> Place {
+        Place {
+            root: name.to_string(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Two places overlap when one contains the other: same root, and
+    /// one field path a prefix of the other. `o` overlaps `o.inner`;
+    /// `o.a` and `o.b` do not.
+    fn overlaps(&self, other: &Place) -> bool {
+        if self.root != other.root {
+            return false;
+        }
+        let n = self.fields.len().min(other.fields.len());
+        self.fields[..n] == other.fields[..n]
+    }
+
+    fn render(&self) -> String {
+        let mut s = self.root.clone();
+        for f in &self.fields {
+            s.push('.');
+            s.push_str(f);
+        }
+        s
+    }
+}
+
+/// The place an argument borrows, and whether the borrow is mutable.
+fn borrow_place(arg: &Expr) -> Option<(Place, bool)> {
+    let ExprKind::Borrow {
+        array,
+        field,
+        mutable,
+    } = &arg.kind
+    else {
+        return None;
+    };
+    let mut p = Place::local(array);
+    if let Some(f) = field {
+        p.fields.push(f.clone());
+    }
+    Some((p, *mutable))
+}
+
+/// Within one call, a mutable borrow must not overlap any other borrow.
+/// VCgen havocs the mutable argument into a fresh symbol and keeps the
+/// other arguments' pre-call symbols, so overlapping borrows would let
+/// the caller assume a contract framed over storage the callee actually
+/// changed — unsound, not merely imprecise.
+fn check_borrow_conflicts(
+    args: &[Expr],
+    receiver: Option<(Place, bool, Span)>,
+) -> CResult<()> {
+    let mut borrows: Vec<(Place, bool, Span)> = Vec::new();
+    if let Some(r) = receiver {
+        borrows.push(r);
+    }
+    for a in args {
+        if let Some((p, m)) = borrow_place(a) {
+            borrows.push((p, m, a.span));
+        }
+    }
+    for i in 0..borrows.len() {
+        for j in (i + 1)..borrows.len() {
+            let (pi, mi, _) = &borrows[i];
+            let (pj, mj, sj) = &borrows[j];
+            if (*mi || *mj) && pi.overlaps(pj) {
+                return Err(Diagnostic {
+                    name: "borrow.conflict".into(),
+                    title: format!("conflicting borrows of `{}` in one call", pi.render()),
+                    span: *sj,
+                    label: format!("this overlaps the borrow of `{}`", pi.render()),
+                    notes: vec![(
+                        "note".into(),
+                        "a mutable borrow must not overlap another borrow in the same \
+                         call: the callee's contract frames them as distinct storage"
+                            .into(),
+                    )],
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A class value passed by value is moved out of the local that named

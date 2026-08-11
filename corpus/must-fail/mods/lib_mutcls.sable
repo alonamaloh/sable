@@ -1,0 +1,28 @@
+// Helper module: a class with a `&mut self` method that also borrows a
+// class, for the borrow-conflict guard.
+
+pub class Cell2 {
+    u64 v;
+
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+pub class Box2 {
+    Cell2 c;
+    u64 tag;
+
+    /// post self.c.v = k.v
+    /// post self.tag = 0
+    init hold(Cell2 k) {
+        self.c = k;
+        self.tag = 0;
+    }
+
+    /// post self.tag = k.v
+    fn absorb(&mut self, &Cell2 k) {
+        self.tag = k.v;
+    }
+}

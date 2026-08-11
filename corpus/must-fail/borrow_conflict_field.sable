@@ -1,0 +1,13 @@
+// expect-error: borrow.conflict
+// Overlap is about places, not names: the mutably-borrowed receiver and
+// one of its own fields are the same storage, so the callee's contract
+// cannot frame them as distinct.
+
+use lib_mutcls;
+
+fn caller() -> u64 {
+    var c = Cell2::make(3);
+    var mut o = Box2::hold(c);
+    o.absorb(&o.c);
+    return 0;
+}
