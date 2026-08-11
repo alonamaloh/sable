@@ -20,6 +20,40 @@ pub fn read_inner(&Inner i) -> u64 {
     return i.v;
 }
 
+// An array-valued field is a place too, so it can be borrowed and
+// passed on. The length is the same either way; borrowing is what lets
+// a caller re-read the field's contents without owning the base.
+/// pre  xs.len ≥ 1
+/// post result = xs.get 0
+fn head(&[u32] xs) -> u32 {
+    return xs[0];
+}
+
+pub class Buf {
+    [u32] cells;
+
+    /// invariant cells.len ≥ 1
+
+    /// pre  1 ≤ n
+    /// post self.cells.len = n
+    /// post self.cells.get 0 = v
+    init filled(u64 n, u32 v) {
+        self.cells = alloc_array<u32>(n, v);
+    }
+
+    /// post result = self.cells.get 0
+    fn first(&self) -> u32 {
+        u32 r = head(&self.cells);
+        return r;
+    }
+}
+
+/// post result = b.cells.get 0
+pub fn buf_head(&Buf b) -> u32 {
+    u32 r = head(&b.cells);
+    return r;
+}
+
 pub class Outer {
     Inner inner;
     u64 tag;
@@ -58,5 +92,28 @@ pub fn nested_method() -> u64 {
     var i = Inner::make(42);
     var o = Outer::wrap(i, 0);
     u64 r = o.inner_value();
+    return r;
+}
+
+/// post result = 9
+pub fn borrowed_array_field() -> u32 {
+    var b = Buf::filled(4, 9);
+    u32 r = buf_head(&b);
+    u32 s = b.first();
+    /// assert #[label(agree)] r = s
+    return r;
+}
+
+// Affinity is per path: a move on a branch that returns never reaches
+// the code after the branch, so `i` is still live below.
+/// post result = 5
+pub fn move_on_returning_branch(u64 t) -> u64 {
+    var i = Inner::make(5);
+    if (t == 0) {
+        var o = Outer::wrap(i, 1);
+        u64 e = read_inner(&o.inner);
+        return e;
+    }
+    u64 r = read_inner(&i);
     return r;
 }

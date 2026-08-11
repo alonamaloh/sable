@@ -1415,10 +1415,17 @@ impl<'a> Generator<'a> {
                     Some(Val::Obj(chain)) => Some(chain.clone()),
                     _ => None,
                 };
+                // A field borrow names the field's own place; whether
+                // that place is an object or an array is what the
+                // checker recorded on the expression (ADR 0020).
+                let place = |v: String| match e.ty {
+                    Some(Ty::Array(..)) => Val::Arr(v),
+                    _ => Val::Obj(v),
+                };
                 match (base, field) {
                     // `&x.f` — the borrowed place is the field, not the
-                    // base object (ADR 0020).
-                    (Some(chain), Some(f)) => Val::Obj(project_field(&chain, f)),
+                    // base object.
+                    (Some(chain), Some(f)) => place(project_field(&chain, f)),
                     (Some(chain), None) => Val::Obj(chain),
                     (None, Some(f)) => {
                         // `&self.f` inside a member.
@@ -1426,7 +1433,7 @@ impl<'a> Generator<'a> {
                             Some(Val::Obj(chain)) => chain.clone(),
                             _ => "self".to_string(),
                         };
-                        Val::Obj(project_field(&selfv, f))
+                        place(project_field(&selfv, f))
                     }
                     (None, None) => Val::Arr(self.arr_str(array)),
                 }

@@ -1,0 +1,17 @@
+// expect-error: type.not_a_place
+// Field borrows name a place with its own ownership — a class-valued
+// field or an array-valued one. A scalar field is a value, read out
+// directly rather than borrowed.
+
+use lib_cls;
+
+fn caller() -> u64 {
+    var i = Cell::make(3);
+    u64 r = read_v(&i.v);
+    return r;
+}
+
+/// post result = 0
+fn read_v(&[u32] xs) -> u64 {
+    return 0;
+}

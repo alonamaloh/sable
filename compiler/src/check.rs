@@ -828,50 +828,48 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 else_block,
             } => {
                 check_expr(ctx, cond, Some(Ty::Bool))?;
-                let before: HashMap<String, bool> = ctx
-                    .vars
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.initialized))
-                    .collect();
+                // Both flow facts are per-path: a name is initialized
+                // after the `if` iff every falling-through branch
+                // initialized it, and moved-out iff any of them moved
+                // it. A branch that returns contributes neither.
+                let snapshot = |ctx: &Ctx| -> HashMap<String, (bool, bool)> {
+                    ctx.vars
+                        .iter()
+                        .map(|(k, v)| (k.clone(), (v.initialized, v.moved)))
+                        .collect()
+                };
+                let before = snapshot(ctx);
                 let then_ret = check_block(ctx, then_block, ret_ty)?;
-                let after_then: HashMap<String, bool> = ctx
-                    .vars
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.initialized))
-                    .collect();
-                for (name, init) in &before {
+                let after_then = snapshot(ctx);
+                for (name, (init, moved)) in &before {
                     if let Some(v) = ctx.vars.get_mut(name.as_str()) {
                         v.initialized = *init;
+                        v.moved = *moved;
                     }
                 }
                 let else_ret = match else_block {
                     Some(b) => check_block(ctx, b, ret_ty)?,
                     None => false,
                 };
-                // Initialized after the `if` iff initialized on every path
-                // that falls through (returning branches contribute none).
-                let after_else: HashMap<String, bool> = ctx
-                    .vars
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.initialized))
-                    .collect();
+                let after_else = snapshot(ctx);
                 for (name, v) in ctx.vars.iter_mut() {
-                    let was = before.get(name).copied().unwrap_or(false);
+                    let was = before.get(name).copied().unwrap_or((false, false));
                     let mut reaching = Vec::new();
                     if !then_ret {
-                        reaching.push(after_then.get(name).copied().unwrap_or(false));
+                        reaching.push(after_then.get(name).copied().unwrap_or(was));
                     }
                     if !else_ret {
                         reaching.push(match else_block {
-                            Some(_) => after_else.get(name).copied().unwrap_or(false),
+                            Some(_) => after_else.get(name).copied().unwrap_or(was),
                             None => was,
                         });
                     }
-                    v.initialized = if reaching.is_empty() {
-                        was
+                    if reaching.is_empty() {
+                        (v.initialized, v.moved) = was;
                     } else {
-                        reaching.iter().all(|b| *b)
-                    };
+                        v.initialized = reaching.iter().all(|(i, _)| *i);
+                        v.moved = reaching.iter().any(|(_, m)| *m);
+                    }
                 }
                 returned = then_ret && else_ret;
             }
@@ -1773,9 +1771,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             field,
             mutable,
         } => {
-            // `&x.f` / `&self.f` — borrowing a class-valued field
-            // (ADR 0020). The base must name a class; the field must
-            // itself be class-typed.
+            // `&x.f` / `&self.f` — borrowing a field as a place
+            // (ADR 0020). The base must name a class; the field is
+            // either class-typed or array-typed.
             if let Some(fname) = field {
                 if *mutable {
                     return Err(Diagnostic {
@@ -1833,16 +1831,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         label: "unknown field".into(),
                         notes: vec![],
                     })?;
-                let Ty::Class(fci) = fld.1 else {
-                    return Err(Diagnostic {
-                        name: "type.not_a_class".into(),
-                        title: format!("field `{fname}` is not a class value"),
+                return match fld.1 {
+                    Ty::Class(fci) => Ok(Ty::ClassRef(fci)),
+                    // An owned array field is a place too: `&x.limbs`
+                    // borrows the array itself, shared.
+                    Ty::Array(elem, _) => Ok(Ty::Array(elem, Mutability::Shared)),
+                    _ => Err(Diagnostic {
+                        name: "type.not_a_place".into(),
+                        title: format!("field `{fname}` is not a borrowable place"),
                         span,
-                        label: "only class-valued fields are borrowed this way".into(),
+                        label: "only class- and array-valued fields are borrowed this way".into(),
                         notes: vec![],
-                    });
+                    }),
                 };
-                return Ok(Ty::ClassRef(fci));
             }
             // `&c` of a class local, or a shared re-borrow of a `&C`
             // parameter passed along to a callee (ADR 0010).

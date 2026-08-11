@@ -25,4 +25,7 @@ fn test_class_fields() {
     o.inner_value();
     nest_and_read();
     nested_method();
+    borrowed_array_field();
+    move_on_returning_branch(0);
+    move_on_returning_branch(1);
 }

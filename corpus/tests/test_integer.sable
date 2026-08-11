@@ -1,0 +1,237 @@
+// Dynamic checks for the signed layer: `intVal` contracts monitored per
+// call, the sign-and-magnitude class invariant (`neg ≤ 1`, no negative
+// zero) checked at every init exit and RAII drop, and the Euclidean
+// convention (ADR 0004) pinned on all four sign combinations — the
+// remainder is non-negative whatever the operands look like.
+
+use bignum;
+use integer;
+
+// Monitored assertion: the pre is the check.
+/// pre x = y
+fn expect_eq(i32 x, i32 y) {
+}
+
+// A one-limb `Integer`. The pre keeps `Integer::make`'s no-negative-zero
+// precondition reachable: a negative value needs a non-zero magnitude.
+/// pre 1 ≤ d
+/// pre s ≤ 1
+fn small(u32 d, u64 s) -> Integer {
+    mut [u32] xs = alloc_array<u32>(1, 0);
+    xs[0] = d;
+    var m = Nat::from_prefix(&xs, 1);
+    var r = Integer::make(m, s);
+    return r;
+}
+
+fn test_ordering() {
+    var p = small(7, 0);
+    var n = small(7, 1);
+    var z = zero();
+    expect_eq(int_cmp(&p, &n), 1);
+    expect_eq(int_cmp(&n, &p), -1);
+    expect_eq(int_cmp(&p, &p), 0);
+    expect_eq(int_cmp(&n, &n), 0);
+    expect_eq(int_cmp(&n, &z), -1);
+    expect_eq(int_cmp(&z, &p), -1);
+    // Same sign, different magnitude: negatives reverse.
+    var m = small(3, 1);
+    expect_eq(int_cmp(&n, &m), -1);
+    expect_eq(int_cmp(&m, &n), 1);
+}
+
+fn test_negate_and_abs() {
+    var p = small(7, 0);
+    var n = small(7, 1);
+    var z = zero();
+    var np = negate(&p);
+    expect_eq(int_cmp(&np, &n), 0);
+    var nn = negate(&n);
+    expect_eq(int_cmp(&nn, &p), 0);
+    // Zero is its own negation, and stays positive zero — the invariant
+    // monitor is what checks the second half.
+    var nz = negate(&z);
+    expect_eq(int_cmp(&nz, &z), 0);
+    var ap = abs(&p);
+    expect_eq(int_cmp(&ap, &p), 0);
+    var an = abs(&n);
+    expect_eq(int_cmp(&an, &p), 0);
+}
+
+fn test_add_like_signs() {
+    var a = small(7, 0);
+    var b = small(5, 0);
+    var s = a + b;
+    var e = small(12, 0);
+    expect_eq(int_cmp(&s, &e), 0);
+    var c = small(7, 1);
+    var d = small(5, 1);
+    var t = c + d;
+    var f = small(12, 1);
+    expect_eq(int_cmp(&t, &f), 0);
+}
+
+fn test_add_unlike_signs() {
+    var a = small(7, 0);
+    var b = small(5, 1);
+    var s = a + b;
+    var e = small(2, 0);
+    expect_eq(int_cmp(&s, &e), 0);
+    // The larger magnitude wins the sign.
+    var t = b + a;
+    expect_eq(int_cmp(&t, &e), 0);
+    var c = small(5, 0);
+    var d = small(7, 1);
+    var u = c + d;
+    var f = small(2, 1);
+    expect_eq(int_cmp(&u, &f), 0);
+}
+
+fn test_add_cancels_to_zero() {
+    var a = small(9, 0);
+    var b = small(9, 1);
+    var z = zero();
+    var s = a + b;
+    expect_eq(int_cmp(&s, &z), 0);
+    var t = b + a;
+    expect_eq(int_cmp(&t, &z), 0);
+}
+
+fn test_sub() {
+    var a = small(7, 0);
+    var b = small(5, 0);
+    var s = a - b;
+    var e = small(2, 0);
+    expect_eq(int_cmp(&s, &e), 0);
+    // Crossing zero.
+    var t = b - a;
+    var f = small(2, 1);
+    expect_eq(int_cmp(&t, &f), 0);
+    // Subtracting a negative adds.
+    var c = small(5, 1);
+    var u = a - c;
+    var g = small(12, 0);
+    expect_eq(int_cmp(&u, &g), 0);
+    var z = zero();
+    var v = a - a;
+    expect_eq(int_cmp(&v, &z), 0);
+}
+
+fn test_mul_signs() {
+    var p = small(6, 0);
+    var n = small(7, 1);
+    var pn = p * n;
+    var e = small(42, 1);
+    expect_eq(int_cmp(&pn, &e), 0);
+    var nn = n * n;
+    var f = small(49, 0);
+    expect_eq(int_cmp(&nn, &f), 0);
+    var pp = p * p;
+    var g = small(36, 0);
+    expect_eq(int_cmp(&pp, &g), 0);
+    // A zero operand cancels the sign: the product is positive zero.
+    var z = zero();
+    var pz = p * z;
+    expect_eq(int_cmp(&pz, &z), 0);
+    var nz = n * z;
+    expect_eq(int_cmp(&nz, &z), 0);
+}
+
+// Euclidean division on all four sign combinations of 7 and 2: the
+// remainder is 1 every time, and the quotient rounds away from zero for
+// a negative dividend.
+fn test_div_inexact() {
+    var a = small(7, 0);
+    var na = small(7, 1);
+    var b = small(2, 0);
+    var nb = small(2, 1);
+    var one = small(1, 0);
+
+    var q1 = a / b;
+    var e1 = small(3, 0);
+    expect_eq(int_cmp(&q1, &e1), 0);
+    var r1 = a % b;
+    expect_eq(int_cmp(&r1, &one), 0);
+
+    var q2 = na / b;
+    var e2 = small(4, 1);
+    expect_eq(int_cmp(&q2, &e2), 0);
+    var r2 = na % b;
+    expect_eq(int_cmp(&r2, &one), 0);
+
+    var q3 = a / nb;
+    var e3 = small(3, 1);
+    expect_eq(int_cmp(&q3, &e3), 0);
+    var r3 = a % nb;
+    expect_eq(int_cmp(&r3, &one), 0);
+
+    var q4 = na / nb;
+    var e4 = small(4, 0);
+    expect_eq(int_cmp(&q4, &e4), 0);
+    var r4 = na % nb;
+    expect_eq(int_cmp(&r4, &one), 0);
+}
+
+// The exact case takes the other branch: no rounding correction, and the
+// remainder is positive zero on every sign combination.
+fn test_div_exact() {
+    var a = small(6, 0);
+    var na = small(6, 1);
+    var b = small(3, 0);
+    var nb = small(3, 1);
+    var z = zero();
+
+    var q1 = a / b;
+    var e1 = small(2, 0);
+    expect_eq(int_cmp(&q1, &e1), 0);
+    var r1 = a % b;
+    expect_eq(int_cmp(&r1, &z), 0);
+
+    var q2 = na / b;
+    var e2 = small(2, 1);
+    expect_eq(int_cmp(&q2, &e2), 0);
+    var r2 = na % b;
+    expect_eq(int_cmp(&r2, &z), 0);
+
+    var q3 = a / nb;
+    expect_eq(int_cmp(&q3, &e2), 0);
+    var r3 = a % nb;
+    expect_eq(int_cmp(&r3, &z), 0);
+
+    var q4 = na / nb;
+    expect_eq(int_cmp(&q4, &e1), 0);
+    var r4 = na % nb;
+    expect_eq(int_cmp(&r4, &z), 0);
+}
+
+// A dividend smaller than the divisor: the quotient is zero going one
+// way and −1 going the other, and the remainder still lands in range.
+fn test_div_small_dividend() {
+    var a = small(2, 0);
+    var na = small(2, 1);
+    var b = small(5, 0);
+    var z = zero();
+
+    var q1 = a / b;
+    expect_eq(int_cmp(&q1, &z), 0);
+    var r1 = a % b;
+    expect_eq(int_cmp(&r1, &a), 0);
+
+    var q2 = na / b;
+    var e2 = small(1, 1);
+    expect_eq(int_cmp(&q2, &e2), 0);
+    var r2 = na % b;
+    var f2 = small(3, 0);
+    expect_eq(int_cmp(&r2, &f2), 0);
+}
+
+// The magnitude copy that a borrow-to-move needs: `negate` rebuilds its
+// operand's limbs through the array-field borrow, so the source stays
+// intact and usable afterwards.
+fn test_magnitude_copy() {
+    var p = small(123456789, 0);
+    var n = negate(&p);
+    var b = negate(&n);
+    expect_eq(int_cmp(&b, &p), 0);
+    expect_eq(int_cmp(&p, &p), 0);
+}

@@ -1,0 +1,491 @@
+// Signed integers as sign + magnitude over bignum's `Nat` — the first
+// library type built *on* a verified class, exercising class-valued
+// fields and moves (ADR 0020). The whole specification is one ghost
+// function, `intVal`, and one line per operation.
+
+use bignum;
+
+/// def intVal (neg : int) (m : Sable.Seq Int) : int :=
+///   if neg = 1 then 0 - natVal m else natVal m
+
+/// theorem intVal_pos (m : Sable.Seq Int) : intVal 0 m = natVal m := by
+///   rw [intVal, if_neg (by omega)]
+
+/// theorem intVal_neg (m : Sable.Seq Int) : intVal 1 m = 0 - natVal m := by
+///   rw [intVal, if_pos rfl]
+
+/// theorem intVal_zero (n : int) (m : Sable.Seq Int) (h : natVal m = 0) :
+///     intVal n m = 0 := by
+///   simp only [natVal] at h
+///   simp only [intVal, natVal]
+///   split <;> omega
+
+// The sign algebra of a product, once, so each branch of `int_mul` is a
+// rewrite: like signs cancel, unlike signs do not.
+
+/// theorem intVal_mul_same (n : int) (ma mb : Sable.Seq Int) (h : n = 0 ∨ n = 1) :
+///     intVal n ma * intVal n mb = natVal ma * natVal mb := by
+///   rcases h with h | h <;> subst h <;> simp [Int.neg_mul_neg]
+
+/// theorem intVal_mul_diff (na nb : int) (ma mb : Sable.Seq Int)
+///     (h : (na = 0 ∧ nb = 1) ∨ (na = 1 ∧ nb = 0)) :
+///     intVal na ma * intVal nb mb = 0 - natVal ma * natVal mb := by
+///   rcases h with ⟨h1, h2⟩ | ⟨h1, h2⟩ <;> subst h1 <;> subst h2 <;>
+///     simp [Int.mul_neg, Int.neg_mul]
+
+// --------------------------- magnitude helpers ---------------------------
+
+// The zero magnitude: a `Nat` whose limb prefix is empty.
+/// post #[label(val)] natVal result.limbs = 0
+/// post #[label(len)] result.limbs.len = 0
+pub fn zero_nat() -> Nat {
+    [u32] zs = alloc_array<u32>(1, 0);
+    var z = Nat::from_prefix(&zs, 0);
+    return z;
+}
+
+/// discharge zero_nat.post.val by
+///   rw [h_result]
+///   have h := valIn_nil zs 0 0 (by omega)
+///   omega
+
+// `Nat` is affine, so a borrowed magnitude has to be duplicated before
+// it can be moved into an `Integer`. Re-running the prefix constructor
+// over the existing limbs is the copy: the class invariant supplies its
+// nonzero-top precondition, and no arithmetic is involved.
+/// post #[label(val)] natVal result.limbs = natVal a.limbs
+/// post #[label(len)] result.limbs.len = a.limbs.len
+pub fn copy_nat(&Nat a) -> Nat {
+    var c = Nat::from_prefix(&a.limbs, a.limbs.len);
+    return c;
+}
+
+// The unit magnitude.
+/// post #[label(val)] natVal result.limbs = 1
+/// post #[label(len)] result.limbs.len = 1
+pub fn one_nat() -> Nat {
+    mut [u32] os = alloc_array<u32>(1, 0);
+    os[0] = 1;
+    var o = Nat::from_prefix(&os, 1);
+    return o;
+}
+
+// Zero test on a magnitude, reported as 0/1 so it can be a call
+// argument. This is where magnitude nonnegativity is established once.
+/// post #[label(zero)]   result = 1 ↔ natVal a.limbs = 0
+/// post #[label(pos)]    result = 0 ↔ natVal a.limbs ≥ 1
+/// post #[label(nonneg)] 0 ≤ natVal a.limbs
+/// post #[label(range)]  result ≤ 1
+pub fn nat_is_zero(&Nat a) -> u64 {
+    var z = zero_nat();
+    if (cmp(a, &z) == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+/// discharge nat_is_zero.post.pos.2 by
+///   have han : 0 ≤ natVal a.limbs := valIn_nonneg a.limbs 0 (a.limbs.len)
+///     (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   omega
+
+// ------------------------------- the class -------------------------------
+
+pub class Integer {
+    Nat mag;
+    // Sign as 0/1: `bool` is not yet a call-argument type.
+    u64 neg;
+
+    /// invariant neg ≤ 1
+    // Magnitudes are nonnegative — carried here so every borrow of an
+    // `Integer` gets the fact without re-deriving it from limb bounds.
+    /// invariant 0 ≤ natVal mag.limbs
+    // No negative zero: the representation is unique.
+    /// invariant neg = 0 ∨ natVal mag.limbs ≥ 1
+
+    /// pre  s ≤ 1
+    /// pre  s = 0 ∨ natVal m.limbs ≥ 1
+    /// post #[label(val)]  intVal self.neg self.mag.limbs = intVal s m.limbs
+    /// post #[label(sign)] self.neg = s
+    /// post #[label(len)]  self.mag.limbs.len = m.limbs.len
+    init make(Nat m, u64 s) {
+        self.mag = m;
+        self.neg = s;
+    }
+}
+
+/// discharge Integer::make.inv_exit.0_natval_mag_limbs by
+///   have han : 0 ≤ natVal m.limbs := valIn_nonneg m.limbs 0 (m.limbs.len)
+///     (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   omega
+
+// ----------------------------- construction ------------------------------
+
+/// post #[label(val)] intVal result.neg result.mag.limbs = natVal m.limbs
+/// post #[label(len)] result.mag.limbs.len = m.limbs.len
+pub fn of_nat(Nat m) -> Integer {
+    var r = Integer::make(m, 0);
+    return r;
+}
+
+/// post #[label(val)] intVal result.neg result.mag.limbs = 0
+/// post #[label(len)] result.mag.limbs.len = 0
+pub fn zero() -> Integer {
+    var r = Integer::make(zero_nat(), 0);
+    return r;
+}
+
+// The magnitude, as a nonnegative `Integer`.
+/// post #[label(val)] intVal result.neg result.mag.limbs
+///          = (if x.neg = 1 then 0 - intVal x.neg x.mag.limbs
+///             else intVal x.neg x.mag.limbs)
+/// post #[label(len)] result.mag.limbs.len = x.mag.limbs.len
+pub fn abs(&Integer x) -> Integer {
+    var r = Integer::make(copy_nat(&x.mag), 0);
+    return r;
+}
+
+// Negation flips the sign — except at zero, where the unique
+// representation must be preserved.
+/// post #[label(val)] intVal result.neg result.mag.limbs
+///          = 0 - intVal x.neg x.mag.limbs
+/// post #[label(len)] result.mag.limbs.len = x.mag.limbs.len
+pub fn negate(&Integer x) -> Integer {
+    if (nat_is_zero(&x.mag) == 1) {
+        var r = Integer::make(copy_nat(&x.mag), 0);
+        return r;
+    }
+    if (x.neg == 1) {
+        var p = Integer::make(copy_nat(&x.mag), 0);
+        return p;
+    }
+    var n = Integer::make(copy_nat(&x.mag), 1);
+    return n;
+}
+
+// ------------------------------ comparison -------------------------------
+
+// Same sign: the magnitude order, reversed when both are negative.
+// Different signs: the negative one loses, and it is strictly smaller
+// because a negative `Integer` has magnitude at least one.
+/// post #[label(lt)] result = -1
+///          ↔ intVal a.neg a.mag.limbs < intVal b.neg b.mag.limbs
+/// post #[label(eq)] result = 0
+///          ↔ intVal a.neg a.mag.limbs = intVal b.neg b.mag.limbs
+/// post #[label(gt)] result = 1
+///          ↔ intVal b.neg b.mag.limbs < intVal a.neg a.mag.limbs
+/// post #[label(range)] result = -1 ∨ result = 0 ∨ result = 1
+pub fn int_cmp(&Integer a, &Integer b) -> i32 {
+    if (a.neg == b.neg) {
+        i32 c = cmp(&a.mag, &b.mag);
+        if (a.neg == 0) {
+            return c;
+        }
+        if (c == -1) {
+            return 1;
+        }
+        if (c == 1) {
+            return -1;
+        }
+        return 0;
+    }
+    if (a.neg == 1) {
+        return -1;
+    }
+    return 1;
+}
+
+// ------------------------------ arithmetic -------------------------------
+
+// Like signs add magnitudes and keep the sign; unlike signs subtract the
+// smaller magnitude from the larger and take the larger one's sign. The
+// no-negative-zero invariant is what makes the first case unconditional:
+// a negative operand already has magnitude at least one, so the sum
+// cannot be zero.
+/// pre  a.mag.limbs.len + b.mag.limbs.len ≤ 4611686018427387904
+/// post #[label(sum)] intVal result.neg result.mag.limbs
+///          = intVal a.neg a.mag.limbs + intVal b.neg b.mag.limbs
+pub fn int_add(&Integer a, &Integer b) -> Integer {
+    if (a.neg == b.neg) {
+        var s = add(&a.mag, &b.mag);
+        var r = Integer::make(s, a.neg);
+        return r;
+    }
+    i32 c = cmp(&a.mag, &b.mag);
+    if (c == 0) {
+        var z = zero();
+        return z;
+    }
+    if (c == 1) {
+        var d = sub(&a.mag, &b.mag);
+        var p = Integer::make(d, a.neg);
+        return p;
+    }
+    var e = sub(&b.mag, &a.mag);
+    var q = Integer::make(e, b.neg);
+    return q;
+}
+
+/// pre  a.mag.limbs.len + b.mag.limbs.len ≤ 4611686018427387904
+/// post #[label(diff)] intVal result.neg result.mag.limbs
+///          = intVal a.neg a.mag.limbs - intVal b.neg b.mag.limbs
+pub fn int_sub(&Integer a, &Integer b) -> Integer {
+    var nb = negate(b);
+    var r = int_add(a, &nb);
+    return r;
+}
+
+// Magnitudes multiply, signs exclusive-or — but a zero product must come
+// back as positive zero, and unlike signs with one zero operand is
+// exactly the case that would otherwise build a negative zero.
+/// pre  a.mag.limbs.len + b.mag.limbs.len ≤ 4611686018427387904
+/// post #[label(prod)] intVal result.neg result.mag.limbs
+///          = intVal a.neg a.mag.limbs * intVal b.neg b.mag.limbs
+pub fn int_mul(&Integer a, &Integer b) -> Integer {
+    var m = mul(&a.mag, &b.mag);
+    if (nat_is_zero(&m) == 1) {
+        var z = zero();
+        return z;
+    }
+    if (a.neg == b.neg) {
+        var r = Integer::make(m, 0);
+        return r;
+    }
+    var n = Integer::make(m, 1);
+    return n;
+}
+
+// ------------------------------- division --------------------------------
+
+// Sable's `/` and `%` are Euclidean (ADR 0004) — the remainder is
+// non-negative whatever the signs — and so are Lean's on `Int`, so the
+// contract below is the operation itself. Magnitude division gives
+// `A = Q·B + R` with `0 ≤ R < B`; these four facts turn that into the
+// signed quotient and remainder. A negative divisor only flips the
+// quotient's sign; a negative dividend with a non-zero remainder is the
+// one case that rounds away, costing one more in magnitude.
+
+/// theorem sdiv_exact (A B : int) (hB : 1 ≤ B) (h : A % B = 0) :
+///     (0 - A) / B = 0 - (A / B) ∧ (0 - A) % B = 0 := by
+///   obtain ⟨h1, h2, h3⟩ := (Int.ediv_emod_unique (a := A) (b := B) (by omega)).mp ⟨rfl, rfl⟩
+///   exact (Int.ediv_emod_unique (a := 0 - A) (b := B) (q := 0 - (A / B)) (r := 0)
+///     (by omega)).mpr ⟨by grind, by omega, by omega⟩
+
+/// theorem sdiv_inexact (A B : int) (hB : 1 ≤ B) (h : 1 ≤ A % B) :
+///     (0 - A) / B = 0 - (A / B) - 1 ∧ (0 - A) % B = B - A % B := by
+///   obtain ⟨h1, h2, h3⟩ := (Int.ediv_emod_unique (a := A) (b := B) (by omega)).mp ⟨rfl, rfl⟩
+///   exact (Int.ediv_emod_unique (a := 0 - A) (b := B) (q := 0 - (A / B) - 1)
+///     (r := B - A % B) (by omega)).mpr ⟨by grind, by omega, by omega⟩
+
+/// theorem sdiv_neg_divisor (a b : int) : a / (0 - b) = 0 - (a / b) := by
+///   simp [Int.ediv_neg]
+
+/// theorem smod_neg_divisor (a b : int) : a % (0 - b) = a % b := by
+///   simp [Int.emod_neg]
+
+/// pre  natVal b.mag.limbs ≥ 1
+/// pre  a.mag.limbs.len + b.mag.limbs.len ≤ 2305843009213693952
+/// post #[label(quot)] intVal result.neg result.mag.limbs
+///          = intVal a.neg a.mag.limbs / intVal b.neg b.mag.limbs
+pub fn int_div(&Integer a, &Integer b) -> Integer {
+    var q0 = div(&a.mag, &b.mag);
+    var r0 = rem(&a.mag, &b.mag);
+    u64 rz = nat_is_zero(&r0);
+    u64 qz = nat_is_zero(&q0);
+    // A negative dividend that does not divide evenly rounds away from
+    // zero, so its quotient is one larger in magnitude — and never zero,
+    // which is why this branch needs no zero check.
+    if (a.neg == 1 && rz == 0) {
+        var one = one_nat();
+        var qm = add(&q0, &one);
+        if (a.neg == b.neg) {
+            var u = Integer::make(qm, 0);
+            return u;
+        }
+        var v = Integer::make(qm, 1);
+        return v;
+    }
+    if (qz == 1) {
+        var z = zero();
+        return z;
+    }
+    if (a.neg == b.neg) {
+        var p = Integer::make(q0, 0);
+        return p;
+    }
+    var n = Integer::make(q0, 1);
+    return n;
+}
+
+// The remainder is non-negative by construction, so its sign is always
+// zero: for a negative dividend it is the complement `B - R`.
+/// pre  natVal b.mag.limbs ≥ 1
+/// pre  a.mag.limbs.len + b.mag.limbs.len ≤ 2305843009213693952
+/// post #[label(rem)] intVal result.neg result.mag.limbs
+///          = intVal a.neg a.mag.limbs % intVal b.neg b.mag.limbs
+pub fn int_rem(&Integer a, &Integer b) -> Integer {
+    var r0 = rem(&a.mag, &b.mag);
+    u64 rz = nat_is_zero(&r0);
+    if (rz == 1 || a.neg == 0) {
+        var p = Integer::make(r0, 0);
+        return p;
+    }
+    var d = sub(&b.mag, &r0);
+    var s = Integer::make(d, 0);
+    return s;
+}
+
+// ------------------------------- operators -------------------------------
+
+// Bindings are keyed by (symbol, class), so these live alongside the
+// `Nat` bindings that `bignum` exports (ADR 0012).
+
+operator +   = int_add;
+operator -   = int_sub;
+operator *   = int_mul;
+operator /   = int_div;
+operator %   = int_rem;
+operator cmp = int_cmp;
+
+// ------------------------------ discharges -------------------------------
+
+// `int_mul`'s three paths, each a rewrite through the sign-algebra
+// lemmas: a zero product, like signs, unlike signs.
+
+/// discharge int_mul.post.prod by
+///   rw [h_result, h_zero_post_val]
+///   have hz : natVal (a.mag).limbs * natVal (b.mag).limbs = 0 := by omega
+///   rcases Int.mul_eq_zero.mp hz with h | h
+///   · rw [intVal_zero (a.neg) ((a.mag).limbs) h]; simp
+///   · rw [intVal_zero (b.neg) ((b.mag).limbs) h]; simp
+
+/// discharge int_mul.post.prod.2 by
+///   rw [h_result, h_Integer_make_post_val, intVal_pos, h_path_a_neg_b_neg,
+///       intVal_mul_same (b.neg) ((a.mag).limbs) ((b.mag).limbs) (by omega)]
+///   omega
+
+/// discharge int_mul.post.prod.3 by
+///   rw [h_result, h_Integer_make_post_val, intVal_neg,
+///       intVal_mul_diff (a.neg) (b.neg) ((a.mag).limbs) ((b.mag).limbs) (by omega)]
+///   omega
+
+// `one_nat`'s single limb, and the magnitude nonnegativity that
+// `nat_is_zero` exports, on its non-zero path.
+
+/// discharge one_nat.post.val by
+///   subst h_result
+///   have h1 := window_open (os.set 0 1) 0 1 (by omega)
+///   have h2 := valIn_nil (os.set 0 1) (0 + 1) 1 (by omega)
+///   have h3 : (os.set 0 1).get 0 = 1 := by
+///     rw [Sable.Seq.get_set, if_pos rfl]
+///   omega
+
+/// discharge nat_is_zero.post.nonneg.2 by
+///   have han : 0 ≤ natVal a.limbs := valIn_nonneg a.limbs 0 (a.limbs.len)
+///     (fun k hk1 hk2 => (h_field_limbs_elems k hk1 hk2).1)
+///   omega
+
+// The quotient is no longer than the dividend, so the rounding
+// correction cannot overflow the length budget `add` asks for.
+
+/// discharge int_div.call_pre.add.a_limbs_len_b_limbs_len_4611686018427387 by
+///   sable_norm
+///   have h := ediv_le_self_nat (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs)
+///     (by omega) (by omega)
+///   have hl : (q0.limbs).len ≤ (a.mag.limbs).len :=
+///     len_le_of_val_le (a.mag.limbs) (q0.limbs) (by omega) (by omega)
+///       h_field_limbs_elems
+///       (fun k hk1 hk2 => (h_field_limbs_elems_3 k hk1 hk2).1)
+///       (fun h0 => by omega)
+///   omega
+
+/// discharge int_rem.call_pre.sub.natval_b_limbs_natval_a_limbs by
+///   have h := emod_lt (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs) (by omega)
+///   omega
+
+// The five quotient paths. Each rewrites the operands to their signed
+// forms and applies the matching Euclidean fact; what is left is linear
+// in `A / B` and `A % B`, so omega closes it.
+
+/// discharge int_div.post.quot by
+///   have ha : (a.neg) = 1 := h_path_a_neg_1_rz_0.1
+///   have hb : (b.neg) = 1 := by omega
+///   have hi := sdiv_inexact (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs)
+///     (by omega) (by omega)
+///   rw [h_result, h_Integer_make_post_val, intVal_pos, ha, hb]
+///   simp only [intVal_neg]
+///   rw [sdiv_neg_divisor, hi.1]
+///   omega
+
+/// discharge int_div.post.quot.2 by
+///   have ha : (a.neg) = 1 := h_path_a_neg_1_rz_0.1
+///   have hb : (b.neg) = 0 := by omega
+///   have hi := sdiv_inexact (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs)
+///     (by omega) (by omega)
+///   rw [h_result, h_Integer_make_post_val, intVal_neg, ha, hb, intVal_neg,
+///       intVal_pos, hi.1]
+///   omega
+
+/// discharge int_div.post.quot.3 by
+///   rw [h_result, h_zero_post_val]
+///   rcases (by omega : (a.neg) = 0 ∨ (a.neg) = 1) with ha | ha
+///   · rcases (by omega : (b.neg) = 0 ∨ (b.neg) = 1) with hb | hb
+///     · rw [ha, hb]; simp only [intVal_pos]; omega
+///     · rw [ha, hb, intVal_pos, intVal_neg, sdiv_neg_divisor]; omega
+///   · have hq : natVal ((a.mag)).limbs / natVal ((b.mag)).limbs = 0 := by omega
+///     have hd := ediv_decomp (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs) (by omega)
+///     rw [hq] at hd
+///     have hA : natVal ((a.mag)).limbs = 0 := by omega
+///     rw [ha, intVal_neg, hA]
+///     simp
+
+/// discharge int_div.post.quot.4 by
+///   rw [h_result, h_Integer_make_post_val, intVal_pos]
+///   rcases (by omega : (a.neg) = 0 ∨ (a.neg) = 1) with ha | ha
+///   · have hb : (b.neg) = 0 := by omega
+///     rw [ha, hb]; simp only [intVal_pos]; omega
+///   · have hb : (b.neg) = 1 := by omega
+///     have he := sdiv_exact (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs)
+///       (by omega) (by omega)
+///     rw [ha, hb]
+///     simp only [intVal_neg]
+///     rw [sdiv_neg_divisor, he.1]
+///     omega
+
+/// discharge int_div.post.quot.5 by
+///   rw [h_result, h_Integer_make_post_val, intVal_neg]
+///   rcases (by omega : (a.neg) = 0 ∨ (a.neg) = 1) with ha | ha
+///   · have hb : (b.neg) = 1 := by omega
+///     rw [ha, hb, intVal_pos, intVal_neg, sdiv_neg_divisor]
+///     omega
+///   · have hb : (b.neg) = 0 := by omega
+///     have he := sdiv_exact (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs)
+///       (by omega) (by omega)
+///     rw [ha, hb, intVal_neg, intVal_pos, he.1]
+///     omega
+
+// The two remainder paths: a non-negative dividend (or an exact
+// division) keeps the magnitude remainder, and a negative one takes its
+// complement. The divisor's sign never reaches the result.
+
+/// discharge int_rem.post.rem by
+///   rw [h_result, h_Integer_make_post_val, intVal_pos]
+///   rcases (by omega : (a.neg) = 0 ∨ (a.neg) = 1) with ha | ha
+///   · rcases (by omega : (b.neg) = 0 ∨ (b.neg) = 1) with hb | hb
+///     · rw [ha, hb]; simp only [intVal_pos]; omega
+///     · rw [ha, hb, intVal_pos, intVal_neg, smod_neg_divisor]; omega
+///   · have he := sdiv_exact (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs)
+///       (by omega) (by omega)
+///     rcases (by omega : (b.neg) = 0 ∨ (b.neg) = 1) with hb | hb
+///     · rw [ha, hb, intVal_neg, intVal_pos, he.2]; omega
+///     · rw [ha, hb]; simp only [intVal_neg]
+///       rw [smod_neg_divisor, he.2]; omega
+
+/// discharge int_rem.post.rem.2 by
+///   have ha : (a.neg) = 1 := by omega
+///   have hi := sdiv_inexact (natVal ((a.mag)).limbs) (natVal ((b.mag)).limbs)
+///     (by omega) (by omega)
+///   rw [h_result, h_Integer_make_post_val, intVal_pos, ha, intVal_neg]
+///   rcases (by omega : (b.neg) = 0 ∨ (b.neg) = 1) with hb | hb
+///   · rw [hb, intVal_pos, hi.2]; omega
+///   · rw [hb, intVal_neg, smod_neg_divisor, hi.2]; omega
