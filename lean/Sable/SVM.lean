@@ -146,15 +146,33 @@ structure RawHeap where
 def RawHeap.empty : RawHeap :=
   { next := 0, allocs := fun _ => none }
 
-/-- A byte offset is in bounds of a live allocation. -/
-def RawHeap.inBounds (μ : RawHeap) (a k : Int) : Prop :=
-  ∃ al, μ.allocs a = some al ∧ al.live ∧ 0 ≤ k ∧ k < al.size
+/-- A byte offset is in bounds of a live allocation. Decidable by
+construction: the machine must be able to *compute* this, since it is
+the difference between a store and `undef`. -/
+def RawHeap.inBounds (μ : RawHeap) (a k : Int) : Bool :=
+  match μ.allocs a with
+  | some al => al.live && decide (0 ≤ k) && decide (k < al.size)
+  | none => false
 
 /-- The byte at `(a, k)`, if that address is in a live allocation. -/
 def RawHeap.byteAt (μ : RawHeap) (a k : Int) : Option RawByte :=
   match μ.allocs a with
   | some al => if al.live ∧ 0 ≤ k ∧ k < al.size then some (al.bytes.get k) else none
   | none => none
+
+/-- The initialized byte at `(a, k)`, if there is one. `none` covers all
+three ways a load can be meaningless — absent, dead, out of bounds, or
+uninitialized — because the machine's answer is the same for each and
+the *checker*'s job is to tell them apart in a diagnostic. -/
+def RawHeap.loadByte (μ : RawHeap) (a k : Int) : Option Int :=
+  match μ.byteAt a k with
+  | some (.init b) => some b
+  | _ => none
+
+/-- Whether `free(p)` is meaningful: `p` must name the *start* of a live
+allocation. Freeing an interior pointer is not a partial release. -/
+def RawHeap.freeable (μ : RawHeap) (a k : Int) : Bool :=
+  decide (k = 0) && (match μ.allocs a with | some al => al.live | none => false)
 
 /-- Write one byte. A no-op on a dead or absent allocation; the rules
 never reach it, because the bounds premise is checked first. -/
@@ -253,6 +271,11 @@ inductive Expr where
   | widen   (dst : IntTy) (e : Expr)
   | narrow  (dst : IntTy) (e : Expr)
   | allocArray (len init : Expr)
+  /-- `p + d`: pointer arithmetic, which is *pure*. Provenance is
+  carried along and the offset moves; nothing is dereferenced, so a
+  pointer may sit outside its allocation without any outcome at all.
+  Only a load or a store asks whether it is in bounds. -/
+  | ptrAdd  (p d : Expr)
   | someE   (e : Expr)
   | noneE
 
@@ -271,6 +294,23 @@ inductive Stmt where
   | ret    (e : Expr)
   | check  (name : String) (c : Expr)
   | call   (dst : Option String) (f : String) (args : List Expr)
+  /-- `dst = alloc(size)` — a fresh root allocation of `size`
+  uninitialized bytes, and a pointer to its start. Provenance comes from
+  a deterministic counter, so a released id is never handed out twice. -/
+  | rawAlloc  (dst : String) (size : Expr)
+  /-- `free(p)` — release the whole allocation `p` points at. It must
+  point at the *start* of a live allocation: freeing an interior pointer
+  is `undef`, not a partial release. -/
+  | rawFree   (p : Expr)
+  /-- `dst = load8(p)` — read one initialized byte. Out of bounds, dead,
+  or uninitialized is `undef`; verified code proves it unreachable. -/
+  | rawLoad8  (dst : String) (p : Expr)
+  /-- `store8(p, v)` — write one byte, which becomes initialized. -/
+  | rawStore8 (p : Expr) (v : Expr)
+  /-- `dst = take8(p)` — read one initialized byte *and* leave the
+  storage uninitialized. Reading it again is `undef` until it is written
+  back, which is what makes a move out of raw memory expressible. -/
+  | rawTake8  (dst : String) (p : Expr)
 
 /-! ## Environments
 
@@ -595,6 +635,23 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   -- alloc_array(n, v): OOM is a defined trap (§10), decided against the
   -- machine's capacity parameter. Negative length is excluded by `u64`
   -- typing (ADR 0005), hence undef.
+  -- pointer arithmetic: no heap access, hence no bounds question here
+  | ptrAdd_ok {ρ : Env} {ep ed : Expr} {a k d : Int}
+      (hp : Eval cap ρ ep (.ok (.ptr a k))) (hd : Eval cap ρ ed (.ok (.int d))) :
+      Eval cap ρ (.ptrAdd ep ed) (.ok (.ptr a (k + d)))
+  | ptrAdd_undef₁ {ρ : Env} {ep ed : Expr} {v : Val}
+      (hp : Eval cap ρ ep (.ok v)) (hv : ∀ a k, v ≠ .ptr a k) :
+      Eval cap ρ (.ptrAdd ep ed) (.abort .undef)
+  | ptrAdd_abort₁ {ρ : Env} {ep ed : Expr} {a : Abort}
+      (hp : Eval cap ρ ep (.abort a)) :
+      Eval cap ρ (.ptrAdd ep ed) (.abort a)
+  | ptrAdd_undef₂ {ρ : Env} {ep ed : Expr} {a k : Int} {v : Val}
+      (hp : Eval cap ρ ep (.ok (.ptr a k))) (hd : Eval cap ρ ed (.ok v))
+      (hv : ∀ d, v ≠ .int d) :
+      Eval cap ρ (.ptrAdd ep ed) (.abort .undef)
+  | ptrAdd_abort₂ {ρ : Env} {ep ed : Expr} {a k : Int} {ab : Abort}
+      (hp : Eval cap ρ ep (.ok (.ptr a k))) (hd : Eval cap ρ ed (.abort ab)) :
+      Eval cap ρ (.ptrAdd ep ed) (.abort ab)
   | alloc_ok {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
       (h₀ : 0 ≤ n) (hc : n ≤ cap) :
@@ -798,6 +855,111 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
   | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
       Step P cap (.run (.ret e :: k) ρ σ μ) a.toConfig
+  -- raw allocation: fresh provenance, uninitialized bytes
+  | alloc_ok {ρ : Env} {dst : String} {e : Expr} {n : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.int n))) (h₀ : 0 ≤ n) (hc : n ≤ cap) :
+      Step P cap (.run (.rawAlloc dst e :: k) ρ σ μ)
+        (.run k (ρ.update dst (.ptr μ.next 0)) σ (μ.fresh n))
+  | alloc_oom {ρ : Env} {dst : String} {e : Expr} {n : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.int n))) (h₀ : 0 ≤ n) (hc : cap < n) :
+      Step P cap (.run (.rawAlloc dst e :: k) ρ σ μ) (.trapped (.oom n))
+  | alloc_neg {ρ : Env} {dst : String} {e : Expr} {n : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.int n))) (h₀ : n < 0) :
+      Step P cap (.run (.rawAlloc dst e :: k) ρ σ μ) .undef
+  | alloc_undef_size {ρ : Env} {dst : String} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
+      Step P cap (.run (.rawAlloc dst e :: k) ρ σ μ) .undef
+  | alloc_abort {ρ : Env} {dst : String} {e : Expr} {a : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort a)) :
+      Step P cap (.run (.rawAlloc dst e :: k) ρ σ μ) a.toConfig
+  -- free: the pointer must name the start of a live allocation
+  | free_ok {ρ : Env} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hf : μ.freeable a k' = true) :
+      Step P cap (.run (.rawFree e :: k) ρ σ μ) (.run k ρ σ (μ.release a))
+  | free_undef_dead {ρ : Env} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hf : μ.freeable a k' = false) :
+      Step P cap (.run (.rawFree e :: k) ρ σ μ) .undef
+  | free_undef_ptr {ρ : Env} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawFree e :: k) ρ σ μ) .undef
+  | free_abort {ρ : Env} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawFree e :: k) ρ σ μ) ab.toConfig
+  -- load8: in bounds, live, and initialized
+  | load8_ok {ρ : Env} {dst : String} {e : Expr} {a k' b : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hb : μ.loadByte a k' = some b) :
+      Step P cap (.run (.rawLoad8 dst e :: k) ρ σ μ)
+        (.run k (ρ.update dst (.int b)) σ μ)
+  | load8_undef_byte {ρ : Env} {dst : String} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hb : μ.loadByte a k' = none) :
+      Step P cap (.run (.rawLoad8 dst e :: k) ρ σ μ) .undef
+  | load8_undef_ptr {ρ : Env} {dst : String} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawLoad8 dst e :: k) ρ σ μ) .undef
+  | load8_abort {ρ : Env} {dst : String} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawLoad8 dst e :: k) ρ σ μ) ab.toConfig
+  -- store8: in bounds and live; the byte becomes initialized. An
+  -- out-of-`u8`-range value is checker duty, hence undef.
+  | store8_ok {ρ : Env} {ep ev : Expr} {a k' w : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok (.int w)))
+      (hr : IntTy.u8.inRange w) (hb : μ.inBounds a k' = true) :
+      Step P cap (.run (.rawStore8 ep ev :: k) ρ σ μ)
+        (.run k ρ σ (μ.store a k' (.init w)))
+  | store8_undef_addr {ρ : Env} {ep ev : Expr} {a k' w : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok (.int w)))
+      (hbad : ¬ IntTy.u8.inRange w ∨ μ.inBounds a k' = false) :
+      Step P cap (.run (.rawStore8 ep ev :: k) ρ σ μ) .undef
+  | store8_undef_val {ρ : Env} {ep ev : Expr} {a k' : Int} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok v))
+      (hw : ∀ w, v ≠ .int w) :
+      Step P cap (.run (.rawStore8 ep ev :: k) ρ σ μ) .undef
+  | store8_abort_val {ρ : Env} {ep ev : Expr} {a k' : Int} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.abort ab)) :
+      Step P cap (.run (.rawStore8 ep ev :: k) ρ σ μ) ab.toConfig
+  | store8_undef_ptr {ρ : Env} {ep ev : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawStore8 ep ev :: k) ρ σ μ) .undef
+  | store8_abort_ptr {ρ : Env} {ep ev : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.abort ab)) :
+      Step P cap (.run (.rawStore8 ep ev :: k) ρ σ μ) ab.toConfig
+  -- take8: load, and leave the storage uninitialized
+  | take8_ok {ρ : Env} {dst : String} {e : Expr} {a k' b : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hb : μ.loadByte a k' = some b) :
+      Step P cap (.run (.rawTake8 dst e :: k) ρ σ μ)
+        (.run k (ρ.update dst (.int b)) σ (μ.store a k' .uninit))
+  | take8_undef_byte {ρ : Env} {dst : String} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hb : μ.loadByte a k' = none) :
+      Step P cap (.run (.rawTake8 dst e :: k) ρ σ μ) .undef
+  | take8_undef_ptr {ρ : Env} {dst : String} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawTake8 dst e :: k) ρ σ μ) .undef
+  | take8_abort {ρ : Env} {dst : String} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawTake8 dst e :: k) ρ σ μ) ab.toConfig
   -- fall off the end of a body: return unit
   | nil_ret {ρ : Env} {μ : RawHeap} :
       Step P cap (.run [] ρ [] μ) (.done .unit)

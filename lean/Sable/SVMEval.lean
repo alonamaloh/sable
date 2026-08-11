@@ -36,6 +36,23 @@ def EOut.bindInt (o : EOut) (f : Int → EOut) : EOut :=
   | .ok _        => .abort .undef
   | .abort a     => .abort a
 
+/-- Continue with the operand's pointer; ill-shaped is undef. -/
+def EOut.bindPtr (o : EOut) (f : Int → Int → EOut) : EOut :=
+  match o with
+  | .ok (.ptr a k) => f a k
+  | .ok _          => .abort .undef
+  | .abort a       => .abort a
+
+@[simp] theorem EOut.bindPtr_ptr (a k : Int) (f : Int → Int → EOut) :
+    (EOut.ok (.ptr a k)).bindPtr f = f a k := rfl
+
+@[simp] theorem EOut.bindPtr_abort (ab : Abort) (f : Int → Int → EOut) :
+    (EOut.abort ab).bindPtr f = .abort ab := rfl
+
+theorem EOut.bindPtr_ok_of_ne {v : Val} (f : Int → Int → EOut)
+    (hv : ∀ a k, v ≠ .ptr a k) : (EOut.ok v).bindPtr f = .abort .undef := by
+  cases v <;> simp [EOut.bindPtr] at * <;> exact absurd rfl (hv _ _)
+
 /-- Continue with the operand's boolean value; ill-shaped is undef. -/
 def EOut.bindBool (o : EOut) (f : Bool → EOut) : EOut :=
   match o with
@@ -135,6 +152,9 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
           if n < 0 then .abort .undef
           else if n ≤ cap then .ok (.arr ⟨n, fun _ => v⟩)
           else .abort (.trap (.oom n))
+  | .ptrAdd ep ed =>
+      (evalE cap ρ ep).bindPtr fun a k =>
+        (evalE cap ρ ed).bindInt fun d => .ok (.ptr a (k + d))
   | .someE e => (evalE cap ρ e).bindInt fun n => .ok (.opt (some n))
   | .noneE => .ok (.opt none)
 
@@ -232,6 +252,11 @@ theorem Eval.evalE_eq {cap : Int} {ρ : Env} {e : Expr} {out : EOut}
   | alloc_neg h₁ h₂ h₀ ih₁ ih₂ =>
       simp only [evalE, ih₁, ih₂, EOut.bindInt_int]
       rw [if_pos h₀]
+  | ptrAdd_ok hp hd ihp ihd => simp [evalE, ihp, ihd]
+  | ptrAdd_undef₁ hp hv ihp => simp [evalE, ihp, EOut.bindPtr_ok_of_ne _ hv]
+  | ptrAdd_abort₁ hp ihp => simp [evalE, ihp]
+  | ptrAdd_undef₂ hp hd hv ihp ihd => simp [evalE, ihp, ihd, EOut.bindInt_ok_of_ne _ hv]
+  | ptrAdd_abort₂ hp hd ihp ihd => simp [evalE, ihp, ihd]
   | alloc_undef₁ h₁ hv ih₁ => simp [evalE, ih₁, EOut.bindInt_ok_of_ne _ hv]
   | alloc_abort₁ h ih => simp [evalE, ih]
   | alloc_undef₂ h₁ h₂ hv ih₁ ih₂ => simp [evalE, ih₁, ih₂, EOut.bindInt_ok_of_ne _ hv]
@@ -283,6 +308,25 @@ private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool �
     | arr a => simpa [EOut.bindBool] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindBool] using Hundef _ ih nofun
+
+private theorem eval_bindPtr {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → Int → EOut}
+    (ih : Eval cap ρ e (evalE cap ρ e))
+    (Habort : ∀ a, Eval cap ρ e (.abort a) → Eval cap ρ tgt (.abort a))
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ a k, v ≠ .ptr a k) →
+      Eval cap ρ tgt (.abort .undef))
+    (Hok : ∀ a k, Eval cap ρ e (.ok (.ptr a k)) → Eval cap ρ tgt (f a k)) :
+    Eval cap ρ tgt ((evalE cap ρ e).bindPtr f) := by
+  cases ho : evalE cap ρ e with
+  | abort a => rw [ho] at ih; simpa using Habort a ih
+  | ok v =>
+    rw [ho] at ih
+    cases v with
+    | ptr a k => simpa using Hok a k ih
+    | unit => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | int n => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | bool b => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | arr a => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | opt o => simpa [EOut.bindPtr] using Hundef _ ih nofun
 
 private theorem eval_bindInt₂ {cap : Int} {ρ : Env} {e₁ e₂ tgt : Expr}
     {f : Int → Int → EOut}
@@ -426,6 +470,12 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
       by_cases hr : dst.inRange n
       · rw [if_pos hr]; exact .narrow_ok h hr
       · rw [if_neg hr]; exact .narrow_oob h hr
+  | ptrAdd ep ed ihp ihd =>
+      simp only [evalE]
+      refine eval_bindPtr ihp (fun a h => .ptrAdd_abort₁ h)
+        (fun v h hv => .ptrAdd_undef₁ h hv) fun a k hp => ?_
+      exact eval_bindInt ihd (fun ab hd => .ptrAdd_abort₂ hp hd)
+        (fun v hd hv => .ptrAdd_undef₂ hp hd hv) fun d hd => .ptrAdd_ok hp hd
   | allocArray e₁ e₂ ih₁ ih₂ =>
       simp only [evalE]
       refine eval_bindInt₂ ih₁ ih₂ (fun a h => .alloc_abort₁ h)
@@ -533,6 +583,23 @@ theorem EOut.stepBool_ok_of_ne {v : Val} (f : Bool → Config)
     (hv : ∀ b, v ≠ .bool b) : (EOut.ok v).stepBool f = .undef := by
   cases v <;> first | exact absurd rfl (hv _) | rfl
 
+/-- Continue with the operand's pointer; ill-shaped is undef. -/
+def EOut.stepPtr (o : EOut) (f : Int → Int → Config) : Config :=
+  match o with
+  | .ok (.ptr a k) => f a k
+  | .ok _          => .undef
+  | .abort ab      => ab.toConfig
+
+@[simp] theorem EOut.stepPtr_ptr (a k : Int) (f : Int → Int → Config) :
+    (EOut.ok (.ptr a k)).stepPtr f = f a k := rfl
+
+@[simp] theorem EOut.stepPtr_abort (ab : Abort) (f : Int → Int → Config) :
+    (EOut.abort ab).stepPtr f = ab.toConfig := rfl
+
+theorem EOut.stepPtr_ok_of_ne {v : Val} (f : Int → Int → Config)
+    (hv : ∀ a k, v ≠ .ptr a k) : (EOut.ok v).stepPtr f = .undef := by
+  cases v <;> simp [EOut.stepPtr] at * <;> exact absurd rfl (hv _ _)
+
 /-- `stepF P cap c`: the configuration `Step` relates `c` to — computed.
 `none` exactly on terminal configurations. -/
 def stepF (P : Prog) (cap : Int) : Config → Option Config
@@ -576,6 +643,30 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
                 if fd.params.length = vs.length then
                   .run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ) μ
                 else .undef)
+  | .run (.rawAlloc dst e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepInt fun n =>
+        if n < 0 then .undef
+        else if n ≤ cap then .run k (ρ.update dst (.ptr μ.next 0)) σ (μ.fresh n)
+        else .trapped (.oom n))
+  | .run (.rawFree e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        if μ.freeable a k' then .run k ρ σ (μ.release a) else .undef)
+  | .run (.rawLoad8 dst e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.loadByte a k' with
+        | some b => .run k (ρ.update dst (.int b)) σ μ
+        | none => .undef)
+  | .run (.rawStore8 ep ev :: k) ρ σ μ =>
+      some ((evalE cap ρ ep).stepPtr fun a k' =>
+        (evalE cap ρ ev).stepInt fun w =>
+          if IntTy.u8.inRange w ∧ μ.inBounds a k' = true then
+            .run k ρ σ (μ.store a k' (.init w))
+          else .undef)
+  | .run (.rawTake8 dst e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.loadByte a k' with
+        | some b => .run k (ρ.update dst (.int b)) σ (μ.store a k' .uninit)
+        | none => .undef)
   | .done _ => none
   | .trapped _ => none
   | .undef => none
@@ -623,6 +714,41 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
       | cons fr σ => simp [stepF, h.evalE_eq]
   | nil_ret => rfl
   | nil_pop => rfl
+  -- raw heap
+  | alloc_ok h h₀ hc =>
+      simp only [stepF, h.evalE_eq, EOut.stepInt_int]
+      rw [if_neg (by omega), if_pos hc]
+  | alloc_oom h h₀ hc =>
+      simp only [stepF, h.evalE_eq, EOut.stepInt_int]
+      rw [if_neg (by omega), if_neg (by omega)]
+  | alloc_neg h h₀ =>
+      simp only [stepF, h.evalE_eq, EOut.stepInt_int]
+      rw [if_pos h₀]
+  | alloc_undef_size h hv => simp [stepF, h.evalE_eq, EOut.stepInt_ok_of_ne _ hv]
+  | alloc_abort h => simp [stepF, h.evalE_eq]
+  | free_ok h hf => simp [stepF, h.evalE_eq, hf]
+  | free_undef_dead h hf => simp [stepF, h.evalE_eq, hf]
+  | free_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | free_abort h => simp [stepF, h.evalE_eq]
+  | load8_ok h hb => simp [stepF, h.evalE_eq, hb]
+  | load8_undef_byte h hb => simp [stepF, h.evalE_eq, hb]
+  | load8_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | load8_abort h => simp [stepF, h.evalE_eq]
+  | store8_ok hp hv hr hb => simp [stepF, hp.evalE_eq, hv.evalE_eq, hr, hb]
+  | store8_undef_addr hp hv hbad =>
+      simp only [stepF, hp.evalE_eq, hv.evalE_eq, EOut.stepPtr_ptr, EOut.stepInt_int]
+      rcases hbad with hr | hb
+      · rw [if_neg (by simp [hr])]
+      · rw [if_neg (by simp [hb])]
+  | store8_undef_val hp hv hw =>
+      simp [stepF, hp.evalE_eq, hv.evalE_eq, EOut.stepInt_ok_of_ne _ hw]
+  | store8_abort_val hp hv => simp [stepF, hp.evalE_eq, hv.evalE_eq]
+  | store8_undef_ptr hp hv => simp [stepF, hp.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | store8_abort_ptr hp => simp [stepF, hp.evalE_eq]
+  | take8_ok h hb => simp [stepF, h.evalE_eq, hb]
+  | take8_undef_byte h hb => simp [stepF, h.evalE_eq, hb]
+  | take8_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | take8_abort h => simp [stepF, h.evalE_eq]
 
 private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Int → Config}
@@ -662,6 +788,25 @@ private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀
     | arr a => simpa [EOut.stepBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepBool] using Hundef _ ih nofun
 
+private theorem step_stepPtr {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
+    {f : Int → Int → Config}
+    (Habort : ∀ ab, Eval cap ρ e (.abort ab) → Step P cap c₀ ab.toConfig)
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ a k, v ≠ .ptr a k) → Step P cap c₀ .undef)
+    (Hok : ∀ a k, Eval cap ρ e (.ok (.ptr a k)) → Step P cap c₀ (f a k)) :
+    Step P cap c₀ ((evalE cap ρ e).stepPtr f) := by
+  have ih := evalE_eval cap ρ e
+  cases ho : evalE cap ρ e with
+  | abort ab => rw [ho] at ih; simpa using Habort ab ih
+  | ok v =>
+    rw [ho] at ih
+    cases v with
+    | ptr a k => simpa using Hok a k ih
+    | unit => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | int n => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | bool b => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | arr a => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | opt o => simpa [EOut.stepPtr] using Hundef _ ih nofun
+
 /-- Everything `stepF` computes is a step. -/
 theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
     (h : stepF P cap c = some c') : Step P cap c c' := by
@@ -669,7 +814,7 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
   | done v => simp [stepF] at h
   | trapped t => simp [stepF] at h
   | undef => simp [stepF] at h
-  | run k ρ σ =>
+  | run k ρ σ μ =>
     cases k with
     | nil =>
         cases σ with
@@ -750,6 +895,55 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
                   · simpa [hn] using
                       Step.call_undef_arity (P := P) (k := k) (σ := σ) (dst := dst) hf
                         (ha ▸ evalArgs_evalArgs cap ρ args) hn
+      | rawAlloc dst e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepInt (fun a he => .alloc_abort he)
+            (fun v he hv => .alloc_undef_size he hv) fun n he => ?_
+          by_cases hneg : n < 0
+          · rw [if_pos hneg]; exact .alloc_neg he hneg
+          · rw [if_neg hneg]
+            by_cases hc : n ≤ cap
+            · rw [if_pos hc]; exact .alloc_ok he (by omega) hc
+            · rw [if_neg hc]; exact .alloc_oom he (by omega) (by omega)
+      | rawFree e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .free_abort he)
+            (fun v he hv => .free_undef_ptr he hv) fun a k' he => ?_
+          cases hf : μ.freeable a k' with
+          | true => rw [if_pos (by simp [hf])]; exact .free_ok he hf
+          | false => rw [if_neg (by simp [hf])]; exact .free_undef_dead he hf
+      | rawLoad8 dst e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .load8_abort he)
+            (fun v he hv => .load8_undef_ptr he hv) fun a k' he => ?_
+          cases hb : μ.loadByte a k' with
+          | some b => simpa [hb] using Step.load8_ok he hb
+          | none => simpa [hb] using Step.load8_undef_byte he hb
+      | rawStore8 ep ev =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .store8_abort_ptr he)
+            (fun v he hv => .store8_undef_ptr he hv) fun a k' hp => ?_
+          refine step_stepInt (fun ab hv => .store8_abort_val hp hv)
+            (fun v hv hw => .store8_undef_val hp hv hw) fun w hv => ?_
+          by_cases hok : IntTy.u8.inRange w ∧ μ.inBounds a k' = true
+          · rw [if_pos hok]; exact .store8_ok hp hv hok.1 hok.2
+          · rw [if_neg hok]
+            refine .store8_undef_addr hp hv ?_
+            by_cases hr : IntTy.u8.inRange w
+            · exact Or.inr (by simpa [hr] using hok)
+            · exact Or.inl hr
+      | rawTake8 dst e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .take8_abort he)
+            (fun v he hv => .take8_undef_ptr he hv) fun a k' he => ?_
+          cases hb : μ.loadByte a k' with
+          | some b => simpa [hb] using Step.take8_ok he hb
+          | none => simpa [hb] using Step.take8_undef_byte he hb
 
 /-- The two presentations of the machine step agree. -/
 theorem step_iff_stepF {P : Prog} {cap : Int} {c c' : Config} :
