@@ -1220,7 +1220,20 @@ top. `VarInfo { initialized, mutable, moved }` is a bit-set adequate for whole
 local class values; it is not an engine, and resource work should not extend it
 further.
 
-#### U2a — general place/borrow engine (safe side)
+#### U2a — general place/borrow engine (safe side) *(started 2026-08-11)*
+
+The safe-side test surface paid before the engine was even finished. Building
+`Place` (root plus field path) and asking what it would catch turned up two real
+holes, both now closed with guards: a mutable borrow overlapping another borrow
+in the same call was **unsound** (vcgen havocs the mutable argument and keeps the
+shared argument's pre-call symbol — a verified program returned the wrong answer
+and the monitor caught it), and a borrow of a moved-out place was accepted
+because `use_after_move` only guarded the name-read path, not the borrow path.
+The second is latent rather than live today — the interpreter shares `Rc`s, so
+nothing is destroyed at a move — and becomes unsound the moment a move actually
+transfers, which is what resources do. This is the argument for U2a in one
+paragraph.
+
 
 - a reusable `Place` AST: `local | self | Place.field`, with room for later
   projections;

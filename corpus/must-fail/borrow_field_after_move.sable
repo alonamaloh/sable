@@ -1,0 +1,23 @@
+// expect-error: class.use_after_move
+// Moving the whole kills every place inside it: `&o.c` is dead once `o`
+// has moved, because a place is dead if anything containing it moved.
+
+use lib_cls;
+
+/// post result = 0
+fn peek(&Cell c) -> u64 {
+    return 0;
+}
+
+/// post result = 0
+fn take_holder(Holder h) -> u64 {
+    return 0;
+}
+
+fn caller() -> u64 {
+    var i = Cell::make(3);
+    var o = Holder::hold(i);
+    u64 t = take_holder(o);
+    u64 r = peek(&o.c);
+    return r;
+}

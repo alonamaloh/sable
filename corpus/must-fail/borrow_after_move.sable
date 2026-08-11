@@ -1,0 +1,17 @@
+// expect-error: class.use_after_move
+// A borrow is a use: once the local has been moved out, `&it` is dead
+// too, not only reading its name.
+
+use lib_cls;
+
+/// post result = 0
+fn peek(&Cell c) -> u64 {
+    return 0;
+}
+
+fn caller() -> u64 {
+    var i = Cell::make(3);
+    var a = Holder::hold(i);
+    u64 r = peek(&i);
+    return r;
+}

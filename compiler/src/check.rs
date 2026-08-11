@@ -34,10 +34,6 @@ type CResult<T> = Result<T, Diagnostic>;
 struct VarInfo {
     ty: Ty,
     initialized: bool,
-    /// Moved out (ADR 0020): classes are affine, so passing one by
-    /// value consumes the local. A moved-from name is dead — reading
-    /// it is an error, and it is not dropped at scope end.
-    moved: bool,
     /// Declared `mut` (ADR 0016). Params are immutable; `self.f`
     /// pseudo-vars are governed by the receiver kind instead.
     mutable: bool,
@@ -51,6 +47,10 @@ struct Ctx<'a> {
     /// allowed owned arrays / borrows / array-passing (design §9).
     in_test: bool,
     vars: HashMap<String, VarInfo>,
+    /// Places moved out of (ADR 0020/0022). Keyed by place rather than
+    /// by name: a field is a place in its own right, so moving one out
+    /// kills that field and the whole, but not its siblings.
+    moved: HashSet<Place>,
     /// Locals and parameters have pairwise-distinct names
     /// (keeps path-splitting and havoc in the VC generator scope-free).
     declared: HashSet<String>,
@@ -311,6 +311,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_test: is_test,
             vars: HashMap::new(),
             declared: HashSet::new(),
+            moved: HashSet::new(),
             calls: Vec::new(),
             in_class: None,
             in_init: false,
@@ -343,7 +344,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 VarInfo {
                     ty: p.ty,
                     initialized: true,
-                    moved: false,
                     mutable: false,
                 },
             );
@@ -373,6 +373,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_test: false,
             vars: HashMap::new(),
             declared: HashSet::new(),
+            moved: HashSet::new(),
             calls: Vec::new(),
             in_class: None,
             in_init: false,
@@ -396,7 +397,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 VarInfo {
                     ty: p.ty,
                     initialized: true,
-                    moved: false,
                     mutable: false,
                 },
             );
@@ -425,6 +425,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_test: false,
                 vars: HashMap::new(),
                 declared: HashSet::new(),
+            moved: HashSet::new(),
                 calls: Vec::new(),
                 in_class: Some((ci, true)),
                 in_init: true,
@@ -440,7 +441,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: p.ty,
                         initialized: true,
-                    moved: false,
                         mutable: false,
                     },
                 );
@@ -451,7 +451,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: *fty,
                         initialized: false,
-                    moved: false,
                         mutable: true,
                     },
                 );
@@ -481,6 +480,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_test: false,
                 vars: HashMap::new(),
                 declared: HashSet::new(),
+            moved: HashSet::new(),
                 calls: Vec::new(),
                 in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                 in_init: false,
@@ -496,7 +496,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: p.ty,
                         initialized: true,
-                    moved: false,
                         mutable: false,
                     },
                 );
@@ -507,7 +506,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     VarInfo {
                         ty: *fty,
                         initialized: true,
-                    moved: false,
                         mutable: true,
                     },
                 );
@@ -577,6 +575,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_test: false,
                     vars: HashMap::new(),
                     declared: HashSet::new(),
+            moved: HashSet::new(),
                     calls: Vec::new(),
                     in_class: Some((ci, true)),
                     in_init: true,
@@ -592,7 +591,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: p.ty,
                             initialized: true,
-                    moved: false,
                             mutable: false,
                         },
                     );
@@ -603,7 +601,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: *fty,
                             initialized: false,
-                    moved: false,
                             mutable: true,
                         },
                     );
@@ -632,6 +629,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_test: false,
                     vars: HashMap::new(),
                     declared: HashSet::new(),
+            moved: HashSet::new(),
                     calls: Vec::new(),
                     in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                     in_init: false,
@@ -647,7 +645,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: p.ty,
                             initialized: true,
-                    moved: false,
                             mutable: false,
                         },
                     );
@@ -658,7 +655,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         VarInfo {
                             ty: *fty,
                             initialized: true,
-                    moved: false,
                             mutable: true,
                         },
                     );
@@ -753,7 +749,6 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     VarInfo {
                         ty: *ty,
                         initialized: init.is_some(),
-                        moved: false,
                         mutable: *mutable,
                     },
                 );
@@ -832,45 +827,65 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // after the `if` iff every falling-through branch
                 // initialized it, and moved-out iff any of them moved
                 // it. A branch that returns contributes neither.
-                let snapshot = |ctx: &Ctx| -> HashMap<String, (bool, bool)> {
+                let snapshot = |ctx: &Ctx| -> HashMap<String, bool> {
                     ctx.vars
                         .iter()
-                        .map(|(k, v)| (k.clone(), (v.initialized, v.moved)))
+                        .map(|(k, v)| (k.clone(), v.initialized))
                         .collect()
                 };
                 let before = snapshot(ctx);
+                let before_moved = ctx.moved.clone();
                 let then_ret = check_block(ctx, then_block, ret_ty)?;
                 let after_then = snapshot(ctx);
-                for (name, (init, moved)) in &before {
+                let after_then_moved = ctx.moved.clone();
+                for (name, init) in &before {
                     if let Some(v) = ctx.vars.get_mut(name.as_str()) {
                         v.initialized = *init;
-                        v.moved = *moved;
                     }
                 }
+                ctx.moved = before_moved.clone();
                 let else_ret = match else_block {
                     Some(b) => check_block(ctx, b, ret_ty)?,
                     None => false,
                 };
                 let after_else = snapshot(ctx);
-                for (name, v) in ctx.vars.iter_mut() {
-                    let was = before.get(name).copied().unwrap_or((false, false));
-                    let mut reaching = Vec::new();
-                    if !then_ret {
-                        reaching.push(after_then.get(name).copied().unwrap_or(was));
-                    }
-                    if !else_ret {
-                        reaching.push(match else_block {
-                            Some(_) => after_else.get(name).copied().unwrap_or(was),
-                            None => was,
-                        });
-                    }
-                    if reaching.is_empty() {
-                        (v.initialized, v.moved) = was;
-                    } else {
-                        v.initialized = reaching.iter().all(|(i, _)| *i);
-                        v.moved = reaching.iter().any(|(_, m)| *m);
+                let after_else_moved = ctx.moved.clone();
+                // Reaching branches only: a branch that returns
+                // contributes nothing to the fall-through state.
+                let mut reaching_init: Vec<&HashMap<String, bool>> = Vec::new();
+                let mut reaching_moved: Vec<&HashSet<Place>> = Vec::new();
+                if !then_ret {
+                    reaching_init.push(&after_then);
+                    reaching_moved.push(&after_then_moved);
+                }
+                if !else_ret {
+                    match else_block {
+                        Some(_) => {
+                            reaching_init.push(&after_else);
+                            reaching_moved.push(&after_else_moved);
+                        }
+                        None => {
+                            reaching_init.push(&before);
+                            reaching_moved.push(&before_moved);
+                        }
                     }
                 }
+                for (name, v) in ctx.vars.iter_mut() {
+                    let was = before.get(name).copied().unwrap_or(false);
+                    v.initialized = if reaching_init.is_empty() {
+                        was
+                    } else {
+                        reaching_init
+                            .iter()
+                            .all(|m| m.get(name).copied().unwrap_or(was))
+                    };
+                }
+                // Moved on any reaching path means dead below.
+                ctx.moved = if reaching_moved.is_empty() {
+                    before_moved
+                } else {
+                    reaching_moved.iter().flat_map(|s| s.iter().cloned()).collect()
+                };
                 returned = then_ret && else_ret;
             }
             Stmt::While {
@@ -978,7 +993,6 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     VarInfo {
                         ty: t,
                         initialized: true,
-                    moved: false,
                         mutable: *mutable,
                     },
                 );
@@ -1196,7 +1210,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
-                if v.moved {
+                if ctx.is_moved(&Place::local(name)) {
                     return Err(Diagnostic {
                         name: "class.use_after_move".into(),
                         title: format!("`{name}` has been moved out"),
@@ -1780,6 +1794,29 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             field,
             mutable,
         } => {
+            // Borrowing is a use, so it needs the place alive: `&o` and
+            // `&o.f` are both dead once `o` has moved. Reading a name
+            // goes through `ExprKind::Var`; this is the other door.
+            {
+                let mut p = Place::local(array);
+                if let Some(f) = field {
+                    p.fields.push(f.clone());
+                }
+                if ctx.is_moved(&p) {
+                    return Err(Diagnostic {
+                        name: "class.use_after_move".into(),
+                        title: format!("`{}` has been moved out", p.render()),
+                        span,
+                        label: "borrowing a moved-from place".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "classes are affine: a by-value argument consumes the \
+                             local (ADR 0020), and a borrow of it is a use"
+                                .into(),
+                        )],
+                    });
+                }
+            }
             // `&x.f` / `&self.f` — borrowing a field as a place
             // (ADR 0020). The base must name a class; the field is
             // either class-typed or array-typed.
@@ -2222,7 +2259,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
 /// A place: a local (or `self`), optionally projected through fields.
 /// Ownership and borrowing are questions about places, not names — a
 /// field is a place in its own right (ADR 0020, ADR 0022).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct Place {
     root: String,
     fields: Vec<String>,
@@ -2236,15 +2273,18 @@ impl Place {
         }
     }
 
-    /// Two places overlap when one contains the other: same root, and
-    /// one field path a prefix of the other. `o` overlaps `o.inner`;
-    /// `o.a` and `o.b` do not.
+    /// `self` contains `other`: same root, and `self`'s field path is a
+    /// prefix of `other`'s. `o` contains `o.inner`; not conversely.
+    fn contains(&self, other: &Place) -> bool {
+        self.root == other.root
+            && self.fields.len() <= other.fields.len()
+            && self.fields[..] == other.fields[..self.fields.len()]
+    }
+
+    /// Two places overlap when either contains the other. `o` overlaps
+    /// `o.inner`; `o.a` and `o.b` do not.
     fn overlaps(&self, other: &Place) -> bool {
-        if self.root != other.root {
-            return false;
-        }
-        let n = self.fields.len().min(other.fields.len());
-        self.fields[..n] == other.fields[..n]
+        self.contains(other) || other.contains(self)
     }
 
     fn render(&self) -> String {
@@ -2320,16 +2360,33 @@ fn check_borrow_conflicts(
 /// value, and a call result is already a temporary.
 fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
     if let ExprKind::Var(name) = &arg.kind {
-        if let Some(v) = ctx.vars.get_mut(name.as_str()) {
-            if matches!(v.ty, Ty::Class(_)) {
-                v.moved = true;
-            }
+        if ctx
+            .vars
+            .get(name.as_str())
+            .is_some_and(|v| matches!(v.ty, Ty::Class(_)))
+        {
+            ctx.moved.insert(Place::local(name));
         }
     }
     Ok(())
 }
 
 impl<'a> Ctx<'a> {
+    /// A place is dead if it, or anything containing it, has been moved
+    /// out: moving `o` kills `o.inner` too.
+    fn is_moved(&self, p: &Place) -> bool {
+        self.moved.iter().any(|m| m.contains(p))
+    }
+
+    /// Some strict sub-place has been moved out. The whole can no
+    /// longer move or be borrowed, but the untouched siblings are
+    /// still readable. Nothing produces field moves yet (U7a); the
+    /// query exists so the joins are already right when they do.
+    #[allow(dead_code)]
+    fn is_partially_moved(&self, p: &Place) -> bool {
+        self.moved.iter().any(|m| p.contains(m) && m != p)
+    }
+
     /// Type of `self.field`; `mutating` additionally requires an
     /// `init` or `&mut self` context.
     fn self_field_ty(&self, field: &str, span: Span, mutating: bool) -> CResult<Ty> {
