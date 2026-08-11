@@ -1,0 +1,31 @@
+// expect-error: class.use_after_move
+// A declaration is a sink: `var x = self.c;` takes the field's value, so
+// the field is a hole afterwards and reading it is a use after move. The
+// form differs from `consume(self.c)`; what happens to the field does not.
+
+class Cell {
+    u64 v;
+
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+/// post result = c.v
+fn peek(&Cell c) -> u64 {
+    return c.v;
+}
+
+class Box {
+    Cell c;
+
+    init of(Cell a) {
+        self.c = a;
+    }
+
+    fn drain(&mut self) -> u64 {
+        var x = self.c;
+        return peek(&self.c);
+    }
+}

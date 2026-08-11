@@ -11,7 +11,7 @@
 use crate::ast::*;
 use crate::speceval::{self, GhostDefs, SpecEnv, SpecVal};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -183,6 +183,10 @@ struct PosixWorld {
     data: Vec<i128>,
     /// How many descriptors the world has handed out.
     fds: i128,
+    /// Descriptors whose *authority* has been adopted. The world can
+    /// supply each one once: affinity governs a token that exists, and
+    /// this is what stops a second one being minted beside it.
+    claimed: HashSet<i128>,
     /// Which read attempts misbehave, by 0-based call index: `Short(k)`
     /// transfers `k` bytes, `Fail(e)` returns `-e`.
     schedule: Vec<ReadOutcome>,
@@ -222,6 +226,7 @@ impl PosixWorld {
         PosixWorld {
             data,
             fds: 3,
+            claimed: HashSet::new(),
             schedule,
             reads: 0,
             pos: vec![0; 3],
@@ -236,6 +241,24 @@ impl PosixWorld {
             .unwrap_or(ReadOutcome::Full);
         self.reads += 1;
         out
+    }
+}
+
+/// A place a value can be moved out of or dropped: a local, or a field of
+/// the enclosing `self`. These are the roots of the checker's `Place`, at
+/// the depth the program language can name.
+enum RtPlace {
+    Local(String),
+    SelfField(String),
+}
+
+impl RtPlace {
+    /// How the place is spelled in a diagnostic.
+    fn name(&self) -> String {
+        match self {
+            RtPlace::Local(n) => n.clone(),
+            RtPlace::SelfField(f) => format!("self.{f}"),
+        }
     }
 }
 
@@ -448,7 +471,21 @@ impl<'a> Interp<'a> {
                 &format!("post of `{}`", f.name),
             )?;
         }
+        self.drop_owned_params(&f.params, &mut frame)?;
         Ok(result)
+    }
+
+    /// Owned parameters die with the frame, after the contract has been
+    /// checked against them. A by-value class argument was handed over, so
+    /// the callee is who destroys it — unless the body moved it on, in
+    /// which case its place is already empty.
+    fn drop_owned_params(&mut self, params: &[Param], frame: &mut Frame) -> IResult<()> {
+        for p in params.iter().rev() {
+            if matches!(p.ty, Ty::Class(_)) {
+                self.drop_place(&RtPlace::Local(p.name.clone()), frame)?;
+            }
+        }
+        Ok(())
     }
 
     /// Contract-clause check with the right environment: entry values for
@@ -469,6 +506,18 @@ impl<'a> Interp<'a> {
             };
             if let Some(sv) = spec_of(val) {
                 vars.insert(name.clone(), sv);
+            }
+        }
+        // A by-value parameter the body handed on is gone from its place,
+        // but a contract speaks about the *value* it was given, and a value
+        // outlives the transfer of authority (ADR 0024): the post of an
+        // `init` that stores its argument in a field still says what the
+        // field got.
+        for (name, v) in &frame.entry_scalars {
+            if !frame.vars.contains_key(name) {
+                if let Some(sv) = spec_of(v) {
+                    vars.insert(name.clone(), sv);
+                }
             }
         }
         if let Some((class, fields)) = &frame.self_ctx {
@@ -557,11 +606,14 @@ impl<'a> Interp<'a> {
     }
 
     fn exec_block(&mut self, stmts: &[Stmt], frame: &mut Frame) -> IResult<Flow> {
-        let mut class_locals: Vec<String> = Vec::new();
+        let mut locals: Vec<String> = Vec::new();
         let mut out = Flow::Normal;
         for stmt in stmts {
-            if let Stmt::VarDecl { name, .. } = stmt {
-                class_locals.push(name.clone());
+            match stmt {
+                Stmt::VarDecl { name, .. } | Stmt::Decl { name, .. } => {
+                    locals.push(name.clone());
+                }
+                _ => {}
             }
             match self.exec_stmt(stmt, frame)? {
                 Flow::Normal => {}
@@ -571,18 +623,82 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        // RAII: drop block-local class values in reverse declaration
-        // order. The order *within* a drop is fixed and load-bearing
-        // (ADR 0029): check the invariant, then run the destructor body,
-        // then drop the remaining fields. Checking after the body would
-        // evaluate the invariant over a hole the body just made.
-        for name in class_locals.iter().rev() {
-            if let Some(RtVal::Obj { class, fields }) = frame.vars.get(name).cloned() {
-                self.drop_value(class, &fields, name)?;
-                frame.vars.remove(name);
-            }
+        // RAII: drop block-local values in reverse declaration order.
+        // A local the block moved away is no longer in its place, which is
+        // the whole reason a move removes it: the value belongs to whoever
+        // took it, and this scope has nothing left to destroy.
+        for name in locals.iter().rev() {
+            self.drop_place(&RtPlace::Local(name.clone()), frame)?;
         }
         Ok(out)
+    }
+
+    /// Remove a value from its source place, returning it.
+    ///
+    /// This is what makes a move a move at runtime: the source stops
+    /// holding the value, so no later drop — of the scope, of the object,
+    /// of the field — can reach it a second time. Every ownership transfer
+    /// goes through here.
+    fn take_place(&mut self, place: &RtPlace, frame: &mut Frame) -> Option<RtVal> {
+        match place {
+            RtPlace::Local(name) => frame.vars.remove(name.as_str()),
+            RtPlace::SelfField(field) => {
+                let (_, fields) = frame.self_ctx.clone()?;
+                let v = fields.borrow_mut().remove(field.as_str());
+                v
+            }
+        }
+    }
+
+    /// Take a value out of a place and destroy it: at scope exit, and
+    /// wherever a place is overwritten. A place holding no value — moved
+    /// away, or never initialized — has nothing to drop.
+    fn drop_place(&mut self, place: &RtPlace, frame: &mut Frame) -> IResult<()> {
+        let held = match place {
+            RtPlace::Local(name) => frame.vars.get(name.as_str()).cloned(),
+            RtPlace::SelfField(field) => frame
+                .self_ctx
+                .as_ref()
+                .and_then(|(_, fields)| fields.borrow().get(field.as_str()).cloned()),
+        };
+        let Some(RtVal::Obj { class, fields }) = held else {
+            return Ok(());
+        };
+        // Out of its place *before* the destructor runs: a `deinit` that
+        // reached the dying value through its own name would see a value
+        // that no longer belongs to anyone.
+        self.take_place(place, frame);
+        self.drop_value(class, &fields, &place.name())
+    }
+
+    /// The source place of an expression, if it names one. A call or a
+    /// constructor is already a temporary: it has no source to clear.
+    ///
+    /// The two roots here are the two the program language can name as an
+    /// ownership source, and they are the roots of the checker's `Place`.
+    fn source_place(e: &Expr) -> Option<RtPlace> {
+        match &e.kind {
+            ExprKind::Var(n) => Some(RtPlace::Local(n.clone())),
+            ExprKind::SelfField { field } => Some(RtPlace::SelfField(field.clone())),
+            _ => None,
+        }
+    }
+
+    /// Evaluate an expression in a position that *takes* the value, and
+    /// clear its source place if it named one. Declarations, assignments,
+    /// field assignments, arguments, and returns all transfer ownership,
+    /// and they all transfer it the same way.
+    ///
+    /// Only class values have runtime identity to transfer: resources are
+    /// erased (ADR 0024), and integers are copied.
+    fn eval_moved(&mut self, e: &Expr, frame: &mut Frame) -> IResult<RtVal> {
+        let v = self.eval(e, frame)?;
+        if matches!(v, RtVal::Obj { .. }) {
+            if let Some(place) = Self::source_place(e) {
+                self.take_place(&place, frame);
+            }
+        }
+        Ok(v)
     }
 
     /// Drop one class value: invariant, body, then the remaining fields in
@@ -673,18 +789,18 @@ impl<'a> Interp<'a> {
         match stmt {
             Stmt::Decl { name, init, .. } => {
                 if let Some(e) = init {
-                    let v = self.eval(e, frame)?;
+                    let v = self.eval_moved(e, frame)?;
                     frame.vars.insert(name.clone(), v);
                 }
                 Ok(Flow::Normal)
             }
             Stmt::Assign { name, value, .. } => {
-                let v = self.eval(value, frame)?;
-                // Reassigning a class local drops the old value: its
-                // invariant is checked exactly as at scope-end RAII.
-                if let Some(RtVal::Obj { class, fields }) = frame.vars.get(name).cloned() {
-                    self.check_invariants_at(&self.classes[class].clone(), &fields, name)?;
-                }
+                let v = self.eval_moved(value, frame)?;
+                // Overwriting a place destroys what it held: the same drop
+                // as at scope exit, destructor and fields included. The
+                // new value goes in afterwards, so a self-assignment
+                // cannot destroy what it is about to store.
+                self.drop_place(&RtPlace::Local(name.clone()), frame)?;
                 frame.vars.insert(name.clone(), v);
                 Ok(Flow::Normal)
             }
@@ -754,12 +870,17 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::VarDecl { name, init, .. } => {
-                let v = self.eval(init, frame)?;
+                let v = self.eval_moved(init, frame)?;
                 frame.vars.insert(name.clone(), v);
                 Ok(Flow::Normal)
             }
             Stmt::FieldAssign { field, value, .. } => {
-                let v = self.eval(value, frame)?;
+                let v = self.eval_moved(value, frame)?;
+                // A field is a place like any other: overwriting it
+                // destroys what it held. An `init` is the exception —
+                // there is nothing there yet — and `drop_place` on an
+                // uninitialized field finds nothing to do.
+                self.drop_place(&RtPlace::SelfField(field.clone()), frame)?;
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
                 fields.borrow_mut().insert(field.clone(), v);
                 Ok(Flow::Normal)
@@ -811,8 +932,11 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::Return { value, .. } => {
+                // Returning a place is a move: the value leaves with the
+                // caller, so the scopes unwinding behind it must not find
+                // it still sitting in its source and destroy it.
                 let v = match value {
-                    Some(e) => self.eval(e, frame)?,
+                    Some(e) => self.eval_moved(e, frame)?,
                     None => RtVal::Unit,
                 };
                 Ok(Flow::Return(v))
@@ -963,6 +1087,7 @@ impl<'a> Interp<'a> {
             &fields,
             &format!("{}::{} exit", class.name, ifn.name),
         )?;
+        self.drop_owned_params(&ifn.params, &mut frame)?;
         Ok(RtVal::Obj { class: ci, fields })
     }
 
@@ -1040,6 +1165,7 @@ impl<'a> Interp<'a> {
                 &format!("post of `{}::{method}`", class.name),
             )?;
         }
+        self.drop_owned_params(&m.f.params, &mut frame)?;
         Ok(result)
     }
 
@@ -1069,9 +1195,40 @@ impl<'a> Interp<'a> {
             // exception: the *script* it selects is real runtime state,
             // and a test controlling it is what "scripted world" means.
             ExprKind::ResOp { op, args, .. } => {
-                if let ResOp::TestWorld = op {
-                    let script = self.eval_int(&args[0], frame)?;
-                    self.world = Some(PosixWorld::scripted(script));
+                match op {
+                    ResOp::TestWorld => {
+                        let script = self.eval_int(&args[0], frame)?;
+                        self.world = Some(PosixWorld::scripted(script));
+                    }
+                    // Adoption spends the world's claim on a descriptor.
+                    // The VC is what makes a second adoption unreachable;
+                    // this is the monitor saying so independently, the
+                    // same two layers the raw operations have.
+                    ResOp::OpenFileOf => {
+                        let fd = self.eval_int(&args[1], frame)?;
+                        if let Some(w) = &mut self.world {
+                            if fd < 0 || fd >= w.fds {
+                                return Err(Trap {
+                                    undef: false,
+                                    message: format!(
+                                        "open_file: descriptor {fd} is not open in this world"
+                                    ),
+                                    span: e.span,
+                                });
+                            }
+                            if !w.claimed.insert(fd) {
+                                return Err(Trap {
+                                    undef: false,
+                                    message: format!(
+                                        "open_file: descriptor {fd}'s authority has already \
+                                         been handed out"
+                                    ),
+                                    span: e.span,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 Ok(RtVal::Unit)
             }
@@ -1367,7 +1524,7 @@ impl<'a> Interp<'a> {
                     .expect("checked: class exists");
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
-                    vals.push(self.eval(a, frame)?);
+                    vals.push(self.eval_moved(a, frame)?);
                 }
                 self.construct(ci, init, vals, e.span)
             }
@@ -1379,7 +1536,7 @@ impl<'a> Interp<'a> {
                 };
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
-                    vals.push(self.eval(a, frame)?);
+                    vals.push(self.eval_moved(a, frame)?);
                 }
                 self.invoke(class, method, fields, vals)
             }
@@ -1469,33 +1626,15 @@ impl<'a> Interp<'a> {
                 // the callee's runtime signature does not have the
                 // parameter at all (ADR 0024). Both sides drop the same
                 // positions, so the remaining ones still line up.
+                // A by-value class argument is a *move*, and moves clear
+                // their source place — `eval_moved` is the same operation
+                // the other transfers use.
                 let mut vals = Vec::with_capacity(args.len());
                 for (a, p) in args.iter().zip(&f.params) {
                     if p.ty.is_resource() {
                         continue;
                     }
-                    vals.push(self.eval(a, frame)?);
-                }
-                // A by-value class argument is a *move*: the source place
-                // stops holding it, so nothing drops it here as well as at
-                // its new owner. Harmless while destructors were empty —
-                // the invariant check was merely repeated — and a real
-                // double drop now that bodies run (ADR 0029).
-                for (a, p) in args.iter().zip(&f.params) {
-                    if !matches!(p.ty, Ty::Class(_)) {
-                        continue;
-                    }
-                    match &a.kind {
-                        ExprKind::Var(n) => {
-                            frame.vars.remove(n.as_str());
-                        }
-                        ExprKind::SelfField { field } => {
-                            if let Some((_, fields)) = &frame.self_ctx {
-                                fields.borrow_mut().remove(field.as_str());
-                            }
-                        }
-                        _ => {}
-                    }
+                    vals.push(self.eval_moved(a, frame)?);
                 }
                 if f.extern_info.is_some() {
                     // The foreign implementation receives only ABI values:

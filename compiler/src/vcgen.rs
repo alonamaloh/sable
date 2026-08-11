@@ -1261,6 +1261,9 @@ impl<'a> Generator<'a> {
                         // `ret_inv` analogue — a view carries its own
                         // well-formedness, not a user invariant.
                         Val::View(chain) => format!("(result = {chain})"),
+                        // A raw pointer is data: provenance and an offset,
+                        // no authority, nothing to re-establish (ADR 0026).
+                        Val::Ptr(chain) => format!("(result = {chain})"),
                         _ => unreachable!("unit values cannot be returned"),
                     },
                 });
@@ -1377,7 +1380,12 @@ impl<'a> Generator<'a> {
                     // about to cease to exist.
                     Cctx::Method(..) | Cctx::Deinit(_) => {
                         let vs = match v {
-                            Val::Int(s) | Val::Arr(s) | Val::Obj(s) => s,
+                            // A resource field holds its view, and a raw
+                            // field a pointer: both are ordinary values in
+                            // the structure, and the authority that came
+                            // with the resource is nowhere here (ADR 0024).
+                            Val::Int(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s)
+                            | Val::Ptr(s) => s,
                             Val::Prop(p) => format!("(decide {p})"),
                             _ => unreachable!("checked: field value"),
                         };
@@ -2245,6 +2253,11 @@ impl<'a> Generator<'a> {
                     // authority. Whether the descriptor is open is a VC,
                     // not a checker fact — the checker tracks tokens, and
                     // the outside world is not one of them (ADR 0028).
+                    //
+                    // Handing it out *spends* it: the world records the
+                    // claim, so the same descriptor cannot be adopted
+                    // twice. Affinity governs one token; this is what
+                    // stops a second token being minted beside it.
                     ResOp::OpenFileOf => {
                         let Val::View(w) = self.eval(&args[0]) else {
                             unreachable!("checked: world borrow")
@@ -2252,15 +2265,28 @@ impl<'a> Generator<'a> {
                         let Val::Int(fd) = self.eval(&args[1]) else {
                             unreachable!("checked: i32 descriptor")
                         };
-                        let goal = format!("Sable.PosixWorldView.isOpen ({w}) {fd}");
+                        let goal = format!("Sable.PosixWorldView.available ({w}) {fd}");
                         let ob = self.obligation(
                             &format!("{}.open_file.{}", self.fname, slug(&fd)),
-                            "`open_file` needs a descriptor the world has handed out".into(),
+                            "`open_file` needs a descriptor the world has open and \
+                             has not handed out"
+                                .into(),
                             e.span,
                             goal.clone(),
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: borrow arg")
+                        };
+                        let w2 = self.hinted_sym("_world", Some(array.clone()));
+                        self.binders
+                            .push((w2.clone(), ResKind::PosixWorld.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{array}_claim"),
+                            format!("{w2} = Sable.PosixWorldView.claim ({w}) {fd}"),
+                        );
+                        self.env.insert(array.clone(), Val::View(w2));
                         let f = self.hinted_sym("_file", hint);
                         self.binders
                             .push((f.clone(), ResKind::OpenFile.view_ty().into()));
@@ -2284,6 +2310,14 @@ impl<'a> Generator<'a> {
                         for (h, prop) in view_wf_hyps(ResKind::PosixWorld, &w, &w) {
                             self.push_hyp_unique(h, prop);
                         }
+                        // A fresh world has handed out no authority yet.
+                        // This is a fact about *this* world, not a
+                        // well-formedness condition: a world reached any
+                        // other way may well have claims outstanding.
+                        self.push_hyp_unique(
+                            format!("h_{}_unclaimed", w.trim_start_matches('_')),
+                            format!("∀ k, ({w}).claimed.get k = 0"),
+                        );
                         Val::View(w)
                     }
                 }
@@ -2723,6 +2757,25 @@ impl<'a> Generator<'a> {
                     Ty::Bool => {
                         self.binders.push((ret_sym.clone(), "Prop".into()));
                     }
+                    // A method returns a class or a resource on the same
+                    // terms a function does: a fresh state with its field
+                    // facts and invariant, or a fresh view. Ownership of
+                    // what came back is the checker's business and appears
+                    // nowhere here (ADR 0010, ADR 0024).
+                    Ty::Class(rci) => {
+                        let rcd = &self.classes[rci];
+                        self.binders
+                            .push((ret_sym.clone(), lean_class_name(&rcd.name)));
+                        let rcd = rcd.clone();
+                        self.push_class_state_facts(&rcd, &ret_sym);
+                        self.push_invariant_hyps(&rcd, &ret_sym);
+                    }
+                    Ty::Res(k) | Ty::ResRef(k, _) => {
+                        self.binders.push((ret_sym.clone(), k.view_ty().into()));
+                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym) {
+                            self.push_hyp_unique(h, prop);
+                        }
+                    }
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
@@ -2777,6 +2830,8 @@ impl<'a> Generator<'a> {
                     Ty::Option(_) => Val::Opt(ret_sym),
                     Ty::Unit => Val::Unit,
                     Ty::Bool => Val::Prop(ret_sym),
+                    Ty::Class(_) => Val::Obj(ret_sym),
+                    Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -3029,6 +3084,11 @@ impl<'a> Generator<'a> {
                             self.push_hyp_unique(h, prop);
                         }
                     }
+                    // A returned pointer is an opaque `RawPtr`: what is
+                    // known about it is whatever the post says.
+                    Ty::Raw(_) => {
+                        self.binders.push((ret_sym.clone(), "Sable.RawPtr".into()));
+                    }
                     Ty::Unit => {}
                     _ => unreachable!(),
                 }
@@ -3055,6 +3115,7 @@ impl<'a> Generator<'a> {
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
                     Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
+                    Ty::Raw(_) => Val::Ptr(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
             }

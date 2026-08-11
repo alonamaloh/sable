@@ -1,0 +1,19 @@
+// expect-error: array.use_after_move
+// An owned array moves into the field it is assigned to. Both names would
+// reach the same elements, while the logic treats them as two values — so
+// a store through the old name is a write the verifier does not see. The
+// post below is provable and false.
+
+class Holder {
+    [u64] buf;
+
+    /// invariant buf.len = 4
+
+    /// post self.buf.get 0 = 7
+    init make() {
+        mut [u64] nb = alloc_array<u64>(4, 0);
+        nb[0] = 7;
+        self.buf = nb;
+        nb[0] = 99;
+    }
+}

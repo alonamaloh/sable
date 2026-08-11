@@ -1,0 +1,17 @@
+// expect-error: double_adopt.open_file
+// Affinity governs a token that exists; it says nothing about minting a
+// second one beside it. Adoption therefore *spends* the world's claim on a
+// descriptor, and asking twice is a failed VC — the checker tracks tokens,
+// and the state of the outside is geometry (ADR 0028).
+
+fn eat(resource OpenFile f) {
+}
+
+/// pre w.isOpen fd ∧ 0 ≤ fd
+/// pre w.claimed.get fd = 0
+fn double_adopt(i32 fd, resource &mut PosixWorld w) {
+    resource OpenFile a = open_file(&mut w, fd);
+    resource OpenFile b = open_file(&mut w, fd);
+    eat(a);
+    eat(b);
+}

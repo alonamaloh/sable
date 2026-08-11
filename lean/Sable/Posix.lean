@@ -39,10 +39,18 @@ whether it fails. Those are real external behaviour and no contract can
 predict them, so they appear in the machine and the monitor but never in
 the view. A caller that wants to be correct must handle every outcome the
 contract admits, which is the whole point of passing the world
-explicitly. -/
+explicitly.
+
+`claimed` is which descriptors' *authority* has already been handed out:
+`claimed.get fd ≠ 0` means an `OpenFile` for `fd` exists somewhere. The
+world is the only source of that authority, and it can supply it once —
+without this, affinity stops a program reusing one token but not minting
+a second token for the same descriptor, which is the same duplication by
+another route. -/
 structure PosixWorldView where
   data : Seq Int
   fds : Int
+  claimed : Seq Int
 
 /-- Well-formedness of a world, assumed at every binding site: the
 stream really is a *byte* stream, and the descriptor count is a count.
@@ -71,6 +79,32 @@ def PosixWorldView.isOpen (w : PosixWorldView) (fd : Int) : Prop :=
 
 @[simp] theorem PosixWorldView.isOpen_iff (w : PosixWorldView) (fd : Int) :
     w.isOpen fd ↔ (0 ≤ fd ∧ fd < w.fds) := Iff.rfl
+
+/-- A descriptor whose authority the world can still hand out: open, and
+not already claimed. This is `open_file`'s precondition. -/
+def PosixWorldView.available (w : PosixWorldView) (fd : Int) : Prop :=
+  w.isOpen fd ∧ w.claimed.get fd = 0
+
+@[simp] theorem PosixWorldView.available_iff (w : PosixWorldView) (fd : Int) :
+    w.available fd ↔ (w.isOpen fd ∧ w.claimed.get fd = 0) := Iff.rfl
+
+/-- The world after handing out `fd`'s authority.
+
+Stated as a function of the old world rather than as a conjunction of
+"this changed, everything else did not": a functional effect is one
+rewrite for `grind`, where the conjunction form leaves it in case
+analysis at every use (the lesson ADR 0026 records). -/
+def PosixWorldView.claim (w : PosixWorldView) (fd : Int) : PosixWorldView :=
+  { w with claimed := w.claimed.set fd 1 }
+
+@[simp] theorem PosixWorldView.claim_data (w : PosixWorldView) (fd : Int) :
+    (w.claim fd).data = w.data := rfl
+
+@[simp] theorem PosixWorldView.claim_fds (w : PosixWorldView) (fd : Int) :
+    (w.claim fd).fds = w.fds := rfl
+
+@[simp] theorem PosixWorldView.claim_claimed (w : PosixWorldView) (fd : Int) :
+    (w.claim fd).claimed = w.claimed.set fd 1 := rfl
 
 /-- The bytes a read of `n` bytes at `pos` would return, as a claim about
 the world's stream rather than a value: `read` reports how many bytes it

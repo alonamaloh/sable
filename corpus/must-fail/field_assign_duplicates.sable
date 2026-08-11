@@ -1,0 +1,18 @@
+// expect-error: resource.use_after_move
+// A field is an ownership sink like any other: storing a resource in one
+// consumes the local. Without that, the class holds the authority and the
+// caller still names it — the duplication the affine category exists to
+// prevent, reached by the one sink that used to mark nothing.
+
+fn eat(resource RawSpan s) {
+}
+
+class Keeper {
+    resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+        eat(s);
+    }
+}

@@ -1,0 +1,146 @@
+// One ownership transfer, every syntactic form that performs one.
+//
+// A move is not a property of an argument list: it is what happens
+// whenever a value lands in a place that takes it. Declarations,
+// assignments, field assignments, arguments, constructor arguments and
+// returns are all sinks, and each does the same two things — the source
+// place stops holding the value, and whatever the destination held is
+// destroyed. The subjects here exist so the dynamic side can check that
+// each of those paths destroys exactly once.
+
+use posix_read;
+
+// ------------------------------ the tripwire ------------------------------
+//
+// `Token`'s destructor breaks its own invariant. That is deliberate, and
+// it is legal for the reason ADR 0029 gives: a destructor owes no exit
+// invariant, because there is nothing left to hold it. What it buys is an
+// observable answer to "was this value destroyed twice?" — the second drop
+// would check an invariant the first one falsified.
+
+pub class Token {
+    u64 v;
+
+    /// invariant v = 1
+
+    /// post self.v = 1
+    init make() {
+        self.v = 1;
+    }
+
+    deinit {
+        self.v = 0;
+    }
+}
+
+// A `return` of a local: the value leaves with the caller, so the scope
+// unwinding behind it must not find it still in its place.
+pub fn produce() -> Token {
+    var t = Token::make();
+    return t;
+}
+
+// A by-value parameter: the argument was handed over, so the *callee* is
+// who destroys it — after its contract has been checked, and only if the
+// body did not hand it on again.
+pub fn swallow(Token t) -> u64 {
+    return 1;
+}
+
+pub class Holder {
+    Token t;
+
+    init of(Token x) {
+        self.t = x;
+    }
+
+    // A field is a place: assigning one destroys what it held, and takes
+    // the value out of the local that supplied it.
+    fn refresh(&mut self) {
+        var n = Token::make();
+        self.t = n;
+    }
+}
+
+// ---------------------------- replacing authority --------------------------
+//
+// The shape a member has to use when it wants to give a field's authority
+// away: take it out, put something back, and return what was taken. A
+// member that left the hole would hand the caller an object whose
+// invariant is stated over a field that is not there.
+
+pub class Keeper {
+    resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+
+    /// post result.len = (old self).span.len
+    fn replace(&mut self, resource RawSpan fresh) -> resource RawSpan {
+        resource RawSpan taken = self.span;
+        self.span = fresh;
+        return taken;
+    }
+}
+
+pub fn eat_span(resource RawSpan s) {
+}
+
+/// pre #[label(a)] a.len ≥ 0
+/// pre #[label(b)] b.len ≥ 0
+pub fn swap_authority(resource RawSpan a, resource RawSpan b) {
+    var mut k = Keeper::hold(a);
+    resource RawSpan back = k.replace(b);
+    eat_span(back);
+}
+
+// -------------------------- a travelling obligation ------------------------
+//
+// `#[must_consume]` is about where the authority *ends up*, not about the
+// field being moved: moving it into a local moves the obligation too, and
+// only passing it by value to something that takes it discharges one.
+
+pub class Handle {
+    i32 fd;
+    #[must_consume] resource OpenFile fh;
+    resource PosixWorld w;
+
+    /// invariant 0 ≤ fd
+    /// invariant w.isOpen fd
+    /// invariant fh.fd = fd
+
+    /// pre  #[label(nonneg)] 0 ≤ d
+    /// pre  #[label(open)]   world.isOpen d ∧ f.fd = d
+    /// post #[label(fd)]     self.fd = d
+    init adopt(i32 d, resource OpenFile f, resource PosixWorld world) {
+        self.fd = d;
+        self.fh = f;
+        self.w = world;
+    }
+
+    deinit {
+        resource OpenFile tok = self.fh;
+        i32 r = posix_close(self.fd, tok, &mut self.w);
+    }
+}
+
+// ------------------------------ minting authority --------------------------
+//
+// Adoption spends the world's claim on a descriptor, so two descriptors
+// are two carves and one descriptor is one. Affinity governs the token
+// that exists; availability is what stops a second one appearing beside
+// it.
+
+pub fn eat_file(resource OpenFile f) {
+}
+
+/// pre #[label(open)]  w.isOpen 1 ∧ w.isOpen 2
+/// pre #[label(fresh)] w.claimed.get 1 = 0 ∧ w.claimed.get 2 = 0
+pub fn two_descriptors(resource &mut PosixWorld w) {
+    resource OpenFile a = open_file(&mut w, 1);
+    resource OpenFile b = open_file(&mut w, 2);
+    eat_file(a);
+    eat_file(b);
+}

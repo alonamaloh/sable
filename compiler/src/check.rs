@@ -48,6 +48,12 @@ struct VarInfo {
     /// return, no assignment to an outer place, and no passing to a
     /// user function that could launder them out.
     branded: bool,
+    /// Holds the authority of a `#[must_consume]` field (ADR 0029). The
+    /// obligation travels with the token: moving it into a local moves
+    /// the obligation too, so abandoning that local is the same
+    /// diagnostic as abandoning the field. Passing it by value discharges
+    /// it — the authority is somebody else's problem then.
+    must_consume: bool,
 }
 
 struct Ctx<'a> {
@@ -437,6 +443,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     initialized: true,
                     mutable: false,
                         branded: false,
+                        must_consume: false,
                     },
             );
         }
@@ -495,6 +502,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     initialized: true,
                     mutable: false,
                         branded: false,
+                        must_consume: false,
                     },
             );
         }
@@ -544,6 +552,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: false,
                         branded: false,
+                        must_consume: false,
                     },
                 );
             }
@@ -555,11 +564,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: false,
                         mutable: true,
                         branded: false,
+                        must_consume: false,
                     },
                 );
             }
             check_block(&mut ctx, &mut init.body, Ty::Unit)?;
             unsafe_regions += ctx.unsafe_blocks;
+            reject_field_holes(&ctx, &meta.name, &init.name, init.name_span)?;
             for (fname, _) in &meta.fields {
                 if !ctx.vars[&format!("self.{fname}")].initialized {
                     return Err(Diagnostic {
@@ -605,6 +616,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: false,
                         branded: false,
+                        must_consume: false,
                     },
                 );
             }
@@ -616,11 +628,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: true,
                         branded: false,
+                        must_consume: false,
                     },
                 );
             }
             let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
             unsafe_regions += ctx.unsafe_blocks;
+            reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
             if !returns && m.f.ret != Ty::Unit {
                 return Err(Diagnostic {
                     name: "type.missing_return".into(),
@@ -673,6 +687,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: true,
                         branded: false,
+                        must_consume: class
+                            .fields
+                            .iter()
+                            .any(|f| &f.name == fname && f.must_consume),
                     },
                 );
             }
@@ -693,28 +711,57 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             // `#[must_consume]`: the field's authority has to be handed on.
             // An ordinary affine field may be abandoned — that is a leak,
             // and affine-not-linear authority permits leaks.
-            for f in &class.fields {
-                if !f.must_consume {
+            //
+            // The obligation travels with the token, so this asks about
+            // every place that holds one and not only about the field:
+            // moving it into a local and dropping the local abandons the
+            // authority exactly as leaving it in the field does. What
+            // discharges it is passing it *by value* to something that
+            // takes it — which is why the check is "still live here", not
+            // "was moved at some point".
+            let mut outstanding: Vec<(&String, &VarInfo)> = ctx
+                .vars
+                .iter()
+                .filter(|(_, v)| v.must_consume)
+                .collect();
+            outstanding.sort_by_key(|(name, _)| name.as_str());
+            for (name, _) in outstanding {
+                let place = match name.strip_prefix("self.") {
+                    Some(f) => Place {
+                        root: "self".to_string(),
+                        fields: vec![f.to_string()],
+                    },
+                    None => Place::local(name),
+                };
+                if ctx.is_moved(&place) {
                     continue;
                 }
-                let place = Place {
-                    root: "self".to_string(),
-                    fields: vec![f.name.clone()],
+                let (span, label) = match name.strip_prefix("self.") {
+                    Some(f) => (
+                        class
+                            .fields
+                            .iter()
+                            .find(|fld| fld.name == f)
+                            .map_or(class.name_span, |fld| fld.span),
+                        "this field is `#[must_consume]`",
+                    ),
+                    None => (
+                        class.name_span,
+                        "this holds the authority of a `#[must_consume]` field",
+                    ),
                 };
-                if !ctx.is_moved(&place) {
-                    return Err(Diagnostic {
-                        name: "resource.abandoned".into(),
-                        title: format!("`deinit` abandons `self.{}`", f.name),
-                        span: f.span,
-                        label: "this field is `#[must_consume]`".into(),
-                        notes: vec![(
-                            "note".into(),
-                            "hand the authority on — pass it by value to something that \
-                             consumes it — or drop the marker and accept the leak"
-                                .into(),
-                        )],
-                    });
-                }
+                return Err(Diagnostic {
+                    name: "resource.abandoned".into(),
+                    title: format!("`deinit` abandons `{name}`"),
+                    span,
+                    label: label.into(),
+                    notes: vec![(
+                        "note".into(),
+                        "hand the authority on — pass it by value to something that \
+                         consumes it — or drop the marker and accept the leak"
+                            .into(),
+                    )],
+                });
             }
             call_graph.insert(ctx.current_fn.clone(), ctx.calls);
         }
@@ -789,6 +836,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: true,
                             mutable: false,
                         branded: false,
+                        must_consume: false,
                     },
                     );
                 }
@@ -800,6 +848,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: false,
                             mutable: true,
                         branded: false,
+                        must_consume: false,
                     },
                     );
                 }
@@ -850,6 +899,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: true,
                             mutable: false,
                         branded: false,
+                        must_consume: false,
                     },
                     );
                 }
@@ -861,6 +911,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: true,
                             mutable: true,
                         branded: false,
+                        must_consume: false,
                     },
                     );
                 }
@@ -952,6 +1003,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     });
                 }
                 let mut branded = false;
+                let mut must_consume = false;
                 if let Some(e) = init {
                     check_expr(ctx, e, Some(*ty))?;
                     // A local initialized from branded storage is branded
@@ -961,10 +1013,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     // operations exist to produce.
                     branded = matches!(ty, Ty::Raw(_) | Ty::Res(_)) && brand_of(ctx, e);
                     // `resource RawSpan t = s;` — a local-to-local move,
-                    // the same rule classes follow (ADR 0020/0024).
-                    if matches!(ty, Ty::Res(_)) {
-                        mark_moved(ctx, e)?;
-                    }
+                    // the same rule classes follow (ADR 0020/0024). A
+                    // declaration is not an escape: the new local inherits
+                    // the brand rather than laundering it.
+                    must_consume = transfer(ctx, e, None)?;
                 }
                 ctx.vars.insert(
                     name.clone(),
@@ -973,6 +1025,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         initialized: init.is_some(),
                         mutable: *mutable,
                         branded,
+                        must_consume,
                     },
                 );
             }
@@ -997,9 +1050,6 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     .vars
                     .get(name.as_str())
                     .is_some_and(|v| v.branded);
-                if !dest_branded {
-                    reject_brand_escape(ctx, value, "be assigned to an outer local", *name_span)?;
-                }
                 if !was_mutable {
                     return Err(Diagnostic {
                         name: "mut.assign_immutable".into(),
@@ -1022,14 +1072,16 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     // place dies here (ADR 0020). Every other class-typed
                     // expression is a call or a construction — a fresh
                     // owned value that nothing else names.
-                    if matches!(value.kind, ExprKind::Var(_)) {
-                        mark_moved(ctx, value)?;
-                    }
+                    let carries = transfer(ctx, value, escape_sink(dest_branded, name_span))?;
                     // The destination owns a value again even if it had
                     // been moved out earlier.
                     let dest = Place::local(name);
                     ctx.moved.retain(|m| !dest.contains(m));
-                    ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
+                    let v = ctx.vars.get_mut(name.as_str()).unwrap();
+                    v.initialized = true;
+                    // The local now holds whatever obligation the value
+                    // brought, and no longer the previous one.
+                    v.must_consume = carries;
                 } else {
                     if matches!(ty, Ty::Array(..)) {
                         return Err(Diagnostic {
@@ -1041,9 +1093,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                     check_expr(ctx, value, Some(ty))?;
+                    transfer(ctx, value, escape_sink(dest_branded, name_span))?;
                     ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
                 }
             }
+
             Stmt::If {
                 cond,
                 then_block,
@@ -1180,30 +1234,28 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     .collect();
                 let before_moved = ctx.moved.clone();
                 let _body_ret = check_block(ctx, body, ret_ty)?;
-                // Resource shape must be preserved at the backedge
-                // (ADR 0024): a token consumed by the body is not there
-                // for the second iteration, and a token created per
+                // Affine shape must be preserved at the backedge
+                // (ADR 0024): a value consumed by the body is not there
+                // for the second iteration, and a resource created per
                 // iteration and never consumed leaks one per turn. Views
                 // may change freely — that is what the loop invariant is
                 // for; the *shape* is what must come back.
-                // Only resources live at the loop head are part of the
+                // Only values live at the loop head are part of the
                 // shape. One declared and consumed inside the body is
                 // per-iteration scratch, not something the backedge owes.
-                if let Some(p) = ctx
-                    .moved
-                    .symmetric_difference(&before_moved)
-                    .find(|p| ctx.is_resource_place(p) && before.contains_key(&p.root))
-                {
+                if let Some(p) = ctx.moved.symmetric_difference(&before_moved).find(|p| {
+                    ctx.place_ty(p).is_some_and(is_affine) && before.contains_key(&p.root)
+                }) {
                     return Err(Diagnostic {
-                        name: "resource.loop_shape".into(),
+                        name: format!("{}.loop_shape", ctx.affine_kind(p)),
                         title: format!("the loop body consumes `{}`", p.render()),
                         span: *kw_span,
                         label: "the second iteration would not have it".into(),
                         notes: vec![(
                             "note".into(),
-                            "a loop must leave the same resources live at the backedge as \
-                             at the head; the invariant carries their views, not their \
-                             existence"
+                            "a loop must leave the same values live at the backedge as at \
+                             the head; an invariant carries what they are, not whether \
+                             they are still there"
                                 .into(),
                         )],
                     });
@@ -1244,8 +1296,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                     (Some(e), _) => {
-                        reject_brand_escape(ctx, e, "be returned", e.span)?;
                         check_expr(ctx, e, Some(ret_ty))?;
+                        // Returning a place consumes it: the value leaves
+                        // with the caller, and a field returned this way is
+                        // authority the object no longer has.
+                        transfer(ctx, e, Some(("be returned", e.span)))?;
                     }
                 }
                 returned = true;
@@ -1272,22 +1327,32 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // `var d = c;` — a local-to-local move (ADR 0020). A bare
                 // name is not otherwise a class-typed expression, so the
                 // expected type has to be supplied here for the move to
-                // be legal at all.
+                // be legal at all. `var x = self.f;` moves a field the
+                // same way.
                 let moved_from = match &init.kind {
                     ExprKind::Var(src) => match ctx.vars.get(src.as_str()).map(|v| v.ty) {
                         Some(Ty::Class(ci)) => Some(ci),
                         _ => None,
                     },
+                    ExprKind::SelfField { field } => {
+                        match ctx.vars.get(format!("self.{field}").as_str()).map(|v| v.ty) {
+                            Some(Ty::Class(ci)) => Some(ci),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
                 let t = match moved_from {
                     Some(ci) => {
                         check_expr(ctx, init, Some(Ty::Class(ci)))?;
-                        mark_moved(ctx, init)?;
                         Ty::Class(ci)
                     }
                     None => check_expr(ctx, init, None)?,
                 };
+                // A declaration takes the value like any other sink, and
+                // is not an escape: the new local inherits the brand
+                // rather than laundering it.
+                let must_consume = transfer(ctx, init, None)?;
                 if t == Ty::Unit {
                     return Err(Diagnostic {
                         name: "type.unit_binding".into(),
@@ -1305,6 +1370,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         initialized: true,
                         mutable: *mutable,
                         branded: false,
+                        must_consume,
                     },
                 );
             }
@@ -1415,6 +1481,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             // proved.
                             mutable: *mutable,
                             branded: true,
+                            must_consume: false,
                         },
                     );
                 }
@@ -1471,7 +1538,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 field_span,
                 value,
             } => {
-                let fty = ctx.self_field_ty(field, *field_span, true)?;
+                let fty = ctx.self_field_ty_rebind(field, *field_span, true)?;
                 // Array fields accept an owned-array MOVE (`self.buf = nb;`
                 // — Vec growth) or a fresh allocation; the moved-from local
                 // is not tracked as dead in v1 (documented).
@@ -1509,6 +1576,24 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
                 if !checked {
                     check_expr(ctx, value, Some(fty))?;
+                }
+                // A field is a sink like any other: it takes the value, so
+                // the source place dies. And a field outlives the exposure
+                // body, so it is a place a brand may not reach.
+                let carries = transfer(ctx, value, Some(("be stored in a field", *field_span)))?;
+                // The field owns a value again even if it had been moved
+                // out earlier: `resource R old = self.f; self.f = new;` is
+                // how a member replaces authority rather than losing it.
+                let dest = Place {
+                    root: "self".to_string(),
+                    fields: vec![field.clone()],
+                };
+                ctx.moved.retain(|m| !dest.contains(m));
+                // A field keeps its declared obligation and picks up one
+                // that travelled into it; storing a token in a field is
+                // not a way to lose its marker.
+                if let Some(v) = ctx.vars.get_mut(&format!("self.{field}")) {
+                    v.must_consume |= carries;
                 }
                 if ctx.in_init {
                     ctx.vars
@@ -1585,6 +1670,14 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         label: format!("`{array}` must be `&mut [{}]` to be written", elem.name()),
                         notes: vec![],
                     });
+                }
+                // Writing is a use: an owned array moved into a field is
+                // gone, and a store through the old name would reach the
+                // field's storage while the logic believes the two are
+                // separate values.
+                let place = Place::local(array);
+                if ctx.is_moved(&place) {
+                    return Err(moved_out(ctx, &place, *array_span, "store"));
                 }
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
                 check_expr(ctx, value, Some(Ty::Int(elem)))?;
@@ -2292,13 +2385,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            let launders = class_holds_storage(ctx.class_metas, ci, 0);
             for (arg, p) in args.iter_mut().zip(&params) {
                 // A constructor returns a class, and a class may hold
                 // resource fields (ADR 0029) — so it is exactly a container
                 // a brand could leave in.
-                if class_holds_storage(ctx.class_metas, ci, 0) {
-                    reject_brand_escape(ctx, arg, "be passed to a constructor", arg.span)?;
-                }
+                let escapes = launders.then(|| ("be passed to a constructor", arg.span));
                 match p.ty {
                     Ty::Array(elem, m) => {
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
@@ -2328,23 +2420,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    Ty::Class(_) => {
-                        check_expr(ctx, arg, Some(p.ty))?;
-                        mark_moved(ctx, arg)?;
-                    }
                     Ty::ClassRef(..) | Ty::ResRef(..) => {
                         require_explicit_borrow(ctx, arg, p.ty)?;
                         check_expr(ctx, arg, Some(p.ty))?;
                     }
-                    Ty::Res(_) => {
+                    _ => {
                         check_expr(ctx, arg, Some(p.ty))?;
-                        mark_moved(ctx, arg)?;
                     }
-                    Ty::Raw(_) => {
-                        check_expr(ctx, arg, Some(p.ty)).map(|_| ())?;
-                    }
-                    _ => check_expr(ctx, arg, Some(p.ty)).map(|_| ())?,
                 }
+                transfer(ctx, arg, escapes)?;
             }
             check_borrow_conflicts(ctx, args, None)?;
             ctx.calls.push(format!("{class}::{init}"));
@@ -2441,8 +2525,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     })
                 };
             }
+            // A method is a callee like any other: it can launder a brand
+            // only if its signature can give storage back.
+            let launders = match ret {
+                Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
+                Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
+                _ => false,
+            };
             for (arg, p) in args.iter_mut().zip(&params) {
                 check_expr(ctx, arg, Some(p.ty))?;
+                transfer(ctx, arg, launders.then(|| ("be passed to a method", arg.span)))?;
             }
             check_borrow_conflicts(
                 ctx,
@@ -2978,9 +3070,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 _ => false,
             };
             for (arg, pty) in args.iter_mut().zip(param_tys) {
-                if launders {
-                    reject_brand_escape(ctx, arg, "be passed to a function", arg.span)?;
-                }
+                let escapes = launders.then(|| ("be passed to a function", arg.span));
                 match pty {
                     Ty::Bool => {
                         return Err(Diagnostic {
@@ -3019,23 +3109,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    Ty::Class(_) => {
-                        check_expr(ctx, arg, Some(pty))?;
-                        mark_moved(ctx, arg)?;
-                    }
                     Ty::ClassRef(..) | Ty::ResRef(..) => {
                         require_explicit_borrow(ctx, arg, pty)?;
                         check_expr(ctx, arg, Some(pty))?;
                     }
-                    Ty::Res(_) => {
+                    _ => {
                         check_expr(ctx, arg, Some(pty))?;
-                        mark_moved(ctx, arg)?;
                     }
-                    Ty::Raw(_) => {
-                        check_expr(ctx, arg, Some(pty)).map(|_| ())?;
-                    }
-                    _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }
+                transfer(ctx, arg, escapes)?;
             }
             check_borrow_conflicts(ctx, args, None)?;
             if *callee != ctx.current_fn {
@@ -3231,7 +3313,7 @@ fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
             if ctx
                 .vars
                 .get(name.as_str())
-                .is_some_and(|v| matches!(v.ty, Ty::Class(_) | Ty::Res(_)))
+                .is_some_and(|v| is_affine(v.ty))
             {
                 ctx.moved.insert(Place::local(name));
             }
@@ -3241,32 +3323,151 @@ fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
         // lets a `deinit` pass one field on and still read another
         // (ADR 0029).
         ExprKind::SelfField { field } => {
-            ctx.moved.insert(Place {
-                root: "self".to_string(),
-                fields: vec![field.clone()],
+            let fty = ctx.in_class.and_then(|(ci, _)| {
+                ctx.class_metas[ci]
+                    .fields
+                    .iter()
+                    .find(|(n, _)| n == field)
+                    .map(|(_, t)| *t)
             });
+            if fty.is_some_and(is_affine) {
+                ctx.moved.insert(Place {
+                    root: "self".to_string(),
+                    fields: vec![field.clone()],
+                });
+            }
         }
         _ => {}
     }
     Ok(())
 }
 
+/// Values that can be transferred but not duplicated: class values and
+/// resources, and owned arrays, whose element storage is shared by every
+/// name that reaches it.
+fn is_affine(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned)
+    )
+}
+
+/// The one ownership sink.
+///
+/// Every construct that takes a value *by value* — a declaration, an
+/// assignment, a field assignment, a call or constructor argument, a
+/// return — ends here, so what a transfer means is written once: the
+/// source place dies, and a loan brand may not cross a sink that outlives
+/// the exposure it came from.
+///
+/// `escapes` names the sink for the escape diagnostic, and is `None` for a
+/// sink that cannot outlive the body: a callee that has no way to give
+/// storage back, or a local that inherits the brand instead.
+///
+/// Call it *after* the expression has been checked: a moved-from place is
+/// unreadable, and the escape rule needs the expression's type.
+/// Returns whether the value carried a `#[must_consume]` obligation, so a
+/// sink that is itself a place can keep it travelling. A sink that is not
+/// a place — an argument, a return — discharges it by ignoring it: the
+/// authority has left this frame.
+fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<bool> {
+    if let Some((how, span)) = escapes {
+        reject_brand_escape(ctx, e, how, span)?;
+    }
+    let carries = match &e.kind {
+        ExprKind::Var(n) => ctx.vars.get(n.as_str()),
+        ExprKind::SelfField { field } => ctx.vars.get(format!("self.{field}").as_str()),
+        _ => None,
+    }
+    .is_some_and(|v| v.must_consume);
+    mark_moved(ctx, e)?;
+    Ok(carries)
+}
+
+/// A member may not leave a hole in `self`.
+///
+/// Moving a field out is legal *inside* a body — that is what
+/// `partially-moved` means — but an `init` or a method has to put
+/// something back before it exits. Its caller holds a whole class value
+/// and knows nothing about which fields left; the class invariant is
+/// stated over all of them, and an invariant over a hole is not a
+/// question with an answer (ADR 0023).
+///
+/// A `deinit` is the exception, and the reason is the same one: the value
+/// ceases to exist, so there is no invariant left to hold and no caller
+/// left to mislead (ADR 0029).
+fn reject_field_holes(ctx: &Ctx, class: &str, member: &str, span: Span) -> CResult<()> {
+    let mut holes: Vec<String> = ctx
+        .moved
+        .iter()
+        .filter(|p| p.root == "self")
+        .map(|p| p.render())
+        .collect();
+    holes.sort();
+    let Some(first) = holes.first() else {
+        return Ok(());
+    };
+    Err(Diagnostic {
+        name: "class.field_not_restored".into(),
+        title: format!("`{class}::{member}` leaves `{first}` moved out"),
+        span,
+        label: "a member must leave `self` whole".into(),
+        notes: vec![(
+            "note".into(),
+            "assign the field again before returning — `resource R old = self.f; \
+             self.f = new;` replaces authority rather than losing it. Only a \
+             `deinit` may hand a field on and leave, because the value is ending"
+                .into(),
+        )],
+    })
+}
+
+/// An assignment is an escape unless the destination is itself branded: a
+/// local that belongs to the exposure body dies with it.
+fn escape_sink(dest_branded: bool, span: &Span) -> Option<(&'static str, Span)> {
+    if dest_branded {
+        None
+    } else {
+        Some(("be assigned to an outer local", *span))
+    }
+}
+
 impl<'a> Ctx<'a> {
-    /// Whether this place names a resource (root type only for now —
-    /// resource fields are a scheduled deliverable).
+    /// The type of a place. A field place is recorded as a `self.f`
+    /// pseudo-var, which is where a field's type lives; nothing deeper
+    /// than one projection is nameable yet.
+    fn place_ty(&self, p: &Place) -> Option<Ty> {
+        let name = match p.fields.as_slice() {
+            [] => p.root.clone(),
+            [f] => format!("{}.{}", p.root, f),
+            _ => return None,
+        };
+        self.vars.get(name.as_str()).map(|v| v.ty)
+    }
+
+    /// Whether this place names a resource.
     fn is_resource_place(&self, p: &Place) -> bool {
-        match p.fields.as_slice() {
-            [] => self
-                .vars
-                .get(p.root.as_str())
-                .is_some_and(|v| v.ty.is_resource()),
-            // A field place: `self.f` is recorded as a pseudo-var, which is
-            // where a resource field's type lives.
-            [f] => self
-                .vars
-                .get(format!("{}.{}", p.root, f).as_str())
-                .is_some_and(|v| v.ty.is_resource()),
-            _ => false,
+        self.place_ty(p).is_some_and(|t| t.is_resource())
+    }
+
+    /// Whether this place names an owned array, whose moves are affine for
+    /// a different reason: the elements are shared storage, not authority.
+    fn is_array_place(&self, p: &Place) -> bool {
+        self.place_ty(p)
+            .is_some_and(|t| matches!(t, Ty::Array(_, Mutability::Owned)))
+    }
+
+    /// Which affine category a place belongs to, as the prefix its
+    /// diagnostics carry. The consequence differs — a class you can
+    /// rebuild, a resource is authority somebody else now holds, an array
+    /// is storage two names would reach — so the name says which.
+    fn affine_kind(&self, p: &Place) -> &'static str {
+        if self.is_resource_place(p) {
+            "resource"
+        } else if self.is_array_place(p) {
+            "array"
+        } else {
+            "class"
         }
     }
 
@@ -3276,9 +3477,28 @@ impl<'a> Ctx<'a> {
         self.moved.iter().any(|m| m.contains(p))
     }
 
-    /// Type of `self.field`; `mutating` additionally requires an
-    /// `init` or `&mut self` context.
+    /// Type of `self.field` for a *use*: reading it, or writing through
+    /// it. A field whose value moved away has neither.
     fn self_field_ty(&self, field: &str, span: Span, mutating: bool) -> CResult<Ty> {
+        let ty = self.self_field_ty_rebind(field, span, mutating)?;
+        // A field whose value was moved out is dead, and so is the whole
+        // object; its untouched siblings are still readable. This is what
+        // `partially-moved` means, and it is what a `deinit` body that
+        // hands one field on and reads another needs (ADR 0029).
+        let place = Place {
+            root: "self".to_string(),
+            fields: vec![field.to_string()],
+        };
+        if self.is_moved(&place) {
+            return Err(moved_out(self, &place, span, "read"));
+        }
+        Ok(ty)
+    }
+
+    /// Type of `self.field` as an assignment *target*. Rebinding a field
+    /// is how a member gives it a value again, so unlike every other
+    /// mention of a field this one is legal on a moved-out place.
+    fn self_field_ty_rebind(&self, field: &str, span: Span, mutating: bool) -> CResult<Ty> {
         let Some((ci, is_mut)) = self.in_class else {
             return Err(Diagnostic {
                 name: "type.self_outside_class".into(),
@@ -3296,17 +3516,6 @@ impl<'a> Ctx<'a> {
                 label: "take `&mut self` to write".into(),
                 notes: vec![],
             });
-        }
-        // A field whose value was moved out is dead, and so is the whole
-        // object; its untouched siblings are still readable. This is what
-        // `partially-moved` means, and it is what a `deinit` body that
-        // hands one field on and reads another needs (ADR 0029).
-        let place = Place {
-            root: "self".to_string(),
-            fields: vec![field.to_string()],
-        };
-        if self.is_moved(&place) {
-            return Err(moved_out(self, &place, span, "read"));
         }
         self.class_metas[ci]
             .fields
@@ -3378,21 +3587,34 @@ fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
 /// outer place, or handing it to a user function would let it outlive
 /// the storage (ADR 0026).
 fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()> {
-    let name = match &e.kind {
-        ExprKind::Var(n) => n,
-        ExprKind::Borrow { array, .. } => array,
-        _ => return Ok(()),
-    };
-    let names_storage = ctx
-        .vars
-        .get(name.as_str())
-        .is_some_and(|v| v.branded && matches!(v.ty, Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..)));
-    if !names_storage {
+    // The brand follows provenance, so the question is asked of the whole
+    // expression: `raw_offset(p, 1)` and `split_off(&mut m, n)` name the
+    // loan's storage exactly as `p` and `m` do. Asking it only of a bare
+    // name would let one arithmetic operation launder it.
+    if !brand_of(ctx, e) {
         return Ok(());
     }
+    // A byte *loaded* from branded storage is an ordinary number: the
+    // brand is about naming storage, not about having touched it.
+    let ty = match &e.kind {
+        // For a name the variable table is the authority: a bare
+        // class- or resource-typed name is inferred without ever being
+        // stamped on the expression.
+        ExprKind::Var(n) | ExprKind::Borrow { array: n, .. } => {
+            ctx.vars.get(n.as_str()).map(|v| v.ty)
+        }
+        _ => e.ty,
+    };
+    if !ty.is_some_and(|t| matches!(t, Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..))) {
+        return Ok(());
+    }
+    let name = match &e.kind {
+        ExprKind::Var(n) | ExprKind::Borrow { array: n, .. } => format!("`{n}`"),
+        _ => "storage derived from this exposure".to_string(),
+    };
     Err(Diagnostic {
         name: "expose.brand_escapes".into(),
-        title: format!("`{name}` cannot {how}"),
+        title: format!("{name} cannot {how}"),
         span,
         label: "this names storage borrowed for the exposure body".into(),
         notes: vec![(
@@ -3412,9 +3634,24 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
 fn moved_out(ctx: &Ctx, p: &Place, span: Span, how: &str) -> Diagnostic {
     let label = match how {
         "borrow" => "borrowing a moved-from place",
+        "store" => "writing into a moved-from place",
         _ => "the value was passed by value earlier",
     }
     .to_string();
+    if ctx.is_array_place(p) {
+        return Diagnostic {
+            name: "array.use_after_move".into(),
+            title: format!("`{}` has been moved out", p.render()),
+            span,
+            label,
+            notes: vec![(
+                "note".into(),
+                "an owned array moves into its new place: both names would reach \
+                 the same elements, and the logic treats them as separate values"
+                    .into(),
+            )],
+        };
+    }
     if ctx.is_resource_place(p) {
         return Diagnostic {
             name: "resource.use_after_move".into(),

@@ -1,0 +1,13 @@
+// expect-error: expose.brand_escapes
+// The brand follows *provenance*, so the escape rule has to ask about the
+// whole expression. `outer = p;` was already rejected; one pointer
+// arithmetic operation in between names the same storage and must be
+// rejected for the same reason.
+
+fn stash(&[u8] a) -> u8 {
+    mut raw<u8> outer;
+    unsafe expose &a as (p, resource m) {
+        outer = raw_offset(p, 1);
+    }
+    return 0;
+}

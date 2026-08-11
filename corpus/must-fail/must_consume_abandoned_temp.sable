@@ -1,0 +1,20 @@
+// expect-error: resource.abandoned
+// `#[must_consume]` means the authority has to go somewhere, not that the
+// field has to be *moved*. Moving it into a local and dropping the local
+// abandons it exactly as leaving it in the field does, so the obligation
+// travels with the token until something takes it by value.
+
+class Handle {
+    i32 fd;
+    #[must_consume] resource OpenFile fh;
+
+    /// pre  0 ≤ d
+    init adopt(i32 d, resource OpenFile f) {
+        self.fd = d;
+        self.fh = f;
+    }
+
+    deinit {
+        resource OpenFile tmp = self.fh;
+    }
+}

@@ -1,0 +1,19 @@
+// expect-error: class.field_not_restored
+// Returning a field hands its authority to the caller — who still holds
+// the whole object, and can ask again. A member may move a field out, but
+// it has to put something back before it exits: the invariant is stated
+// over every field, and an invariant over a hole is not a question with an
+// answer. Only a `deinit` may leave one, because the value is ending.
+
+class Keeper {
+    resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+
+    fn steal(&mut self) -> resource RawSpan {
+        return self.span;
+    }
+}

@@ -1,0 +1,69 @@
+// expect-test-failure: pre of `require_zero` violated
+// The other half of exact-once. `corpus/tests/test_ownership.sable` shows
+// that no value is destroyed twice — which a compiler that destroyed
+// *nothing* would also pass. `Loud`'s destructor calls something whose
+// precondition it violates, so a drop that happens is a dynamic failure,
+// and each test below is a transfer path whose value must still be
+// destroyed at the end.
+//
+// This subject cannot live in `corpus/verifies`: its destructor is a
+// deliberately failing call, and a verifying file may not contain one.
+
+/// pre n = 0
+fn require_zero(u64 n) {
+}
+
+class Loud {
+    u64 v;
+
+    /// invariant v = 1
+
+    /// post self.v = 1
+    init make() {
+        self.v = 1;
+    }
+
+    deinit {
+        require_zero(self.v);
+    }
+}
+
+fn produce_loud() -> Loud {
+    var t = Loud::make();
+    return t;
+}
+
+fn swallow_loud(Loud t) -> u64 {
+    return 1;
+}
+
+class Crate {
+    Loud inner;
+
+    init of(Loud x) {
+        self.inner = x;
+    }
+}
+
+// A scope-local value is destroyed at the end of its scope.
+fn test_scope_drops() {
+    var t = Loud::make();
+}
+
+// A returned value is destroyed by whoever ends up holding it — once,
+// and at the caller.
+fn test_return_drops_at_caller() {
+    var t = produce_loud();
+}
+
+// A by-value argument is destroyed by the callee.
+fn test_by_value_arg_drops() {
+    var a = Loud::make();
+    u64 r = swallow_loud(a);
+}
+
+// A field is destroyed with the object that owns it.
+fn test_field_drops() {
+    var a = Loud::make();
+    var c = Crate::of(a);
+}

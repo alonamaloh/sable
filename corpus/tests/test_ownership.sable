@@ -1,0 +1,87 @@
+// Exact-once destruction, one test per transfer path.
+//
+// `Token`'s destructor falsifies its own invariant, so a value destroyed
+// twice traps on the second drop's invariant check. Every test below moves
+// a token through one syntactic form and then lets it die: passing means
+// the value was destroyed at most once, and `test-fails/deinit_runs.sable`
+// is the other half — it shows the destructor runs at all.
+//
+// Contracts about resource views are not monitorable (a view is ghost), so
+// the world-facing subjects here are fenced.
+// expect-skip: world.isOpen d ∧ f.fd = d
+// expect-skip: w.isOpen fd
+// expect-skip: fh.fd = fd
+//
+// `Keeper::replace` has no test: a `RawSpan` can only be borrowed from an
+// exposure today, and an exposure needs its token back before the body
+// ends, so there is no way to hand one to a class. It arrives with
+// allocation.
+
+use ownership;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+// A plain scope: one value, one drop.
+fn test_scope_drop() {
+    var t = Token::make();
+    expect_eq(1, 1);
+}
+
+// `return`: the value belongs to the caller, and the callee's scope exit
+// must not destroy it on the way out.
+fn test_return() {
+    var t = produce();
+    expect_eq(1, 1);
+}
+
+// Local to local: `a` is dead, `d` owns it, and only one of them drops.
+fn test_local_move() {
+    var a = Token::make();
+    var d = a;
+    expect_eq(1, 1);
+}
+
+// Reassignment: the old value of `t` is destroyed here, and `u` is not
+// destroyed twice for having been moved into it.
+fn test_reassign() {
+    var mut t = Token::make();
+    var u = Token::make();
+    t = u;
+    expect_eq(1, 1);
+}
+
+// A by-value argument, consumed by the callee.
+fn test_by_value_arg() {
+    var a = Token::make();
+    u64 r = swallow(a);
+    expect_eq(r, 1);
+}
+
+// A constructor argument becomes a field, and the field drops with the
+// object — not also at the caller.
+fn test_ctor_arg() {
+    var a = Token::make();
+    var h = Holder::of(a);
+    expect_eq(1, 1);
+}
+
+// A field assignment inside a method: the old field value is destroyed
+// there, and the local that supplied the new one is not destroyed at the
+// end of the method while the field still holds it.
+fn test_field_assign() {
+    var a = Token::make();
+    var mut h = Holder::of(a);
+    h.refresh();
+    expect_eq(1, 1);
+}
+
+// A destructor that hands its authority on through a local: the handle
+// closes exactly once, and the descriptor was claimed exactly once.
+fn test_handle_travels() {
+    mut resource PosixWorld w = posix_world(0);
+    mut resource OpenFile fh = open_file(&mut w, 1);
+    var h = Handle::adopt(1, fh, w);
+    expect_eq(1, 1);
+}

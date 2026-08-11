@@ -1,0 +1,28 @@
+// expect-error: class.loop_shape
+// The affine shape at a loop's backedge has to match its head, and that
+// is not a rule about authority: a class value consumed by the body is
+// not there for the second iteration either.
+
+class Cell {
+    u64 v;
+
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+fn eat(Cell c) -> u64 {
+    return 1;
+}
+
+fn loopy(Cell a, u64 n) -> u64 {
+    mut u64 t = 0;
+    /// invariant t ≤ n
+    /// variant n - t
+    while (t < n) {
+        u64 r = eat(a);
+        t = t + 1;
+    }
+    return t;
+}

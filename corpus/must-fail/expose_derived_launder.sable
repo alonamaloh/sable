@@ -1,0 +1,26 @@
+// expect-error: expose.brand_escapes
+// The same laundering `expose_launder_via_class` rejects, reached through
+// a derived resource instead of the exposure's own token. A sealed
+// transformation of branded storage is branded storage.
+
+class Keeper {
+    resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+}
+
+/// pre  s.len ≥ 0
+fn wrap(resource RawSpan s) -> Keeper {
+    var k = Keeper::hold(s);
+    return k;
+}
+
+/// pre  a.len = 4
+fn smuggle(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        var escaped = wrap(split_off(&mut m, 4));
+    }
+}

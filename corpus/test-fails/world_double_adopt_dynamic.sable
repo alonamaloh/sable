@@ -1,0 +1,11 @@
+// expect-test-failure: authority has already been handed out
+// The static half of this is `corpus/must-fail/world_double_adopt.sable`,
+// a failed VC. This is the monitor saying the same thing independently:
+// the world can supply a descriptor's authority once, and a program that
+// bypassed the obligation would mint a second token here.
+
+fn test_double_adopt() {
+    mut resource PosixWorld w = posix_world(0);
+    mut resource OpenFile a = open_file(&mut w, 1);
+    mut resource OpenFile b = open_file(&mut w, 1);
+}
