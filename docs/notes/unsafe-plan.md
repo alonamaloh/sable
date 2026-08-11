@@ -1355,31 +1355,57 @@ though it is per-iteration scratch the backedge does not owe) and a hole in
 is adjacent to itself. A zero-length token duplicated out of nothing is exactly
 the failure the category exists to prevent, and it survived about ten minutes.
 
-### U3 — byte raw heap in the formal SVM
+### U3 — byte raw heap in the formal SVM *(done 2026-08-11, ADR 0025)*
 
-Add the byte-only raw heap and operations to the normative SVM, evaluator, Rust
-lowering, and differential harness.
+The byte heap is in the normative machine: `RawHeap` (a fresh-provenance
+counter plus a partial map of allocations, each a `Seq RawByte` where
+uninitialized is a distinct state), `Val.ptr alloc off` — provenance plus an
+offset, never an address — and the operations `rawAlloc`, `rawFree`, `rawLoad8`,
+`rawStore8`, `rawTake8`, plus `ptrAdd`.
 
-Operations:
+**The structural finding: pointer arithmetic is pure, so it is an expression,
+and everything that touches the heap is a statement.** That is the
+A-normalization precedent calls already set, and it is what let `Eval` stay
+*completely* unchanged — expressions still have no heap, so not one existing
+expression rule was reinterpreted. The claim that unsafe Sable extends the
+machine rather than reinterpreting it is checked rather than asserted: the heap
+was threaded through the configuration in its own commit, with no operations at
+all, and agreement in both directions, determinism, totality, and progress
+re-proved with no change to any tactic.
 
-```text
-fresh loan/root allocation
-pointer add
-load8
-store8
-take8
-free
-```
+The rules state their side conditions as *decidable* predicates
+(`RawHeap.loadByte`, `.freeable`, `.inBounds`) rather than existentials over the
+heap. Written the other way first, the agreement proofs needed case analysis on
+inaccessible implicit binders — but the real argument is normative: these are
+exactly the questions the machine must compute to tell a store from `undef`.
 
-No lexical exposure yet; direct SVM subjects exercise the semantics.
+`Sable/SVMRawTests.lean` holds 20 direct SVM subjects — programs in the
+machine's own syntax, which is what this rung intended — pinning the valid path
+and every route to `undef`: out of bounds either way, a load of never-written
+storage, a load of a byte `take8` emptied (and that writing it back makes it
+readable again), use after free, double free, interior free, a non-pointer
+dereference, and an out-of-`u8` store. Allocation past the cap is `Trap.oom`,
+because exhausting memory is a defined failure, not a program error.
 
-Exit criteria:
+**Two layers of defence, both verified by injection.** An evaluator that forgets
+`take8`'s write-back fails the agreement proof. Changing the rule *and* the
+evaluator together consistently passes agreement and fails an outcome guard.
+Neither alone catches both — which is the argument for keeping the outcome
+subjects rather than trusting agreement.
 
-- agreement in both directions re-proved;
-- determinism, totality, and progress restored;
-- valid and invalid raw subjects added to `corpus/svm-diff`;
-- injected wrong lowering is detected;
-- invalid load/store/free reaches the intended `undef` outcome.
+**Ordering correction, recorded rather than quietly satisfied.** Two exit
+criteria as originally worded — "valid and invalid raw subjects added to
+`corpus/svm-diff`" and "injected wrong lowering is detected" — presuppose a
+*source surface* for the raw operations, which this rung explicitly does not
+build ("no lexical exposure yet"). `corpus/svm-diff` subjects are `.sable` files
+lowered by `svm.rs`; with no raw syntax there is nothing to lower and nothing
+for `interp.rs` to run. Both move to U4, which is where the surface arrives.
+What this rung could check in their place — that an injected wrong *semantics*
+is detected — it checks twice.
+
+Still open here: alignment (nothing in a byte-only heap can observe it; it
+starts to matter with typed storage) and `copy_nonoverlapping` (it waits for the
+operations to have contracts).
 
 ### U4 — lexical byte exposure and `copy_prefix`
 
@@ -1414,7 +1440,13 @@ Exit criteria:
 - mutable exposure reconstructs the final safe array;
 - shared exposure cannot mutate;
 - all pointers/resources carrying the loan brand are gone at scope exit;
-- unsafe-block counts appear in build output.
+- unsafe-block counts appear in build output;
+- **inherited from U3, which could not satisfy them without a source surface**:
+  valid and invalid raw subjects in `corpus/svm-diff`, and an injected wrong
+  *lowering* being detected. U3's semantics is pinned by direct SVM subjects in
+  `Sable/SVMRawTests.lean`; what is still unchecked is the `svm.rs` lowering and
+  `interp.rs`'s agreement with the machine on raw programs, and neither exists
+  until the operations can be written in Sable.
 
 This is the first go/no-go checkpoint. Do not proceed to allocators if the safe
 wrapper is proof-noisy or if the checker cannot explain failures locally.
