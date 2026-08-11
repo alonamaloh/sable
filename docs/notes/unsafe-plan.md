@@ -1585,20 +1585,54 @@ Deferred with reasons: `open` (it needs a descriptor *and* authority — a produ
 type; the two-step carve is what avoids one) and `write` (symmetric to `read`, no
 new question), plus interruption, partial writes, and any real libc binding.
 
-### U7a — destruction semantics and resource fields
+### U7a — destruction semantics and resource fields *(done 2026-08-11, ADR 0029)*
 
-Lift the empty-`deinit` restriction with the semantics pinned above: invariant
-assumed on entry and not re-established, fields movable out of the body, no
-double drop, monitor ordering fixed in the interpreter, `partially-moved` in the
-place engine. Add resource fields in classes and `#[must_consume]`.
+`deinit` bodies run. The semantics were pinned before the restriction was lifted,
+which is the order this note insisted on: the class invariant holds on **entry**
+and is *not* re-established (there is nothing left to hold it, so a destructor
+owes no `inv_exit` and has no `_old_self` twin); the body may move fields out,
+which is how a class that owns authority hands it on; a moved field is not dropped
+again, and the rest drop in reverse declaration order. The interpreter's order
+within a drop is **invariant → body → remaining fields**, since checking after the
+body would evaluate the invariant over a hole the body just made.
 
-Exit criteria:
+Classes hold resource fields, and `#[must_consume]` marks one whose authority must
+go somewhere — abandoning it is a diagnostic, as is putting the marker on a class
+with no destructor. An *unmarked* affine resource field may be abandoned: that is
+a leak, and affine-not-linear authority permits leaks. The marker is what turns a
+permitted leak into a diagnosed one.
 
-- a class destructor consumes a resource field exactly once;
-- a partially-moved class drops only its remaining fields, in reverse order;
-- the dynamic invariant monitor runs before the body, never over a hole;
-- an abandoned `#[must_consume]` field is diagnosed; an ordinary affine field is
-  not.
+**The most useful output of this rung is what it invalidated.**
+
+- **U2a's mutable field borrow is sound in a destructor.** `&mut a.f` was deferred
+  because a callee could not re-establish `a`'s invariant. In a `deinit` there is
+  no invariant left to break, so the reason evaporates exactly where the invariant
+  does — and `&mut self.w` is how the destructor hands its world to
+  `posix_close`. Legal there and nowhere else.
+- **U5's brand argument stopped being true.** It reasoned that only a raw or
+  resource *return type* could launder a loan brand, because Sable had no
+  storage-typed fields. Resource fields make a class exactly such a container.
+  `class_holds_storage` decides it now, transitively. The lesson is not that the
+  earlier argument was careless — it was correct when made — but that an argument
+  from "the language has no X" expires when X arrives, and the ADR that made it
+  should be re-read when it does.
+- **`havoc_mut_borrow_args` assumed a borrow names a whole place**: `&mut self.w`
+  replaced `self` with a view and lost the self-chain. A field borrow now writes
+  the fresh state back into the base, leaving every sibling where it was.
+
+Also: a by-value class argument now removes the value from its source place in the
+interpreter — harmless while destructors were empty (the invariant check was
+merely repeated) and a real double drop once bodies run.
+
+`Ctx::is_partially_moved` was *deleted* rather than kept behind an `allow`: only
+`self` can be partially moved today and `self` is not usable as a whole, so the
+query has no reachable caller. Three lines to restore when one appears.
+
+Deliberately not done: a leak *warning* for abandoned unmarked fields (the
+diagnostic exists only for the marker, which keeps the signal high), and
+`#[must_consume]` on locals and parameters — which is where it would catch a
+forgotten `close` at a call site, and which needs the marker on a *type* rather
+than a field.
 
 ### U7b — typed cells, layout, and static bump arena
 
