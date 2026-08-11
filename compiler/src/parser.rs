@@ -1416,7 +1416,7 @@ impl<'a> Parser<'a> {
         // text, so neither the index nor the bounds' variables may be
         // assigned by the body.
         let mut assigned = std::collections::HashSet::new();
-        crate::vcgen::collect_assigned(&body, &mut assigned);
+        crate::vcgen::collect_assigned(&body, &mut assigned, crate::vcgen::ANY_RECV_MUTATES);
         if assigned.contains(&index) {
             return Err(Diagnostic {
                 name: "parse.for_assigns_index".into(),

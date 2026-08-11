@@ -1,0 +1,45 @@
+// expect-error: count.post
+// Regression guard: a `&mut self` method call in a *declaration
+// initializer* mutates its receiver exactly as much as the same call in
+// statement position, so the receiver must join the loop's havoc set.
+// Without that, `c`'s pre-loop state (`n = 0`, from the init's post)
+// survives the loop and the false claim below "verifies".
+
+class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    /// post result = self.n
+    fn bump(&mut self) -> u64 {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    /// post result = self.n
+    fn get(&self) -> u64 {
+        return self.n;
+    }
+}
+
+/// post result = 0
+fn count() -> u64 {
+    var mut c = Counter::zero();
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant c.n = i
+    /// variant 3 - i
+    while (i < 3) {
+        u64 seen = c.bump();
+        i = i + 1;
+    }
+    u64 r = c.get();
+    return r;
+}

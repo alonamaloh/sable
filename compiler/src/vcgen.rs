@@ -1092,7 +1092,30 @@ impl<'a> Generator<'a> {
     /// transitively). Hypotheses mentioning havocked names are dropped.
     fn havoc(&mut self, body: &[Stmt]) {
         let mut havoc_set: HashSet<String> = HashSet::new();
-        collect_assigned(body, &mut havoc_set);
+        {
+            // `c.m()` havocs `c` only when `m` takes `&mut self`; a
+            // shared-receiver call cannot write, so keeping its facts is
+            // both sound and what framing across a loop depends on.
+            let classes = self.classes;
+            let var_tys = &self.var_tys;
+            let cctx_class = match self.cctx {
+                Cctx::Init(c) | Cctx::Method(c, _) => Some(c),
+                Cctx::None => None,
+            };
+            let resolver = |recv: &str, method: &str| {
+                let cd = match var_tys.get(recv) {
+                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci)) => Some(&classes[*ci]),
+                    _ if recv == "self" => cctx_class,
+                    _ => None,
+                };
+                match cd.and_then(|cd| cd.methods.iter().find(|m| m.f.name == method)) {
+                    Some(m) => m.self_kind == SelfKind::Mut,
+                    // Unresolvable receiver: over-approximate.
+                    None => true,
+                }
+            };
+            collect_assigned(body, &mut havoc_set, &resolver);
+        }
         // Cascade: symbolic values referring to havocked names die too.
         loop {
             let mut grew = false;
@@ -2468,12 +2491,24 @@ impl<'a> Generator<'a> {
     }
 }
 
-pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+/// Whether a method call mutates its receiver. Answering this needs the
+/// class table, which not every caller of `collect_assigned` has; those
+/// that do not pass [`ANY_RECV_MUTATES`] and over-approximate.
+pub type MutRecv<'a> = &'a dyn std::ops::Fn(&str, &str) -> bool;
+
+/// Conservative resolver: every method call may mutate its receiver.
+pub const ANY_RECV_MUTATES: MutRecv<'static> = &|_, _| true;
+
+pub fn collect_assigned(
+    stmts: &[Stmt],
+    out: &mut std::collections::HashSet<String>,
+    mut_recv: MutRecv,
+) {
     for s in stmts {
         match s {
             Stmt::Assign { name, value, .. } => {
                 out.insert(name.clone());
-                collect_mut_borrows(value, out);
+                collect_mut_borrows(value, out, mut_recv);
             }
             Stmt::Store { array, .. } => {
                 out.insert(array.clone());
@@ -2481,38 +2516,41 @@ pub fn collect_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<Stri
             Stmt::FieldAssign { .. } | Stmt::FieldStore { .. } => {
                 out.insert("self".to_string());
             }
-            Stmt::VarDecl { .. } | Stmt::Assert(_) => {}
+            Stmt::Assert(_) => {}
             Stmt::ExprStmt(e) => {
-                if let ExprKind::MethodCall { recv, .. } = &e.kind {
-                    out.insert(recv.clone());
-                }
-                collect_mut_borrows(e, out);
+                collect_mut_borrows(e, out, mut_recv);
             }
-            Stmt::Decl { init: Some(e), .. } => {
-                collect_mut_borrows(e, out);
+            // The initializer of a declaration mutates just as much as
+            // the same call in statement position: `u64 t = c.bump();`
+            // and `var d = f(&mut b);` both write through their
+            // receiver/argument, and omitting them leaves the loop head
+            // asserting pre-loop facts about storage the body changed.
+            Stmt::Decl { init: Some(e), .. } | Stmt::VarDecl { init: e, .. } => {
+                collect_mut_borrows(e, out, mut_recv);
             }
             Stmt::Return { value: Some(e), .. } => {
-                collect_mut_borrows(e, out);
+                collect_mut_borrows(e, out, mut_recv);
             }
             Stmt::If {
                 then_block,
                 else_block,
                 ..
             } => {
-                collect_assigned(then_block, out);
+                collect_assigned(then_block, out, mut_recv);
                 if let Some(eb) = else_block {
-                    collect_assigned(eb, out);
+                    collect_assigned(eb, out, mut_recv);
                 }
             }
-            Stmt::While { body, .. } => collect_assigned(body, out),
+            Stmt::While { body, .. } => collect_assigned(body, out, mut_recv),
             _ => {}
         }
     }
 }
 
 /// `&mut a` anywhere inside an expression means `a` may be mutated by a
-/// call — conservative marking for loop havoc.
-fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
+/// call — conservative marking for loop havoc. A `&mut self` method call
+/// marks its receiver for the same reason.
+fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mut_recv: MutRecv) {
     match &e.kind {
         ExprKind::Borrow { array, mutable, .. } => {
             if *mutable {
@@ -2523,36 +2561,44 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>) {
         | ExprKind::Widen { arg: operand, .. }
         | ExprKind::Narrow { arg: operand, .. }
         | ExprKind::IsSome { operand }
-        | ExprKind::OptValue { operand } => collect_mut_borrows(operand, out),
+        | ExprKind::OptValue { operand } => collect_mut_borrows(operand, out, mut_recv),
         ExprKind::TraitCall { args, .. } => {
             for a in args {
-                collect_mut_borrows(a, out);
+                collect_mut_borrows(a, out, mut_recv);
             }
         }
         ExprKind::ClassField { .. } | ExprKind::ClassFieldLen { .. } => {}
-        ExprKind::ClassFieldIndex { index, .. } => collect_mut_borrows(index, out),
-        ExprKind::SomeE(inner) => collect_mut_borrows(inner, out),
+        ExprKind::ClassFieldIndex { index, .. } => collect_mut_borrows(index, out, mut_recv),
+        ExprKind::SomeE(inner) => collect_mut_borrows(inner, out, mut_recv),
         ExprKind::Binary { lhs, rhs, .. } => {
-            collect_mut_borrows(lhs, out);
-            collect_mut_borrows(rhs, out);
+            collect_mut_borrows(lhs, out, mut_recv);
+            collect_mut_borrows(rhs, out, mut_recv);
         }
-        ExprKind::Call { args, .. }
-        | ExprKind::CtorCall { args, .. }
-        | ExprKind::MethodCall { args, .. } => {
+        ExprKind::MethodCall {
+            recv, method, args, ..
+        } => {
+            if mut_recv(recv, method) {
+                out.insert(recv.clone());
+            }
             for a in args {
-                collect_mut_borrows(a, out);
+                collect_mut_borrows(a, out, mut_recv);
+            }
+        }
+        ExprKind::Call { args, .. } | ExprKind::CtorCall { args, .. } => {
+            for a in args {
+                collect_mut_borrows(a, out, mut_recv);
             }
         }
         ExprKind::AllocArray { len, init, .. } => {
-            collect_mut_borrows(len, out);
-            collect_mut_borrows(init, out);
+            collect_mut_borrows(len, out, mut_recv);
+            collect_mut_borrows(init, out, mut_recv);
         }
         ExprKind::Index { index, .. } | ExprKind::SelfFieldIndex { index, .. } => {
-            collect_mut_borrows(index, out)
+            collect_mut_borrows(index, out, mut_recv)
         }
         ExprKind::ArrayLit(elems) => {
             for el in elems {
-                collect_mut_borrows(el, out);
+                collect_mut_borrows(el, out, mut_recv);
             }
         }
         _ => {}

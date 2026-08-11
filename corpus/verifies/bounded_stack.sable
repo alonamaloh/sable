@@ -41,3 +41,48 @@ fn demo() {
     s.push(7);
     s.pop();
 }
+
+// A `&mut self` method inside a loop: the receiver is havocked at the
+// loop head, so what the caller knows about it afterwards is exactly
+// what the loop invariant says — and the invariant is carried by the
+// method's own post, one iteration at a time. The call sits in a
+// declaration initializer, which mutates just as much as the same call
+// in statement position.
+pub class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    /// post result = self.n
+    fn bump(&mut self) -> u64 {
+        self.n = self.n + 1;
+        return self.n;
+    }
+
+    /// post result = self.n
+    fn get(&self) -> u64 {
+        return self.n;
+    }
+}
+
+/// post result = 3
+pub fn count_to_three() -> u64 {
+    var mut c = Counter::zero();
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant c.n = i
+    /// variant 3 - i
+    while (i < 3) {
+        u64 seen = c.bump();
+        i = i + 1;
+    }
+    u64 r = c.get();
+    return r;
+}
