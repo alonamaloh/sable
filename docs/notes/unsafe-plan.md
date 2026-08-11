@@ -1528,33 +1528,62 @@ already marked optional for the prototype), and any real ABI. Nothing is compile
 or linked; what this rung establishes is the contract shape and the trust
 bookkeeping.
 
-### U6 — POSIX-shaped handles and scripted worlds
+### U6 — POSIX-shaped handles and scripted worlds *(done 2026-08-11, ADR 0028)*
 
-Add built-in or minimal user-definable non-memory resources sufficient for:
+Two non-memory resources: an `OpenFile` is the authority to use one descriptor
+(its *position* in the view, because that is where POSIX puts it), and a
+`PosixWorld` is the outside. **Any foreign operation that touches global state
+receives the world explicitly**, which is what replaces a `modifies` clause over
+the universe — and it means a caller can tell from a signature alone whether a
+function can reach outside at all.
 
-```text
-OpenFile
-PosixWorld
-```
+Authority for a descriptor is carved out of the world that has descriptors:
+`open_file(&mut w, fd)`, with "is it really open" as a *precondition*. Same
+division as `split_off` — the checker tracks tokens, the VCs track geometry, and
+the state of the outside is geometry. `posix_world(script)` is the one place
+authority appears from nothing, so the checker confines it to `test_` functions;
+the script is what makes external behaviour something a test *author* controls
+(one script shortens the second read, another fails the first), and the corpus
+checks that a failed read leaves the buffer and the position exactly where they
+were.
 
-Implement safe wrappers for `read`, `write`, and `close` against test stubs
-before binding a real libc.
+Handles are passed explicitly rather than owned by an RAII class, as this note
+sequenced. `close` consumes the `OpenFile`, so a double close and a read after
+close are both checker errors at the second use.
 
-**Handles are passed explicitly here, not owned by an RAII class**
-(`fn close(i32 fd, resource OpenFile open)`). A `File` class whose destructor
-closes the handle needs non-empty `deinit` and the destruction semantics above,
-which is U7a work; forgetting to call `close` leaks a descriptor, which is
-exactly what affine-not-linear authority permits and what `#[must_consume]`
-later diagnoses.
+Three findings:
 
-Exit criteria:
+- **The exposure obligation caught the extern contract being
+  under-specified**: a `read` post saying "these bytes came from the stream" says
+  nothing about whether they are *bytes*, so the caller's `[u8]` could not be
+  reconstructed. A world's stream is now a byte stream by well-formedness, stated
+  for *every* index — off-the-end junk is our modelling choice as much as the
+  stream is, and choosing it to be a byte removes a window premise from every
+  read contract.
+- **U4's "state effects functionally" lesson extends to foreign contracts.** The
+  destination is one equation over `SpanView.fillFrom`, and since `n = 0` leaves
+  every byte where it was, a short read and a failed read need no case analysis.
+  Written as three clauses it needed two nested splits and did not close.
+- **A wrapper that hides the world must say what it preserved.** `read_twice`
+  could not prove its second read's precondition until `read_into`'s post said
+  the handle survived — found by writing the second caller.
 
-- `close` consumes `OpenFile` exactly once;
-- read mutates only the passed buffer and world/file state;
-- short reads and errors are represented in the contract;
-- `sable test` can script external input and failures;
-- resource/extern assumptions appear in the manifest;
-- no retained pointer is permitted.
+**The honest cost: this is the first rung whose safe wrapper needs a hand proof.**
+`read_into` carries a three-line `discharge` on the exposure exit — not on its own
+contract, which verifies automatically. `copy_prefix` needed nothing; a foreign
+contract whose effect depends on an unpredictable outcome puts a case analysis in
+front of the reconstruction. The tempting fix, a prelude lemma shaped to this one
+signature, would be a prelude that knows about `posix_read`, which is worse than a
+visible discharge in the subject that needs it.
+
+Also structural rather than a gap: **resource-view contracts are not
+monitorable**, because a view is ghost and at runtime there is nothing to look at.
+The verifier covers those; the monitor covers how many bytes arrived and which
+ones, and the test file carries `expect-skip` fences saying so.
+
+Deferred with reasons: `open` (it needs a descriptor *and* authority — a product
+type; the two-step carve is what avoids one) and `write` (symmetric to `read`, no
+new question), plus interruption, partial writes, and any real libc binding.
 
 ### U7a — destruction semantics and resource fields
 
