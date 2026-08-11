@@ -1,0 +1,21 @@
+// expect-error: resource.use_after_move
+// Reading through a handle that was closed is the same error at a
+// different call: the authority went with the close.
+
+/// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
+/// post #[label(world)] w.data = (old w).data ∧ w.fds = (old w).fds
+extern "C" #[audit(id := "posix.close.v1", reason := "test stub")]
+fn posix_close(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) -> i32;
+/// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
+/// post #[label(bound)] result ≤ n
+extern "C" #[audit(id := "posix.read.v1", reason := "test stub")]
+fn posix_read(i32 fd, raw<u8> p, u64 n, resource &mut RawSpan buf,
+              resource &mut OpenFile fh, resource &mut PosixWorld w) -> i64;
+
+/// pre  w.isOpen fd ∧ fh.fd = fd
+fn read_after_close(i32 fd, raw<u8> p, resource &mut RawSpan buf,
+                    resource OpenFile fh, resource &mut PosixWorld w) -> i64 {
+    i32 c = posix_close(fd, fh, &mut w);
+    i64 got = posix_read(fd, p, 1, &mut buf, &mut fh, &mut w);
+    return got;
+}

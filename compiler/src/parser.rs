@@ -2926,6 +2926,8 @@ fn is_reserved_name(name: &str) -> bool {
         "alloc_array",
         "split_off",
         "join",
+        "open_file",
+        "posix_world",
         "raw_offset",
         "raw_load8",
         "raw_store8",

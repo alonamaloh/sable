@@ -1,0 +1,15 @@
+// expect-error: resource.use_after_move
+// `close` consumes the `OpenFile` exactly once. A second close is a
+// use-after-move — a checker error, not a runtime check, which is the
+// whole point of the handle being affine.
+
+/// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
+/// post #[label(world)] w.data = (old w).data ∧ w.fds = (old w).fds
+extern "C" #[audit(id := "posix.close.v1", reason := "test stub")]
+fn posix_close(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) -> i32;
+
+/// pre  w.isOpen fd ∧ fh.fd = fd
+fn double_close(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) {
+    i32 a = posix_close(fd, fh, &mut w);
+    i32 b = posix_close(fd, fh, &mut w);
+}

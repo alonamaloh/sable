@@ -70,6 +70,7 @@ pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<Tes
                 fuel: FUEL,
                 skipped: Vec::new(),
                 raw: RawHeap::default(),
+                world: None,
             };
             let outcome = interp.call(test, Vec::new()).map(|_| ()).map_err(|trap| {
                 let (file, line, col) = mods.locate(trap.span.start);
@@ -103,6 +104,7 @@ pub fn run_fn(
         fuel: FUEL,
         skipped: Vec::new(),
         raw: RawHeap::default(),
+        world: None,
     };
     interp.call(f, Vec::new()).map_err(|trap| {
         if trap.undef {
@@ -126,6 +128,9 @@ struct Interp<'a> {
     fuel: u64,
     skipped: Vec<(String, String)>,
     raw: RawHeap,
+    /// `None` until a test asks for one. A program cannot conjure the
+    /// world; only `posix_world` can, and only in a test.
+    world: Option<PosixWorld>,
 }
 
 /// The interpreter's raw heap. It mirrors the SVM's: a fresh-provenance
@@ -163,6 +168,74 @@ impl RawHeap {
         } else {
             None
         }
+    }
+}
+
+/// The scripted external world `sable test` plays against.
+///
+/// A contract cannot predict a short read or an I/O error, so those live
+/// here and never in the view (ADR 0028). The `script` argument to
+/// `posix_world` selects the schedule, which is what makes external
+/// behaviour something a test *author* controls rather than something that
+/// happens to them.
+struct PosixWorld {
+    /// The byte stream descriptors read from, indexed by absolute position.
+    data: Vec<i128>,
+    /// How many descriptors the world has handed out.
+    fds: i128,
+    /// Which read attempts misbehave, by 0-based call index: `Short(k)`
+    /// transfers `k` bytes, `Fail(e)` returns `-e`.
+    schedule: Vec<ReadOutcome>,
+    /// How many reads have happened.
+    reads: usize,
+    /// Positions, by descriptor.
+    pos: Vec<i128>,
+}
+
+#[derive(Clone, Copy)]
+enum ReadOutcome {
+    Full,
+    Short(i128),
+    Fail(i128),
+}
+
+impl PosixWorld {
+    /// Scripts are numbered so a test can name one. Each is deliberately
+    /// small and deliberately nasty: the interesting cases are the ones a
+    /// caller is tempted to assume away.
+    fn scripted(script: i128) -> PosixWorld {
+        let data: Vec<i128> = (0..16).map(|i| (i * 7 + 3) % 256).collect();
+        let schedule = match script {
+            // Everything succeeds.
+            0 => vec![],
+            // The second read is short by half.
+            1 => vec![ReadOutcome::Full, ReadOutcome::Short(2)],
+            // The first read fails outright (EIO).
+            2 => vec![ReadOutcome::Fail(5)],
+            // Short, then a failure, then fine again.
+            _ => vec![
+                ReadOutcome::Short(1),
+                ReadOutcome::Fail(5),
+                ReadOutcome::Full,
+            ],
+        };
+        PosixWorld {
+            data,
+            fds: 3,
+            schedule,
+            reads: 0,
+            pos: vec![0; 3],
+        }
+    }
+
+    fn next_outcome(&mut self) -> ReadOutcome {
+        let out = self
+            .schedule
+            .get(self.reads)
+            .copied()
+            .unwrap_or(ReadOutcome::Full);
+        self.reads += 1;
+        out
     }
 }
 
@@ -239,6 +312,82 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Ok(RtVal::Int(sum))
+            }
+            // POSIX-shaped shims against the scripted world. Short reads
+            // and failures come from the script, not from the contract:
+            // no contract can predict them, which is why a caller has to
+            // handle every outcome its post admits (ADR 0028).
+            "posix.read.v1" => {
+                let (RtVal::Int(fd), RtVal::Ptr(a, off), RtVal::Int(n)) =
+                    (args[0].clone(), args[1].clone(), args[2].clone())
+                else {
+                    unreachable!("checked: (i32, raw<u8>, u64)")
+                };
+                let Some(w) = self.world.as_mut() else {
+                    return Err(Trap {
+                        undef: false,
+                        message: format!("`{}` called with no world in play", f.name),
+                        span,
+                    });
+                };
+                if fd < 0 || fd >= w.fds {
+                    return Err(Trap {
+                        undef: true,
+                        message: format!("`{}`: descriptor {fd} was never handed out", f.name),
+                        span,
+                    });
+                }
+                let want = match w.next_outcome() {
+                    ReadOutcome::Full => n,
+                    ReadOutcome::Short(k) => k.min(n),
+                    ReadOutcome::Fail(e) => return Ok(RtVal::Int(-e)),
+                };
+                let pos = w.pos[fd as usize];
+                let avail = (w.data.len() as i128 - pos).max(0);
+                let got = want.min(avail);
+                let bytes: Vec<i128> = (0..got)
+                    .map(|i| w.data[(pos + i) as usize])
+                    .collect();
+                w.pos[fd as usize] = pos + got;
+                for (i, b) in bytes.iter().enumerate() {
+                    let at = off + i as i128;
+                    if self.raw.live_at(a, at).is_none() {
+                        return Err(Trap {
+                            undef: true,
+                            message: format!("`{}` writes out of bounds: {a}+{at}", f.name),
+                            span,
+                        });
+                    }
+                    self.raw
+                        .allocs
+                        .get_mut(&a)
+                        .expect("live_at checked")
+                        .bytes[at as usize] = Some(*b);
+                }
+                Ok(RtVal::Int(got))
+            }
+            "posix.close.v1" => {
+                let RtVal::Int(fd) = args[0].clone() else {
+                    unreachable!("checked: i32")
+                };
+                let Some(w) = self.world.as_mut() else {
+                    return Err(Trap {
+                        undef: false,
+                        message: format!("`{}` called with no world in play", f.name),
+                        span,
+                    });
+                };
+                if fd < 0 || fd >= w.fds {
+                    return Err(Trap {
+                        undef: true,
+                        message: format!("`{}`: descriptor {fd} was never handed out", f.name),
+                        span,
+                    });
+                }
+                // Closing twice is a *checker* error — the `OpenFile` is
+                // affine — so the shim need not police it, and the fact
+                // that it cannot is the point: the discipline is static.
+                Ok(RtVal::Int(0))
             }
             other => Err(Trap {
                 undef: false,
@@ -877,8 +1026,16 @@ impl<'a> Interp<'a> {
             ExprKind::Var(name) => Ok(frame.vars[name.as_str()].clone()),
             // Resource transformations redistribute authority, which is
             // a static notion: at runtime there is nothing to move and
-            // nothing to return (ADR 0024).
-            ExprKind::ResOp { .. } => Ok(RtVal::Unit),
+            // nothing to return (ADR 0024). `posix_world` is the
+            // exception: the *script* it selects is real runtime state,
+            // and a test controlling it is what "scripted world" means.
+            ExprKind::ResOp { op, args, .. } => {
+                if let ResOp::TestWorld = op {
+                    let script = self.eval_int(&args[0], frame)?;
+                    self.world = Some(PosixWorld::scripted(script));
+                }
+                Ok(RtVal::Unit)
+            }
             // The raw operations. Each classification here must match the
             // machine's: a trap is a trap, and everything the SVM calls
             // `undef` is a trap with a precise message — the reference

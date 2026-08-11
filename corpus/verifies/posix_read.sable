@@ -1,0 +1,90 @@
+// POSIX-shaped handles and an explicit world (ADR 0028).
+//
+// Two non-memory resources: an `OpenFile` is the authority to use one
+// descriptor, and a `PosixWorld` is the outside. Any foreign operation
+// that touches global state must receive the world *explicitly* — that is
+// what replaces a `modifies` clause over the universe, and it is why a
+// caller can tell, from a signature alone, whether a function can reach
+// the outside at all.
+//
+// Handles are passed explicitly rather than owned by an RAII class: a
+// `File` whose destructor closes the descriptor needs non-empty `deinit`
+// and destruction semantics, which is later work. Forgetting to `close`
+// leaks a descriptor, which is exactly what affine-not-linear authority
+// permits.
+//
+// What the view deliberately does *not* model: whether the next read is
+// short, and whether it fails. No contract can predict those, so they live
+// in the machine and the monitor, and a caller has to handle every outcome
+// its post admits.
+
+// `read` reports how many bytes it transferred, or a negative errno. Both
+// outcomes are in the contract, because neither is predictable.
+/// pre  #[label(names)] p.alloc = buf.alloc ∧ p.off = buf.off
+/// pre  #[label(fits)]  n ≤ buf.len
+/// pre  #[label(fh)]  w.isOpen fd ∧ fh.fd = fd
+/// post #[label(bound)] result ≤ n
+/// post #[label(shape)] buf.alloc = (old buf).alloc ∧ buf.off = (old buf).off
+///          ∧ buf.len = (old buf).len
+/// post #[label(dest)]  buf = (old buf).fillFrom
+///          (if 0 ≤ result then result else 0) w.data (old fh).pos
+/// post #[label(pos)]   0 ≤ result → fh.pos = (old fh).pos + result
+/// post #[label(errpos)] result < 0 → fh.pos = (old fh).pos
+/// post #[label(fd)]    fh.fd = (old fh).fd
+/// post #[label(data)]  w.data = (old w).data ∧ w.fds = (old w).fds
+pub extern "C" #[audit(id := "posix.read.v1", reason := "test stub over a scripted world")]
+fn posix_read(i32 fd, raw<u8> p, u64 n, resource &mut RawSpan buf,
+              resource &mut OpenFile fh, resource &mut PosixWorld w) -> i64;
+
+/// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
+/// post #[label(world)] w.data = (old w).data ∧ w.fds = (old w).fds
+pub extern "C" #[audit(id := "posix.close.v1", reason := "test stub over a scripted world")]
+fn posix_close(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) -> i32;
+
+// The safe wrapper. Reading into a `[u8]` is the exposure again; what is
+// new is that the result may be short or negative, and the contract has to
+// let the caller find out which.
+// A wrapper that hides the world has to say what it preserved, or its own
+// caller cannot read twice. `read_twice` is what found this missing.
+/// pre  #[label(fh)]    w.isOpen fd ∧ fh.fd = fd
+/// post #[label(bound)] result ≤ dst.len
+/// post #[label(still)] fh.fd = (old fh).fd ∧ w.fds = (old w).fds
+pub fn read_into(i32 fd, &mut [u8] dst, resource &mut OpenFile fh,
+                 resource &mut PosixWorld w) -> i64 {
+    mut i64 got = 0;
+    unsafe expose &mut dst as (p, resource m) {
+        got = posix_read(fd, p, dst.len, &mut m, &mut fh, &mut w);
+    }
+    return got;
+}
+
+// The one hand proof in this rung, and worth naming: a *foreign* read
+// contract needs it where `copy_prefix` needed nothing. Three lines, on
+// the exposure's exit obligation rather than on the wrapper's own
+// contract — the bytes that arrived are bytes because the world's stream
+// is a byte stream, and the rest of the buffer was already fine.
+/// discharge read_into.expose.dst.bytes by
+///   subst_eqs
+///   exact Sable.SpanView.fillFrom_reconstructible h_m_recon
+///     (fun k => (And.right (And.right h_w_wf_2)) k)
+
+// `close` consumes the `OpenFile`: after this the authority is gone, and
+// the checker — not a runtime check — is what stops a second close.
+/// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
+pub fn close_it(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) {
+    i32 r = posix_close(fd, fh, &mut w);
+}
+
+// Reading twice advances the position, and the *caller* is the one who has
+// to notice a short read: the contract will not pretend otherwise.
+/// pre  #[label(fh)]  w.isOpen fd ∧ fh.fd = fd
+/// post #[label(bound)] result ≤ dst.len
+pub fn read_twice(i32 fd, &mut [u8] dst, resource &mut OpenFile fh,
+                  resource &mut PosixWorld w) -> i64 {
+    i64 a = read_into(fd, &mut dst, &mut fh, &mut w);
+    if (a < 0) {
+        return a;
+    }
+    i64 b = read_into(fd, &mut dst, &mut fh, &mut w);
+    return b;
+}

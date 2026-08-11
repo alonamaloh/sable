@@ -2014,8 +2014,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let op = *op;
             let op_span = *op_span;
             let arity = match op {
-                ResOp::SplitOff => 2,
-                ResOp::Join => 2,
+                ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf => 2,
+                ResOp::TestWorld => 1,
             };
             if args.len() != arity {
                 return Err(Diagnostic {
@@ -2061,6 +2061,42 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         mark_moved(ctx, arg)?;
                     }
                     want
+                }
+                // `open_file(&mut w, fd)` — the authority to use a
+                // descriptor, carved out of the world that handed it out.
+                // Whether the descriptor is really open is a *precondition*,
+                // not a checker rule: the checker tracks tokens, not the
+                // state of the outside world (ADR 0028).
+                ResOp::OpenFileOf => {
+                    let want = Ty::ResRef(ResKind::PosixWorld, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], want)?;
+                    check_expr(ctx, &mut args[0], Some(want))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::I32)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::OpenFile)
+                }
+                // `posix_world(script)` — the one place authority appears
+                // from nothing, so it is confined to tests. A program that
+                // could conjure a world could conjure any authority the
+                // world hands out.
+                ResOp::TestWorld => {
+                    if !ctx.in_test {
+                        return Err(Diagnostic {
+                            name: "posix.world_outside_test".into(),
+                            title: "`posix_world` exists only in tests".into(),
+                            span: op_span,
+                            label: "a program cannot conjure the outside world".into(),
+                            notes: vec![(
+                                "note".into(),
+                                "outside a test the world arrives as a parameter, from \
+                                 whoever is entitled to it; a program that could make \
+                                 one could make any authority the world hands out"
+                                    .into(),
+                            )],
+                        });
+                    }
+                    check_expr(ctx, &mut args[0], Some(Ty::Int(IntTy::U64)))?;
+                    Ty::Res(ResKind::PosixWorld)
                 }
             }
         }

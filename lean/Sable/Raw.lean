@@ -345,6 +345,43 @@ theorem SpanView.ofSeq_reconstructible (a : Int) (s : Seq Int)
   obtain ⟨hlo, hhi⟩ := h k h0 (by simpa using hk)
   exact ⟨by simp, by simpa using hlo, by simpa using hhi⟩
 
+/-- A destination after a transfer of `n` bytes from `src`, starting from_
+`from_`. One equation covers a short read and a failed one alike: `n = 0`
+leaves every byte where it was, so a contract stating its effect this way
+needs no case analysis on the outcome — the same lesson `write` taught,
+applied to a *foreign* contract (ADR 0028). -/
+def SpanView.fillFrom (v : SpanView) (n : Int) (src : Seq Int) (from_ : Int) : SpanView :=
+  { v with
+    bytes := ⟨v.bytes.len, fun k =>
+      if 0 ≤ k ∧ k < n then .init (src.get (from_ + k)) else v.bytes.get k⟩ }
+
+@[simp] theorem SpanView.fillFrom_alloc (v : SpanView) (n : Int) (src : Seq Int) (from_ : Int) :
+    (v.fillFrom n src from_).alloc = v.alloc := rfl
+
+@[simp] theorem SpanView.fillFrom_off (v : SpanView) (n : Int) (src : Seq Int) (from_ : Int) :
+    (v.fillFrom n src from_).off = v.off := rfl
+
+@[simp] theorem SpanView.fillFrom_len (v : SpanView) (n : Int) (src : Seq Int) (from_ : Int) :
+    (v.fillFrom n src from_).len = v.len := rfl
+
+@[simp] theorem SpanView.fillFrom_bytes_len (v : SpanView) (n : Int) (src : Seq Int) (from_ : Int) :
+    (v.fillFrom n src from_).bytes.len = v.bytes.len := rfl
+
+@[simp] theorem SpanView.fillFrom_get (v : SpanView) (n : Int) (src : Seq Int) (from_ k : Int) :
+    (v.fillFrom n src from_).bytes.get k =
+      if 0 ≤ k ∧ k < n then .init (src.get (from_ + k)) else v.bytes.get k := rfl
+
+/-- A transfer of bytes leaves the destination reconstructible: the bytes
+that arrived are bytes, and the rest were already fine. -/
+theorem SpanView.fillFrom_reconstructible {v : SpanView} {n from_ : Int} {src : Seq Int}
+    (hv : v.reconstructible) (hsrc : ∀ k, 0 ≤ src.get k ∧ src.get k ≤ 255) :
+    (v.fillFrom n src from_).reconstructible := by
+  intro k h0 hk
+  simp only [SpanView.fillFrom_get]
+  split
+  · exact ⟨by simp, (hsrc (from_ + k)).1, (hsrc (from_ + k)).2⟩
+  · exact hv k h0 (by simpa using hk)
+
 /-- Carving preserves reconstructibility: a sub-span's bytes are a
 subrange of the whole's. One lemma per operation is the whole cost of
 keeping an exposure's exit automatic — and this is why `split_off` inside

@@ -1,0 +1,10 @@
+// expect-error: posix.world_outside_test
+// A program cannot conjure the outside world. Outside a test, the world
+// arrives as a parameter from whoever is entitled to it — a program that
+// could make one could make any authority the world hands out.
+
+
+fn sneak() -> i64 {
+    mut resource PosixWorld w = posix_world(0);
+    return 0;
+}

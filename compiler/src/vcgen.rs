@@ -2140,6 +2140,51 @@ impl<'a> Generator<'a> {
                         );
                         Val::View(whole)
                     }
+                    // `open_file(&mut w, fd)`: the world hands out the
+                    // authority. Whether the descriptor is open is a VC,
+                    // not a checker fact — the checker tracks tokens, and
+                    // the outside world is not one of them (ADR 0028).
+                    ResOp::OpenFileOf => {
+                        let Val::View(w) = self.eval(&args[0]) else {
+                            unreachable!("checked: world borrow")
+                        };
+                        let Val::Int(fd) = self.eval(&args[1]) else {
+                            unreachable!("checked: i32 descriptor")
+                        };
+                        let goal = format!("Sable.PosixWorldView.isOpen ({w}) {fd}");
+                        let ob = self.obligation(
+                            &format!("{}.open_file.{}", self.fname, slug(&fd)),
+                            "`open_file` needs a descriptor the world has handed out".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let f = self.hinted_sym("_file", hint);
+                        self.binders
+                            .push((f.clone(), ResKind::OpenFile.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_open", f.trim_start_matches('_')),
+                            format!("({f}).fd = {fd} ∧ ({f}).pos = 0"),
+                        );
+                        Val::View(f)
+                    }
+                    // `posix_world(script)`: a test's world. The script
+                    // selects which external behaviour the monitor plays
+                    // out, and the *view* says nothing about it — no
+                    // contract can predict a short read.
+                    ResOp::TestWorld => {
+                        let Val::Int(_script) = self.eval(&args[0]) else {
+                            unreachable!("checked: u64 script")
+                        };
+                        let w = self.hinted_sym("_world", hint);
+                        self.binders
+                            .push((w.clone(), ResKind::PosixWorld.view_ty().into()));
+                        for (h, prop) in view_wf_hyps(ResKind::PosixWorld, &w, &w) {
+                            self.push_hyp_unique(h, prop);
+                        }
+                        Val::View(w)
+                    }
                 }
             }
             ExprKind::Borrow { array, field, .. } => {
@@ -3416,6 +3461,21 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         ResKind::RawSpan => vec![(
             format!("h_{name}_wf"),
             format!("0 ≤ {binder}.len ∧ {binder}.len ≤ {binder}.bytes.len"),
+        )],
+        // A descriptor is nonnegative and a position never goes backwards
+        // past the start of the file. Nothing about *which* file, and
+        // nothing about the outside world: that is the world's business.
+        ResKind::OpenFile => vec![(
+            format!("h_{name}_wf"),
+            format!("0 ≤ {binder}.fd ∧ 0 ≤ {binder}.pos"),
+        )],
+        // A world's stream is a *byte* stream. Without that, a `read`
+        // post saying "these bytes came from the stream" says nothing
+        // about whether they are bytes, and the caller's `[u8]` cannot be
+        // reconstructed from them (ADR 0028).
+        ResKind::PosixWorld => vec![(
+            format!("h_{name}_wf"),
+            format!("Sable.PosixWorldView.wf {binder}"),
         )],
     }
 }

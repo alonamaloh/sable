@@ -3,6 +3,7 @@ import Sable.IntModel
 import Sable.Auto
 import Sable.Seq
 import Sable.Raw
+import Sable.Posix
 import Sable.OptionAcc
 import Sable.Ghost
 import Sable.Perm

@@ -121,6 +121,13 @@ pub enum Ty {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResKind {
     RawSpan,
+    /// One open file description: the authority to use a descriptor, and
+    /// the position that description is at (ADR 0028).
+    OpenFile,
+    /// The external world. A foreign operation that touches global state
+    /// must receive this explicitly, which is what replaces a free-form
+    /// `modifies` clause over the outside.
+    PosixWorld,
 }
 
 /// The sealed transformations of resource authority. These are not
@@ -135,6 +142,15 @@ pub enum ResOp {
     /// `join(a, b)` — consumes two adjacent spans of one allocation and
     /// returns authority over their concatenation.
     Join,
+    /// `open_file(&mut w, fd) -> resource OpenFile` — carve the authority
+    /// to use a descriptor out of the world that handed it out. Authority
+    /// for a descriptor has to come from *somewhere*, and the world is the
+    /// thing that has descriptors (ADR 0028).
+    OpenFileOf,
+    /// `posix_world(script) -> resource PosixWorld` — a scripted world, for
+    /// tests only. This is the one place authority appears from nothing,
+    /// and the checker confines it to `test_` functions.
+    TestWorld,
 }
 
 impl ResOp {
@@ -142,6 +158,8 @@ impl ResOp {
         match name {
             "split_off" => Some(ResOp::SplitOff),
             "join" => Some(ResOp::Join),
+            "open_file" => Some(ResOp::OpenFileOf),
+            "posix_world" => Some(ResOp::TestWorld),
             _ => None,
         }
     }
@@ -150,6 +168,8 @@ impl ResOp {
         match self {
             ResOp::SplitOff => "split_off",
             ResOp::Join => "join",
+            ResOp::OpenFileOf => "open_file",
+            ResOp::TestWorld => "posix_world",
         }
     }
 }
@@ -212,6 +232,8 @@ impl ResKind {
     pub fn from_name(name: &str) -> Option<ResKind> {
         match name {
             "RawSpan" => Some(ResKind::RawSpan),
+            "OpenFile" => Some(ResKind::OpenFile),
+            "PosixWorld" => Some(ResKind::PosixWorld),
             _ => None,
         }
     }
@@ -219,6 +241,8 @@ impl ResKind {
     pub fn name(self) -> &'static str {
         match self {
             ResKind::RawSpan => "RawSpan",
+            ResKind::OpenFile => "OpenFile",
+            ResKind::PosixWorld => "PosixWorld",
         }
     }
 
@@ -226,6 +250,8 @@ impl ResKind {
     pub fn view_ty(self) -> &'static str {
         match self {
             ResKind::RawSpan => "Sable.SpanView",
+            ResKind::OpenFile => "Sable.OpenFileView",
+            ResKind::PosixWorld => "Sable.PosixWorldView",
         }
     }
 }

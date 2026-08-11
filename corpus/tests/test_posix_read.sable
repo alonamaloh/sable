@@ -1,0 +1,76 @@
+// Dynamic checks against a scripted world. The script is what a test
+// *author* controls: `posix_world(n)` selects a schedule of read outcomes,
+// so a short read and an I/O error are things a test can arrange rather
+// than things it has to hope for.
+//
+// Script 0 succeeds throughout. Script 1 makes the second read short.
+// Script 2 fails the first read outright.
+
+// Contracts about resource *views* are not monitorable, and that is
+// structural rather than a gap: a view is ghost (ADR 0024), so at runtime
+// there is no value for the monitor to look at. The verifier is what covers
+// these; the monitor covers the value-level halves — how many bytes
+// arrived, and which ones.
+// expect-skip: w.isOpen fd ∧ fh.fd = fd
+// expect-skip: fh.fd = (old fh).fd ∧ w.fds = (old w).fds
+
+use posix_read;
+
+/// pre x = y
+fn expect_eq(i64 x, i64 y) {
+}
+
+/// pre x = y
+fn expect_byte(u8 x, u8 y) {
+}
+
+// The stream is `(i * 7 + 3) % 256`, so a full four-byte read at the start
+// is 3, 10, 17, 24.
+fn test_full_read() {
+    mut resource PosixWorld w = posix_world(0);
+    mut resource OpenFile fh = open_file(&mut w, 0);
+    mut [u8] buf = [0, 0, 0, 0];
+    i64 got = read_into(0, &mut buf, &mut fh, &mut w);
+    expect_eq(got, 4);
+    expect_byte(buf[0], 3);
+    expect_byte(buf[1], 10);
+    expect_byte(buf[2], 17);
+    expect_byte(buf[3], 24);
+    close_it(0, fh, &mut w);
+}
+
+// A short read: the second call transfers two bytes, not four. The bytes
+// past the transfer are the buffer's own — untouched, as the contract says.
+fn test_short_read() {
+    mut resource PosixWorld w = posix_world(1);
+    mut resource OpenFile fh = open_file(&mut w, 0);
+    mut [u8] buf = [9, 9, 9, 9];
+    i64 first = read_into(0, &mut buf, &mut fh, &mut w);
+    expect_eq(first, 4);
+    i64 second = read_into(0, &mut buf, &mut fh, &mut w);
+    expect_eq(second, 2);
+    // Position advanced by 4 then 2: bytes 4 and 5 of the stream.
+    expect_byte(buf[0], 31);
+    expect_byte(buf[1], 38);
+    // Beyond the short transfer, the previous read's bytes remain.
+    expect_byte(buf[2], 17);
+    expect_byte(buf[3], 24);
+    close_it(0, fh, &mut w);
+}
+
+// A failing read: negative result, buffer untouched, position unmoved.
+fn test_failing_read() {
+    mut resource PosixWorld w = posix_world(2);
+    mut resource OpenFile fh = open_file(&mut w, 0);
+    mut [u8] buf = [9, 9];
+    i64 got = read_into(0, &mut buf, &mut fh, &mut w);
+    expect_eq(got, -5);
+    expect_byte(buf[0], 9);
+    expect_byte(buf[1], 9);
+    // The position did not move, so the next read starts at the beginning.
+    i64 again = read_into(0, &mut buf, &mut fh, &mut w);
+    expect_eq(again, 2);
+    expect_byte(buf[0], 3);
+    expect_byte(buf[1], 10);
+    close_it(0, fh, &mut w);
+}
