@@ -1,0 +1,14 @@
+// expect-error: expose.brand_escapes
+// The brand has to survive an inferred binding as well as a typed one:
+// `var q = raw_offset(p, 0);` names the loan's storage exactly as
+// `raw<u8> q = ...` does, and a declaration that dropped the brand would
+// launder it in one step.
+
+fn stash(&[u8] a) -> u8 {
+    mut raw<u8> outer;
+    unsafe expose &a as (p, resource m) {
+        var q = raw_offset(p, 0);
+        outer = q;
+    }
+    return 0;
+}

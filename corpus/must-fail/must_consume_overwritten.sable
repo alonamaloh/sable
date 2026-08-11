@@ -1,0 +1,23 @@
+// expect-error: resource.abandoned
+// Overwriting a place that still holds a `#[must_consume]` token drops its
+// authority on the floor — the same leak as walking away from it, and the
+// obligation the new value carries is not the one that was owed. Consume
+// what is there first: that empties the place, and an empty place may be
+// given a new value.
+
+class Twin {
+    #[must_consume] resource RawSpan required;
+    resource RawSpan other;
+
+    /// pre  #[label(a)] a.len ≥ 0
+    /// pre  #[label(b)] b.len ≥ 0
+    init of(resource RawSpan a, resource RawSpan b) {
+        self.required = a;
+        self.other = b;
+    }
+
+    deinit {
+        mut resource RawSpan t = self.required;
+        t = self.other;
+    }
+}

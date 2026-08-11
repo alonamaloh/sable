@@ -67,3 +67,11 @@ fn test_field_drops() {
     var a = Loud::make();
     var c = Crate::of(a);
 }
+
+// A discarded class-valued result is a temporary that nothing names. It
+// is still an owned value, and it dies at the end of the statement that
+// made it — the alternative is a class whose destructor never runs
+// because nobody wrote down its name.
+fn test_discarded_temporary_drops() {
+    produce_loud();
+}

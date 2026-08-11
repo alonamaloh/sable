@@ -131,6 +131,62 @@ carries both halves:
   live in `corpus/verifies`, because a verifying file may not contain a
   deliberately failing call.
 
+## Second pass: four places the sweep did not reach
+
+A follow-up review of the first pass found four more, each the same rule
+missing from one more spot. They are recorded here rather than in a new
+ADR because they decide nothing new — they are what "every sink" and
+"exactly once" already meant.
+
+**A marker block is not a scope, and now the interpreter agrees.**
+`unsafe { ... }` and an exposure body license operations; the checker
+keeps their locals in the enclosing function (ADR 0026). The interpreter
+ran them through the scoping `exec_block` and destroyed class values at
+the closing brace, so a value declared inside one and used after it was
+accepted by the checker and **panicked** the monitor. The two sides cannot
+differ, and the checker's answer is the language's: `exec_open_block`
+runs a marker block's statements while its declarations accumulate in the
+enclosing scope's drop list.
+
+**An inferred declaration lost the loan brand.** `raw<u8> q = raw_offset(p, 0)`
+computed the brand; `var q = raw_offset(p, 0)` stored `branded: false`, so
+one inferred binding laundered what the recursive `brand_of` had just been
+taught to see. The comment above it claimed the opposite, which is the
+failure mode the corpus exists to catch.
+
+**A discarded class-valued result was never destroyed.** `produce();` as
+an expression statement built a temporary and dropped the value on the
+floor without running its destructor. A temporary is an owned value with
+no place, so it is the one drop that cannot go through `drop_place`: it
+dies at the end of the statement that made it. Rejecting class-valued
+expression statements would also have closed it, but destroying the
+temporary is the rule the rest of the language already follows.
+
+**`#[must_consume]` could be overwritten.** The obligation travelled, but
+assigning over a place that still held one silently replaced it with
+whatever the right-hand side carried. The rule is now that **a live place
+holding a must-consume token may not be assigned to**: consume it first,
+which empties the place, and an empty place may be given a new value. The
+same applies to a marked field, and marked fields now carry their marker
+in *every* member context rather than only in the destructor — which is
+also what lets a method that moves the authority into a local and
+abandons it be diagnosed.
+
+**A limitation, stated rather than implied.** Passing a marked token by
+value discharges the obligation, and the callee's parameter does not
+inherit it. So `#[must_consume]` currently means *must leave this frame*,
+not *must reach a consuming primitive*: a do-nothing sink function
+satisfies it. That is acceptable while the marker lives on a field, and it
+has to change before `SystemDealloc`, which needs the marker on a type.
+
+**The extern nonescape argument was stated too strongly** (ADR 0027, and
+repeated in the checker). "A callee that cannot return storage cannot
+retain it" is compiler-checked for a *verified* callee — Sable has no
+globals, so the pointer dies with the frame — and an **audited promise**
+for a foreign one, since nothing stops C stashing it in a foreign global.
+The rule and the code are unchanged; which side of the audited boundary
+the reasoning sits on is not. ADR 0027 carries the amendment.
+
 ## Consequences
 
 - `Ctx::place_ty` replaces the per-category place queries; `affine_kind`
@@ -162,6 +218,13 @@ carries both halves:
   is adoptable once in a world's life. Re-adoption after close would need
   the world to model closure, which the crude `0 ≤ fd < fds` view does not.
 - **Block scoping for locals.** Locals are function-wide in the checker;
-  what stops a use after its block is the initialization analysis, not a
-  scope. Nothing here needed more, but it is a real difference from the
-  interpreter, which drops at block exit.
+  what stops a use after an `if` or loop body is the initialization
+  analysis, not a scope. The interpreter drops at those braces, which
+  agrees because a value it destroyed is one the checker will not let you
+  name. Marker blocks are the case where the two really did differ, and
+  that is now fixed; a genuine scope construct is still not needed.
+- **A callee inheriting a `#[must_consume]` obligation.** The marker is on
+  a field, so passing the token by value discharges it. Making it mean
+  "reaches a consuming primitive" needs the marker on a *type*, which is
+  the same prerequisite ADR 0029 recorded and which `SystemDealloc` will
+  force.

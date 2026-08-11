@@ -605,30 +605,61 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Run a block that owns its declarations: whatever it declares is
+    /// destroyed at the closing brace, in reverse declaration order.
     fn exec_block(&mut self, stmts: &[Stmt], frame: &mut Frame) -> IResult<Flow> {
         let mut locals: Vec<String> = Vec::new();
+        let out = self.exec_stmts(stmts, frame, &mut locals);
+        // RAII: drop block-local values in reverse declaration order.
+        // A local the block moved away is no longer in its place, which is
+        // the whole reason a move removes it: the value belongs to whoever
+        // took it, and this scope has nothing left to destroy.
+        //
+        // The drops run whether the block fell off its end or returned,
+        // but not after a trap: a trapped program has stopped, and running
+        // destructors past the failure would report the *second* thing that
+        // went wrong.
+        let out = out?;
+        for name in locals.iter().rev() {
+            self.drop_place(&RtPlace::Local(name.clone()), frame)?;
+        }
+        Ok(out)
+    }
+
+    /// Run a block whose declarations belong to the *enclosing* scope.
+    ///
+    /// `unsafe { ... }` and an exposure body are markers, not scopes: the
+    /// checker keeps their locals in the function (ADR 0026), so a value
+    /// declared inside one is still live at the closing brace and must not
+    /// be destroyed there. The two sides have to agree about this, and the
+    /// checker's answer is the language's.
+    fn exec_open_block(
+        &mut self,
+        stmts: &[Stmt],
+        frame: &mut Frame,
+        locals: &mut Vec<String>,
+    ) -> IResult<Flow> {
+        self.exec_stmts(stmts, frame, locals)
+    }
+
+    fn exec_stmts(
+        &mut self,
+        stmts: &[Stmt],
+        frame: &mut Frame,
+        locals: &mut Vec<String>,
+    ) -> IResult<Flow> {
         let mut out = Flow::Normal;
         for stmt in stmts {
-            match stmt {
-                Stmt::VarDecl { name, .. } | Stmt::Decl { name, .. } => {
-                    locals.push(name.clone());
-                }
-                _ => {}
+            if let Stmt::VarDecl { name, .. } | Stmt::Decl { name, .. } = stmt {
+                locals.push(name.clone());
             }
-            match self.exec_stmt(stmt, frame)? {
+            match self.exec_stmt(stmt, frame, locals)? {
                 Flow::Normal => {}
                 ret => {
                     out = ret;
                     break;
                 }
             }
-        }
-        // RAII: drop block-local values in reverse declaration order.
-        // A local the block moved away is no longer in its place, which is
-        // the whole reason a move removes it: the value belongs to whoever
-        // took it, and this scope has nothing left to destroy.
-        for name in locals.iter().rev() {
-            self.drop_place(&RtPlace::Local(name.clone()), frame)?;
         }
         Ok(out)
     }
@@ -784,7 +815,12 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    fn exec_stmt(&mut self, stmt: &Stmt, frame: &mut Frame) -> IResult<Flow> {
+    fn exec_stmt(
+        &mut self,
+        stmt: &Stmt,
+        frame: &mut Frame,
+        locals: &mut Vec<String>,
+    ) -> IResult<Flow> {
         self.burn(stmt_span(stmt))?;
         match stmt {
             Stmt::Decl { name, init, .. } => {
@@ -805,7 +841,7 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             // `unsafe { ... }` is a marker: the block runs like any other.
-            Stmt::Unsafe { body, .. } => self.exec_block(body, frame),
+            Stmt::Unsafe { body, .. } => self.exec_open_block(body, frame, locals),
             // Exposure: copy the array's bytes into a fresh loan
             // allocation, run the body, copy the final bytes back, and
             // kill the allocation. Modelling it as a real copy is what
@@ -830,7 +866,7 @@ impl<'a> Interp<'a> {
                 // The resource has no runtime representation (ADR 0024);
                 // the binding exists so the body's names resolve.
                 frame.vars.insert(res.clone(), RtVal::Unit);
-                let flow = self.exec_block(body, frame)?;
+                let flow = self.exec_open_block(body, frame, locals)?;
                 let final_bytes = self
                     .raw
                     .allocs
@@ -862,7 +898,14 @@ impl<'a> Interp<'a> {
                 Ok(flow)
             }
             Stmt::ExprStmt(e) => {
-                self.eval(e, frame)?;
+                // A discarded class value is a temporary that nothing
+                // names, and it dies at the end of the statement that made
+                // it. It is the one owned value with no place, so it is
+                // also the one drop that cannot go through `drop_place`.
+                let v = self.eval(e, frame)?;
+                if let RtVal::Obj { class, fields } = v {
+                    self.drop_value(class, &fields, "temporary")?;
+                }
                 Ok(Flow::Normal)
             }
             Stmt::Assert(clause) => {

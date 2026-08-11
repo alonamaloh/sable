@@ -77,6 +77,18 @@ fn test_field_assign() {
     expect_eq(1, 1);
 }
 
+// `unsafe { ... }` and an exposure body are markers, not scopes: a value
+// declared inside one is destroyed at the end of the *function*, which is
+// where the checker says it dies. Destroying it at the closing brace would
+// leave the two sides disagreeing about a value that still has a name.
+fn test_marker_blocks_are_not_scopes() {
+    u64 a = unsafe_block_local();
+    mut [u8] buf = alloc_array<u8>(2, 0);
+    u64 b = exposure_body_local(&mut buf);
+    expect_eq(a, 1);
+    expect_eq(b, 1);
+}
+
 // A destructor that hands its authority on through a local: the handle
 // closes exactly once, and the descriptor was claimed exactly once.
 fn test_handle_travels() {

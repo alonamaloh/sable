@@ -82,6 +82,15 @@ convention, it is the honesty of the output.
   *return* storage cannot retain it either — its locals die with its frame.
   So only a signature returning raw or resource can launder a brand, which
   is exactly what decision 5 forbids for externs.
+
+  **Amended (ADR 0030): that argument is compiler-checked for a verified
+  callee and an audited promise for a foreign one.** Nothing stops C
+  stashing a pointer in a foreign global and using it after the call
+  returns, so for an `extern` the returnless signature does not *establish*
+  nonescape — it states it, as part of what the audit id covers. The rule
+  is unchanged and so is the code; what changes is which side of the
+  audited boundary the reasoning sits on. (Resource fields also made the
+  premise "no storage-typed fields" false outright; see ADR 0029.)
 - **`extern.generic` had to move from the checker to the parser.**
   Monomorphization drops an uninstantiated template before the checker sees
   it, and substitutes the parameters away on an instantiated one — leaving

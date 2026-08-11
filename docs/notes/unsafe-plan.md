@@ -1681,6 +1681,19 @@ that falsifies its own invariant, so a second drop traps, and
 each path destroys at all. The second cannot live in `corpus/verifies` — a
 verifying file may not contain a deliberately failing call.
 
+**A second review pass found four more of the same shape**, each the rule missing
+from one more spot, and all four are now closed: `unsafe { }` and an exposure
+body were scopes in the *interpreter* while the checker keeps their locals in the
+function (an accepted program **panicked** the monitor); an inferred `var q =
+raw_offset(p, 0)` dropped the loan brand a typed declaration computes; a
+discarded class-valued call result was a temporary nobody destroyed; and a live
+`#[must_consume]` place could be assigned over, which abandons the authority the
+marker exists to protect. The standing limitation is now stated rather than
+implied: passing a marked token by value discharges the obligation, so the marker
+means *must leave this frame*, not *must reach a consuming primitive* — a
+do-nothing sink satisfies it, and fixing that needs the marker on a type, which
+is what `SystemDealloc` will force in U7b/U8.
+
 ### U7b — typed cells, layout, and static bump arena
 
 Add:

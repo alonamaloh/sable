@@ -144,3 +144,25 @@ pub fn two_descriptors(resource &mut PosixWorld w) {
     eat_file(a);
     eat_file(b);
 }
+
+// ---------------------------- markers, not scopes --------------------------
+//
+// `unsafe { ... }` and an exposure body license operations; they do not
+// open a scope. A value declared inside one is still live at the closing
+// brace, and the interpreter has to destroy it where the checker says it
+// dies — at the end of the function — rather than at the brace.
+
+pub fn unsafe_block_local() -> u64 {
+    unsafe {
+        var t = Token::make();
+    }
+    return swallow(t);
+}
+
+/// pre a.len ≥ 1
+pub fn exposure_body_local(&mut [u8] a) -> u64 {
+    unsafe expose &mut a as (p, resource m) {
+        var t = Token::make();
+    }
+    return swallow(t);
+}

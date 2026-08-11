@@ -523,6 +523,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
     // Class members.
     for (ci, class) in program.classes.iter_mut().enumerate() {
         let meta = &class_metas[ci];
+        // Name and declaration span of every `#[must_consume]` field,
+        // snapshotted because the member loops borrow the class mutably.
+        let marked: Vec<(String, Span)> = class
+            .fields
+            .iter()
+            .filter(|f| f.must_consume)
+            .map(|f| (f.name.clone(), f.span))
+            .collect();
+        let class_span = class.name_span;
         for init in &mut class.inits {
             let mut ctx = Ctx {
                 sigs: &sigs,
@@ -564,13 +573,17 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: false,
                         mutable: true,
                         branded: false,
-                        must_consume: false,
+                        // The marker is the field's, in every member: it is
+                        // what makes overwriting a live one a diagnostic
+                        // rather than a silent leak.
+                        must_consume: marked_field(&marked, fname),
                     },
                 );
             }
             check_block(&mut ctx, &mut init.body, Ty::Unit)?;
             unsafe_regions += ctx.unsafe_blocks;
             reject_field_holes(&ctx, &meta.name, &init.name, init.name_span)?;
+            reject_outstanding_obligations(&ctx, &marked, class_span, &init.name, false)?;
             for (fname, _) in &meta.fields {
                 if !ctx.vars[&format!("self.{fname}")].initialized {
                     return Err(Diagnostic {
@@ -628,13 +641,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: true,
                         branded: false,
-                        must_consume: false,
+                        must_consume: marked_field(&marked, fname),
                     },
                 );
             }
             let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
             unsafe_regions += ctx.unsafe_blocks;
             reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
+            reject_outstanding_obligations(&ctx, &marked, class_span, &m.f.name, false)?;
             if !returns && m.f.ret != Ty::Unit {
                 return Err(Diagnostic {
                     name: "type.missing_return".into(),
@@ -687,10 +701,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: true,
                         branded: false,
-                        must_consume: class
-                            .fields
-                            .iter()
-                            .any(|f| &f.name == fname && f.must_consume),
+                        must_consume: marked_field(&marked, fname),
                     },
                 );
             }
@@ -719,50 +730,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             // discharges it is passing it *by value* to something that
             // takes it — which is why the check is "still live here", not
             // "was moved at some point".
-            let mut outstanding: Vec<(&String, &VarInfo)> = ctx
-                .vars
-                .iter()
-                .filter(|(_, v)| v.must_consume)
-                .collect();
-            outstanding.sort_by_key(|(name, _)| name.as_str());
-            for (name, _) in outstanding {
-                let place = match name.strip_prefix("self.") {
-                    Some(f) => Place {
-                        root: "self".to_string(),
-                        fields: vec![f.to_string()],
-                    },
-                    None => Place::local(name),
-                };
-                if ctx.is_moved(&place) {
-                    continue;
-                }
-                let (span, label) = match name.strip_prefix("self.") {
-                    Some(f) => (
-                        class
-                            .fields
-                            .iter()
-                            .find(|fld| fld.name == f)
-                            .map_or(class.name_span, |fld| fld.span),
-                        "this field is `#[must_consume]`",
-                    ),
-                    None => (
-                        class.name_span,
-                        "this holds the authority of a `#[must_consume]` field",
-                    ),
-                };
-                return Err(Diagnostic {
-                    name: "resource.abandoned".into(),
-                    title: format!("`deinit` abandons `{name}`"),
-                    span,
-                    label: label.into(),
-                    notes: vec![(
-                        "note".into(),
-                        "hand the authority on — pass it by value to something that \
-                         consumes it — or drop the marker and accept the leak"
-                            .into(),
-                    )],
-                });
-            }
+            reject_outstanding_obligations(&ctx, &marked, class_span, "deinit", true)?;
             call_graph.insert(ctx.current_fn.clone(), ctx.calls);
         }
     }
@@ -1072,10 +1040,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     // place dies here (ADR 0020). Every other class-typed
                     // expression is a call or a construction — a fresh
                     // owned value that nothing else names.
+                    let dest = Place::local(name);
+                    reject_overwrite_of_obligation(ctx, &dest, *name_span)?;
                     let carries = transfer(ctx, value, escape_sink(dest_branded, name_span))?;
                     // The destination owns a value again even if it had
                     // been moved out earlier.
-                    let dest = Place::local(name);
                     ctx.moved.retain(|m| !dest.contains(m));
                     let v = ctx.vars.get_mut(name.as_str()).unwrap();
                     v.initialized = true;
@@ -1351,7 +1320,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 };
                 // A declaration takes the value like any other sink, and
                 // is not an escape: the new local inherits the brand
-                // rather than laundering it.
+                // rather than laundering it — which only works if the
+                // brand is actually computed here, exactly as a typed
+                // declaration computes it.
+                let branded = matches!(t, Ty::Raw(_) | Ty::Res(_)) && brand_of(ctx, init);
                 let must_consume = transfer(ctx, init, None)?;
                 if t == Ty::Unit {
                     return Err(Diagnostic {
@@ -1369,7 +1341,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         ty: t,
                         initialized: true,
                         mutable: *mutable,
-                        branded: false,
+                        branded,
                         must_consume,
                     },
                 );
@@ -1580,14 +1552,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // A field is a sink like any other: it takes the value, so
                 // the source place dies. And a field outlives the exposure
                 // body, so it is a place a brand may not reach.
-                let carries = transfer(ctx, value, Some(("be stored in a field", *field_span)))?;
-                // The field owns a value again even if it had been moved
-                // out earlier: `resource R old = self.f; self.f = new;` is
-                // how a member replaces authority rather than losing it.
                 let dest = Place {
                     root: "self".to_string(),
                     fields: vec![field.clone()],
                 };
+                reject_overwrite_of_obligation(ctx, &dest, *field_span)?;
+                let carries = transfer(ctx, value, Some(("be stored in a field", *field_span)))?;
+                // The field owns a value again even if it had been moved
+                // out earlier: `resource R old = self.f; self.f = new;` is
+                // how a member replaces authority rather than losing it.
                 ctx.moved.retain(|m| !dest.contains(m));
                 // A field keeps its declared obligation and picks up one
                 // that travelled into it; storing a token in a field is
@@ -3059,11 +3032,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty).collect();
             let ret = sig.ret;
-            // A callee that cannot give a branded value back cannot retain
-            // one either: Sable has no globals, so a pointer handed to a
-            // function dies with its frame. Only a signature that *returns*
-            // storage can launder the brand out — and since ADR 0029 a
-            // class counts, because it may have resource fields.
+            // Only a signature that *returns* storage can launder a brand
+            // out — and since ADR 0029 a class counts, because it may have
+            // resource fields.
+            //
+            // Why a returnless signature is enough differs by callee, and
+            // the difference is the audited boundary (ADR 0027/0030). For a
+            // *verified* callee the argument is compiler-checked: Sable has
+            // no globals, so a pointer it cannot give back dies with its
+            // frame. For an `extern` it is an audited promise — nothing
+            // stops C stashing the pointer in a foreign global — and it is
+            // part of what the contract's audit id covers.
             let launders = match ret {
                 Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
@@ -3382,6 +3361,111 @@ fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<b
     .is_some_and(|v| v.must_consume);
     mark_moved(ctx, e)?;
     Ok(carries)
+}
+
+/// Whether a field carries the `#[must_consume]` marker.
+fn marked_field(marked: &[(String, Span)], field: &str) -> bool {
+    marked.iter().any(|(name, _)| name == field)
+}
+
+/// `#[must_consume]` at the end of a body: nothing may still be holding
+/// an obligation that this body was the last chance to discharge.
+///
+/// The obligation travels with the token, so this asks about every place
+/// that holds one and not only about the field: moving it into a local
+/// and dropping the local abandons the authority exactly as leaving it in
+/// the field does. What discharges one is passing the value *by value* to
+/// something that takes it, which is why the question is "still live
+/// here", not "was moved at some point".
+///
+/// `fields` says whether a marked field still holding its authority is an
+/// abandonment. In a `deinit` it is — the object is ending, and nothing
+/// after this will consume it. In an `init` or a method it is the normal
+/// state of affairs: the class holds the authority, which is what the
+/// field is *for*.
+fn reject_outstanding_obligations(
+    ctx: &Ctx,
+    marked: &[(String, Span)],
+    class_span: Span,
+    member: &str,
+    fields: bool,
+) -> CResult<()> {
+    let mut outstanding: Vec<&String> = ctx
+        .vars
+        .iter()
+        .filter(|(_, v)| v.must_consume)
+        .map(|(name, _)| name)
+        .collect();
+    outstanding.sort();
+    for name in outstanding {
+        let field = name.strip_prefix("self.");
+        if field.is_some() && !fields {
+            continue;
+        }
+        let place = match field {
+            Some(f) => Place {
+                root: "self".to_string(),
+                fields: vec![f.to_string()],
+            },
+            None => Place::local(name),
+        };
+        if ctx.is_moved(&place) {
+            continue;
+        }
+        let (span, label) = match field {
+            Some(f) => (
+                marked
+                    .iter()
+                    .find(|(name, _)| name == f)
+                    .map_or(class_span, |(_, span)| *span),
+                "this field is `#[must_consume]`",
+            ),
+            None => (
+                class_span,
+                "this holds the authority of a `#[must_consume]` field",
+            ),
+        };
+        return Err(Diagnostic {
+            name: "resource.abandoned".into(),
+            title: format!("`{member}` abandons `{name}`"),
+            span,
+            label: label.into(),
+            notes: vec![(
+                "note".into(),
+                "hand the authority on — pass it by value to something that \
+                 consumes it — or drop the marker and accept the leak"
+                    .into(),
+            )],
+        });
+    }
+    Ok(())
+}
+
+/// Overwriting a place that still holds a `#[must_consume]` token
+/// abandons its authority: the same leak, reached by writing over it
+/// rather than by walking away. Consume it first — that leaves the place
+/// empty, and an empty place may be given a new value.
+fn reject_overwrite_of_obligation(ctx: &Ctx, place: &Place, span: Span) -> CResult<()> {
+    let name = place.render();
+    let holds = ctx
+        .vars
+        .get(name.as_str())
+        .is_some_and(|v| v.must_consume && v.initialized);
+    if !holds || ctx.is_moved(place) {
+        return Ok(());
+    }
+    Err(Diagnostic {
+        name: "resource.abandoned".into(),
+        title: format!("assigning to `{name}` abandons its authority"),
+        span,
+        label: "this holds a `#[must_consume]` token".into(),
+        notes: vec![(
+            "note".into(),
+            "consume what is there first — passing it by value empties the place — \
+             and then assign; overwriting it drops the authority on the floor"
+                .into(),
+        )],
+    })
 }
 
 /// A member may not leave a hole in `self`.
