@@ -40,6 +40,11 @@ pub struct TestReport {
 struct Trap {
     message: String,
     span: crate::span::Span,
+    /// This failure is the machine's `undef`, not a trap. The interpreter
+    /// is allowed to be *more precise* than the machine — it says which
+    /// rule was broken — as long as it agrees on the classification, which
+    /// is what the differential harness compares (ADR 0025).
+    undef: bool,
 }
 
 type IResult<T> = Result<T, Trap>;
@@ -99,7 +104,13 @@ pub fn run_fn(
         skipped: Vec::new(),
         raw: RawHeap::default(),
     };
-    interp.call(f, Vec::new()).map_err(|trap| trap.message)
+    interp.call(f, Vec::new()).map_err(|trap| {
+        if trap.undef {
+            format!("undef: {}", trap.message)
+        } else {
+            trap.message
+        }
+    })
 }
 
 enum Flow {
@@ -265,6 +276,7 @@ impl<'a> Interp<'a> {
         match speceval::eval_clause(&clause.text, &env) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Trap {
+                undef: false,
                 message: format!("{what} violated: {}", clause.text.replace('\n', " ")),
                 span: clause.span,
             }),
@@ -311,6 +323,7 @@ impl<'a> Interp<'a> {
         match speceval::eval_clause(&clause.text, &env) {
             Ok(true) => Ok(()),
             Ok(false) => Err(Trap {
+                undef: false,
                 message: format!("{what} violated: {}", clause.text.replace('\n', " ")),
                 span: clause.span,
             }),
@@ -377,6 +390,7 @@ impl<'a> Interp<'a> {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(Trap {
+                        undef: false,
                         message: format!(
                             "class invariant of `{}` violated at `{what}`: {}",
                             class.name,
@@ -452,6 +466,7 @@ impl<'a> Interp<'a> {
                             Some(v) => a.borrow_mut()[i] = *v,
                             None => {
                                 return Err(Trap {
+                                    undef: false,
                                     message: format!(
                                         "exposure of `{array}` ends with byte {i} \
                                          uninitialized"
@@ -504,6 +519,7 @@ impl<'a> Interp<'a> {
                 let len = arr.borrow().len() as i128;
                 if idx < 0 || idx >= len {
                     return Err(Trap {
+                        undef: false,
                         message: format!("store index out of bounds: index {idx}, length {len}"),
                         span: *field_span,
                     });
@@ -525,6 +541,7 @@ impl<'a> Interp<'a> {
                 let len = a.borrow().len() as i128;
                 if idx < 0 || idx >= len {
                     return Err(Trap {
+                        undef: false,
                         message: format!("store index out of bounds: index {idx}, length {len}"),
                         span: *array_span,
                     });
@@ -572,6 +589,7 @@ impl<'a> Interp<'a> {
                         if let Some(val) = self.variant_value(frame, v) {
                             if val < 0 {
                                 return Err(Trap {
+                                    undef: false,
                                     message: format!(
                                         "loop variant is negative ({val}): {}",
                                         v.text
@@ -582,6 +600,7 @@ impl<'a> Interp<'a> {
                             if let Some(prev) = prev_variant {
                                 if val >= prev {
                                     return Err(Trap {
+                                        undef: false,
                                         message: format!(
                                             "loop variant did not decrease ({prev} → {val}): {}",
                                             v.text
@@ -808,7 +827,12 @@ impl<'a> Interp<'a> {
                     RtVal::Int(n) => n,
                     _ => unreachable!("checked: integer argument"),
                 };
+                // Every way a raw operation can fail is the machine's
+                // `undef`: the static semantics is what makes these
+                // unreachable, so there is no defined runtime behavior to
+                // trap into (ADR 0025).
                 let bad = |msg: String| Trap {
+                    undef: true,
                     message: msg,
                     span: e.span,
                 };
@@ -902,6 +926,7 @@ impl<'a> Interp<'a> {
                 let arr = a.borrow();
                 if idx < 0 || idx >= arr.len() as i128 {
                     return Err(Trap {
+                        undef: false,
                         message: format!("index out of bounds: index {idx}, length {}", arr.len()),
                         span: e.span,
                     });
@@ -921,6 +946,7 @@ impl<'a> Interp<'a> {
                 match o {
                     Some(v) => Ok(RtVal::Int(v)),
                     None => Err(Trap {
+                        undef: false,
                         message: "`.value` of an empty option".into(),
                         span: e.span,
                     }),
@@ -959,6 +985,7 @@ impl<'a> Interp<'a> {
                 let arr = a.borrow();
                 if idx < 0 || idx as usize >= arr.len() {
                     return Err(Trap {
+                        undef: false,
                         message: format!("index out of bounds: index {idx}, length {}", arr.len()),
                         span: e.span,
                     });
@@ -970,6 +997,7 @@ impl<'a> Interp<'a> {
                 let v = self.eval_int(arg, frame)?;
                 if v < target.min() || v > target.max() {
                     return Err(Trap {
+                        undef: false,
                         message: format!(
                             "narrow out of range: {v} does not fit in `{}`",
                             target.name()
@@ -1017,6 +1045,7 @@ impl<'a> Interp<'a> {
                 // Defined allocation-failure behavior: the named OOM trap.
                 if n < 0 || n > 50_000_000 {
                     return Err(Trap {
+                        undef: false,
                         message: format!("OOM trap: alloc_array of length {n}"),
                         span: e.span,
                     });
@@ -1051,6 +1080,7 @@ impl<'a> Interp<'a> {
                 let len = arr.borrow().len() as i128;
                 if idx < 0 || idx >= len {
                     return Err(Trap {
+                        undef: false,
                         message: format!("index out of bounds: index {idx}, length {len}"),
                         span: e.span,
                     });
@@ -1128,18 +1158,21 @@ impl<'a> Interp<'a> {
                     BinOp::Add => a + b,
                     BinOp::Sub => a - b,
                     BinOp::Mul => a.checked_mul(b).ok_or_else(|| Trap {
+                        undef: false,
                         message: "multiplication exceeds i128 (ghost width)".into(),
                         span: e.span,
                     })?,
                     BinOp::Div | BinOp::Rem => {
                         if b == 0 {
                             return Err(Trap {
+                                undef: false,
                                 message: "division by zero".into(),
                                 span: rhs.span,
                             });
                         }
                         if *op == BinOp::Div && it.signed() && a == it.min() && b == -1 {
                             return Err(Trap {
+                                undef: false,
                                 message: format!(
                                     "Euclidean quotient overflows: {}.min / -1",
                                     it.name()
@@ -1183,6 +1216,7 @@ impl<'a> Interp<'a> {
         if val < it.min() || val > it.max() {
             let src = &self.source[e.span.start..e.span.end.min(self.source.len())];
             return Err(Trap {
+                undef: false,
                 message: format!(
                     "overflow: `{src}` = {val} does not fit in `{}` ({what})",
                     it.name()
@@ -1196,6 +1230,7 @@ impl<'a> Interp<'a> {
     fn burn(&mut self, span: crate::span::Span) -> IResult<()> {
         if self.fuel == 0 {
             return Err(Trap {
+                undef: false,
                 message: "fuel exhausted (runaway loop or recursion?)".into(),
                 span,
             });

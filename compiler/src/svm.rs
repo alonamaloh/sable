@@ -47,6 +47,14 @@ pub fn lower_fn_entry(f: &Fn) -> Result<String, String> {
     ))
 }
 
+/// Fresh names for the statements an exposure expands into. A counter is
+/// enough: lowering is single-threaded and one pass.
+fn next_loan() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
 fn lower_block(stmts: &[Stmt]) -> Result<String, String> {
     let mut out = Vec::new();
     for s in stmts {
@@ -79,11 +87,56 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
                     .to_string(),
             )
         }
-        Stmt::Expose { .. } => {
-            return Err(
-                "`unsafe expose` has no machine lowering yet: the loan-allocation model                  is normative but not wired into the differential harness"
-                    .into(),
-            )
+        // The machine has no exposure primitive: the construct *is* the
+        // loan-allocation model, so lowering spells it out — allocate,
+        // copy the bytes in, run the body, copy the final bytes back,
+        // release. A native backend would take the address of the
+        // existing buffer instead; nonescape is what makes the two
+        // observationally equivalent (ADR 0026).
+        Stmt::Expose {
+            array,
+            mutable,
+            ptr,
+            res,
+            body,
+            ..
+        } => {
+            let id = next_loan();
+            let loan = format!("_loan{id}");
+            let i = format!("_li{id}");
+            let t = format!("_lb{id}");
+            let n = format!("(.len \"{array}\")");
+            let at = format!("(.ptrAdd (.var \"{loan}\") (.var \"{i}\"))");
+            let inner = lower_block(body)?;
+            let inner = inner.trim_start_matches('[').trim_end_matches(']');
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(format!("(.rawAlloc \"{loan}\" {n})"));
+            parts.push(format!("(.assign \"{i}\" (.intLit .u64 0))"));
+            parts.push(format!(
+                "(.while (.cmp .lt (.var \"{i}\") {n}) \
+                 [(.rawStore8 {at} (.index \"{array}\" (.var \"{i}\"))), \
+                  (.assign \"{i}\" (.wrapArith .add .u64 (.var \"{i}\") (.intLit .u64 1)))])"
+            ));
+            // The body's own pointer name is the loan's start. `res` is
+            // erased: authority has no runtime representation.
+            parts.push(format!(
+                "(.assign \"{ptr}\" (.var \"{loan}\"))"
+            ));
+            let _ = res;
+            if !inner.is_empty() {
+                parts.push(inner.to_string());
+            }
+            if *mutable {
+                parts.push(format!("(.assign \"{i}\" (.intLit .u64 0))"));
+                parts.push(format!(
+                    "(.while (.cmp .lt (.var \"{i}\") {n}) \
+                     [(.rawLoad8 \"{t}\" {at}), \
+                      (.store \"{array}\" (.var \"{i}\") (.var \"{t}\")), \
+                      (.assign \"{i}\" (.wrapArith .add .u64 (.var \"{i}\") (.intLit .u64 1)))])"
+                ));
+            }
+            parts.push(format!("(.rawFree (.var \"{loan}\"))"));
+            Some(parts.join(", "))
         }
         Stmt::Assign { name, value, .. } => Some(lower_bind(name, value)?),
         Stmt::Store {
@@ -138,6 +191,23 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
         // A call for effect: `f(args);` — the discarded-result form of
         // the machine's A-normal call.
         Stmt::ExprStmt(e) => match &e.kind {
+            // Raw operations are statements in the machine (ADR 0025).
+            // Resource arguments are erased: authority has no runtime
+            // representation, so only the pointer and value lower.
+            ExprKind::RawOp { op, args, .. } => Some(match op {
+                RawOp::Store8 => format!(
+                    "(.rawStore8 {} {})",
+                    lower_expr(&args[0])?,
+                    lower_expr(&args[1])?
+                ),
+                RawOp::Copy => {
+                    return Err("`raw_copy_nonoverlapping` has no single machine step: \
+                                the machine copies a byte at a time, and lowering it \
+                                would invent a loop the source did not write"
+                        .into())
+                }
+                _ => return Err(format!("`{}` produces a value", op.name())),
+            }),
             ExprKind::Call { callee, args, .. } => Some(lower_call(&None, callee, args)?),
             _ => {
                 return Err("expression statements are outside the SVM core subset".into());
@@ -157,6 +227,15 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
 fn lower_bind(name: &str, e: &Expr) -> Result<String, String> {
     match &e.kind {
         ExprKind::Call { callee, args, .. } => lower_call(&Some(name.to_string()), callee, args),
+        // A load is a machine statement that binds its destination.
+        ExprKind::RawOp {
+            op: RawOp::Load8,
+            args,
+            ..
+        } => Ok(format!(
+            "(.rawLoad8 \"{name}\" {})",
+            lower_expr(&args[0])?
+        )),
         _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(e)?)),
     }
 }
@@ -304,6 +383,13 @@ fn lean_ty(t: IntTy) -> Result<String, String> {
 /// `Config.render`. Unrecognized traps stay verbatim under an
 /// `unclassified:` prefix so a comparison failure shows them.
 pub fn canonical_outcome(res: Result<RtVal, String>) -> String {
+    // A raw failure the interpreter described precisely is the machine's
+    // `undef`; the harness compares classifications, not prose.
+    if let Err(msg) = &res {
+        if let Some(_detail) = msg.strip_prefix("undef: ") {
+            return "undef".into();
+        }
+    }
     match res {
         Ok(v) => match v {
             RtVal::Unit => "done unit".into(),

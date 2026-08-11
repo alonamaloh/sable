@@ -1,0 +1,12 @@
+// Reading past the end of the loan. The machine calls this `undef`; the
+// interpreter reports which rule was broken. Both classify it the same
+// way, which is what the harness compares.
+
+fn subj() -> u8 {
+    mut [u8] a = alloc_array<u8>(2, 4);
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        r = raw_load8(raw_offset(p, 5), &m);
+    }
+    return r;
+}

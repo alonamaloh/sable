@@ -1407,49 +1407,63 @@ Still open here: alignment (nothing in a byte-only heap can observe it; it
 starts to matter with typed storage) and `copy_nonoverlapping` (it waits for the
 operations to have contracts).
 
-### U4 — lexical byte exposure and `copy_prefix`
+### U4 — lexical byte exposure and `copy_prefix` *(done 2026-08-11, ADR 0026)*
 
-Add hidden loan brands, shared/mutable exposure, `RawSpan` split/join, and byte
-intrinsics to the Sable compiler and interpreter.
+**The go/no-go verdict is go.** `copy_prefix` verifies from a three-line
+value-level contract with no heap predicate, frame clause, separating
+conjunction, provenance lemma, disjointness proof, or discharge script — and so
+do four other subjects in `corpus/verifies/unsafe_copy.sable`, including one
+that splits a span inside the exposure and rejoins it. 29 obligations, zero hand
+proofs. The checkpoint's second half — "the checker can explain failures
+locally" — is carried by eight negative subjects, each landing on a named
+diagnostic at the right span.
 
-Primary subject:
+Two decisions carry it:
 
-```text
-corpus/verifies/unsafe_copy.sable
-```
+- **Exposure is a construct, not a proof.** `unsafe expose &a as (p, resource m)
+  { ... }` lends the array's bytes and takes them back; the bridge between the
+  safe world and the raw world is syntax with generated obligations.
+- **Affinity supplies separation.** `raw_copy_nonoverlapping` has *no nonoverlap
+  premise*. The two spans are distinct affine tokens, and that is what being
+  distinct means. This was the design test the plan named, and it passes.
 
-with `copy_prefix` as above.
+Loan brands do nonescape without lifetime syntax: branded values cannot be
+returned, assigned outside the body, or passed to a user function. The brand
+follows *provenance* through `raw_offset`/`split_off`/`join` and **not** onto
+loaded bytes — a byte read out of memory is an ordinary number, and branding it
+made `return b` illegal until a corpus subject caught it.
 
-Required negative subjects:
+The three findings that decided whether the rung passed are all about the shape
+of what the *compiler* emits, which is the point: the vocabulary has to be
+visible to `simp` (an `abbrev` is not — every notion carries an explicit
+unfolding lemma); `reconstructible` had to lose its existential, because
+`∃ b, get k = .init b ∧ ...` defeats `grind`; and a store's effect has to be
+*functional* (`m₂ = write m k (.init w)`) rather than a conjunction of
+"index k is now this, everything else unchanged", which left grind in case
+analysis at every exit. Reconstructibility itself is tracked as a hypothesis
+established by each operation — the treatment array length and element ranges
+already get across a store — and one lemma per operation is the entire cost of
+keeping the exit automatic.
 
-```text
-return pointer from expose
-store pointer in outer local
-leave a split span unjoined
-use resource after move
-borrow source mutably while shared
-read an uninitialized byte
-range beyond span
-invoke raw load outside unsafe
-```
+`unsafe regions: N` appears in build output: the count of places resting on a
+proof rather than the type system is a fact about the program.
 
-Exit criteria:
+**U3's two inherited criteria are now met**, since the raw operations finally
+have a surface to lower: `svm.rs` expands exposure into the machine's own
+loan-allocation model (allocate, copy in, run, copy back, release),
+`corpus/svm-diff` gained a valid and an invalid raw subject, and an injected
+wrong lowering diverges. The interpreter's raw failures classify as `undef`
+while keeping a precise message — the licence ADR 0025 granted.
 
-- `copy_prefix` verifies with no `assume`, `defer`, or user-visible heap logic;
-- dynamic tests cover empty, partial, and full copies;
-- mutable exposure reconstructs the final safe array;
-- shared exposure cannot mutate;
-- all pointers/resources carrying the loan brand are gone at scope exit;
-- unsafe-block counts appear in build output;
-- **inherited from U3, which could not satisfy them without a source surface**:
-  valid and invalid raw subjects in `corpus/svm-diff`, and an injected wrong
-  *lowering* being detected. U3's semantics is pinned by direct SVM subjects in
-  `Sable/SVMRawTests.lean`; what is still unchecked is the `svm.rs` lowering and
-  `interp.rs`'s agreement with the machine on raw programs, and neither exists
-  until the operations can be written in Sable.
-
-This is the first go/no-go checkpoint. Do not proceed to allocators if the safe
-wrapper is proof-noisy or if the checker cannot explain failures locally.
+Two things recorded rather than hidden. **The exposure's exit obligation is
+currently unfalsifiable**: every operation in this surface preserves
+reconstructibility, so it always closes. `take8` is what will make it bite — it
+is in the machine but not the surface, and needs a strengthened
+`write_reconstructible`. So the plan's negative subject "read an uninitialized
+byte" is unreachable for now; `load8_init`, a real obligation on every load, is
+the guard that exists instead. And **a stale warm `sable daemon` serves the old
+prelude after a `lake build`**, which cost real time here and will cost it
+again.
 
 ### U5 — deterministic extern shim and trust manifest
 

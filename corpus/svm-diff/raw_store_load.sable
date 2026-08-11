@@ -1,0 +1,13 @@
+// Raw memory through a lexical exposure, lowered to the machine's own
+// loan-allocation model: allocate, copy the bytes in, run the body, copy
+// the final bytes back, release. `interp.rs` does the same thing with a
+// bulk copy; agreeing on the outcome is the point.
+
+fn subj() -> u8 {
+    mut [u8] a = alloc_array<u8>(3, 1);
+    unsafe expose &mut a as (p, resource m) {
+        raw_store8(p, 9, &mut m);
+        raw_store8(raw_offset(p, 2), 7, &mut m);
+    }
+    return a[0] + a[2];
+}
