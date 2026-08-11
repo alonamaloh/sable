@@ -1634,6 +1634,53 @@ diagnostic exists only for the marker, which keeps the signal high), and
 forgotten `close` at a call site, and which needs the marker on a *type* rather
 than a field.
 
+### U7c — one ownership transfer *(done 2026-08-11, ADR 0030)*
+
+Unscheduled, and added because an external review of U7a was right: ordinary
+calls removed a by-value class argument from its source place and every other
+transfer cloned. The finding generalised — the divergence was not a missing case
+in one pass but a missing *notion* in both, so a move was written six times and
+agreed nowhere.
+
+One `take_place`/`drop_place` in the interpreter behind one `eval_moved`, and one
+`transfer` in the checker at the matching sinks. Overwriting a place now runs a
+full drop rather than repeating an invariant check; a returned local leaves with
+the caller instead of being destroyed behind it; an owned parameter dies with the
+callee's frame after its contract has been checked.
+
+**What the sweep turned up is the argument for doing it before U7b**, which adds
+sinks (`init`, `take`, `drop_in_place`, an arena owning `PointsTo` beside a
+`SystemDealloc`) on top of this layer:
+
+- `self.f = x` marked nothing, so a class could hold a resource the caller still
+  named — duplicated authority through the one sink with no rule;
+- an owned array moved into a field kept its old name alive, and a **verified**
+  post was false at runtime. The v1 note calling this "not tracked" was
+  documenting an unsoundness;
+- `return self.f` handed a field's authority to a caller still holding the
+  object. A member may now move a field out only if it puts something back:
+  the invariant is stated over every field, and an invariant over a hole is not
+  a question with an answer. Only a `deinit` may leave one — ADR 0029's rule,
+  and precisely its reason;
+- the loop-shape rule was resource-only, though its argument never mentioned
+  authority;
+- `#[must_consume]` meant "moved somewhere", which a temporary satisfied. The
+  obligation now travels with the token, which is what `SystemDealloc` needs;
+- adoption did not spend the world's claim on a descriptor, so affinity stopped
+  reuse of one token but not minting a second. `PosixWorldView.claimed` and an
+  `available` precondition fix it, with the monitor checking independently;
+- three ICEs reachable from ordinary source, all missing match arms: a method
+  assigning a resource parameter to a resource field, a call to a method
+  returning a class or resource, and a function returning `raw<u8>`.
+
+**Exact-once needs two corpus halves, and this is the reusable part.** "No value
+is destroyed twice" is what the paths needed, and a compiler that destroyed
+*nothing* would pass it: `corpus/tests/test_ownership.sable` uses a destructor
+that falsifies its own invariant, so a second drop traps, and
+`corpus/test-fails/deinit_runs.sable` gives a destructor a failing call to show
+each path destroys at all. The second cannot live in `corpus/verifies` — a
+verifying file may not contain a deliberately failing call.
+
 ### U7b — typed cells, layout, and static bump arena
 
 Add:
