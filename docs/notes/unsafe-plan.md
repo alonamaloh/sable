@@ -1465,26 +1465,68 @@ the guard that exists instead. And **a stale warm `sable daemon` serves the old
 prelude after a `lake build`**, which cost real time here and will cost it
 again.
 
-### U5 — deterministic extern shim and trust manifest
+### U5 — deterministic extern shim and trust manifest *(done 2026-08-11, ADR 0027)*
 
-Add:
+`extern "C" #[audit(id := "...", reason := "...")] fn c_fill(...);` — a foreign
+declaration whose contract is *audited*, not proved. It owes no obligations
+because there is no body to check it against, but its clauses still get
+well-formedness defs: a trusted contract that does not elaborate is not a
+contract. The metadata is mandatory, because a trusted contract with no recorded
+reason is an unsourced axiom.
 
-- `extern "C"` declarations with mandatory structured audit metadata;
-- erased resource parameters;
-- noescape pointer arguments;
-- resource-shaped effects;
-- a deterministic test shim (`fill`, `copy`, or `checksum`);
-- module-level trust manifests stored beside content-addressed artifacts.
+**The interesting part of this rung was not the calling convention, it was the
+honesty of the output.** Build status now refuses to say `fully verified` when it
+is trusting something:
 
-Exit criteria:
+```text
+unsafe regions: 8
+extern assumptions: 2
+  - test.checksum.v1 (c_checksum): ...
+  - test.fill.v1 (c_fill): ...
+status: verified relative to audited boundary
+```
 
-- a safe Sable wrapper around `c_fill` verifies;
-- the foreign implementation receives only ABI values;
-- mutation is reflected in the returned resource/safe array view;
-- undeclared mutation is impossible at the Sable call boundary;
-- importing the wrapper imports its trust manifest transitively;
-- build status says “verified relative to audited boundary,” not “fully
-  verified.”
+The manifest goes **inside** the hashed content as a comment header, as this note
+already argued it must: an artifact's validity is mere existence of its `.ok`
+file, so it must not survive a change to what it trusted. Verified — `test.fill.v1`
+and `test.fill.v2` hash differently. Imports need no union step, since the flat
+merge already puts a dependency's externs in the importer's program, and an
+importer's status names the boundary it inherited.
+
+Effects are **structural**, through the resource parameters: only a passed
+`resource &mut R` may change, a `resource &R` frames itself, and there is no
+`modifies` clause in the language to get wrong. `checksum_all` proves its array
+comes back byte for byte across a foreign call. Resources are erased from the ABI,
+so the shim receives the pointer, the length, and the byte. An extern may not
+return raw or resource storage and may not be generic — forbidding retention *in
+the signature* is what makes handing borrowed storage to a foreign function safe
+at all.
+
+Three findings:
+
+- **U4's brand rule was too blunt**, and this rung found it: it forbade passing
+  branded storage to any function, which blocked the extern call outright. The
+  right rule follows from a property of the language — with no globals and no raw-
+  or resource-typed fields, a callee that cannot *return* storage cannot retain it
+  either. Only a signature returning raw or resource launders a brand.
+- **`extern.generic` had to move to the parser**: mono drops an uninstantiated
+  template before the checker sees it and substitutes the parameters away on an
+  instantiated one, so there is no generic extern left for a checker rule.
+- **U4's unfalsifiable exposure obligation is now falsifiable.** Every operation
+  in U4's surface preserved reconstructibility, so `expose.<a>.bytes` always
+  closed; an extern whose post says the bytes become `uninit` fails it. Trusting a
+  boundary is different from trusting the compiler, and this is where it shows.
+
+Test shims are keyed on the **audit id**, not the name — the id names the contract
+version the program was verified against. An unknown id traps rather than running
+the empty body, because a contract that appears to hold because nothing happened
+is the one outcome a monitor must never produce (`corpus/test-fails/extern_no_shim.sable`).
+
+Still open: the rest of the manifest (machine profile and hash, intrinsics used,
+per-export slicing — the profile has no selection mechanism yet, and slicing is
+already marked optional for the prototype), and any real ABI. Nothing is compiled
+or linked; what this rung establishes is the contract shape and the trust
+bookkeeping.
 
 ### U6 — POSIX-shaped handles and scripted worlds
 
