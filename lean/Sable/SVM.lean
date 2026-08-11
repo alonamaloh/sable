@@ -103,6 +103,78 @@ inductive Val where
   | bool (b : Bool)
   | arr  (a : Seq Int)
   | opt  (o : Option Int)
+  /-- A raw pointer: provenance plus a byte offset, never a machine
+  address. Two live pointers may name the same address only if they name
+  the same allocation, which is what makes `free` able to invalidate
+  exactly the pointers derived from what it released. -/
+  | ptr  (alloc off : Int)
+
+/-! ## The raw heap
+
+The safe value plane keeps owned arrays and classes inside `Val`; the
+raw heap is a *separate* component of the configuration, and every safe
+rule preserves it unchanged. That separation is the point: adding
+unsafe Sable does not reinterpret a single existing rule.
+
+Byte state is not `Int`: uninitialized is a distinct state, and it must
+stay distinguishable from every inhabitant of a value type (the same
+choice `Sable.ByteState` makes for views — this is the machine's copy,
+since `SVM.lean` is self-contained). -/
+
+/-- A byte of raw storage. -/
+inductive RawByte where
+  | uninit : RawByte
+  | init : Int → RawByte
+  deriving Repr, DecidableEq
+
+/-- One allocation. `live` is kept rather than removed on free, so stale
+provenance stays distinguishable from fresh provenance: a released id is
+never handed out again. -/
+structure Allocation where
+  size : Int
+  live : Bool
+  bytes : Seq RawByte
+
+/-- The raw heap: a fresh-provenance counter and a partial map from
+allocation ids. Ids at or above `next` are unallocated, which is what
+makes a new allocation disjoint from everything already reachable
+without inspecting anything (ADR 0022). -/
+structure RawHeap where
+  next : Int
+  allocs : Int → Option Allocation
+
+def RawHeap.empty : RawHeap :=
+  { next := 0, allocs := fun _ => none }
+
+/-- A byte offset is in bounds of a live allocation. -/
+def RawHeap.inBounds (μ : RawHeap) (a k : Int) : Prop :=
+  ∃ al, μ.allocs a = some al ∧ al.live ∧ 0 ≤ k ∧ k < al.size
+
+/-- The byte at `(a, k)`, if that address is in a live allocation. -/
+def RawHeap.byteAt (μ : RawHeap) (a k : Int) : Option RawByte :=
+  match μ.allocs a with
+  | some al => if al.live ∧ 0 ≤ k ∧ k < al.size then some (al.bytes.get k) else none
+  | none => none
+
+/-- Write one byte. A no-op on a dead or absent allocation; the rules
+never reach it, because the bounds premise is checked first. -/
+def RawHeap.store (μ : RawHeap) (a k : Int) (b : RawByte) : RawHeap :=
+  { μ with allocs := fun i =>
+      if i = a then (μ.allocs i).map (fun al => { al with bytes := al.bytes.set k b })
+      else μ.allocs i }
+
+/-- Mark an allocation dead. The entry stays, so its id is never reused
+and a pointer into it stays distinguishable from a fresh one. -/
+def RawHeap.release (μ : RawHeap) (a : Int) : RawHeap :=
+  { μ with allocs := fun i =>
+      if i = a then (μ.allocs i).map (fun al => { al with live := false })
+      else μ.allocs i }
+
+/-- A fresh allocation of `size` uninitialized bytes at id `μ.next`. -/
+def RawHeap.fresh (μ : RawHeap) (size : Int) : RawHeap :=
+  { next := μ.next + 1,
+    allocs := fun i =>
+      if i = μ.next then some ⟨size, true, ⟨size, fun _ => .uninit⟩⟩ else μ.allocs i }
 
 /-- Terminal trap outcomes, distinct from normal termination. These are
 *structural* (they carry the operation and the offending data); the
@@ -591,12 +663,17 @@ structure Frame where
   ρ   : Env
 
 /-- A configuration: either running (a continuation of statements, the
-current frame's locals, and the stack of suspended callers — design
-§10's ⟨code, frames, heap, ghost⟩ with the heap absorbed into owned
-array values and the ghost component scoped out), or one of the three
-terminal outcomes (ADR 0005): normal termination, a trap, or `undef`. -/
+current frame's locals, the stack of suspended callers, and the raw
+heap — design §10's ⟨code, frames, heap, ghost⟩ with the *safe* heap
+absorbed into owned array values, the raw heap explicit, and the ghost
+component scoped out), or one of the three terminal outcomes
+(ADR 0005): normal termination, a trap, or `undef`.
+
+Every rule that is not a raw operation threads `μ` unchanged. That is
+not an accident of the encoding — it is the claim that unsafe Sable adds
+a component rather than reinterpreting the machine. -/
 inductive Config where
-  | run     (k : List Stmt) (ρ : Env) (σ : List Frame)
+  | run     (k : List Stmt) (ρ : Env) (σ : List Frame) (μ : RawHeap)
   | done    (v : Val)
   | trapped (t : Trap)
   | undef
@@ -627,105 +704,105 @@ Normative decisions (ADR 0005):
   blessed, cf. `swap` §5).
 -/
 inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
-  | assign_ok {ρ : Env} {x : String} {e : Expr} {v : Val} {k : List Stmt} {σ : List Frame}
+  | assign_ok {ρ : Env} {x : String} {e : Expr} {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.ok v)) :
-      Step P cap (.run (.assign x e :: k) ρ σ) (.run k (ρ.update x v) σ)
-  | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.assign x e :: k) ρ σ μ) (.run k (ρ.update x v) σ μ)
+  | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
-      Step P cap (.run (.assign x e :: k) ρ σ) a.toConfig
-  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.assign x e :: k) ρ σ μ) a.toConfig
+  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ρ x = some (.arr a)) (h₀ : 0 ≤ n) (h₁ : n < a.len) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ) (.run k (ρ.update x (.arr (a.set n w))) σ)
-  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) (.run k (ρ.update x (.arr (a.set n w))) σ μ)
+  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ρ x = some (.arr a)) (h : n < 0 ∨ a.len ≤ n) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ) (.trapped (.indexOOB n a.len))
-  | store_abort_idx {ρ : Env} {x : String} {ei ev : Expr} {a : Abort} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) (.trapped (.indexOOB n a.len))
+  | store_abort_idx {ρ : Env} {x : String} {ei ev : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.abort a)) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ) a.toConfig
-  | store_undef_idx {ρ : Env} {x : String} {ei ev : Expr} {v : Val} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) a.toConfig
+  | store_undef_idx {ρ : Env} {x : String} {ei ev : Expr} {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok v)) (hv : ∀ n, v ≠ .int n) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ) .undef
-  | store_abort_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {a : Abort} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
+  | store_abort_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.abort a)) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ) a.toConfig
-  | store_undef_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {v : Val} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) a.toConfig
+  | store_undef_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok v))
       (hw : ∀ m, v ≠ .int m) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ) .undef
-  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
+  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ) .undef
-  | ite_true {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
+  | ite_true {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool true))) :
-      Step P cap (.run (.ite c thn els :: k) ρ σ) (.run (thn ++ k) ρ σ)
-  | ite_false {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.ite c thn els :: k) ρ σ μ) (.run (thn ++ k) ρ σ μ)
+  | ite_false {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool false))) :
-      Step P cap (.run (.ite c thn els :: k) ρ σ) (.run (els ++ k) ρ σ)
-  | ite_undef {ρ : Env} {c : Expr} {thn els k : List Stmt} {v : Val} {σ : List Frame}
+      Step P cap (.run (.ite c thn els :: k) ρ σ μ) (.run (els ++ k) ρ σ μ)
+  | ite_undef {ρ : Env} {c : Expr} {thn els k : List Stmt} {v : Val} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
-      Step P cap (.run (.ite c thn els :: k) ρ σ) .undef
-  | ite_abort {ρ : Env} {c : Expr} {thn els k : List Stmt} {a : Abort} {σ : List Frame}
+      Step P cap (.run (.ite c thn els :: k) ρ σ μ) .undef
+  | ite_abort {ρ : Env} {c : Expr} {thn els k : List Stmt} {a : Abort} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.abort a)) :
-      Step P cap (.run (.ite c thn els :: k) ρ σ) a.toConfig
-  | while_true {ρ : Env} {c : Expr} {body k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.ite c thn els :: k) ρ σ μ) a.toConfig
+  | while_true {ρ : Env} {c : Expr} {body k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool true))) :
-      Step P cap (.run (.while c body :: k) ρ σ) (.run (body ++ .while c body :: k) ρ σ)
-  | while_false {ρ : Env} {c : Expr} {body k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.while c body :: k) ρ σ μ) (.run (body ++ .while c body :: k) ρ σ μ)
+  | while_false {ρ : Env} {c : Expr} {body k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool false))) :
-      Step P cap (.run (.while c body :: k) ρ σ) (.run k ρ σ)
-  | while_undef {ρ : Env} {c : Expr} {body k : List Stmt} {v : Val} {σ : List Frame}
+      Step P cap (.run (.while c body :: k) ρ σ μ) (.run k ρ σ μ)
+  | while_undef {ρ : Env} {c : Expr} {body k : List Stmt} {v : Val} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
-      Step P cap (.run (.while c body :: k) ρ σ) .undef
-  | while_abort {ρ : Env} {c : Expr} {body k : List Stmt} {a : Abort} {σ : List Frame}
+      Step P cap (.run (.while c body :: k) ρ σ μ) .undef
+  | while_abort {ρ : Env} {c : Expr} {body k : List Stmt} {a : Abort} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.abort a)) :
-      Step P cap (.run (.while c body :: k) ρ σ) a.toConfig
+      Step P cap (.run (.while c body :: k) ρ σ μ) a.toConfig
   -- compiled `defer` (§9): "true or halt", carrying the obligation name
-  | check_pass {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {σ : List Frame}
+  | check_pass {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool true))) :
-      Step P cap (.run (.check name c :: k) ρ σ) (.run k ρ σ)
-  | check_fail {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.check name c :: k) ρ σ μ) (.run k ρ σ μ)
+  | check_fail {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool false))) :
-      Step P cap (.run (.check name c :: k) ρ σ) (.trapped (.deferViolation name))
-  | check_undef {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {v : Val} {σ : List Frame}
+      Step P cap (.run (.check name c :: k) ρ σ μ) (.trapped (.deferViolation name))
+  | check_undef {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {v : Val} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok v)) (hv : ∀ b, v ≠ .bool b) :
-      Step P cap (.run (.check name c :: k) ρ σ) .undef
-  | check_abort {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {a : Abort} {σ : List Frame}
+      Step P cap (.run (.check name c :: k) ρ σ μ) .undef
+  | check_abort {ρ : Env} {name : String} {c : Expr} {k : List Stmt} {a : Abort} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.abort a)) :
-      Step P cap (.run (.check name c :: k) ρ σ) a.toConfig
+      Step P cap (.run (.check name c :: k) ρ σ μ) a.toConfig
   -- calls (A-normal, ADR 0005): lookup, then arguments, then arity
-  | call_undef_fn {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {k : List Stmt} {σ : List Frame}
+  | call_undef_fn {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hf : P f = none) :
-      Step P cap (.run (.call dst f args :: k) ρ σ) .undef
-  | call_abort {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {a : Abort} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.call dst f args :: k) ρ σ μ) .undef
+  | call_abort {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hf : P f = some fd) (ha : EvalArgs cap ρ args (.abort a)) :
-      Step P cap (.run (.call dst f args :: k) ρ σ) a.toConfig
-  | call_undef_arity {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.call dst f args :: k) ρ σ μ) a.toConfig
+  | call_undef_arity {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hf : P f = some fd) (ha : EvalArgs cap ρ args (.ok vs))
       (hn : fd.params.length ≠ vs.length) :
-      Step P cap (.run (.call dst f args :: k) ρ σ) .undef
-  | call_enter {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.call dst f args :: k) ρ σ μ) .undef
+  | call_enter {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hf : P f = some fd) (ha : EvalArgs cap ρ args (.ok vs))
       (hn : fd.params.length = vs.length) :
-      Step P cap (.run (.call dst f args :: k) ρ σ)
-        (.run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ))
+      Step P cap (.run (.call dst f args :: k) ρ σ μ)
+        (.run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ) μ)
   -- returns: pop a caller, or answer the program
-  | ret_ok {ρ : Env} {e : Expr} {v : Val} {k : List Stmt}
+  | ret_ok {ρ : Env} {e : Expr} {v : Val} {k : List Stmt} {μ : RawHeap}
       (h : Eval cap ρ e (.ok v)) :
-      Step P cap (.run (.ret e :: k) ρ []) (.done v)
-  | ret_pop {ρ : Env} {e : Expr} {v : Val} {k : List Stmt} {fr : Frame} {σ : List Frame}
+      Step P cap (.run (.ret e :: k) ρ [] μ) (.done v)
+  | ret_pop {ρ : Env} {e : Expr} {v : Val} {k : List Stmt} {fr : Frame} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.ok v)) :
-      Step P cap (.run (.ret e :: k) ρ (fr :: σ)) (.run fr.k (fr.ρ.bindDst fr.dst v) σ)
-  | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame}
+      Step P cap (.run (.ret e :: k) ρ (fr :: σ) μ) (.run fr.k (fr.ρ.bindDst fr.dst v) σ μ)
+  | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
-      Step P cap (.run (.ret e :: k) ρ σ) a.toConfig
+      Step P cap (.run (.ret e :: k) ρ σ μ) a.toConfig
   -- fall off the end of a body: return unit
-  | nil_ret {ρ : Env} :
-      Step P cap (.run [] ρ []) (.done .unit)
-  | nil_pop {ρ : Env} {fr : Frame} {σ : List Frame} :
-      Step P cap (.run [] ρ (fr :: σ)) (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ)
+  | nil_ret {ρ : Env} {μ : RawHeap} :
+      Step P cap (.run [] ρ [] μ) (.done .unit)
+  | nil_pop {ρ : Env} {fr : Frame} {σ : List Frame} {μ : RawHeap} :
+      Step P cap (.run [] ρ (fr :: σ) μ) (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ μ)
 
 /-- Reflexive-transitive closure of `Step`. -/
 inductive Steps (P : Prog) (cap : Int) : Config → Config → Prop where
@@ -744,16 +821,16 @@ def Config.Terminal : Config → Prop
 
 /-- Behavior of a function body `k` from locals `ρ`: normal return. -/
 def Returns (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) (v : Val) : Prop :=
-  Steps P cap (.run k ρ []) (.done v)
+  Steps P cap (.run k ρ [] .empty) (.done v)
 
 /-- Behavior: terminal trap. -/
 def TrapsWith (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) (t : Trap) : Prop :=
-  Steps P cap (.run k ρ []) (.trapped t)
+  Steps P cap (.run k ρ [] .empty) (.trapped t)
 
 /-- Behavior: the undef outcome — what the static semantics must prove
 unreachable for checked programs. -/
 def ReachesUndef (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) : Prop :=
-  Steps P cap (.run k ρ []) .undef
+  Steps P cap (.run k ρ [] .empty) .undef
 
 /-- Divergence: every reachable configuration can still step. This is
 what `partial fn` (§8) permits and totality forbids — and with frames,

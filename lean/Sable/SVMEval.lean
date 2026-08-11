@@ -263,6 +263,7 @@ private theorem eval_bindInt {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → 
     | bool b => simpa [EOut.bindInt] using Hundef _ ih nofun
     | arr a => simpa [EOut.bindInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindInt] using Hundef _ ih nofun
+    | ptr a k => simpa [EOut.bindInt] using Hundef _ ih nofun
 
 private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool → EOut}
     (ih : Eval cap ρ e (evalE cap ρ e))
@@ -280,6 +281,7 @@ private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool �
     | unit => simpa [EOut.bindBool] using Hundef _ ih nofun
     | int n => simpa [EOut.bindBool] using Hundef _ ih nofun
     | arr a => simpa [EOut.bindBool] using Hundef _ ih nofun
+    | ptr a k => simpa [EOut.bindBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindBool] using Hundef _ ih nofun
 
 private theorem eval_bindInt₂ {cap : Int} {ρ : Env} {e₁ e₂ tgt : Expr}
@@ -400,6 +402,7 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
           | unit => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
           | int n => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
           | bool b => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
+          | ptr a k => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
           | opt o => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
   | index x e ih =>
       simp only [evalE]
@@ -533,37 +536,37 @@ theorem EOut.stepBool_ok_of_ne {v : Val} (f : Bool → Config)
 /-- `stepF P cap c`: the configuration `Step` relates `c` to — computed.
 `none` exactly on terminal configurations. -/
 def stepF (P : Prog) (cap : Int) : Config → Option Config
-  | .run [] _ [] => some (.done .unit)
-  | .run [] _ (fr :: σ) => some (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ)
-  | .run (.assign x e :: k) ρ σ =>
+  | .run [] _ [] _ => some (.done .unit)
+  | .run [] _ (fr :: σ) μ => some (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ μ)
+  | .run (.assign x e :: k) ρ σ μ =>
       some (match evalE cap ρ e with
-        | .ok v => .run k (ρ.update x v) σ
+        | .ok v => .run k (ρ.update x v) σ μ
         | .abort a => a.toConfig)
-  | .run (.store x ei ev :: k) ρ σ =>
+  | .run (.store x ei ev :: k) ρ σ μ =>
       some ((evalE cap ρ ei).stepInt fun n =>
         (evalE cap ρ ev).stepInt fun w =>
           match ρ x with
           | some (.arr a) =>
-              if 0 ≤ n ∧ n < a.len then .run k (ρ.update x (.arr (a.set n w))) σ
+              if 0 ≤ n ∧ n < a.len then .run k (ρ.update x (.arr (a.set n w))) σ μ
               else .trapped (.indexOOB n a.len)
           | _ => .undef)
-  | .run (.ite c thn els :: k) ρ σ =>
+  | .run (.ite c thn els :: k) ρ σ μ =>
       some ((evalE cap ρ c).stepBool fun b =>
-        if b then .run (thn ++ k) ρ σ else .run (els ++ k) ρ σ)
-  | .run (.while c body :: k) ρ σ =>
+        if b then .run (thn ++ k) ρ σ μ else .run (els ++ k) ρ σ μ)
+  | .run (.while c body :: k) ρ σ μ =>
       some ((evalE cap ρ c).stepBool fun b =>
-        if b then .run (body ++ .while c body :: k) ρ σ else .run k ρ σ)
-  | .run (.ret e :: _) ρ σ =>
+        if b then .run (body ++ .while c body :: k) ρ σ μ else .run k ρ σ μ)
+  | .run (.ret e :: _) ρ σ μ =>
       some (match evalE cap ρ e with
         | .ok v =>
             match σ with
             | [] => .done v
-            | fr :: σ' => .run fr.k (fr.ρ.bindDst fr.dst v) σ'
+            | fr :: σ' => .run fr.k (fr.ρ.bindDst fr.dst v) σ' μ
         | .abort a => a.toConfig)
-  | .run (.check name c :: k) ρ σ =>
+  | .run (.check name c :: k) ρ σ μ =>
       some ((evalE cap ρ c).stepBool fun b =>
-        if b then .run k ρ σ else .trapped (.deferViolation name))
-  | .run (.call dst f args :: k) ρ σ =>
+        if b then .run k ρ σ μ else .trapped (.deferViolation name))
+  | .run (.call dst f args :: k) ρ σ μ =>
       some (match P f with
         | none => .undef
         | some fd =>
@@ -571,7 +574,7 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
             | .abort a => a.toConfig
             | .ok vs =>
                 if fd.params.length = vs.length then
-                  .run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ)
+                  .run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ) μ
                 else .undef)
   | .done _ => none
   | .trapped _ => none
@@ -636,6 +639,7 @@ private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ 
     | int n => simpa using Hok n ih
     | unit => simpa [EOut.stepInt] using Hundef _ ih nofun
     | bool b => simpa [EOut.stepInt] using Hundef _ ih nofun
+    | ptr a k => simpa [EOut.stepInt] using Hundef _ ih nofun
     | arr a => simpa [EOut.stepInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepInt] using Hundef _ ih nofun
 
@@ -654,6 +658,7 @@ private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀
     | bool b => simpa using Hok b ih
     | unit => simpa [EOut.stepBool] using Hundef _ ih nofun
     | int n => simpa [EOut.stepBool] using Hundef _ ih nofun
+    | ptr a k => simpa [EOut.stepBool] using Hundef _ ih nofun
     | arr a => simpa [EOut.stepBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepBool] using Hundef _ ih nofun
 
@@ -759,8 +764,9 @@ theorem Step.deterministic {P : Prog} {cap : Int} {c c₁ c₂ : Config}
 
 /-- Progress: a `run` configuration always steps — with `undef` a
 defined outcome, nothing is stuck (ADR 0005). -/
-theorem Step.progress (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) (σ : List Frame) :
-    ∃ c', Step P cap (.run k ρ σ) c' := by
+theorem Step.progress (P : Prog) (cap : Int) (k : List Stmt) (ρ : Env) (σ : List Frame)
+    (μ : RawHeap) :
+    ∃ c', Step P cap (.run k ρ σ μ) c' := by
   cases k with
   | nil => cases σ <;> exact ⟨_, stepF_sound rfl⟩
   | cons s k => cases s <;> exact ⟨_, stepF_sound rfl⟩
@@ -800,6 +806,7 @@ def Val.render : Val → String
   | .unit => "unit"
   | .int n => s!"int {n}"
   | .bool b => s!"bool {b}"
+  | .ptr a k => s!"ptr {a}+{k}"
   | .arr a =>
       "arr [" ++ String.intercalate ", "
         ((List.range a.len.toNat).map fun i => toString (a.get (Int.ofNat i))) ++ "]"

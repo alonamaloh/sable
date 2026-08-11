@@ -80,7 +80,7 @@ fn svm_differential() {
     for (i, (id, fi, term, _)) in cases.iter().enumerate() {
         driver.push_str(&format!("def p{i} : List Stmt := {term}\n"));
         driver.push_str(&format!(
-            "#eval IO.println (\"{id}\\t\" ++ (run prog{fi} {CAP} {FUEL} (.run p{i} Env.empty [])).render)\n"
+            "#eval IO.println (\"{id}\\t\" ++ (run prog{fi} {CAP} {FUEL} (.run p{i} Env.empty [] .empty)).render)\n"
         ));
     }
     let driver_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("svm_diff_driver.lean");
