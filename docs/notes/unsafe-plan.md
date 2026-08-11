@@ -1119,7 +1119,15 @@ side owns program-language flow facts, and Lean receives proof expressions
 verbatim, so the probe can be written and judged before a line of checker code
 exists.
 
-### U1 — concrete Lean resource probe
+### U1 — concrete Lean resource probe *(first pass done 2026-08-11)*
+
+`docs/notes/unsafe-probe.lean` exists and checks: the byte model, the context
+interpretation, preservation for split/join/load/store/take/allocate/free, the
+aggregate round trip, and the carving loop including interpretation preservation
+across the backedge. Five vcgen-shaped goals close under `sable_auto` at the
+default budget; `#print axioms` shows no `sorryAx`. Question 5 (abstract typed
+storage) is **not** covered — the probe is byte-only, and the findings section
+says what that would take. Remaining before U2: the ADR.
 
 Create `docs/notes/unsafe-probe.lean`, matching the convention every prior probe
 used (`bignum-probe`, `algd-probe`, `json-probe`, `utf8-probe`); it graduates
