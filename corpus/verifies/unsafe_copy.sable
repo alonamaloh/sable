@@ -1,0 +1,79 @@
+// The first safe wrapper over raw memory (ADR 0026).
+//
+// `copy_prefix` copies bytes through pointers, in `unsafe`, and its
+// contract is four lines of value-level arithmetic. There is **no
+// user-visible heap predicate, frame clause, separating conjunction,
+// provenance lemma, or manual proof of disjointness** — that was the
+// acceptance criterion for the whole raw-memory direction, and this
+// function is what it was written against.
+//
+// Two things carry it. First, *lexical exposure*: `unsafe expose` lends
+// the array's bytes for the body and takes them back, so the bridge
+// between the safe world's `[u8]` and the raw world's bytes is a
+// construct rather than a proof. Second, *affinity supplies separation*:
+// `raw_copy_nonoverlapping` has no nonoverlap premise at all, because
+// `smem` and `dmem` are distinct affine tokens and that is what being
+// distinct means. A caller who possesses two exclusive resources should
+// not have to prove they do not alias.
+
+/// pre  src.len ≤ dst.len
+/// post #[label(copied)] ∀ i, 0 ≤ i → i < src.len → dst.get i = src.get i
+/// post #[label(kept)]   ∀ i, src.len ≤ i → i < dst.len → dst.get i = (old dst).get i
+pub fn copy_prefix(&[u8] src, &mut [u8] dst) {
+    unsafe expose &src as (sp, resource smem) {
+        unsafe expose &mut dst as (dp, resource dmem) {
+            raw_copy_nonoverlapping(sp, dp, src.len, &smem, &mut dmem);
+        }
+    }
+}
+
+// A shared exposure reads. It cannot write: the resource it binds is not
+// `mut`, so `&mut smem` is rejected by the checker rather than disproved
+// by a frame condition.
+/// pre  a.len ≥ 1
+/// post result = a.get 0
+pub fn first_byte(&[u8] a) -> u8 {
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        r = raw_load8(p, &m);
+    }
+    return r;
+}
+
+// A mutable exposure writes, and the array afterwards is what the bytes
+// say. The frame half of the contract — that nothing else moved — comes
+// out of the store being a *function* on the view.
+/// pre  a.len ≥ 2
+/// post #[label(set)]  a.get 1 = 9
+/// post #[label(rest)] ∀ k, 0 ≤ k → k < a.len → k ≠ 1 → a.get k = (old a).get k
+pub fn set_second(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        raw_store8(raw_offset(p, 1), 9, &mut m);
+    }
+}
+
+// Pointer arithmetic is pure, so a pointer may be computed anywhere; only
+// the load asks whether it is in bounds.
+/// pre  a.len ≥ 3
+/// post result = a.get 2
+pub fn third_byte(&[u8] a) -> u8 {
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        r = raw_load8(raw_offset(p, 2), &m);
+    }
+    return r;
+}
+
+// Carving inside an exposure: the span may be split, and the whole extent
+// has to be rejoined before the body ends, or the array cannot be
+// reconstructed.
+/// pre  a.len ≥ 1
+/// post #[label(head)] a.get 0 = 7
+pub fn split_write_join(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        resource RawSpan tail = split_off(&mut m, 1);
+        raw_store8(p, 7, &mut m);
+        resource RawSpan whole = join(m, tail);
+        m = whole;
+    }
+}

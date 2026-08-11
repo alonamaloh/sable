@@ -373,6 +373,9 @@ enum Val {
     /// Symbolic resource *view*: a binder or a transformation of one.
     /// The token it belongs to is not represented — that is the point.
     View(String),
+    /// Symbolic raw pointer: a `Sable.RawPtr` expression. It carries no
+    /// authority, so it is data like any other (ADR 0026).
+    Ptr(String),
     Unit,
 }
 
@@ -383,6 +386,20 @@ enum Tail<'a> {
         invariants: &'a [Clause],
         variant: &'a Clause,
         v0: String,
+    },
+    /// The body of a lexical exposure. Falling off its end is where the
+    /// array is reconstructed, which is why an exposure body may not
+    /// `return`: leaving any other way would skip the reconstruction.
+    Expose {
+        array: &'a str,
+        res: &'a str,
+        ptr: &'a str,
+        mutable: bool,
+        kw_span: Span,
+        loan: String,
+        entry_arr: String,
+        rest: Vec<&'a Stmt>,
+        outer: Box<Tail<'a>>,
     },
 }
 
@@ -472,6 +489,7 @@ impl<'a> Generator<'a> {
                 lean_class_name(&self.classes[*ci].name)
             }
             Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) => k.view_ty().to_string(),
+            Some(Ty::Raw(_)) => "Sable.RawPtr".to_string(),
             Some(Ty::Int(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             _ => "Sable.Seq Int".to_string(),
@@ -507,6 +525,7 @@ impl<'a> Generator<'a> {
                 Ty::Res(k) | Ty::ResRef(k, _) => {
                     Some((name.clone(), k.view_ty().to_string()))
                 }
+                Ty::Raw(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::Option(_) | Ty::Unit => None,
             })
             .collect();
@@ -747,6 +766,10 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(p.name.clone(), Val::View(binder));
                 }
+                Ty::Raw(_) => {
+                    self.binders.push((p.name.clone(), "Sable.RawPtr".into()));
+                    self.env.insert(p.name.clone(), Val::Ptr(p.name.clone()));
+                }
                 Ty::Int(it) => {
                     self.binders.push((p.name.clone(), "Int".into()));
                     self.hyps
@@ -889,6 +912,80 @@ impl<'a> Generator<'a> {
                 );
                 self.push_obligation(ob);
             }
+            // A path fell off the end of an exposure body: reconstruct.
+            if let Tail::Expose {
+                array,
+                res,
+                ptr,
+                mutable,
+                kw_span,
+                loan,
+                entry_arr,
+                rest,
+                outer,
+            } = tail
+            {
+                let view = self.view_str(res);
+                // What "the safe world owns this again" means, stated as
+                // obligations rather than assumed: the whole extent came
+                // back, and every byte the array needs is present. A
+                // split descendant that was never rejoined fails the
+                // first; a byte left `uninit` fails the second.
+                let ob = self.obligation(
+                    &format!("{}.expose.{array}.extent", self.fname),
+                    format!("the whole of `{array}` must be owned again here"),
+                    *kw_span,
+                    format!(
+                        "({view}).len = ({entry_arr}).len ∧ ({view}).off = 0 \
+                         ∧ ({view}).alloc = {loan}"
+                    ),
+                );
+                self.push_obligation(ob);
+                let ob = self.obligation(
+                    &format!("{}.expose.{array}.bytes", self.fname),
+                    format!(
+                        "every byte of `{array}` must be present and in `u8` range here"
+                    ),
+                    *kw_span,
+                    format!("Sable.SpanView.reconstructible ({view})"),
+                );
+                self.push_obligation(ob);
+                if *mutable {
+                    // The array becomes what the bytes say. Its element
+                    // range is not a separate obligation: it is the other
+                    // half of reconstructibility, which the one obligation
+                    // above already asked for.
+                    let a2 = self.hinted_sym("_arr", Some((*array).to_string()));
+                    self.binders.push((a2.clone(), "Sable.Seq Int".into()));
+                    self.push_hyp_unique(
+                        format!("h_{array}_bytes"),
+                        format!("{a2} = Sable.SpanView.toSeq ({view})"),
+                    );
+                    // Both of these were just proved above; restating them
+                    // in the shape every other array fact has is what
+                    // keeps downstream automation on familiar ground.
+                    self.push_hyp_unique(
+                        format!("h_{array}_len"),
+                        format!("({a2}.len) = ({entry_arr}.len)"),
+                    );
+                    self.push_hyp_unique(
+                        format!("h_{array}_elems"),
+                        format!(
+                            "∀ k, 0 ≤ k → k < {a2}.len → 0 ≤ {a2}.get k ∧ {a2}.get k ≤ u8.max"
+                        ),
+                    );
+                    self.env.insert((*array).to_string(), Val::Arr(a2));
+                }
+                // The loan is over: the bindings go out of scope, which is
+                // what the brand rules already guarantee nothing survived.
+                self.env.remove(*res);
+                self.env.remove(*ptr);
+                self.var_tys.remove(*res);
+                self.var_tys.remove(*ptr);
+                let rest = rest.clone();
+                let outer = (**outer).clone();
+                self.exec(&rest, &outer);
+            }
             return;
         };
         match stmt {
@@ -974,6 +1071,81 @@ impl<'a> Generator<'a> {
                     },
                 });
                 self.emit_posts(result_eq);
+            }
+            // `unsafe { ... }`: a marker with no verification content of
+            // its own. Splice the body into the continuation, which is
+            // also why locals declared inside outlive it.
+            Stmt::Unsafe { body, .. } => {
+                let mut inner: Vec<&Stmt> = body.iter().collect();
+                inner.extend_from_slice(rest);
+                self.exec(&inner, tail);
+            }
+            // Lexical exposure. Entry hands the body a span whose bytes
+            // are the array's elements, all initialized, at offset 0 of a
+            // fresh loan allocation. Exit takes it back: the array becomes
+            // what the bytes say, under three obligations that together
+            // are what "the safe world owns this again" means (ADR 0026).
+            Stmt::Expose {
+                kw_span,
+                array,
+                mutable,
+                ptr,
+                res,
+                body,
+                ..
+            } => {
+                let entry_arr = self.arr_str(array);
+                let loan = {
+                    self.fresh += 1;
+                    format!("_loan{}", self.fresh)
+                };
+                self.binders.push((loan.clone(), "Int".into()));
+                let view = self.hinted_sym("_view", Some(res.clone()));
+                self.binders
+                    .push((view.clone(), ResKind::RawSpan.view_ty().into()));
+                self.push_hyp_unique(
+                    format!("h_{res}_entry"),
+                    format!("{view} = Sable.SpanView.ofSeq {loan} {entry_arr}"),
+                );
+                // Reconstructibility is tracked the way array length and
+                // element ranges are tracked across a store: assumed
+                // because the *operation* establishes it, with the reason
+                // recorded. Here the array is a `[u8]`, so every byte
+                // starts present and in range — `ofSeq_reconstructible`
+                // is the theorem, and the array's own element facts are
+                // its premise (ADR 0026).
+                self.push_hyp_unique(
+                    format!("h_{res}_recon"),
+                    format!("Sable.SpanView.reconstructible {view}"),
+                );
+                self.env.insert(res.clone(), Val::View(view.clone()));
+                self.var_tys
+                    .insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                let p = self.hinted_sym("_ptr", Some(ptr.clone()));
+                self.binders.push((p.clone(), "Sable.RawPtr".into()));
+                self.push_hyp_unique(
+                    format!("h_{ptr}_entry"),
+                    format!("{p} = Sable.SpanView.start {view}"),
+                );
+                self.env.insert(ptr.clone(), Val::Ptr(p));
+                self.var_tys.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                // The body runs, then the array is reconstructed. The
+                // exposure is a *statement*, so the body's tail is the
+                // reconstruction, not the function's continuation — which
+                // is why a `return` inside is a checker error.
+                let inner: Vec<&Stmt> = body.iter().collect();
+                let etail = Tail::Expose {
+                    array,
+                    res,
+                    ptr,
+                    mutable: *mutable,
+                    kw_span: *kw_span,
+                    loan,
+                    entry_arr,
+                    rest: rest.to_vec(),
+                    outer: Box::new(tail.clone()),
+                };
+                self.exec(&inner, &etail);
             }
             Stmt::ExprStmt(e) => {
                 // Evaluated for obligations/assumptions only.
@@ -1286,7 +1458,8 @@ impl<'a> Generator<'a> {
                     continue;
                 }
                 let s = match val {
-                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s) => s,
+                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s)
+                    | Val::Ptr(s) => s,
                     Val::Prop(s) => s,
                     Val::Unit => continue,
                 };
@@ -1610,6 +1783,170 @@ impl<'a> Generator<'a> {
             ExprKind::SomeE(_) | ExprKind::NoneE => {
                 unreachable!("checked: options only in return position")
             }
+            // The raw operations. Every one carries a *pointer-names-byte*
+            // premise instead of a global provenance predicate: same
+            // allocation, offset lands inside the span. The resource
+            // borrow beside it is what says the caller may touch it, and
+            // that is a checker fact with no VC (ADR 0026).
+            ExprKind::RawOp { op, args, .. } => {
+                let hint = self.name_hint.take();
+                match op {
+                    RawOp::Offset => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::Int(d) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64")
+                        };
+                        Val::Ptr(format!("(Sable.RawPtr.add {p} {d})"))
+                    }
+                    RawOp::Load8 => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(m) = self.eval(&args[1]) else {
+                            unreachable!("checked: span borrow")
+                        };
+                        let k = format!("(({p}).off - ({m}).off)");
+                        let ob = self.obligation(
+                            &format!("{}.load8.{}", self.fname, slug(self.src(e.span))),
+                            "`raw_load8` must name a byte of the borrowed span".into(),
+                            e.span,
+                            format!("Sable.SpanView.namesByte ({m}) ({p}) {k}"),
+                        );
+                        self.push_obligation(ob);
+                        let ob = self.obligation(
+                            &format!("{}.load8_init.{}", self.fname, slug(self.src(e.span))),
+                            "`raw_load8` must read an initialized byte".into(),
+                            e.span,
+                            format!("(({m}).bytes.get {k}) ≠ Sable.ByteState.uninit"),
+                        );
+                        self.push_obligation(ob);
+                        let b = self.hinted_sym("_b", hint);
+                        self.binders.push((b.clone(), "Int".into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_byte", b.trim_start_matches('_')),
+                            format!(
+                                "Sable.ByteState.init {b} = (({m}).bytes.get {k}) \
+                                 ∧ 0 ≤ {b} ∧ {b} ≤ u8.max"
+                            ),
+                        );
+                        Val::Int(b)
+                    }
+                    RawOp::Store8 => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::Int(w) = self.eval(&args[1]) else {
+                            unreachable!("checked: u8")
+                        };
+                        let Val::View(m) = self.eval(&args[2]) else {
+                            unreachable!("checked: span borrow")
+                        };
+                        let k = format!("(({p}).off - ({m}).off)");
+                        let ob = self.obligation(
+                            &format!("{}.store8.{}", self.fname, slug(self.src(e.span))),
+                            "`raw_store8` must name a byte of the borrowed span".into(),
+                            e.span,
+                            format!("Sable.SpanView.namesByte ({m}) ({p}) {k}"),
+                        );
+                        self.push_obligation(ob);
+                        let ExprKind::Borrow { array: mname, .. } = &args[2].kind else {
+                            unreachable!("checked: borrow arg")
+                        };
+                        let m2 = self.hinted_sym("_view", Some(mname.clone()));
+                        self.binders
+                            .push((m2.clone(), ResKind::RawSpan.view_ty().into()));
+                        // Functional, not axiomatic: the composition
+                        // lemmas in the prelude fire on `write`'s shape,
+                        // where a conjunction of facts would leave
+                        // automation doing case analysis at every store.
+                        self.push_hyp_unique(
+                            format!("h_{mname}_store"),
+                            format!(
+                                "{m2} = Sable.SpanView.write ({m}) {k} \
+                                 (Sable.ByteState.init {w})"
+                            ),
+                        );
+                        // `write_reconstructible`: the stored value is
+                        // `u8`-typed, so its range is already a hypothesis
+                        // and the write preserves reconstructibility.
+                        self.push_hyp_unique(
+                            format!("h_{mname}_recon"),
+                            format!("Sable.SpanView.reconstructible {m2}"),
+                        );
+                        self.env.insert(mname.clone(), Val::View(m2));
+                        Val::Unit
+                    }
+                    RawOp::Copy => {
+                        let Val::Ptr(sp) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::Ptr(dp) = self.eval(&args[1]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::Int(n) = self.eval(&args[2]) else {
+                            unreachable!("checked: u64")
+                        };
+                        let Val::View(sm) = self.eval(&args[3]) else {
+                            unreachable!("checked: span borrow")
+                        };
+                        let Val::View(dm) = self.eval(&args[4]) else {
+                            unreachable!("checked: span borrow")
+                        };
+                        // Both pointers must sit at their span's start and
+                        // the range must fit. There is deliberately **no
+                        // nonoverlap premise**: the two spans are distinct
+                        // affine tokens, and that is what separation is.
+                        let ob = self.obligation(
+                            &format!("{}.copy.range", self.fname),
+                            "`raw_copy_nonoverlapping` must stay inside both spans".into(),
+                            e.span,
+                            format!(
+                                "({sp}).alloc = ({sm}).alloc ∧ ({sp}).off = ({sm}).off \
+                                 ∧ ({dp}).alloc = ({dm}).alloc ∧ ({dp}).off = ({dm}).off \
+                                 ∧ 0 ≤ {n} ∧ {n} ≤ ({sm}).len ∧ {n} ≤ ({dm}).len"
+                            ),
+                        );
+                        self.push_obligation(ob);
+                        let ob = self.obligation(
+                            &format!("{}.copy.init", self.fname),
+                            "`raw_copy_nonoverlapping` must read initialized bytes".into(),
+                            e.span,
+                            format!(
+                                "∀ k, 0 ≤ k → k < {n} → \
+                                 (({sm}).bytes.get k) ≠ Sable.ByteState.uninit"
+                            ),
+                        );
+                        self.push_obligation(ob);
+                        let ExprKind::Borrow { array: dname, .. } = &args[4].kind else {
+                            unreachable!("checked: borrow arg")
+                        };
+                        let d2 = self.hinted_sym("_view", Some(dname.clone()));
+                        self.binders
+                            .push((d2.clone(), ResKind::RawSpan.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{dname}_copy"),
+                            format!(
+                                "({d2}).alloc = ({dm}).alloc ∧ ({d2}).off = ({dm}).off \
+                                 ∧ ({d2}).len = ({dm}).len \
+                                 ∧ (∀ k, 0 ≤ k → k < {n} → \
+                                     ({d2}).bytes.get k = ({sm}).bytes.get k) \
+                                 ∧ (∀ k, {n} ≤ k → ({d2}).bytes.get k = ({dm}).bytes.get k)"
+                            ),
+                        );
+                        // The copied prefix comes from a reconstructible
+                        // source and the tail is untouched, so both halves
+                        // of the destination stay reconstructible.
+                        self.push_hyp_unique(
+                            format!("h_{dname}_recon"),
+                            format!("Sable.SpanView.reconstructible {d2}"),
+                        );
+                        self.env.insert(dname.clone(), Val::View(d2));
+                        Val::Unit
+                    }
+                }
+            }
             // The sealed resource transformations. Their contracts are
             // generated here rather than written in a prelude, because
             // each states a rule about who owns what and the rules are
@@ -1648,13 +1985,27 @@ impl<'a> Generator<'a> {
                             format!("h_{array}_prefix"),
                             format!("{prefix} = ({whole}).take {n}"),
                         );
-                        self.env.insert(array.clone(), Val::View(prefix));
+                        self.env.insert(array.clone(), Val::View(prefix.clone()));
                         let suffix = self.hinted_sym("_view", hint);
                         self.binders
                             .push((suffix.clone(), ResKind::RawSpan.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_suffix", suffix.trim_start_matches('_')),
                             format!("{suffix} = ({whole}).drop {n}"),
+                        );
+                        // Carving preserves reconstructibility on both
+                        // sides — a sub-span's bytes are a subrange of the
+                        // whole's (`take_reconstructible`,
+                        // `drop_reconstructible`). Tracking it here is what
+                        // keeps a split inside an exposure from turning
+                        // into hand proof at the exit (ADR 0026).
+                        self.push_hyp_unique(
+                            format!("h_{array}_recon"),
+                            format!("Sable.SpanView.reconstructible {}", prefix.clone()),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_recon", suffix.trim_start_matches('_')),
+                            format!("Sable.SpanView.reconstructible {suffix}"),
                         );
                         Val::View(suffix)
                     }
@@ -1685,6 +2036,10 @@ impl<'a> Generator<'a> {
                         self.push_hyp_unique(
                             format!("h_{}_join", whole.trim_start_matches('_')),
                             format!("{whole} = ({a}).cat ({b})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_recon", whole.trim_start_matches('_')),
+                            format!("Sable.SpanView.reconstructible {whole}"),
                         );
                         Val::View(whole)
                     }
@@ -2518,7 +2873,9 @@ impl<'a> Generator<'a> {
             .env
             .iter()
             .filter_map(|(name, val)| match val {
-                Val::Int(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s) if s != name => {
+                Val::Int(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s) | Val::Ptr(s)
+                    if s != name =>
+                {
                     Some((name.clone(), s.clone()))
                 }
                 _ => None,
@@ -2594,6 +2951,14 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Current symbolic view of a resource in scope.
+    fn view_str(&self, name: &str) -> String {
+        match self.env.get(name) {
+            Some(Val::View(s)) => s.clone(),
+            _ => unreachable!("checked: resource in scope"),
+        }
+    }
+
     /// Current symbolic state of a `&mut` param — an array chain or a
     /// class-state symbol.
     fn state_str(&self, name: &str) -> String {
@@ -2634,6 +2999,7 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), "Sable.Seq Int".into()));
                     }
                 }
+                Ty::Raw(_) => out.push((p.name.clone(), "Sable.RawPtr".into())),
                 Ty::Res(k) | Ty::ResRef(k, _) => {
                     out.push((p.name.clone(), k.view_ty().into()));
                     if let Some(entry) = self.entry_states.get(&p.name) {

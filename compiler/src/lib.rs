@@ -34,6 +34,7 @@ pub enum Outcome {
     Verified {
         functions: usize,
         obligations: usize,
+        unsafe_regions: usize,
         /// Obligations compiled to runtime traps (sound escape).
         deferred: Vec<String>,
         /// Obligations taken as audited axioms (unsound escape): (name, reason).
@@ -51,6 +52,11 @@ pub enum Outcome {
 pub struct VerifiedInfo {
     pub functions: usize,
     pub obligations: usize,
+    /// `unsafe` regions in the checked file. Surfaced in build output
+    /// because the count of places a reader must audit is a fact about
+    /// the program, and burying it would defeat having a boundary
+    /// (ADR 0026).
+    pub unsafe_regions: usize,
     pub deferred: Vec<String>,
     pub assumed: Vec<(String, String)>,
     /// Automation-budget warnings (non-fatal), as diagnostics.
@@ -136,6 +142,7 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
         Ok(info) => Outcome::Verified {
             functions: info.functions,
             obligations: info.obligations,
+            unsafe_regions: info.unsafe_regions,
             deferred: info.deferred,
             assumed: info.assumed,
             warnings: info
@@ -205,6 +212,7 @@ pub fn check_file_structured(
         .collect();
     let functions = prep.program.fns.len();
     let obligations = prep.emitted.names.thms.len();
+    let unsafe_regions = prep.unsafe_regions;
 
     if opts.emit_lean_only {
         print!("{}", prep.emitted.lean_source);
@@ -213,6 +221,7 @@ pub fn check_file_structured(
             Ok(VerifiedInfo {
                 functions,
                 obligations,
+                unsafe_regions,
                 deferred,
                 assumed,
                 warnings: Vec::new(),
@@ -279,6 +288,7 @@ pub fn check_file_structured(
             Ok(VerifiedInfo {
                 functions,
                 obligations,
+                unsafe_regions,
                 deferred,
                 assumed,
                 warnings,

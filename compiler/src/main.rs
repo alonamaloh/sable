@@ -132,6 +132,7 @@ fn main() -> ExitCode {
         Outcome::Verified {
             functions,
             obligations,
+            unsafe_regions,
             deferred,
             assumed,
             warnings,
@@ -153,6 +154,12 @@ fn main() -> ExitCode {
                 }
                 for (a, reason) in &assumed {
                     println!("  assumed (UNSOUND, audited):    {a} — {reason}");
+                }
+                // The audit surface, when there is one: a reader needs
+                // to know how many places rest on a proof rather than on
+                // the type system (ADR 0026).
+                if unsafe_regions > 0 {
+                    println!("  unsafe regions: {unsafe_regions}");
                 }
                 if deferred.is_empty() && assumed.is_empty() {
                     println!("status: fully verified");

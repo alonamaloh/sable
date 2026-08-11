@@ -1,0 +1,12 @@
+// expect-error: expose.return_from_body
+// Leaving the body any way other than falling off its end would skip the
+// reconstruction — which is the only thing that puts the bytes back.
+
+/// pre  a.len ≥ 1
+fn early(&[u8] a) -> u8 {
+    unsafe expose &a as (p, resource m) {
+        u8 b = raw_load8(p, &m);
+        return b;
+    }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// expect-error: expose.brand_escapes
+// A pointer may not be stashed in a local that outlives the exposure:
+// the storage it names belongs to the safe world again once the body
+// ends.
+
+fn stash(&[u8] a) -> u8 {
+    mut raw<u8> outer;
+    unsafe expose &a as (p, resource m) {
+        outer = p;
+    }
+    return 0;
+}

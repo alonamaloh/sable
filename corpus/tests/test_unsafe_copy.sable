@@ -1,0 +1,51 @@
+// Dynamic checks over the raw-memory wrapper. The interpreter models
+// exposure the way the machine does — copy the array's bytes into a fresh
+// loan allocation, run the body, copy the final bytes back, kill the
+// allocation — so a leaked pointer or an uninitialized byte is a real
+// runtime failure and not silently fine.
+
+use unsafe_copy;
+
+/// pre x = y
+fn expect_eq(u8 x, u8 y) {
+}
+
+fn test_copy_prefix() {
+    mut [u8] src = [1, 2, 3];
+    mut [u8] dst = [9, 9, 9, 9, 9];
+    copy_prefix(&src, &mut dst);
+    expect_eq(dst[0], 1);
+    expect_eq(dst[1], 2);
+    expect_eq(dst[2], 3);
+    // Past the prefix, untouched.
+    expect_eq(dst[3], 9);
+    expect_eq(dst[4], 9);
+}
+
+// The empty and full cases, which is where an off-by-one in the loan
+// bookkeeping would show.
+fn test_copy_edges() {
+    mut [u8] empty = [];
+    mut [u8] dst = [4, 5];
+    copy_prefix(&empty, &mut dst);
+    expect_eq(dst[0], 4);
+    expect_eq(dst[1], 5);
+
+    mut [u8] full = [7, 8];
+    copy_prefix(&full, &mut dst);
+    expect_eq(dst[0], 7);
+    expect_eq(dst[1], 8);
+}
+
+fn test_load_and_store() {
+    mut [u8] a = [11, 22, 33];
+    expect_eq(first_byte(&a), 11);
+    expect_eq(third_byte(&a), 33);
+    set_second(&mut a);
+    expect_eq(a[0], 11);
+    expect_eq(a[1], 9);
+    expect_eq(a[2], 33);
+    split_write_join(&mut a);
+    expect_eq(a[0], 7);
+    expect_eq(a[1], 9);
+}

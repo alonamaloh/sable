@@ -24,6 +24,8 @@ pub enum RtVal {
         class: usize,
         fields: Rc<RefCell<HashMap<String, RtVal>>>,
     },
+    /// A raw pointer: allocation id plus byte offset (ADR 0025/0026).
+    Ptr(i128, i128),
     Unit,
 }
 
@@ -62,6 +64,7 @@ pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<Tes
                 source,
                 fuel: FUEL,
                 skipped: Vec::new(),
+                raw: RawHeap::default(),
             };
             let outcome = interp.call(test, Vec::new()).map(|_| ()).map_err(|trap| {
                 let (file, line, col) = mods.locate(trap.span.start);
@@ -94,6 +97,7 @@ pub fn run_fn(
         source: mods.combined_source.as_str(),
         fuel: FUEL,
         skipped: Vec::new(),
+        raw: RawHeap::default(),
     };
     interp.call(f, Vec::new()).map_err(|trap| trap.message)
 }
@@ -110,6 +114,45 @@ struct Interp<'a> {
     source: &'a str,
     fuel: u64,
     skipped: Vec<(String, String)>,
+    raw: RawHeap,
+}
+
+/// The interpreter's raw heap. It mirrors the SVM's: a fresh-provenance
+/// counter and allocations that are marked dead rather than removed, so a
+/// stale pointer stays distinguishable from a fresh one (ADR 0025).
+///
+/// Exposure is modelled the way the SVM models it — copy the array's
+/// bytes into a fresh loan allocation, run the body, copy the final bytes
+/// back — because that is what makes the escape rules observable: a
+/// pointer that outlived its exposure would name a dead allocation.
+#[derive(Default)]
+struct RawHeap {
+    next: i128,
+    allocs: HashMap<i128, RawAlloc>,
+}
+
+struct RawAlloc {
+    live: bool,
+    /// `None` is uninitialized: distinct from any byte value.
+    bytes: Vec<Option<i128>>,
+}
+
+impl RawHeap {
+    fn fresh(&mut self, bytes: Vec<Option<i128>>) -> i128 {
+        let id = self.next;
+        self.next += 1;
+        self.allocs.insert(id, RawAlloc { live: true, bytes });
+        id
+    }
+
+    fn live_at(&self, alloc: i128, off: i128) -> Option<&RawAlloc> {
+        let al = self.allocs.get(&alloc)?;
+        if al.live && off >= 0 && (off as usize) < al.bytes.len() {
+            Some(al)
+        } else {
+            None
+        }
+    }
 }
 
 struct Frame {
@@ -369,6 +412,62 @@ impl<'a> Interp<'a> {
                 }
                 frame.vars.insert(name.clone(), v);
                 Ok(Flow::Normal)
+            }
+            // `unsafe { ... }` is a marker: the block runs like any other.
+            Stmt::Unsafe { body, .. } => self.exec_block(body, frame),
+            // Exposure: copy the array's bytes into a fresh loan
+            // allocation, run the body, copy the final bytes back, and
+            // kill the allocation. Modelling it as a real copy is what
+            // makes a leaked pointer observable at runtime rather than
+            // silently fine (ADR 0026).
+            Stmt::Expose {
+                kw_span,
+                array,
+                mutable,
+                ptr,
+                res,
+                body,
+                ..
+            } => {
+                let RtVal::Arr(a) = frame.vars[array.as_str()].clone() else {
+                    unreachable!("checked: u8 array")
+                };
+                let bytes: Vec<Option<i128>> = a.borrow().iter().map(|v| Some(*v)).collect();
+                let n = bytes.len();
+                let alloc = self.raw.fresh(bytes);
+                frame.vars.insert(ptr.clone(), RtVal::Ptr(alloc, 0));
+                // The resource has no runtime representation (ADR 0024);
+                // the binding exists so the body's names resolve.
+                frame.vars.insert(res.clone(), RtVal::Unit);
+                let flow = self.exec_block(body, frame)?;
+                let final_bytes = self
+                    .raw
+                    .allocs
+                    .get(&alloc)
+                    .map(|al| al.bytes.clone())
+                    .expect("the loan allocation is ours");
+                if *mutable {
+                    for (i, b) in final_bytes.iter().enumerate().take(n) {
+                        match b {
+                            Some(v) => a.borrow_mut()[i] = *v,
+                            None => {
+                                return Err(Trap {
+                                    message: format!(
+                                        "exposure of `{array}` ends with byte {i} \
+                                         uninitialized"
+                                    ),
+                                    span: *kw_span,
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(al) = self.raw.allocs.get_mut(&alloc) {
+                    al.live = false;
+                }
+                frame.vars.remove(ptr.as_str());
+                frame.vars.remove(res.as_str());
+                Ok(flow)
             }
             Stmt::ExprStmt(e) => {
                 self.eval(e, frame)?;
@@ -688,6 +787,107 @@ impl<'a> Interp<'a> {
             // a static notion: at runtime there is nothing to move and
             // nothing to return (ADR 0024).
             ExprKind::ResOp { .. } => Ok(RtVal::Unit),
+            // The raw operations. Each classification here must match the
+            // machine's: a trap is a trap, and everything the SVM calls
+            // `undef` is a trap with a precise message — the reference
+            // interpreter may say *which* rule was broken while agreeing
+            // on the outcome class (ADR 0025).
+            ExprKind::RawOp { op, args, .. } => {
+                let vals: Vec<RtVal> = {
+                    let mut vs = Vec::with_capacity(args.len());
+                    for a in args {
+                        vs.push(self.eval(a, frame)?);
+                    }
+                    vs
+                };
+                let ptr_at = |i: usize| match vals[i] {
+                    RtVal::Ptr(a, o) => (a, o),
+                    _ => unreachable!("checked: raw<u8> argument"),
+                };
+                let int_at = |i: usize| match vals[i] {
+                    RtVal::Int(n) => n,
+                    _ => unreachable!("checked: integer argument"),
+                };
+                let bad = |msg: String| Trap {
+                    message: msg,
+                    span: e.span,
+                };
+                match op {
+                    RawOp::Offset => {
+                        let (a, o) = ptr_at(0);
+                        Ok(RtVal::Ptr(a, o + int_at(1)))
+                    }
+                    RawOp::Load8 => {
+                        let (a, o) = ptr_at(0);
+                        match self.raw.live_at(a, o).map(|al| al.bytes[o as usize]) {
+                            Some(Some(b)) => Ok(RtVal::Int(b)),
+                            Some(None) => Err(bad(format!(
+                                "raw_load8 reads uninitialized byte {o} of allocation {a}"
+                            ))),
+                            None => Err(bad(format!(
+                                "raw_load8 out of bounds or after free: {a}+{o}"
+                            ))),
+                        }
+                    }
+                    RawOp::Store8 => {
+                        let (a, o) = ptr_at(0);
+                        let w = int_at(1);
+                        if self.raw.live_at(a, o).is_none() {
+                            return Err(bad(format!(
+                                "raw_store8 out of bounds or after free: {a}+{o}"
+                            )));
+                        }
+                        self.raw
+                            .allocs
+                            .get_mut(&a)
+                            .expect("live_at checked")
+                            .bytes[o as usize] = Some(w);
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::Copy => {
+                        let (sa, so) = ptr_at(0);
+                        let (da, do_) = ptr_at(1);
+                        let n = int_at(2);
+                        for i in 0..n {
+                            let b = match self
+                                .raw
+                                .live_at(sa, so + i)
+                                .map(|al| al.bytes[(so + i) as usize])
+                            {
+                                Some(Some(b)) => b,
+                                Some(None) => {
+                                    return Err(bad(format!(
+                                        "raw_copy_nonoverlapping reads uninitialized byte \
+                                         {} of allocation {sa}",
+                                        so + i
+                                    )));
+                                }
+                                None => {
+                                    return Err(bad(format!(
+                                        "raw_copy_nonoverlapping source out of bounds: \
+                                         {sa}+{}",
+                                        so + i
+                                    )));
+                                }
+                            };
+                            if self.raw.live_at(da, do_ + i).is_none() {
+                                return Err(bad(format!(
+                                    "raw_copy_nonoverlapping destination out of bounds: \
+                                     {da}+{}",
+                                    do_ + i
+                                )));
+                            }
+                            self.raw
+                                .allocs
+                                .get_mut(&da)
+                                .expect("live_at checked")
+                                .bytes[(do_ + i) as usize] = Some(b);
+                        }
+                        Ok(RtVal::Unit)
+                    }
+                }
+            }
+
             ExprKind::Len { array } => {
                 let RtVal::Arr(a) = &frame.vars[array.as_str()] else {
                     unreachable!()
@@ -1035,12 +1235,16 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
                 .filter_map(|(k, v)| spec_of(v).map(|sv| (k.clone(), sv)))
                 .collect(),
         ),
+        // A pointer has no specification value: contracts speak about
+        // views, and a view is not something the monitor can see.
+        RtVal::Ptr(..) => return None,
         RtVal::Unit => return None,
     })
 }
 
 fn stmt_span(stmt: &Stmt) -> crate::span::Span {
     match stmt {
+        Stmt::Unsafe { kw_span, .. } | Stmt::Expose { kw_span, .. } => *kw_span,
         Stmt::Decl { name_span, .. } | Stmt::Assign { name_span, .. } => *name_span,
         Stmt::Assert(c) => c.line_span,
         Stmt::If { cond, .. } => cond.span,

@@ -83,6 +83,8 @@ pub struct Prepared {
     /// Warnings from freshly verified dependencies, in this module's
     /// combined coordinates.
     pub dep_warnings: Vec<Diagnostic>,
+    /// `unsafe` regions the checker counted (ADR 0026).
+    pub unsafe_regions: usize,
 }
 
 pub fn prepare(
@@ -253,6 +255,7 @@ pub fn prepare(
             emitted,
             lean_name,
             dep_warnings,
+            unsafe_regions: checked.unsafe_regions,
         }),
     )
 }

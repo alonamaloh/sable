@@ -1,0 +1,11 @@
+// expect-error: mut.borrow_immutable
+// A shared exposure cannot mutate. It is not disproved by a frame
+// condition — the resource it binds is not `mut`, so unique access is
+// never available in the first place, and the diagnostic is the ordinary
+// immutable-local one.
+/// pre  a.len ≥ 1
+fn sneak(&[u8] a) {
+    unsafe expose &a as (p, resource m) {
+        raw_store8(p, 1, &mut m);
+    }
+}

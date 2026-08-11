@@ -68,6 +68,23 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             ..
         } => Some(lower_bind(name, e)?),
         Stmt::VarDecl { name, init, .. } => Some(lower_bind(name, init)?),
+        // `unsafe { ... }` is a marker with no machine step of its own.
+        Stmt::Unsafe { body, .. } => {
+            let inner = lower_block(body)?;
+            // Splice the body in place: the block does not scope.
+            Some(
+                inner
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string(),
+            )
+        }
+        Stmt::Expose { .. } => {
+            return Err(
+                "`unsafe expose` has no machine lowering yet: the loan-allocation model                  is normative but not wired into the differential harness"
+                    .into(),
+            )
+        }
         Stmt::Assign { name, value, .. } => Some(lower_bind(name, value)?),
         Stmt::Store {
             array,
@@ -164,10 +181,30 @@ fn lower_expr(e: &Expr) -> Result<String, String> {
         ExprKind::BoolLit(b) => format!("(.boolLit {b})"),
         ExprKind::Var(x) => format!("(.var \"{x}\")"),
         ExprKind::ResOp { op, .. } => {
+            // Resource transformations are static: they redistribute
+            // authority and there is nothing for the machine to do. A
+            // differential subject containing one is a subject about
+            // nothing, so it is an error rather than a silent erasure.
             return Err(format!(
-                "`{}` has no machine semantics yet: the raw heap is not in the SVM",
+                "`{}` is static: there is no machine step to compare",
                 op.name()
             ));
+        }
+        ExprKind::RawOp { op, args, .. } => {
+            let lowered: Result<Vec<String>, String> = args.iter().map(lower_expr).collect();
+            let lowered = lowered?;
+            match op {
+                RawOp::Offset => format!("(.ptrAdd {} {})", lowered[0], lowered[1]),
+                // The rest are statements in the machine (§ADR 0025), so
+                // they cannot appear in expression position here; the
+                // statement lowering handles them.
+                _ => {
+                    return Err(format!(
+                        "`{}` is a statement in the machine, not an expression",
+                        op.name()
+                    ))
+                }
+            }
         }
         ExprKind::Unary { op, operand } => match op {
             UnOp::Not => format!("(.not {})", lower_expr(operand)?),
@@ -280,6 +317,7 @@ pub fn canonical_outcome(res: Result<RtVal, String>) -> String {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            RtVal::Ptr(a, o) => format!("done ptr {a}+{o}"),
             RtVal::Opt(None) => "done opt none".into(),
             RtVal::Opt(Some(n)) => format!("done opt some {n}"),
             RtVal::Obj { .. } => "unclassified: class value".into(),

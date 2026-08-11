@@ -575,6 +575,9 @@ impl<'a> Parser<'a> {
         if self.at(&Tok::KwResource) {
             return self.resource_ty();
         }
+        if self.at(&Tok::KwRaw) {
+            return self.raw_ty();
+        }
         if self.at(&Tok::Amp) {
             let start = self.bump().span;
             let mutability = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
@@ -604,6 +607,30 @@ impl<'a> Parser<'a> {
             }
         }
         self.scalar_ty()
+    }
+
+    /// `raw<u8>` — a raw pointer type.
+    fn raw_ty(&mut self) -> PResult<(Ty, Span)> {
+        let start = self.expect(Tok::KwRaw)?.span;
+        self.expect(Tok::Lt)?;
+        let (elem, elem_span) = self.int_ty()?;
+        let end = self.expect(Tok::Gt)?.span;
+        if elem != IntTy::U8 {
+            return Err(Diagnostic {
+                name: "raw.element_type".into(),
+                title: format!("`raw<{}>` is not supported yet", elem.name()),
+                span: elem_span,
+                label: "only `raw<u8>` for now".into(),
+                notes: vec![(
+                    "note".into(),
+                    "wider raw access needs typed storage, which is a scheduled \
+                     deliverable; byte-at-a-time comes first so no layout question \
+                     is answered by accident"
+                        .into(),
+                )],
+            });
+        }
+        Ok((Ty::Raw(elem), start.join(end)))
     }
 
     /// `resource R` (owned, moved), `resource &R`, or `resource &mut R`.
@@ -669,6 +696,9 @@ impl<'a> Parser<'a> {
     fn ret_ty(&mut self) -> PResult<Ty> {
         if self.at(&Tok::KwResource) {
             return Ok(self.resource_ty()?.0);
+        }
+        if self.at(&Tok::KwRaw) {
+            return Ok(self.raw_ty()?.0);
         }
         if let Tok::Ident(name) = self.peek() {
             if let Some(ci) = self.class_names.iter().position(|c| c == name) {
@@ -1560,6 +1590,50 @@ impl<'a> Parser<'a> {
         ])
     }
 
+    /// `expose &a as (p, resource m) { ... }` / `expose &mut a as ...`,
+    /// after the `unsafe` keyword has been consumed.
+    fn expose_stmt(&mut self, kw_span: Span) -> PResult<Stmt> {
+        self.expect(Tok::KwExpose)?;
+        self.expect(Tok::Amp)?;
+        let mutable = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        let (array, array_span) = self.ident()?;
+        match self.peek() {
+            Tok::Ident(kw) if kw == "as" => {
+                self.bump();
+            }
+            _ => return Err(self.error_expected("`as`")),
+        }
+        self.expect(Tok::LParen)?;
+        let (ptr, ptr_span) = self.ident()?;
+        if is_reserved_name(&ptr) {
+            return Err(reserved_name_error(&ptr, ptr_span, "variable"));
+        }
+        self.expect(Tok::Comma)?;
+        self.expect(Tok::KwResource)?;
+        let (res, res_span) = self.ident()?;
+        if is_reserved_name(&res) {
+            return Err(reserved_name_error(&res, res_span, "variable"));
+        }
+        self.expect(Tok::RParen)?;
+        let body = self.block()?;
+        Ok(Stmt::Expose {
+            kw_span,
+            array,
+            array_span,
+            mutable,
+            ptr,
+            ptr_span,
+            res,
+            res_span,
+            body,
+        })
+    }
+
     fn stmt(&mut self) -> PResult<Stmt> {
         match self.peek().clone() {
             // `mut <decl>` — the declared local is mutable (ADR 0016).
@@ -1670,6 +1744,17 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::KwUnsafe => {
+                let kw_span = self.bump().span;
+                // `unsafe expose &a as (p, resource m) { ... }` — the
+                // bridge to raw bytes; or a plain `unsafe { ... }` block,
+                // which is where raw operations may be called.
+                if self.at(&Tok::KwExpose) {
+                    return self.expose_stmt(kw_span);
+                }
+                let body = self.block()?;
+                Ok(Stmt::Unsafe { kw_span, body })
+            }
             Tok::KwResource => {
                 // `resource RawSpan tail = split_off(...);` — an owned
                 // resource local. The category is spelled out at every
@@ -1704,6 +1789,32 @@ impl<'a> Parser<'a> {
                     name,
                     name_span,
                     init: Some(init),
+                    mutable: std::mem::take(&mut self.pending_mut),
+                })
+            }
+            Tok::KwRaw => {
+                // `raw<u8> p = raw_offset(q, 1);` — a pointer local. It
+                // may also be declared without an initializer, which is
+                // the only way to have one before an exposure exists to
+                // produce a value; definite initialization is what keeps
+                // it from being read early.
+                let (ty, _) = self.raw_ty()?;
+                let (name, name_span) = self.ident()?;
+                if is_reserved_name(&name) {
+                    return Err(reserved_name_error(&name, name_span, "variable"));
+                }
+                let init = if self.at(&Tok::Assign) {
+                    self.bump();
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                self.expect(Tok::Semi)?;
+                Ok(Stmt::Decl {
+                    ty,
+                    name,
+                    name_span,
+                    init,
                     mutable: std::mem::take(&mut self.pending_mut),
                 })
             }
@@ -2276,6 +2387,30 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::Ident(name) if RawOp::from_name(&name).is_some() => {
+                let op = RawOp::from_name(&name).expect("checked");
+                self.bump();
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                while !self.at(&Tok::RParen) {
+                    args.push(self.expr()?);
+                    if self.at(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::RawOp {
+                        op,
+                        op_span: span,
+                        args,
+                    },
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
             Tok::Ident(name) if ResOp::from_name(&name).is_some() => {
                 let op = ResOp::from_name(&name).expect("checked");
                 self.bump();
@@ -2641,6 +2776,12 @@ fn is_reserved_name(name: &str) -> bool {
         "alloc_array",
         "split_off",
         "join",
+        "raw_offset",
+        "raw_load8",
+        "raw_store8",
+        "raw_copy_nonoverlapping",
+        "expose",
+        "as",
     ];
     RESERVED.contains(&name) || IntTy::from_name(name).is_some() || name == "bool"
 }
@@ -2667,7 +2808,7 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
         ExprKind::Var(n) => {
             out.insert(n.clone());
         }
-        ExprKind::ResOp { args, .. } => {
+        ExprKind::ResOp { args, .. } | ExprKind::RawOp { args, .. } => {
             for a in args {
                 expr_vars(a, out);
             }

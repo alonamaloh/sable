@@ -1,0 +1,7 @@
+// expect-error: raw.outside_unsafe
+// Raw memory access needs the block. It is the audit boundary: every
+// place where a proof, rather than the type system, keeps memory safe.
+fn no_block(resource &RawSpan m, raw<u8> p) -> u8 {
+    u8 b = raw_load8(p, &m);
+    return b;
+}

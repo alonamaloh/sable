@@ -1,0 +1,10 @@
+// expect-error: unjoined.expose
+// A split descendant must be rejoined before the body ends: the array is
+// reconstructed from one span covering the whole extent, and half of one
+// does not.
+/// pre  a.len ≥ 2
+fn unjoined(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        resource RawSpan tail = split_off(&mut m, 1);
+    }
+}

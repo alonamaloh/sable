@@ -1,0 +1,11 @@
+// expect-error: beyond.load8
+// Reading past the end of the span. The pointer arithmetic itself is
+// fine — pointers are pure — and the load is what asks.
+/// pre  a.len ≥ 1
+fn beyond(&[u8] a) -> u8 {
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        r = raw_load8(raw_offset(p, 4), &m);
+    }
+    return r;
+}

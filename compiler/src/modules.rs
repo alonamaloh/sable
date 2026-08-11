@@ -260,7 +260,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
         const_names: &HashMap<&str, (usize, bool)>,
     ) {
         match &e.kind {
-            ExprKind::ResOp { args, .. } => {
+            ExprKind::ResOp { args, .. } | ExprKind::RawOp { args, .. } => {
                 for a in args {
                     walk_expr(a, refs, const_names);
                 }
@@ -350,6 +350,9 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 Stmt::Assign { value, .. } => walk_expr(value, refs, const_names),
                 Stmt::VarDecl { init, .. } => walk_expr(init, refs, const_names),
                 Stmt::ExprStmt(e) => walk_expr(e, refs, const_names),
+                Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                    walk_stmts(body, refs, const_names)
+                }
                 Stmt::FieldAssign { value, .. } => walk_expr(value, refs, const_names),
                 Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
                     walk_expr(index, refs, const_names);

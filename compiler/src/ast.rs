@@ -105,6 +105,10 @@ pub enum Ty {
     /// An owned resource: affine authority, erased at runtime, with a
     /// pure view the proof language reads (ADR 0024).
     Res(ResKind),
+    /// `raw<u8>` — a raw pointer: provenance plus a byte offset, never an
+    /// address. Carries no authority at all; a load or a store needs a
+    /// resource borrow alongside it (ADR 0026).
+    Raw(IntTy),
     /// `resource &R` / `resource &mut R` — a borrow of that authority.
     ResRef(ResKind, Mutability),
     /// No return value (procedures like in-place sorts).
@@ -146,6 +150,60 @@ impl ResOp {
         match self {
             ResOp::SplitOff => "split_off",
             ResOp::Join => "join",
+        }
+    }
+}
+
+/// The raw machine operations. Each needs a resource borrow alongside its
+/// pointer — the pointer says *which* byte, the resource says the caller
+/// is allowed to touch it — and each may only be called inside `unsafe`
+/// (ADR 0026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawOp {
+    /// `raw_offset(p, d) -> raw<u8>` — pure pointer arithmetic.
+    Offset,
+    /// `raw_load8(p, resource &RawSpan m) -> u8`
+    Load8,
+    /// `raw_store8(p, v, resource &mut RawSpan m)`
+    Store8,
+    /// `raw_copy_nonoverlapping(sp, dp, n, resource &RawSpan s,
+    /// resource &mut RawSpan d)` — the affine tokens are what supply
+    /// separation, so there is no nonoverlap premise to discharge.
+    Copy,
+}
+
+impl RawOp {
+    pub fn from_name(name: &str) -> Option<RawOp> {
+        match name {
+            "raw_offset" => Some(RawOp::Offset),
+            "raw_load8" => Some(RawOp::Load8),
+            "raw_store8" => Some(RawOp::Store8),
+            "raw_copy_nonoverlapping" => Some(RawOp::Copy),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RawOp::Offset => "raw_offset",
+            RawOp::Load8 => "raw_load8",
+            RawOp::Store8 => "raw_store8",
+            RawOp::Copy => "raw_copy_nonoverlapping",
+        }
+    }
+
+    /// Only `raw_offset` is pure; the rest touch memory and are the
+    /// reason `unsafe` exists.
+    pub fn touches_memory(self) -> bool {
+        !matches!(self, RawOp::Offset)
+    }
+
+    pub fn arity(self) -> usize {
+        match self {
+            RawOp::Offset => 2,
+            RawOp::Load8 => 2,
+            RawOp::Store8 => 3,
+            RawOp::Copy => 5,
         }
     }
 }
@@ -197,6 +255,7 @@ impl Ty {
             Ty::Class(_) => "class".to_string(),
             Ty::ClassRef(_, Mutability::Mut) => "&mut class".to_string(),
             Ty::ClassRef(..) => "&class".to_string(),
+            Ty::Raw(t) => format!("raw<{}>", t.name()),
             Ty::Res(k) => format!("resource {}", k.name()),
             Ty::ResRef(k, Mutability::Mut) => format!("resource &mut {}", k.name()),
             Ty::ResRef(k, _) => format!("resource &{}", k.name()),
@@ -292,6 +351,12 @@ pub enum ExprKind {
     /// `a.len` where `a` names an array parameter.
     Len {
         array: String,
+    },
+    /// A raw machine operation. Its contract is generated (ADR 0026).
+    RawOp {
+        op: RawOp,
+        op_span: Span,
+        args: Vec<Expr>,
     },
     /// A sealed resource transformation: `split_off(&mut s, n)`,
     /// `join(a, b)`. Its contract is generated, not written (ADR 0024).
@@ -480,6 +545,32 @@ pub enum Stmt {
         variant: Option<Clause>,
         /// Span of the `while` keyword (for "missing variant" errors).
         kw_span: Span,
+        body: Vec<Stmt>,
+    },
+    /// `unsafe { ... }` — the block raw operations may be called in. It
+    /// is a marker, not a scope: locals declared inside still belong to
+    /// the enclosing function (ADR 0026).
+    Unsafe {
+        kw_span: Span,
+        body: Vec<Stmt>,
+    },
+    /// `unsafe expose &a as (p, resource m) { ... }` — the bridge from a
+    /// safe `[u8]` to raw bytes. The body sees a pointer and a resource
+    /// naming the array's storage; at scope exit the array is what the
+    /// bytes say (mutable form) or provably unchanged (shared form).
+    Expose {
+        kw_span: Span,
+        /// The exposed array's local name.
+        array: String,
+        array_span: Span,
+        /// `&mut a` exposes for writing; `&a` read-only.
+        mutable: bool,
+        /// The body's pointer binding.
+        ptr: String,
+        ptr_span: Span,
+        /// The body's resource binding.
+        res: String,
+        res_span: Span,
         body: Vec<Stmt>,
     },
 }

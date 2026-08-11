@@ -27,6 +27,11 @@ pub struct ClassMeta {
 
 pub struct CheckResult {
     pub sigs: HashMap<String, FnSig>,
+    /// How many `unsafe` regions the program opened. Reported by the
+    /// driver: the number of places a reader must audit is a fact about
+    /// the program, and burying it would defeat the point of having a
+    /// boundary (ADR 0026).
+    pub unsafe_regions: usize,
 }
 
 type CResult<T> = Result<T, Diagnostic>;
@@ -37,9 +42,22 @@ struct VarInfo {
     /// Declared `mut` (ADR 0016). Params are immutable; `self.f`
     /// pseudo-vars are governed by the receiver kind instead.
     mutable: bool,
+    /// Introduced by, or derived from, a lexical exposure — a *loan
+    /// brand* (ADR 0026). Branded values name storage that exists only
+    /// for the body of that exposure, so they may not escape it: no
+    /// return, no assignment to an outer place, and no passing to a
+    /// user function that could launder them out.
+    branded: bool,
 }
 
 struct Ctx<'a> {
+    /// Inside an `unsafe` block or an exposure body: raw operations are
+    /// legal here and nowhere else (ADR 0026).
+    in_unsafe: bool,
+    /// How many `unsafe` regions this function opened — reported, because
+    /// the number of places a reader must audit is a fact about the
+    /// program worth surfacing.
+    unsafe_blocks: usize,
     sigs: &'a HashMap<String, FnSig>,
     current_fn: String,
     current_has_variant: bool,
@@ -101,6 +119,7 @@ fn class_tbounds(c: &ClassDecl) -> HashMap<String, (String, u8)> {
 }
 
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
+    let mut unsafe_regions = 0usize;
     let traits_c: Vec<TraitDecl> = program.traits.clone();
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for f in &program.fns {
@@ -333,6 +352,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             vars: HashMap::new(),
             declared: HashSet::new(),
             moved: HashSet::new(),
+            in_unsafe: false,
+            unsafe_blocks: 0,
             calls: Vec::new(),
             in_class: None,
             in_init: false,
@@ -366,10 +387,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ty: p.ty,
                     initialized: true,
                     mutable: false,
-                },
+                        branded: false,
+                    },
             );
         }
         let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
+        unsafe_regions += ctx.unsafe_blocks;
         if !returns && f.ret != Ty::Unit {
             return Err(Diagnostic {
                 name: "type.missing_return".into(),
@@ -395,6 +418,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             vars: HashMap::new(),
             declared: HashSet::new(),
             moved: HashSet::new(),
+            in_unsafe: false,
+            unsafe_blocks: 0,
             calls: Vec::new(),
             in_class: None,
             in_init: false,
@@ -419,10 +444,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ty: p.ty,
                     initialized: true,
                     mutable: false,
-                },
+                        branded: false,
+                    },
             );
         }
         let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
+        unsafe_regions += ctx.unsafe_blocks;
         if !returns && f.ret != Ty::Unit {
             return Err(Diagnostic {
                 name: "type.missing_return".into(),
@@ -447,6 +474,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 vars: HashMap::new(),
                 declared: HashSet::new(),
             moved: HashSet::new(),
+            in_unsafe: false,
+            unsafe_blocks: 0,
                 calls: Vec::new(),
                 in_class: Some((ci, true)),
                 in_init: true,
@@ -463,6 +492,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         ty: p.ty,
                         initialized: true,
                         mutable: false,
+                        branded: false,
                     },
                 );
             }
@@ -473,10 +503,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         ty: *fty,
                         initialized: false,
                         mutable: true,
+                        branded: false,
                     },
                 );
             }
             check_block(&mut ctx, &mut init.body, Ty::Unit)?;
+            unsafe_regions += ctx.unsafe_blocks;
             for (fname, _) in &meta.fields {
                 if !ctx.vars[&format!("self.{fname}")].initialized {
                     return Err(Diagnostic {
@@ -502,6 +534,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 vars: HashMap::new(),
                 declared: HashSet::new(),
             moved: HashSet::new(),
+            in_unsafe: false,
+            unsafe_blocks: 0,
                 calls: Vec::new(),
                 in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                 in_init: false,
@@ -518,6 +552,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         ty: p.ty,
                         initialized: true,
                         mutable: false,
+                        branded: false,
                     },
                 );
             }
@@ -528,10 +563,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         ty: *fty,
                         initialized: true,
                         mutable: true,
+                        branded: false,
                     },
                 );
             }
             let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
+            unsafe_regions += ctx.unsafe_blocks;
             if !returns && m.f.ret != Ty::Unit {
                 return Err(Diagnostic {
                     name: "type.missing_return".into(),
@@ -597,6 +634,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     vars: HashMap::new(),
                     declared: HashSet::new(),
             moved: HashSet::new(),
+            in_unsafe: false,
+            unsafe_blocks: 0,
                     calls: Vec::new(),
                     in_class: Some((ci, true)),
                     in_init: true,
@@ -613,7 +652,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: p.ty,
                             initialized: true,
                             mutable: false,
-                        },
+                        branded: false,
+                    },
                     );
                 }
                 for (fname, fty) in &meta.fields {
@@ -623,10 +663,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: *fty,
                             initialized: false,
                             mutable: true,
-                        },
+                        branded: false,
+                    },
                     );
                 }
                 check_block(&mut ctx, &mut init.body, Ty::Unit)?;
+                unsafe_regions += ctx.unsafe_blocks;
+            unsafe_regions += ctx.unsafe_blocks;
                 for (fname, _) in &meta.fields {
                     if !ctx.vars[&format!("self.{fname}")].initialized {
                         return Err(Diagnostic {
@@ -651,6 +694,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     vars: HashMap::new(),
                     declared: HashSet::new(),
             moved: HashSet::new(),
+            in_unsafe: false,
+            unsafe_blocks: 0,
                     calls: Vec::new(),
                     in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                     in_init: false,
@@ -667,7 +712,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: p.ty,
                             initialized: true,
                             mutable: false,
-                        },
+                        branded: false,
+                    },
                     );
                 }
                 for (fname, fty) in &meta.fields {
@@ -677,10 +723,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: *fty,
                             initialized: true,
                             mutable: true,
-                        },
+                        branded: false,
+                    },
                     );
                 }
                 let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
+                unsafe_regions += ctx.unsafe_blocks;
+            unsafe_regions += ctx.unsafe_blocks;
                 if !returns && m.f.ret != Ty::Unit {
                     return Err(Diagnostic {
                         name: "type.missing_return".into(),
@@ -711,7 +760,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         });
     }
 
-    Ok(CheckResult { sigs })
+    Ok(CheckResult {
+        sigs,
+        unsafe_regions,
+    })
 }
 
 /// Returns whether every path through the block returns.
@@ -762,8 +814,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         notes: vec![],
                     });
                 }
+                let mut branded = false;
                 if let Some(e) = init {
                     check_expr(ctx, e, Some(*ty))?;
+                    // A local initialized from branded storage is branded
+                    // — but only if it *names* storage. A byte loaded out
+                    // of raw memory is an ordinary number, and branding it
+                    // would forbid returning the very thing the raw
+                    // operations exist to produce.
+                    branded = matches!(ty, Ty::Raw(_) | Ty::Res(_)) && brand_of(ctx, e);
                     // `resource RawSpan t = s;` — a local-to-local move,
                     // the same rule classes follow (ADR 0020/0024).
                     if matches!(ty, Ty::Res(_)) {
@@ -776,6 +835,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         ty: *ty,
                         initialized: init.is_some(),
                         mutable: *mutable,
+                        branded,
                     },
                 );
             }
@@ -796,6 +856,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
+                let dest_branded = ctx
+                    .vars
+                    .get(name.as_str())
+                    .is_some_and(|v| v.branded);
+                if !dest_branded {
+                    reject_brand_escape(ctx, value, "be assigned to an outer local", *name_span)?;
+                }
                 if !was_mutable {
                     return Err(Diagnostic {
                         name: "mut.assign_immutable".into(),
@@ -1040,6 +1107,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                     (Some(e), _) => {
+                        reject_brand_escape(ctx, e, "be returned", e.span)?;
                         check_expr(ctx, e, Some(ret_ty))?;
                     }
                 }
@@ -1099,8 +1167,163 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         ty: t,
                         initialized: true,
                         mutable: *mutable,
+                        branded: false,
                     },
                 );
+            }
+            // `unsafe { ... }` is a marker, not a scope: locals declared
+            // inside outlive the block, exactly as in an `if` body would
+            // not — the block only licenses raw operations (ADR 0026).
+            Stmt::Unsafe { body, .. } => {
+                let outer = ctx.in_unsafe;
+                ctx.in_unsafe = true;
+                ctx.unsafe_blocks += 1;
+                let r = check_block(ctx, body, ret_ty);
+                ctx.in_unsafe = outer;
+                returned = r?;
+            }
+            Stmt::Expose {
+                kw_span,
+                array,
+                array_span,
+                mutable,
+                ptr,
+                ptr_span,
+                res,
+                res_span,
+                body,
+            } => {
+                let (elem, src_mut, declared_mut) = match ctx.vars.get(array.as_str()) {
+                    Some(v) => match v.ty {
+                        Ty::Array(e, m) => (e, m, v.mutable),
+                        _ => {
+                            return Err(Diagnostic {
+                                name: "expose.not_an_array".into(),
+                                title: format!("`{array}` is not an array"),
+                                span: *array_span,
+                                label: format!("this has type `{}`", v.ty.name()),
+                                notes: vec![],
+                            });
+                        }
+                    },
+                    None => {
+                        return Err(Diagnostic {
+                            name: "type.unknown_variable".into(),
+                            title: format!("unknown variable `{array}`"),
+                            span: *array_span,
+                            label: "not declared".into(),
+                            notes: vec![],
+                        });
+                    }
+                };
+                if elem != IntTy::U8 {
+                    return Err(Diagnostic {
+                        name: "expose.element_type".into(),
+                        title: format!("cannot expose `[{}]` as bytes yet", elem.name()),
+                        span: *array_span,
+                        label: "only `u8` arrays for now".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "a wider element would make the byte order part of the \
+                             contract, and layout is a scheduled deliverable"
+                                .into(),
+                        )],
+                    });
+                }
+                if *mutable {
+                    if src_mut == Mutability::Shared {
+                        return Err(Diagnostic {
+                            name: "expose.mutate_shared".into(),
+                            title: format!("cannot expose `{array}` mutably"),
+                            span: *array_span,
+                            label: "this array is a shared borrow".into(),
+                            notes: vec![],
+                        });
+                    }
+                    if src_mut == Mutability::Owned && !declared_mut {
+                        return Err(Diagnostic {
+                            name: "mut.borrow_immutable".into(),
+                            title: format!("`&mut` exposure of immutable local `{array}`"),
+                            span: *array_span,
+                            label: "declare it `mut` to allow mutable exposure".into(),
+                            notes: vec![],
+                        });
+                    }
+                }
+                // The two bindings carry the loan brand. They name storage
+                // that exists only for this body, so nothing derived from
+                // them may outlive it.
+                for (name, span, ty) in [
+                    (ptr.as_str(), ptr_span, Ty::Raw(IntTy::U8)),
+                    (res.as_str(), res_span, Ty::Res(ResKind::RawSpan)),
+                ] {
+                    if !ctx.declared.insert(name.to_string()) {
+                        return Err(Diagnostic {
+                            name: "type.duplicate_name".into(),
+                            title: format!("duplicate variable name `{name}`"),
+                            span: *span,
+                            label: "already declared in this function".into(),
+                            notes: vec![],
+                        });
+                    }
+                    ctx.vars.insert(
+                        name.to_string(),
+                        VarInfo {
+                            ty,
+                            initialized: true,
+                            // A mutable exposure's resource may be split
+                            // and rejoined, which needs `&mut m`; a shared
+                            // one may not, which is how "shared exposure
+                            // cannot mutate" is enforced rather than
+                            // proved.
+                            mutable: *mutable,
+                            branded: true,
+                        },
+                    );
+                }
+                // Raw operations are legal in an exposure body without a
+                // nested `unsafe`: `unsafe expose` already said the word.
+                let outer = ctx.in_unsafe;
+                ctx.in_unsafe = true;
+                ctx.unsafe_blocks += 1;
+                let r = check_block(ctx, body, ret_ty);
+                ctx.in_unsafe = outer;
+                let body_returned = r?;
+                if body_returned {
+                    return Err(Diagnostic {
+                        name: "expose.return_from_body".into(),
+                        title: "cannot return from inside an exposure".into(),
+                        span: *kw_span,
+                        label: "the array has to be reconstructed first".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "leaving the body is what puts the bytes back; a `return` \
+                             would skip that"
+                                .into(),
+                        )],
+                    });
+                }
+                // The resource must still be owned here: the whole extent
+                // has to come back, and a split descendant has to be
+                // rejoined explicitly (the extent obligation checks that
+                // it covers everything).
+                if ctx.is_moved(&Place::local(res)) {
+                    return Err(Diagnostic {
+                        name: "expose.resource_lost".into(),
+                        title: format!("`{res}` does not come back at the end of the body"),
+                        span: *kw_span,
+                        label: "the exposed storage was moved away".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "the array is reconstructed from this resource's bytes, so it \
+                             must still be owned here; rejoin what was split off"
+                                .into(),
+                        )],
+                    });
+                }
+                ctx.vars.remove(ptr.as_str());
+                ctx.vars.remove(res.as_str());
+                ctx.moved.retain(|p| p.root != *ptr && p.root != *res);
             }
             Stmt::Assert(_) => {
                 // Proof language: elaborated by Lean (well-formedness def)
@@ -1236,6 +1459,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
 
 fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
+        Stmt::Unsafe { kw_span, .. } | Stmt::Expose { kw_span, .. } => *kw_span,
         Stmt::Decl { name_span, .. } => *name_span,
         Stmt::Assert(c) => c.line_span,
         Stmt::Assign { name_span, .. } => *name_span,
@@ -1682,6 +1906,62 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             remap(m.ret)
         }
+        ExprKind::RawOp { op, op_span, args } => {
+            let op = *op;
+            let op_span = *op_span;
+            if op.touches_memory() && !ctx.in_unsafe {
+                return Err(Diagnostic {
+                    name: "raw.outside_unsafe".into(),
+                    title: format!("`{}` may only be called inside `unsafe`", op.name()),
+                    span: op_span,
+                    label: "raw memory access".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "the block is the audit boundary: it marks every place where a \
+                         proof, rather than the type system, is what keeps memory safe"
+                            .into(),
+                    )],
+                });
+            }
+            if args.len() != op.arity() {
+                return Err(Diagnostic {
+                    name: "type.arity".into(),
+                    title: format!(
+                        "`{}` takes {} argument(s), {} given",
+                        op.name(),
+                        op.arity(),
+                        args.len()
+                    ),
+                    span: op_span,
+                    label: "wrong number of arguments".into(),
+                    notes: vec![],
+                });
+            }
+            let raw = Ty::Raw(IntTy::U8);
+            let u8t = Ty::Int(IntTy::U8);
+            let u64t = Ty::Int(IntTy::U64);
+            let shared = Ty::ResRef(ResKind::RawSpan, Mutability::Shared);
+            let unique = Ty::ResRef(ResKind::RawSpan, Mutability::Mut);
+            let want: &[Ty] = match op {
+                RawOp::Offset => &[raw, u64t],
+                RawOp::Load8 => &[raw, shared],
+                RawOp::Store8 => &[raw, u8t, unique],
+                RawOp::Copy => &[raw, raw, u64t, shared, unique],
+            };
+            for (arg, w) in args.iter_mut().zip(want) {
+                require_explicit_borrow(ctx, arg, *w)?;
+                check_expr(ctx, arg, Some(*w))?;
+            }
+            check_borrow_conflicts(ctx, args, None)?;
+            match op {
+                // A pointer derived from a branded one is branded too:
+                // provenance is what the brand tracks, and arithmetic
+                // preserves it.
+                RawOp::Offset => raw,
+                RawOp::Load8 => u8t,
+                RawOp::Store8 | RawOp::Copy => Ty::Unit,
+            }
+        }
         ExprKind::ResOp { op, op_span, args } => {
             let op = *op;
             let op_span = *op_span;
@@ -1840,6 +2120,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
             for (arg, p) in args.iter_mut().zip(&params) {
+                reject_brand_escape(ctx, arg, "be passed to a constructor", arg.span)?;
                 match p.ty {
                     Ty::Array(elem, m) => {
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
@@ -1880,6 +2161,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(_) => {
                         check_expr(ctx, arg, Some(p.ty))?;
                         mark_moved(ctx, arg)?;
+                    }
+                    Ty::Raw(_) => {
+                        check_expr(ctx, arg, Some(p.ty)).map(|_| ())?;
                     }
                     _ => check_expr(ctx, arg, Some(p.ty)).map(|_| ())?,
                 }
@@ -2489,6 +2773,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty).collect();
             let ret = sig.ret;
             for (arg, pty) in args.iter_mut().zip(param_tys) {
+                reject_brand_escape(ctx, arg, "be passed to a function", arg.span)?;
                 match pty {
                     Ty::Bool => {
                         return Err(Diagnostic {
@@ -2538,6 +2823,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(_) => {
                         check_expr(ctx, arg, Some(pty))?;
                         mark_moved(ctx, arg)?;
+                    }
+                    Ty::Raw(_) => {
+                        check_expr(ctx, arg, Some(pty)).map(|_| ())?;
                     }
                     _ => check_expr(ctx, arg, Some(pty)).map(|_| ())?,
                 }
@@ -2816,6 +3104,54 @@ impl<'a> Ctx<'a> {
         }
         Ok(())
     }
+}
+
+/// Whether an expression's value inherits a loan brand. Provenance is
+/// what propagates: pointer arithmetic on branded storage, a split of a
+/// branded span, a join involving one.
+fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Var(n) | ExprKind::Borrow { array: n, .. } => {
+            ctx.vars.get(n.as_str()).is_some_and(|v| v.branded)
+        }
+        ExprKind::RawOp { args, .. } | ExprKind::ResOp { args, .. } => {
+            args.iter().any(|a| brand_of(ctx, a))
+        }
+        _ => false,
+    }
+}
+
+/// A branded value names storage that exists only for the body of its
+/// exposure. It may be used by raw operations and the sealed resource
+/// transformations, and nowhere else — returning it, assigning it to an
+/// outer place, or handing it to a user function would let it outlive
+/// the storage (ADR 0026).
+fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()> {
+    let name = match &e.kind {
+        ExprKind::Var(n) => n,
+        ExprKind::Borrow { array, .. } => array,
+        _ => return Ok(()),
+    };
+    let names_storage = ctx
+        .vars
+        .get(name.as_str())
+        .is_some_and(|v| v.branded && matches!(v.ty, Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..)));
+    if !names_storage {
+        return Ok(());
+    }
+    Err(Diagnostic {
+        name: "expose.brand_escapes".into(),
+        title: format!("`{name}` cannot {how}"),
+        span,
+        label: "this names storage borrowed for the exposure body".into(),
+        notes: vec![(
+            "note".into(),
+            "an exposure lends the array's bytes for the body and takes them back at \
+             the end; a pointer or resource that outlived it would name storage the \
+             safe world owns again"
+                .into(),
+        )],
+    })
 }
 
 /// Use of a place whose value has moved away. Classes and resources are

@@ -111,6 +111,9 @@ fn subst_stmts(
             | Stmt::Return { value: Some(e), .. } => subst_expr(e, values),
             Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
             Stmt::Assert(c) => c.text = subst_clause_text(&c.text, text_map),
+            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                subst_stmts(body, values, text_map)
+            }
             Stmt::Store { index, value, .. } | Stmt::FieldStore { index, value, .. } => {
                 subst_expr(index, values);
                 subst_expr(value, values);
@@ -153,7 +156,7 @@ fn subst_expr(e: &mut Expr, values: &HashMap<String, i128>) {
                 e.kind = ExprKind::IntLit(*v);
             }
         }
-        ExprKind::ResOp { args, .. } => {
+        ExprKind::ResOp { args, .. } | ExprKind::RawOp { args, .. } => {
             for a in args {
                 subst_expr(a, values);
             }

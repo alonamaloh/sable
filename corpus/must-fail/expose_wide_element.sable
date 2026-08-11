@@ -1,0 +1,7 @@
+// expect-error: expose.element_type
+// Only `u8` arrays expose as bytes. A wider element would make byte
+// order part of the contract, and layout is a scheduled deliverable.
+fn wide(&[u32] a) {
+    unsafe expose &a as (p, resource m) {
+    }
+}
