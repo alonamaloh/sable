@@ -564,8 +564,8 @@ DMA, and atomics remain deliberately deferred and require their own decisions.
 
 ### M45 — scalar LLVM IR backend *(in progress, ADR 0058)*
 
-The first implementation slice is green, while the complete milestone remains
-in progress. `sable build --emit-llvm` lowers only an opaque `VerifiedProgram`
+The first three implementation slices are green, while the complete milestone
+remains in progress. `sable build --emit-llvm` lowers only an opaque `VerifiedProgram`
 containing the exact checked and monomorphized AST whose obligations succeeded
 in Lean; code generation cannot reload, mutate, or independently reconstruct
 the source program. The emitter is handwritten textual LLVM IR with no libLLVM
@@ -575,20 +575,36 @@ capability, rather than to a caller-supplied module view.
 The landed subset covers scalar literals, locals, assignment, direct
 nonrecursive calls, Boolean negation, unit procedures, returns, proof-assert
 erasure, otherwise-scalar `unsafe` blocks, `if`, `while`, signedness-aware
-comparisons, and CFG short circuiting. Per-block reachability handles nested
-returns; loop conditions remain in the header and are re-evaluated each trip;
-entry-hoisted local slots retain declaration-site initializer stores. Entry
-mode emits only the
+comparisons, CFG short circuiting, explicit `widen`/`narrow`, and checked
+integer arithmetic. Per-block reachability handles nested returns; loop
+conditions remain in the header and are re-evaluated each trip; entry-hoisted
+local slots retain declaration-site initializer stores. Entry mode emits only the
 transitive call closure plus an `i32 @main` bridge; whole-module mode rejects
 generic/class/record/trait declarations instead of silently omitting them.
 Output embeds its artifact and immutable proof-environment identities, stdout
-is pipe-clean, and `-o` publishes through a same-directory temporary file. The
-focused evidence is 18/18 library tests and 4/4 CLI tests; the latter proves a
-failed verification preserves an existing output, rejects audited assumptions
-without overwriting output, and runs both verified 42-returning scalar and CFG
-subjects successfully under Clang `-O0` and `-O2`.
-The complete one-worker verifier/dynamic corpus remains green through the new
-verified-program handoff (205.93s).
+is pipe-clean, and `-o` publishes through a same-directory temporary file.
+
+Signed and unsigned addition, subtraction, and multiplication use the matching
+`llvm.*.with.overflow` intrinsic, and signed negation uses
+`llvm.ssub.with.overflow`; their overflow bits branch to a defined trap.
+Division and remainder guard zero before `udiv`/`urem`/`sdiv`/`srem`, and signed
+division guards `MIN / -1`. Signed remainder treats `MIN % -1` as zero without
+executing LLVM's invalid `srem` pair. When LLVM's truncating signed remainder is
+negative, explicit unflagged add/subtract operations and SSA selections correct
+both quotient and remainder to Sable's Euclidean convention. Widening selects `sext` or `zext`; narrowing
+first represents the source value in `i128`, checks the destination's signed
+range, and truncates only on the success edge. Every arithmetic/conversion
+failure reports raw operand bits through the weak `__sable_rt_trap_v1` hook,
+then the internal `noreturn` helper invokes `llvm.trap` even if the hook returns.
+The emitter uses no `nsw`, `nuw`, `exact`, `inbounds`, or `llvm.assume` shortcut.
+
+Focused evidence is green at 23/23 single-job, non-incremental library tests and
+5/5 verified LLVM CLI tests. Clang was present: the scalar, CFG, and arithmetic
+subjects each returned the expected 42 at both `-O0` and `-O2`. The CLI gate
+also preserves an existing output on verification failure and rejects audited
+assumptions before publication. This arithmetic checkpoint has not yet run an
+interpreter differential or the complete verifier/dynamic corpus again; those
+remain closure evidence rather than claims of this slice.
 
 The v0 acceptance boundary is intentionally narrow: fixed-width integers,
 booleans, unit, scalar locals/parameters/returns, nonrecursive calls, ordinary
@@ -605,9 +621,9 @@ length-prefixed mangling without promising a public ABI, and file output is
 atomic. Deterministic emitter tests require no LLVM installation; optional
 future differential runs will compare supported subjects with the interpreter
 under Clang `-O0` and `-O2`; the current Clang gate pins the scalar entry's
-expected exit value directly.
-Conversions, guarded arithmetic, Euclidean division/remainder, and versioned
-runtime traps remain the next implementation slices.
+expected exit value directly. Remaining M45 work is the broader strict-negative
+matrix, interpreter/trap differentials, and a complete serial regression before
+declaring the scalar v0 boundary finished.
 
 ## Post-U10 usability sequence
 

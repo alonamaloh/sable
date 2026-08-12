@@ -101,6 +101,42 @@ fn verified_control_flow_and_short_circuit_run_at_o0_and_o2() {
 }
 
 #[test]
+fn verified_checked_arithmetic_and_euclidean_conversions_run_at_o0_and_o2() {
+    let source = repo_root().join("corpus/llvm-diff/arithmetic.sable");
+    let output = build_command()
+        .args([
+            "build",
+            "--emit-llvm",
+            "--entry",
+            "arithmetic_entry",
+            "-o",
+            "-",
+        ])
+        .arg(&source)
+        .output()
+        .expect("run the Sable arithmetic LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM arithmetic build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    assert!(ir.contains("@llvm.sadd.with.overflow.i8"));
+    assert!(ir.contains("@llvm.usub.with.overflow.i8"));
+    assert!(ir.contains("@llvm.smul.with.overflow.i16"));
+    assert!(ir.contains("@__sable_rt_trap_v1"));
+    assert!(ir.contains("@__sable_rt_fail_v1"));
+    assert!(ir.contains("sdiv i32"));
+    assert!(ir.contains("srem i32"));
+    assert!(ir.contains("sext i16"));
+    assert!(ir.contains("trunc i128"));
+    for forbidden in [" nsw ", " nuw ", " exact ", " inbounds ", "llvm.assume"] {
+        assert!(!ir.contains(forbidden), "forbidden LLVM token: {forbidden}");
+    }
+    assert_clang_exit("arithmetic", &ir, 42);
+}
+
+#[test]
 fn failed_verification_preserves_an_existing_output() {
     let temp = temp_dir("atomic");
     let destination = temp.join("program.ll");

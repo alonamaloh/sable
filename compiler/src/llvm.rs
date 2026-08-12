@@ -9,7 +9,7 @@ use crate::VerifiedProgram;
 use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, Stmt, Ty, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub type BackendError = Diagnostic;
 
@@ -71,10 +71,12 @@ fn emit_program(
     let mut out = String::from(
         "; Sable textual LLVM IR v0\n; Generated from a Lean-verified program (ADR 0058).\n\n",
     );
+    let mut definitions = String::new();
+    let mut support = ModuleSupport::default();
     for (index, function) in program.fns.iter().enumerate() {
         if selected_set.contains(&index) {
-            FunctionEmitter::new(program, function).emit(&mut out)?;
-            out.push('\n');
+            FunctionEmitter::new(program, function, &mut support).emit(&mut definitions)?;
+            definitions.push('\n');
         }
     }
 
@@ -84,8 +86,10 @@ fn emit_program(
             .iter()
             .find(|function| function.name == *entry)
             .expect("entry selection validated above");
-        emit_main_bridge(function, &mut out);
+        emit_main_bridge(function, &mut definitions);
     }
+    support.emit(&mut out);
+    out.push_str(&definitions);
     Ok(out)
 }
 
@@ -419,6 +423,25 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             op: UnOp::Not,
             operand,
         } => validate_bool_expr(program, operand, "logical-not operand"),
+        ExprKind::Unary {
+            op: UnOp::Neg,
+            operand,
+        } => {
+            validate_expr(program, operand)?;
+            let Some(Ty::Int(integer)) = operand.ty else {
+                return Err(vec![unsupported(
+                    operand.span,
+                    "unary-minus operand is not a checked integer",
+                )]);
+            };
+            if !integer.signed() {
+                return Err(vec![unsupported(
+                    operand.span,
+                    "unary-minus operand is not a checked signed integer",
+                )]);
+            }
+            require_expr_type(expression, Ty::Int(integer), "unary-minus result")
+        }
         ExprKind::Binary {
             op: BinOp::And | BinOp::Or,
             lhs,
@@ -455,17 +478,67 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             }
             require_expr_type(expression, Ty::Bool, "comparison result")
         }
-        ExprKind::Unary { .. }
-        | ExprKind::Binary {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem,
+        ExprKind::Binary {
+            op: op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem),
+            lhs,
+            rhs,
             ..
-        } => Err(vec![unsupported(
-            expression.span,
-            "checked arithmetic awaits the guarded-arithmetic LLVM slice",
-        )]),
+        } => {
+            validate_expr(program, lhs)?;
+            validate_expr(program, rhs)?;
+            let Some(Ty::Int(integer)) = lhs.ty else {
+                return Err(vec![unsupported(
+                    lhs.span,
+                    format!("left operand of `{}` is not a checked integer", op.symbol()),
+                )]);
+            };
+            if rhs.ty != Some(Ty::Int(integer)) {
+                return Err(vec![unsupported(
+                    rhs.span,
+                    format!(
+                        "right operand of `{}` does not have checked type `{}`",
+                        op.symbol(),
+                        integer.name()
+                    ),
+                )]);
+            }
+            require_expr_type(expression, Ty::Int(integer), "arithmetic result")
+        }
+        ExprKind::Widen { target, arg } => {
+            validate_expr(program, arg)?;
+            require_concrete_integer(*target, expression.span, "widen target")?;
+            let Some(Ty::Int(source)) = arg.ty else {
+                return Err(vec![unsupported(
+                    arg.span,
+                    "widen operand is not a checked integer",
+                )]);
+            };
+            if source.min() < target.min() || source.max() > target.max() {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "widen from `{}` to `{}` is not value-preserving",
+                        source.name(),
+                        target.name()
+                    ),
+                )]);
+            }
+            require_expr_type(expression, Ty::Int(*target), "widen result")
+        }
+        ExprKind::Narrow { target, arg } => {
+            validate_expr(program, arg)?;
+            require_concrete_integer(*target, expression.span, "narrow target")?;
+            if !matches!(arg.ty, Some(Ty::Int(_))) {
+                return Err(vec![unsupported(
+                    arg.span,
+                    "narrow operand is not a checked integer",
+                )]);
+            }
+            require_expr_type(expression, Ty::Int(*target), "narrow result")
+        }
         _ => Err(vec![unsupported(
             expression.span,
-            "expression is outside the straight-line scalar LLVM subset",
+            "expression is outside the scalar LLVM subset",
         )]),
     }
 }
@@ -491,7 +564,9 @@ fn require_expr_type(expression: &Expr, expected: Ty, role: &str) -> Result<(), 
 }
 
 fn require_scalar(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
-    if matches!(ty, Ty::Int(_) | Ty::Bool | Ty::Unit) {
+    if matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+        || matches!(ty, Ty::Bool | Ty::Unit)
+    {
         Ok(())
     } else {
         Err(vec![unsupported(
@@ -502,7 +577,7 @@ fn require_scalar(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError
 }
 
 fn require_value_scalar(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
-    if matches!(ty, Ty::Int(_) | Ty::Bool) {
+    if matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) || ty == Ty::Bool {
         Ok(())
     } else {
         Err(vec![unsupported(
@@ -512,6 +587,146 @@ fn require_value_scalar(ty: Ty, span: Span, role: &str) -> Result<(), Vec<Backen
                 ty.name()
             ),
         )])
+    }
+}
+
+fn require_concrete_integer(
+    integer: IntTy,
+    span: Span,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    if matches!(integer, IntTy::TParam(_)) {
+        Err(vec![unsupported(
+            span,
+            format!("{role} still contains an unmonomorphized integer type parameter"),
+        )])
+    } else {
+        Ok(())
+    }
+}
+
+// Trap kinds are part of the versioned `__sable_rt_trap_v1` hook.  Keep them
+// explicit rather than deriving them from AST discriminants: the AST is an
+// internal Rust detail, while embedding runtimes may inspect these numbers.
+const TRAP_ADD_OVERFLOW: u32 = 1;
+const TRAP_SUB_OVERFLOW: u32 = 2;
+const TRAP_MUL_OVERFLOW: u32 = 3;
+const TRAP_NEG_OVERFLOW: u32 = 4;
+const TRAP_DIV_ZERO: u32 = 5;
+const TRAP_DIV_OVERFLOW: u32 = 6;
+const TRAP_NARROW_RANGE: u32 = 7;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OverflowIntrinsic {
+    SignedAdd(u32),
+    UnsignedAdd(u32),
+    SignedSub(u32),
+    UnsignedSub(u32),
+    SignedMul(u32),
+    UnsignedMul(u32),
+}
+
+impl OverflowIntrinsic {
+    fn for_binary(operator: BinOp, integer: IntTy) -> Self {
+        match (operator, integer.signed()) {
+            (BinOp::Add, true) => Self::SignedAdd(integer.bits()),
+            (BinOp::Add, false) => Self::UnsignedAdd(integer.bits()),
+            (BinOp::Sub, true) => Self::SignedSub(integer.bits()),
+            (BinOp::Sub, false) => Self::UnsignedSub(integer.bits()),
+            (BinOp::Mul, true) => Self::SignedMul(integer.bits()),
+            (BinOp::Mul, false) => Self::UnsignedMul(integer.bits()),
+            _ => unreachable!("overflow intrinsic requested for non-overflowing operator"),
+        }
+    }
+
+    fn signed_sub(integer: IntTy) -> Self {
+        debug_assert!(integer.signed());
+        Self::SignedSub(integer.bits())
+    }
+
+    fn stem(self) -> &'static str {
+        match self {
+            Self::SignedAdd(_) => "sadd",
+            Self::UnsignedAdd(_) => "uadd",
+            Self::SignedSub(_) => "ssub",
+            Self::UnsignedSub(_) => "usub",
+            Self::SignedMul(_) => "smul",
+            Self::UnsignedMul(_) => "umul",
+        }
+    }
+
+    fn bits(self) -> u32 {
+        match self {
+            Self::SignedAdd(bits)
+            | Self::UnsignedAdd(bits)
+            | Self::SignedSub(bits)
+            | Self::UnsignedSub(bits)
+            | Self::SignedMul(bits)
+            | Self::UnsignedMul(bits) => bits,
+        }
+    }
+
+    fn name(self) -> String {
+        format!("llvm.{}.with.overflow.i{}", self.stem(), self.bits())
+    }
+
+    fn declaration(self) -> String {
+        let bits = self.bits();
+        format!(
+            "declare {{ i{bits}, i1 }} @{}(i{bits}, i{bits})",
+            self.name()
+        )
+    }
+}
+
+#[derive(Default)]
+struct ModuleSupport {
+    overflow_intrinsics: BTreeSet<OverflowIntrinsic>,
+    needs_trap: bool,
+}
+
+impl ModuleSupport {
+    fn require_overflow(&mut self, intrinsic: OverflowIntrinsic) {
+        self.overflow_intrinsics.insert(intrinsic);
+        self.needs_trap = true;
+    }
+
+    fn require_trap(&mut self) {
+        self.needs_trap = true;
+    }
+
+    fn emit(&self, out: &mut String) {
+        for intrinsic in &self.overflow_intrinsics {
+            out.push_str(&intrinsic.declaration());
+            out.push('\n');
+        }
+        if self.needs_trap {
+            if !self.overflow_intrinsics.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(
+                "; __sable_rt_trap_v1 kinds: 1 add, 2 sub, 3 mul, 4 neg, \
+                 5 div/rem zero, 6 signed div overflow, 7 narrow range\n\
+                 ; type_info bytes: result/destination, lhs/source, rhs; \
+                 type codes u8..u64,i8..i64 = 1..8\n\
+                 declare void @llvm.trap() cold noreturn nounwind\n\n\
+                 define weak void @__sable_rt_trap_v1(i32 %kind, i32 %type_info, \
+                 i64 %lhs_bits, i64 %rhs_bits) nounwind {\n\
+                 entry:\n\
+                   ret void\n\
+                 }\n\n\
+                 define internal void @__sable_rt_fail_v1(i32 %kind, i32 %type_info, \
+                 i64 %lhs_bits, i64 %rhs_bits) cold noreturn nounwind {\n\
+                 entry:\n\
+                   call void @__sable_rt_trap_v1(i32 %kind, i32 %type_info, \
+                 i64 %lhs_bits, i64 %rhs_bits)\n\
+                   call void @llvm.trap()\n\
+                   unreachable\n\
+                 }\n\n",
+            );
+        } else if !self.overflow_intrinsics.is_empty() {
+            out.push('\n');
+        }
     }
 }
 
@@ -525,9 +740,10 @@ struct Value {
     operand: Option<String>,
 }
 
-struct FunctionEmitter<'a> {
+struct FunctionEmitter<'a, 'support> {
     program: &'a Program,
     function: &'a Fn,
+    support: &'support mut ModuleSupport,
     locals: HashMap<String, Local>,
     next_local: usize,
     next_temp: usize,
@@ -539,11 +755,12 @@ struct FunctionEmitter<'a> {
     current_block: Option<String>,
 }
 
-impl<'a> FunctionEmitter<'a> {
-    fn new(program: &'a Program, function: &'a Fn) -> Self {
+impl<'a, 'support> FunctionEmitter<'a, 'support> {
+    fn new(program: &'a Program, function: &'a Fn, support: &'support mut ModuleSupport) -> Self {
         Self {
             program,
             function,
+            support,
             locals: HashMap::new(),
             next_local: 0,
             next_temp: 0,
@@ -843,6 +1060,19 @@ impl<'a> FunctionEmitter<'a> {
                     operand: Some(temp),
                 })
             }
+            ExprKind::Unary {
+                op: UnOp::Neg,
+                operand,
+            } => {
+                let operand = self.emit_expr(operand)?;
+                let Ty::Int(integer) = operand.ty else {
+                    unreachable!("validated unary-minus operand")
+                };
+                self.emit_checked_neg(
+                    integer,
+                    operand.operand.expect("integer unary-minus operand"),
+                )
+            }
             ExprKind::Call { callee, args, .. } => {
                 let function = self
                     .program
@@ -922,7 +1152,420 @@ impl<'a> FunctionEmitter<'a> {
                     operand: Some(temp),
                 })
             }
+            ExprKind::Binary {
+                op: op @ (BinOp::Add | BinOp::Sub | BinOp::Mul),
+                lhs,
+                rhs,
+                ..
+            } => {
+                // Evaluation order is observable through calls and traps:
+                // finish the left expression before beginning the right.
+                let lhs = self.emit_expr(lhs)?;
+                let rhs = self.emit_expr(rhs)?;
+                let Ty::Int(integer) = lhs.ty else {
+                    unreachable!("validated arithmetic operand")
+                };
+                self.emit_checked_binary(
+                    *op,
+                    integer,
+                    lhs.operand.expect("integer arithmetic lhs"),
+                    rhs.operand.expect("integer arithmetic rhs"),
+                )
+            }
+            ExprKind::Binary {
+                op: op @ (BinOp::Div | BinOp::Rem),
+                lhs,
+                rhs,
+                ..
+            } => {
+                let lhs = self.emit_expr(lhs)?;
+                let rhs = self.emit_expr(rhs)?;
+                let Ty::Int(integer) = lhs.ty else {
+                    unreachable!("validated division operand")
+                };
+                self.emit_div_rem(
+                    *op,
+                    integer,
+                    lhs.operand.expect("integer division lhs"),
+                    rhs.operand.expect("integer division rhs"),
+                )
+            }
+            ExprKind::Widen { target, arg } => {
+                let value = self.emit_expr(arg)?;
+                let Ty::Int(source) = value.ty else {
+                    unreachable!("validated widen operand")
+                };
+                let operand = value.operand.expect("integer widen operand");
+                if source.bits() == target.bits() {
+                    Ok(Value {
+                        ty: Ty::Int(*target),
+                        operand: Some(operand),
+                    })
+                } else {
+                    let temp = self.new_temp();
+                    let extension = if source.signed() { "sext" } else { "zext" };
+                    self.instruction(format!(
+                        "{temp} = {extension} {} {operand} to {}",
+                        llvm_ty(Ty::Int(source)),
+                        llvm_ty(Ty::Int(*target))
+                    ));
+                    Ok(Value {
+                        ty: Ty::Int(*target),
+                        operand: Some(temp),
+                    })
+                }
+            }
+            ExprKind::Narrow { target, arg } => {
+                let value = self.emit_expr(arg)?;
+                let Ty::Int(source) = value.ty else {
+                    unreachable!("validated narrow operand")
+                };
+                self.emit_narrow(
+                    source,
+                    *target,
+                    value.operand.expect("integer narrow operand"),
+                )
+            }
             _ => unreachable!("validated before lowering"),
+        }
+    }
+
+    fn emit_checked_binary(
+        &mut self,
+        operator: BinOp,
+        integer: IntTy,
+        lhs: String,
+        rhs: String,
+    ) -> Result<Value, Vec<BackendError>> {
+        let intrinsic = OverflowIntrinsic::for_binary(operator, integer);
+        self.support.require_overflow(intrinsic);
+        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let pair = self.new_temp();
+        self.instruction(format!(
+            "{pair} = call {{ {llvm_integer}, i1 }} @{}({llvm_integer} {lhs}, \
+             {llvm_integer} {rhs})",
+            intrinsic.name()
+        ));
+        let result = self.new_temp();
+        self.instruction(format!(
+            "{result} = extractvalue {{ {llvm_integer}, i1 }} {pair}, 0"
+        ));
+        let overflow = self.new_temp();
+        self.instruction(format!(
+            "{overflow} = extractvalue {{ {llvm_integer}, i1 }} {pair}, 1"
+        ));
+        let kind = match operator {
+            BinOp::Add => TRAP_ADD_OVERFLOW,
+            BinOp::Sub => TRAP_SUB_OVERFLOW,
+            BinOp::Mul => TRAP_MUL_OVERFLOW,
+            _ => unreachable!("checked binary operator"),
+        };
+        self.emit_trap_guard(
+            &overflow,
+            kind,
+            integer,
+            integer,
+            &lhs,
+            Some((integer, rhs.as_str())),
+        );
+        Ok(Value {
+            ty: Ty::Int(integer),
+            operand: Some(result),
+        })
+    }
+
+    fn emit_checked_neg(
+        &mut self,
+        integer: IntTy,
+        operand: String,
+    ) -> Result<Value, Vec<BackendError>> {
+        let intrinsic = OverflowIntrinsic::signed_sub(integer);
+        self.support.require_overflow(intrinsic);
+        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let pair = self.new_temp();
+        self.instruction(format!(
+            "{pair} = call {{ {llvm_integer}, i1 }} @{}({llvm_integer} 0, \
+             {llvm_integer} {operand})",
+            intrinsic.name()
+        ));
+        let result = self.new_temp();
+        self.instruction(format!(
+            "{result} = extractvalue {{ {llvm_integer}, i1 }} {pair}, 0"
+        ));
+        let overflow = self.new_temp();
+        self.instruction(format!(
+            "{overflow} = extractvalue {{ {llvm_integer}, i1 }} {pair}, 1"
+        ));
+        self.emit_trap_guard(
+            &overflow,
+            TRAP_NEG_OVERFLOW,
+            integer,
+            integer,
+            &operand,
+            None,
+        );
+        Ok(Value {
+            ty: Ty::Int(integer),
+            operand: Some(result),
+        })
+    }
+
+    fn emit_div_rem(
+        &mut self,
+        operator: BinOp,
+        integer: IntTy,
+        lhs: String,
+        rhs: String,
+    ) -> Result<Value, Vec<BackendError>> {
+        self.support.require_trap();
+        let llvm_integer = llvm_ty(Ty::Int(integer));
+
+        // LLVM division by zero is immediate undefined behavior.  This guard
+        // dominates every `*div`/`*rem` instruction emitted below.
+        let is_zero = self.new_temp();
+        self.instruction(format!("{is_zero} = icmp eq {llvm_integer} {rhs}, 0"));
+        self.emit_trap_guard(
+            &is_zero,
+            TRAP_DIV_ZERO,
+            integer,
+            integer,
+            &lhs,
+            Some((integer, rhs.as_str())),
+        );
+
+        if !integer.signed() {
+            let result = self.new_temp();
+            let instruction = if operator == BinOp::Div {
+                "udiv"
+            } else {
+                "urem"
+            };
+            self.instruction(format!(
+                "{result} = {instruction} {llvm_integer} {lhs}, {rhs}"
+            ));
+            return Ok(Value {
+                ty: Ty::Int(integer),
+                operand: Some(result),
+            });
+        }
+
+        let is_min = self.new_temp();
+        self.instruction(format!(
+            "{is_min} = icmp eq {llvm_integer} {lhs}, {}",
+            integer.min()
+        ));
+        let is_negative_one = self.new_temp();
+        self.instruction(format!(
+            "{is_negative_one} = icmp eq {llvm_integer} {rhs}, -1"
+        ));
+        let is_min_over_negative_one = self.new_temp();
+        self.instruction(format!(
+            "{is_min_over_negative_one} = and i1 {is_min}, {is_negative_one}"
+        ));
+
+        if operator == BinOp::Div {
+            // LLVM's `sdiv min, -1` is poison/undefined even without flags;
+            // Sable gives that quotient a checked overflow trap.
+            self.emit_trap_guard(
+                &is_min_over_negative_one,
+                TRAP_DIV_OVERFLOW,
+                integer,
+                integer,
+                &lhs,
+                Some((integer, rhs.as_str())),
+            );
+            let quotient = self.new_temp();
+            self.instruction(format!("{quotient} = sdiv {llvm_integer} {lhs}, {rhs}"));
+            let remainder = self.new_temp();
+            self.instruction(format!("{remainder} = srem {llvm_integer} {lhs}, {rhs}"));
+            let quotient = self.emit_euclidean_quotient(integer, quotient, remainder, &rhs);
+            Ok(Value {
+                ty: Ty::Int(integer),
+                operand: Some(quotient),
+            })
+        } else {
+            // Sable's `min % -1` is zero.  LLVM makes even `srem min, -1`
+            // undefined, so route that pair around the instruction and merge
+            // the language-defined zero with the ordinary truncating result.
+            let special_label = self.new_label("rem.min-neg-one");
+            let normal_label = self.new_label("rem.normal");
+            let merge_label = self.new_label("rem.merge");
+            self.terminate(format!(
+                "br i1 {is_min_over_negative_one}, label %{special_label}, label %{normal_label}"
+            ));
+
+            self.start_block(normal_label);
+            let remainder = self.new_temp();
+            self.instruction(format!("{remainder} = srem {llvm_integer} {lhs}, {rhs}"));
+            let normal_predecessor = self.current_label().to_owned();
+            self.terminate(format!("br label %{merge_label}"));
+
+            self.start_block(special_label);
+            let special_predecessor = self.current_label().to_owned();
+            self.terminate(format!("br label %{merge_label}"));
+
+            self.start_block(merge_label);
+            let merged = self.new_temp();
+            self.instruction(format!(
+                "{merged} = phi {llvm_integer} [ {remainder}, %{normal_predecessor} ], \
+                 [ 0, %{special_predecessor} ]"
+            ));
+            let remainder = self.emit_euclidean_remainder(integer, merged, &rhs);
+            Ok(Value {
+                ty: Ty::Int(integer),
+                operand: Some(remainder),
+            })
+        }
+    }
+
+    fn emit_euclidean_quotient(
+        &mut self,
+        integer: IntTy,
+        quotient: String,
+        remainder: String,
+        divisor: &str,
+    ) -> String {
+        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let remainder_negative = self.new_temp();
+        self.instruction(format!(
+            "{remainder_negative} = icmp slt {llvm_integer} {remainder}, 0"
+        ));
+        let divisor_negative = self.new_temp();
+        self.instruction(format!(
+            "{divisor_negative} = icmp slt {llvm_integer} {divisor}, 0"
+        ));
+
+        // These internal corrections are mathematically in range whenever a
+        // negative truncating remainder exists.  Plain unflagged LLVM add/sub
+        // is total modular arithmetic, so even the unselected candidate
+        // cannot introduce poison.
+        let incremented = self.new_temp();
+        self.instruction(format!("{incremented} = add {llvm_integer} {quotient}, 1"));
+        let decremented = self.new_temp();
+        self.instruction(format!("{decremented} = sub {llvm_integer} {quotient}, 1"));
+        let correction = self.new_temp();
+        self.instruction(format!(
+            "{correction} = select i1 {divisor_negative}, {llvm_integer} {incremented}, \
+             {llvm_integer} {decremented}"
+        ));
+        let result = self.new_temp();
+        self.instruction(format!(
+            "{result} = select i1 {remainder_negative}, {llvm_integer} {correction}, \
+             {llvm_integer} {quotient}"
+        ));
+        result
+    }
+
+    fn emit_euclidean_remainder(
+        &mut self,
+        integer: IntTy,
+        remainder: String,
+        divisor: &str,
+    ) -> String {
+        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let remainder_negative = self.new_temp();
+        self.instruction(format!(
+            "{remainder_negative} = icmp slt {llvm_integer} {remainder}, 0"
+        ));
+        let divisor_negative = self.new_temp();
+        self.instruction(format!(
+            "{divisor_negative} = icmp slt {llvm_integer} {divisor}, 0"
+        ));
+        let add_divisor = self.new_temp();
+        self.instruction(format!(
+            "{add_divisor} = add {llvm_integer} {remainder}, {divisor}"
+        ));
+        let subtract_divisor = self.new_temp();
+        self.instruction(format!(
+            "{subtract_divisor} = sub {llvm_integer} {remainder}, {divisor}"
+        ));
+        let correction = self.new_temp();
+        self.instruction(format!(
+            "{correction} = select i1 {divisor_negative}, {llvm_integer} {subtract_divisor}, \
+             {llvm_integer} {add_divisor}"
+        ));
+        let result = self.new_temp();
+        self.instruction(format!(
+            "{result} = select i1 {remainder_negative}, {llvm_integer} {correction}, \
+             {llvm_integer} {remainder}"
+        ));
+        result
+    }
+
+    fn emit_narrow(
+        &mut self,
+        source: IntTy,
+        target: IntTy,
+        operand: String,
+    ) -> Result<Value, Vec<BackendError>> {
+        self.support.require_trap();
+        let source_ty = llvm_ty(Ty::Int(source));
+        let extension = if source.signed() { "sext" } else { "zext" };
+        let wide = self.new_temp();
+        self.instruction(format!(
+            "{wide} = {extension} {source_ty} {operand} to i128"
+        ));
+        let below = self.new_temp();
+        self.instruction(format!("{below} = icmp slt i128 {wide}, {}", target.min()));
+        let above = self.new_temp();
+        self.instruction(format!("{above} = icmp sgt i128 {wide}, {}", target.max()));
+        let outside = self.new_temp();
+        self.instruction(format!("{outside} = or i1 {below}, {above}"));
+        self.emit_trap_guard(&outside, TRAP_NARROW_RANGE, target, source, &operand, None);
+        let result = self.new_temp();
+        self.instruction(format!(
+            "{result} = trunc i128 {wide} to {}",
+            llvm_ty(Ty::Int(target))
+        ));
+        Ok(Value {
+            ty: Ty::Int(target),
+            operand: Some(result),
+        })
+    }
+
+    fn emit_trap_guard(
+        &mut self,
+        failure: &str,
+        kind: u32,
+        info_type: IntTy,
+        lhs_type: IntTy,
+        lhs: &str,
+        rhs: Option<(IntTy, &str)>,
+    ) {
+        self.support.require_trap();
+        // The ABI carries raw source-width operand bits.  Zero extension is
+        // intentional even for signed inputs: diagnostics can reconstruct the
+        // signed value from `type_info`, while the payload remains lossless.
+        let lhs_bits = self.emit_raw_bits(lhs_type, lhs);
+        let rhs_bits = rhs
+            .map(|(ty, value)| self.emit_raw_bits(ty, value))
+            .unwrap_or_else(|| "0".into());
+        let trap_label = self.new_label("trap");
+        let continue_label = self.new_label("trap.ok");
+        self.terminate(format!(
+            "br i1 {failure}, label %{trap_label}, label %{continue_label}"
+        ));
+
+        self.start_block(trap_label);
+        self.instruction(format!(
+            "call void @__sable_rt_fail_v1(i32 {kind}, i32 {}, i64 {lhs_bits}, i64 {rhs_bits})",
+            packed_type_info(info_type, lhs_type, rhs.map(|(ty, _)| ty))
+        ));
+        self.terminate("unreachable");
+
+        self.start_block(continue_label);
+    }
+
+    fn emit_raw_bits(&mut self, integer: IntTy, operand: &str) -> String {
+        if integer.bits() == 64 {
+            operand.to_owned()
+        } else {
+            let temp = self.new_temp();
+            self.instruction(format!(
+                "{temp} = zext {} {operand} to i64",
+                llvm_ty(Ty::Int(integer))
+            ));
+            temp
         }
     }
 
@@ -1054,6 +1697,26 @@ fn llvm_ty(ty: Ty) -> String {
         Ty::Unit => "void".into(),
         _ => unreachable!("non-scalar type validated out"),
     }
+}
+
+fn integer_type_code(integer: IntTy) -> u32 {
+    match integer {
+        IntTy::U8 => 1,
+        IntTy::U16 => 2,
+        IntTy::U32 => 3,
+        IntTy::U64 => 4,
+        IntTy::I8 => 5,
+        IntTy::I16 => 6,
+        IntTy::I32 => 7,
+        IntTy::I64 => 8,
+        IntTy::TParam(_) => unreachable!("type parameter after monomorphization"),
+    }
+}
+
+fn packed_type_info(result: IntTy, lhs: IntTy, rhs: Option<IntTy>) -> u32 {
+    integer_type_code(result)
+        | (integer_type_code(lhs) << 8)
+        | (rhs.map(integer_type_code).unwrap_or(0) << 16)
 }
 
 fn type_code(ty: Ty) -> &'static str {
@@ -1274,6 +1937,33 @@ mod tests {
         )
     }
 
+    fn variable(name: &str, integer: IntTy) -> Expr {
+        expression(ExprKind::Var(name.into()), Ty::Int(integer))
+    }
+
+    fn binary(operator: BinOp, integer: IntTy, lhs: Expr, rhs: Expr) -> Expr {
+        expression(
+            ExprKind::Binary {
+                op: operator,
+                op_span: Span::new(0, 1),
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            Ty::Int(integer),
+        )
+    }
+
+    fn returning_function(name: &str, integer: IntTy, value: Expr) -> Fn {
+        function(
+            name,
+            Ty::Int(integer),
+            vec![Stmt::Return {
+                value: Some(value),
+                span: Span::new(0, 1),
+            }],
+        )
+    }
+
     fn program(fns: Vec<Fn>) -> Program {
         Program {
             fns,
@@ -1319,9 +2009,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_arithmetic_until_it_is_guarded() {
+    fn checked_arithmetic_uses_deduplicated_intrinsics_and_guarded_traps() {
         let int = Ty::Int(IntTy::I32);
-        let binary = expression(
+        let first_binary = expression(
             ExprKind::Binary {
                 op: BinOp::Add,
                 op_span: Span::new(0, 1),
@@ -1334,12 +2024,43 @@ mod tests {
             "add",
             int,
             vec![Stmt::Return {
-                value: Some(binary),
+                value: Some(first_binary),
                 span: Span::new(0, 1),
             }],
         );
-        let error = emit_program(&program(vec![f]), 1, &EmitOptions::default()).unwrap_err();
-        assert_eq!(error[0].name, "backend.unsupported");
+        let second_binary = expression(
+            ExprKind::Binary {
+                op: BinOp::Add,
+                op_span: Span::new(0, 1),
+                lhs: Box::new(expression(ExprKind::IntLit(3), int)),
+                rhs: Box::new(expression(ExprKind::IntLit(4), int)),
+            },
+            int,
+        );
+        let g = function(
+            "add_again",
+            int,
+            vec![Stmt::Return {
+                value: Some(second_binary),
+                span: Span::new(0, 1),
+            }],
+        );
+        let ir = emit_program(&program(vec![f, g]), 1, &EmitOptions::default()).unwrap();
+        assert_eq!(
+            ir.matches("declare { i32, i1 } @llvm.sadd.with.overflow.i32")
+                .count(),
+            1
+        );
+        let call = ir
+            .find("call { i32, i1 } @llvm.sadd.with.overflow.i32")
+            .unwrap();
+        let guard = ir[call..].find("br i1").unwrap() + call;
+        let continuation = ir[guard..].find("trap.ok:").unwrap() + guard;
+        let ret = ir[continuation..].find("ret i32").unwrap() + continuation;
+        assert!(call < guard && guard < continuation && continuation < ret);
+        assert!(ir.contains("call void @__sable_rt_fail_v1(i32 1, i32 460551"));
+        assert!(ir.contains("define weak void @__sable_rt_trap_v1"));
+        assert!(ir.contains("call void @llvm.trap()\nunreachable"));
     }
 
     #[test]
@@ -1560,5 +2281,208 @@ mod tests {
         let ir = emit_program(&program(vec![local]), 1, &EmitOptions::default()).unwrap();
         assert!(ir.contains("%v0 = alloca i32"));
         assert!(!ir.contains("store i32 0, ptr %v0"));
+    }
+
+    #[test]
+    fn checked_negation_and_unsigned_arithmetic_choose_matching_intrinsics() {
+        let mut negate = returning_function(
+            "negate",
+            IntTy::I8,
+            expression(
+                ExprKind::Unary {
+                    op: UnOp::Neg,
+                    operand: Box::new(variable("x", IntTy::I8)),
+                },
+                Ty::Int(IntTy::I8),
+            ),
+        );
+        negate.params = vec![parameter("x", Ty::Int(IntTy::I8))];
+        let mut multiply = returning_function(
+            "multiply",
+            IntTy::U16,
+            binary(
+                BinOp::Mul,
+                IntTy::U16,
+                variable("x", IntTy::U16),
+                variable("y", IntTy::U16),
+            ),
+        );
+        multiply.params = vec![
+            parameter("x", Ty::Int(IntTy::U16)),
+            parameter("y", Ty::Int(IntTy::U16)),
+        ];
+
+        let ir =
+            emit_program(&program(vec![negate, multiply]), 1, &EmitOptions::default()).unwrap();
+        assert!(ir.contains("@llvm.ssub.with.overflow.i8(i8 0, i8"));
+        assert!(ir.contains("@llvm.umul.with.overflow.i16"));
+        assert!(ir.contains("@__sable_rt_fail_v1(i32 4"));
+        assert!(ir.contains("@__sable_rt_fail_v1(i32 3"));
+    }
+
+    #[test]
+    fn signed_division_guards_llvm_ub_and_corrects_euclidean_result() {
+        let mut divide = returning_function(
+            "divide",
+            IntTy::I32,
+            binary(
+                BinOp::Div,
+                IntTy::I32,
+                variable("x", IntTy::I32),
+                variable("y", IntTy::I32),
+            ),
+        );
+        divide.params = vec![
+            parameter("x", Ty::Int(IntTy::I32)),
+            parameter("y", Ty::Int(IntTy::I32)),
+        ];
+        let ir = emit_program(&program(vec![divide]), 1, &EmitOptions::default()).unwrap();
+
+        let zero_check = ir.find("icmp eq i32 %t1, 0").unwrap();
+        let zero_guard = ir[zero_check..].find("br i1").unwrap() + zero_check;
+        let overflow_check = ir.find("icmp eq i32 %t0, -2147483648").unwrap();
+        let overflow_guard = ir[overflow_check..].find("br i1").unwrap() + overflow_check;
+        let divide = ir.find(" = sdiv i32").unwrap();
+        assert!(zero_check < zero_guard && zero_guard < overflow_check);
+        assert!(overflow_check < overflow_guard && overflow_guard < divide);
+        assert!(ir[divide..].contains(" = srem i32"));
+        assert!(ir[divide..].contains("icmp slt i32"));
+        let correction = &ir[divide..];
+        assert!(correction.contains(" = add i32"));
+        assert!(correction.contains(" = sub i32"));
+        assert!(correction.contains("select i1"));
+    }
+
+    #[test]
+    fn signed_remainder_routes_min_negative_one_around_srem() {
+        let mut remainder = returning_function(
+            "remainder",
+            IntTy::I64,
+            binary(
+                BinOp::Rem,
+                IntTy::I64,
+                variable("x", IntTy::I64),
+                variable("y", IntTy::I64),
+            ),
+        );
+        remainder.params = vec![
+            parameter("x", Ty::Int(IntTy::I64)),
+            parameter("y", Ty::Int(IntTy::I64)),
+        ];
+        let ir = emit_program(&program(vec![remainder]), 1, &EmitOptions::default()).unwrap();
+
+        let split = ir.find("label %b2.rem.min-neg-one").unwrap();
+        let normal = ir.find("b3.rem.normal:\n  %t").unwrap();
+        let srem = ir.find(" = srem i64").unwrap();
+        let special = ir.find("b2.rem.min-neg-one:\n").unwrap();
+        let merge = ir.find("b4.rem.merge:\n").unwrap();
+        assert!(split < normal && normal < srem && srem < special && special < merge);
+        let phi = &ir[merge..];
+        assert!(phi.contains("phi i64"));
+        assert!(phi.contains("[ 0, %b2.rem.min-neg-one ]"));
+        assert!(phi.contains(" = add i64"));
+        assert!(phi.contains(" = sub i64"));
+        assert!(phi.contains("select i1"));
+    }
+
+    #[test]
+    fn conversions_preserve_signedness_and_guard_narrowing_in_i128() {
+        let mut widen_signed = returning_function(
+            "widen_signed",
+            IntTy::I64,
+            expression(
+                ExprKind::Widen {
+                    target: IntTy::I64,
+                    arg: Box::new(variable("x", IntTy::I16)),
+                },
+                Ty::Int(IntTy::I64),
+            ),
+        );
+        widen_signed.params = vec![parameter("x", Ty::Int(IntTy::I16))];
+        let mut widen_unsigned = returning_function(
+            "widen_unsigned",
+            IntTy::U32,
+            expression(
+                ExprKind::Widen {
+                    target: IntTy::U32,
+                    arg: Box::new(variable("x", IntTy::U8)),
+                },
+                Ty::Int(IntTy::U32),
+            ),
+        );
+        widen_unsigned.params = vec![parameter("x", Ty::Int(IntTy::U8))];
+        let mut narrow = returning_function(
+            "narrow",
+            IntTy::I8,
+            expression(
+                ExprKind::Narrow {
+                    target: IntTy::I8,
+                    arg: Box::new(variable("x", IntTy::U64)),
+                },
+                Ty::Int(IntTy::I8),
+            ),
+        );
+        narrow.params = vec![parameter("x", Ty::Int(IntTy::U64))];
+        let mut narrow_signed = returning_function(
+            "narrow_signed",
+            IntTy::U8,
+            expression(
+                ExprKind::Narrow {
+                    target: IntTy::U8,
+                    arg: Box::new(variable("x", IntTy::I8)),
+                },
+                Ty::Int(IntTy::U8),
+            ),
+        );
+        narrow_signed.params = vec![parameter("x", Ty::Int(IntTy::I8))];
+        let ir = emit_program(
+            &program(vec![widen_signed, widen_unsigned, narrow, narrow_signed]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap();
+
+        assert!(ir.contains("sext i16"));
+        assert!(ir.contains("zext i8"));
+        assert!(ir.contains("zext i64 %t0 to i128"));
+        assert!(ir.contains("icmp slt i128"));
+        assert!(ir.contains("icmp sgt i128"));
+        let guard = ir.find("br i1").unwrap();
+        let trunc = ir.find("trunc i128").unwrap();
+        assert!(guard < trunc);
+        // destination i8=5, source u64=4, no rhs: 5 | (4 << 8)
+        assert!(ir.contains("@__sable_rt_fail_v1(i32 7, i32 1029"));
+        // The signed interpretation lives in type_info; the payload is the
+        // lossless original source-width bit pattern (an i64 needs no cast).
+        assert!(ir.contains("i32 1029, i64 %t0, i64 0)"));
+        // destination u8=1, source i8=5, no rhs: 1 | (5 << 8). Signed
+        // sub-64-bit payloads are deliberately zero-extended raw bits.
+        assert!(ir.contains("= zext i8 %t0 to i64"));
+        assert!(ir.contains("i32 1281"));
+    }
+
+    #[test]
+    fn arithmetic_ir_never_uses_poison_promises() {
+        let mut add = returning_function(
+            "add",
+            IntTy::I32,
+            binary(
+                BinOp::Add,
+                IntTy::I32,
+                variable("x", IntTy::I32),
+                variable("y", IntTy::I32),
+            ),
+        );
+        add.params = vec![
+            parameter("x", Ty::Int(IntTy::I32)),
+            parameter("y", Ty::Int(IntTy::I32)),
+        ];
+        let ir = emit_program(&program(vec![add]), 1, &EmitOptions::default()).unwrap();
+        for forbidden in [" nsw ", " nuw ", " exact ", " inbounds ", "llvm.assume"] {
+            assert!(
+                !ir.contains(forbidden),
+                "forbidden LLVM promise: {forbidden}"
+            );
+        }
     }
 }

@@ -56,8 +56,17 @@ is the handwritten, libLLVM-free command shown above (full form:
 `sable build --emit-llvm [--entry NAME] [-o FILE|-] file.sable`). It consumes
 only an opaque `VerifiedProgram` containing the exact AST accepted by Lean,
 emits scalar literals/locals/calls/Boolean negation/unit plus `if`, `while`,
-signedness-aware comparisons, and true short circuiting, and strictly rejects
-everything not yet implemented. Exact guarded arithmetic is the next slice; see
+signedness-aware comparisons, true short circuiting, checked integer
+arithmetic, and explicit integer conversions, and strictly rejects everything
+not yet implemented. Signed and unsigned add/subtract/multiply and signed
+negation use overflow intrinsics; division/remainder and narrowing are guarded,
+signed division/remainder is corrected to Sable's Euclidean convention, and
+every failure reaches a versioned weak hook and then `llvm.trap`. The emitter
+uses none of LLVM's poison-producing arithmetic promises. Focused evidence is
+green at 23/23 single-job, non-incremental library tests and 5/5 verified CLI
+tests; with Clang present, the scalar, CFG, and arithmetic subjects each
+returned 42 at `-O0` and `-O2`. Broader differential and full-corpus reruns
+remain M45 closure work; see
 [`docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md`](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md).
 
 - **The bignum pillar** (M15–M16, the Tier-3 opener): arbitrary-precision `Nat` over base-2³² limbs with a normalizing representation invariant ([`corpus/verifies/bignum.sable`](corpus/verifies/bignum.sable)). The entire specification is one recursive ghost valuation, `natVal`, and one line per operation: `cmp` decides the order, `add`/`sub`/`mul` post `natVal result.limbs = natVal a.limbs ⊕ natVal b.limbs`, `div`/`rem` post `… = natVal a.limbs / natVal b.limbs` against Lean's own Euclidean division — with division built *compositionally* (double-and-subtract riding the contracts of the other verified ops, closed by one uniqueness lemma) — and `gcd` is Euclid in fifteen lines whose spec is kernel-check-proven to agree with Lean core's `Int.gcd`. **255 obligations across 10 functions, 73 hand discharges, zero escapes**, every clause monitored dynamically — the first benchmark where the mathematics itself was the test.

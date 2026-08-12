@@ -1,13 +1,13 @@
 # ADR 0058 — LLVM lowering consumes the verified program
 
-**Decided 2026-08-12; first implementation slice landed, milestone in progress.** Unsafe Sable v1 has a
+**Decided 2026-08-12; three implementation slices landed, milestone in progress.** Unsafe Sable v1 has a
 defensible formal stopping point, but Sable still has no native-code path. The
 first backend should make verified programs runnable without making LLVM part
 of the verifier or introducing a second, subtly different front-end pipeline.
 
 ## Decision
 
-The compiler will gain a handwritten textual LLVM IR emitter, selected with:
+The compiler has a handwritten textual LLVM IR emitter, selected with:
 
 ```text
 sable build --emit-llvm [--entry NAME] [-o FILE|-] [-M PATH] file.sable
@@ -60,18 +60,22 @@ production module. Recursion is rejected over the same selected call graph.
 ## Preserving Sable arithmetic
 
 LLVM's convenient undefined/poison-producing flags are not Sable semantics.
-The backend therefore emits no `nsw`, `nuw`, `inbounds`, or `llvm.assume` as a
-substitute for a Sable proof. Checked addition, subtraction, and multiplication
-use LLVM overflow intrinsics and branch to a trap on the overflow bit. Division
-and remainder guard zero, and signed division additionally guards
-`min / -1`, before executing LLVM's instruction.
+The backend therefore emits no `nsw`, `nuw`, `exact`, `inbounds`, or
+`llvm.assume` as a substitute for a Sable proof. Checked signed and unsigned addition,
+subtraction, and multiplication use the matching LLVM overflow intrinsics and
+branch to a trap on the overflow bit; signed negation uses signed-subtract-with-
+overflow from zero. Division and remainder guard zero, and signed division
+additionally guards `min / -1`, before executing LLVM's instruction.
 
 Sable signed division is Euclidean; LLVM signed division truncates toward
 zero. The emitted control flow corrects LLVM's quotient and remainder when the
 truncating remainder is negative, rather than changing the source-language
-meaning. Narrowing performs an explicit range check before truncation. Boolean
-short circuiting is control flow with merge values, so an unevaluated operand
-cannot trap or produce effects.
+meaning. The representable Sable result `min % -1 = 0` bypasses LLVM's invalid
+`srem min, -1` pair entirely. Widening uses the source signedness to choose
+`sext` or `zext`; narrowing extends the source value to `i128`, performs an
+explicit signed range check there, and truncates only on the success edge.
+Boolean short circuiting is control flow with merge values, so an unevaluated
+operand cannot trap or produce effects.
 
 Runtime failures use a versioned trap hook plus an internal `noreturn` helper:
 
@@ -80,9 +84,21 @@ void @__sable_rt_trap_v1(i32 kind, i32 type_info,
                          i64 lhs_bits, i64 rhs_bits)
 ```
 
-The default helper invokes the weak hook and then `llvm.trap`; embedding code
-may replace the hook for diagnostics. This interface describes failures, not a
-stable calling convention for Sable functions.
+The internal helper invokes the weak hook and then unconditionally invokes
+`llvm.trap`; a returning replacement hook cannot suppress the failure.
+Embedding code may replace the hook for diagnostics. This interface describes
+failures, not a stable calling convention for Sable functions.
+
+The `v1` numeric schema is fixed independently of Rust enum layout. Failure
+`kind` values are 1 add overflow, 2 subtract overflow, 3 multiply overflow,
+4 negation overflow, 5 division/remainder by zero, 6 signed division overflow,
+and 7 narrowing out of range. Integer type codes are 1 through 8 for
+`u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, and `i64`, respectively.
+`type_info` packs the result/destination code in bits 0–7, the left/source code
+in bits 8–15, and the optional right code in bits 16–23. Operand payloads are
+the original source-width bit patterns zero-extended to `i64` (or unchanged for
+64-bit values); signed interpretation therefore comes from the type code, not
+from sign extension of the payload.
 
 ## Names and output
 
@@ -107,20 +123,24 @@ environment unless explicitly required (for example by
 `SABLE_REQUIRE_CLANG=1`); the ordinary emitter suite never acquires an LLVM
 tool dependency.
 
-The first two slices are now implemented: the opaque `VerifiedProgram`
+The first three slices are now implemented: the opaque `VerifiedProgram`
 boundary, root-bound entry selection, CLI, atomic output, provenance comments,
 strict scalar lowering, and a real CFG for branches, loops, comparisons, and
 short circuiting. Local allocation is entry-hoisted while initialization stays
-at its source point. Their focused gates are green at 18/18 library tests and
-4/4 CLI tests; both scalar and CFG subjects return 42 when compiled by Clang at
-`-O0` and `-O2`, while verification failure and
-audited-assumption rejection both leave an existing output untouched. The
-complete one-worker verifier/dynamic corpus also remains green through the new
-handoff (205.93s). The remaining work should continue in reviewable slices:
-exact arithmetic, conversions, and traps; finally
-broader strict diagnostics, differential fixtures, and final user
-documentation. Until those slices and gates land, the complete v0 backend is
-still in progress.
+at its source point. The third slice adds checked signed/unsigned arithmetic,
+signed negation, guarded division/remainder with Euclidean correction, explicit
+widening/narrowing, and the versioned weak trap hook plus mandatory
+`llvm.trap`. Its structural tests pin guard dominance, the `min % -1` bypass,
+raw trap payloads, and the absence of poison promises.
+
+Focused gates are green at 23/23 single-job, non-incremental library tests and
+5/5 verified LLVM CLI tests. Clang was present: scalar, CFG, and arithmetic
+subjects each returned the expected 42 at `-O0` and `-O2`. Verification failure
+and audited-assumption rejection leave existing output untouched. These are
+direct compiled-result gates, not interpreter differentials, and the complete
+verifier/dynamic corpus was not rerun for the arithmetic slice. Broader strict
+diagnostics, interpreter/trap differential fixtures, and a final serial
+regression remain before the complete v0 backend is declared finished.
 
 ## Consequences
 

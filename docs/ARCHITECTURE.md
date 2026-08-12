@@ -108,17 +108,30 @@ single code-generation boundary rather than building a parallel frontend.
 
 The working `sable build --emit-llvm` path has no libLLVM dependency. The first
 landed slices accept scalar literals, locals, calls, Boolean negation, unit,
-`if`, `while`, signedness-aware comparisons, and CFG short circuiting; they
-reject unsupported code within the selected `--entry` call closure (or
-anywhere in whole-module mode). Local slots are hoisted to the entry block but
-their initializer stores remain at the source declaration, so loops neither
-grow the stack nor fabricate initialization. Output carries the exact
-artifact and proof-environment identities, uses versionable length-prefixed
-internal mangling, and file publication is atomic. The next slice adds checked
-arithmetic with explicit guards, never
-poison-producing flags or `llvm.assume`. The focused CLI gate compiles and runs
-both verified scalar/CFG subjects under Clang `-O0` and `-O2`, while LLVM tools remain
-optional for emitting IR. The complete v0 boundary remains in progress.
+`if`, `while`, signedness-aware comparisons, CFG short circuiting, explicit
+integer conversions, and checked arithmetic; they reject unsupported code
+within the selected `--entry` call closure (or anywhere in whole-module mode).
+Local slots are hoisted to the entry block but their initializer stores remain
+at the source declaration, so loops neither grow the stack nor fabricate
+initialization. Signed and unsigned add/subtract/multiply and signed negation
+use the matching LLVM overflow intrinsics. Division and remainder guard zero
+before any LLVM division instruction; signed division also guards `MIN / -1`,
+while signed `MIN % -1` bypasses LLVM's invalid `srem` pair and yields zero.
+Negative truncating remainders are corrected to Sable's Euclidean quotient and
+remainder. Widening uses `sext`/`zext`; narrowing extends into `i128`, checks the
+destination range, and only then truncates. Failures call the weak versioned
+trap hook and unconditionally continue to the internal `llvm.trap` path. No
+`nsw`, `nuw`, `exact`, `inbounds`, or `llvm.assume` promise substitutes for
+these checks.
+
+Output carries the exact artifact and proof-environment identities, uses
+versionable length-prefixed internal mangling, and file publication is atomic.
+Focused gates are green at 23/23 single-job, non-incremental library tests and
+5/5 verified CLI tests. With Clang present, verified scalar, CFG, and
+arithmetic subjects each return 42 at `-O0` and `-O2`; LLVM tools remain
+optional for emitting IR. Interpreter differentials and a full-corpus rerun
+have not yet been performed for this arithmetic checkpoint, so the complete v0
+boundary remains in progress.
 
 ## Key invariants
 
