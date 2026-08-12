@@ -204,9 +204,7 @@ fn module_relative_path(module: &str) -> Result<String, String> {
         if component.is_empty()
             || component == "."
             || component == ".."
-            || component
-                .chars()
-                .any(|ch| matches!(ch, '/' | '\\' | '\0'))
+            || component.chars().any(|ch| matches!(ch, '/' | '\\' | '\0'))
         {
             return Err(format!("unsafe Lean module identifier `{module}`"));
         }
@@ -458,8 +456,8 @@ public section
 
     #[test]
     fn one_import_command_cannot_name_two_modules() {
-        let error = parse_header_imports("import Sable.One Sable.Two\n", "Fixture.lean")
-            .unwrap_err();
+        let error =
+            parse_header_imports("import Sable.One Sable.Two\n", "Fixture.lean").unwrap_err();
         assert!(error.contains("invalid Lean module identifier"));
     }
 

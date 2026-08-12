@@ -562,13 +562,59 @@ MMIO/device-description abstraction, UART receive/interrupt/error/timing models,
 page tables, privileged instructions, any Sail/ISA connection, concurrency,
 DMA, and atomics remain deliberately deferred and require their own decisions.
 
+### M45 — scalar LLVM IR backend *(in progress, ADR 0058)*
+
+The first implementation slice is green, while the complete milestone remains
+in progress. `sable build --emit-llvm` lowers only an opaque `VerifiedProgram`
+containing the exact checked and monomorphized AST whose obligations succeeded
+in Lean; code generation cannot reload, mutate, or independently reconstruct
+the source program. The emitter is handwritten textual LLVM IR with no libLLVM
+dependency. Entry selection is bound to the root span stored inside that
+capability, rather than to a caller-supplied module view.
+
+The landed subset covers scalar literals, locals, assignment, direct
+nonrecursive calls, Boolean negation, unit procedures, returns, proof-assert
+erasure, and otherwise-scalar `unsafe` blocks. Entry mode emits only the
+transitive call closure plus an `i32 @main` bridge; whole-module mode rejects
+generic/class/record/trait declarations instead of silently omitting them.
+Output embeds its artifact and immutable proof-environment identities, stdout
+is pipe-clean, and `-o` publishes through a same-directory temporary file. The
+focused evidence is 12/12 library tests and 3/3 CLI tests; the latter proves a
+failed verification preserves an existing output, rejects audited assumptions
+without overwriting output, and runs the verified 42-returning subject
+successfully under Clang `-O0` and `-O2`.
+The complete one-worker verifier/dynamic corpus remains green through the new
+verified-program handoff (205.93s).
+
+The v0 acceptance boundary is intentionally narrow: fixed-width integers,
+booleans, unit, scalar locals/parameters/returns, nonrecursive calls, ordinary
+control flow, short circuiting, conversions, and checked arithmetic. Entry mode
+checks the selected function's transitive closure, while whole-module mode
+rejects any unsupported production declaration. Arrays, options, classes,
+records, borrows, raw/resource/device operations, externs, deferred obligations,
+and recursion receive source diagnostics rather than partial lowering.
+
+Arithmetic must retain Sable semantics under optimization: explicit overflow,
+division, and narrowing guards; Euclidean signed division correction; no
+`nsw`/`nuw`/`inbounds`/`llvm.assume` shortcuts. Internal names use
+length-prefixed mangling without promising a public ABI, and file output is
+atomic. Deterministic emitter tests require no LLVM installation; optional
+future differential runs will compare supported subjects with the interpreter
+under Clang `-O0` and `-O2`; the current Clang gate pins the scalar entry's
+expected exit value directly.
+Control flow, short circuiting, conversions, guarded arithmetic, Euclidean
+division/remainder, and versioned runtime traps remain the next implementation
+slices.
+
 ## Post-U10 usability sequence
 
-With that stopping point reached, LLVM IR lowering is the active next milestone.
+With that stopping point reached, LLVM IR lowering is the active next milestone
+(M45/ADR 0058, currently in progress).
 The rest remains a working order, not a promise that evidence cannot reorder it:
 
-1. Add an LLVM IR backend, preserving the checked language semantics and using
-   differential/end-to-end tests to keep lowering honest.
+1. Complete the scalar LLVM IR backend described above, preserving the checked
+   language semantics and using differential/end-to-end tests to keep lowering
+   honest.
 2. Generalize aggregate values: class type parameters, then arrays and options
    whose elements are not restricted to the current integer-oriented surface.
 3. Add printing and formatting together with the smallest practical `String`

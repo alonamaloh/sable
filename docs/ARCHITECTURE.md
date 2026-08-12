@@ -97,6 +97,26 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
+## Native lowering boundary (in progress)
+
+ADR 0058 adds a second consumer only *after* the verification path succeeds:
+the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
+handwritten textual LLVM emitter consumes that capability. It may not reload
+source or accept an unchecked `Program`. This keeps module resolution,
+monomorphization, checking, VC generation, and Lean evidence on one side of a
+single code-generation boundary rather than building a parallel frontend.
+
+The working `sable build --emit-llvm` path has no libLLVM dependency. The first
+landed slice accepts straight-line scalar literals, locals, calls, Boolean
+negation, and unit; it rejects unsupported code within the selected `--entry`
+call closure (or anywhere in whole-module mode). Output carries the exact
+artifact and proof-environment identities, uses versionable length-prefixed
+internal mangling, and file publication is atomic. The next slices will add
+control flow and checked arithmetic with explicit guards, never
+poison-producing flags or `llvm.assume`. The focused CLI gate compiles and runs
+the verified scalar subject under Clang `-O0` and `-O2`, while LLVM tools remain
+optional for emitting IR. The complete v0 boundary remains in progress.
+
 ## Key invariants
 
 - **Verbatim splice.** Contract clauses appear in generated Lean exactly as written (module call-site substitution of parameter names by argument expressions). Generated theorems bind program variables under their source names so clauses elaborate unchanged. If a clause doesn't elaborate, the error must point at the `.sable` clause, not at generated code.

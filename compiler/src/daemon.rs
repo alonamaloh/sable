@@ -156,13 +156,11 @@ fn handle_request(
         return error_reply("request missing \"text\"");
     };
 
-    let proof_environment = match crate::lean::ProofEnvironment::load_published(
-        repo_root,
-        request_fingerprint,
-    ) {
-        Ok(environment) => environment,
-        Err(error) => return error_reply(&error),
-    };
+    let proof_environment =
+        match crate::lean::ProofEnvironment::load_published(repo_root, request_fingerprint) {
+            Ok(environment) => environment,
+            Err(error) => return error_reply(&error),
+        };
     let built = match proof_environment.ensure_built(repo_root) {
         Ok(built) => built,
         Err(error) => return error_reply(&error),
@@ -188,11 +186,11 @@ fn handle_request(
         }
     }
 
-    match server
-        .as_mut()
-        .expect("server was spawned above")
-        .check(Path::new(file), expected_source, stream)
-    {
+    match server.as_mut().expect("server was spawned above").check(
+        Path::new(file),
+        expected_source,
+        stream,
+    ) {
         Ok(messages) => {
             if let Err(error) = proof_environment.validate_built(&built) {
                 return error_reply(&error);

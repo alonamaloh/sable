@@ -1,0 +1,21 @@
+// First native-backend subject: the deliberately small, verified scalar core.
+
+/// post result = 42
+fn answer() -> i32 {
+    i32 value = 42;
+    return value;
+}
+
+/// post result = 42
+fn scalar_entry() -> i32 {
+    return answer();
+}
+
+/// post result = true
+fn truth() -> bool {
+    return true;
+}
+
+fn no_value() {
+    return;
+}

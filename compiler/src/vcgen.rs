@@ -114,10 +114,7 @@ pub struct RecordFieldEmit {
 
 fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
     fn is_uart_ty(ty: Ty) -> bool {
-        matches!(
-            ty,
-            Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
-        )
+        matches!(ty, Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _))
     }
 
     fn signature_uses_uart(function: &Fn) -> bool {
@@ -164,9 +161,7 @@ fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
             }
             ExprKind::Index { index, .. }
             | ExprKind::SelfFieldIndex { index, .. }
-            | ExprKind::ClassFieldIndex { index, .. } => {
-                visit_expr(index, uses_uart, used)
-            }
+            | ExprKind::ClassFieldIndex { index, .. } => visit_expr(index, uses_uart, used),
             ExprKind::AllocArray { len, init, .. } => {
                 visit_expr(len, uses_uart, used);
                 visit_expr(init, uses_uart, used);
@@ -421,9 +416,8 @@ pub fn generate(
     let (uses_uart_profile, uart_intrinsics) = collect_uart_dependencies(program);
     let uart_profile = uses_uart_profile
         .then(|| {
-            crate::profile::uart_poll_v1_hash(repo_root).map(|hash| {
-                vec![(crate::profile::UART_POLL_V1_ID.into(), hash)]
-            })
+            crate::profile::uart_poll_v1_hash(repo_root)
+                .map(|hash| vec![(crate::profile::UART_POLL_V1_ID.into(), hash)])
         })
         .transpose()?;
     let mut result = VcResult {
@@ -6037,9 +6031,5 @@ pub fn slug(text: &str) -> String {
         }
     }
     let out = out.trim_matches('_').to_string();
-    if out.is_empty() {
-        "e".to_string()
-    } else {
-        out
-    }
+    if out.is_empty() { "e".to_string() } else { out }
 }

@@ -547,10 +547,7 @@ impl ProofEnvironment {
         self.materialize_source(repo_root)?;
         let environment_dir = proof_environment_dir(repo_root, &self.id);
         let _lock = ProofBuildLock::acquire(&environment_dir.join("build.lock"))?;
-        self.validate_snapshot(
-            &environment_dir.join("source"),
-            "published source snapshot",
-        )?;
+        self.validate_snapshot(&environment_dir.join("source"), "published source snapshot")?;
 
         let built = environment_dir.join("built");
         let ready = built.join("READY");
@@ -600,10 +597,17 @@ impl ProofEnvironment {
     pub fn validate_built(&self, built: &Path) -> Result<(), String> {
         self.validate_snapshot(built, "immutable proof build")?;
         let ready = built.join("READY");
-        let metadata = std::fs::symlink_metadata(&ready)
-            .map_err(|error| format!("cannot inspect proof readiness {}: {error}", ready.display()))?;
+        let metadata = std::fs::symlink_metadata(&ready).map_err(|error| {
+            format!(
+                "cannot inspect proof readiness {}: {error}",
+                ready.display()
+            )
+        })?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(format!("proof readiness {} is not a regular file", ready.display()));
+            return Err(format!(
+                "proof readiness {} is not a regular file",
+                ready.display()
+            ));
         }
         let actual = std::fs::read_to_string(&ready)
             .map_err(|error| format!("cannot read proof readiness {}: {error}", ready.display()))?;
@@ -700,8 +704,12 @@ fn validate_proof_environment_dir(repo_root: &Path, id: &str) -> Result<(), Stri
 }
 
 fn validate_local_directory(path: &Path) -> Result<(), String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| format!("cannot inspect managed directory {}: {error}", path.display()))?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "cannot inspect managed directory {}: {error}",
+            path.display()
+        )
+    })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         Err(format!(
             "managed proof-environment path {} must be a local directory",
@@ -727,13 +735,19 @@ fn ensure_local_directory(path: &Path) -> Result<(), String> {
                 )),
             }
         }
-        Err(error) => Err(format!("cannot inspect managed directory {}: {error}", path.display())),
+        Err(error) => Err(format!(
+            "cannot inspect managed directory {}: {error}",
+            path.display()
+        )),
     }
 }
 
 fn capture_proof_files(repo_root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
     let root_metadata = std::fs::symlink_metadata(repo_root).map_err(|error| {
-        format!("cannot inspect proof snapshot root {}: {error}", repo_root.display())
+        format!(
+            "cannot inspect proof snapshot root {}: {error}",
+            repo_root.display()
+        )
     })?;
     if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         return Err(format!(
@@ -743,8 +757,12 @@ fn capture_proof_files(repo_root: &Path) -> Result<BTreeMap<String, Vec<u8>>, St
     }
     let lean_relative = Path::new("lean");
     let lean_dir = repo_root.join(lean_relative);
-    let lean_metadata = std::fs::symlink_metadata(&lean_dir)
-        .map_err(|error| format!("cannot inspect proof workspace {}: {error}", lean_dir.display()))?;
+    let lean_metadata = std::fs::symlink_metadata(&lean_dir).map_err(|error| {
+        format!(
+            "cannot inspect proof workspace {}: {error}",
+            lean_dir.display()
+        )
+    })?;
     if lean_metadata.file_type().is_symlink() || !lean_metadata.is_dir() {
         return Err(format!(
             "proof workspace {} must be a repository-local directory",
@@ -784,7 +802,10 @@ fn capture_lean_tree(
         ));
     }
     let entries = std::fs::read_dir(&directory).map_err(|error| {
-        format!("cannot read proof source directory {}: {error}", directory.display())
+        format!(
+            "cannot read proof source directory {}: {error}",
+            directory.display()
+        )
     })?;
     let mut children = entries
         .collect::<Result<Vec<_>, _>>()
@@ -806,7 +827,10 @@ fn capture_lean_tree(
         }
         if metadata.is_dir() {
             capture_lean_tree(root, &child_relative, files)?;
-        } else if child_relative.extension().is_some_and(|extension| extension == "lean") {
+        } else if child_relative
+            .extension()
+            .is_some_and(|extension| extension == "lean")
+        {
             capture_proof_file(root, &child_relative, files)?;
         }
     }
@@ -874,19 +898,32 @@ fn unique_directory(parent: &Path, prefix: &str) -> Result<PathBuf, String> {
 static NEXT_PROOF_TEMP: AtomicU64 = AtomicU64::new(0);
 
 fn remove_unready_built(environment_dir: &Path, built: &Path) -> Result<(), String> {
-    if built.parent() != Some(environment_dir) || built.file_name().and_then(|name| name.to_str()) != Some("built") {
-        return Err(format!("refusing to replace out-of-scope proof build {}", built.display()));
+    if built.parent() != Some(environment_dir)
+        || built.file_name().and_then(|name| name.to_str()) != Some("built")
+    {
+        return Err(format!(
+            "refusing to replace out-of-scope proof build {}",
+            built.display()
+        ));
     }
-    let metadata = std::fs::symlink_metadata(built)
-        .map_err(|error| format!("cannot inspect incomplete proof build {}: {error}", built.display()))?;
+    let metadata = std::fs::symlink_metadata(built).map_err(|error| {
+        format!(
+            "cannot inspect incomplete proof build {}: {error}",
+            built.display()
+        )
+    })?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(format!(
             "incomplete proof build {} is not an owned directory",
             built.display()
         ));
     }
-    std::fs::remove_dir_all(built)
-        .map_err(|error| format!("cannot replace incomplete proof build {}: {error}", built.display()))
+    std::fs::remove_dir_all(built).map_err(|error| {
+        format!(
+            "cannot replace incomplete proof build {}: {error}",
+            built.display()
+        )
+    })
 }
 
 fn require_sable_olean(built: &Path) -> Result<(), String> {
@@ -894,7 +931,10 @@ fn require_sable_olean(built: &Path) -> Result<(), String> {
     let metadata = std::fs::symlink_metadata(&olean)
         .map_err(|error| format!("proof build is missing {}: {error}", olean.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        Err(format!("proof build output {} is not a regular file", olean.display()))
+        Err(format!(
+            "proof build output {} is not a regular file",
+            olean.display()
+        ))
     } else {
         Ok(())
     }
@@ -951,7 +991,10 @@ const LOCK_UNLOCK: std::os::raw::c_int = 8;
 
 unsafe extern "C" {
     #[link_name = "flock"]
-    fn process_flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn process_flock(
+        fd: std::os::raw::c_int,
+        operation: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
 }
 
 /// The full search path is derived from the exact READY build and extended

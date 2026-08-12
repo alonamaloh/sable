@@ -1,11 +1,16 @@
-use sable::{Options, Outcome, check_file};
-use std::path::PathBuf;
+use sable::{Options, Outcome, VerifiedInfo, check_file};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
 Usage:
   sable check <file.sable>           verify a Sable source file
   sable check --emit-lean <file>     print the generated Lean instead of checking
+  sable build --emit-llvm <file>     verify, then emit textual LLVM IR
+             [--entry <name>]        also emit a C-compatible main for <name>
+             [-o <file>|-]           write atomically to <file> (default: stdout)
   sable test  <file.sable>           run test_* functions with dynamic contract checks
   sable ... -M <dir>                 add a directory to the `use` module search path
   sable lsp                          run the language server on stdio
@@ -18,16 +23,16 @@ fn main() -> ExitCode {
     let mut opts = Options::default();
     let mut command = None;
     let mut file = None;
+    let mut emit_llvm = false;
+    let mut entry = None;
+    let mut output = None;
 
-    let mut expect_module_path = false;
-    for arg in &args {
-        if expect_module_path {
-            opts.module_paths.push(PathBuf::from(arg));
-            expect_module_path = false;
-            continue;
-        }
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
         match arg.as_str() {
             "check" if command.is_none() => command = Some("check"),
+            "build" if command.is_none() => command = Some("build"),
             "test" if command.is_none() => command = Some("test"),
             "lsp" if command.is_none() => command = Some("lsp"),
             "daemon" if command.is_none() => command = Some("daemon"),
@@ -35,7 +40,39 @@ fn main() -> ExitCode {
             // does, among others); stdio is our only transport, so accept it.
             "--stdio" if command == Some("lsp") => {}
             "--emit-lean" => opts.emit_lean_only = true,
-            "-M" | "--module-path" => expect_module_path = true,
+            "--emit-llvm" => emit_llvm = true,
+            "--entry" => {
+                if entry.is_some() {
+                    eprintln!("error: `--entry` may only be supplied once\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    eprintln!("error: `--entry` requires a function name\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                entry = Some(value.clone());
+            }
+            "-o" | "--output" => {
+                if output.is_some() {
+                    eprintln!("error: `-o` may only be supplied once\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    eprintln!("error: `-o` requires a path or `-`\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                output = Some(PathBuf::from(value));
+            }
+            "-M" | "--module-path" => {
+                i += 1;
+                let Some(value) = args.get(i) else {
+                    eprintln!("error: `-M` requires a directory\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                opts.module_paths.push(PathBuf::from(value));
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -48,6 +85,24 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         }
+        i += 1;
+    }
+
+    if opts.emit_lean_only && command != Some("check") {
+        eprintln!("error: `--emit-lean` is only valid with `sable check`\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    if emit_llvm && command != Some("build") {
+        eprintln!("error: `--emit-llvm` is only valid with `sable build`\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    if (entry.is_some() || output.is_some()) && command != Some("build") {
+        eprintln!("error: `--entry` and `-o` are only valid with `sable build`\n{USAGE}");
+        return ExitCode::from(2);
+    }
+    if command == Some("build") && !emit_llvm {
+        eprintln!("error: `sable build` currently requires `--emit-llvm`\n{USAGE}");
+        return ExitCode::from(2);
     }
 
     if command == Some("daemon") {
@@ -87,6 +142,10 @@ fn main() -> ExitCode {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
+
+    if command == "build" {
+        return build_llvm(&file, &opts, entry, output.as_deref());
+    }
 
     if command == "test" {
         return match sable::test_file(&file, &opts) {
@@ -206,4 +265,164 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn build_llvm(
+    file: &Path,
+    opts: &Options,
+    entry: Option<String>,
+    output: Option<&Path>,
+) -> ExitCode {
+    let (mods, verified) = sable::verify_file_structured(file, opts);
+    let verified = match verified {
+        Ok(verified) => verified,
+        Err(diags) => {
+            for diag in &diags {
+                eprintln!("{}", mods.render(diag));
+            }
+            eprintln!(
+                "verification failed: {} error(s) in {}",
+                diags.len(),
+                file.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let emit_opts = sable::llvm::EmitOptions { entry };
+    let ir = match sable::llvm::emit_verified(&verified, &emit_opts) {
+        Ok(ir) => ir,
+        Err(diags) => {
+            for diag in &diags {
+                eprintln!("{}", mods.render(diag));
+            }
+            eprintln!(
+                "LLVM lowering failed: {} error(s) in {}",
+                diags.len(),
+                file.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let write_result = match output {
+        Some(path) if path != Path::new("-") => write_atomic(path, ir.as_bytes()),
+        _ => write_stdout(ir.as_bytes()),
+    };
+    if let Err(error) = write_result {
+        let destination = output
+            .filter(|path| *path != Path::new("-"))
+            .map_or_else(|| "stdout".to_owned(), |path| path.display().to_string());
+        eprintln!("error: could not write LLVM IR to {destination}: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    report_verified(file, verified.info(), &mods);
+    ExitCode::SUCCESS
+}
+
+fn write_stdout(bytes: &[u8]) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(bytes)?;
+    stdout.flush()
+}
+
+fn report_verified(file: &Path, info: &VerifiedInfo, mods: &sable::modules::ModuleSet) {
+    for warning in &info.warnings {
+        eprintln!("{}", mods.render_level("warning", warning));
+    }
+    let proved = info.obligations - info.deferred.len() - info.assumed.len();
+    eprintln!(
+        "verified: {} — {} obligation(s) across {} function(s): \
+         {proved} proved, {} deferred, {} assumed",
+        file.display(),
+        info.obligations,
+        info.functions,
+        info.deferred.len(),
+        info.assumed.len(),
+    );
+    for deferred in &info.deferred {
+        eprintln!("  deferred (sound runtime trap): {deferred}");
+    }
+    for (assumed, reason) in &info.assumed {
+        eprintln!("  assumed (UNSOUND, audited):    {assumed} — {reason}");
+    }
+    if info.unsafe_regions > 0 {
+        eprintln!("  unsafe regions: {}", info.unsafe_regions);
+    }
+    if !info.externs.is_empty() {
+        eprintln!("  extern assumptions: {}", info.externs.len());
+        for (id, reason, name) in &info.externs {
+            eprintln!("    - {id} ({name}): {reason}");
+        }
+    }
+    for (id, hash) in &info.machine_profiles {
+        eprintln!("  machine profile: {id} ({hash})");
+    }
+    if !info.machine_intrinsics.is_empty() {
+        eprintln!(
+            "  machine intrinsics: {}",
+            info.machine_intrinsics.join(", ")
+        );
+    }
+    if !info.deferred.is_empty() || !info.assumed.is_empty() {
+        eprintln!(
+            "status: verified with escapes (defers: {}, assumes: {})",
+            info.deferred.len(),
+            info.assumed.len()
+        );
+    } else if !info.externs.is_empty() {
+        eprintln!("status: verified relative to audited boundary");
+    } else {
+        eprintln!("status: fully verified");
+    }
+}
+
+fn write_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
+    let file_name = destination.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "output path must name a file")
+    })?;
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut attempt = 0_u32;
+    let (temp_path, mut temp) = loop {
+        let temp_name = format!(
+            ".{}.sable-tmp-{}-{attempt}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        );
+        let temp_path = parent.join(temp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(temp) => break (temp_path, temp),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                attempt = attempt.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "no temporary filename available",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+
+    if let Err(error) = temp.write_all(bytes).and_then(|()| temp.sync_all()) {
+        drop(temp);
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    drop(temp);
+    if let Err(error) = fs::rename(&temp_path, destination) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    Ok(())
 }

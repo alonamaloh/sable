@@ -42,6 +42,7 @@ cd compiler && cargo build --release
 
 sable check file.sable                   # verify: every obligation kernel-checked by Lean
 sable test  file.sable                   # run test_* functions with dynamic contract checks
+sable build --emit-llvm --entry main file.sable  # verify, then print textual LLVM IR
 sable check -M lib/ app.sable            # resolve `use` imports against lib/ (ADR 0013)
 sable lsp                                # language server (stdio)
 sable daemon                             # warm checker: ~0.25s/check instead of ~2.4s
@@ -49,6 +50,15 @@ sable daemon                             # warm checker: ~0.25s/check instead of
 # optional direct formal-package gate; normal checks build an immutable snapshot
 cd ../lean && lake -Kjobs=1 build
 ```
+
+Native lowering is the active in-progress milestone. Its first working slice
+is the handwritten, libLLVM-free command shown above (full form:
+`sable build --emit-llvm [--entry NAME] [-o FILE|-] file.sable`). It consumes
+only an opaque `VerifiedProgram` containing the exact AST accepted by Lean,
+emits straight-line scalar literals/locals/calls/Boolean negation/unit, and
+strictly rejects everything not yet implemented. Control flow and exact
+guarded arithmetic are the next slices; see
+[`docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md`](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md).
 
 - **The bignum pillar** (M15–M16, the Tier-3 opener): arbitrary-precision `Nat` over base-2³² limbs with a normalizing representation invariant ([`corpus/verifies/bignum.sable`](corpus/verifies/bignum.sable)). The entire specification is one recursive ghost valuation, `natVal`, and one line per operation: `cmp` decides the order, `add`/`sub`/`mul` post `natVal result.limbs = natVal a.limbs ⊕ natVal b.limbs`, `div`/`rem` post `… = natVal a.limbs / natVal b.limbs` against Lean's own Euclidean division — with division built *compositionally* (double-and-subtract riding the contracts of the other verified ops, closed by one uniqueness lemma) — and `gcd` is Euclid in fifteen lines whose spec is kernel-check-proven to agree with Lean core's `Int.gcd`. **255 obligations across 10 functions, 73 hand discharges, zero escapes**, every clause monitored dynamically — the first benchmark where the mathematics itself was the test.
 - **The verified free-list allocator** (M41, ADR 0037–0052): releasable system roots fold into an affine aggregate; first-fit allocation returns an exact mandatory `BlockLease`; public return rejects the wrong allocator, repeated use, or substituted subregion metadata; and predecessor/successor coalescing clears real in-band headers and proves exact span joins ([`corpus/verifies/free_list_return.sable`](corpus/verifies/free_list_return.sable)). Six branch fixtures and a deterministic 144-return reference-model comparison exercise the runtime policy, while final destruction still requires the exact complete root authority. U10's sound loop audit forced the traversal/search proofs to state their restored resource frame explicitly; the walk, insert-location, and first-fit pairs are green at 33/33, 13/13, and 22/22 obligations respectively. The complete serial corpus is green in 297.65s, and the full serial Rust suite is green.
@@ -88,7 +98,7 @@ Architecture in one sentence: the Rust compiler (`compiler/`) owns the program l
 
 ## Where this is headed
 
-The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With the unsafe-Sable checkpoint reached, **LLVM IR lowering is now the active next milestone**, followed provisionally by broader aggregate generics, minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and only then domain-forced floating point; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
+The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With the unsafe-Sable checkpoint reached, **LLVM IR lowering is now the active next milestone** ([ADR 0058](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md), implementation in progress), followed provisionally by broader aggregate generics, minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and only then domain-forced floating point; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
 
 ## Provenance
 

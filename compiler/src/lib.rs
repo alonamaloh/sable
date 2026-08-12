@@ -10,6 +10,7 @@ pub mod diag;
 pub mod interp;
 pub mod lean;
 pub mod lexer;
+pub mod llvm;
 pub mod lsp;
 pub mod modules;
 pub mod mono;
@@ -23,7 +24,7 @@ pub mod vcgen;
 
 use diag::Diagnostic;
 use span::LineMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Failure {
     /// Machine-matchable name (obligation name or error code).
@@ -74,6 +75,52 @@ pub struct VerifiedInfo {
     pub assumed: Vec<(String, String)>,
     /// Automation-budget warnings (non-fatal), as diagnostics.
     pub warnings: Vec<Diagnostic>,
+}
+
+/// A typed, monomorphized program together with the exact Lean verification
+/// that authorizes a production backend to consume it.
+///
+/// `program` is moved directly out of the [`artifacts::Prepared`] value whose
+/// generated Lean document was checked and stamped. It is never reconstructed
+/// by reloading the source after verification. The two identities let callers
+/// record which content-addressed artifact and immutable proof environment the
+/// result came from.
+#[derive(Debug)]
+pub struct VerifiedProgram {
+    program: ast::Program,
+    info: VerifiedInfo,
+    /// End of the root module's coordinate range in `program` spans. Keeping
+    /// this inside the capability prevents callers from pairing the verified
+    /// AST with an unrelated `ModuleSet` to bypass root-entry selection.
+    root_span_end: usize,
+    /// Content-addressed Lean artifact name stamped by verification.
+    artifact_name: String,
+    /// Identity of the immutable Lean prelude/profile environment used.
+    proof_fingerprint: String,
+}
+
+impl VerifiedProgram {
+    /// The exact checked and monomorphized AST authorized by Lean.
+    pub fn program(&self) -> &ast::Program {
+        &self.program
+    }
+
+    /// Verification and audit metadata for reporting and backend policy.
+    pub fn info(&self) -> &VerifiedInfo {
+        &self.info
+    }
+
+    pub fn artifact_name(&self) -> &str {
+        &self.artifact_name
+    }
+
+    pub fn proof_fingerprint(&self) -> &str {
+        &self.proof_fingerprint
+    }
+
+    pub(crate) fn root_span_end(&self) -> usize {
+        self.root_span_end
+    }
 }
 
 /// Fast, Lean-free pass over source text: scan → lex → parse → typecheck.
@@ -198,6 +245,47 @@ pub fn check_file_structured(
     path: &Path,
     opts: &Options,
 ) -> (modules::ModuleSet, Result<VerifiedInfo, Vec<Diagnostic>>) {
+    if !opts.emit_lean_only {
+        let (mods, result) = verify_file_structured(path, opts);
+        return (mods, result.map(|verified| verified.info));
+    }
+
+    let (mods, prepared) = prepare_file_structured(path, opts);
+    let prep = match prepared {
+        Ok((_, prep)) => prep,
+        Err(diags) => return (mods, Err(diags)),
+    };
+
+    print!("{}", prep.emitted.lean_source);
+    (mods, Ok(verified_info(&prep, Vec::new())))
+}
+
+/// Verify a file with Lean and return the exact typed program that was proved.
+///
+/// Unlike [`check_file_structured`], this function always runs Lean and stamps
+/// the successful artifact, even when `opts.emit_lean_only` is set. It also
+/// never prints generated Lean. Production backends should use this entry
+/// point so they cannot accidentally compile an AST reloaded after proof.
+pub fn verify_file_structured(
+    path: &Path,
+    opts: &Options,
+) -> (modules::ModuleSet, Result<VerifiedProgram, Vec<Diagnostic>>) {
+    let (mods, prepared) = prepare_file_structured(path, opts);
+    let (repo_root, prep) = match prepared {
+        Ok(prepared) => prepared,
+        Err(diags) => return (mods, Err(diags)),
+    };
+    let result = verify_prepared(&repo_root, opts, &mods, prep);
+    (mods, result)
+}
+
+fn prepare_file_structured(
+    path: &Path,
+    opts: &Options,
+) -> (
+    modules::ModuleSet,
+    Result<(PathBuf, artifacts::Prepared), Vec<Diagnostic>>,
+) {
     let Some(repo_root) =
         lean::find_repo_root(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
             .or_else(|| lean::find_repo_root(&std::env::current_dir().ok()?))
@@ -214,11 +302,10 @@ pub fn check_file_structured(
     };
 
     let (mods, prepared) = artifacts::prepare(path, opts, &repo_root);
-    let prep = match prepared {
-        Ok(p) => p,
-        Err(diags) => return (mods, Err(diags)),
-    };
+    (mods, prepared.map(|prep| (repo_root, prep)))
+}
 
+fn verified_info(prep: &artifacts::Prepared, warnings: Vec<Diagnostic>) -> VerifiedInfo {
     let deferred: Vec<String> = prep.program.defers.iter().map(|d| d.name.clone()).collect();
     let assumed: Vec<(String, String)> = prep
         .program
@@ -233,30 +320,31 @@ pub fn check_file_structured(
     let machine_profiles = prep.vc.machine.profiles.clone();
     let machine_intrinsics = prep.vc.machine.intrinsics.clone();
 
-    if opts.emit_lean_only {
-        print!("{}", prep.emitted.lean_source);
-        return (
-            mods,
-            Ok(VerifiedInfo {
-                functions,
-                obligations,
-                unsafe_regions,
-                externs,
-                machine_profiles,
-                machine_intrinsics,
-                deferred,
-                assumed,
-                warnings: Vec::new(),
-            }),
-        );
+    VerifiedInfo {
+        functions,
+        obligations,
+        unsafe_regions,
+        externs,
+        machine_profiles,
+        machine_intrinsics,
+        deferred,
+        assumed,
+        warnings,
     }
+}
 
+fn verify_prepared(
+    repo_root: &Path,
+    opts: &Options,
+    mods: &modules::ModuleSet,
+    mut prep: artifacts::Prepared,
+) -> Result<VerifiedProgram, Vec<Diagnostic>> {
     // Root documents are immutable and content-addressed. Concurrent checks
     // of the same basename or different source versions cannot overwrite the
     // exact bytes this verification is about to send to Lean.
-    let lean_file = match artifacts::write_root_generated(&repo_root, opts, &prep) {
+    let lean_file = match artifacts::write_root_generated(repo_root, opts, &prep) {
         Ok(path) => path,
-        Err(message) => return (mods, Err(vec![io_diag("io.write", message)])),
+        Err(message) => return Err(vec![io_diag("io.write", message)]),
     };
 
     // Warm path: a running `sable daemon` keeps a Lean server alive and
@@ -265,7 +353,7 @@ pub fn check_file_structured(
     // before the generated-artifact directory was on its search path
     // (its messages then report unknown modules).
     let daemon_messages = daemon::try_check(
-        &repo_root,
+        repo_root,
         &lean_file,
         &prep.proof_environment,
         &prep.emitted.lean_source,
@@ -274,42 +362,40 @@ pub fn check_file_structured(
     let messages = match daemon_messages {
         Some(m) => m,
         None => match lean::run_lean(
-            &repo_root,
+            repo_root,
             &prep.proof_environment,
             &lean_file,
             None,
             &prep.emitted.lean_source,
         ) {
             Ok(m) => m,
-            Err(msg) => return (mods, Err(vec![io_diag("internal.lean_invocation", msg)])),
+            Err(msg) => return Err(vec![io_diag("internal.lean_invocation", msg)]),
         },
     };
 
-    let diags = lean::dedup_by_name(lean::diagnose(&prep.emitted, &prep.vc, &messages, &mods));
+    let diags = lean::dedup_by_name(lean::diagnose(&prep.emitted, &prep.vc, &messages, mods));
     if diags.is_empty() {
         // Record the verification so importers reuse it (ADR 0013
         // slice 2): same content, same artifact, proven once.
-        if let Err(msg) = artifacts::stamp_verified(&repo_root, opts, &prep) {
-            return (mods, Err(vec![io_diag("io.write", msg)]));
+        if let Err(msg) = artifacts::stamp_verified(repo_root, opts, &prep) {
+            return Err(vec![io_diag("io.write", msg)]);
         }
         let mut warnings =
             lean::dedup_by_name(lean::diagnose_warnings(&prep.emitted, &prep.vc, &messages));
-        warnings.extend(prep.dep_warnings);
-        (
-            mods,
-            Ok(VerifiedInfo {
-                functions,
-                obligations,
-                unsafe_regions,
-                externs,
-                machine_profiles,
-                machine_intrinsics,
-                deferred,
-                assumed,
-                warnings,
-            }),
-        )
+        warnings.append(&mut prep.dep_warnings);
+        let info = verified_info(&prep, warnings);
+        let root_span_end = mods
+            .modules
+            .first()
+            .map_or(0, |module| module.base + module.len.max(1));
+        Ok(VerifiedProgram {
+            program: prep.program,
+            info,
+            root_span_end,
+            artifact_name: prep.lean_name,
+            proof_fingerprint: prep.proof_fingerprint,
+        })
     } else {
-        (mods, Err(diags))
+        Err(diags)
     }
 }

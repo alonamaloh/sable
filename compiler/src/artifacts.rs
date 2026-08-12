@@ -645,11 +645,7 @@ pub fn ensure_artifact(path: &Path, opts: &Options, repo_root: &Path) -> Artifac
     let environment = match lean::ProofEnvironment::capture(repo_root) {
         Ok(environment) => environment,
         Err(message) => {
-            return Err(io_portable(
-                path,
-                "internal.proof_fingerprint",
-                message,
-            ));
+            return Err(io_portable(path, "internal.proof_fingerprint", message));
         }
     };
     ensure_artifact_snapshot(path, opts, repo_root, None, &environment)
@@ -1107,9 +1103,8 @@ pub fn stamp_verified(repo_root: &Path, opts: &Options, prep: &Prepared) -> Resu
         prep,
         "before stamping the root artifact",
     )?;
-    prep.proof_environment.validate_built(
-        &prep.proof_environment.ensure_built(repo_root)?,
-    )?;
+    prep.proof_environment
+        .validate_built(&prep.proof_environment.ensure_built(repo_root)?)?;
     let dir = lean::modules_dir(repo_root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     write_immutable(

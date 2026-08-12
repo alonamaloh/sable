@@ -1,0 +1,14 @@
+// The native backend must not erase an audited proof escape.
+
+/// post result = a / b
+fn assumed_div(u32 a, u32 b) -> u32 {
+    return a / b;
+}
+
+/// assume #[audit(reason := "deliberate LLVM rejection fixture")]
+///        assumed_div.div_zero.a_b
+
+fn assumed_entry() -> i32 {
+    assumed_div(1, 0);
+    return 0;
+}
