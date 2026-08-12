@@ -81,6 +81,9 @@ pub fn free_list_one_step() -> u64 {
 ///       · rw [h_header_init]
 ///         simp [Sable.FreeHeaderView.hasFields,
 ///           Sable.FreeHeaderView.putFields]
+///       · rw [h_header_init, h_header9_header, h_free8_take,
+///           h_state_take_free, h_allocator_view6_create]
+///         rfl
 ///       · rw [hkey]
 ///         omega
 ///       · simp [Sable.freeHeaderBytes, Sable.u64.layout]

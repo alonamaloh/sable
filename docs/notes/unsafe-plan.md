@@ -1962,6 +1962,26 @@ the tail `StoredChain`, and its variant must be `limit - current`. Stop before
 predecessor-link mutation, splitting, or leasing: first test whether loop havoc
 preserves this proof shape cleanly with zero `assume` and zero `defer`.
 
+**The U8f3 read-only traversal loop is complete (2026-08-12, ADR 0047).**
+`free_list_walk_two` builds a real two-node list, carries both the unchanged
+root chain and the suffix chain through the loop, extracts each header through
+the policy-bearing step, reads its runtime link, restores the exact allocator
+view, advances, and proves strict decrease of `limit - current`. Cleanup then
+extracts both headers in order, clears their typed cells, rejoins the exact
+split extents, restores the complete root, and releases it. All 30 obligations
+are proved with zero assumptions or deferrals and the dynamic test returns 64.
+The proof exposed and closed one missing model fact: every stored-chain header
+is now explicitly tied to the allocator root's allocation provenance, which is
+what licenses forming `base + current` for a generic chain node.
+The complete one-worker corpus and focused regressions pass.
+
+Next implement first-fit selection without mutating links: return the first
+header whose runtime size is sufficient, while restoring every rejected node.
+State the result as a chain decomposition or equivalent prefix witness so
+minimality comes from the invariant rather than from the concrete test. Only
+after that search proof is stable should allocation remove the chosen node and
+choose between whole-block leasing and a header-sized remainder split.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;

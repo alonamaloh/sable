@@ -582,6 +582,45 @@ def AllocatorView.putHeader
   { v with headers := fun k =>
       if k = header.key then some header else v.headers k }
 
+@[simp] theorem AllocatorView.takeHeader_headerAt_ne
+    (v : AllocatorView) {removed key : Int} (hne : key ≠ removed) :
+    (v.takeHeader removed).headerAt key = v.headerAt key := by
+  simp [AllocatorView.takeHeader, AllocatorView.headerAt, hne,
+    AllocatorView.takeFree, AllocatorView.leaseAt]
+
+@[simp] theorem AllocatorView.putHeader_headerAt_ne
+    (v : AllocatorView) (header : FreeHeaderView) {key : Int}
+    (hne : key ≠ header.key) :
+    (v.putHeader header).headerAt key = v.headerAt key := by
+  simp [AllocatorView.putHeader, AllocatorView.headerAt, hne,
+    AllocatorView.takeFree, AllocatorView.leaseAt]
+
+theorem AllocatorView.takeHeader_canTakeHeader_ne
+    (v : AllocatorView) {removed key : Int}
+    (htake : v.canTakeHeader key) (hne : key ≠ removed) :
+    (v.takeHeader removed).canTakeHeader key := by
+  rcases htake with ⟨hpresent, hfree, hkey, hwf, howner⟩
+  refine ⟨?_, hfree, ?_, ?_, ?_⟩
+  · simpa [AllocatorView.takeHeader, hne] using hpresent
+  · simpa [AllocatorView.takeHeader_headerAt_ne v hne] using hkey
+  · simpa [AllocatorView.takeHeader_headerAt_ne v hne] using hwf
+  · rw [AllocatorView.takeHeader_headerAt_ne v hne]
+    change (v.headerAt key).allocator = v.allocator
+    exact howner
+
+theorem AllocatorView.putHeader_canTakeHeader_ne
+    (v : AllocatorView) (header : FreeHeaderView) {key : Int}
+    (htake : v.canTakeHeader key) (hne : key ≠ header.key) :
+    (v.putHeader header).canTakeHeader key := by
+  rcases htake with ⟨hpresent, hfree, hkey, hwf, howner⟩
+  refine ⟨?_, hfree, ?_, ?_, ?_⟩
+  · simpa [AllocatorView.putHeader, hne] using hpresent
+  · simpa [AllocatorView.putHeader_headerAt_ne v header hne] using hkey
+  · simpa [AllocatorView.putHeader_headerAt_ne v header hne] using hwf
+  · rw [AllocatorView.putHeader_headerAt_ne v header hne]
+    change (v.headerAt key).allocator = v.allocator
+    exact howner
+
 @[simp] theorem AllocatorView.putHeader_headerAt
     (v : AllocatorView) (header : FreeHeaderView) :
     (v.putHeader header).headerAt header.key = header := by
@@ -654,7 +693,8 @@ def AllocatorView.storesHeader
   v.free key = none ∧
   header.key = key ∧
   header.wf ∧
-  header.allocator = v.allocator
+  header.allocator = v.allocator ∧
+  header.sizeCell.alloc = v.root.alloc
 
 inductive AllocatorView.StoredChain
     (v : AllocatorView) (limit : Int) : Int → Prop where
@@ -680,7 +720,7 @@ theorem AllocatorView.storesHeader_canTake
     AllocatorView.storesHeader_headerAt h
   exact ⟨by simp [h.1], h.2.1, by simpa [hat] using h.2.2.1,
     by simpa [hat] using h.2.2.2.1,
-    by simpa [hat] using h.2.2.2.2⟩
+    by simpa [hat] using h.2.2.2.2.1⟩
 
 theorem AllocatorView.StoredChain.step
     {v : AllocatorView} {limit head : Int}
@@ -725,6 +765,7 @@ theorem AllocatorView.StoredChain.singleAfterPut
     {v : AllocatorView} {header : FreeHeaderView} {size limit : Int}
     (hput : v.canPutHeader header)
     (hfields : header.hasFields size limit)
+    (hroot : header.sizeCell.alloc = v.root.alloc)
     (hkey : 0 ≤ header.key)
     (hsize : freeHeaderBytes ≤ size)
     (hbound : header.key + size ≤ limit) :
@@ -733,13 +774,65 @@ theorem AllocatorView.StoredChain.singleAfterPut
   · exact ⟨by simp [AllocatorView.putHeader],
       by simpa [AllocatorView.putHeader] using hput.2.2.1,
       rfl, hput.2.1,
-      by change header.allocator = v.allocator; exact hput.1⟩
+      by change header.allocator = v.allocator; exact hput.1,
+      by simpa [AllocatorView.putHeader] using hroot⟩
   · exact hfields
   · exact hkey
   · exact hsize
   · exact hbound
   · omega
   · exact AllocatorView.StoredChain.nil
+
+theorem AllocatorView.StoredChain.putHeaderBefore
+    {v : AllocatorView} {limit head : Int} {header : FreeHeaderView}
+    (chain : v.StoredChain limit head) (hbefore : header.key < head) :
+    (v.putHeader header).StoredChain limit head := by
+  induction chain with
+  | nil => exact AllocatorView.StoredChain.nil
+  | cons key size next node stored fields hkey hsize horder hbound tail ih =>
+      apply AllocatorView.StoredChain.cons key size next node
+      · refine ⟨?_, stored.2.1, stored.2.2.1, stored.2.2.2.1,
+          ?_, ?_⟩
+        · have hne : key ≠ header.key := by omega
+          simpa [AllocatorView.putHeader, hne] using stored.1
+        · change node.allocator = v.allocator
+          exact stored.2.2.2.2.1
+        · simpa [AllocatorView.putHeader] using stored.2.2.2.2.2
+      · exact fields
+      · exact hkey
+      · exact hsize
+      · exact horder
+      · exact hbound
+      · apply ih
+        simp [freeHeaderBytes, u64.layout] at hsize
+        omega
+
+theorem AllocatorView.StoredChain.prependAfterPut
+    {v : AllocatorView} {header : FreeHeaderView}
+    {size next limit : Int}
+    (tail : v.StoredChain limit next)
+    (hput : v.canPutHeader header)
+    (hfields : header.hasFields size next)
+    (hroot : header.sizeCell.alloc = v.root.alloc)
+    (hkey : 0 ≤ header.key)
+    (hsize : freeHeaderBytes ≤ size)
+    (horder : header.key + size ≤ next)
+    (hbound : next ≤ limit) :
+    (v.putHeader header).StoredChain limit header.key := by
+  apply AllocatorView.StoredChain.cons header.key size next header
+  · exact ⟨by simp [AllocatorView.putHeader],
+      by simpa [AllocatorView.putHeader] using hput.2.2.1,
+      rfl, hput.2.1,
+      by change header.allocator = v.allocator; exact hput.1,
+      by simpa [AllocatorView.putHeader] using hroot⟩
+  · exact hfields
+  · exact hkey
+  · exact hsize
+  · exact horder
+  · exact hbound
+  · apply tail.putHeaderBefore
+    simp [freeHeaderBytes, u64.layout] at hsize
+    omega
 
 @[simp] theorem FreeBlockView.split_joinable (v : FreeBlockView) (n : Int) :
     (v.prefix n).joinable (v.suffix n) := by
@@ -873,6 +966,43 @@ theorem AllocatorView.initialStoredHeaderRoundTrip_complete
   · omega
   · intro k hk
     simp [hk]
+
+/-- Normalize the two-node lifecycle used by the first real free-list walk:
+split the initial root, park initialized headers for suffix then prefix,
+extract and clear both, rejoin their exact extents, and return the root. -/
+theorem AllocatorView.initialSplitStoredHeadersRoundTrip_complete
+    (allocator : Int) (root : SpanView) (n : Int)
+    (leftSize leftNext rightSize rightNext : Int) (hn : n ≠ 0) :
+    let initial := AllocatorView.initial allocator root
+    let whole := initial.takeFree 0
+    let left := whole.prefix n
+    let right := whole.suffix n
+    let leftHeader := left.toHeader.putFields leftSize leftNext
+    let rightHeader := right.toHeader.putFields rightSize rightNext
+    let parkedRight := (initial.take 0).putHeader rightHeader
+    let parkedBoth := parkedRight.putHeader leftHeader
+    let withoutLeft := parkedBoth.takeHeader 0
+    let returnedLeft := (parkedBoth.headerAt 0).clearFields.toFree
+    let withoutBoth := withoutLeft.takeHeader n
+    let returnedRight := (withoutLeft.headerAt n).clearFields.toFree
+    let joined := returnedLeft.join returnedRight
+    (withoutBoth.putFree joined).complete := by
+  simp [AllocatorView.complete, AllocatorView.releaseSpan,
+    SpanView.sameExtent, AllocatorView.initial, AllocatorView.takeFree,
+    AllocatorView.leaseAt, AllocatorView.take, AllocatorView.putFree,
+    AllocatorView.put, AllocatorView.putHeader, AllocatorView.takeHeader,
+    AllocatorView.headerAt, FreeBlockView.prefix, FreeBlockView.suffix,
+    FreeBlockView.join, FreeBlockView.toHeader, FreeHeaderView.putFields,
+    FreeHeaderView.clearFields, FreeHeaderView.toFree,
+    FreeHeaderView.rawCell, FreeBlockView.toLease,
+    BlockLeaseView.toFree, freeHeaderBytes, u64.layout, hn]
+  constructor
+  · omega
+  · constructor
+    · intro k hk
+      simp [hk]
+    · intro k hkn hk0
+      simp [hkn, hk0]
 
 @[simp] theorem FreeBlockView.join_prefix_suffix_extent
     (v : FreeBlockView) (n : Int) :

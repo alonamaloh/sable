@@ -1,0 +1,12 @@
+// expect-skip: Sable.AllocatorView.StoredChain state limit 0
+// expect-skip: Sable.AllocatorView.StoredChain state limit current
+
+use free_list_walk;
+
+/// pre actual = expected
+fn expect_eq_u64(u64 actual, u64 expected) {
+}
+
+fn test_free_list_walk_two() {
+    expect_eq_u64(free_list_walk_two(), 64);
+}
