@@ -1,0 +1,132 @@
+// Public lease-return policy. A read-only address search recovers the exact
+// sorted gap, one local predecessor-size read discovers left adjacency, and
+// ordinary verified branches select one of the four coalescing transitions or
+// the existing noncoalescing insertion transitions.
+
+use free_list_insert_location;
+use free_list_insert_head;
+use free_list_insert_after;
+use free_list_remove_head;
+use free_list_predecessor_size;
+use free_list_coalesce_head;
+use free_list_coalesce_previous;
+use free_list_coalesce_next;
+use free_list_coalesce_both;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] list.limit = state.root.len
+/// pre  #[label(returnable)] Sable.AllocatorView.returnableIn
+///        state list.limit list.head lease
+/// pre  #[label(key)] lease.key = key
+/// pre  #[label(size)] lease.span.len = size
+/// pre  #[label(header)] Sable.freeHeaderBytes ≤ size ∧
+///        key % u64.layout.align = 0
+/// post #[label(limit_frame)] list.limit = (old list).limit
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state list.limit list.head
+pub fn free_list_return(raw<u8> base,
+                        &mut FreeListState list,
+                        resource &mut AllocatorState state,
+                        u64 key, u64 size,
+                        resource BlockLease lease) {
+    var location = free_list_locate_insert(
+        base, &mut state, list.limit, list.head, key);
+    /// assert #[label(location)] Sable.AllocatorView.InsertionLocation
+    ///          state list.limit list.head key size
+    ///          location.previous location.current
+    /// assert #[label(returnable)] state.returnable lease
+    /// assert #[label(before_current)] key + size <= location.current
+    /// assert #[label(chain)] Sable.AllocatorView.StoredChain
+    ///          state list.limit list.head
+    if (location.current == list.head) {
+        if (location.current != list.limit &&
+                key + size == location.current) {
+            free_list_coalesce_head(
+                base, &mut list, &mut state, key, size, lease);
+        } else {
+            free_list_insert_head(
+                base, &mut list, &mut state, key, size, lease);
+        }
+        return;
+    }
+
+    u64 previous_size = free_list_predecessor_size(
+        base, &mut state, list.limit, list.head,
+        key, size, location.previous, location.current);
+    /// assert #[label(location_after_probe)]
+    ///          Sable.AllocatorView.InsertionLocation
+    ///          state list.limit list.head key size
+    ///          location.previous location.current
+    /// assert #[label(returnable_after_probe)] state.returnable lease
+    /// assert #[label(after_previous)]
+    ///          location.previous + previous_size <= key
+    /// assert #[label(chain_after_probe)] Sable.AllocatorView.StoredChain
+    ///          state list.limit list.head
+    if (location.previous + previous_size == key) {
+        if (location.current != list.limit &&
+                key + size == location.current) {
+            free_list_coalesce_both(
+                base, &mut state, list.limit, list.head,
+                key, size, location.previous, location.current, lease);
+        } else {
+            free_list_coalesce_previous(
+                base, &mut state, list.limit, list.head,
+                key, size, location.previous, location.current, lease);
+        }
+        return;
+    }
+
+    if (location.current != list.limit &&
+            key + size == location.current) {
+        free_list_coalesce_next(
+            base, &mut state, list.limit, list.head,
+            key, size, location.previous, location.current, lease);
+        return;
+    }
+
+    free_list_insert_after(
+        base, &mut state, list.limit, list.head,
+        key, size, location.previous, location.current, lease);
+}
+
+/// discharge free_list_return.call_pre.free_list_locate_insert.chain by
+///   obtain ⟨previous, current, hlocation⟩ := h_pre_returnable.2
+///   exact hlocation.1
+
+/// discharge free_list_return.assert.location by
+///   have hsearch := h_free_list_locate_insert_post_search
+///   rw [← h_pre_key] at hsearch
+///   have hlocation :=
+///     Sable.AllocatorView.returnableIn_location
+///       h_pre_returnable hsearch
+///   rw [h_pre_key, h_pre_size] at hlocation
+///   rw [h_free_list_locate_insert_post_frame]
+///   exact hlocation
+
+/// discharge free_list_return.assert.returnable by
+///   rw [h_free_list_locate_insert_post_frame]
+///   exact h_pre_returnable.1
+
+/// discharge free_list_return.assert.before_current by
+///   exact h_assert_location.2.2.1
+
+/// discharge free_list_return.assert.chain by
+///   exact h_assert_location.1
+
+/// discharge free_list_return.assert.after_previous by
+///   obtain ⟨probeHeader, hprobeStored, hprobeFields⟩ :=
+///     h_free_list_predecessor_size_post_fields
+///   obtain ⟨locationHeader, locationSize, hlocationStored,
+///       hlocationFields, hgap⟩ :=
+///     h_assert_location.predecessor
+///       (by simpa using h_path_not_location_current_old_lis)
+///   have sameHeader : locationHeader = probeHeader :=
+///     Sable.AllocatorView.storesHeader_unique
+///       hlocationStored hprobeStored
+///   subst locationHeader
+///   unfold Sable.FreeHeaderView.hasFields at hlocationFields
+///   unfold Sable.FreeHeaderView.hasFields at hprobeFields
+///   have sameSize : locationSize = previous_size :=
+///     Sable.CellState.init.inj
+///       (hlocationFields.1.symm.trans hprobeFields.1)
+///   omega

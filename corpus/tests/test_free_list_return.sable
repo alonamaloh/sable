@@ -1,0 +1,348 @@
+// expect-skip: base.alloc = state.root.alloc ∧ base.off = 0
+// expect-skip: list.limit = state.root.len
+// expect-skip: returnableIn
+// expect-skip: state = old state
+// expect-skip: Sable.AllocatorView.InsertionSearch
+// expect-skip: Sable.AllocatorView.InsertionLocation
+// expect-skip: state.returnable lease
+// expect-skip: Sable.AllocatorView.StoredChain
+// expect-skip: ∃ predecessor
+
+use free_list_return;
+use free_list_remove_head;
+
+/// pre actual = expected
+fn expect_eq_u64(u64 actual, u64 expected) {
+}
+
+fn test_return_coalesces_head_successor() {
+    unsafe system_alloc(64) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock returned_block =
+        allocator_take_free(&mut state, 0);
+    resource FreeBlock successor_block =
+        free_block_split(&mut returned_block, 24);
+    resource BlockLease returned = free_block_lease(returned_block);
+
+    unsafe {
+        raw<u8> successor_ptr = raw_offset(base, 24);
+        mut resource FreeHeader successor =
+            raw_into_free_header(successor_ptr, successor_block);
+        raw_header_init(successor_ptr, 40, 64, &mut successor);
+    }
+    allocator_put_header(&mut state, successor);
+    var mut list = FreeListState::make(24, 64);
+
+    free_list_return(base, &mut list, &mut state, 0, 24, returned);
+    expect_eq_u64(list.head, 0);
+
+    mut resource FreeHeader merged =
+        allocator_take_header(&mut state, 0);
+    mut u64 merged_size = 0;
+    mut u64 merged_next = 0;
+    unsafe {
+        merged_size = raw_header_size(base, &merged);
+        merged_next = raw_header_next(base, &merged);
+        raw_header_clear(base, &mut merged);
+        resource FreeBlock whole_free =
+            raw_from_free_header(base, merged);
+    }
+    expect_eq_u64(merged_size, 64);
+    expect_eq_u64(merged_next, 64);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
+
+fn test_return_coalesces_predecessor_only() {
+    unsafe system_alloc(96) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock predecessor_block =
+        allocator_take_free(&mut state, 0);
+    mut resource FreeBlock returned_block =
+        free_block_split(&mut predecessor_block, 24);
+    mut resource FreeBlock live_gap_block =
+        free_block_split(&mut returned_block, 24);
+    resource FreeBlock successor_block =
+        free_block_split(&mut live_gap_block, 16);
+    resource BlockLease returned = free_block_lease(returned_block);
+    resource BlockLease live_gap = free_block_lease(live_gap_block);
+
+    unsafe {
+        raw<u8> successor_ptr = raw_offset(base, 64);
+        mut resource FreeHeader successor =
+            raw_into_free_header(successor_ptr, successor_block);
+        raw_header_init(successor_ptr, 32, 96, &mut successor);
+    }
+    allocator_put_header(&mut state, successor);
+    unsafe {
+        mut resource FreeHeader predecessor =
+            raw_into_free_header(base, predecessor_block);
+        raw_header_init(base, 24, 64, &mut predecessor);
+    }
+    allocator_put_header(&mut state, predecessor);
+    var mut list = FreeListState::make(0, 96);
+
+    free_list_return(base, &mut list, &mut state, 24, 24, returned);
+    expect_eq_u64(list.head, 0);
+
+    mut resource FreeHeader merged =
+        allocator_take_header(&mut state, 0);
+    mut u64 merged_size = 0;
+    mut u64 merged_next = 0;
+    unsafe {
+        merged_size = raw_header_size(base, &merged);
+        merged_next = raw_header_next(base, &merged);
+        raw_header_clear(base, &mut merged);
+        resource FreeBlock left = raw_from_free_header(base, merged);
+    }
+    expect_eq_u64(merged_size, 48);
+    expect_eq_u64(merged_next, 64);
+
+    mut resource FreeHeader successor_cleanup =
+        allocator_take_header(&mut state, 64);
+    unsafe {
+        raw<u8> successor_cleanup_ptr = raw_offset(base, 64);
+        raw_header_clear(successor_cleanup_ptr, &mut successor_cleanup);
+        resource FreeBlock right =
+            raw_from_free_header(successor_cleanup_ptr, successor_cleanup);
+    }
+    resource FreeBlock gap = block_lease_free(live_gap);
+    resource FreeBlock prefix = free_block_join(left, gap);
+    resource FreeBlock whole_free = free_block_join(prefix, right);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
+
+fn test_return_coalesces_successor_only() {
+    unsafe system_alloc(96) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock predecessor_block =
+        allocator_take_free(&mut state, 0);
+    mut resource FreeBlock live_gap_block =
+        free_block_split(&mut predecessor_block, 24);
+    mut resource FreeBlock returned_block =
+        free_block_split(&mut live_gap_block, 16);
+    resource FreeBlock successor_block =
+        free_block_split(&mut returned_block, 24);
+    resource BlockLease live_gap = free_block_lease(live_gap_block);
+    resource BlockLease returned = free_block_lease(returned_block);
+
+    unsafe {
+        raw<u8> successor_ptr = raw_offset(base, 64);
+        mut resource FreeHeader successor =
+            raw_into_free_header(successor_ptr, successor_block);
+        raw_header_init(successor_ptr, 32, 96, &mut successor);
+    }
+    allocator_put_header(&mut state, successor);
+    unsafe {
+        mut resource FreeHeader predecessor =
+            raw_into_free_header(base, predecessor_block);
+        raw_header_init(base, 24, 64, &mut predecessor);
+    }
+    allocator_put_header(&mut state, predecessor);
+    var mut list = FreeListState::make(0, 96);
+
+    free_list_return(base, &mut list, &mut state, 40, 24, returned);
+    expect_eq_u64(list.head, 0);
+
+    mut resource FreeHeader predecessor_cleanup =
+        allocator_take_header(&mut state, 0);
+    mut u64 predecessor_size = 0;
+    mut u64 predecessor_next = 0;
+    unsafe {
+        predecessor_size = raw_header_size(base, &predecessor_cleanup);
+        predecessor_next = raw_header_next(base, &predecessor_cleanup);
+        raw_header_clear(base, &mut predecessor_cleanup);
+        resource FreeBlock left =
+            raw_from_free_header(base, predecessor_cleanup);
+    }
+    expect_eq_u64(predecessor_size, 24);
+    expect_eq_u64(predecessor_next, 40);
+
+    mut resource FreeHeader merged_cleanup =
+        allocator_take_header(&mut state, 40);
+    mut u64 merged_size = 0;
+    mut u64 merged_next = 0;
+    unsafe {
+        raw<u8> merged_ptr = raw_offset(base, 40);
+        merged_size = raw_header_size(merged_ptr, &merged_cleanup);
+        merged_next = raw_header_next(merged_ptr, &merged_cleanup);
+        raw_header_clear(merged_ptr, &mut merged_cleanup);
+        resource FreeBlock right =
+            raw_from_free_header(merged_ptr, merged_cleanup);
+    }
+    expect_eq_u64(merged_size, 56);
+    expect_eq_u64(merged_next, 96);
+    resource FreeBlock gap = block_lease_free(live_gap);
+    resource FreeBlock prefix = free_block_join(left, gap);
+    resource FreeBlock whole_free = free_block_join(prefix, right);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
+
+fn test_return_coalesces_both_neighbors() {
+    unsafe system_alloc(96) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock predecessor_block =
+        allocator_take_free(&mut state, 0);
+    mut resource FreeBlock returned_block =
+        free_block_split(&mut predecessor_block, 24);
+    resource FreeBlock successor_block =
+        free_block_split(&mut returned_block, 24);
+    resource BlockLease returned = free_block_lease(returned_block);
+
+    unsafe {
+        raw<u8> successor_ptr = raw_offset(base, 48);
+        mut resource FreeHeader successor =
+            raw_into_free_header(successor_ptr, successor_block);
+        raw_header_init(successor_ptr, 48, 96, &mut successor);
+    }
+    allocator_put_header(&mut state, successor);
+    unsafe {
+        mut resource FreeHeader predecessor =
+            raw_into_free_header(base, predecessor_block);
+        raw_header_init(base, 24, 48, &mut predecessor);
+    }
+    allocator_put_header(&mut state, predecessor);
+    var mut list = FreeListState::make(0, 96);
+
+    free_list_return(base, &mut list, &mut state, 24, 24, returned);
+    expect_eq_u64(list.head, 0);
+
+    mut resource FreeHeader merged =
+        allocator_take_header(&mut state, 0);
+    mut u64 merged_size = 0;
+    mut u64 merged_next = 0;
+    unsafe {
+        merged_size = raw_header_size(base, &merged);
+        merged_next = raw_header_next(base, &merged);
+        raw_header_clear(base, &mut merged);
+        resource FreeBlock whole_free =
+            raw_from_free_header(base, merged);
+    }
+    expect_eq_u64(merged_size, 96);
+    expect_eq_u64(merged_next, 96);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
+
+fn test_return_coalesces_predecessor_at_sentinel() {
+    unsafe system_alloc(64) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock predecessor_block =
+        allocator_take_free(&mut state, 0);
+    resource FreeBlock returned_block =
+        free_block_split(&mut predecessor_block, 24);
+    resource BlockLease returned = free_block_lease(returned_block);
+
+    unsafe {
+        mut resource FreeHeader predecessor =
+            raw_into_free_header(base, predecessor_block);
+        raw_header_init(base, 24, 64, &mut predecessor);
+    }
+    allocator_put_header(&mut state, predecessor);
+    var mut list = FreeListState::make(0, 64);
+
+    free_list_return(base, &mut list, &mut state, 24, 40, returned);
+
+    mut resource FreeHeader merged =
+        allocator_take_header(&mut state, 0);
+    mut u64 merged_size = 0;
+    mut u64 merged_next = 0;
+    unsafe {
+        merged_size = raw_header_size(base, &merged);
+        merged_next = raw_header_next(base, &merged);
+        raw_header_clear(base, &mut merged);
+        resource FreeBlock whole_free =
+            raw_from_free_header(base, merged);
+    }
+    expect_eq_u64(merged_size, 64);
+    expect_eq_u64(merged_next, 64);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
+
+fn test_return_inserts_when_separated() {
+    unsafe system_alloc(112) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock predecessor_block =
+        allocator_take_free(&mut state, 0);
+    mut resource FreeBlock left_gap_block =
+        free_block_split(&mut predecessor_block, 24);
+    mut resource FreeBlock returned_block =
+        free_block_split(&mut left_gap_block, 16);
+    mut resource FreeBlock right_gap_block =
+        free_block_split(&mut returned_block, 16);
+    resource FreeBlock successor_block =
+        free_block_split(&mut right_gap_block, 16);
+    resource BlockLease left_gap = free_block_lease(left_gap_block);
+    resource BlockLease returned = free_block_lease(returned_block);
+    resource BlockLease right_gap = free_block_lease(right_gap_block);
+
+    unsafe {
+        raw<u8> successor_ptr = raw_offset(base, 72);
+        mut resource FreeHeader successor =
+            raw_into_free_header(successor_ptr, successor_block);
+        raw_header_init(successor_ptr, 40, 112, &mut successor);
+    }
+    allocator_put_header(&mut state, successor);
+    unsafe {
+        mut resource FreeHeader predecessor =
+            raw_into_free_header(base, predecessor_block);
+        raw_header_init(base, 24, 72, &mut predecessor);
+    }
+    allocator_put_header(&mut state, predecessor);
+    var mut list = FreeListState::make(0, 112);
+
+    free_list_return(base, &mut list, &mut state, 40, 16, returned);
+
+    mut resource FreeHeader predecessor_cleanup =
+        allocator_take_header(&mut state, 0);
+    mut u64 predecessor_next = 0;
+    unsafe {
+        predecessor_next = raw_header_next(base, &predecessor_cleanup);
+        raw_header_clear(base, &mut predecessor_cleanup);
+        resource FreeBlock predecessor_free =
+            raw_from_free_header(base, predecessor_cleanup);
+    }
+    expect_eq_u64(predecessor_next, 40);
+
+    mut resource FreeHeader inserted_cleanup =
+        allocator_take_header(&mut state, 40);
+    mut u64 inserted_size = 0;
+    mut u64 inserted_next = 0;
+    unsafe {
+        raw<u8> inserted_ptr = raw_offset(base, 40);
+        inserted_size = raw_header_size(inserted_ptr, &inserted_cleanup);
+        inserted_next = raw_header_next(inserted_ptr, &inserted_cleanup);
+        raw_header_clear(inserted_ptr, &mut inserted_cleanup);
+        resource FreeBlock inserted_free =
+            raw_from_free_header(inserted_ptr, inserted_cleanup);
+    }
+    expect_eq_u64(inserted_size, 16);
+    expect_eq_u64(inserted_next, 72);
+
+    mut resource FreeHeader successor_cleanup =
+        allocator_take_header(&mut state, 72);
+    unsafe {
+        raw<u8> successor_cleanup_ptr = raw_offset(base, 72);
+        raw_header_clear(successor_cleanup_ptr, &mut successor_cleanup);
+        resource FreeBlock successor_free =
+            raw_from_free_header(successor_cleanup_ptr, successor_cleanup);
+    }
+    resource FreeBlock left_gap_free = block_lease_free(left_gap);
+    resource FreeBlock right_gap_free = block_lease_free(right_gap);
+    resource FreeBlock first =
+        free_block_join(predecessor_free, left_gap_free);
+    resource FreeBlock second = free_block_join(first, inserted_free);
+    resource FreeBlock third = free_block_join(second, right_gap_free);
+    resource FreeBlock whole_free = free_block_join(third, successor_free);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}

@@ -1,0 +1,95 @@
+// Read the exact runtime size of an insertion location's predecessor without
+// changing allocator authority. The public return dispatcher uses this one
+// local observation to distinguish predecessor adjacency from separation.
+
+use free_list_insert_location;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] limit = state.root.len
+/// pre  #[label(location)] Sable.AllocatorView.InsertionLocation
+///        state limit head key size previous current
+/// pre  #[label(interior)] current != head
+/// post #[label(frame)] state = old state
+/// post #[label(fields)] ∃ predecessor,
+///        (old state).storesHeader previous predecessor ∧
+///        predecessor.hasFields result current
+pub fn free_list_predecessor_size(
+        raw<u8> base,
+        resource &mut AllocatorState state,
+        u64 limit, u64 head, u64 key, u64 size,
+        u64 previous, u64 current) -> u64 {
+    resource FreeHeader predecessor =
+        allocator_step_header(&mut state, limit, previous);
+    mut u64 previous_size = 0;
+    unsafe {
+        raw<u8> predecessor_ptr = raw_offset(base, previous);
+        previous_size = raw_header_size(predecessor_ptr, &predecessor);
+    }
+    allocator_put_header(&mut state, predecessor);
+    return previous_size;
+}
+
+/// discharge free_list_predecessor_size.allocator_step_header.previous by
+///   exact ⟨h_pre_location.predecessorNotEnd
+///       (by simpa using h_pre_interior),
+///     h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)⟩
+
+/// discharge free_list_predecessor_size.free_header.size by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hnode : _header2 = header := by
+///     rw [h_header2_step,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨_, _, hkeyoff, _, _, _, _, _⟩ := hwf
+///   rw [hnode]
+///   constructor
+///   · unfold Sable.PointsToView.names
+///     constructor
+///     · calc
+///         (Sable.RawPtr.add base previous).alloc = base.alloc := rfl
+///         _ = _old_state.root.alloc := h_pre_base.1
+///         _ = header.sizeCell.alloc := hstored.2.2.2.2.2.symm
+///     · calc
+///         (Sable.RawPtr.add base previous).off =
+///             base.off + previous := rfl
+///         _ = previous := by rw [h_pre_base.2]; omega
+///         _ = header.key := hstored.2.2.1.symm
+///         _ = header.sizeCell.off := hkeyoff
+///   · rw [hfields.1]
+///     simp
+
+/// discharge free_list_predecessor_size.allocator_put_header by
+///   have hchain := h_pre_location.predecessorChain
+///     (by simpa using h_pre_interior)
+///   have htake := Sable.AllocatorView.StoredChain.takeable
+///     hchain
+///     (h_pre_location.predecessorNotEnd
+///       (by simpa using h_pre_interior))
+///   rw [h_state_step_header, h_header2_step]
+///   exact Sable.AllocatorView.takeHeader_canPutHeader
+///     _old_state previous htake
+
+/// discharge free_list_predecessor_size.post.frame by
+///   have hchain := h_pre_location.predecessorChain
+///     (by simpa using h_pre_interior)
+///   rw [h_state_put_header, h_state_step_header, h_header2_step]
+///   exact Sable.AllocatorView.StoredChain.extract_restore
+///     hchain
+///     (h_pre_location.predecessorNotEnd
+///       (by simpa using h_pre_interior))
+
+/// discharge free_list_predecessor_size.post.fields by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hnode : _header2 = header := by
+///     rw [h_header2_step,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hvalue : previousSize = _value3 := by
+///     rw [hnode, hfields.1] at h_value3_header_size
+///     injection h_value3_header_size
+///   refine ⟨header, hstored, ?_⟩
+///   rw [h_result, ← hvalue]
+///   exact hfields

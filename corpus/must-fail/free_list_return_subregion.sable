@@ -1,0 +1,31 @@
+// expect-error: free_list_return_subregion.call_pre.free_list_return.key
+// expect-error: free_list_return_subregion.call_pre.free_list_return.size
+// A caller cannot describe an interior subregion of an exact lease as the
+// returned extent: both key and size ties fail locally at the public call.
+
+use free_list_return;
+use free_list_remove_head;
+
+/// pre base.alloc = state.root.alloc ∧ base.off = 0
+/// pre list.limit = state.root.len
+/// pre Sable.AllocatorView.returnableIn
+///       state list.limit list.head lease
+/// pre lease.key = key
+/// pre lease.span.len = size
+/// pre key ≤ u64.max - 8
+/// pre Sable.freeHeaderBytes + 8 ≤ size
+/// pre (key + 8) % u64.layout.align = 0
+pub fn free_list_return_subregion(
+        raw<u8> base,
+        &mut FreeListState list,
+        resource &mut AllocatorState state,
+        u64 key, u64 size,
+        resource BlockLease lease) {
+    free_list_return(
+        base, &mut list, &mut state, key + 8, size - 8, lease);
+}
+
+/// discharge free_list_return_subregion.overflow.size_8 by
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     at h_pre_sable_freeheaderbytes_8
+///   constructor <;> omega

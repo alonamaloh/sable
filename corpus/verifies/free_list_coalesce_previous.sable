@@ -21,7 +21,7 @@ use free_list_insert_after;
 ///        state.storesHeader previous predecessor ∧
 ///        predecessor.hasFields previousSize current ∧
 ///        previous + previousSize = key
-/// pre  #[label(before)] key + size < current
+/// pre  #[label(no_successor)] current = limit ∨ key + size < current
 /// post #[label(chain)]
 ///        Sable.AllocatorView.StoredChain state limit head
 pub fn free_list_coalesce_previous(raw<u8> base,
@@ -206,6 +206,7 @@ pub fn free_list_coalesce_previous(raw<u8> base,
 ///       _ = node.key := hwf.2.2.1.symm
 ///       _ = previous := hstored.2.2.1
 ///   have hcurrent := h_pre_location.currentChain.head_le_limit
+///   have hbefore := h_pre_location.2.2.1
 ///   constructor <;> omega
 
 /// discharge free_list_coalesce_previous.free_header.from_block by
@@ -374,6 +375,7 @@ pub fn free_list_coalesce_previous(raw<u8> base,
 ///     omega
 ///   have hheaderOrder :
 ///       header.key + (_value4 + size) ≤ current := by
+///     have hbefore := h_pre_location.2.2.1
 ///     rw [hheaderKey, ← hvalue]
 ///     omega
 ///   have hcan :
