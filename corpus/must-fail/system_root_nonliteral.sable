@@ -1,0 +1,4 @@
+// expect-error: system_root.literal_size
+fn dynamic_size(u64 n) {
+    unsafe system_alloc(n) as (p, resource mem, resource release);
+}

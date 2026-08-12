@@ -1,0 +1,10 @@
+// expect-error: swapped.system_dealloc
+// Allocation identity lives in the release view. Swapping two otherwise
+// equal-sized release tokens fails at the first local deallocation obligation.
+
+fn swapped() {
+    unsafe system_alloc(8) as (p, resource mem, resource release);
+    unsafe system_alloc(8) as (q, resource other, resource other_release);
+    unsafe system_dealloc(p, mem, other_release);
+    unsafe system_dealloc(q, other, release);
+}

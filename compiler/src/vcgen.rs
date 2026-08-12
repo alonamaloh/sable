@@ -1307,6 +1307,90 @@ impl<'a> Generator<'a> {
                 self.var_tys.insert(ptr.clone(), Ty::Raw(IntTy::U8));
                 self.exec(rest, tail);
             }
+            Stmt::SystemAlloc {
+                size,
+                ptr,
+                res,
+                release,
+                ..
+            } => {
+                let Val::Int(n) = self.eval(size) else {
+                    unreachable!("checked: u64 size")
+                };
+                let alloc = self.hinted_sym("_system_alloc", Some(ptr.clone()));
+                self.binders.push((alloc.clone(), "Int".into()));
+                let view = self.hinted_sym("_view", Some(res.clone()));
+                self.binders
+                    .push((view.clone(), ResKind::RawSpan.view_ty().into()));
+                self.push_hyp_unique(
+                    format!("h_{res}_system"),
+                    format!("{view} = Sable.SpanView.uninit {alloc} {n}"),
+                );
+                self.push_hyp_unique(
+                    format!("h_{res}_wf"),
+                    format!("0 ≤ {view}.len ∧ {view}.len ≤ {view}.bytes.len"),
+                );
+                self.env.insert(res.clone(), Val::View(view.clone()));
+                self.var_tys
+                    .insert(res.clone(), Ty::Res(ResKind::RawSpan));
+
+                let rel = self.hinted_sym("_release", Some(release.clone()));
+                self.binders.push((
+                    rel.clone(),
+                    ResKind::SystemDealloc.view_ty().into(),
+                ));
+                self.push_hyp_unique(
+                    format!("h_{release}_system"),
+                    format!("{rel} = {{ alloc := {alloc}, len := {n} }}"),
+                );
+                self.push_hyp_unique(
+                    format!("h_{release}_wf"),
+                    format!("Sable.SystemDeallocView.wf {rel}"),
+                );
+                self.env.insert(release.clone(), Val::View(rel));
+                self.var_tys.insert(
+                    release.clone(),
+                    Ty::Res(ResKind::SystemDealloc),
+                );
+
+                let p = self.hinted_sym("_ptr", Some(ptr.clone()));
+                self.binders.push((p.clone(), "Sable.RawPtr".into()));
+                self.push_hyp_unique(
+                    format!("h_{ptr}_system"),
+                    format!("{p} = Sable.SpanView.start ({view})"),
+                );
+                self.env.insert(ptr.clone(), Val::Ptr(p));
+                self.var_tys.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                self.exec(rest, tail);
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                let Val::Ptr(p) = self.eval(ptr) else {
+                    unreachable!("checked: raw pointer")
+                };
+                let Val::View(bytes) = self.eval(res) else {
+                    unreachable!("checked: RawSpan")
+                };
+                let Val::View(rel) = self.eval(release) else {
+                    unreachable!("checked: SystemDealloc")
+                };
+                let goal = format!(
+                    "({p}).alloc = ({rel}).alloc ∧ ({p}).off = 0 ∧ \
+                     ({bytes}).alloc = ({rel}).alloc ∧ ({bytes}).off = 0 ∧ \
+                     ({bytes}).len = ({rel}).len"
+                );
+                let ob = self.obligation(
+                    &format!("{}.system_dealloc", self.fname),
+                    "`system_dealloc` needs the base pointer and complete raw allocation authority"
+                        .into(),
+                    ptr.span,
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.push_hyp_unique("h_system_dealloc".into(), goal);
+                self.exec(rest, tail);
+            }
             // Lexical exposure. Entry hands the body a span whose bytes
             // are the array's elements, all initialized, at offset 0 of a
             // fresh loan allocation. Exit takes it back: the array becomes
@@ -3876,6 +3960,10 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         ResKind::PosixWorld => vec![(
             format!("h_{name}_wf"),
             format!("Sable.PosixWorldView.wf {binder}"),
+        )],
+        ResKind::SystemDealloc => vec![(
+            format!("h_{name}_wf"),
+            format!("Sable.SystemDeallocView.wf {binder}"),
         )],
     }
 }

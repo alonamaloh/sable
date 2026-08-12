@@ -83,6 +83,10 @@ fn lower_block_erasing(stmts: &[Stmt], erased_resources: &[&str]) -> Result<Stri
                 block_resources.push(name.as_str());
             }
             Stmt::StaticAlloc { res, .. } => block_resources.push(res.as_str()),
+            Stmt::SystemAlloc { res, release, .. } => {
+                block_resources.push(res.as_str());
+                block_resources.push(release.as_str());
+            }
             _ => {}
         }
     }
@@ -119,6 +123,12 @@ fn lower_stmt_erasing(s: &Stmt, erased_resources: &[&str]) -> Result<Option<Stri
         }
         Stmt::StaticAlloc { size, ptr, .. } => {
             Some(format!("(.rawAlloc \"{ptr}\" {})", lower_expr(size)?))
+        }
+        Stmt::SystemAlloc { size, ptr, .. } => {
+            Some(format!("(.rawAlloc \"{ptr}\" {})", lower_expr(size)?))
+        }
+        Stmt::SystemDealloc { ptr, .. } => {
+            Some(format!("(.rawFree {})", lower_expr(ptr)?))
         }
         // The machine has no exposure primitive: the construct *is* the
         // loan-allocation model, so lowering spells it out — allocate,

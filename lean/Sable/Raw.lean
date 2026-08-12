@@ -18,6 +18,14 @@ import Sable.Layout
 
 namespace Sable
 
+/-- Pure identity and geometry carried by the unique right to release a
+system allocation. The authority itself remains checker-only. -/
+structure SystemDeallocView where
+  alloc : Int
+  len : Int
+
+def SystemDeallocView.wf (v : SystemDeallocView) : Prop := 0 < v.len
+
 /-- Raw storage is not a byte sequence: uninitialized is a distinct
 state, and it must stay distinguishable from every inhabitant of a value
 type. An initialized `option<u8>` holding `none` is not uninitialized

@@ -1,0 +1,4 @@
+// expect-error: system_root.size
+fn zero() {
+    unsafe system_alloc(0) as (p, resource mem, resource release);
+}

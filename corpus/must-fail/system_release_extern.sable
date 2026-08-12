@@ -1,0 +1,6 @@
+// expect-error: resource.release_sealed
+// System release cannot be promised away at an audited ABI. Resource tokens
+// erase there; only the compiler-sealed operation performs rawFree.
+
+extern "C" #[audit(id := "test.fake-release.v1", reason := "negative subject")]
+fn fake(#[consumes] resource SystemDealloc release);

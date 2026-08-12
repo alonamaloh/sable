@@ -1,0 +1,9 @@
+// expect-error: interior.system_dealloc
+// The full span is insufficient with an interior pointer: system release is
+// defined only at the allocation's base.
+
+fn interior() {
+    unsafe system_alloc(8) as (p, resource mem, resource release);
+    raw<u8> q = raw_offset(p, 1);
+    unsafe system_dealloc(q, mem, release);
+}

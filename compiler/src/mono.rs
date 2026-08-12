@@ -379,7 +379,13 @@ fn prepare_stmts(
             | Stmt::VarDecl { init: e, .. }
             | Stmt::FieldAssign { value: e, .. }
             | Stmt::StaticAlloc { size: e, .. }
+            | Stmt::SystemAlloc { size: e, .. }
             | Stmt::Return { value: Some(e), .. } => prepare_expr(e, bound_params),
+            Stmt::SystemDealloc { ptr, res, release, .. } => {
+                prepare_expr(ptr, bound_params);
+                prepare_expr(res, bound_params);
+                prepare_expr(release, bound_params);
+            }
             Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
             Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
                 prepare_stmts(body, qual, bound_params)
@@ -679,7 +685,13 @@ impl Mono {
                 | Stmt::VarDecl { init: e, .. }
                 | Stmt::FieldAssign { value: e, .. }
                 | Stmt::StaticAlloc { size: e, .. }
+                | Stmt::SystemAlloc { size: e, .. }
                 | Stmt::Return { value: Some(e), .. } => self.rewrite_expr(e, depth)?,
+                Stmt::SystemDealloc { ptr, res, release, .. } => {
+                    self.rewrite_expr(ptr, depth)?;
+                    self.rewrite_expr(res, depth)?;
+                    self.rewrite_expr(release, depth)?;
+                }
                 Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
                     self.rewrite_stmts(body, depth)?
                 }
@@ -847,7 +859,13 @@ fn subst_stmts(
             | Stmt::ExprStmt(value)
             | Stmt::VarDecl { init: value, .. }
             | Stmt::FieldAssign { value, .. }
-            | Stmt::StaticAlloc { size: value, .. } => subst_expr(value, args, bound_calls)?,
+            | Stmt::StaticAlloc { size: value, .. }
+            | Stmt::SystemAlloc { size: value, .. } => subst_expr(value, args, bound_calls)?,
+            Stmt::SystemDealloc { ptr, res, release, .. } => {
+                subst_expr(ptr, args, bound_calls)?;
+                subst_expr(res, args, bound_calls)?;
+                subst_expr(release, args, bound_calls)?;
+            }
             Stmt::Return { value: Some(e), .. } => subst_expr(e, args, bound_calls)?,
             Stmt::Return { value: None, .. } => {}
             Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {

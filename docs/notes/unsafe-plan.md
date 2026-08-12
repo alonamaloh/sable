@@ -1798,6 +1798,18 @@ Next add `SystemDealloc` under that rule, then allocator identities,
 `BlockLease`, in-band headers, free, and coalescing. A compiler-sealed release
 operation is the terminal consumer; no user function may declare itself one.
 
+**The U8b system-root slice is complete (2026-08-12, ADR 0036).**
+`system_alloc` returns a fresh base, the complete raw extent, and mandatory
+`SystemDealloc`; `system_dealloc` consumes the latter two only after a local VC
+ties base pointer, allocation identity, zero offset, and original length
+together. It is the compiler-sealed terminal operation and lowers to SVM
+`rawFree`. A foreign declaration cannot promise the release away. Typed
+storage must return to raw and carved extents must rejoin before release.
+
+Next introduce allocator identities and `BlockLease`, then store the free-list
+metadata in the root's free blocks. The allocator retains `SystemDealloc` until
+its own destruction; client `free` consumes leases, not the system token.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;

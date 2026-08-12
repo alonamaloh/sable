@@ -1,0 +1,7 @@
+// expect-error: resource.abandoned
+// Raw bytes remain affine and leakable, but the system release token is
+// mandatory: a releasable root may not silently become a static leak.
+
+fn abandoned() {
+    unsafe system_alloc(8) as (p, resource mem, resource release);
+}

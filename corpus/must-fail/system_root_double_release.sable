@@ -1,0 +1,9 @@
+// expect-error: resource.use_after_move
+// Both full raw authority and the mandatory release token are consumed at the
+// first release, so a second call is rejected before verification.
+
+fn twice() {
+    unsafe system_alloc(8) as (p, resource mem, resource release);
+    unsafe system_dealloc(p, mem, release);
+    unsafe system_dealloc(p, mem, release);
+}

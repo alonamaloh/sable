@@ -867,6 +867,50 @@ impl<'a> Interp<'a> {
                 frame.vars.insert(res.clone(), RtVal::Unit);
                 Ok(Flow::Normal)
             }
+            Stmt::SystemAlloc {
+                size,
+                ptr,
+                res,
+                release,
+                ..
+            } => {
+                let RtVal::Int(n) = self.eval(size, frame)? else {
+                    unreachable!("checked: u64 literal")
+                };
+                let alloc = self.raw.fresh(vec![None; n as usize]);
+                frame.vars.insert(ptr.clone(), RtVal::Ptr(alloc, 0));
+                frame.vars.insert(res.clone(), RtVal::Unit);
+                frame.vars.insert(release.clone(), RtVal::Unit);
+                Ok(Flow::Normal)
+            }
+            Stmt::SystemDealloc {
+                ptr,
+                res,
+                release,
+                kw_span,
+            } => {
+                let RtVal::Ptr(alloc, off) = self.eval(ptr, frame)? else {
+                    unreachable!("checked: raw pointer")
+                };
+                self.eval_moved(res, frame)?;
+                self.eval_moved(release, frame)?;
+                let Some(al) = self.raw.allocs.get_mut(&alloc) else {
+                    return Err(Trap {
+                        undef: true,
+                        message: format!("system_dealloc names absent allocation {alloc}"),
+                        span: *kw_span,
+                    });
+                };
+                if off != 0 || !al.live {
+                    return Err(Trap {
+                        undef: true,
+                        message: format!("system_dealloc needs a live base pointer: {alloc}+{off}"),
+                        span: *kw_span,
+                    });
+                }
+                al.live = false;
+                Ok(Flow::Normal)
+            }
             // Exposure: copy the array's bytes into a fresh loan
             // allocation, run the body, copy the final bytes back, and
             // kill the allocation. Modelling it as a real copy is what
@@ -1910,6 +1954,8 @@ fn stmt_span(stmt: &Stmt) -> crate::span::Span {
     match stmt {
         Stmt::Unsafe { kw_span, .. }
         | Stmt::StaticAlloc { kw_span, .. }
+        | Stmt::SystemAlloc { kw_span, .. }
+        | Stmt::SystemDealloc { kw_span, .. }
         | Stmt::Expose { kw_span, .. } => *kw_span,
         Stmt::Decl { name_span, .. } | Stmt::Assign { name_span, .. } => *name_span,
         Stmt::Assert(c) => c.line_span,

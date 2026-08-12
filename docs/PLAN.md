@@ -351,6 +351,31 @@ authority will rely on. U8b may now introduce `SystemDealloc` and the allocator
 identity/lease model, but free and coalescing should still land only as part of
 a vertical positive, negative, dynamic, and machine-semantics slice.
 
+### M40 — releasable system roots *(2026-08-12, ADR 0036)*
+
+`unsafe system_alloc(N) as (base, resource bytes, resource release);` is the
+first releasable root: fresh provenance, one complete uninitialized `RawSpan`,
+and a mandatory `SystemDealloc` whose view records allocation identity and
+length. `unsafe system_dealloc(base, bytes, release);` is the only terminal
+consumer. Its local VC requires the base pointer and the complete matching raw
+extent, which forces carved blocks to be rejoined and typed cells to be emptied
+and returned to raw authority before the machine executes `rawFree`.
+
+System release is more tightly sealed than `OpenFile`: an audited extern may
+not accept the token even with `#[consumes]`, because resources erase at the
+ABI and C could merely promise away a release it did not perform in the Sable
+machine. The checker, VC generator, interpreter, and SVM lowering all moved
+together. The two positive paths verify at 9/9 obligations and execute
+dynamically; eight focused failures cover the lifetime and identity boundary;
+and the Rust/Lean differential suite now agrees on 48 source programs, while
+the direct SVM suite already covers invalid, double, interior, and post-free
+behavior.
+
+Next is the allocator-specific layer: allocator identity, `BlockLease`, and an
+in-band free-list invariant accounting for free plus live regions. Client free
+must consume the matching lease, while only final allocator destruction owns
+and consumes `SystemDealloc`.
+
 ## Parallel track (low intensity)
 
 The SVM semantic oracle — **checkpoint reached**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers `corpus/svm-diff` (34 subjects: signed-extreme arithmetic, the normative evaluation-order traps, short-circuit guards, loops, OOM, options) through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator on every `cargo test` (~0.5s); the first run found zero divergences, and an injected lowering bug (`%` rewired to `/`) is caught as two. **Calls + frames landed** (A-normalized, ADR 0005 res. 4): `call dst f args` at statement level, a frame stack in the configuration, `EvalArgs` for left-to-right argument evaluation, and all agreement/determinism/progress theorems re-proven over the extended machine; the harness gained per-file program environments and eight call subjects (42 total, zero divergences — including recursion through ten frames and argument-order trap identity). **The byte raw heap landed** (ADR 0025): `RawHeap` in the configuration, `Val.ptr` as provenance plus offset, and `rawAlloc`/`rawFree`/`rawLoad8`/`rawStore8`/`rawTake8` plus a pure `ptrAdd`. The structural finding is that pointer arithmetic is *pure*, so it is an expression, and everything touching the heap is an A-normalized statement — which is why `Eval` needed no change at all and not one existing expression rule was reinterpreted. That claim is checked rather than asserted: the heap was threaded through the configuration in its own commit with no operations, and agreement both directions, determinism, totality, and progress re-proved with no tactic touched. Rule side conditions are stated as *decidable* predicates (`loadByte`, `freeable`, `inBounds`) because they are exactly what the machine must compute to tell a store from `undef`. 20 direct SVM subjects in `Sable/SVMRawTests.lean` pin the valid path and every route to `undef` — out of bounds, uninitialized, use after free, double free, interior free, non-pointer dereference, out-of-`u8` store — and both layers of defence are verified by injection: an evaluator that forgets `take8`'s write-back fails the agreement proof, while a rule and evaluator changed together consistently passes agreement and fails an outcome guard. Next steps there: ghost transitions for the erasure metatheorem, then classes.

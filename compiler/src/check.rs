@@ -185,6 +185,21 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
                 )],
             });
         }
+        if matches!(p.ty, Ty::Res(ResKind::SystemDealloc)) {
+            return Err(Diagnostic {
+                name: "resource.release_sealed".into(),
+                title: "system release authority may not cross an extern boundary".into(),
+                span: p.span,
+                label: "only `unsafe system_dealloc` may consume this resource".into(),
+                notes: vec![(
+                    "note".into(),
+                    "resource authority erases at the ABI, so a foreign parameter could \
+                     only promise the token away; it could not perform the Sable machine's \
+                     checked allocation release"
+                        .into(),
+                )],
+            });
+        }
         let mandatory = matches!(p.ty, Ty::Res(kind) if kind.must_consume());
         if p.consumes && !mandatory {
             return Err(Diagnostic {
@@ -1640,6 +1655,80 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
                 ctx.unsafe_blocks += 1;
             }
+            Stmt::SystemAlloc {
+                size,
+                ptr,
+                ptr_span,
+                res,
+                res_span,
+                release,
+                release_span,
+                ..
+            } => {
+                check_expr(ctx, size, Some(Ty::Int(IntTy::U64)))?;
+                let ExprKind::IntLit(n) = size.kind else {
+                    return Err(Diagnostic {
+                        name: "system_root.literal_size".into(),
+                        title: "a system root needs a compile-time literal size".into(),
+                        span: size.span,
+                        label: "use an integer literal from 1 through 50000000".into(),
+                        notes: vec![],
+                    });
+                };
+                if !(1..=50_000_000).contains(&n) {
+                    return Err(Diagnostic {
+                        name: "system_root.size".into(),
+                        title: format!("system root size {n} is outside the supported profile"),
+                        span: size.span,
+                        label: "expected 1 through 50000000 bytes".into(),
+                        notes: vec![],
+                    });
+                }
+                for (name, span, ty, mutable) in [
+                    (ptr.as_str(), ptr_span, Ty::Raw(IntTy::U8), false),
+                    (res.as_str(), res_span, Ty::Res(ResKind::RawSpan), true),
+                    (
+                        release.as_str(),
+                        release_span,
+                        Ty::Res(ResKind::SystemDealloc),
+                        false,
+                    ),
+                ] {
+                    if !ctx.declared.insert(name.to_string()) {
+                        return Err(Diagnostic {
+                            name: "type.duplicate_name".into(),
+                            title: format!("duplicate variable name `{name}`"),
+                            span: *span,
+                            label: "already declared in this function".into(),
+                            notes: vec![],
+                        });
+                    }
+                    ctx.vars.insert(
+                        name.to_string(),
+                        VarInfo {
+                            ty,
+                            initialized: true,
+                            mutable,
+                            branded: false,
+                            obligation: mandatory_ty(ty),
+                        },
+                    );
+                }
+                ctx.unsafe_blocks += 1;
+            }
+            Stmt::SystemDealloc {
+                ptr,
+                res,
+                release,
+                ..
+            } => {
+                check_expr(ctx, ptr, Some(Ty::Raw(IntTy::U8)))?;
+                check_expr(ctx, res, Some(Ty::Res(ResKind::RawSpan)))?;
+                transfer(ctx, res, None)?;
+                check_expr(ctx, release, Some(Ty::Res(ResKind::SystemDealloc)))?;
+                transfer(ctx, release, None)?;
+                ctx.unsafe_blocks += 1;
+            }
             Stmt::Expose {
                 kw_span,
                 array,
@@ -1964,6 +2053,8 @@ fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
         Stmt::Unsafe { kw_span, .. }
         | Stmt::StaticAlloc { kw_span, .. }
+        | Stmt::SystemAlloc { kw_span, .. }
+        | Stmt::SystemDealloc { kw_span, .. }
         | Stmt::Expose { kw_span, .. } => *kw_span,
         Stmt::Decl { name_span, .. } => *name_span,
         Stmt::Assert(c) => c.line_span,
@@ -3843,6 +3934,10 @@ fn reject_outstanding_obligations(
             .vars
             .get(name.as_str())
             .is_some_and(|v| mandatory_ty(v.ty));
+        let sealed_release = ctx
+            .vars
+            .get(name.as_str())
+            .is_some_and(|v| matches!(v.ty, Ty::Res(ResKind::SystemDealloc)));
         let (span, label) = match field {
             Some(f) => (
                 marked
@@ -3869,7 +3964,11 @@ fn reject_outstanding_obligations(
             title: format!("`{member}` abandons `{name}`"),
             span,
             label: label.into(),
-            notes: vec![("note".into(), if mandatory {
+            notes: vec![("note".into(), if sealed_release {
+                "return the full allocation to raw authority and pass it with the base \
+                 pointer to `unsafe system_dealloc`"
+                    .into()
+            } else if mandatory {
                 "hand the authority through verified owned parameters until it reaches \
                  an audited `#[consumes]` operation"
                     .into()

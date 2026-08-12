@@ -109,7 +109,13 @@ fn subst_stmts(
             | Stmt::VarDecl { init: e, .. }
             | Stmt::FieldAssign { value: e, .. }
             | Stmt::StaticAlloc { size: e, .. }
+            | Stmt::SystemAlloc { size: e, .. }
             | Stmt::Return { value: Some(e), .. } => subst_expr(e, values),
+            Stmt::SystemDealloc { ptr, res, release, .. } => {
+                subst_expr(ptr, values);
+                subst_expr(res, values);
+                subst_expr(release, values);
+            }
             Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
             Stmt::Assert(c) => c.text = subst_clause_text(&c.text, text_map),
             Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {

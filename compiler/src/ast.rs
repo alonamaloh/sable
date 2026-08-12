@@ -152,6 +152,9 @@ pub enum ResKind {
     /// must receive this explicitly, which is what replaces a free-form
     /// `modifies` clause over the outside.
     PosixWorld,
+    /// The unique authority to release one system allocation. Mandatory:
+    /// it must reach the compiler-sealed deallocation operation (ADR 0036).
+    SystemDealloc,
 }
 
 /// The sealed transformations of resource authority. These are not
@@ -283,6 +286,7 @@ impl ResKind {
             "RawSpan" => Some(ResKind::RawSpan),
             "OpenFile" => Some(ResKind::OpenFile),
             "PosixWorld" => Some(ResKind::PosixWorld),
+            "SystemDealloc" => Some(ResKind::SystemDealloc),
             _ => None,
         }
     }
@@ -293,15 +297,17 @@ impl ResKind {
             ResKind::PointsToU64 => "PointsTo<u64>",
             ResKind::OpenFile => "OpenFile",
             ResKind::PosixWorld => "PosixWorld",
+            ResKind::SystemDealloc => "SystemDealloc",
         }
     }
 
     /// Authority of this kind may not be abandoned.  Every owned place
     /// carrying it has a travelling obligation until an audited primitive
-    /// consumes it.  `OpenFile` is the first proving instance; release
-    /// authority joins this set before deallocation lands (ADR 0035).
+    /// consumes it. `OpenFile` is the first proving instance and
+    /// `SystemDealloc` is the first compiler-sealed instance (ADRs
+    /// 0035–0036).
     pub fn must_consume(self) -> bool {
-        matches!(self, ResKind::OpenFile)
+        matches!(self, ResKind::OpenFile | ResKind::SystemDealloc)
     }
 
     /// The Lean type of this resource's view.
@@ -311,6 +317,7 @@ impl ResKind {
             ResKind::PointsToU64 => "Sable.PointsToView Int",
             ResKind::OpenFile => "Sable.OpenFileView",
             ResKind::PosixWorld => "Sable.PosixWorldView",
+            ResKind::SystemDealloc => "Sable.SystemDeallocView",
         }
     }
 }
@@ -649,6 +656,26 @@ pub enum Stmt {
         ptr_span: Span,
         res: String,
         res_span: Span,
+    },
+    /// A releasable system root: fresh pointer, full raw authority, and
+    /// one mandatory release token (ADR 0036).
+    SystemAlloc {
+        kw_span: Span,
+        size: Expr,
+        ptr: String,
+        ptr_span: Span,
+        res: String,
+        res_span: Span,
+        release: String,
+        release_span: Span,
+    },
+    /// Release a full system root. Both resources are consumed; the
+    /// `SystemDealloc` argument is a compiler-sealed terminal sink.
+    SystemDealloc {
+        kw_span: Span,
+        ptr: Expr,
+        res: Expr,
+        release: Expr,
     },
     /// `unsafe expose &a as (p, resource m) { ... }` — the bridge from a
     /// safe `[u8]` to raw bytes. The body sees a pointer and a resource

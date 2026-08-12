@@ -1,0 +1,9 @@
+// Source-level allocation and release lower to rawAlloc/rawFree.
+fn system_root_roundtrip() -> u64 {
+    unsafe system_alloc(1) as (p, resource mem, resource release);
+    unsafe {
+        raw_store8(p, 91, &mut mem);
+    }
+    unsafe system_dealloc(p, mem, release);
+    return 91;
+}

@@ -71,3 +71,9 @@ non-mandatory resource.
 This closes U8's consumption entry gate. It does not itself introduce
 `SystemDealloc`, allocation leases, free, or coalescing; those operations may
 now be designed on top of a rule strong enough to protect release authority.
+
+## Amendment — ADR 0036
+
+`SystemDealloc` is now the second mandatory resource kind, with a stricter
+terminal policy: it cannot use audited `#[consumes]` extern parameters and may
+terminate only at the compiler-sealed `unsafe system_dealloc` operation.

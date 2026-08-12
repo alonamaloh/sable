@@ -350,7 +350,14 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 Stmt::Assign { value, .. } => walk_expr(value, refs, const_names),
                 Stmt::VarDecl { init, .. } => walk_expr(init, refs, const_names),
                 Stmt::ExprStmt(e) => walk_expr(e, refs, const_names),
-                Stmt::StaticAlloc { size, .. } => walk_expr(size, refs, const_names),
+                Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                    walk_expr(size, refs, const_names)
+                }
+                Stmt::SystemDealloc { ptr, res, release, .. } => {
+                    walk_expr(ptr, refs, const_names);
+                    walk_expr(res, refs, const_names);
+                    walk_expr(release, refs, const_names);
+                }
                 Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
                     walk_stmts(body, refs, const_names)
                 }

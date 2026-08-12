@@ -1921,6 +1921,54 @@ impl<'a> Parser<'a> {
         Ok(Stmt::StaticAlloc { kw_span, size, ptr, ptr_span, res, res_span })
     }
 
+    /// `system_alloc(N) as (p, resource m, resource release);`, after
+    /// `unsafe`. Unlike the static root, this returns mandatory release
+    /// authority (ADR 0036).
+    fn system_alloc_stmt(&mut self, kw_span: Span) -> PResult<Stmt> {
+        let (op, _) = self.ident()?;
+        debug_assert_eq!(op, "system_alloc");
+        self.expect(Tok::LParen)?;
+        let size = self.expr()?;
+        self.expect(Tok::RParen)?;
+        match self.peek() {
+            Tok::Ident(kw) if kw == "as" => { self.bump(); }
+            _ => return Err(self.error_expected("`as`")),
+        }
+        self.expect(Tok::LParen)?;
+        let (ptr, ptr_span) = self.ident()?;
+        self.expect(Tok::Comma)?;
+        self.expect(Tok::KwResource)?;
+        let (res, res_span) = self.ident()?;
+        self.expect(Tok::Comma)?;
+        self.expect(Tok::KwResource)?;
+        let (release, release_span) = self.ident()?;
+        for (name, span) in [(&ptr, ptr_span), (&res, res_span), (&release, release_span)] {
+            if is_reserved_name(name) {
+                return Err(reserved_name_error(name, span, "variable"));
+            }
+        }
+        self.expect(Tok::RParen)?;
+        self.expect(Tok::Semi)?;
+        Ok(Stmt::SystemAlloc {
+            kw_span, size, ptr, ptr_span, res, res_span, release, release_span,
+        })
+    }
+
+    /// `system_dealloc(p, mem, release);`, after `unsafe`.
+    fn system_dealloc_stmt(&mut self, kw_span: Span) -> PResult<Stmt> {
+        let (op, _) = self.ident()?;
+        debug_assert_eq!(op, "system_dealloc");
+        self.expect(Tok::LParen)?;
+        let ptr = self.expr()?;
+        self.expect(Tok::Comma)?;
+        let res = self.expr()?;
+        self.expect(Tok::Comma)?;
+        let release = self.expr()?;
+        self.expect(Tok::RParen)?;
+        self.expect(Tok::Semi)?;
+        Ok(Stmt::SystemDealloc { kw_span, ptr, res, release })
+    }
+
     fn stmt(&mut self) -> PResult<Stmt> {
         match self.peek().clone() {
             // `mut <decl>` — the declared local is mutable (ADR 0016).
@@ -2041,6 +2089,12 @@ impl<'a> Parser<'a> {
                 }
                 if matches!(self.peek(), Tok::Ident(op) if op == "static_alloc") {
                     return self.static_alloc_stmt(kw_span);
+                }
+                if matches!(self.peek(), Tok::Ident(op) if op == "system_alloc") {
+                    return self.system_alloc_stmt(kw_span);
+                }
+                if matches!(self.peek(), Tok::Ident(op) if op == "system_dealloc") {
+                    return self.system_dealloc_stmt(kw_span);
                 }
                 let body = self.block()?;
                 Ok(Stmt::Unsafe { kw_span, body })
@@ -3079,6 +3133,8 @@ fn is_reserved_name(name: &str) -> bool {
         "raw_cell_take_u64",
         "raw_cell_drop_u64",
         "static_alloc",
+        "system_alloc",
+        "system_dealloc",
         "expose",
         "as",
     ];

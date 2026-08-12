@@ -1,0 +1,26 @@
+// A releasable system root (ADR 0036). The mandatory release token survives
+// the typed-cell round trip; deallocation requires the base pointer and the
+// complete allocation returned to raw authority.
+
+/// post result = 77
+pub fn system_root_u64() -> u64 {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut u64 out = 0;
+    unsafe {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(base, mem);
+        raw_cell_init_u64(base, 77, &mut cell);
+        out = raw_cell_take_u64(base, &mut cell);
+        resource RawSpan bytes = raw_from_cell_u64(base, cell);
+    }
+    unsafe system_dealloc(base, bytes, release);
+    return out;
+}
+
+// Carving is compatible with release only after authority is reassembled.
+pub fn system_root_split_join() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource RawSpan head = mem;
+    resource RawSpan tail = split_off(&mut head, 3);
+    resource RawSpan whole = join(head, tail);
+    unsafe system_dealloc(base, whole, release);
+}
