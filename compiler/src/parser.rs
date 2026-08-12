@@ -963,11 +963,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Limit-free, non-recursive syntax probe used only after the bounded
-    /// parser reports an error. It carries limit diagnostics out when the
-    /// candidate is otherwise a complete generic call. Expression operators
-    /// and misplaced brackets terminate the probe, so a later comparison
-    /// cannot be mistaken for this candidate's close.
+    /// Independently bounded, non-recursive syntax probe used only after the
+    /// main bounded parser reports an error. It carries limit diagnostics out
+    /// when the candidate is otherwise a complete generic call. Expression
+    /// operators and misplaced brackets terminate the probe, so a later
+    /// comparison cannot be mistaken for this candidate's close.
     fn malformed_generic_list_has_call_follower(&self, start: usize) -> bool {
         debug_assert_eq!(self.token_at(start).tok, Tok::Lt);
         let mut index = start + 1;

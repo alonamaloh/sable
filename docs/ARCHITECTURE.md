@@ -15,8 +15,12 @@ foo.sable
   │  load (compiler/src/modules.rs)   resolve `use` imports (ADR 0013): DFS over the
   │                                   module DAG (cycle-checked, canonical-path dedup),
   │                                   each file scanned/lexed in place within a
-  │                                   combined source string; imported class names
-  │                                   seed dependent parses; flat merge → ONE Program.
+  │                                   combined source string; imported checked-class
+  │                                   indices and generic-class arities seed dependent
+  │                                   parses through separate tables; flat merge → ONE
+  │                                   Program. Visibility resolves runtime
+  │                                   (fn/class/record), trait, and const namespaces
+  │                                   separately before that merge.
   │                                   Every later stage is module-oblivious;
   │                                   ModuleSet retains exact canonical paths,
   │                                   source bytes, resolved edges, and order;
@@ -35,11 +39,12 @@ mono (compiler/src/mono.rs)           monomorphization (ADR 0006/0007): expands
   │                                   plain contracted fns, impl spec defs become
   │                                   module ghost defs, K::m resolves to the impl;
   │                                   bounds checked here (mono.unsatisfied_bound).
-  │                                   G0 represents type arguments recursively with
-  │                                   source spans and opaque canonical type keys, while
-  │                                   the source grammar remains integer/parameter-only;
-  │                                   duplicate parameters and arity above 256 fail in
-  │                                   the parser, and dormant wider shapes fail in mono.
+  │                                   G0 represents and parses type arguments recursively
+  │                                   (int/bool/parameter/record/class/array/option), with
+  │                                   whole-argument spans and opaque canonical type keys.
+  │                                   Paths are capped at depth 64, lists at 256 entries,
+  │                                   and each outer argument at 4096 nodes. Wider shapes
+  │                                   remain semantic non-v1 and fail closed in mono.
   │                                   Instances are keyed structurally by function/class
   │                                   kind, template base, and original canonical args;
   │                                   exact requests deduplicate while a registry rejects
@@ -153,21 +158,38 @@ this completed scalar boundary and are future M46+ work.
 
 ## Key invariants
 
-- **Generic widening starts fail closed.** `GenericTy` is recursive, and each
-  call or constructor `TypeArg` retains its shape and source span, but this G0
-  checkpoint does not widen accepted source: only integer types and in-scope
-  parameters parse as arguments. Monomorphization rejects every other dormant
-  shape before checked types are built. Its preparation, substitution, and
-  generic-use walks cover record literals, `some(...)`, class destructors, and
-  member contracts and variants. Canonical type keys are opaque. Each
-  `InstanceKey` is the function/class kind, template base, and original recursive
+- **Generic widening starts fail closed.** G0 is complete as a representation,
+  parser, identity, and rejection foundation. `GenericTy` and its opaque
+  canonical key recurse over integers, `bool`, parameters, records, classes,
+  arrays, and options. Each call or constructor `TypeArg` retains the span of
+  its complete outer type. The same bounded parser drives lookahead and AST
+  construction: a recursive path is at most 64 nodes, any argument list at most
+  256 entries, and one outer argument at most 4096 nodes. Imported generic-class
+  arities live in a table separate from checked class indices. None of that
+  widens v1 semantics: every non-integer shape reaches
+  `mono.type_arg_unsupported` before checked types are built. Preparation,
+  substitution, and generic-use walks cover record literals, `some(...)`, class
+  destructors, and member contracts and variants. Each `InstanceKey` is the
+  function/class kind, template base, and original recursive
   `CanonicalTypeKey` arguments, so only exact structural requests deduplicate.
   The collision-free legacy emitted spelling is unchanged; an emitted-name
   registry rejects ambiguous legacy spellings and collisions with source,
-  template, or impl-lowered names at deterministic diagnostics. A source
-  function/class/record namespace preflight runs before mono removes templates.
-  The next slice adds bounded recursive generic-argument parsing while mono
-  continues to reject every newly expressible non-v1 shape.
+  template, or impl-lowered names deterministically. Duplicate traits, impl
+  specs, and impl methods likewise diagnose the second source declaration.
+- **Module visibility follows the referenced namespace.** The loader keeps one
+  flat runtime namespace for functions, classes, and records, and distinct
+  trait and constant namespaces. Restrictive `use m::{...}` filters names across
+  those categories (including `pub const`), while each actual reference checks
+  visibility in its own category. The nominal walk covers recursive generic
+  arguments and matches checked `Ty` exhaustively, so adding a type form cannot
+  silently bypass visibility. A deterministic collision preflight runs before
+  owner lookup and the flat merge. This is category-correct v1 linking, not the
+  later per-module namespaces and backend mangling.
+- **G0 is closed by the full serial gate, not parser tests alone.** With one
+  Cargo job, one Sable test job, one Lean job, and one Rust test thread, the
+  final checkpoint passed 82/82 library tests, all 368 corpus subjects in
+  424.42s, LLVM CLI 6/6, the exact verified-program interpreter↔Clang
+  differential at `-O0` and `-O2`, and SVM differential 69/69.
 - **Verbatim splice.** Contract clauses appear in generated Lean exactly as written (module call-site substitution of parameter names by argument expressions). Generated theorems bind program variables under their source names so clauses elaborate unchanged. If a clause doesn't elaborate, the error must point at the `.sable` clause, not at generated code.
 - **Every obligation and every hypothesis is named by content.** Hypothesis names are content-anchored slugs (`h_pre_sorted_a`, `h_inv_<slug>`, `h_path_<slug>`, `h_<callee>_post_<slug>`, `h_cinv_<slug>`; same-slug collisions get `_2` suffixes rather than shadowing) — discharge scripts survive unrelated edits. Obligation names are `fn.kind.<expression-slug>`, or `fn.kind.<label>` where the clause carries `#[label(name)]` (stable semantic names; hypotheses become `h_inv_<label>` etc.). Lean theorem names are sanitized versions; user-facing names live in the source map.
 - **Class structures are emitted under mangled names** (`SableC_<name>`) so user class names can never collide with Lean root-namespace names (`class Nat` vs core `Nat`). Clauses never name the class — only values — so the verbatim-splice invariant is untouched; the prefix appears only in compiler-built binder types and `.mk` literals.

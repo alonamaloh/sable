@@ -223,6 +223,17 @@ The roadmap's boss fight ("when `qhat_bound` is discharged, the moonshot is esse
 
 `pub fn` / `pub class` / `pub trait` / `pub const` — default private, Rust-shaped. The boundary in one line: **the program language sees its own module plus the `pub` items of modules it directly imports; the proof layer sees the whole DAG** (a pub contract must elaborate for importers, and contracts name ghost defs freely — so ghosts, theorems, and clause text stay one flat namespace by necessity, not just taste). `use m::{a,b}` is now restrictive (v1 treated the list as documentation), listed names must be exported, and transitive references are `module.not_imported` until the module `use`s the owner itself. Enforcement is a loader pass over the per-module parses before the flat merge erases ownership — a reference walk (calls, ctors, class-typed params/returns/fields, trait bounds, impl heads, operator bindings, const tokens) against a DAG-wide item index; impls and operator bindings export with their trait/class, `pub` anywhere else is `module.bad_pub`. The sweep added 47 `pub` markers by fixpoint iteration on the new diagnostics — export density is reference density, the `mut` sweep's discipline. Guards for all three diagnostics incl. the restrictive-list and transitive variants. Still flat-merge underneath: same-named private helpers in two modules still collide (documented in the ADR; mangling deferred until it hurts).
 
+G0's nominal-type audit tightened the implementation boundary without changing
+that surface: functions/classes/records now share one explicit runtime lookup,
+while traits and constants each have their own namespace. Restrictive lists
+recognize `pub const`, and actual references resolve in their own namespace.
+Visibility walks recursive use-site generic types as well as an exhaustive match
+over nominal checked types. Cross-module collision selection is reconstructed in
+source order before owner lookup, so neither hash-map order nor visibility can
+hide the first link error. Same-module duplicate traits and duplicate impl spec
+or method members now point deterministically at the second declaration. The
+linker is still flat; real per-module names and backend mangling remain step 5.
+
 ### M26 — class values as places *(2026-08-11, ADR 0020)*
 
 ADR 0010's deferred slice B, the part two benchmarks forced at once: **class-valued fields** (`class Outer { Inner inner; }` — nested Lean structures, with the inner class's field facts *and invariant* pushed one level down), **by-value class parameters** (classes are affine, so passing one consumes the local — `class.use_after_move`), and **borrowing a field** (`&o.inner`, `&self.inner`: the borrowed place is the field, not the base). `&mut C` and local-to-local moves stay deferred; nothing forces them yet. The finding that made it cheap: **a move and a borrow are identical to the logic** — both bind the structure value with its facts and invariant, differing only in the affine discipline (checker) and runtime transfer, so vcgen gained one match arm rather than a verification concept, and `Val::Obj`/`push_class_state_facts`/`push_invariant_hyps` just recurse. Affinity itself is one new `VarInfo` field on the state machine that already tracked definite initialization — a typechecker diagnostic with a span, not a failed proof, which is the same architecture `docs/notes/unsafe-sketch.md` bets on for resources, now demonstrated a level up. The deep content is ownership maturing from *locals* to *places*: `Integer` wants a `Nat` inside a class, resource carving wants a byte range inside an allocation, same notion at different granularity. Known gap, recorded: direct nested reads (`self.inner.v`) are not surface syntax — borrow the field and use an accessor; clause text already nests freely. The `Integer` benchmark that forced the slice immediately found a latent modules bug: a module that both declares a class and imports one had inconsistent class indices, because the flat merge ordered by *load* order (root first) while every parse saw its dependencies' classes first — the root is loaded first but finishes last. Both now use finish order, which reproduces every module's view simultaneously; guarded by `corpus/verifies/class_import.sable`.
@@ -655,26 +666,37 @@ working hypothesis, not a promise that evidence cannot reorder it:
    extends it.
 2. Generalize aggregate values and their lowering in forcing stages:
 
-   - **G0 — recursive types (underway):** make the compiler's type operations
-     recurse structurally and fail closed before widening the accepted surface.
-     The first checkpoint has landed: recursive `GenericTy`, opaque canonical
-     type keys, and spanned recursive `TypeArg` values at calls and constructors.
-     The grammar still accepts only integer types and in-scope type parameters;
-     the parser rejects duplicate parameter names and declarations above the
-     256-parameter ceiling, while mono rejects dormant unsupported shapes.
-     Preparation, substitution, and generic-use traversal now cover record
-     literals, `some(...)`, class destructors, and member contracts and variants.
-     Structural instance identity has also landed: each `InstanceKey` includes
-     function/class kind, template base, and the original recursive
-     `CanonicalTypeKey` arguments, so exact requests deduplicate without using
-     an emitted spelling as identity. Collision-free programs retain the legacy
-     names; ambiguous legacy spellings and source/template/impl-lowered name
-     collisions fail closed at deterministic diagnostics, with a source
-     function/class/record namespace preflight before template removal. Focused
-     serial evidence is green: library 52/52, `vec` 84 obligations, `concepts`
-     17, `trait_hash` 10, and `hashmap` 112. The immediate next slice is bounded
-     recursive generic-argument parsing, with newly expressible non-v1 shapes
-     still rejected by mono until their semantics land.
+   - **G0 — recursive types (complete):** this is deliberately the compiler's
+     representation/parser/identity/fail-closed foundation, not non-integer
+     runtime semantics. Recursive `GenericTy`, opaque canonical keys, and
+     whole-span `TypeArg` values now cover use-site integers, `bool`, in-scope
+     parameters, visible records and classes (with recursively checked class
+     arguments), `[T]`, and `option<T>`. Lookahead and AST construction share one
+     parser with caps of 64 nodes per recursive path, 256 arguments per list, and
+     4096 nodes per outer argument. Imported generic-class arities are retained
+     separately from checked class indices. Duplicate type parameters and the
+     256-parameter declaration ceiling still fail in the parser; every parsed
+     non-integer argument still fails at `mono.type_arg_unsupported` before a
+     checked type exists.
+
+     Preparation, substitution, and generic-use traversal cover record literals,
+     `some(...)`, class destructors, and member contracts and variants. Each
+     structural `InstanceKey` includes function/class kind, template base, and
+     the original recursive `CanonicalTypeKey` arguments, so exact requests
+     deduplicate independently of emitted spelling. The registry rejects legacy
+     spelling ambiguity and source/template/impl-lowered collisions
+     deterministically. Namespace preflight keeps functions/classes/records in
+     one runtime category while traits and constants remain separate; recursive
+     nominal visibility is exhaustive, restrictive imports include public
+     constants, and duplicate trait/impl members diagnose in source order. The
+     The complete low-concurrency command (`CARGO_BUILD_JOBS=1`,
+     `CARGO_INCREMENTAL=0`, `SABLE_TEST_JOBS=1`, `SABLE_LEAN_JOBS=1`,
+     `SABLE_REQUIRE_CLANG=1`, Cargo `-j1`, Rust `--test-threads=1`) is green:
+     library 82/82; all 368 verifier/must-fail/dynamic/dynamic-failure corpus
+     subjects in 424.42s; LLVM CLI 6/6; exact-`VerifiedProgram`
+     interpreter↔Clang differential at `-O0` and `-O2`; SVM 69/69; allocator,
+     grind-budget, and LSP gates green. **G1 is next:** give Boolean/POD shapes
+     checking, verification, interpreter, and LLVM semantics.
    - **G1 — Boolean/POD aggregates:** establish the first non-integer aggregate
      storage, value, verification, interpreter, and LLVM paths.
    - **G2 — affine options:** carry ownership and destruction correctly through

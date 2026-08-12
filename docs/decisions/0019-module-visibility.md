@@ -46,8 +46,9 @@ extern table the parser was seeded with, recorded at load time.
 ## What deliberately did not change
 
 - **Linking is still the flat source-level merge** (ADR 0013): private
-  items still occupy the one namespace, so two modules' same-named
-  private helpers still collide (`module.name_collision`). Fixing that
+  items still occupy their category's flat namespace, so two modules'
+  same-named private runtime helpers still collide
+  (`module.name_collision`). Fixing that
   needs per-module name mangling through spans, diagnostics, and the
   monitor — deferred until it hurts; visibility gates *references*,
   not existence.
@@ -66,3 +67,38 @@ references, so marker density is export density (the `mut` sweep's
 discipline, ADR 0016). Guards: `module.private` (direct reference and
 restrictive-list variants), `module.not_imported` (transitive
 reference and outside-the-list variants), `module.bad_pub`.
+
+## G0 namespace and nominal-type audit (2026-08-12)
+
+The implementation now makes the namespaces implicit in this ADR explicit:
+
+- functions, classes, and records share the flat **runtime** namespace;
+- traits have their own namespace; and
+- constants have their own namespace.
+
+A restrictive `use m::{name}` remains a spelling filter across importable
+program categories, so it succeeds when that module exports `name` in any of
+them—including `pub const`, which the original implementation accidentally
+omitted. An actual reference is then checked against its own namespace. Thus a
+private trait does not hide a public runtime item with the same spelling, and a
+runtime call does not acquire visibility merely because a same-named constant
+is public.
+
+The visibility reference walk now includes recursively nested use-site generic
+types and exhaustively matches every checked `Ty` form that can carry a nominal
+class or record. The exhaustive match is intentional: adding a new checked type
+form must update visibility or fail compilation, rather than silently opening a
+bypass. Imported generic-class names and arities are also recorded separately
+from checked class indices, preserving the finish-order index invariant from
+ADR 0013 while recursive type arguments are parsed.
+
+Collision preflight uses module finish order and source spans before visibility
+owner lookup. Consequently functions/classes/records with the same spelling in
+different modules reliably produce `module.name_collision`, while equal
+spellings in the distinct runtime, trait, and const namespaces remain legal.
+Duplicate traits within one merged program and duplicate impl spec/method
+members are likewise selected in source order by monomorphization.
+
+None of this replaces flat linking. Private declarations still collide with a
+same-namespace declaration in another module, and real per-module namespacing,
+stable mangling, and re-exports remain deferred.

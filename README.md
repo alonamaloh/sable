@@ -4,7 +4,7 @@
 
 Sable is an imperative, C-flavored language in which **every function carries a machine-checked proof of its contract**. One source file interleaves two languages: a C-like program language with no undefined behavior and an ownership-based memory model, and a Lean 4 proof language that lives entirely on lines beginning with `///`.
 
-**Status: milestones M0–M45 are complete. Unsafe Sable v1 has reached a defensible stopping point, and the scalar LLVM IR backend is complete.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; M45 adds verified-to-native scalar LLVM lowering. Broader devices, ISA work, and aggregate backend support remain deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
+**Status: milestones M0–M45 are complete. Unsafe Sable v1 has reached a defensible stopping point, the scalar LLVM IR backend is complete, and M46/G0's recursive generic-type foundation is complete.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; M45 adds verified-to-native scalar LLVM lowering. G0 completes representation, parsing, structural identity, and fail-closed validation; Boolean/POD semantics begin at G1. Broader devices, ISA work, and aggregate backend support remain deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
 
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
 - [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
@@ -75,23 +75,33 @@ and passed the randomized allocator, grind-budget, LSP, and documentation
 tests. Aggregate values and their backend ABI remain future M46+ work. See
 [`docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md`](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md).
 
-M46/G0 is now underway with a fail-closed recursive generic-type checkpoint.
-The AST has recursive `GenericTy` values and opaque canonical type keys, and
-call/constructor type arguments retain both that shape and their source span.
-The accepted grammar is deliberately unchanged: uses still supply only an
-integer type or an in-scope type parameter, duplicate parameter names and more
-than 256 parameters are rejected, and monomorphization diagnoses any dormant
-unsupported shape. Generic-use traversal now includes record literals,
-`some(...)`, class destructors, and member contracts and variants. Structural
-instance identity and emitted-name collision detection have now landed too: an
-`InstanceKey` combines function/class kind, the template base, and the original
-recursive `CanonicalTypeKey` arguments, so only exact requests deduplicate.
-Collision-free programs keep their legacy emitted spellings unchanged, while
-ambiguous legacy spellings and collisions with source, template, or impl-lowered
-names fail closed at deterministic diagnostics. A source function/class/record
-namespace preflight runs before templates can be removed. The next G0 slice is
-bounded recursive generic-argument parsing; every newly expressible non-v1
-shape will remain rejected by monomorphization until its semantics are ready.
+M46/G0—the representation, parser, identity, and fail-closed foundation for
+broader generics—is complete. Use-site type arguments now parse recursively as
+integers, `bool`, in-scope parameters, visible records and classes, `[T]`, and
+`option<T>`; a `TypeArg` retains the span of its complete outer type. The parser
+bounds every path at 64 type nodes, every argument list at 256 entries, and each
+outer argument at 4096 total nodes. Imported generic-class names and arities are
+tracked separately from the checked class-index table, so parsing a nested
+nominal type cannot perturb downstream indices. This is a syntax and identity
+checkpoint, not a semantic widening: every non-integer shape still fails at
+`mono.type_arg_unsupported` before checked types are built.
+
+Structural `InstanceKey` identity and deterministic emitted-name collision
+detection remain the monomorphizer's authority. Generic-use traversal covers
+record literals, `some(...)`, class destructors, and member contracts and
+variants. Duplicate traits, impl spec definitions, and impl methods now report
+the second source declaration deterministically. Module loading also keeps the
+flat linker honest: functions/classes/records share the runtime namespace,
+while traits and constants have separate namespaces; restrictive imports now
+recognize public constants, and visibility walks both recursive generic types
+and every nominal checked type. G1 is the first semantic widening: Boolean/POD
+aggregate values across checking, verification, execution, and lowering.
+
+The complete G0 gate ran with one Cargo job, one Sable test job, one Lean job,
+and one Rust test thread. It passed 82/82 library tests, all 368 verifier,
+must-fail, dynamic, and dynamic-failure corpus subjects (424.42s), LLVM CLI
+6/6, the exact-`VerifiedProgram` interpreter↔Clang differential at both `-O0`
+and `-O2`, and all 69/69 SVM differential subjects.
 
 - **The bignum pillar** (M15–M16, the Tier-3 opener): arbitrary-precision `Nat` over base-2³² limbs with a normalizing representation invariant ([`corpus/verifies/bignum.sable`](corpus/verifies/bignum.sable)). The entire specification is one recursive ghost valuation, `natVal`, and one line per operation: `cmp` decides the order, `add`/`sub`/`mul` post `natVal result.limbs = natVal a.limbs ⊕ natVal b.limbs`, `div`/`rem` post `… = natVal a.limbs / natVal b.limbs` against Lean's own Euclidean division — with division built *compositionally* (double-and-subtract riding the contracts of the other verified ops, closed by one uniqueness lemma) — and `gcd` is Euclid in fifteen lines whose spec is kernel-check-proven to agree with Lean core's `Int.gcd`. **255 obligations across 10 functions, 73 hand discharges, zero escapes**, every clause monitored dynamically — the first benchmark where the mathematics itself was the test.
 - **The verified free-list allocator** (M41, ADR 0037–0052): releasable system roots fold into an affine aggregate; first-fit allocation returns an exact mandatory `BlockLease`; public return rejects the wrong allocator, repeated use, or substituted subregion metadata; and predecessor/successor coalescing clears real in-band headers and proves exact span joins ([`corpus/verifies/free_list_return.sable`](corpus/verifies/free_list_return.sable)). Six branch fixtures and a deterministic 144-return reference-model comparison exercise the runtime policy, while final destruction still requires the exact complete root authority. U10's sound loop audit forced the traversal/search proofs to state their restored resource frame explicitly; the walk, insert-location, and first-fit pairs are green at 33/33, 13/13, and 22/22 obligations respectively. The complete serial corpus is green in 297.65s, and the full serial Rust suite is green.
@@ -131,7 +141,7 @@ Architecture in one sentence: the Rust compiler (`compiler/`) owns the program l
 
 ## Where this is headed
 
-The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1 and scalar LLVM v0 complete, **broader aggregate generics are next**: recursive type handling, Boolean/POD aggregates, affine options, generic slots/`Vec`, then `HashMap`. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
+The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1, scalar LLVM v0, and the G0 recursive-type foundation complete, **broader aggregate generics are next**: Boolean/POD aggregates, affine options, generic slots/`Vec`, then `HashMap`. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
 
 ## Provenance
 
