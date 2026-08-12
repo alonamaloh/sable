@@ -8,9 +8,22 @@
 // expect-skip: result.key = current
 // expect-skip: result.allocator = state.allocator
 // expect-skip: result.span.alloc = state.root.alloc
+// expect-skip: Sable.AllocatorView.returnable state
+// expect-skip: Sable.AllocatorView.InsertionLocation
+// expect-skip: state.returnable result
+// expect-skip: returnableIn
+// expect-skip: lease.key = key
+// expect-skip: lease.span.len = size
+// expect-skip: Sable.AllocatorView.BeforePath
+// expect-skip: Sable.AllocatorView.InsertionSearch
+// expect-skip: Sable.freeHeaderBytes ≤ size
+// expect-skip: state.returnable lease
+// expect-skip: Sable.AllocatorView.StoredChain state list.limit
 
 use free_list_first_fit;
 use free_list_lease_after;
+use free_list_insert;
+use free_list_remove_head;
 
 /// pre actual = expected
 fn expect_eq_u64(u64 actual, u64 expected) {
@@ -46,7 +59,9 @@ fn test_free_list_remove_after_two_nodes() {
     resource BlockLease lease = free_list_lease_after(
         base, &mut state, 64, 0, 32,
         location.previous, location.current, location.size, location.next);
-    resource FreeBlock removed = block_lease_free(lease);
+    var mut list = FreeListState::make(0, 64);
+    free_list_insert(base, &mut list, &mut state, 24, 40, lease);
+    expect_eq_u64(list.head, 0);
 
     mut resource FreeHeader left_cleanup =
         allocator_take_header(&mut state, 0);
@@ -54,6 +69,15 @@ fn test_free_list_remove_after_two_nodes() {
         raw_header_clear(base, &mut left_cleanup);
         resource FreeBlock left_block =
             raw_from_free_header(base, left_cleanup);
+    }
+
+    mut resource FreeHeader returned_cleanup =
+        allocator_take_header(&mut state, 24);
+    unsafe {
+        raw<u8> returned_ptr = raw_offset(base, 24);
+        raw_header_clear(returned_ptr, &mut returned_cleanup);
+        resource FreeBlock removed =
+            raw_from_free_header(returned_ptr, returned_cleanup);
     }
     resource FreeBlock whole_free = free_block_join(left_block, removed);
     allocator_put_free(&mut state, whole_free);

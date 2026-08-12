@@ -1,0 +1,89 @@
+// U8g2 client return dispatcher. The lease contract carries existence of its
+// exact sorted gap; a read-only runtime search recovers the concrete cursors,
+// then ordinary verified policy selects head or predecessor relinking.
+
+use free_list_insert_location;
+use free_list_insert_head;
+use free_list_insert_after;
+use free_list_remove_head;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] list.limit = state.root.len
+/// pre  #[label(returnable)] Sable.AllocatorView.returnableIn
+///        state list.limit list.head lease
+/// pre  #[label(key)] lease.key = key
+/// pre  #[label(size)] lease.span.len = size
+/// pre  #[label(header)] Sable.freeHeaderBytes ≤ size ∧
+///        key % u64.layout.align = 0
+/// post #[label(limit_frame)] list.limit = (old list).limit
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state list.limit list.head
+pub fn free_list_insert(raw<u8> base,
+                        &mut FreeListState list,
+                        resource &mut AllocatorState state,
+                        u64 key, u64 size,
+                        resource BlockLease lease) {
+    var location = free_list_locate_insert(
+        base, &mut state, list.limit, list.head, key);
+    if (location.current == list.head) {
+        free_list_insert_head(
+            base, &mut list, &mut state, key, size, lease);
+        return;
+    }
+    free_list_insert_after(
+        base, &mut state, list.limit, list.head,
+        key, size, location.previous, location.current, lease);
+}
+
+/// discharge free_list_insert.call_pre.free_list_locate_insert.chain by
+///   obtain ⟨previous, current, hlocation⟩ := h_pre_returnable.2
+///   exact hlocation.1
+
+/// discharge free_list_insert.call_pre.free_list_insert_head.chain by
+///   have hsearch := h_free_list_locate_insert_post_search
+///   rw [← h_pre_key] at hsearch
+///   have hlocation :=
+///     Sable.AllocatorView.returnableIn_location
+///       h_pre_returnable hsearch
+///   rw [h_pre_key, h_pre_size] at hlocation
+///   rw [h_free_list_locate_insert_post_frame]
+///   exact hlocation.1
+
+/// discharge free_list_insert.call_pre.free_list_insert_head.returnable by
+///   rw [h_free_list_locate_insert_post_frame]
+///   exact h_pre_returnable.1
+
+/// discharge free_list_insert.call_pre.free_list_insert_head.before by
+///   have hsearch := h_free_list_locate_insert_post_search
+///   rw [← h_pre_key] at hsearch
+///   have hlocation :=
+///     Sable.AllocatorView.returnableIn_location
+///       h_pre_returnable hsearch
+///   rw [h_pre_key, h_pre_size] at hlocation
+///   calc
+///     key + size ≤ location.current := hlocation.2.2.1
+///     _ = _old_list.head := h_path_location_current_old_lis
+
+/// discharge free_list_insert.call_pre.free_list_insert_after.chain by
+///   have hsearch := h_free_list_locate_insert_post_search
+///   rw [← h_pre_key] at hsearch
+///   have hlocation :=
+///     Sable.AllocatorView.returnableIn_location
+///       h_pre_returnable hsearch
+///   rw [h_pre_key, h_pre_size] at hlocation
+///   rw [h_free_list_locate_insert_post_frame]
+///   exact hlocation.1
+
+/// discharge free_list_insert.call_pre.free_list_insert_after.returnable by
+///   rw [h_free_list_locate_insert_post_frame]
+///   exact h_pre_returnable.1
+
+/// discharge free_list_insert.call_pre.free_list_insert_after.location by
+///   have hsearch := h_free_list_locate_insert_post_search
+///   rw [← h_pre_key] at hsearch
+///   have hlocation :=
+///     Sable.AllocatorView.returnableIn_location
+///       h_pre_returnable hsearch
+///   rw [h_pre_key, h_pre_size] at hlocation
+///   rw [h_free_list_locate_insert_post_frame]
+///   exact hlocation

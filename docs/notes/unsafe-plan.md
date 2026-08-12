@@ -2027,14 +2027,21 @@ Both whole and split dynamic fixtures now return the same allocated lease
 through that operation before restoring and releasing the root. Every new
 obligation is proved with zero assumptions or deferrals.
 
-Next generalize this to arbitrary sorted insertion. Carry an explicit
-predecessor/current gap witness through a read-only location pass, then rebuild
-the predecessor link around the exact returned lease. Do not infer predecessor
-nonoverlap from `returnable` alone: it rules out allocator entries at or inside
-the lease, but does not identify an earlier block's end. Once the structural
-insert is stable, coalesce with predecessor and successor through proved
-adjacency and `FreeBlock` joins, then add local wrong-owner/double-return/
-subregion guards and randomized dynamic comparison.
+**The U8g2 sorted reinsertion slice is complete (2026-08-12, ADR 0051).**
+Allocation now returns `returnableIn`, pairing its exact collision frame with
+an existential predecessor/current gap. A read-only address-order pass walks
+real links and returns a deterministic `InsertionSearch`; uniqueness ties
+those runtime cursors to the carried gap instead of trusting caller metadata.
+Ordinary verified Sable then inserts at the head or rebuilds the exact real
+predecessor header around the returned block. Dynamic fixtures cover
+head/non-head crossed with whole/split allocation, returning the same
+mandatory lease through the public dispatcher before exact root release. All
+new obligations are proved with zero assumptions or deferrals.
+
+Next coalesce locally with predecessor and successor through proved adjacency
+and `FreeBlock` joins. Keep the four adjacency cases explicit until their
+authority transitions and link updates are stable; only then add local
+wrong-owner/double-return/subregion guards and randomized dynamic comparison.
 
 Exit criteria:
 

@@ -9,9 +9,19 @@
 // expect-skip: result.key = current
 // expect-skip: result.allocator = state.allocator
 // expect-skip: result.span.alloc = state.root.alloc
+// expect-skip: state.returnable result
+// expect-skip: returnableIn
+// expect-skip: Sable.AllocatorView.BeforePath
+// expect-skip: Sable.AllocatorView.InsertionSearch
+// expect-skip: lease.key = key
+// expect-skip: lease.span.len = size
+// expect-skip: Sable.freeHeaderBytes ≤ size
+// expect-skip: state.returnable lease
+// expect-skip: Sable.AllocatorView.InsertionLocation
 
 use free_list_first_fit;
 use free_list_allocate_found;
+use free_list_insert;
 use free_list_remove_head;
 
 /// pre actual = expected
@@ -50,7 +60,10 @@ fn test_free_list_allocate_after_split() {
         base, &mut list, &mut state, 32,
         location.previous, location.current, location.size, location.next);
     expect_eq_u64(list.head, 0);
-    resource FreeBlock allocated = block_lease_free(lease);
+
+    free_list_insert(
+        base, &mut list, &mut state, 24, 32, lease);
+    expect_eq_u64(list.head, 0);
 
     mut resource FreeHeader left_cleanup =
         allocator_take_header(&mut state, 0);
@@ -58,6 +71,15 @@ fn test_free_list_allocate_after_split() {
         raw_header_clear(base, &mut left_cleanup);
         resource FreeBlock left_block =
             raw_from_free_header(base, left_cleanup);
+    }
+
+    mut resource FreeHeader returned_cleanup =
+        allocator_take_header(&mut state, 24);
+    unsafe {
+        raw<u8> returned_ptr = raw_offset(base, 24);
+        raw_header_clear(returned_ptr, &mut returned_cleanup);
+        resource FreeBlock allocated =
+            raw_from_free_header(returned_ptr, returned_cleanup);
     }
 
     mut resource FreeHeader remainder_cleanup =

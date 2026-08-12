@@ -27,6 +27,8 @@ use free_list_remove_head;
 ///          (if need + Sable.freeHeaderBytes ≤ size then need else size)
 /// post #[label(owner)] result.allocator = state.allocator
 /// post #[label(root)] result.span.alloc = state.root.alloc
+/// post #[label(returnable_in)]
+///        state.returnableIn list.limit list.head result
 pub fn free_list_allocate_found(raw<u8> base,
                                 &mut FreeListState list,
                                 resource &mut AllocatorState state,

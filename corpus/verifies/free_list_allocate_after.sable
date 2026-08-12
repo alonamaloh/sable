@@ -16,6 +16,8 @@
 /// post #[label(lease)] result.key = current ∧ result.span.len = need
 /// post #[label(owner)] result.allocator = state.allocator
 /// post #[label(root)] result.span.alloc = state.root.alloc
+/// post #[label(returnable)] state.returnable result
+/// post #[label(returnable_in)] state.returnableIn limit head result
 pub fn free_list_allocate_after(raw<u8> base,
                                 resource &mut AllocatorState state,
                                 u64 limit, u64 head, u64 need,
@@ -660,3 +662,308 @@ pub fn free_list_allocate_after(raw<u8> base,
 ///     Sable.AllocatorView.putHeader,
 ///     Sable.AllocatorView.takeHeader] using
 ///     hstored.2.2.2.2.2
+
+/// discharge free_list_allocate_after.post.returnable by
+///   obtain ⟨selectedHeader, hselectedStored, hselectedFields, hfit⟩ :=
+///     h_pre_location.foundData (by simpa using h_pre_found)
+///   obtain ⟨predecessorHeader, previousSize, hpredecessorStored,
+///       hpredecessorFields, hrejected⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hbefore :=
+///     h_pre_location.predecessorBefore (by simpa using h_pre_interior)
+///   have hselected : _header2 = selectedHeader := by
+///     rw [h_header2_take,
+///       Sable.AllocatorView.storesHeader_headerAt hselectedStored]
+///   have hpredecessor : _header10 = predecessorHeader := by
+///     rw [h_header10_take, h_state_take_header,
+///       Sable.AllocatorView.takeHeader_headerAt_ne _ (by omega),
+///       Sable.AllocatorView.storesHeader_headerAt hpredecessorStored]
+///   have hvalue : previousSize = _value11 := by
+///     rw [hpredecessor, hpredecessorFields.1]
+///       at h_value11_header_size
+///     injection h_value11_header_size
+///   have hpredkey : predecessor_2.key = previous := by
+///     simp [h_predecessor_init, h_predecessor_clear, hpredecessor,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeHeaderView.clearFields,
+///       hpredecessorStored.2.2.1]
+///   have hremkey : remainder_header.key = current + need := by
+///     simp [h_remainder_header_init, h_header7_header,
+///       h_free6_suffix, h_free4_block, h_selected_clear, hselected,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix,
+///       Sable.FreeHeaderView.toFree,
+///       Sable.FreeHeaderView.clearFields,
+///       hselectedStored.2.2.1]
+///   have hmatch := h_pre_location.resultChain.takeMatchingHead
+///     (by simpa using h_pre_found) hselectedStored hselectedFields
+///   have hwhole :=
+///     Sable.AllocatorView.StoredChain.takeMatchingHead_returnable
+///       h_pre_location.resultChain (by simpa using h_pre_found)
+///       hselectedStored hselectedFields
+///   have hwholeKey :
+///       selectedHeader.clearFields.toFree.toLease.key = current := by
+///     change selectedHeader.clearFields.toFree.key = current
+///     rw [Sable.FreeHeaderView.clearFields_toFree_key]
+///     exact hselectedStored.2.2.1
+///   have hbare :
+///       ((_old_state.takeHeader current).takeHeader previous
+///         ).returnable selectedHeader.clearFields.toFree.toLease :=
+///     Sable.AllocatorView.returnable_takeHeader_ne
+///       hwhole (by rw [hwholeKey]; omega)
+///   have hneedpos : 0 < need := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///       at h_pre_request
+///     omega
+///   have hneedle :
+///       need ≤ selectedHeader.clearFields.toFree.toLease.span.len := by
+///     change need ≤ selectedHeader.clearFields.toFree.span.len
+///     rw [Sable.FreeHeaderView.clearFields_toFree_span_len, hmatch.1]
+///     omega
+///   have hprefix :
+///       ((_old_state.takeHeader current).takeHeader previous
+///         ).returnable block.toLease := by
+///     rw [h_block_prefix, h_free4_block, h_selected_clear, hselected]
+///     exact Sable.AllocatorView.returnable_prefix
+///       hbare ⟨hneedpos, hneedle⟩
+///   have hblockkey : block.toLease.key = current := by
+///     rw [h_block_prefix, h_free4_block, h_selected_clear, hselected]
+///     simpa [Sable.FreeBlockView.toLease,
+///       Sable.FreeBlockView.prefix] using hselectedStored.2.2.1
+///   have hblocklen : block.toLease.span.len = need := by
+///     rw [h_block_prefix]
+///     simp [Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix]
+///   have hafterRemainder :=
+///     Sable.AllocatorView.returnable_putHeaderOutside
+///       hprefix (Or.inr (by
+///         rw [hblockkey, hblocklen, hremkey]
+///         omega))
+///   have hfinal :=
+///     Sable.AllocatorView.returnable_putHeaderOutside
+///       hafterRemainder (Or.inl (by rw [hpredkey, hblockkey]; omega))
+///   rw [h_result, h_lease16_lease, h_state_put_header_2,
+///     h_state_put_header, h_state_take_header_2,
+///     h_state_take_header]
+///   exact hfinal
+
+/// discharge free_list_allocate_after.post.returnable_in by
+///   obtain ⟨selectedHeader, hselectedStored, hselectedFields, hfit⟩ :=
+///     h_pre_location.foundData (by simpa using h_pre_found)
+///   obtain ⟨predecessorHeader, previousSize, hpredecessorStored,
+///       hpredecessorFields, hrejected⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hbefore :=
+///     h_pre_location.predecessorBefore (by simpa using h_pre_interior)
+///   have hselected : _header2 = selectedHeader := by
+///     rw [h_header2_take,
+///       Sable.AllocatorView.storesHeader_headerAt hselectedStored]
+///   have hpredecessor : _header10 = predecessorHeader := by
+///     rw [h_header10_take, h_state_take_header,
+///       Sable.AllocatorView.takeHeader_headerAt_ne _ (by omega),
+///       Sable.AllocatorView.storesHeader_headerAt hpredecessorStored]
+///   have hvalue : previousSize = _value11 := by
+///     rw [hpredecessor, hpredecessorFields.1]
+///       at h_value11_header_size
+///     injection h_value11_header_size
+///   have hselectedMatch :=
+///     h_pre_location.resultChain.takeMatchingHead
+///       (by simpa using h_pre_found)
+///       hselectedStored hselectedFields
+///   have hpredecessorMatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior))
+///       hpredecessorStored hpredecessorFields
+///   have hremkey : remainder_header.key = current + need := by
+///     simp [h_remainder_header_init, h_header7_header,
+///       h_free6_suffix, h_free4_block, h_selected_clear, hselected,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix,
+///       Sable.FreeHeaderView.toFree,
+///       Sable.FreeHeaderView.clearFields,
+///       hselectedStored.2.2.1]
+///   have hremfields :
+///       remainder_header.hasFields (size - need) next := by
+///     simp [h_remainder_header_init, h_header7_header,
+///       Sable.FreeHeaderView.hasFields,
+///       Sable.FreeHeaderView.putFields]
+///   have hremextent :
+///       remainder_header.toFree.span.len = size - need := by
+///     rw [h_remainder_header_init, h_header7_header,
+///       Sable.FreeBlockView.toHeader_putFields_toFree_span_len,
+///       h_free6_split.2.2.2.2, h_free4_block,
+///       h_selected_clear, hselected,
+///       Sable.FreeHeaderView.clearFields_toFree_span_len,
+///       hselectedMatch.1]
+///   have hremroot : remainder_header.sizeCell.alloc =
+///       ((_old_state.takeHeader current).takeHeader previous).root.alloc := by
+///     simpa [h_remainder_header_init, h_header7_header,
+///       h_free6_suffix, h_free4_block, h_selected_clear, hselected,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix,
+///       Sable.FreeHeaderView.toFree,
+///       Sable.FreeHeaderView.rawCell, Sable.SpanView.cat,
+///       Sable.FreeHeaderView.clearFields,
+///       Sable.PointsToView.clear,
+///       Sable.AllocatorView.takeHeader] using
+///       hselectedStored.2.2.2.2.2
+///   have hneedpos : 0 < need := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///       at h_pre_request
+///     omega
+///   have hproper : need < size := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///       at h_pre_split
+///     omega
+///   have hslotOld := hselectedMatch.2.1 (current + need)
+///     (by omega) (by omega)
+///   have hne : current + need ≠ previous := by omega
+///   have hslot :
+///       state_2.free (current + need) = none ∧
+///       state_2.headers (current + need) = none := by
+///     rw [h_state_take_header_2, h_state_take_header]
+///     simpa [Sable.AllocatorView.takeHeader, hne] using hslotOld
+///   have hslotBare :
+///       ((_old_state.takeHeader current).takeHeader previous
+///         ).free (current + need) = none ∧
+///       ((_old_state.takeHeader current).takeHeader previous
+///         ).headers (current + need) = none := by
+///     rw [← h_state_take_header, ← h_state_take_header_2]
+///     exact hslot
+///   have hcanrem :
+///       ((_old_state.takeHeader current).takeHeader previous
+///         ).canPutHeader remainder_header := by
+///     unfold Sable.AllocatorView.canPutHeader
+///     refine ⟨?_, h_remainder_header_wf, ?_, ?_⟩
+///     · simpa [h_remainder_header_init, h_header7_header,
+///         h_free6_suffix, h_free4_block, h_selected_clear,
+///         Sable.FreeHeaderView.putFields,
+///         Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix,
+///         Sable.FreeHeaderView.toFree,
+///         Sable.FreeHeaderView.clearFields,
+///         Sable.AllocatorView.takeHeader,
+///         h_state_take_header_2,
+///         h_state_take_header] using h_header2_owner
+///     · rw [hremkey]
+///       exact hslotBare.1
+///     · rw [hremkey]
+///       exact hslotBare.2
+///   have hrelinked : predecessor_2 =
+///       predecessorHeader.clearFields.putFields
+///         previousSize (current + need) := by
+///     rw [h_predecessor_init, h_predecessor_clear,
+///       hpredecessor, ← hvalue]
+///   have hpredkey : predecessor_2.key = previous := by
+///     rw [hrelinked]
+///     exact hpredecessorStored.2.2.1
+///   have hpredfields :
+///       predecessor_2.hasFields previousSize (current + need) := by
+///     simp [hrelinked, Sable.FreeHeaderView.hasFields,
+///       Sable.FreeHeaderView.clearFields,
+///       Sable.FreeHeaderView.putFields]
+///   have hcanrelinked :
+///       (((_old_state.takeHeader current).takeHeader previous
+///         ).putHeader remainder_header).canPutHeader predecessor_2 := by
+///     rw [h_state_put_header, h_state_take_header_2,
+///       h_state_take_header] at h_fact_sable_allocatorview_canp
+///     exact h_fact_sable_allocatorview_canp
+///   have hremmin : Sable.freeHeaderBytes ≤ size - need := by
+///     omega
+///   have hfinalChain :
+///       (((( _old_state.takeHeader current).takeHeader previous
+///         ).putHeader remainder_header).putHeader predecessor_2
+///         ).StoredChain limit head :=
+///     h_pre_location.splitAfter
+///       (by simpa using h_pre_found)
+///       (by simpa using h_pre_interior)
+///       hselectedStored hselectedFields
+///       hpredecessorStored hpredecessorFields
+///       hremkey hremfields hremextent hremroot hcanrem
+///       hrelinked hcanrelinked h_pre_request.1 hremmin
+///   have hpredroot : predecessor_2.sizeCell.alloc =
+///       (((_old_state.takeHeader current).takeHeader previous
+///         ).putHeader remainder_header).root.alloc := by
+///     rw [hrelinked]
+///     exact hpredecessorStored.2.2.2.2.2
+///   have hfinalStored :
+///       (((( _old_state.takeHeader current).takeHeader previous
+///         ).putHeader remainder_header).putHeader predecessor_2
+///         ).storesHeader previous predecessor_2 := by
+///     have hstored := Sable.AllocatorView.putHeader_storesHeader
+///       hcanrelinked hpredroot
+///     simpa [hpredkey] using hstored
+///   have hagree : _old_state.AgreesBelow
+///       (((( _old_state.takeHeader current).takeHeader previous
+///         ).putHeader remainder_header).putHeader predecessor_2) previous := by
+///     refine ⟨rfl, rfl, ?_⟩
+///     intro k hk
+///     have hkPrevious : k ≠ previous := by omega
+///     have hkCurrent : k ≠ current := by omega
+///     have hkRemainder : k ≠ remainder_header.key := by
+///       rw [hremkey]
+///       omega
+///     have hkPredecessor : k ≠ predecessor_2.key := by
+///       rw [hpredkey]
+///       omega
+///     simp [Sable.AllocatorView.takeHeader,
+///       Sable.AllocatorView.putHeader, hkPrevious, hkCurrent,
+///       hkRemainder, hkPredecessor]
+///   have hlocation :
+///       (((( _old_state.takeHeader current).takeHeader previous
+///         ).putHeader remainder_header).putHeader predecessor_2
+///         ).InsertionLocation limit head current need previous
+///           (current + need) :=
+///     h_pre_location.replacementInsertionLocation
+///       (by simpa using h_pre_interior)
+///       hfinalChain hagree hfinalStored hpredfields
+///       hpredecessorMatch.2.2.2.1 (by omega)
+///   have hwhole :=
+///     Sable.AllocatorView.StoredChain.takeMatchingHead_returnable
+///       h_pre_location.resultChain (by simpa using h_pre_found)
+///       hselectedStored hselectedFields
+///   have hwholeKey :
+///       selectedHeader.clearFields.toFree.toLease.key = current := by
+///     change selectedHeader.clearFields.toFree.key = current
+///     rw [Sable.FreeHeaderView.clearFields_toFree_key]
+///     exact hselectedStored.2.2.1
+///   have hbare :
+///       ((_old_state.takeHeader current).takeHeader previous
+///         ).returnable selectedHeader.clearFields.toFree.toLease :=
+///     Sable.AllocatorView.returnable_takeHeader_ne
+///       hwhole (by rw [hwholeKey]; omega)
+///   have hneedle :
+///       need ≤ selectedHeader.clearFields.toFree.toLease.span.len := by
+///     change need ≤ selectedHeader.clearFields.toFree.span.len
+///     rw [Sable.FreeHeaderView.clearFields_toFree_span_len,
+///       hselectedMatch.1]
+///     omega
+///   have hprefix :
+///       ((_old_state.takeHeader current).takeHeader previous
+///         ).returnable block.toLease := by
+///     rw [h_block_prefix, h_free4_block, h_selected_clear, hselected]
+///     exact Sable.AllocatorView.returnable_prefix
+///       hbare ⟨hneedpos, hneedle⟩
+///   have hblockkey : block.toLease.key = current := by
+///     rw [h_block_prefix, h_free4_block, h_selected_clear, hselected]
+///     simpa [Sable.FreeBlockView.toLease,
+///       Sable.FreeBlockView.prefix] using hselectedStored.2.2.1
+///   have hblocklen : block.toLease.span.len = need := by
+///     rw [h_block_prefix]
+///     simp [Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix]
+///   have hafterRemainder :=
+///     Sable.AllocatorView.returnable_putHeaderOutside
+///       hprefix (Or.inr (by
+///         rw [hblockkey, hblocklen, hremkey]
+///         omega))
+///   have hfinalReturn :=
+///     Sable.AllocatorView.returnable_putHeaderOutside
+///       hafterRemainder (Or.inl (by
+///         rw [hpredkey, hblockkey]
+///         omega))
+///   rw [h_result, h_lease16_lease, h_state_put_header_2,
+///     h_state_put_header, h_state_take_header_2,
+///     h_state_take_header]
+///   refine ⟨hfinalReturn, previous, current + need, ?_⟩
+///   rw [hblockkey, hblocklen]
+///   exact hlocation

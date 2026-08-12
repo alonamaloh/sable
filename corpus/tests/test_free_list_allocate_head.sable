@@ -14,9 +14,15 @@
 // expect-skip: lease.key = key
 // expect-skip: lease.span.len = size
 // expect-skip: Sable.freeHeaderBytes ≤ size
+// expect-skip: returnableIn
+// expect-skip: limit = state.root.len
+// expect-skip: state = old state
+// expect-skip: Sable.AllocatorView.BeforePath
+// expect-skip: Sable.AllocatorView.InsertionSearch
+// expect-skip: Sable.AllocatorView.StoredChain state limit
 
 use free_list_allocate_head;
-use free_list_insert_head;
+use free_list_insert;
 use free_list_remove_head;
 
 /// pre actual = expected
@@ -39,7 +45,7 @@ fn test_free_list_allocate_head_split() {
         base, &mut list, &mut state, 32, 64, 64);
     expect_eq_u64(list.head, 32);
 
-    free_list_insert_head(
+    free_list_insert(
         base, &mut list, &mut state, 0, 32, lease);
     expect_eq_u64(list.head, 0);
 
@@ -81,7 +87,7 @@ fn test_free_list_allocate_head_whole() {
         base, &mut list, &mut state, 24, 32, 32);
     expect_eq_u64(list.head, 32);
 
-    free_list_insert_head(
+    free_list_insert(
         base, &mut list, &mut state, 0, 32, lease);
     expect_eq_u64(list.head, 0);
 

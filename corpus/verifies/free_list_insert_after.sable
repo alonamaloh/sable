@@ -1,0 +1,386 @@
+// U8g2 non-head sorted insertion. A read-only address-order witness identifies
+// the exact predecessor/current gap. The returned lease becomes a real header
+// in that gap and the predecessor is rebuilt to point at it.
+
+use free_list_remove_head;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] limit = state.root.len
+/// pre  #[label(chain)]
+///        Sable.AllocatorView.StoredChain state limit head
+/// pre  #[label(returnable)] state.returnable lease
+/// pre  #[label(key)] lease.key = key
+/// pre  #[label(size)] lease.span.len = size
+/// pre  #[label(header)] Sable.freeHeaderBytes ≤ size ∧
+///        key % u64.layout.align = 0
+/// pre  #[label(location)] Sable.AllocatorView.InsertionLocation
+///        state limit head key size previous current
+/// pre  #[label(interior)] current != head
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state limit head
+pub fn free_list_insert_after(raw<u8> base,
+                              resource &mut AllocatorState state,
+                              u64 limit, u64 head,
+                              u64 key, u64 size,
+                              u64 previous, u64 current,
+                              resource BlockLease lease) {
+    resource FreeBlock block = block_lease_free(lease);
+    unsafe {
+        raw<u8> block_ptr = raw_offset(base, key);
+        mut resource FreeHeader inserted =
+            raw_into_free_header(block_ptr, block);
+        raw_header_init(block_ptr, size, current, &mut inserted);
+    }
+
+    mut resource FreeHeader predecessor =
+        allocator_take_header(&mut state, previous);
+    mut u64 previous_size = 0;
+    unsafe {
+        raw<u8> predecessor_ptr = raw_offset(base, previous);
+        previous_size = raw_header_size(predecessor_ptr, &predecessor);
+        raw_header_clear(predecessor_ptr, &mut predecessor);
+        raw_header_init(
+            predecessor_ptr, previous_size, key, &mut predecessor);
+    }
+
+    allocator_put_header(&mut state, inserted);
+    allocator_put_header(&mut state, predecessor);
+}
+
+/// discharge free_list_insert_after.block_lease_free by
+///   exact ⟨h_pre_returnable.2.1,
+///     h_pre_returnable.2.2.1⟩
+
+/// discharge free_list_insert_after.free_header.from_block by
+///   rw [h_free1_free]
+///   constructor
+///   · calc
+///       (Sable.RawPtr.add base key).alloc = base.alloc := rfl
+///       _ = _old_state.root.alloc := h_pre_base.1
+///       _ = lease.span.alloc := h_pre_returnable.2.2.2.1.symm
+///   constructor
+///   · calc
+///       (Sable.RawPtr.add base key).off = base.off + key := rfl
+///       _ = key := by rw [h_pre_base.2]; omega
+///       _ = lease.key := h_pre_key.symm
+///       _ = lease.span.off := h_pre_returnable.2.1
+///   constructor
+///   · rw [Sable.RawPtr.add_off, h_pre_base.2]
+///     omega
+///   constructor
+///   · simpa [Sable.RawPtr.add_off, h_pre_base.2] using
+///       h_pre_header.2
+///   · simpa [Sable.BlockLeaseView.toFree, h_pre_size] using
+///       h_pre_header.1
+
+/// discharge free_list_insert_after.free_header.init by
+///   rw [h_header2_header]
+///   simp [Sable.FreeBlockView.toHeader, Sable.PointsToView.names,
+///     h_fact_sable_rawptr_add_base_ke, Sable.freeHeaderBytes,
+///     Sable.u64.layout]
+///   refine ⟨⟨h_fact_sable_rawptr_add_base_ke.1,
+///       h_fact_sable_rawptr_add_base_ke.2.1⟩,
+///     h_fact_sable_rawptr_add_base_ke.1.symm,
+///     h_fact_sable_rawptr_add_base_ke.2.1.symm, ?_⟩
+///   rw [h_free1_free]
+///   simp [Sable.BlockLeaseView.toFree, Sable.freeHeaderBytes,
+///     Sable.u64.layout] at h_fact_sable_rawptr_add_base_ke ⊢
+///   rw [h_pre_size]
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout] at h_pre_header
+///   omega
+
+/// discharge free_list_insert_after.allocator_take_header.previous by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   exact Sable.AllocatorView.storesHeader_canTake hstored
+
+/// discharge free_list_insert_after.free_header.size by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hnode : _header5 = header := by
+///     rw [h_header5_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨_, _, hkeyoff, _, _, _, _, _⟩ := hwf
+///   rw [hnode]
+///   constructor
+///   · unfold Sable.PointsToView.names
+///     constructor
+///     · calc
+///         (Sable.RawPtr.add base previous).alloc = base.alloc := rfl
+///         _ = _old_state.root.alloc := h_pre_base.1
+///         _ = header.sizeCell.alloc := hstored.2.2.2.2.2.symm
+///     · calc
+///         (Sable.RawPtr.add base previous).off =
+///             base.off + previous := rfl
+///         _ = previous := by rw [h_pre_base.2]; omega
+///         _ = header.key := hstored.2.2.1.symm
+///         _ = header.sizeCell.off := hkeyoff
+///   · rw [hfields.1]
+///     simp
+
+/// discharge free_list_insert_after.free_header.clear by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hnode : _header5 = header := by
+///     rw [h_header5_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨hsizewf, _, hkeyoff, halloc, _, hoff, _, _⟩ := hwf
+///   have hlayout : header.sizeCell.layout = Sable.u64.layout :=
+///     hsizewf.1
+///   rw [hnode]
+///   constructor
+///   · unfold Sable.PointsToView.names
+///     constructor
+///     · calc
+///         (Sable.RawPtr.add base previous).alloc = base.alloc := rfl
+///         _ = _old_state.root.alloc := h_pre_base.1
+///         _ = header.sizeCell.alloc := hstored.2.2.2.2.2.symm
+///     · calc
+///         (Sable.RawPtr.add base previous).off =
+///             base.off + previous := rfl
+///         _ = previous := by rw [h_pre_base.2]; omega
+///         _ = header.key := hstored.2.2.1.symm
+///         _ = header.sizeCell.off := hkeyoff
+///   constructor
+///   · rw [hfields.1]
+///     simp
+///   constructor
+///   · calc
+///       header.nextCell.alloc = header.sizeCell.alloc := halloc.symm
+///       _ = _old_state.root.alloc := hstored.2.2.2.2.2
+///       _ = base.alloc := h_pre_base.1.symm
+///       _ = (Sable.RawPtr.add base previous).alloc := rfl
+///   constructor
+///   · calc
+///       header.nextCell.off =
+///           header.sizeCell.off + header.sizeCell.layout.size := hoff.symm
+///       _ = header.key + Sable.u64.layout.size := by
+///         rw [← hkeyoff, hlayout]
+///       _ = previous + Sable.u64.layout.size := by
+///         rw [hstored.2.2.1]
+///       _ = (Sable.RawPtr.add base previous).off +
+///           Sable.u64.layout.size := by
+///         rw [Sable.RawPtr.add_off, h_pre_base.2]
+///         omega
+///   · rw [hfields.2]
+///     simp
+
+/// discharge free_list_insert_after.free_header.init.2 by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hnode : _header5 = header := by
+///     rw [h_header5_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hvalue : previousSize = _value6 := by
+///     rw [hnode, hfields.1] at h_value6_header_size
+///     injection h_value6_header_size
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hextent := hmatch.1
+///   simp [Sable.FreeHeaderView.toFree,
+///     Sable.FreeHeaderView.rawCell, Sable.SpanView.cat] at hextent
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   have hlayout : header.sizeCell.layout = Sable.u64.layout :=
+///     hwf.1.1
+///   obtain ⟨_, _, hkeyoff, halloc, _, hoff, _, _⟩ := hwf
+///   rw [h_predecessor_clear, hnode]
+///   constructor
+///   · unfold Sable.PointsToView.names
+///     constructor
+///     · calc
+///         (Sable.RawPtr.add base previous).alloc = base.alloc := rfl
+///         _ = _old_state.root.alloc := h_pre_base.1
+///         _ = header.sizeCell.alloc := hstored.2.2.2.2.2.symm
+///     · calc
+///         (Sable.RawPtr.add base previous).off =
+///             base.off + previous := rfl
+///         _ = previous := by rw [h_pre_base.2]; omega
+///         _ = header.key := hstored.2.2.1.symm
+///         _ = header.sizeCell.off := hkeyoff
+///   constructor
+///   · simp [Sable.FreeHeaderView.clearFields]
+///   constructor
+///   · calc
+///       header.nextCell.alloc = header.sizeCell.alloc := halloc.symm
+///       _ = _old_state.root.alloc := hstored.2.2.2.2.2
+///       _ = base.alloc := h_pre_base.1.symm
+///       _ = (Sable.RawPtr.add base previous).alloc := rfl
+///   constructor
+///   · calc
+///       header.nextCell.off =
+///           header.sizeCell.off + header.sizeCell.layout.size := hoff.symm
+///       _ = header.key + header.sizeCell.layout.size := by
+///         rw [← hkeyoff]
+///       _ = previous + header.sizeCell.layout.size := by
+///         rw [hstored.2.2.1]
+///       _ = (Sable.RawPtr.add base previous).off +
+///           Sable.u64.layout.size := by
+///         rw [Sable.RawPtr.add_off, h_pre_base.2, hlayout]
+///         omega
+///   constructor
+///   · simp [Sable.FreeHeaderView.clearFields]
+///   · simp [Sable.FreeHeaderView.clearFields]
+///     rw [← hvalue]
+///     omega
+
+/// discharge free_list_insert_after.allocator_put_header by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hmin := hmatch.2.2.1
+///   have hbefore : previous < key := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout] at hmin
+///     omega
+///   have hreturn :
+///       (_old_state.takeHeader previous).returnable lease :=
+///     Sable.AllocatorView.returnable_takeHeader_ne
+///       h_pre_returnable (by rw [h_pre_key]; omega)
+///   rw [h_state_take_header]
+///   apply Sable.AllocatorView.returnable_canPutHeader hreturn
+///   · simp [h_inserted_init, h_header2_header, h_free1_free,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader,
+///       Sable.BlockLeaseView.toFree]
+///   · exact h_inserted_wf
+///   · simp [h_inserted_init, h_header2_header, h_free1_free,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader,
+///       Sable.BlockLeaseView.toFree]
+
+/// discharge free_list_insert_after.allocator_put_header.2 by
+///   obtain ⟨header, previousSize, hstored, hfields, hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hmin := hmatch.2.2.1
+///   have hbefore : previous < key := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout] at hmin
+///     omega
+///   have hnode : _header5 = header := by
+///     rw [h_header5_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hheaderkey : _header5.key = previous := by
+///     rw [hnode]
+///     exact hstored.2.2.1
+///   have hpredkey : predecessor_2.key = previous := by
+///     simp [h_predecessor_init, h_predecessor_clear, hnode,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeHeaderView.clearFields,
+///       hstored.2.2.1]
+///   have hinsertedkey : inserted.key = key := by
+///     simp [h_inserted_init, h_header2_header, h_free1_free,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader,
+///       Sable.BlockLeaseView.toFree, h_pre_key]
+///   have horiginal : state.canPutHeader _header5 := by
+///     rw [h_state_take_header, h_header5_take]
+///     exact Sable.AllocatorView.takeHeader_canPutHeader
+///       _old_state previous h_fact_sable_allocatorview_cant
+///   have hne : previous ≠ inserted.key := by
+///     rw [hinsertedkey]
+///     omega
+///   rw [h_state_put_header]
+///   unfold Sable.AllocatorView.canPutHeader at horiginal ⊢
+///   refine ⟨?_, h_predecessor_wf_2, ?_, ?_⟩
+///   · simpa [h_predecessor_init, h_predecessor_clear,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeHeaderView.clearFields,
+///       Sable.AllocatorView.putHeader] using horiginal.1
+///   · simpa [Sable.AllocatorView.putHeader, hpredkey,
+///       hheaderkey] using horiginal.2.2.1
+///   · simpa [Sable.AllocatorView.putHeader, hpredkey,
+///       hheaderkey, hne] using horiginal.2.2.2
+
+/// discharge free_list_insert_after.post.chain by
+///   obtain ⟨predecessorHeader, previousSize, hstored, hfields,
+///       hgap⟩ :=
+///     h_pre_location.predecessor (by simpa using h_pre_interior)
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hmin := hmatch.2.2.1
+///   have hbefore : previous < key := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout] at hmin
+///     omega
+///   have hnode : _header5 = predecessorHeader := by
+///     rw [h_header5_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hvalue : previousSize = _value6 := by
+///     rw [hnode, hfields.1] at h_value6_header_size
+///     injection h_value6_header_size
+///   have hinsertedkey : inserted.key = key := by
+///     simp [h_inserted_init, h_header2_header, h_free1_free,
+///       Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader,
+///       Sable.BlockLeaseView.toFree, h_pre_key]
+///   have hinsertedfields : inserted.hasFields size current := by
+///     simp [h_inserted_init, Sable.FreeHeaderView.hasFields,
+///       Sable.FreeHeaderView.putFields]
+///   have hinsertedextent : inserted.toFree.span.len = size := by
+///     rw [h_inserted_init, h_header2_header,
+///       Sable.FreeBlockView.toHeader_putFields_toFree_span_len,
+///       h_free1_free]
+///     exact h_pre_size
+///   have hreturn :
+///       (_old_state.takeHeader previous).returnable lease :=
+///     Sable.AllocatorView.returnable_takeHeader_ne
+///       h_pre_returnable (by rw [h_pre_key]; omega)
+///   have hinsertedclear :
+///       (_old_state.takeHeader previous).clearInterior
+///         inserted.key size := by
+///     rw [hinsertedkey]
+///     exact Sable.AllocatorView.returnable_clearInterior
+///       hreturn h_pre_key h_pre_size
+///   have hinsertedroot : inserted.sizeCell.alloc =
+///       (_old_state.takeHeader previous).root.alloc := by
+///     rw [h_inserted_init, h_header2_header, h_free1_free]
+///     simpa [Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader,
+///       Sable.BlockLeaseView.toFree,
+///       Sable.AllocatorView.takeHeader] using
+///       h_pre_returnable.2.2.2.1
+///   have hcaninserted :
+///       (_old_state.takeHeader previous).canPutHeader inserted := by
+///     apply Sable.AllocatorView.returnable_canPutHeader hreturn
+///     · rw [hinsertedkey]
+///       exact h_pre_key.symm
+///     · exact h_inserted_wf
+///     · simp [h_inserted_init, h_header2_header, h_free1_free,
+///         Sable.FreeHeaderView.putFields,
+///         Sable.FreeBlockView.toHeader,
+///         Sable.BlockLeaseView.toFree]
+///   have hrelinked : predecessor_2 =
+///       predecessorHeader.clearFields.putFields previousSize key := by
+///     rw [h_predecessor_init, h_predecessor_clear,
+///       hnode, ← hvalue]
+///   have hcanrelinked :
+///       ((_old_state.takeHeader previous).putHeader inserted
+///         ).canPutHeader predecessor_2 := by
+///     rw [h_state_put_header, h_state_take_header]
+///       at h_fact_sable_allocatorview_canp
+///     exact h_fact_sable_allocatorview_canp
+///   rw [h_state_put_header_2, h_state_put_header,
+///     h_state_take_header]
+///   exact h_pre_location.insertAfter
+///     (by simpa using h_pre_interior)
+///     hinsertedkey hinsertedfields hinsertedextent
+///     hinsertedclear hinsertedroot hcaninserted
+///     hstored hfields hrelinked hcanrelinked
+///     h_key_range.1 h_pre_header.1

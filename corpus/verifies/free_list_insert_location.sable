@@ -1,0 +1,169 @@
+// U8g2 read-only address-order search. It restores every inspected header and
+// returns the unique predecessor/current cursors at the first key not before
+// the client lease (or the root-length sentinel).
+
+use free_list_remove_head;
+
+pub class FreeListInsertLocation {
+    u64 previous;
+    u64 current;
+
+    /// post self.previous = previous ∧ self.current = current
+    init make(u64 previous, u64 current) {
+        self.previous = previous;
+        self.current = current;
+    }
+}
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] limit = state.root.len
+/// pre  #[label(chain)]
+///        Sable.AllocatorView.StoredChain state limit head
+/// post #[label(frame)] state = old state
+/// post #[label(search)] Sable.AllocatorView.InsertionSearch
+///        (old state) limit key limit head result.previous result.current
+pub fn free_list_locate_insert(raw<u8> base,
+                               resource &mut AllocatorState state,
+                               u64 limit, u64 head, u64 key)
+                               -> FreeListInsertLocation {
+    mut u64 previous = limit;
+    mut u64 current = head;
+    /// invariant state = old state
+    /// invariant Sable.AllocatorView.StoredChain state limit current
+    /// invariant Sable.AllocatorView.BeforePath
+    ///             (old state) limit key head previous current
+    /// variant limit - current
+    while (current != limit && current < key) {
+        resource FreeHeader node =
+            allocator_step_header(&mut state, limit, current);
+        mut u64 next = 0;
+        unsafe {
+            raw<u8> node_ptr = raw_offset(base, current);
+            next = raw_header_next(node_ptr, &node);
+        }
+        allocator_put_header(&mut state, node);
+        previous = current;
+        current = next;
+    }
+    var location = FreeListInsertLocation::make(previous, current);
+    return location;
+}
+
+/// discharge free_list_locate_insert.inv_init.sable_allocatorview_beforepath_old_state by
+///   exact Sable.AllocatorView.BeforePath.nil
+
+/// discharge free_list_locate_insert.free_header.next by
+///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
+///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
+///     Sable.AllocatorView.StoredChain.step
+///       h_inv_sable_allocatorview_stor
+///       h_path_current_limit_current_ke.1
+///   have hnode : _header7 = node := by
+///     rw [h_header7_step,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨hsizewf, _, hkeyoff, halloc, _, hoff, _, _⟩ := hwf
+///   have hlayout : node.sizeCell.layout = Sable.u64.layout :=
+///     hsizewf.1
+///   rw [hnode]
+///   constructor
+///   · constructor
+///     · calc
+///         node.nextCell.alloc = node.sizeCell.alloc := halloc.symm
+///         _ = _old_state.root.alloc := hstored.2.2.2.2.2
+///         _ = base.alloc := h_pre_base.1.symm
+///         _ = (Sable.RawPtr.add base current).alloc := rfl
+///     · calc
+///         node.nextCell.off =
+///             node.sizeCell.off + node.sizeCell.layout.size := hoff.symm
+///         _ = node.key + Sable.u64.layout.size := by
+///           rw [← hkeyoff, hlayout]
+///         _ = current + Sable.u64.layout.size := by
+///           rw [hstored.2.2.1]
+///         _ = (Sable.RawPtr.add base current).off +
+///             Sable.u64.layout.size := by
+///           rw [Sable.RawPtr.add_off, h_pre_base.2]
+///           omega
+///   · rw [hfields.2]
+///     simp
+
+/// discharge free_list_locate_insert.allocator_put_header by
+///   have htake : Sable.AllocatorView.canTakeHeader _old_state current :=
+///     Sable.AllocatorView.StoredChain.takeable
+///       h_inv_sable_allocatorview_stor
+///       h_path_current_limit_current_ke.1
+///   rw [h_state_step_header, h_header7_step]
+///   exact Sable.AllocatorView.takeHeader_canPutHeader
+///     _old_state current htake
+
+/// discharge free_list_locate_insert.inv_preserved.state_old_state by
+///   rw [h_state_put_header, h_state_step_header, h_header7_step]
+///   exact Sable.AllocatorView.StoredChain.extract_restore
+///     h_inv_sable_allocatorview_stor
+///     h_path_current_limit_current_ke.1
+
+/// discharge free_list_locate_insert.inv_preserved.sable_allocatorview_storedchain_state_li by
+///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
+///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
+///     Sable.AllocatorView.StoredChain.step
+///       h_inv_sable_allocatorview_stor
+///       h_path_current_limit_current_ke.1
+///   have hnode : _header7 = node := by
+///     rw [h_header7_step,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   unfold Sable.FreeHeaderView.hasFields at hfields
+///   rw [hnode, hfields.2] at h_value8_header_next
+///   have hnext : storedNext = _value8 := by
+///     injection h_value8_header_next
+///   have hrestore : state_2 = _old_state := by
+///     rw [h_state_put_header, h_state_step_header, h_header7_step]
+///     exact Sable.AllocatorView.StoredChain.extract_restore
+///       h_inv_sable_allocatorview_stor
+///       h_path_current_limit_current_ke.1
+///   rw [hrestore, ← hnext]
+///   exact tail
+
+/// discharge free_list_locate_insert.inv_preserved.sable_allocatorview_beforepath_old_state by
+///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
+///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
+///     Sable.AllocatorView.StoredChain.step
+///       h_inv_sable_allocatorview_stor
+///       h_path_current_limit_current_ke.1
+///   have hnode : _header7 = node := by
+///     rw [h_header7_step,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   unfold Sable.FreeHeaderView.hasFields at hfields
+///   rw [hnode, hfields.2] at h_value8_header_next
+///   have hnext : storedNext = _value8 := by
+///     injection h_value8_header_next
+///   rw [← hnext]
+///   exact Sable.AllocatorView.BeforePath.step
+///     h_inv_sable_allocatorview_befo
+///     h_path_current_limit_current_ke.1 hstored hfields
+///     h_path_current_limit_current_ke.2
+
+/// discharge free_list_locate_insert.variant_decreases.limit_current by
+///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
+///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
+///     Sable.AllocatorView.StoredChain.step
+///       h_inv_sable_allocatorview_stor
+///       h_path_current_limit_current_ke.1
+///   have hnode : _header7 = node := by
+///     rw [h_header7_step,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   unfold Sable.FreeHeaderView.hasFields at hfields
+///   rw [hnode, hfields.2] at h_value8_header_next
+///   injection h_value8_header_next
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout] at hfit
+///   rw [h_variant_limit_current]
+///   omega
+
+/// discharge free_list_locate_insert.post.search by
+///   rw [h_result,
+///     h_FreeListInsertLocation_make_post_self_previous_previous_s.1,
+///     h_FreeListInsertLocation_make_post_self_previous_previous_s.2]
+///   apply h_inv_sable_allocatorview_befo.toSearch
+///   by_cases hend : current = limit
+///   · exact Or.inl hend
+///   · exact Or.inr (by omega)

@@ -27,6 +27,8 @@ use free_list_remove_head;
 /// post #[label(owner)] result.allocator = state.allocator
 /// post #[label(root)] result.span.alloc = state.root.alloc
 /// post #[label(returnable)] state.returnable result
+/// post #[label(returnable_in)]
+///        state.returnableIn list.limit list.head result
 pub fn free_list_allocate_head(raw<u8> base,
                                &mut FreeListState list,
                                resource &mut AllocatorState state,
@@ -267,6 +269,98 @@ pub fn free_list_allocate_head(raw<u8> base,
 ///   exact Sable.AllocatorView.returnable_putHeaderOutside
 ///     hprefix (Or.inr houtside)
 
+/// discharge free_list_allocate_head.post.returnable_in by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hmatch := Sable.AllocatorView.StoredChain.takeMatchingHead
+///     h_pre_chain (by simpa using h_pre_nonempty) hstored hfields
+///   have hsplit : need + Sable.freeHeaderBytes ≤ size := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     omega
+///   have hresultKey : result.key = _old_list.head := by
+///     rw [h_result, h_lease11_lease, h_block_prefix]
+///     simp [Sable.FreeBlockView.toLease,
+///       Sable.FreeBlockView.prefix,
+///       h_free_list_remove_head_post_removed.1]
+///   have hresultLen : result.span.len = need := by
+///     rw [h_result, h_lease11_lease, h_block_prefix]
+///     simp [Sable.FreeBlockView.toLease,
+///       Sable.FreeBlockView.prefix]
+///   have hprefix : state.returnable block_2.toLease := by
+///     rw [h_block_prefix]
+///     apply Sable.AllocatorView.returnable_prefix
+///       h_free_list_remove_head_post_returnable
+///     constructor
+///     · exact h_fact_0_need_need_block_span_l.1
+///     · change need ≤ block.span.len
+///       omega
+///   have hremkey : remainder_header.key = _old_list.head + need := by
+///     simp [h_remainder_header_init, h_header6_header,
+///       h_free5_suffix, Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix,
+///       h_free_list_remove_head_post_removed.1]
+///   have houtside :
+///       block_2.toLease.key + block_2.toLease.span.len ≤
+///         remainder_header.key := by
+///     rw [hremkey, h_block_prefix]
+///     simp [Sable.FreeBlockView.toLease,
+///       Sable.FreeBlockView.prefix,
+///       h_free_list_remove_head_post_removed.1]
+///   have hreturn : state_2.returnable result := by
+///     rw [h_result, h_lease11_lease, h_state_put_header]
+///     exact Sable.AllocatorView.returnable_putHeaderOutside
+///       hprefix (Or.inr houtside)
+///   have hnewFields :
+///       remainder_header.hasFields (size - need) next := by
+///     simp [h_remainder_header_init, h_header6_header,
+///       Sable.FreeHeaderView.hasFields,
+///       Sable.FreeHeaderView.putFields]
+///   have hnewExtent :
+///       remainder_header.toFree.span.len = size - need := by
+///     rw [h_remainder_header_init, h_header6_header,
+///       Sable.FreeBlockView.toHeader_putFields_toFree_span_len,
+///       h_free5_split.2.2.2.2,
+///       h_free_list_remove_head_post_removed.2]
+///   have hnewClear :
+///       state.clearInterior remainder_header.key (size - need) := by
+///     intro k hlo hhi
+///     rw [hremkey] at hlo hhi
+///     rw [h_free_list_remove_head_post_transition]
+///     apply hmatch.2.1 k
+///     · omega
+///     · omega
+///   have hnewRoot :
+///       remainder_header.sizeCell.alloc = state.root.alloc := by
+///     rw [h_remainder_header_init, h_header6_header, h_free5_suffix]
+///     exact h_free_list_remove_head_post_root
+///   have hchain : state_2.StoredChain list_2.limit list_2.head := by
+///     rw [h_state_put_header,
+///       h_FreeListState_advance_post_self_head_next_self_limi.1,
+///       h_FreeListState_advance_post_self_head_next_self_limi.2,
+///       ← hremkey]
+///     apply Sable.AllocatorView.StoredChain.prependAfterPut
+///     · rw [h_free_list_remove_head_post_head]
+///         at h_free_list_remove_head_post_chain
+///       exact h_free_list_remove_head_post_chain
+///     · exact h_fact_sable_allocatorview_canp
+///     · exact hnewFields
+///     · exact hnewExtent
+///     · exact hnewClear
+///     · exact hnewRoot
+///     · rw [hremkey]
+///       omega
+///     · simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///       omega
+///     · rw [hremkey]
+///       have horder := hmatch.2.2.2.1
+///       omega
+///     · rw [h_free_list_remove_head_post_limit_frame]
+///       exact hmatch.2.2.2.2.1
+///   refine ⟨hreturn, list_2.limit, list_2.head, ?_⟩
+///   rw [hresultKey, hresultLen]
+///   apply Sable.AllocatorView.InsertionLocation.head hchain
+///   rw [h_FreeListState_advance_post_self_head_next_self_limi.1]
+///   omega
+
 /// discharge free_list_allocate_head.post.head.2 by
 ///   have hwhole : ¬ need + Sable.freeHeaderBytes ≤ size := by
 ///     intro hsplit
@@ -290,3 +384,27 @@ pub fn free_list_allocate_head(raw<u8> base,
 ///   rw [h_result, h_lease12_lease]
 ///   simpa [Sable.FreeBlockView.toLease] using
 ///     h_free_list_remove_head_post_root
+
+/// discharge free_list_allocate_head.post.returnable_in.2 by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hmatch := Sable.AllocatorView.StoredChain.takeMatchingHead
+///     h_pre_chain (by simpa using h_pre_nonempty) hstored hfields
+///   have hwhole : ¬ need + Sable.freeHeaderBytes ≤ size := by
+///     intro hsplit
+///     apply h_path_not_need_size_16
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout] at hsplit ⊢
+///     omega
+///   have hkey : result.key = _old_list.head := by
+///     rw [h_result, h_lease12_lease]
+///     exact h_free_list_remove_head_post_removed.1
+///   have hlen : result.span.len = size := by
+///     rw [h_result, h_lease12_lease]
+///     exact h_free_list_remove_head_post_removed.2
+///   refine ⟨?_, list.limit, list.head, ?_⟩
+///   · rw [h_result, h_lease12_lease]
+///     exact h_free_list_remove_head_post_returnable
+///   · rw [hkey, hlen]
+///     apply Sable.AllocatorView.InsertionLocation.head
+///       h_free_list_remove_head_post_chain
+///     rw [h_free_list_remove_head_post_head]
+///     exact hmatch.2.2.2.1
