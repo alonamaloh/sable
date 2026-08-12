@@ -1,0 +1,20 @@
+// Native trap-ABI subject.  Each operation is fully verified under its
+// precondition.  The LLVM integration test deliberately calls the internal
+// lowered functions with contract-violating values so it can exercise guards
+// that verified Sable callers cannot reach.
+
+/// pre x = 0
+/// pre y = 0
+fn add_guard(i8 x, i8 y) -> i8 {
+    return x + y;
+}
+
+/// pre rhs = 1
+fn div_guard(i32 lhs, i32 rhs) -> i32 {
+    return lhs / rhs;
+}
+
+/// pre 0 ≤ value ∧ value ≤ 127
+fn narrow_guard(i32 value) -> i8 {
+    return narrow<i8>(value);
+}

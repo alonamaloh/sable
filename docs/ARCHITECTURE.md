@@ -126,12 +126,17 @@ these checks.
 
 Output carries the exact artifact and proof-environment identities, uses
 versionable length-prefixed internal mangling, and file publication is atomic.
-Focused gates are green at 23/23 single-job, non-incremental library tests and
-5/5 verified CLI tests. With Clang present, verified scalar, CFG, and
-arithmetic subjects each return 42 at `-O0` and `-O2`; LLVM tools remain
-optional for emitting IR. Interpreter differentials and a full-corpus rerun
-have not yet been performed for this arithmetic checkpoint, so the complete v0
-boundary remains in progress.
+Focused library gates are green at 23/23 single-job, non-incremental tests, and
+the complete verified CLI suite is green at 6/6 single-threaded. With Clang
+present, verified scalar, CFG, and arithmetic subjects each return 42 at
+`-O0` and `-O2`; LLVM tools remain
+optional for emitting IR. A verified trap subject compiles at both levels, and
+four contract-violating test wrappers observe the exact pinned hook payloads
+for add overflow, division by zero, signed `MIN / -1`, and narrowing range. The
+strong hook returns, after which mandatory `llvm.trap` still terminates the
+process. This is a direct executable ABI gate, not an interpreter differential;
+interpreter comparison and a full-corpus rerun remain before the complete v0
+boundary is declared finished.
 
 ## Key invariants
 

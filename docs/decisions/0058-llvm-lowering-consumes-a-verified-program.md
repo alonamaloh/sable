@@ -1,6 +1,7 @@
 # ADR 0058 — LLVM lowering consumes the verified program
 
-**Decided 2026-08-12; three implementation slices landed, milestone in progress.** Unsafe Sable v1 has a
+**Decided 2026-08-12; three implementation slices and the executable trap-ABI
+gate landed, milestone in progress.** Unsafe Sable v1 has a
 defensible formal stopping point, but Sable still has no native-code path. The
 first backend should make verified programs runnable without making LLVM part
 of the verifier or introducing a second, subtly different front-end pipeline.
@@ -116,10 +117,11 @@ file. `-o -` streams a completed in-memory document to standard output.
 ## Evidence and staging
 
 Emitter unit tests inspect deterministic IR and source diagnostics. Where
-`clang` is available, later differential fixtures will compile and run the
-same scalar subjects at `-O0` and `-O2`, comparing return values and traps with
-the Sable interpreter. These end-to-end checks are optional for a normal developer
-environment unless explicitly required (for example by
+`clang` is available, direct native fixtures compile and run at `-O0` and
+`-O2`; the current gate covers successful results and observable trap-ABI
+behavior. A later differential layer will compare those results and traps with
+the Sable interpreter. These end-to-end checks are optional for a normal
+developer environment unless explicitly required (for example by
 `SABLE_REQUIRE_CLANG=1`); the ordinary emitter suite never acquires an LLVM
 tool dependency.
 
@@ -133,13 +135,19 @@ widening/narrowing, and the versioned weak trap hook plus mandatory
 `llvm.trap`. Its structural tests pin guard dominance, the `min % -1` bypass,
 raw trap payloads, and the absence of poison promises.
 
-Focused gates are green at 23/23 single-job, non-incremental library tests and
-5/5 verified LLVM CLI tests. Clang was present: scalar, CFG, and arithmetic
-subjects each returned the expected 42 at `-O0` and `-O2`. Verification failure
-and audited-assumption rejection leave existing output untouched. These are
-direct compiled-result gates, not interpreter differentials, and the complete
-verifier/dynamic corpus was not rerun for the arithmetic slice. Broader strict
-diagnostics, interpreter/trap differential fixtures, and a final serial
+Focused library gates are green at 23/23 single-job, non-incremental tests, and
+the complete verified LLVM CLI suite is green at 6/6 single-threaded. Clang was
+present: scalar, CFG, and arithmetic subjects each returned the expected 42 at
+`-O0` and `-O2`. Verification failure
+and audited-assumption rejection leave existing output untouched. A fully
+verified trap subject also compiled at both optimization levels; four
+contract-violating test wrappers produced the exact pinned kind, type-info, and
+raw-operand payloads for add overflow, division by zero, signed `MIN / -1`
+division, and narrowing range. Their strong hook returned, and the following
+`llvm.trap` still terminated each process. These are direct compiled-result and
+trap-ABI gates, not interpreter differentials, and the complete verifier/dynamic
+corpus was not rerun for this checkpoint. Broader strict diagnostics,
+interpreter differentials for both results and traps, and a final serial
 regression remain before the complete v0 backend is declared finished.
 
 ## Consequences

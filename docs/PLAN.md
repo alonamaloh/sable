@@ -598,13 +598,18 @@ failure reports raw operand bits through the weak `__sable_rt_trap_v1` hook,
 then the internal `noreturn` helper invokes `llvm.trap` even if the hook returns.
 The emitter uses no `nsw`, `nuw`, `exact`, `inbounds`, or `llvm.assume` shortcut.
 
-Focused evidence is green at 23/23 single-job, non-incremental library tests and
-5/5 verified LLVM CLI tests. Clang was present: the scalar, CFG, and arithmetic
-subjects each returned the expected 42 at both `-O0` and `-O2`. The CLI gate
+Focused library evidence is green at 23/23 single-job, non-incremental tests,
+and the complete verified LLVM CLI suite is green at 6/6 single-threaded. Clang
+was present: the scalar, CFG, and arithmetic subjects each returned the
+expected 42 at both `-O0` and `-O2`. The CLI gate
 also preserves an existing output on verification failure and rejects audited
-assumptions before publication. This arithmetic checkpoint has not yet run an
-interpreter differential or the complete verifier/dynamic corpus again; those
-remain closure evidence rather than claims of this slice.
+assumptions before publication. The verified trap subject also compiled at both
+optimization levels. Four contract-violating wrappers reached add overflow,
+division by zero, signed `MIN / -1` division, and narrow-range guards with the
+exact pinned kind, type-info, and raw-operand payloads; a returning strong hook
+could not suppress the following `llvm.trap`. This is executable native ABI
+evidence, not an interpreter comparison, and the complete verifier/dynamic
+corpus was not rerun for this checkpoint.
 
 The v0 acceptance boundary is intentionally narrow: fixed-width integers,
 booleans, unit, scalar locals/parameters/returns, nonrecursive calls, ordinary
@@ -620,10 +625,11 @@ division, and narrowing guards; Euclidean signed division correction; no
 length-prefixed mangling without promising a public ABI, and file output is
 atomic. Deterministic emitter tests require no LLVM installation; optional
 future differential runs will compare supported subjects with the interpreter
-under Clang `-O0` and `-O2`; the current Clang gate pins the scalar entry's
-expected exit value directly. Remaining M45 work is the broader strict-negative
-matrix, interpreter/trap differentials, and a complete serial regression before
-declaring the scalar v0 boundary finished.
+under Clang `-O0` and `-O2`; the current Clang gate directly pins successful
+exit values and the versioned trap ABI. Remaining M45 work is the broader
+strict-negative matrix, interpreter differentials for both results and traps,
+and a complete serial regression before declaring the scalar v0 boundary
+finished.
 
 ## Post-U10 usability sequence
 
