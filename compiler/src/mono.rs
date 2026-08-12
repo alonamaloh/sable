@@ -11,13 +11,14 @@
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::span::Span;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 type MResult<T> = Result<T, Diagnostic>;
 
 const DEPTH_CAP: usize = 32;
 
 pub fn monomorphize(program: &mut Program) -> MResult<()> {
+    preflight_source_names(program)?;
     validate_v1_type_args(program)?;
     let mut fn_templates: HashMap<String, Fn> = HashMap::new();
     let mut class_templates: HashMap<String, ClassDecl> = HashMap::new();
@@ -215,10 +216,12 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
         }
     }
 
+    let emitted_names = seed_emitted_names(program)?;
     let mut ctx = Mono {
         fn_templates,
         class_templates,
-        instantiated: HashSet::new(),
+        instances: HashMap::new(),
+        emitted_names,
         queue: VecDeque::new(),
         new_fns: Vec::new(),
         new_classes: Vec::new(),
@@ -269,6 +272,52 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
     ctx.new_classes.sort_by(|a, b| a.name.cmp(&b.name));
     program.fns.extend(ctx.new_fns);
     program.classes.extend(ctx.new_classes);
+    Ok(())
+}
+
+/// Monomorphization removes generic declarations before the checker sees the
+/// program, so it must reject source-name conflicts first. Mirror the
+/// checker's shared-namespace ordering: functions, then records, then classes.
+/// This also covers already-retained templates, which can occur in synthetic
+/// `Program` values and must not be allowed to overwrite a newly extracted
+/// template in the lookup maps below.
+fn preflight_source_names(program: &Program) -> MResult<()> {
+    let mut function_names = HashSet::new();
+    for function in program.fns.iter().chain(&program.fn_templates) {
+        if !function_names.insert(function.name.clone()) {
+            return Err(Diagnostic {
+                name: "type.duplicate_function".into(),
+                title: format!("function `{}` is defined twice", function.name),
+                span: function.name_span,
+                label: "second definition here".into(),
+                notes: vec![],
+            });
+        }
+    }
+
+    let mut shared_names = function_names;
+    for record in &program.records {
+        if !shared_names.insert(record.name.clone()) {
+            return Err(Diagnostic {
+                name: "record.duplicate".into(),
+                title: format!("`{}` is defined twice", record.name),
+                span: record.name_span,
+                label: "functions, classes, and records share one namespace".into(),
+                notes: vec![],
+            });
+        }
+    }
+    for class in program.classes.iter().chain(&program.class_templates) {
+        if !shared_names.insert(class.name.clone()) {
+            return Err(Diagnostic {
+                name: "type.duplicate_class".into(),
+                title: format!("`{}` is defined twice", class.name),
+                span: class.name_span,
+                label: "class/function names share one namespace".into(),
+                notes: vec![],
+            });
+        }
+    }
     Ok(())
 }
 
@@ -440,10 +489,121 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TemplateKind {
+    Function,
+    Class,
+}
+
+impl TemplateKind {
+    fn description(self) -> &'static str {
+        match self {
+            TemplateKind::Function => "function",
+            TemplateKind::Class => "class",
+        }
+    }
+}
+
+/// Exact identity of an instance. The legacy emitted spelling is deliberately
+/// absent: two structural identities may still render to the same v1 name,
+/// which is a diagnosed collision rather than accidental deduplication.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InstanceKey {
+    kind: TemplateKind,
+    template: String,
+    args: Box<[CanonicalTypeKey]>,
+}
+
+impl InstanceKey {
+    fn from_args(kind: TemplateKind, template: &str, args: &ConcreteV1Args) -> InstanceKey {
+        InstanceKey {
+            kind,
+            template: template.to_string(),
+            args: args.keys.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SourceNameKind {
+    Function,
+    FunctionTemplate,
+    Class,
+    ClassTemplate,
+    Record,
+}
+
+impl SourceNameKind {
+    fn description(self) -> &'static str {
+        match self {
+            SourceNameKind::Function => "source function",
+            SourceNameKind::FunctionTemplate => "generic function template",
+            SourceNameKind::Class => "source class",
+            SourceNameKind::ClassTemplate => "generic class template",
+            SourceNameKind::Record => "source record",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum EmittedNameOwner {
+    Source(SourceNameKind),
+    Instance(InstanceKey),
+}
+
+fn seed_emitted_names(program: &Program) -> MResult<BTreeMap<String, EmittedNameOwner>> {
+    let mut names = BTreeMap::new();
+    let mut reserve = |name: &str, span: Span, kind: SourceNameKind| -> MResult<()> {
+        if let Some(existing) = names.get(name) {
+            let EmittedNameOwner::Source(existing) = existing else {
+                unreachable!("seeding happens before any instances")
+            };
+            return Err(Diagnostic {
+                name: "mono.source_name_collision".into(),
+                title: format!("`{name}` has conflicting source declarations"),
+                span,
+                label: format!(
+                    "this {} collides with an earlier {}",
+                    kind.description(),
+                    existing.description()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    "impl lowering can introduce functions before instance names are reserved; \
+                     every retained runtime and template name must still be unique"
+                        .into(),
+                )],
+            });
+        }
+        names.insert(name.to_string(), EmittedNameOwner::Source(kind));
+        Ok(())
+    };
+    for function in &program.fns {
+        reserve(&function.name, function.name_span, SourceNameKind::Function)?;
+    }
+    for function in &program.fn_templates {
+        reserve(
+            &function.name,
+            function.name_span,
+            SourceNameKind::FunctionTemplate,
+        )?;
+    }
+    for class in &program.classes {
+        reserve(&class.name, class.name_span, SourceNameKind::Class)?;
+    }
+    for class in &program.class_templates {
+        reserve(&class.name, class.name_span, SourceNameKind::ClassTemplate)?;
+    }
+    for record in &program.records {
+        reserve(&record.name, record.name_span, SourceNameKind::Record)?;
+    }
+    Ok(names)
+}
+
 #[derive(Clone)]
 struct Request {
-    is_class: bool,
-    template: String,
+    key: InstanceKey,
+    emitted_name: String,
     args: Vec<IntTy>,
     span: Span,
     depth: usize,
@@ -452,7 +612,8 @@ struct Request {
 struct Mono {
     fn_templates: HashMap<String, Fn>,
     class_templates: HashMap<String, ClassDecl>,
-    instantiated: HashSet<String>,
+    instances: HashMap<InstanceKey, String>,
+    emitted_names: BTreeMap<String, EmittedNameOwner>,
     queue: VecDeque<Request>,
     new_fns: Vec<Fn>,
     new_classes: Vec<ClassDecl>,
@@ -730,17 +891,35 @@ fn unsupported_type_arg(span: Span, error: GenericTyError) -> Diagnostic {
     }
 }
 
-/// Consume recursive use-site arguments at the current integer-only mono
-/// boundary. Keeping this conversion fallible makes dormant G0 shapes reject
-/// with a source diagnostic rather than reaching integer helpers or mangling.
-fn take_concrete_v1_type_args(type_args: &mut Vec<TypeArg>) -> MResult<Vec<IntTy>> {
-    std::mem::take(type_args)
-        .into_iter()
-        .map(|TypeArg { ty, span }| {
+/// The current substitution payload plus the future-proof structural keys
+/// taken directly from the recursive source types. Keeping both here prevents
+/// instance identity from being accidentally reconstructed from the temporary
+/// integer-only v1 lowering.
+struct ConcreteV1Args {
+    values: Vec<IntTy>,
+    keys: Box<[CanonicalTypeKey]>,
+}
+
+/// Borrow recursive use-site arguments at the current integer-only mono
+/// boundary. The AST arguments remain intact until request validation and
+/// emitted-name reservation both succeed.
+fn concrete_v1_type_args(type_args: &[TypeArg]) -> MResult<ConcreteV1Args> {
+    let mut values = Vec::with_capacity(type_args.len());
+    let mut keys = Vec::with_capacity(type_args.len());
+    for TypeArg { ty, span } in type_args {
+        values.push(
             ty.try_to_concrete_v1_int()
-                .map_err(|error| unsupported_type_arg(span, error))
-        })
-        .collect()
+                .map_err(|error| unsupported_type_arg(*span, error))?,
+        );
+        keys.push(
+            ty.concrete_key()
+                .map_err(|error| unsupported_type_arg(*span, error))?,
+        );
+    }
+    Ok(ConcreteV1Args {
+        values,
+        keys: keys.into_boxed_slice(),
+    })
 }
 
 fn require_concrete_v1_type_args(type_args: &[TypeArg]) -> MResult<()> {
@@ -770,13 +949,13 @@ fn substitute_type_args(type_args: &mut [TypeArg], args: &[IntTy]) -> MResult<()
 impl Mono {
     fn request(
         &mut self,
-        is_class: bool,
+        kind: TemplateKind,
         template: &str,
-        args: &[IntTy],
+        args: &ConcreteV1Args,
         span: Span,
         depth: usize,
     ) -> MResult<String> {
-        if let Some(index) = args.iter().find_map(|arg| match arg {
+        if let Some(index) = args.values.iter().find_map(|arg| match arg {
             IntTy::TParam(index) => Some(*index),
             _ => None,
         }) {
@@ -785,26 +964,35 @@ impl Mono {
                 GenericTyError::UnsubstitutedTypeParameter(TypeParamId::from_legacy(index)),
             ));
         }
-        let (expected, bounds) = if is_class {
-            let t = &self.class_templates[template];
-            (t.type_params.len(), t.type_bounds.clone())
-        } else {
-            let t = &self.fn_templates[template];
-            (t.type_params.len(), t.type_bounds.clone())
+        let (expected, bounds) = match kind {
+            TemplateKind::Function => {
+                let template = self
+                    .fn_templates
+                    .get(template)
+                    .expect("function requests name a known template");
+                (template.type_params.len(), template.type_bounds.clone())
+            }
+            TemplateKind::Class => {
+                let template = self
+                    .class_templates
+                    .get(template)
+                    .expect("class requests name a known template");
+                (template.type_params.len(), template.type_bounds.clone())
+            }
         };
-        if args.len() != expected {
+        if args.values.len() != expected {
             return Err(Diagnostic {
                 name: "mono.arity".into(),
                 title: format!(
                     "`{template}` takes {expected} type argument(s), {} given",
-                    args.len()
+                    args.values.len()
                 ),
                 span,
                 label: "wrong number of type arguments".into(),
                 notes: vec![],
             });
         }
-        for (bound, arg) in bounds.iter().zip(args) {
+        for (bound, arg) in bounds.iter().zip(&args.values) {
             if let Some(b) = bound {
                 if !self
                     .impls
@@ -820,6 +1008,10 @@ impl Mono {
                 }
             }
         }
+        let key = InstanceKey::from_args(kind, template, args);
+        if let Some(emitted_name) = self.instances.get(&key) {
+            return Ok(emitted_name.clone());
+        }
         if depth > DEPTH_CAP {
             return Err(Diagnostic {
                 name: "mono.depth".into(),
@@ -829,28 +1021,59 @@ impl Mono {
                 notes: vec![],
             });
         }
-        let mangled = mangle(template, args);
-        if self.instantiated.insert(mangled.clone()) {
-            self.queue.push_back(Request {
-                is_class,
-                template: template.to_string(),
-                args: args.to_vec(),
+
+        let emitted_name = mangle(template, &args.values);
+        if let Some(owner) = self.emitted_names.get(&emitted_name) {
+            let occupied_by = match owner {
+                EmittedNameOwner::Source(source_kind) => source_kind.description().to_string(),
+                EmittedNameOwner::Instance(existing) => format!(
+                    "a distinct {} instance of `{}`",
+                    existing.kind.description(),
+                    existing.template
+                ),
+            };
+            return Err(Diagnostic {
+                name: "mono.name_collision".into(),
+                title: format!("generated name `{emitted_name}` is already occupied"),
                 span,
-                depth,
+                label: format!(
+                    "this {} instantiation collides with {occupied_by}",
+                    kind.description()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    "instance identity is structural, but v1 keeps the legacy underscore \
+                     spelling for compatible programs; rename one declaration to make the \
+                     emitted names distinct"
+                        .into(),
+                )],
             });
         }
-        Ok(mangled)
+
+        self.instances.insert(key.clone(), emitted_name.clone());
+        self.emitted_names.insert(
+            emitted_name.clone(),
+            EmittedNameOwner::Instance(key.clone()),
+        );
+        self.queue.push_back(Request {
+            key,
+            emitted_name: emitted_name.clone(),
+            args: args.values.clone(),
+            span,
+            depth,
+        });
+        Ok(emitted_name)
     }
 
     fn instantiate(&mut self, req: Request) -> MResult<()> {
-        if req.is_class {
-            let template = self.class_templates[&req.template].clone();
+        if req.key.kind == TemplateKind::Class {
+            let template = self.class_templates[&req.key.template].clone();
             let mut c = template;
             let param_names = std::mem::take(&mut c.type_params);
             let bounds = std::mem::take(&mut c.type_bounds);
             let (text_map, bound_calls) = self.subst_maps(&param_names, &bounds, &req.args);
-            c.name = mangle(&req.template, &req.args);
-            c.from_template = Some(req.template.clone());
+            c.name = req.emitted_name;
+            c.from_template = Some(req.key.template.clone());
             for fld in &mut c.fields {
                 subst_ty(&mut fld.ty, &req.args);
             }
@@ -869,15 +1092,15 @@ impl Mono {
             }
             self.new_classes.push(c);
         } else {
-            let template = self.fn_templates[&req.template].clone();
+            let template = self.fn_templates[&req.key.template].clone();
             let mut f = template;
             let param_names = std::mem::take(&mut f.type_params);
             let bounds = std::mem::take(&mut f.type_bounds);
             let (text_map, bound_calls) = self.subst_maps(&param_names, &bounds, &req.args);
-            f.name = mangle(&req.template, &req.args);
+            f.name = req.emitted_name;
             // Template-verified instances (ADR 0009): skip their own
             // obligations; owe the substituted `requires`.
-            f.from_template = Some(req.template.clone());
+            f.from_template = Some(req.key.template.clone());
             self.subst_fn(&mut f, &req.args, &text_map, &bound_calls, req.depth)?;
             self.new_fns.push(f);
         }
@@ -1006,9 +1229,6 @@ impl Mono {
                 type_args,
                 args,
             } => {
-                for a in args.iter_mut() {
-                    self.rewrite_expr(a, depth)?;
-                }
                 require_concrete_v1_type_args(type_args)?;
                 if self.fn_templates.contains_key(callee.as_str()) {
                     if type_args.is_empty() {
@@ -1022,8 +1242,16 @@ impl Mono {
                             notes: vec![],
                         });
                     }
-                    let targs = take_concrete_v1_type_args(type_args)?;
-                    *callee = self.request(false, &callee.clone(), &targs, *callee_span, depth)?;
+                    let targs = concrete_v1_type_args(type_args)?;
+                    let emitted = self.request(
+                        TemplateKind::Function,
+                        &callee.clone(),
+                        &targs,
+                        *callee_span,
+                        depth,
+                    )?;
+                    *callee = emitted;
+                    type_args.clear();
                 } else if !type_args.is_empty() {
                     return Err(Diagnostic {
                         name: "mono.not_generic".into(),
@@ -1033,6 +1261,9 @@ impl Mono {
                         notes: vec![],
                     });
                 }
+                for a in args.iter_mut() {
+                    self.rewrite_expr(a, depth)?;
+                }
             }
             ExprKind::CtorCall {
                 class,
@@ -1041,9 +1272,6 @@ impl Mono {
                 args,
                 ..
             } => {
-                for a in args.iter_mut() {
-                    self.rewrite_expr(a, depth)?;
-                }
                 require_concrete_v1_type_args(type_args)?;
                 if self.class_templates.contains_key(class.as_str()) {
                     if type_args.is_empty() {
@@ -1057,8 +1285,16 @@ impl Mono {
                             notes: vec![],
                         });
                     }
-                    let targs = take_concrete_v1_type_args(type_args)?;
-                    *class = self.request(true, &class.clone(), &targs, *class_span, depth)?;
+                    let targs = concrete_v1_type_args(type_args)?;
+                    let emitted = self.request(
+                        TemplateKind::Class,
+                        &class.clone(),
+                        &targs,
+                        *class_span,
+                        depth,
+                    )?;
+                    *class = emitted;
+                    type_args.clear();
                 } else if !type_args.is_empty() {
                     return Err(Diagnostic {
                         name: "mono.not_generic".into(),
@@ -1067,6 +1303,9 @@ impl Mono {
                         label: "not a generic class".into(),
                         notes: vec![],
                     });
+                }
+                for a in args.iter_mut() {
+                    self.rewrite_expr(a, depth)?;
                 }
             }
             ExprKind::MethodCall { args, .. } => {
@@ -1364,6 +1603,11 @@ mod tests {
         program
     }
 
+    fn monomorphization_error(source: &str) -> Diagnostic {
+        let mut program = parse_program(source);
+        monomorphize(&mut program).expect_err("test source should fail monomorphization")
+    }
+
     fn call_name(expr: &Expr) -> (&str, &[TypeArg]) {
         let ExprKind::Call {
             callee, type_args, ..
@@ -1372,6 +1616,182 @@ mod tests {
             panic!("expected a call, found {:?}", expr.kind);
         };
         (callee, type_args)
+    }
+
+    #[test]
+    fn rejects_same_kind_instances_with_ambiguous_legacy_names() {
+        let source = r#"
+fn amb_i32<T>(T value) -> T {
+    return value;
+}
+
+fn amb<T, U>(U value) -> U {
+    return value;
+}
+
+fn root() -> u8 {
+    u8 first = amb_i32<u8>(1);
+    return amb<i32, u8>(first);
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "mono.name_collision");
+        assert_eq!(error.span.start, source.rfind("amb<i32").unwrap());
+        assert!(error.title.contains("amb_i32_u8"));
+        assert!(error.label.contains("distinct function instance"));
+    }
+
+    #[test]
+    fn rejects_cross_kind_instances_with_the_same_legacy_name() {
+        let source = r#"
+fn Cross_i32<T>(T value) -> T {
+    return value;
+}
+
+class Cross<T, U> {
+    U value;
+
+    init make(U value) {
+        self.value = value;
+    }
+}
+
+fn root() {
+    u8 first = Cross_i32<u8>(1);
+    var instance = Cross<i32, u8>::make(first);
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "mono.name_collision");
+        assert_eq!(error.span.start, source.rfind("Cross<i32").unwrap());
+        assert!(error.title.contains("Cross_i32_u8"));
+        assert!(error.label.contains("distinct function instance"));
+    }
+
+    #[test]
+    fn rejects_an_instance_name_occupied_by_an_ordinary_root() {
+        let source = r#"
+fn rooted_u8() -> u8 {
+    return 0;
+}
+
+fn rooted<T>(T value) -> T {
+    return value;
+}
+
+fn root() -> u8 {
+    return rooted<u8>(1);
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "mono.name_collision");
+        assert_eq!(error.span.start, source.rfind("rooted<u8>").unwrap());
+        assert!(error.title.contains("rooted_u8"));
+        assert!(error.label.contains("source function"));
+    }
+
+    #[test]
+    fn rejects_an_instance_name_occupied_by_a_retained_template() {
+        let source = r#"
+fn named_u8<T>(T value) -> T {
+    return value;
+}
+
+fn named<T>(T value) -> T {
+    return value;
+}
+
+fn root() -> u8 {
+    return named<u8>(1);
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "mono.name_collision");
+        assert_eq!(error.span.start, source.rfind("named<u8>").unwrap());
+        assert!(error.title.contains("named_u8"));
+        assert!(error.label.contains("generic function template"));
+    }
+
+    #[test]
+    fn rejects_ordinary_root_and_generic_template_with_the_same_source_name() {
+        let source = r#"
+fn duplicate() -> u8 {
+    return 0;
+}
+
+fn duplicate<T>(T value) -> T {
+    return value;
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "type.duplicate_function");
+        assert_eq!(error.span.start, source.rfind("duplicate<T>").unwrap());
+    }
+
+    #[test]
+    fn concrete_v1_arguments_keep_keys_from_recursive_source_types() {
+        let source_type = GenericTy::Int(IntTy::I32);
+        let source_key = source_type.concrete_key().unwrap();
+        let args = concrete_v1_type_args(&[TypeArg {
+            ty: source_type,
+            span: Span::new(7, 10),
+        }])
+        .unwrap();
+
+        assert_eq!(args.values, vec![IntTy::I32]);
+        assert_eq!(args.keys.as_ref(), &[source_key]);
+
+        // Instance identity consumes the structural-key channel, not the
+        // temporary v1 substitution values. Keep this deliberately mismatched
+        // construction as a wiring regression for the recursive-type rollout.
+        let bool_key = GenericTy::Bool.concrete_key().unwrap();
+        let mismatched = ConcreteV1Args {
+            values: vec![IntTy::I32],
+            keys: vec![bool_key.clone()].into_boxed_slice(),
+        };
+        let key = InstanceKey::from_args(TemplateKind::Function, "identity", &mismatched);
+        assert_eq!(key.args.as_ref(), &[bool_key]);
+        assert_eq!(mangle("identity", &mismatched.values), "identity_i32");
+    }
+
+    #[test]
+    fn deduplicates_only_exact_structural_instance_requests() {
+        let program = parse_and_monomorphize(
+            r#"
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn root() -> u8 {
+    u8 first = identity<u8>(1);
+    return identity<u8>(first);
+}
+"#,
+        );
+        assert_eq!(
+            program
+                .fns
+                .iter()
+                .filter(|function| function.name == "identity_u8")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_generic_source_declarations_before_extraction() {
+        let source = r#"
+fn duplicate<T>(T value) -> T {
+    return value;
+}
+
+fn duplicate<U>(U value) -> U {
+    return value;
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "type.duplicate_function");
+        assert_eq!(error.span.start, source.rfind("duplicate<U>").unwrap());
     }
 
     #[test]

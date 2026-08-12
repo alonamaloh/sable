@@ -663,10 +663,18 @@ working hypothesis, not a promise that evidence cannot reorder it:
      the parser rejects duplicate parameter names and declarations above the
      256-parameter ceiling, while mono rejects dormant unsupported shapes.
      Preparation, substitution, and generic-use traversal now cover record
-     literals, `some(...)`, class destructors, and member contracts and variants. Focused
-     serial evidence is green: library 44/44, `vec` 84 obligations, `concepts`
-     17, `trait_hash` 10, and `hashmap` 112. Structural instance identity and
-     the emitted-name collision registry are the immediate next slice.
+     literals, `some(...)`, class destructors, and member contracts and variants.
+     Structural instance identity has also landed: each `InstanceKey` includes
+     function/class kind, template base, and the original recursive
+     `CanonicalTypeKey` arguments, so exact requests deduplicate without using
+     an emitted spelling as identity. Collision-free programs retain the legacy
+     names; ambiguous legacy spellings and source/template/impl-lowered name
+     collisions fail closed at deterministic diagnostics, with a source
+     function/class/record namespace preflight before template removal. Focused
+     serial evidence is green: library 52/52, `vec` 84 obligations, `concepts`
+     17, `trait_hash` 10, and `hashmap` 112. The immediate next slice is bounded
+     recursive generic-argument parsing, with newly expressible non-v1 shapes
+     still rejected by mono until their semantics land.
    - **G1 — Boolean/POD aggregates:** establish the first non-integer aggregate
      storage, value, verification, interpreter, and LLVM paths.
    - **G2 — affine options:** carry ownership and destruction correctly through

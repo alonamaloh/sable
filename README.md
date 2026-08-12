@@ -82,9 +82,16 @@ The accepted grammar is deliberately unchanged: uses still supply only an
 integer type or an in-scope type parameter, duplicate parameter names and more
 than 256 parameters are rejected, and monomorphization diagnoses any dormant
 unsupported shape. Generic-use traversal now includes record literals,
-`some(...)`, class destructors, and member contracts and variants. Structural instance
-identity and emitted-name collision detection are the next G0 slice, not part
-of this checkpoint.
+`some(...)`, class destructors, and member contracts and variants. Structural
+instance identity and emitted-name collision detection have now landed too: an
+`InstanceKey` combines function/class kind, the template base, and the original
+recursive `CanonicalTypeKey` arguments, so only exact requests deduplicate.
+Collision-free programs keep their legacy emitted spellings unchanged, while
+ambiguous legacy spellings and collisions with source, template, or impl-lowered
+names fail closed at deterministic diagnostics. A source function/class/record
+namespace preflight runs before templates can be removed. The next G0 slice is
+bounded recursive generic-argument parsing; every newly expressible non-v1
+shape will remain rejected by monomorphization until its semantics are ready.
 
 - **The bignum pillar** (M15–M16, the Tier-3 opener): arbitrary-precision `Nat` over base-2³² limbs with a normalizing representation invariant ([`corpus/verifies/bignum.sable`](corpus/verifies/bignum.sable)). The entire specification is one recursive ghost valuation, `natVal`, and one line per operation: `cmp` decides the order, `add`/`sub`/`mul` post `natVal result.limbs = natVal a.limbs ⊕ natVal b.limbs`, `div`/`rem` post `… = natVal a.limbs / natVal b.limbs` against Lean's own Euclidean division — with division built *compositionally* (double-and-subtract riding the contracts of the other verified ops, closed by one uniqueness lemma) — and `gcd` is Euclid in fifteen lines whose spec is kernel-check-proven to agree with Lean core's `Int.gcd`. **255 obligations across 10 functions, 73 hand discharges, zero escapes**, every clause monitored dynamically — the first benchmark where the mathematics itself was the test.
 - **The verified free-list allocator** (M41, ADR 0037–0052): releasable system roots fold into an affine aggregate; first-fit allocation returns an exact mandatory `BlockLease`; public return rejects the wrong allocator, repeated use, or substituted subregion metadata; and predecessor/successor coalescing clears real in-band headers and proves exact span joins ([`corpus/verifies/free_list_return.sable`](corpus/verifies/free_list_return.sable)). Six branch fixtures and a deterministic 144-return reference-model comparison exercise the runtime policy, while final destruction still requires the exact complete root authority. U10's sound loop audit forced the traversal/search proofs to state their restored resource frame explicitly; the walk, insert-location, and first-fit pairs are green at 33/33, 13/13, and 22/22 obligations respectively. The complete serial corpus is green in 297.65s, and the full serial Rust suite is green.

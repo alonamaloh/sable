@@ -1,0 +1,10 @@
+// expect-error: type.duplicate_function
+// Templates occupy the ordinary function namespace even when never used.
+
+fn duplicate<T>(T value) -> T {
+    return value;
+}
+
+fn duplicate<U>(U value) -> U {
+    return value;
+}

@@ -40,6 +40,10 @@ mono (compiler/src/mono.rs)           monomorphization (ADR 0006/0007): expands
   │                                   the source grammar remains integer/parameter-only;
   │                                   duplicate parameters and arity above 256 fail in
   │                                   the parser, and dormant wider shapes fail in mono.
+  │                                   Instances are keyed structurally by function/class
+  │                                   kind, template base, and original canonical args;
+  │                                   exact requests deduplicate while a registry rejects
+  │                                   ambiguous legacy emitted names deterministically.
   │                                   No later stage sees a type variable.
   ▼
 typecheck (compiler/src/check.rs)     types, call graph, and one flow-sensitive
@@ -155,8 +159,15 @@ this completed scalar boundary and are future M46+ work.
   parameters parse as arguments. Monomorphization rejects every other dormant
   shape before checked types are built. Its preparation, substitution, and
   generic-use walks cover record literals, `some(...)`, class destructors, and
-  member contracts and variants. Canonical type keys are opaque; structural instance
-  identity and an emitted-name collision registry remain the next slice.
+  member contracts and variants. Canonical type keys are opaque. Each
+  `InstanceKey` is the function/class kind, template base, and original recursive
+  `CanonicalTypeKey` arguments, so only exact structural requests deduplicate.
+  The collision-free legacy emitted spelling is unchanged; an emitted-name
+  registry rejects ambiguous legacy spellings and collisions with source,
+  template, or impl-lowered names at deterministic diagnostics. A source
+  function/class/record namespace preflight runs before mono removes templates.
+  The next slice adds bounded recursive generic-argument parsing while mono
+  continues to reject every newly expressible non-v1 shape.
 - **Verbatim splice.** Contract clauses appear in generated Lean exactly as written (module call-site substitution of parameter names by argument expressions). Generated theorems bind program variables under their source names so clauses elaborate unchanged. If a clause doesn't elaborate, the error must point at the `.sable` clause, not at generated code.
 - **Every obligation and every hypothesis is named by content.** Hypothesis names are content-anchored slugs (`h_pre_sorted_a`, `h_inv_<slug>`, `h_path_<slug>`, `h_<callee>_post_<slug>`, `h_cinv_<slug>`; same-slug collisions get `_2` suffixes rather than shadowing) — discharge scripts survive unrelated edits. Obligation names are `fn.kind.<expression-slug>`, or `fn.kind.<label>` where the clause carries `#[label(name)]` (stable semantic names; hypotheses become `h_inv_<label>` etc.). Lean theorem names are sanitized versions; user-facing names live in the source map.
 - **Class structures are emitted under mangled names** (`SableC_<name>`) so user class names can never collide with Lean root-namespace names (`class Nat` vs core `Nat`). Clauses never name the class — only values — so the verbatim-splice invariant is untouched; the prefix appears only in compiler-built binder types and `.mk` literals.

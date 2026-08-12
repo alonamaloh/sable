@@ -1,0 +1,16 @@
+// expect-error: mono.name_collision
+// Distinct structural instances may not alias through the legacy underscore
+// spelling: `amb_i32<u8>` and `amb<i32, u8>` both render `amb_i32_u8`.
+
+fn amb_i32<T>(T value) -> T {
+    return value;
+}
+
+fn amb<T, U>(U value) -> U {
+    return value;
+}
+
+fn collision() -> u8 {
+    u8 first = amb_i32<u8>(1);
+    return amb<i32, u8>(first);
+}

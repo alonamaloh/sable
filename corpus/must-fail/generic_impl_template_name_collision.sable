@@ -1,0 +1,17 @@
+// expect-error: mono.source_name_collision
+// Impl lowering creates the ordinary function `Clash_u8_value`; a retained
+// generic template may not reserve that same runtime declaration name.
+
+trait Clash {
+    fn value(Self x) -> u8;
+}
+
+impl Clash for u8 {
+    fn value(u8 x) -> u8 {
+        return x;
+    }
+}
+
+fn Clash_u8_value<T>(T value) -> T {
+    return value;
+}
