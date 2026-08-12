@@ -1840,6 +1840,16 @@ transitions. That is the missing authority vocabulary for writing and walking
 in-band headers without turning an internal free extent into a client lease or
 exposing a general lease-to-span escape hatch.
 
+**The U8d free-block authority shape is proved (2026-08-12, ADR 0039).**
+`FreeBlock` is a mandatory allocator-internal role with offset-derived keys.
+Only it may split/join; the client receives a nonsplittable `BlockLease` through
+an explicit consuming role change. The Lean probe proves well-formed prefix and
+suffix keys, coverage, disjointness, adjacency, byte-preserving rejoin, and
+aggregate take/put restoration.
+
+Next implement the sealed `FreeBlock` operations vertically, then add an
+identity-preserving typed header role for the in-band links.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;
