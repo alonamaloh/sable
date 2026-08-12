@@ -107,9 +107,13 @@ fn corpus() {
 
     // Module-diagnostic guards resolve their helper imports from
     // must-fail/mods (kept out of the top-level scan so the helpers
-    // aren't themselves treated as cases).
+    // aren't themselves treated as cases). Client-boundary guards may
+    // also import their verified subject, just like dynamic tests do.
     let must_fail_opts = Options {
-        module_paths: vec![corpus_dir("must-fail").join("mods")],
+        module_paths: vec![
+            corpus_dir("must-fail").join("mods"),
+            corpus_dir("verifies"),
+        ],
         ..Options::default()
     };
     failures.extend(parallel(sable_files(&corpus_dir("must-fail")), |path| {

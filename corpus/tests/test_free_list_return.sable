@@ -7,6 +7,11 @@
 // expect-skip: state.returnable lease
 // expect-skip: Sable.AllocatorView.StoredChain
 // expect-skip: ∃ predecessor
+// expect-skip: lease.key = key
+// expect-skip: lease.span.len = size
+// expect-skip: Sable.freeHeaderBytes ≤ size
+// expect-skip: limit = state.root.len
+// expect-skip: Sable.AllocatorView.BeforePath
 
 use free_list_return;
 use free_list_remove_head;

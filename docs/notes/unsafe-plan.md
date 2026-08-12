@@ -2038,20 +2038,37 @@ head/non-head crossed with whole/split allocation, returning the same
 mandatory lease through the public dispatcher before exact root release. All
 new obligations are proved with zero assumptions or deferrals.
 
-Next coalesce locally with predecessor and successor through proved adjacency
-and `FreeBlock` joins. Keep the four adjacency cases explicit until their
-authority transitions and link updates are stable; only then add local
-wrong-owner/double-return/subregion guards and randomized dynamic comparison.
+**The U8g3 local-coalescing slice and U8 exit gate are complete (2026-08-12,
+ADR 0052).** `free_list_return` is now the public lease sink. It performs the
+proved address search, probes the real predecessor size, and keeps all four
+adjacency cases explicit: no merge, predecessor only, successor only, or both.
+Each merge clears real typed header cells back to `FreeBlock` authority and
+uses proved span joins before materializing the one surviving header. The
+root-length sentinel is never extracted; predecessor coalescing nevertheless
+accepts a returned block ending exactly at that boundary.
 
-Exit criteria:
+The dispatcher verifies all 94 obligations in its ten-function module closure
+with zero assumptions or deferrals. Six dynamic fixtures exercise every
+branch, including the sentinel edge, and restore the precise system root.
+Wrong allocator, repeated return, and forged subregion metadata fail at the
+public call boundary. A fixed-seed differential harness generates 12
+permutations of 12 statically named leases, compares all 144 returns and every
+intermediate runtime header against a small Rust reference allocator, and
+covers all four adjacency cases reproducibly. The corrected complete corpus
+passes with one worker in 256.46 seconds.
 
-- allocation transfers exactly one disjoint region;
-- free consumes the matching lease;
-- wrong allocator, double free, and freeing a subregion fail locally;
-- coalescing is proved through span adjacency/join;
-- allocator invariant accounts for the entire root allocation;
-- randomized dynamic tests compare against a simple reference allocator;
-- zero `assume` and zero `defer` inside the allocator.
+All U8 exit criteria are now met:
+
+- allocation transfers exactly one disjoint mandatory lease;
+- return consumes that matching lease;
+- wrong allocator, double return, and substituted subregion metadata fail
+  locally;
+- coalescing is proved through exact `FreeBlock` span adjacency and join;
+- the affine aggregate/lease partition plus the `complete` destruction gate
+  accounts for the entire original root before release;
+- deterministic randomized dynamic tests compare against an independent
+  reference allocator; and
+- the allocator contains zero `assume` and zero `defer`.
 
 ### U9 — aggregate resources and intrusive list
 

@@ -376,6 +376,35 @@ in-band free-list invariant accounting for free plus live regions. Client free
 must consume the matching lease, while only final allocator destruction owns
 and consumes `SystemDealloc`.
 
+### M41 — verified in-band free-list allocator *(2026-08-12, ADR 0037–0052)*
+
+The U8 allocator experiment is complete. One affine `AllocatorState` owns the
+free authority from a releasable system root, while client allocations are
+mandatory, nonsplittable `BlockLease` resources carrying allocator identity,
+exact key, and byte extent through raw and typed roles. Allocator-internal
+`FreeBlock` and `FreeHeader` roles split, join, and materialize the real
+two-`u64` in-band metadata without exposing a general lease-to-span escape.
+Destruction is possible only after every role has rejoined into the complete
+key-zero root extent and all stored headers are gone.
+
+The policy is ordinary verified Sable over those sealed transitions: a finite
+root-offset-ordered `StoredChain`, read-only terminating traversal, first-fit
+selection, exact whole-or-split authority change, deterministic address search
+for return, and local predecessor/successor coalescing. `free_list_return`
+keeps the four adjacency cases explicit and proves each merge by clearing real
+headers back to blocks and applying exact span joins. The root-length sentinel
+is never dereferenced, including when a predecessor merge reaches the end of
+the arena.
+
+The public dispatcher verifies 94 obligations across its module closure with
+zero `assume` and zero `defer`. Six dynamic fixtures cover every return branch;
+wrong-owner, repeated-return, and subregion substitutions fail locally. A
+fixed-seed reference-model harness exercises 144 returns, checking the runtime
+head and every in-band header after every operation, and covers all four
+adjacency cases. The complete corpus passes with one worker in 256.46 seconds.
+This closes every U8 exit criterion and makes U9—the reusable `ResourceMap`
+plus an arena-backed intrusive list—the next architecture test.
+
 ## Parallel track (low intensity)
 
 The SVM semantic oracle — **checkpoint reached**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers `corpus/svm-diff` (34 subjects: signed-extreme arithmetic, the normative evaluation-order traps, short-circuit guards, loops, OOM, options) through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator on every `cargo test` (~0.5s); the first run found zero divergences, and an injected lowering bug (`%` rewired to `/`) is caught as two. **Calls + frames landed** (A-normalized, ADR 0005 res. 4): `call dst f args` at statement level, a frame stack in the configuration, `EvalArgs` for left-to-right argument evaluation, and all agreement/determinism/progress theorems re-proven over the extended machine; the harness gained per-file program environments and eight call subjects (42 total, zero divergences — including recursion through ten frames and argument-order trap identity). **The byte raw heap landed** (ADR 0025): `RawHeap` in the configuration, `Val.ptr` as provenance plus offset, and `rawAlloc`/`rawFree`/`rawLoad8`/`rawStore8`/`rawTake8` plus a pure `ptrAdd`. The structural finding is that pointer arithmetic is *pure*, so it is an expression, and everything touching the heap is an A-normalized statement — which is why `Eval` needed no change at all and not one existing expression rule was reinterpreted. That claim is checked rather than asserted: the heap was threaded through the configuration in its own commit with no operations, and agreement both directions, determinism, totality, and progress re-proved with no tactic touched. Rule side conditions are stated as *decidable* predicates (`loadByte`, `freeable`, `inBounds`) because they are exactly what the machine must compute to tell a store from `undef`. 20 direct SVM subjects in `Sable/SVMRawTests.lean` pin the valid path and every route to `undef` — out of bounds, uninitialized, use after free, double free, interior free, non-pointer dereference, out-of-`u8` store — and both layers of defence are verified by injection: an evaluator that forgets `take8`'s write-back fails the agreement proof, while a rule and evaluator changed together consistently passes agreement and fails an outcome guard. Next steps there: ghost transitions for the erasure metatheorem, then classes.
