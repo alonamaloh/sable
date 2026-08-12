@@ -27,9 +27,11 @@ def layout : Layout := ⟨16, 8⟩
 def loOffset : Int := 0
 def hiOffset : Int := 8
 
-/-- A field is wholly inside its record and begins at a valid alignment. -/
+/-- A field is wholly inside its record and begins at a valid alignment for
+every address satisfying the outer layout's alignment. -/
 def fieldFits (outer field : Layout) (off : Int) : Prop :=
-  0 ≤ off ∧ off % field.align = 0 ∧ off + field.size ≤ outer.size
+  0 ≤ off ∧ outer.align % field.align = 0 ∧
+    off % field.align = 0 ∧ off + field.size ≤ outer.size
 
 /-- Half-open field extents do not overlap. -/
 def fieldsDisjoint (a : Layout) (ao : Int) (b : Layout) (bo : Int) : Prop :=

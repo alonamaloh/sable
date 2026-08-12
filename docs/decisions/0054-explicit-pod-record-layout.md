@@ -14,6 +14,8 @@ one complete size and alignment and an offset for every field. The compiler
 accepts the declaration only when:
 
 - its size is positive and its alignment is a nonzero power of two;
+- its alignment is a multiple of every field's alignment, so an aligned
+  record base also aligns every field base;
 - every field begins at an offset satisfying that field's alignment;
 - every field extent is wholly inside the record extent;
 - field extents are pairwise disjoint; and
@@ -95,3 +97,10 @@ semantic hardening gate: record values and cells are now abstract instructions
 of the relational SVM and proved evaluator, with per-byte extent exclusion and
 Rust/Lean differential subjects. This still does not grant records a byte
 representation.
+
+A later static audit found that checking only each relative field offset was
+insufficient: a record declared with alignment 1 could contain a `u64` field at
+offset 0 even though a valid record base need not be `u64`-aligned. The checker
+now also requires the record alignment to be a multiple of every field
+alignment, and `Layout.fieldFits` states the same invariant. The
+`record_field_underaligned` must-fail subject guards the rejected declaration.

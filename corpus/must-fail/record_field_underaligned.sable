@@ -1,0 +1,5 @@
+// expect-error: record.field_alignment
+
+record UnderAligned #[layout(size := 8, align := 1)] {
+    #[offset(0)] u64 value;
+}

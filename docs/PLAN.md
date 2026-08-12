@@ -449,6 +449,9 @@ the typed-node client the probe was designed to force.
 ### M43 — typed records and the intrusive-list acceptance subject *(2026-08-12, ADRs 0054–0055)*
 
 U9 is complete. POD records declare checked size, alignment, and field offsets;
+the outer alignment must be a multiple of every field alignment, so the record's
+base guarantee composes with those relative offsets. The static
+`record.field_alignment` regression rejects under-aligned declarations.
 their initial raw-storable fields are fixed integers, `raw<Record>`, and
 `option<raw<Record>>`. Record values remain abstract rather than serialized.
 Typed record cells implement the same explicit into/init/read/take/drop/from

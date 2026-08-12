@@ -448,6 +448,33 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             label: "offset plus field size is not representable".into(),
                             notes: vec![],
                         })?;
+                // A record value is promised aligned only to the record's
+                // declared alignment.  The relative field offset therefore
+                // establishes an aligned address only when the outer
+                // alignment is itself compatible with the field alignment.
+                // Without this check, an `align := 1` record could claim a
+                // `u64` field at offset zero even though a valid record base
+                // need not be u64-aligned.
+                if r.layout.align % field_layout.align != 0 {
+                    return Err(Diagnostic {
+                        name: "record.field_alignment".into(),
+                        title: format!(
+                            "record `{}` is under-aligned for field `{}`",
+                            r.name, field.name
+                        ),
+                        span: r.layout_span,
+                        label: format!(
+                            "record alignment {} must be a multiple of the field's alignment {}",
+                            r.layout.align, field_layout.align
+                        ),
+                        notes: vec![(
+                            "note".into(),
+                            "a record base is guaranteed only the record's declared alignment; \
+                             the field offset cannot repair an under-aligned base"
+                                .into(),
+                        )],
+                    });
+                }
                 if field.offset < 0 || field.offset % field_layout.align != 0 || end > r.layout.size
                 {
                     return Err(Diagnostic {

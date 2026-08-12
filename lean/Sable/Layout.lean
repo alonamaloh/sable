@@ -34,9 +34,11 @@ layout only: it does not assign a byte encoding to provenance or to `none`
 (ADR 0054). -/
 def rawPtr.layout : Layout := ⟨8, 8⟩
 
-/-- A field is wholly inside its record and begins at a valid alignment. -/
+/-- A field is wholly inside its record and begins at a valid alignment for
+every address satisfying the outer layout's alignment. -/
 def Layout.fieldFits (outer field : Layout) (off : Int) : Prop :=
-  0 ≤ off ∧ off % field.align = 0 ∧ off + field.size ≤ outer.size
+  0 ≤ off ∧ outer.align % field.align = 0 ∧
+    off % field.align = 0 ∧ off + field.size ≤ outer.size
 
 /-- Half-open field extents at their declared offsets do not overlap. -/
 def Layout.fieldsDisjoint (a : Layout) (ao : Int) (b : Layout) (bo : Int) : Prop :=
