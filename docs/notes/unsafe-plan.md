@@ -1899,6 +1899,20 @@ become local arithmetic. The proof must also make the runtime head explicit;
 `AllocatorState` erases, so the algorithm needs an ordinary `u64` head paired
 with that authority rather than pretending the ghost free map can be read.
 
+**The U8f traversal policy is proved (2026-08-12, ADR 0043).** The free list
+is a finite chain sorted by root-relative block offset, with `root.len` as its
+end sentinel and an ordinary safe `u64` head paired with erased allocator
+authority. Each real node has at least the 16-byte header, ends no later than
+its successor, and links no farther than the sentinel. Those local facts prove
+header containment, bounded runtime fields, acyclicity, and strict decrease of
+the loop variant `root.len - current`. Equality identifies adjacent blocks;
+aligned splits retain a suffix only when it can hold another header.
+
+Next implement one checked traversal step vertically before attempting the
+full first-fit loop. Keep predecessor-link mutation and allocation policy out
+of that slice so the relationship between the ordinary head/current offsets
+and the erased aggregate authority is explicit and independently tested.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;
