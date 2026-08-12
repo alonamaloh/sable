@@ -1,0 +1,5 @@
+// expect-error: resource.release_sealed
+// Erasure means a foreign callee cannot perform the sealed aggregate put.
+
+extern "C" #[audit(id := "test.fake-block-free.v1", reason := "negative subject")]
+fn fake_free(#[consumes] resource BlockLease lease);

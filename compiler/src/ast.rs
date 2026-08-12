@@ -155,6 +155,15 @@ pub enum ResKind {
     /// The unique authority to release one system allocation. Mandatory:
     /// it must reach the compiler-sealed deallocation operation (ADR 0036).
     SystemDealloc,
+    /// One allocator-owned aggregate of free byte extents. Its sealed
+    /// take/put operations are the only source and sink of `BlockLease`.
+    AllocatorState,
+    /// Client authority for one allocator block. This refines byte
+    /// authority with allocator/key identity (ADR 0037).
+    BlockLease,
+    /// A leased block in its typed-u64 role. Allocator and key identity
+    /// survive beside the ordinary typed-cell view.
+    LeasedPointsToU64,
 }
 
 /// The sealed transformations of resource authority. These are not
@@ -178,6 +187,14 @@ pub enum ResOp {
     /// tests only. This is the one place authority appears from nothing,
     /// and the checker confines it to `test_` functions.
     TestWorld,
+    /// Fold one complete raw extent into a fresh allocator aggregate.
+    AllocatorCreate,
+    /// Unfold a complete allocator aggregate back to its raw root.
+    AllocatorDestroy,
+    /// Remove one keyed free extent and return it as a client lease.
+    AllocatorTake,
+    /// Consume a matching client lease and restore its free-map entry.
+    AllocatorPut,
 }
 
 impl ResOp {
@@ -187,6 +204,10 @@ impl ResOp {
             "join" => Some(ResOp::Join),
             "open_file" => Some(ResOp::OpenFileOf),
             "posix_world" => Some(ResOp::TestWorld),
+            "allocator_create" => Some(ResOp::AllocatorCreate),
+            "allocator_destroy" => Some(ResOp::AllocatorDestroy),
+            "allocator_take" => Some(ResOp::AllocatorTake),
+            "allocator_put" => Some(ResOp::AllocatorPut),
             _ => None,
         }
     }
@@ -197,6 +218,10 @@ impl ResOp {
             ResOp::Join => "join",
             ResOp::OpenFileOf => "open_file",
             ResOp::TestWorld => "posix_world",
+            ResOp::AllocatorCreate => "allocator_create",
+            ResOp::AllocatorDestroy => "allocator_destroy",
+            ResOp::AllocatorTake => "allocator_take",
+            ResOp::AllocatorPut => "allocator_put",
         }
     }
 }
@@ -287,6 +312,8 @@ impl ResKind {
             "OpenFile" => Some(ResKind::OpenFile),
             "PosixWorld" => Some(ResKind::PosixWorld),
             "SystemDealloc" => Some(ResKind::SystemDealloc),
+            "AllocatorState" => Some(ResKind::AllocatorState),
+            "BlockLease" => Some(ResKind::BlockLease),
             _ => None,
         }
     }
@@ -298,6 +325,9 @@ impl ResKind {
             ResKind::OpenFile => "OpenFile",
             ResKind::PosixWorld => "PosixWorld",
             ResKind::SystemDealloc => "SystemDealloc",
+            ResKind::AllocatorState => "AllocatorState",
+            ResKind::BlockLease => "BlockLease",
+            ResKind::LeasedPointsToU64 => "LeasedPointsTo<u64>",
         }
     }
 
@@ -307,7 +337,14 @@ impl ResKind {
     /// `SystemDealloc` is the first compiler-sealed instance (ADRs
     /// 0035–0036).
     pub fn must_consume(self) -> bool {
-        matches!(self, ResKind::OpenFile | ResKind::SystemDealloc)
+        matches!(
+            self,
+            ResKind::OpenFile
+                | ResKind::SystemDealloc
+                | ResKind::AllocatorState
+                | ResKind::BlockLease
+                | ResKind::LeasedPointsToU64
+        )
     }
 
     /// The Lean type of this resource's view.
@@ -318,7 +355,22 @@ impl ResKind {
             ResKind::OpenFile => "Sable.OpenFileView",
             ResKind::PosixWorld => "Sable.PosixWorldView",
             ResKind::SystemDealloc => "Sable.SystemDeallocView",
+            ResKind::AllocatorState => "Sable.AllocatorView",
+            ResKind::BlockLease => "Sable.BlockLeaseView",
+            ResKind::LeasedPointsToU64 => "Sable.LeasedPointsToU64View",
         }
+    }
+
+    /// This mandatory authority may terminate only in a compiler-sealed
+    /// operation; an erased extern parameter cannot honestly consume it.
+    pub fn sealed_terminal(self) -> bool {
+        matches!(
+            self,
+            ResKind::SystemDealloc
+                | ResKind::AllocatorState
+                | ResKind::BlockLease
+                | ResKind::LeasedPointsToU64
+        )
     }
 }
 

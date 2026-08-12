@@ -1,0 +1,11 @@
+// expect-error: type.mismatch
+// Typing leased bytes must retain allocator/key identity in the result role.
+
+pub fn allocator_lease_loses_identity() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource BlockLease lease = allocator_take(&mut state, 0);
+    unsafe {
+        resource PointsTo<u64> cell = raw_into_cell_u64(base, lease);
+    }
+}

@@ -1,0 +1,5 @@
+// expect-error: resource.release_sealed
+// A foreign mutable borrow cannot claim to rewrite an erased aggregate view.
+
+extern "C" #[audit(id := "test.fake-aggregate-mutation.v1", reason := "negative subject")]
+fn fake_mutate(resource &mut AllocatorState state);

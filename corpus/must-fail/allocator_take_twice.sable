@@ -1,0 +1,13 @@
+// expect-error: allocator_take_twice.allocator_take.0.2
+// Taking the only free entry removes it from the aggregate map.
+
+pub fn allocator_take_twice() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource BlockLease first = allocator_take(&mut state, 0);
+    resource BlockLease second = allocator_take(&mut state, 0);
+    allocator_put(&mut state, first);
+    allocator_put(&mut state, second);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}

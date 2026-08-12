@@ -105,6 +105,195 @@ structure SpanView where
   len : Int
   bytes : Seq ByteState
 
+/-! Allocator aggregates and client leases (ADR 0037). The structures below
+are pure views. Affine authority and the hidden valid-composition invariant
+remain checker facts; only sealed compiler operations establish these view
+transitions. -/
+
+/-- A client block's byte authority and return identity are one resource. -/
+structure BlockLeaseView where
+  allocator : Int
+  key : Int
+  span : SpanView
+
+/-- The same lease while its exact extent has a typed `u64` role. -/
+structure LeasedPointsToU64View where
+  allocator : Int
+  key : Int
+  cell : PointsToView Int
+
+def BlockLeaseView.toCellU64 (v : BlockLeaseView) : LeasedPointsToU64View :=
+  { allocator := v.allocator, key := v.key,
+    cell := { alloc := v.span.alloc, off := v.span.off,
+              layout := u64.layout, state := .uninit } }
+
+def LeasedPointsToU64View.toLease (v : LeasedPointsToU64View) : BlockLeaseView :=
+  { allocator := v.allocator, key := v.key,
+    span := { alloc := v.cell.alloc, off := v.cell.off,
+              len := v.cell.layout.size,
+              bytes := ⟨v.cell.layout.size, fun _ => .uninit⟩ } }
+
+def LeasedPointsToU64View.put
+    (v : LeasedPointsToU64View) (x : Int) : LeasedPointsToU64View :=
+  { v with cell := v.cell.put x }
+
+def LeasedPointsToU64View.clear
+    (v : LeasedPointsToU64View) : LeasedPointsToU64View :=
+  { v with cell := v.cell.clear }
+
+@[simp] theorem BlockLeaseView.toCellU64_allocator (v : BlockLeaseView) :
+    v.toCellU64.allocator = v.allocator := rfl
+@[simp] theorem BlockLeaseView.toCellU64_key (v : BlockLeaseView) :
+    v.toCellU64.key = v.key := rfl
+@[simp] theorem BlockLeaseView.toCellU64_cell (v : BlockLeaseView) :
+    v.toCellU64.cell =
+      { alloc := v.span.alloc, off := v.span.off,
+        layout := u64.layout, state := .uninit } := rfl
+@[simp] theorem LeasedPointsToU64View.toLease_allocator
+    (v : LeasedPointsToU64View) : v.toLease.allocator = v.allocator := rfl
+@[simp] theorem LeasedPointsToU64View.toLease_key
+    (v : LeasedPointsToU64View) : v.toLease.key = v.key := rfl
+@[simp] theorem LeasedPointsToU64View.put_allocator
+    (v : LeasedPointsToU64View) (x : Int) : (v.put x).allocator = v.allocator := rfl
+@[simp] theorem LeasedPointsToU64View.put_key
+    (v : LeasedPointsToU64View) (x : Int) : (v.put x).key = v.key := rfl
+@[simp] theorem LeasedPointsToU64View.put_cell
+    (v : LeasedPointsToU64View) (x : Int) : (v.put x).cell = v.cell.put x := rfl
+@[simp] theorem LeasedPointsToU64View.clear_allocator
+    (v : LeasedPointsToU64View) : v.clear.allocator = v.allocator := rfl
+@[simp] theorem LeasedPointsToU64View.clear_key
+    (v : LeasedPointsToU64View) : v.clear.key = v.key := rfl
+@[simp] theorem LeasedPointsToU64View.clear_cell
+    (v : LeasedPointsToU64View) : v.clear.cell = v.cell.clear := rfl
+
+/-- Pure view of one allocator aggregate. The first slice uses key zero for
+the complete root; later allocator-owned block roles refine this map. -/
+structure AllocatorView where
+  allocator : Int
+  root : SpanView
+  free : Int → Option SpanView
+
+def AllocatorView.initial (allocator : Int) (root : SpanView) : AllocatorView :=
+  { allocator, root, free := fun key => if key = 0 then some root else none }
+
+def AllocatorView.canTake (v : AllocatorView) (key : Int) : Prop :=
+  v.free key ≠ none
+
+def AllocatorView.leaseAt (v : AllocatorView) (key : Int) : BlockLeaseView :=
+  { allocator := v.allocator, key, span := (v.free key).getD v.root }
+
+def AllocatorView.take (v : AllocatorView) (key : Int) : AllocatorView :=
+  { v with free := fun k => if k = key then none else v.free k }
+
+def AllocatorView.canPut (v : AllocatorView) (lease : BlockLeaseView) : Prop :=
+  lease.allocator = v.allocator ∧ v.free lease.key = none
+
+@[simp] theorem AllocatorView.canPut_typedRoundTrip
+    (v : AllocatorView) (lease : BlockLeaseView) (x : Int) :
+    v.canPut (((lease.toCellU64.put x).clear).toLease) ↔ v.canPut lease := by
+  rfl
+
+def AllocatorView.put (v : AllocatorView) (lease : BlockLeaseView) : AllocatorView :=
+  { v with free := fun k => if k = lease.key then some lease.span else v.free k }
+
+def SpanView.sameExtent (a b : SpanView) : Prop :=
+  a.alloc = b.alloc ∧ a.off = b.off ∧ a.len = b.len
+
+def AllocatorView.releaseSpan (v : AllocatorView) : SpanView :=
+  (v.free 0).getD v.root
+
+def AllocatorView.complete (v : AllocatorView) : Prop :=
+  v.free 0 ≠ none ∧ v.releaseSpan.sameExtent v.root ∧
+    ∀ k, k ≠ 0 → v.free k = none
+
+def AllocatorView.wf (v : AllocatorView) : Prop :=
+  (0 ≤ v.root.len ∧ v.root.len ≤ v.root.bytes.len) ∧
+    ∀ k span, v.free k = some span →
+      0 ≤ span.len ∧ span.len ≤ span.bytes.len
+
+@[simp] theorem AllocatorView.initial_complete (allocator : Int) (root : SpanView) :
+    (AllocatorView.initial allocator root).complete := by
+  simp [AllocatorView.complete, AllocatorView.releaseSpan,
+    SpanView.sameExtent, AllocatorView.initial]
+
+@[simp] theorem AllocatorView.initial_canTake_zero (allocator : Int)
+    (root : SpanView) :
+    (AllocatorView.initial allocator root).canTake 0 := by
+  simp [AllocatorView.canTake, AllocatorView.initial]
+
+@[simp] theorem AllocatorView.initial_root (allocator : Int) (root : SpanView) :
+    (AllocatorView.initial allocator root).root = root := rfl
+
+@[simp] theorem AllocatorView.initial_releaseSpan
+    (allocator : Int) (root : SpanView) :
+    (AllocatorView.initial allocator root).releaseSpan = root := rfl
+
+@[simp] theorem AllocatorView.initial_leaseAt_zero_span
+    (allocator : Int) (root : SpanView) :
+    ((AllocatorView.initial allocator root).leaseAt 0).span = root := rfl
+
+@[simp] theorem AllocatorView.take_root (v : AllocatorView) (key : Int) :
+    (v.take key).root = v.root := rfl
+
+@[simp] theorem AllocatorView.put_root (v : AllocatorView)
+    (lease : BlockLeaseView) : (v.put lease).root = v.root := rfl
+
+@[simp] theorem AllocatorView.take_canPut (v : AllocatorView) (key : Int) :
+    (v.take key).canPut (v.leaseAt key) := by
+  constructor
+  · rfl
+  · simp [AllocatorView.take, AllocatorView.leaseAt]
+
+@[simp] theorem AllocatorView.initial_wf (allocator : Int) (root : SpanView)
+    (hroot : 0 ≤ root.len ∧ root.len ≤ root.bytes.len) :
+    (AllocatorView.initial allocator root).wf := by
+  constructor
+  · exact hroot
+  · intro k span hentry
+    by_cases hk : k = 0
+    · subst k
+      simp [AllocatorView.initial] at hentry
+      simpa [hentry] using hroot
+    · simp [AllocatorView.initial, hk] at hentry
+
+@[simp] theorem AllocatorView.take_put (v : AllocatorView) (key : Int)
+    (h : v.canTake key) :
+    (v.take key).put (v.leaseAt key) = v := by
+  cases v with
+  | mk allocator root free =>
+      simp only [AllocatorView.put, AllocatorView.take]
+      congr 1
+      funext k
+      by_cases hk : k = key
+      · subst k
+        simp only [if_pos]
+        simp [AllocatorView.leaseAt]
+        cases heq : free key with
+        | none => exact (h heq).elim
+        | some span => rfl
+      · simp [AllocatorView.leaseAt, hk]
+
+@[simp] theorem AllocatorView.take_put_complete (v : AllocatorView) (key : Int)
+    (h : v.canTake key) :
+    ((v.take key).put (v.leaseAt key)).complete ↔ v.complete := by
+  rw [AllocatorView.take_put v key h]
+
+@[simp] theorem AllocatorView.initial_typedRoundTrip_complete
+    (allocator : Int) (root : SpanView) (x : Int)
+    (hlen : root.len = u64.layout.size) :
+    let v := AllocatorView.initial allocator root
+    ((v.take 0).put (((v.leaseAt 0).toCellU64.put x).clear.toLease)).complete := by
+  simp [AllocatorView.complete, AllocatorView.releaseSpan,
+    SpanView.sameExtent, AllocatorView.initial, AllocatorView.take,
+    AllocatorView.put, AllocatorView.leaseAt, BlockLeaseView.toCellU64,
+    LeasedPointsToU64View.put, LeasedPointsToU64View.clear,
+    LeasedPointsToU64View.toLease, hlen]
+  intro k hk
+  simp [hk]
+
+theorem AllocatorView.complete_releaseSpan_extent (v : AllocatorView)
+    (h : v.complete) : v.releaseSpan.sameExtent v.root := h.2.1
+
 /-- A fresh raw root: every byte exists but has no value yet. -/
 def SpanView.uninit (alloc len : Int) : SpanView :=
   { alloc, off := 0, len, bytes := ⟨len, fun _ => .uninit⟩ }

@@ -2272,11 +2272,20 @@ impl<'a> Generator<'a> {
                         let Val::View(m) = self.eval(&args[1]) else {
                             unreachable!("checked: span value")
                         };
+                        let leased = matches!(
+                            vc_resource_kind(&self.var_tys, &args[1]),
+                            Some(ResKind::BlockLease)
+                        );
+                        let bytes = if leased {
+                            format!("({m}).span")
+                        } else {
+                            m.clone()
+                        };
                         let layout = IntTy::U64.lean_layout();
                         let goal = format!(
-                            "({p}).alloc = ({m}).alloc ∧ ({p}).off = ({m}).off \
-                             ∧ ({m}).len = ({layout}).size \
-                             ∧ ({m}).off % ({layout}).align = 0"
+                            "({p}).alloc = ({bytes}).alloc ∧ ({p}).off = ({bytes}).off \
+                             ∧ ({bytes}).len = ({layout}).size \
+                             ∧ ({bytes}).off % ({layout}).align = 0"
                         );
                         let ob = self.obligation(
                             &format!("{}.cell_u64.from_raw", self.fname),
@@ -2287,11 +2296,20 @@ impl<'a> Generator<'a> {
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
                         let c = self.hinted_sym("_cell", hint);
+                        let result_kind = if leased {
+                            ResKind::LeasedPointsToU64
+                        } else {
+                            ResKind::PointsToU64
+                        };
                         self.binders
-                            .push((c.clone(), ResKind::PointsToU64.view_ty().into()));
+                            .push((c.clone(), result_kind.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_cell", c.trim_start_matches('_')),
-                            format!("{c} = Sable.SpanView.toCellU64 ({m})"),
+                            if leased {
+                                format!("{c} = Sable.BlockLeaseView.toCellU64 ({m})")
+                            } else {
+                                format!("{c} = Sable.SpanView.toCellU64 ({m})")
+                            },
                         );
                         Val::View(c)
                     }
@@ -2302,9 +2320,18 @@ impl<'a> Generator<'a> {
                         let Val::View(c) = self.eval(&args[1]) else {
                             unreachable!("checked: cell value")
                         };
+                        let leased = matches!(
+                            vc_resource_kind(&self.var_tys, &args[1]),
+                            Some(ResKind::LeasedPointsToU64)
+                        );
+                        let cell = if leased {
+                            format!("({c}).cell")
+                        } else {
+                            c.clone()
+                        };
                         let goal = format!(
-                            "Sable.PointsToView.names ({c}) ({p}) \
-                             ∧ ({c}).state = Sable.CellState.uninit"
+                            "Sable.PointsToView.names ({cell}) ({p}) \
+                             ∧ ({cell}).state = Sable.CellState.uninit"
                         );
                         let ob = self.obligation(
                             &format!("{}.cell_u64.to_raw", self.fname),
@@ -2316,16 +2343,27 @@ impl<'a> Generator<'a> {
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
                         let m = self.hinted_sym("_view", hint);
+                        let result_kind = if leased {
+                            ResKind::BlockLease
+                        } else {
+                            ResKind::RawSpan
+                        };
                         self.binders
-                            .push((m.clone(), ResKind::RawSpan.view_ty().into()));
+                            .push((m.clone(), result_kind.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_span", m.trim_start_matches('_')),
-                            format!("{m} = Sable.PointsToView.toSpanU64 ({c})"),
+                            if leased {
+                                format!("{m} = Sable.LeasedPointsToU64View.toLease ({c})")
+                            } else {
+                                format!("{m} = Sable.PointsToView.toSpanU64 ({c})")
+                            },
                         );
-                        self.push_hyp_unique(
-                            format!("h_{}_recon", m.trim_start_matches('_')),
-                            format!("Sable.SpanView.reconstructible {m}"),
-                        );
+                        if !leased {
+                            self.push_hyp_unique(
+                                format!("h_{}_recon", m.trim_start_matches('_')),
+                                format!("Sable.SpanView.reconstructible {m}"),
+                            );
+                        }
                         Val::View(m)
                     }
                     RawOp::CellInitU64 => {
@@ -2338,9 +2376,18 @@ impl<'a> Generator<'a> {
                         let Val::View(c) = self.eval(&args[2]) else {
                             unreachable!("checked: cell borrow")
                         };
+                        let leased = matches!(
+                            vc_resource_kind(&self.var_tys, &args[2]),
+                            Some(ResKind::LeasedPointsToU64)
+                        );
+                        let cell = if leased {
+                            format!("({c}).cell")
+                        } else {
+                            c.clone()
+                        };
                         let goal = format!(
-                            "Sable.PointsToView.names ({c}) ({p}) \
-                             ∧ ({c}).state = Sable.CellState.uninit"
+                            "Sable.PointsToView.names ({cell}) ({p}) \
+                             ∧ ({cell}).state = Sable.CellState.uninit"
                         );
                         let ob = self.obligation(
                             &format!("{}.cell_u64.init", self.fname),
@@ -2355,11 +2402,19 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: borrow arg")
                         };
                         let c2 = self.hinted_sym("_cell", Some(name.clone()));
-                        self.binders
-                            .push((c2.clone(), ResKind::PointsToU64.view_ty().into()));
+                        let kind = if leased {
+                            ResKind::LeasedPointsToU64
+                        } else {
+                            ResKind::PointsToU64
+                        };
+                        self.binders.push((c2.clone(), kind.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{name}_init"),
-                            format!("{c2} = Sable.PointsToView.put ({c}) {w}"),
+                            if leased {
+                                format!("{c2} = Sable.LeasedPointsToU64View.put ({c}) {w}")
+                            } else {
+                                format!("{c2} = Sable.PointsToView.put ({c}) {w}")
+                            },
                         );
                         self.env.insert(name.clone(), Val::View(c2));
                         Val::Unit
@@ -2371,9 +2426,18 @@ impl<'a> Generator<'a> {
                         let Val::View(c) = self.eval(&args[1]) else {
                             unreachable!("checked: cell borrow")
                         };
+                        let leased = matches!(
+                            vc_resource_kind(&self.var_tys, &args[1]),
+                            Some(ResKind::LeasedPointsToU64)
+                        );
+                        let cell = if leased {
+                            format!("({c}).cell")
+                        } else {
+                            c.clone()
+                        };
                         let goal = format!(
-                            "Sable.PointsToView.names ({c}) ({p}) \
-                             ∧ ({c}).state ≠ Sable.CellState.uninit"
+                            "Sable.PointsToView.names ({cell}) ({p}) \
+                             ∧ ({cell}).state ≠ Sable.CellState.uninit"
                         );
                         let opname = if matches!(op, RawOp::CellReadU64) {
                             "read"
@@ -2392,7 +2456,7 @@ impl<'a> Generator<'a> {
                         self.binders.push((value.clone(), "Int".into()));
                         self.push_hyp_unique(
                             format!("h_{}_cell_value", value.trim_start_matches('_')),
-                            format!("({c}).state = Sable.CellState.init {value}"),
+                            format!("({cell}).state = Sable.CellState.init {value}"),
                         );
                         self.push_hyp_unique(
                             format!("h_{}_range", value.trim_start_matches('_')),
@@ -2403,11 +2467,21 @@ impl<'a> Generator<'a> {
                                 unreachable!("checked: borrow arg")
                             };
                             let c2 = self.hinted_sym("_cell", Some(name.clone()));
-                            self.binders
-                                .push((c2.clone(), ResKind::PointsToU64.view_ty().into()));
+                            let kind = if leased {
+                                ResKind::LeasedPointsToU64
+                            } else {
+                                ResKind::PointsToU64
+                            };
+                            self.binders.push((c2.clone(), kind.view_ty().into()));
                             self.push_hyp_unique(
                                 format!("h_{name}_take"),
-                                format!("{c2} = Sable.PointsToView.clear ({c})"),
+                                if leased {
+                                    format!(
+                                        "{c2} = Sable.LeasedPointsToU64View.clear ({c})"
+                                    )
+                                } else {
+                                    format!("{c2} = Sable.PointsToView.clear ({c})")
+                                },
                             );
                             self.env.insert(name.clone(), Val::View(c2));
                         }
@@ -2420,9 +2494,18 @@ impl<'a> Generator<'a> {
                         let Val::View(c) = self.eval(&args[1]) else {
                             unreachable!("checked: cell borrow")
                         };
+                        let leased = matches!(
+                            vc_resource_kind(&self.var_tys, &args[1]),
+                            Some(ResKind::LeasedPointsToU64)
+                        );
+                        let cell = if leased {
+                            format!("({c}).cell")
+                        } else {
+                            c.clone()
+                        };
                         let goal = format!(
-                            "Sable.PointsToView.names ({c}) ({p}) \
-                             ∧ ({c}).state ≠ Sable.CellState.uninit"
+                            "Sable.PointsToView.names ({cell}) ({p}) \
+                             ∧ ({cell}).state ≠ Sable.CellState.uninit"
                         );
                         let ob = self.obligation(
                             &format!("{}.cell_u64.drop", self.fname),
@@ -2437,11 +2520,19 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: borrow arg")
                         };
                         let c2 = self.hinted_sym("_cell", Some(name.clone()));
-                        self.binders
-                            .push((c2.clone(), ResKind::PointsToU64.view_ty().into()));
+                        let kind = if leased {
+                            ResKind::LeasedPointsToU64
+                        } else {
+                            ResKind::PointsToU64
+                        };
+                        self.binders.push((c2.clone(), kind.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{name}_drop"),
-                            format!("{c2} = Sable.PointsToView.clear ({c})"),
+                            if leased {
+                                format!("{c2} = Sable.LeasedPointsToU64View.clear ({c})")
+                            } else {
+                                format!("{c2} = Sable.PointsToView.clear ({c})")
+                            },
                         );
                         self.env.insert(name.clone(), Val::View(c2));
                         Val::Unit
@@ -2614,6 +2705,153 @@ impl<'a> Generator<'a> {
                             format!("∀ k, ({w}).claimed.get k = 0"),
                         );
                         Val::View(w)
+                    }
+                    ResOp::AllocatorCreate => {
+                        let Val::View(root) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw span value")
+                        };
+                        self.fresh += 1;
+                        let identity = format!("_allocator{}", self.fresh);
+                        self.binders.push((identity.clone(), "Int".into()));
+                        let state = self.hinted_sym("_allocator_view", hint);
+                        self.binders.push((
+                            state.clone(),
+                            ResKind::AllocatorState.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{}_create", state.trim_start_matches('_')),
+                            format!(
+                                "{state} = Sable.AllocatorView.initial {identity} ({root})"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_complete", state.trim_start_matches('_')),
+                            format!("Sable.AllocatorView.complete {state}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_key0", state.trim_start_matches('_')),
+                            format!("Sable.AllocatorView.canTake {state} 0"),
+                        );
+                        Val::View(state)
+                    }
+                    ResOp::AllocatorDestroy => {
+                        let Val::View(state) = self.eval(&args[0]) else {
+                            unreachable!("checked: allocator state value")
+                        };
+                        let goal = format!("Sable.AllocatorView.complete ({state})");
+                        let ob = self.obligation(
+                            &format!("{}.allocator_destroy", self.fname),
+                            "`allocator_destroy` needs the complete root returned to the free map"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let root = self.hinted_sym("_view", hint);
+                        self.binders
+                            .push((root.clone(), ResKind::RawSpan.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_destroy", root.trim_start_matches('_')),
+                            format!("{root} = Sable.AllocatorView.releaseSpan ({state})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_extent", root.trim_start_matches('_')),
+                            format!(
+                                "({root}).alloc = ({state}).root.alloc ∧ \
+                                 ({root}).off = ({state}).root.off ∧ \
+                                 ({root}).len = ({state}).root.len"
+                            ),
+                        );
+                        for (h, prop) in view_wf_hyps(
+                            ResKind::RawSpan,
+                            root.trim_start_matches('_'),
+                            &root,
+                        ) {
+                            self.push_hyp_unique(h, prop);
+                        }
+                        Val::View(root)
+                    }
+                    ResOp::AllocatorTake => {
+                        let Val::View(state) = self.eval(&args[0]) else {
+                            unreachable!("checked: allocator state borrow")
+                        };
+                        let Val::Int(key) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 key")
+                        };
+                        let goal = format!("Sable.AllocatorView.canTake ({state}) {key}");
+                        let ob = self.obligation(
+                            &format!("{}.allocator_take.{}", self.fname, slug(&key)),
+                            "`allocator_take` needs a free entry at this key".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: allocator borrow")
+                        };
+                        let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders.push((
+                            residual.clone(),
+                            ResKind::AllocatorState.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_take"),
+                            format!("{residual} = Sable.AllocatorView.take ({state}) {key}"),
+                        );
+                        self.env
+                            .insert(array.clone(), Val::View(residual.clone()));
+                        let lease = self.hinted_sym("_lease", hint);
+                        self.binders
+                            .push((lease.clone(), ResKind::BlockLease.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_take", lease.trim_start_matches('_')),
+                            format!("{lease} = Sable.AllocatorView.leaseAt ({state}) {key}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_returnable", lease.trim_start_matches('_')),
+                            format!(
+                                "Sable.AllocatorView.canPut ({residual}) ({lease})"
+                            ),
+                        );
+                        Val::View(lease)
+                    }
+                    ResOp::AllocatorPut => {
+                        let Val::View(state) = self.eval(&args[0]) else {
+                            unreachable!("checked: allocator state borrow")
+                        };
+                        let Val::View(lease) = self.eval(&args[1]) else {
+                            unreachable!("checked: block lease value")
+                        };
+                        let goal = format!(
+                            "Sable.AllocatorView.canPut ({state}) ({lease})"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.allocator_put", self.fname),
+                            "`allocator_put` needs a lease from this allocator and an absent key"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: allocator borrow")
+                        };
+                        let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders.push((
+                            restored.clone(),
+                            ResKind::AllocatorState.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_put"),
+                            format!(
+                                "{restored} = Sable.AllocatorView.put ({state}) ({lease})"
+                            ),
+                        );
+                        self.env.insert(array.clone(), Val::View(restored));
+                        Val::Unit
                     }
                 }
             }
@@ -3936,6 +4174,23 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mu
 /// The well-formedness a resource view carries at every binding site.
 /// This is the shape of the *value*, not a claim about authority: a span
 /// has a nonnegative length its byte sequence covers.
+fn vc_resource_kind(var_tys: &HashMap<String, Ty>, e: &Expr) -> Option<ResKind> {
+    let name = match &e.kind {
+        ExprKind::Var(name) => Some(name.clone()),
+        ExprKind::SelfField { field } => Some(format!("self.{field}")),
+        ExprKind::Borrow { array, field, .. } => Some(
+            field
+                .as_ref()
+                .map_or_else(|| array.clone(), |f| format!("{array}.{f}")),
+        ),
+        _ => None,
+    }?;
+    match var_tys.get(name.as_str()).copied()? {
+        Ty::Res(kind) | Ty::ResRef(kind, _) => Some(kind),
+        _ => None,
+    }
+}
+
 fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)> {
     match kind {
         ResKind::RawSpan => vec![(
@@ -3965,6 +4220,11 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
             format!("h_{name}_wf"),
             format!("Sable.SystemDeallocView.wf {binder}"),
         )],
+        // These aggregate views contain functions. Expanding their shape
+        // predicates in every unrelated VC gives automation an unbounded
+        // matching surface; sealed operations emit the local facts they
+        // establish instead.
+        ResKind::AllocatorState | ResKind::BlockLease | ResKind::LeasedPointsToU64 => vec![],
     }
 }
 

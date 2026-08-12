@@ -1,0 +1,9 @@
+use allocator_leases;
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+fn test_allocator_lease_round_trip() {
+    expect_eq_u64(allocator_lease_round_trip(), 91);
+}

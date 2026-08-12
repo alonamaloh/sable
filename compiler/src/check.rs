@@ -185,17 +185,24 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
                 )],
             });
         }
-        if matches!(p.ty, Ty::Res(ResKind::SystemDealloc)) {
+        if matches!(p.ty, Ty::Res(kind) | Ty::ResRef(kind, _) if kind.sealed_terminal()) {
+            let kind = match p.ty {
+                Ty::Res(kind) | Ty::ResRef(kind, _) => kind,
+                _ => unreachable!(),
+            };
             return Err(Diagnostic {
                 name: "resource.release_sealed".into(),
-                title: "system release authority may not cross an extern boundary".into(),
+                title: format!(
+                    "{} authority may not cross an extern boundary",
+                    kind.name()
+                ),
                 span: p.span,
-                label: "only `unsafe system_dealloc` may consume this resource".into(),
+                label: "compiler-sealed authority is not an extern ABI capability".into(),
                 notes: vec![(
                     "note".into(),
                     "resource authority erases at the ABI, so a foreign parameter could \
-                     only promise the token away; it could not perform the Sable machine's \
-                     checked allocation release"
+                     only promise the token away; it could not perform the checked \
+                     authority transition"
                         .into(),
                 )],
             });
@@ -2070,6 +2077,30 @@ fn stmt_span(stmt: &Stmt) -> Span {
     }
 }
 
+/// Resource kind named by an operation argument before contextual checking.
+/// Owned resource names otherwise deliberately reject context-free use, so
+/// overloaded sealed/raw operations need this narrow peek first.
+fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
+    let ty = match &e.kind {
+        ExprKind::Var(name) => ctx.vars.get(name.as_str()).map(|v| v.ty),
+        ExprKind::SelfField { field } => ctx
+            .vars
+            .get(format!("self.{field}").as_str())
+            .map(|v| v.ty),
+        ExprKind::Borrow { array, field, .. } => {
+            let key = field
+                .as_ref()
+                .map_or_else(|| array.clone(), |f| format!("{array}.{f}"));
+            ctx.vars.get(key.as_str()).map(|v| v.ty)
+        }
+        _ => e.ty,
+    }?;
+    match ty {
+        Ty::Res(kind) | Ty::ResRef(kind, _) => Some(kind),
+        _ => None,
+    }
+}
+
 fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
     let ty = infer_expr(ctx, e, expected)?;
     if let Some(exp) = expected {
@@ -2542,18 +2573,46 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let cell = Ty::Res(ResKind::PointsToU64);
             let cell_shared = Ty::ResRef(ResKind::PointsToU64, Mutability::Shared);
             let cell_unique = Ty::ResRef(ResKind::PointsToU64, Mutability::Mut);
-            let want: &[Ty] = match op {
-                RawOp::Offset => &[raw, u64t],
-                RawOp::Load8 => &[raw, shared],
-                RawOp::Store8 => &[raw, u8t, unique],
-                RawOp::Copy => &[raw, raw, u64t, shared, unique],
-                RawOp::IntoCellU64 => &[raw, span],
-                RawOp::FromCellU64 => &[raw, cell],
-                RawOp::CellInitU64 => &[raw, u64t, cell_unique],
-                RawOp::CellReadU64 => &[raw, cell_shared],
-                RawOp::CellTakeU64 | RawOp::CellDropU64 => &[raw, cell_unique],
+            let leased = Ty::Res(ResKind::BlockLease);
+            let leased_cell = Ty::Res(ResKind::LeasedPointsToU64);
+            let arg_kind = |i: usize| resource_arg_kind(ctx, &args[i]);
+            let cell_kind = match op {
+                RawOp::IntoCellU64 => arg_kind(1),
+                RawOp::FromCellU64 => arg_kind(1),
+                RawOp::CellInitU64 => arg_kind(2),
+                RawOp::CellReadU64 | RawOp::CellTakeU64 | RawOp::CellDropU64 => arg_kind(1),
+                _ => None,
             };
-            for (arg, w) in args.iter_mut().zip(want) {
+            let leased_role = matches!(
+                cell_kind,
+                Some(ResKind::BlockLease | ResKind::LeasedPointsToU64)
+            );
+            let leased_cell_shared =
+                Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Shared);
+            let leased_cell_unique =
+                Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Mut);
+            let want: Vec<Ty> = match op {
+                RawOp::Offset => vec![raw, u64t],
+                RawOp::Load8 => vec![raw, shared],
+                RawOp::Store8 => vec![raw, u8t, unique],
+                RawOp::Copy => vec![raw, raw, u64t, shared, unique],
+                RawOp::IntoCellU64 => vec![raw, if leased_role { leased } else { span }],
+                RawOp::FromCellU64 => vec![raw, if leased_role { leased_cell } else { cell }],
+                RawOp::CellInitU64 => vec![
+                    raw,
+                    u64t,
+                    if leased_role { leased_cell_unique } else { cell_unique },
+                ],
+                RawOp::CellReadU64 => vec![
+                    raw,
+                    if leased_role { leased_cell_shared } else { cell_shared },
+                ],
+                RawOp::CellTakeU64 | RawOp::CellDropU64 => vec![
+                    raw,
+                    if leased_role { leased_cell_unique } else { cell_unique },
+                ],
+            };
+            for (arg, w) in args.iter_mut().zip(&want) {
                 require_explicit_borrow(ctx, arg, *w)?;
                 check_expr(ctx, arg, Some(*w))?;
                 if matches!(w, Ty::Res(_)) {
@@ -2568,8 +2627,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::Offset => raw,
                 RawOp::Load8 => u8t,
                 RawOp::Store8 | RawOp::Copy => Ty::Unit,
-                RawOp::IntoCellU64 => cell,
-                RawOp::FromCellU64 => span,
+                RawOp::IntoCellU64 => if leased_role { leased_cell } else { cell },
+                RawOp::FromCellU64 => if leased_role { leased } else { span },
                 RawOp::CellInitU64 | RawOp::CellDropU64 => Ty::Unit,
                 RawOp::CellReadU64 | RawOp::CellTakeU64 => u64t,
             }
@@ -2578,8 +2637,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let op = *op;
             let op_span = *op_span;
             let arity = match op {
-                ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf => 2,
-                ResOp::TestWorld => 1,
+                ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf
+                | ResOp::AllocatorTake | ResOp::AllocatorPut => 2,
+                ResOp::TestWorld | ResOp::AllocatorCreate | ResOp::AllocatorDestroy => 1,
             };
             if args.len() != arity {
                 return Err(Diagnostic {
@@ -2661,6 +2721,39 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     }
                     check_expr(ctx, &mut args[0], Some(Ty::Int(IntTy::U64)))?;
                     Ty::Res(ResKind::PosixWorld)
+                }
+                // Fold a complete raw extent into a fresh affine aggregate.
+                ResOp::AllocatorCreate => {
+                    let want = Ty::Res(ResKind::RawSpan);
+                    check_expr(ctx, &mut args[0], Some(want))?;
+                    mark_moved(ctx, &args[0])?;
+                    Ty::Res(ResKind::AllocatorState)
+                }
+                // The aggregate may unfold only when its free map once
+                // again contains the complete root; that condition is a VC.
+                ResOp::AllocatorDestroy => {
+                    let want = Ty::Res(ResKind::AllocatorState);
+                    check_expr(ctx, &mut args[0], Some(want))?;
+                    transfer(ctx, &args[0], None)?;
+                    Ty::Res(ResKind::RawSpan)
+                }
+                ResOp::AllocatorTake => {
+                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], want)?;
+                    check_expr(ctx, &mut args[0], Some(want))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::BlockLease)
+                }
+                ResOp::AllocatorPut => {
+                    let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], state)?;
+                    check_expr(ctx, &mut args[0], Some(state))?;
+                    let lease = Ty::Res(ResKind::BlockLease);
+                    check_expr(ctx, &mut args[1], Some(lease))?;
+                    transfer(ctx, &args[1], None)?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Unit
                 }
             }
         }

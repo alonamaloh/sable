@@ -1,0 +1,11 @@
+// expect-error: resource.abandoned
+// The mandatory return obligation survives while a lease is a typed cell.
+
+pub fn allocator_abandons_typed_lease() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource BlockLease lease = allocator_take(&mut state, 0);
+    unsafe {
+        resource LeasedPointsTo<u64> cell = raw_into_cell_u64(base, lease);
+    }
+}

@@ -655,7 +655,7 @@ impl<'a> Parser<'a> {
             None
         };
         let (name, name_span) = self.ident()?;
-        let (kind, end_span) = if name == "PointsTo" {
+        let (kind, end_span) = if name == "PointsTo" || name == "LeasedPointsTo" {
             self.expect(Tok::Lt)?;
             let (elem, elem_span) = self.int_ty()?;
             let end = self.expect(Tok::Gt)?.span;
@@ -674,7 +674,14 @@ impl<'a> Parser<'a> {
                     )],
                 });
             }
-            (ResKind::PointsToU64, end)
+            (
+                if name == "PointsTo" {
+                    ResKind::PointsToU64
+                } else {
+                    ResKind::LeasedPointsToU64
+                },
+                end,
+            )
         } else {
             let Some(kind) = ResKind::from_name(&name) else {
                 return Err(Diagnostic {

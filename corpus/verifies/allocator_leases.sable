@@ -1,0 +1,20 @@
+// U8c vertical slice: the allocator aggregate is the only source and sink
+// of client block leases. Key zero initially names the complete root.
+
+/// post result = 91
+pub fn allocator_lease_round_trip() -> u64 {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource BlockLease lease = allocator_take(&mut state, 0);
+    mut u64 out = 0;
+    unsafe {
+        mut resource LeasedPointsTo<u64> cell = raw_into_cell_u64(base, lease);
+        raw_cell_init_u64(base, 91, &mut cell);
+        out = raw_cell_take_u64(base, &mut cell);
+        resource BlockLease returned = raw_from_cell_u64(base, cell);
+    }
+    allocator_put(&mut state, returned);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+    return out;
+}

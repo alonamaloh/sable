@@ -1,0 +1,17 @@
+// expect-error: allocator_wrong_owner.allocator_put
+// A lease carries the identity of the aggregate that created it.
+
+pub fn allocator_wrong_owner() {
+    unsafe system_alloc(8) as (base_a, resource mem_a, resource release_a);
+    unsafe system_alloc(8) as (base_b, resource mem_b, resource release_b);
+    mut resource AllocatorState a = allocator_create(mem_a);
+    mut resource AllocatorState b = allocator_create(mem_b);
+    resource BlockLease from_a = allocator_take(&mut a, 0);
+    resource BlockLease from_b = allocator_take(&mut b, 0);
+    allocator_put(&mut a, from_b);
+    allocator_put(&mut b, from_a);
+    resource RawSpan whole_a = allocator_destroy(a);
+    resource RawSpan whole_b = allocator_destroy(b);
+    unsafe system_dealloc(base_a, whole_a, release_a);
+    unsafe system_dealloc(base_b, whole_b, release_b);
+}

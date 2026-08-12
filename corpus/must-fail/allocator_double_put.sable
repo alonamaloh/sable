@@ -1,0 +1,12 @@
+// expect-error: resource.use_after_move
+// Returning a lease consumes the authority; it cannot be returned twice.
+
+pub fn allocator_double_put() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource BlockLease lease = allocator_take(&mut state, 0);
+    allocator_put(&mut state, lease);
+    allocator_put(&mut state, lease);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}

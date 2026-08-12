@@ -1825,6 +1825,21 @@ returning to their matching aggregate. Once the vertical slice is pinned by
 wrong-allocator, double-put, abandoned-lease, and typed-round-trip subjects,
 add allocator-owned free-block roles and the in-band header algorithm.
 
+**The U8c compiler slice is complete (2026-08-12, ADR 0038).** A complete
+`RawSpan` folds into mandatory `AllocatorState`; sealed take/put is the only
+source/sink of mandatory `BlockLease`; and destruction returns the current
+complete raw root for the existing `SystemDealloc` path. The typed `u64` role
+is `LeasedPointsTo<u64>`, so allocator/key identity and the must-consume
+obligation survive init/read/take/drop and conversion back. Completeness tracks
+root geometry rather than freezing client byte contents. The positive vertical
+subject proves 9/9 and executes dynamically; seven negative subjects pin the
+boundary, and the complete single-job suite passes.
+
+Next add an allocator-owned `FreeBlock` role plus sealed split/reinsert
+transitions. That is the missing authority vocabulary for writing and walking
+in-band headers without turning an internal free extent into a client lease or
+exposing a general lease-to-span escape hatch.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;

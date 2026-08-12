@@ -18,6 +18,8 @@ open Sable
 
 set_option linter.unusedVariables false
 
+namespace FreeListProbe
+
 structure BlockLeaseView where
   allocator : Int
   key : Int
@@ -167,3 +169,5 @@ theorem lease_cell_owns_iff (v : BlockLeaseView)
 #check take_disjoint
 #check put_after_take
 #check lease_cell_owns_iff
+
+end FreeListProbe
