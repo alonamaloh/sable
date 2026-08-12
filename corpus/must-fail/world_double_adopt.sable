@@ -4,8 +4,8 @@
 // descriptor, and asking twice is a failed VC — the checker tracks tokens,
 // and the state of the outside is geometry (ADR 0028).
 
-fn eat(resource OpenFile f) {
-}
+extern "C" #[audit(id := "test.consume-open-file.v1", reason := "negative-subject sink")]
+fn eat(#[consumes] resource OpenFile f);
 
 /// pre w.isOpen fd ∧ 0 ≤ fd
 /// pre w.claimed.get fd = 0

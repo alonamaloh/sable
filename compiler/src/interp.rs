@@ -405,7 +405,7 @@ impl<'a> Interp<'a> {
                 }
                 Ok(RtVal::Int(got))
             }
-            "posix.close.v1" => {
+            "posix.close.v2" => {
                 let RtVal::Int(fd) = args[0].clone() else {
                     unreachable!("checked: i32")
                 };

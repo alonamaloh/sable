@@ -323,6 +323,34 @@ propagates through owned calls and is discharged only at declared consuming
 operations. `SystemDealloc`, leases, free, and coalescing remain blocked until
 that rule is demonstrated against a do-nothing sink.
 
+### M39 — resource-type mandatory consumption *(2026-08-12, ADR 0035)*
+
+The U8 entry gate is now closed. `OpenFile` is the proving mandatory resource
+type: owned parameters inherit its obligation, moves relocate it, function
+returns re-establish it at the caller's receiving place, and every direct
+return or unit fallthrough rejects authority that did not reach a terminal
+operation. Fresh mandatory results cannot be discarded as expression
+statements. A class field inherits the policy from its type and therefore
+requires `deinit` without a field annotation; the RAII subjects now verify in
+that form.
+
+Terminal foreign consumption is explicit and audited:
+`#[consumes] resource OpenFile fh` is legal only on an extern parameter. An
+ordinary verified function cannot claim the attribute—its body must carry the
+token onward—and an extern may neither omit it for a mandatory type nor attach
+it to an affine one. Because this strengthens the foreign contract,
+`posix.close.v1` became `posix.close.v2` rather than silently changing under the
+same audit identity. The positive return/wrapper chain verifies at 3/3
+obligations; seven focused negative subjects cover abandonment and declaration
+boundaries, and the POSIX/ownership/RAII dynamic suites execute against the
+versioned shim.
+
+The field-level marker remains as a local ownership policy for otherwise
+affine resources such as `RawSpan`; it is no longer the mechanism release
+authority will rely on. U8b may now introduce `SystemDealloc` and the allocator
+identity/lease model, but free and coalescing should still land only as part of
+a vertical positive, negative, dynamic, and machine-semantics slice.
+
 ## Parallel track (low intensity)
 
 The SVM semantic oracle — **checkpoint reached**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers `corpus/svm-diff` (34 subjects: signed-extreme arithmetic, the normative evaluation-order traps, short-circuit guards, loops, OOM, options) through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator on every `cargo test` (~0.5s); the first run found zero divergences, and an injected lowering bug (`%` rewired to `/`) is caught as two. **Calls + frames landed** (A-normalized, ADR 0005 res. 4): `call dst f args` at statement level, a frame stack in the configuration, `EvalArgs` for left-to-right argument evaluation, and all agreement/determinism/progress theorems re-proven over the extended machine; the harness gained per-file program environments and eight call subjects (42 total, zero divergences — including recursion through ten frames and argument-order trap identity). **The byte raw heap landed** (ADR 0025): `RawHeap` in the configuration, `Val.ptr` as provenance plus offset, and `rawAlloc`/`rawFree`/`rawLoad8`/`rawStore8`/`rawTake8` plus a pure `ptrAdd`. The structural finding is that pointer arithmetic is *pure*, so it is an expression, and everything touching the heap is an A-normalized statement — which is why `Eval` needed no change at all and not one existing expression rule was reinterpreted. That claim is checked rather than asserted: the heap was threaded through the configuration in its own commit with no operations, and agreement both directions, determinism, totality, and progress re-proved with no tactic touched. Rule side conditions are stated as *decidable* predicates (`loadByte`, `freeable`, `inBounds`) because they are exactly what the machine must compute to tell a store from `undef`. 20 direct SVM subjects in `Sable/SVMRawTests.lean` pin the valid path and every route to `undef` — out of bounds, uninitialized, use after free, double free, interior free, non-pointer dereference, out-of-`u8` store — and both layers of defence are verified by injection: an evaluator that forgets `take8`'s write-back fails the agreement proof, while a rule and evaluator changed together consistently passes agreement and fails an outcome guard. Next steps there: ghost transitions for the erasure metatheorem, then classes.

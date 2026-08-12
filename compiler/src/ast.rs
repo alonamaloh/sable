@@ -296,6 +296,14 @@ impl ResKind {
         }
     }
 
+    /// Authority of this kind may not be abandoned.  Every owned place
+    /// carrying it has a travelling obligation until an audited primitive
+    /// consumes it.  `OpenFile` is the first proving instance; release
+    /// authority joins this set before deallocation lands (ADR 0035).
+    pub fn must_consume(self) -> bool {
+        matches!(self, ResKind::OpenFile)
+    }
+
     /// The Lean type of this resource's view.
     pub fn view_ty(self) -> &'static str {
         match self {
@@ -668,6 +676,11 @@ pub struct Param {
     pub name: String,
     pub ty: Ty,
     pub span: Span,
+    /// An audited extern promises that this parameter is the terminal sink
+    /// for a mandatory resource. Verified Sable functions may not assert
+    /// this: their owned parameters inherit the obligation and their bodies
+    /// must prove that it reaches such a sink (ADR 0035).
+    pub consumes: bool,
 }
 
 #[derive(Debug, Clone)]

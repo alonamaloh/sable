@@ -1,0 +1,6 @@
+// expect-error: resource.consumes_verified
+// Verified Sable code cannot assert that an ordinary parameter consumes. Its
+// body has to carry mandatory authority to an audited terminal operation.
+
+fn pretend(#[consumes] resource OpenFile fh) {
+}

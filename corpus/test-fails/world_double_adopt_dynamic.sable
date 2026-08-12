@@ -4,8 +4,12 @@
 // the world can supply a descriptor's authority once, and a program that
 // bypassed the obligation would mint a second token here.
 
+use posix_read;
+
 fn test_double_adopt() {
     mut resource PosixWorld w = posix_world(0);
     mut resource OpenFile a = open_file(&mut w, 1);
     mut resource OpenFile b = open_file(&mut w, 1);
+    close_it(1, a, &mut w);
+    close_it(1, b, &mut w);
 }

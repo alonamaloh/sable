@@ -4,8 +4,9 @@
 
 /// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
 /// post #[label(world)] w.data = (old w).data ∧ w.fds = (old w).fds
-extern "C" #[audit(id := "posix.close.v1", reason := "test stub")]
-fn posix_close(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) -> i32;
+extern "C" #[audit(id := "posix.close.v2", reason := "consuming test stub")]
+fn posix_close(i32 fd, #[consumes] resource OpenFile fh,
+               resource &mut PosixWorld w) -> i32;
 /// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
 /// post #[label(bound)] result ≤ n
 extern "C" #[audit(id := "posix.read.v1", reason := "test stub")]

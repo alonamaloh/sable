@@ -1,0 +1,19 @@
+// Resource-type mandatory consumption (ADR 0035). An owned parameter does
+// not make `OpenFile` disappear: it inherits the obligation. Returning it
+// transfers that obligation to the caller, whose receiving place carries it
+// until the audited terminal sink is reached.
+
+use posix_read;
+
+/// post result = fh
+pub fn forward_file(resource OpenFile fh) -> resource OpenFile {
+    return fh;
+}
+
+/// pre w.isOpen fd ∧ fh.fd = fd
+/// post w.fds = (old w).fds
+pub fn close_forwarded(i32 fd, resource OpenFile fh,
+                       resource &mut PosixWorld w) {
+    resource OpenFile next = forward_file(fh);
+    close_it(fd, next, &mut w);
+}

@@ -1,0 +1,11 @@
+// expect-error: resource.abandoned
+// A mandatory type makes the owning class responsible even without a
+// per-field annotation; without `deinit`, every value would leak the handle.
+
+class BadHandle {
+    resource OpenFile fh;
+
+    init adopt(resource OpenFile f) {
+        self.fh = f;
+    }
+}

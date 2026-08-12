@@ -7,11 +7,10 @@
 // caller can tell, from a signature alone, whether a function can reach
 // the outside at all.
 //
-// Handles are passed explicitly rather than owned by an RAII class: a
-// `File` whose destructor closes the descriptor needs non-empty `deinit`
-// and destruction semantics, which is later work. Forgetting to `close`
-// leaks a descriptor, which is exactly what affine-not-linear authority
-// permits.
+// Handles may be passed explicitly or owned by an RAII class. `OpenFile` is
+// the first mandatory resource type: forgetting to close it is rejected, and
+// an owned parameter carries that obligation until the audited consuming
+// parameter of `posix_close` is reached.
 //
 // What the view deliberately does *not* model: whether the next read is
 // short, and whether it fails. No contract can predict those, so they live
@@ -38,8 +37,9 @@ fn posix_read(i32 fd, raw<u8> p, u64 n, resource &mut RawSpan buf,
 
 /// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
 /// post #[label(world)] w.data = (old w).data ∧ w.fds = (old w).fds
-pub extern "C" #[audit(id := "posix.close.v1", reason := "test stub over a scripted world")]
-fn posix_close(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) -> i32;
+pub extern "C" #[audit(id := "posix.close.v2", reason := "consuming test stub over a scripted world")]
+fn posix_close(i32 fd, #[consumes] resource OpenFile fh,
+               resource &mut PosixWorld w) -> i32;
 
 // The safe wrapper. Reading into a `[u8]` is the exposure again; what is
 // new is that the result may be short or negative, and the contract has to
@@ -71,6 +71,7 @@ pub fn read_into(i32 fd, &mut [u8] dst, resource &mut OpenFile fh,
 // `close` consumes the `OpenFile`: after this the authority is gone, and
 // the checker — not a runtime check — is what stops a second close.
 /// pre  #[label(fh)] w.isOpen fd ∧ fh.fd = fd
+/// post #[label(world)] w.fds = (old w).fds
 pub fn close_it(i32 fd, resource OpenFile fh, resource &mut PosixWorld w) {
     i32 r = posix_close(fd, fh, &mut w);
 }

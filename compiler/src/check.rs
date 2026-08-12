@@ -48,13 +48,12 @@ struct VarInfo {
     /// return, no assignment to an outer place, and no passing to a
     /// user function that could launder them out.
     branded: bool,
-    /// An undischarged `#[must_consume]` obligation is sitting *here*
-    /// (ADR 0029/0030). It travels with the token: moving the value into
-    /// another place moves the obligation, and moving it out of this
-    /// frame discharges it. Being a state of the place rather than a
-    /// property of the declaration is what lets it join path-sensitively
-    /// — outstanding after a branch iff outstanding on some reaching
-    /// path.
+    /// An undischarged mandatory-consumption obligation is sitting *here*
+    /// (ADRs 0029/0030/0035). It may come from the resource type or the
+    /// older per-field marker and travels with the token. Being a state of
+    /// the place rather than a property of the declaration is what lets it
+    /// join path-sensitively — outstanding after a branch iff outstanding
+    /// on some reaching path.
     obligation: bool,
 }
 
@@ -186,6 +185,31 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
                 )],
             });
         }
+        let mandatory = matches!(p.ty, Ty::Res(kind) if kind.must_consume());
+        if p.consumes && !mandatory {
+            return Err(Diagnostic {
+                name: "resource.consumes_non_mandatory".into(),
+                title: format!("`{}` is not mandatory authority", p.name),
+                span: p.span,
+                label: "`#[consumes]` applies to an owned must-consume resource".into(),
+                notes: vec![],
+            });
+        }
+        if mandatory && !p.consumes {
+            return Err(Diagnostic {
+                name: "resource.extern_must_consume".into(),
+                title: format!("extern `{}` could abandon `{}`", f.name, p.name),
+                span: p.span,
+                label: "mark this audited terminal sink `#[consumes]`".into(),
+                notes: vec![(
+                    "note".into(),
+                    "a foreign declaration has no Sable body in which the checker can \
+                     follow mandatory authority; the attribute makes terminal consumption \
+                     part of its audited boundary"
+                        .into(),
+                )],
+            });
+        }
     }
     Ok(())
 }
@@ -287,17 +311,32 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 methods.push((m.f.name.clone(), m.f.params.clone(), m.f.ret, m.self_kind));
             }
             if c.deinit.is_none() {
-                if let Some(f) = c.fields.iter().find(|f| f.must_consume) {
+                if let Some(f) = c
+                    .fields
+                    .iter()
+                    .find(|f| f.must_consume || mandatory_ty(f.ty))
+                {
+                    let mandatory = mandatory_ty(f.ty);
                     return Err(Diagnostic {
                         name: "resource.abandoned".into(),
                         title: format!("`{}` has no `deinit` to consume `{}`", c.name, f.name),
                         span: f.span,
-                        label: "this field is `#[must_consume]`".into(),
+                        label: if mandatory {
+                            "this field's resource type requires consumption".into()
+                        } else {
+                            "this field is `#[must_consume]`".into()
+                        },
                         notes: vec![(
                             "note".into(),
-                            "without a destructor there is nowhere to hand the authority \
-                             on, so every value of this class would abandon it"
-                                .into(),
+                            if mandatory {
+                                "without a destructor there is no path from the field to an \
+                                 audited consuming operation, so every value would abandon it"
+                                    .into()
+                            } else {
+                                "without a destructor there is nowhere to hand the authority \
+                                 on, so every value of this class would abandon it"
+                                    .into()
+                            },
                         )],
                     });
                 }
@@ -463,9 +502,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ty: p.ty,
                     initialized: true,
                     mutable: false,
-                        branded: false,
-                        obligation: false,
-                    },
+                    branded: false,
+                    obligation: mandatory_ty(p.ty),
+                },
             );
         }
         let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
@@ -478,6 +517,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 label: "this function must return on every path".into(),
                 notes: vec![],
             });
+        }
+        if !returns {
+            reject_outstanding_obligations(
+                &ctx,
+                MARKED_NONE,
+                f.name_span,
+                &f.name,
+                true,
+            )?;
         }
         call_graph.insert(f.name.clone(), ctx.calls);
     }
@@ -524,7 +572,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     initialized: true,
                     mutable: false,
                         branded: false,
-                        obligation: false,
+                        obligation: mandatory_ty(p.ty),
                     },
             );
         }
@@ -539,6 +587,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 notes: vec![],
             });
         }
+        if !returns {
+            reject_outstanding_obligations(
+                &ctx,
+                MARKED_NONE,
+                f.name_span,
+                &f.name,
+                true,
+            )?;
+        }
     }
     program.fn_templates = templates;
 
@@ -550,7 +607,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         let marked: Vec<(String, Span)> = class
             .fields
             .iter()
-            .filter(|f| f.must_consume)
+            .filter(|f| f.must_consume || mandatory_ty(f.ty))
             .map(|f| (f.name.clone(), f.span))
             .collect();
         let class_span = class.name_span;
@@ -584,7 +641,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: false,
                         branded: false,
-                        obligation: false,
+                        obligation: mandatory_ty(p.ty),
                     },
                 );
             }
@@ -653,7 +710,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: false,
                         branded: false,
-                        obligation: false,
+                        obligation: mandatory_ty(p.ty),
                     },
                 );
             }
@@ -672,7 +729,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
             unsafe_regions += ctx.unsafe_blocks;
             reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
-            reject_outstanding_obligations(&ctx, &marked, class_span, &m.f.name, false)?;
+            if !returns {
+                reject_outstanding_obligations(&ctx, &marked, class_span, &m.f.name, false)?;
+            }
             if !returns && m.f.ret != Ty::Unit {
                 return Err(Diagnostic {
                     name: "type.missing_return".into(),
@@ -807,7 +866,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             let marked: Vec<(String, Span)> = class
                 .fields
                 .iter()
-                .filter(|f| f.must_consume)
+                .filter(|f| f.must_consume || mandatory_ty(f.ty))
                 .map(|f| (f.name.clone(), f.span))
                 .collect();
             let class_span = class.name_span;
@@ -840,8 +899,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: p.ty,
                             initialized: true,
                             mutable: false,
-                        branded: false,
-                        obligation: false,
+                            branded: false,
+                            obligation: mandatory_ty(p.ty),
                     },
                     );
                 }
@@ -852,8 +911,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: *fty,
                             initialized: false,
                             mutable: true,
-                        branded: false,
-                        obligation: false,
+                            branded: false,
+                            obligation: false,
                     },
                     );
                 }
@@ -906,7 +965,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: true,
                             mutable: false,
                         branded: false,
-                        obligation: false,
+                        obligation: mandatory_ty(p.ty),
                     },
                     );
                 }
@@ -925,7 +984,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
                 unsafe_regions += ctx.unsafe_blocks;
                 reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
-                reject_outstanding_obligations(&ctx, &marked, class_span, &m.f.name, false)?;
+                if !returns {
+                    reject_outstanding_obligations(
+                        &ctx,
+                        &marked,
+                        class_span,
+                        &m.f.name,
+                        false,
+                    )?;
+                }
                 if !returns && m.f.ret != Ty::Unit {
                     return Err(Diagnostic {
                         name: "type.missing_return".into(),
@@ -1416,10 +1483,36 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         transfer(ctx, e, Some(("be returned", e.span)))?;
                     }
                 }
+                // A return is a frame exit on this path. Mandatory
+                // resource parameters and locals must already have
+                // reached a consuming boundary (or be the returned
+                // value, whose transfer above moved the obligation to
+                // the caller). An ordinary method may retain authority
+                // in `self`; that object outlives this frame.
+                let current = ctx.current_fn.clone();
+                reject_outstanding_obligations(
+                    ctx,
+                    ctx.marked_fields,
+                    *span,
+                    &current,
+                    ctx.in_class.is_none() || ctx.in_deinit,
+                )?;
                 returned = true;
             }
             Stmt::ExprStmt(e) => {
-                check_expr(ctx, e, None)?;
+                let ty = check_expr(ctx, e, None)?;
+                if mandatory_ty(ty) {
+                    return Err(Diagnostic {
+                        name: "resource.abandoned".into(),
+                        title: format!(
+                            "discarding this `{}` abandons mandatory authority",
+                            ty.name()
+                        ),
+                        span: e.span,
+                        label: "bind it and hand it to a consuming operation".into(),
+                        notes: vec![],
+                    });
+                }
             }
             Stmt::VarDecl {
                 name,
@@ -3563,6 +3656,10 @@ fn is_affine(ty: Ty) -> bool {
     )
 }
 
+fn mandatory_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Res(kind) if kind.must_consume())
+}
+
 /// The one ownership sink.
 ///
 /// Every construct that takes a value *by value* — a declaration, an
@@ -3577,10 +3674,11 @@ fn is_affine(ty: Ty) -> bool {
 ///
 /// Call it *after* the expression has been checked: a moved-from place is
 /// unreadable, and the escape rule needs the expression's type.
-/// Returns whether the value carried a `#[must_consume]` obligation, so a
-/// sink that is itself a place can keep it travelling. A sink that is not
-/// a place — an argument, a return — discharges it by ignoring it: the
-/// authority has left this frame.
+/// Returns whether the value carries a mandatory-consumption obligation,
+/// so a sink that is itself a place can keep it travelling. An owned
+/// argument moves the authority into a callee whose parameter inherits
+/// a type-level obligation; a return moves it to a caller whose receiving
+/// place derives the same obligation from the result type.
 fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<bool> {
     if let Some((how, span)) = escapes {
         reject_brand_escape(ctx, e, how, span)?;
@@ -3596,10 +3694,15 @@ fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<b
         ),
         _ => None,
     };
-    let mut carries = false;
+    // A fresh result of a mandatory resource type starts with an
+    // obligation even though it has no source place. A move normally
+    // finds the same obligation on its source; deriving it from the type
+    // as well makes returns and compiler-sealed resource producers obey
+    // the same rule without one-off minting hooks.
+    let mut carries = e.ty.is_some_and(mandatory_ty);
     if let Some(name) = source {
         if let Some(v) = ctx.vars.get_mut(name.as_str()) {
-            carries = v.obligation;
+            carries |= v.obligation;
             // The obligation goes with the token. Whether it is discharged
             // or merely relocated is the *sink's* answer, and the source
             // no longer owes it either way.
@@ -3695,20 +3798,22 @@ fn reject_scoped_obligations(
     })
 }
 
-/// Whether a field carries the `#[must_consume]` marker.
+/// Whether a field carries either the legacy per-field marker or a
+/// resource type's mandatory-consumption property.
 fn marked_field(marked: &[(String, Span)], field: &str) -> bool {
     marked.iter().any(|(name, _)| name == field)
 }
 
-/// `#[must_consume]` at the end of a body: nothing may still be holding
-/// an obligation that this body was the last chance to discharge.
+/// At the end of a body, nothing may still be holding an obligation that
+/// this frame was the last chance to discharge.
 ///
 /// The obligation travels with the token, so this asks about every place
 /// that holds one and not only about the field: moving it into a local
 /// and dropping the local abandons the authority exactly as leaving it in
-/// the field does. What discharges one is passing the value *by value* to
-/// something that takes it, which is why the state lives on the place —
-/// "is one sitting here", not "was this ever moved".
+/// the field does. A type-mandatory resource follows owned parameters and
+/// returns across verified calls; only an audited `#[consumes]` extern is
+/// a terminal sink. The older field marker still means the authority must
+/// leave the owning class's destructor.
 ///
 /// `fields` says whether a marked field still holding its authority is an
 /// abandonment. In a `deinit` it is — the object is ending, and nothing
@@ -3734,17 +3839,29 @@ fn reject_outstanding_obligations(
         if field.is_some() && !fields {
             continue;
         }
+        let mandatory = ctx
+            .vars
+            .get(name.as_str())
+            .is_some_and(|v| mandatory_ty(v.ty));
         let (span, label) = match field {
             Some(f) => (
                 marked
                     .iter()
                     .find(|(name, _)| name == f)
                     .map_or(class_span, |(_, span)| *span),
-                "this field is `#[must_consume]`",
+                if mandatory {
+                    "this field's resource type requires consumption"
+                } else {
+                    "this field is `#[must_consume]`"
+                },
             ),
             None => (
                 class_span,
-                "this holds the authority of a `#[must_consume]` field",
+                if mandatory {
+                    "this resource type requires consumption"
+                } else {
+                    "this holds the authority of a `#[must_consume]` field"
+                },
             ),
         };
         return Err(Diagnostic {
@@ -3752,12 +3869,15 @@ fn reject_outstanding_obligations(
             title: format!("`{member}` abandons `{name}`"),
             span,
             label: label.into(),
-            notes: vec![(
-                "note".into(),
-                "hand the authority on — pass it by value to something that \
-                 consumes it — or drop the marker and accept the leak"
-                    .into(),
-            )],
+            notes: vec![("note".into(), if mandatory {
+                "hand the authority through verified owned parameters until it reaches \
+                 an audited `#[consumes]` operation"
+                    .into()
+            } else {
+                "hand the authority on — pass it by value to something that consumes it \
+                 — or drop the field marker and accept the leak"
+                    .into()
+            })],
         });
     }
     Ok(())

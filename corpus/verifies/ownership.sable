@@ -98,13 +98,13 @@ pub fn swap_authority(resource RawSpan a, resource RawSpan b) {
 
 // -------------------------- a travelling obligation ------------------------
 //
-// `#[must_consume]` is about where the authority *ends up*, not about the
-// field being moved: moving it into a local moves the obligation too, and
-// only passing it by value to something that takes it discharges one.
+// Mandatory resource types are about where authority *ends up*, not merely
+// whether a field was moved. `OpenFile` follows owned parameters and locals
+// until the audited consuming parameter of `posix_close` is reached.
 
 pub class Handle {
     i32 fd;
-    #[must_consume] resource OpenFile fh;
+    resource OpenFile fh;
     resource PosixWorld w;
 
     /// invariant 0 ≤ fd
@@ -133,16 +133,13 @@ pub class Handle {
 // that exists; availability is what stops a second one appearing beside
 // it.
 
-pub fn eat_file(resource OpenFile f) {
-}
-
 /// pre #[label(open)]  w.isOpen 1 ∧ w.isOpen 2
 /// pre #[label(fresh)] w.claimed.get 1 = 0 ∧ w.claimed.get 2 = 0
 pub fn two_descriptors(resource &mut PosixWorld w) {
     resource OpenFile a = open_file(&mut w, 1);
     resource OpenFile b = open_file(&mut w, 2);
-    eat_file(a);
-    eat_file(b);
+    close_it(1, a, &mut w);
+    close_it(2, b, &mut w);
 }
 
 // ---------------------------- markers, not scopes --------------------------

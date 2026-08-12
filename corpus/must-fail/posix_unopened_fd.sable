@@ -2,8 +2,10 @@
 // The world says which descriptors it handed out, and `open_file` needs
 // one of them. Whether a descriptor is really open is a *precondition* —
 // the checker tracks tokens, not the state of the outside.
-
+extern "C" #[audit(id := "test.consume-open-file.v1", reason := "negative-subject sink")]
+fn eat(#[consumes] resource OpenFile f);
 
 fn any_fd(i32 fd, resource &mut PosixWorld w) {
     resource OpenFile fh = open_file(&mut w, fd);
+    eat(fh);
 }

@@ -1784,10 +1784,19 @@ Exit criteria:
 
 ### U8 — in-band free-list allocator
 
-Add allocator identities, `BlockLease`, in-band headers, free, and coalescing.
-Before adding those operations, make must-consume a resource-type property that
-propagates through owned parameters and reaches an explicitly consuming sink;
-then introduce `SystemDealloc` under that rule.
+**The U8a entry gate is complete (2026-08-12, ADR 0035).** Mandatory
+consumption is now a compiler-defined resource-type property. `OpenFile` is the
+first instance: verified owned parameters inherit the obligation, returns move
+it to a mandatory receiving place at the caller, class fields require a
+destructor without an annotation, and every frame exit checks it. Only an
+audited extern may mark an owned mandatory parameter `#[consumes]`; a verified
+do-nothing sink, an unmarked extern, and an attribute on an affine resource all
+fail locally. The strengthened POSIX contract is honestly versioned as
+`posix.close.v2`.
+
+Next add `SystemDealloc` under that rule, then allocator identities,
+`BlockLease`, in-band headers, free, and coalescing. A compiler-sealed release
+operation is the terminal consumer; no user function may declare itself one.
 
 Exit criteria:
 

@@ -1124,6 +1124,7 @@ impl<'a> Parser<'a> {
                 name: pname,
                 ty,
                 span: tspan.join(pspan),
+                consumes: false,
             });
             if self.at(&Tok::Comma) {
                 self.bump();
@@ -1271,6 +1272,38 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if !self.at(&Tok::RParen) {
             loop {
+                let consumes_span = if self.at(&Tok::Hash) {
+                    let start = self.bump().span;
+                    self.expect(Tok::LBracket)?;
+                    let (attr, attr_span) = self.ident()?;
+                    if attr != "consumes" {
+                        return Err(Diagnostic {
+                            name: "resource.unknown_param_attribute".into(),
+                            title: format!("unknown parameter attribute `{attr}`"),
+                            span: attr_span,
+                            label: "expected `consumes`".into(),
+                            notes: vec![],
+                        });
+                    }
+                    let end = self.expect(Tok::RBracket)?.span;
+                    Some(start.join(end))
+                } else {
+                    None
+                };
+                if consumes_span.is_some() && !is_extern {
+                    return Err(Diagnostic {
+                        name: "resource.consumes_verified".into(),
+                        title: "a verified function may not declare a consuming parameter".into(),
+                        span: consumes_span.unwrap(),
+                        label: "its body must hand mandatory authority to an audited sink".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "`#[consumes]` is an audited promise on an extern parameter; an \
+                             ordinary Sable parameter inherits the resource-type obligation"
+                                .into(),
+                        )],
+                    });
+                }
                 let (ty, tspan) = self.param_ty()?;
                 let (pname, pspan) = self.ident()?;
                 if is_reserved_name(&pname) {
@@ -1279,7 +1312,8 @@ impl<'a> Parser<'a> {
                 params.push(Param {
                     name: pname,
                     ty,
-                    span: tspan.join(pspan),
+                    span: consumes_span.unwrap_or(tspan).join(pspan),
+                    consumes: consumes_span.is_some(),
                 });
                 if self.at(&Tok::Comma) {
                     self.bump();

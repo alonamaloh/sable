@@ -1,0 +1,9 @@
+// expect-error: resource.abandoned
+// A freshly produced mandatory resource cannot be discarded as an expression
+// statement; it has to land in a place and continue to a consuming operation.
+
+/// pre w.isOpen fd
+/// pre w.claimed.get fd = 0
+fn discard_fresh(i32 fd, resource &mut PosixWorld w) {
+    open_file(&mut w, fd);
+}

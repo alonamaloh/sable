@@ -304,3 +304,11 @@ the static ownership and lifetime shape must agree.
   exposures apart. Scoping the body removes the need today, because
   nothing derived survives to be confused; a second loan open at the same
   time would bring the question back.
+
+## Amendment — ADR 0035
+
+The interprocedural limitation above is resolved for compiler-designated
+mandatory resource types. Owned parameters now inherit the type's obligation,
+and only an audited `#[consumes]` extern parameter (or a future compiler-sealed
+terminal operation) discharges the chain. The per-field marker remains the
+weaker, class-local policy for otherwise affine resource kinds.

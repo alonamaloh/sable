@@ -39,11 +39,10 @@ errors, and interruption, none of which `c_fill` had to answer.
    *author* controls: one script makes the second read short, another fails
    the first outright.
 
-7. **Handles are passed explicitly, not owned by an RAII class.** A `File`
-   whose destructor closes the descriptor needs non-empty `deinit` and
-   destruction semantics, which is later work. Forgetting to `close` leaks
-   a descriptor — exactly what affine-not-linear authority permits, and
-   what a `#[must_consume]` marker would later diagnose.
+7. **Handles initially passed explicitly rather than through an RAII class.**
+   ADR 0029 later supplied non-empty `deinit`, and ADR 0035 made `OpenFile`
+   the first mandatory resource type. Forgetting to `close` is now rejected
+   without a per-field marker.
 
 ## What this rung found
 

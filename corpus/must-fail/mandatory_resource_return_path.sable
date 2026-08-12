@@ -1,0 +1,13 @@
+// expect-error: resource.abandoned
+// A direct return is a frame exit. Consuming on the fallthrough path does not
+// excuse abandoning the mandatory parameter on the returning path.
+
+extern "C" #[audit(id := "test.consume-open-file.v1", reason := "negative-subject sink")]
+fn close(#[consumes] resource OpenFile fh);
+
+fn sometimes(bool early, resource OpenFile fh) {
+    if (early) {
+        return;
+    }
+    close(fh);
+}

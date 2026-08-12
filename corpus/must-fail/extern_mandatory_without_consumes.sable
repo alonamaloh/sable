@@ -1,0 +1,6 @@
+// expect-error: resource.extern_must_consume
+// A foreign declaration has no body for the checker to inspect, so terminal
+// consumption has to be an explicit part of its audited boundary.
+
+extern "C" #[audit(id := "test.missing-consumes.v1", reason := "negative subject")]
+fn bad_sink(resource OpenFile fh);

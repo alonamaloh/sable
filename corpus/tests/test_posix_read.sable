@@ -13,6 +13,7 @@
 // arrived, and which ones.
 // expect-skip: w.isOpen fd ∧ fh.fd = fd
 // expect-skip: fh.fd = (old fh).fd ∧ w.fds = (old w).fds
+// expect-skip: w.fds = (old w).fds
 
 use posix_read;
 

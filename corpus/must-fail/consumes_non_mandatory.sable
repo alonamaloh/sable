@@ -1,0 +1,6 @@
+// expect-error: resource.consumes_non_mandatory
+// `RawSpan` is affine but deliberately leakable; a consumes promise is only
+// meaningful on a mandatory resource type.
+
+extern "C" #[audit(id := "test.bad-consumes.v1", reason := "negative subject")]
+fn pretend(#[consumes] resource RawSpan bytes);

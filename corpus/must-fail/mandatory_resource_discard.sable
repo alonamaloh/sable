@@ -1,0 +1,6 @@
+// expect-error: resource.abandoned
+// An owned parameter inherits the resource type's obligation. A do-nothing
+// by-value sink is therefore not a consuming operation.
+
+fn discard(resource OpenFile fh) {
+}

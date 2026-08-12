@@ -7,9 +7,10 @@
 // authority on — and a moved field is not dropped again; the rest drop in
 // reverse declaration order.
 //
-// `#[must_consume]` says a field's authority has to go somewhere. An
-// ordinary affine field may be abandoned, which is a leak, and
-// affine-not-linear authority permits leaks.
+// `OpenFile` is a mandatory resource type: its authority has to reach the
+// audited consuming parameter of `posix_close`. An ordinary affine type such
+// as `RawSpan` may still be abandoned, which is a leak, and affine-not-linear
+// authority permits leaks.
 
 // One audited contract per boundary: `posix_close` is declared once, and
 // its audit id travels with it into every importer's manifest.
@@ -17,7 +18,7 @@ use posix_read;
 
 pub class Handle {
     i32 fd;
-    #[must_consume] resource OpenFile fh;
+    resource OpenFile fh;
     resource PosixWorld w;
 
     /// invariant 0 ≤ fd
