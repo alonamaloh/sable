@@ -90,7 +90,8 @@ initialization dynamically.
 `corpus/verifies/intrusive_list.sable` is the non-synthetic client: its node is
 exactly the three-field layout above, and both nullable links remain ordinary
 runtime values throughout traversal and unlink. The 34-obligation proof
-completes without assumptions or deferrals. The remaining semantic hardening
-is explicit rather than hidden: abstract record cells are not yet instructions
-of the relational SVM oracle. ADR 0055 makes closing that gap the gate before
-U10; it does not grant records a byte representation in the meantime.
+completes without assumptions or deferrals. ADR 0056 closes the subsequent
+semantic hardening gate: record values and cells are now abstract instructions
+of the relational SVM and proved evaluator, with per-byte extent exclusion and
+Rust/Lean differential subjects. This still does not grant records a byte
+representation.

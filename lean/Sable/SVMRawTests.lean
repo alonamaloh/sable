@@ -262,5 +262,140 @@ Exact resource extent is additionally a verifier obligation. -/
     .rawFromCellU64 (.var "p") ]
   = "undef"
 
+/-! ## Abstract typed POD record cells (ADR 0054/0055) -/
+
+private def nodeFields : List String := ["previous", "next", "payload"]
+private def nodeArgs (p : Expr) (payload : Int) : List Expr :=
+  [.ptrNoneE, .ptrSomeE p, u64 payload]
+
+/- Construct, initialize, copy-read, project, take, and return one abstract
+record extent to raw storage. The value is never serialized. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 42),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawCellInitRecord 0 (.var "p") (.var "node"),
+    .rawCellReadRecord 0 "copy" (.var "p"),
+    .assign "payload" (.recordField (.var "copy") "payload"),
+    .rawCellTakeRecord 0 "taken" (.var "p"),
+    .rawFromCellRecord 0 (.var "p"),
+    .rawFree (.var "p"),
+    .ret (.var "payload") ]
+  = "done int 42"
+
+/- Nullable pointer construction, observation, and projection retain
+provenance plus offset. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 7),
+    .assign "next" (.recordField (.var "node") "next"),
+    .assign "q" (.ptrValue (.var "next")),
+    .ret (.ptrOffset (.var "q")) ]
+  = "done int 0"
+
+/- `.value` on an empty option is a defined language trap, not raw-memory
+`undef`; the verifier normally proves this path unreachable. -/
+#guard outcome [ .assign "q" (.ptrValue .ptrNoneE) ] = "trap optionNone"
+
+/- Missing record fields remain checker-duty type confusion. -/
+#guard outcome
+  [ .recordMake "node" 0 nodeFields [.ptrNoneE, .ptrNoneE, u64 7],
+    .ret (.recordField (.var "node") "missing") ]
+  = "undef"
+
+/- Record outcomes expose their declaration-order fields to the differential
+wire format; comparing only the tag would hide value divergences. -/
+#guard outcome
+  [ .recordMake "node" 0 nodeFields [.ptrNoneE, .ptrNoneE, u64 7],
+    .ret (.var "node") ]
+  = "done record 0 {previous=ptrOpt none, next=ptrOpt none, payload=int 7}"
+
+/- Dropping then removing a record cell zero-fills its complete raw extent. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 9),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawCellInitRecord 0 (.var "p") (.var "node"),
+    .rawCellDropRecord 0 (.var "p"),
+    .rawFromCellRecord 0 (.var "p"),
+    .rawLoad8 "b" (.ptrAdd (.var "p") (u64 23)),
+    .ret (.var "b") ]
+  = "done int 0"
+
+/- Typed access before initialization. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawCellReadRecord 0 "node" (.var "p") ]
+  = "undef"
+
+/- Interior bytes are covered, not merely the record's starting address. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawStore8 (.ptrAdd (.var "p") (u64 17)) (u8 1) ]
+  = "undef"
+
+/- Conversion checks the declared runtime alignment and full extent. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 25),
+    .rawIntoCellRecord 0 24 8 (.ptrAdd (.var "p") (u64 1)) ]
+  = "undef"
+
+/- Initialization is not overwrite, and the value tag must match. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 5),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawCellInitRecord 0 (.var "p") (.var "node"),
+    .rawCellInitRecord 0 (.var "p") (.var "node") ]
+  = "undef"
+
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "wrong" 1 nodeFields (nodeArgs (.var "p") 5),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawCellInitRecord 0 (.var "p") (.var "wrong") ]
+  = "undef"
+
+/- Access and conversion back require the same static record tag. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 5),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawCellInitRecord 0 (.var "p") (.var "node"),
+    .rawCellReadRecord 1 "wrong" (.var "p") ]
+  = "undef"
+
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 5),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawCellInitRecord 0 (.var "p") (.var "node"),
+    .rawFromCellRecord 0 (.var "p") ]
+  = "undef"
+
+/- Record and scalar typed extents exclude overlap in both directions. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawIntoCellU64 (.ptrAdd (.var "p") (u64 8)) ]
+  = "undef"
+
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .rawIntoCellU64 (.ptrAdd (.var "p") (u64 8)),
+    .rawIntoCellRecord 0 24 8 (.var "p") ]
+  = "undef"
+
+/- Releasing the allocation makes its record tags inert. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 24),
+    .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 5),
+    .rawIntoCellRecord 0 24 8 (.var "p"),
+    .rawFree (.var "p"),
+    .rawCellInitRecord 0 (.var "p") (.var "node") ]
+  = "undef"
+
 end SVM
 end Sable

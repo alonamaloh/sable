@@ -9,7 +9,7 @@
 //! The harness is strict by construction: a function that cannot be
 //! lowered to the machine's core subset is a hard failure, not a skip.
 
-use sable::{Options, load_checked};
+use sable::{load_checked, Options};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,7 +35,11 @@ fn svm_differential() {
         })
         .collect();
     files.sort();
-    assert!(!files.is_empty(), "no differential subjects in {}", dir.display());
+    assert!(
+        !files.is_empty(),
+        "no differential subjects in {}",
+        dir.display()
+    );
 
     // Per file: the program environment (every function, callable) and
     // the zero-argument subjects that run on both sides.
@@ -47,7 +51,10 @@ fn svm_differential() {
             Err(fs) => panic!(
                 "{} failed the front end:\n{}",
                 path.display(),
-                fs.iter().map(|f| f.rendered.as_str()).collect::<Vec<_>>().join("\n")
+                fs.iter()
+                    .map(|f| f.rendered.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ),
         };
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
@@ -55,7 +62,7 @@ fn svm_differential() {
             .fns
             .iter()
             .map(|f| {
-                sable::svm::lower_fn_entry(f).unwrap_or_else(|e| {
+                sable::svm::lower_fn_entry(&program, f).unwrap_or_else(|e| {
                     panic!("{stem}::{} is not in the SVM core subset: {e}", f.name)
                 })
             })
@@ -63,11 +70,12 @@ fn svm_differential() {
         progs.push((fi, entries.join(", ")));
         for f in program.fns.iter().filter(|f| f.params.is_empty()) {
             let id = format!("{stem}::{}", f.name);
-            let term = sable::svm::lower_fn(f)
+            let term = sable::svm::lower_fn(&program, f)
                 .unwrap_or_else(|e| panic!("{id} is not in the SVM core subset: {e}"));
-            let outcome = sable::svm::canonical_outcome(sable::interp::run_fn(
-                &program, &mods, &f.name,
-            ));
+            let outcome = sable::svm::canonical_outcome(
+                &program,
+                sable::interp::run_fn(&program, &mods, &f.name),
+            );
             cases.push((id, fi, term, outcome));
         }
     }
@@ -87,7 +95,9 @@ fn svm_differential() {
     std::fs::write(&driver_path, &driver).unwrap();
 
     let lean_dir = repo_root().join("lean");
+    let lean_jobs = std::env::var("SABLE_LEAN_JOBS").unwrap_or_else(|_| "1".into());
     let build = Command::new("lake")
+        .arg(format!("-Kjobs={lean_jobs}"))
         .arg("build")
         .current_dir(&lean_dir)
         .output()

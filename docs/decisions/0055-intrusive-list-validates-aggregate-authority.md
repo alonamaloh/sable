@@ -47,10 +47,9 @@ aggregate survived its intended recursive, pointer-bearing client.
 ## Consequence
 
 U10 may build on the resource API; the list gives no reason to replace it with
-a user-visible separation logic. The next action is nevertheless a hardening
-gate, not MMIO implementation: record-tagged typed cells must be added to the
+a user-visible separation logic. ADR 0056 subsequently closed the explicit
+semantic hardening gate recorded here: record-tagged cells now exist in the
 relational SVM, its proved functional evaluator, direct outcome guards, and the
-differential harness. Today the Rust interpreter executes them and generated
-Lean verifies their views, but the third executable semantics still covers
-only byte and `u64` cells. Recording that boundary prevents U9's successful
-proof from being mistaken for complete semantic triangulation.
+Rust/Lean differential harness. U9's successful aggregate proof and its
+runtime storage model are therefore triangulated before profile-specific MMIO
+work begins.

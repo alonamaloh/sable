@@ -1,0 +1,20 @@
+// State-invalid but type-correct: record reads before initialization are the
+// machine's `undef` outcome in both executable semantics.
+
+record Cell #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 payload;
+}
+
+fn subj() -> u64 {
+    mut [u8] bytes = alloc_array<u8>(8, 0);
+    mut u64 out = 0;
+    unsafe expose &mut bytes as (base, resource mem) {
+        raw<Cell> p = raw_cast<Cell>(base);
+        mut resource PointsTo<Cell> cell = raw_into_cell<Cell>(p, mem);
+        Cell value = raw_cell_read<Cell>(p, &cell);
+        out = value.payload;
+        resource RawSpan returned = raw_from_cell<Cell>(p, cell);
+        mem = returned;
+    }
+    return out;
+}

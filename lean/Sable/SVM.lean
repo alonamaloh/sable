@@ -107,8 +107,9 @@ def IntTy.wrap (t : IntTy) (n : Int) : Int :=
 /-- Machine values. Integers are exact (`Int`); their widths live in the
 typed syntax, and per-operation rules enforce representability — the
 value plane never wraps. Arrays are `Sable.Seq Int` (owned `[T]` of a
-scalar element type; the ghost lift is then the identity). Options are
-scoped to integer payloads. -/
+scalar element type; the ghost lift is then the identity). Integer options
+retain their original compact form; nullable raw pointers and POD records
+are abstract values with no byte representation (ADR 0054). -/
 inductive Val where
   | unit
   | int  (n : Int)
@@ -120,6 +121,21 @@ inductive Val where
   the same allocation, which is what makes `free` able to invalidate
   exactly the pointers derived from what it released. -/
   | ptr  (alloc off : Int)
+  | ptrOpt (o : Option (Int × Int))
+  /-- Declaration tag plus fields in declaration order. Names make field
+  projection independent of compiler-local record indices; the tag still
+  prevents typed-cell confusion. -/
+  | record (tag : Int) (fields : List (String × Val))
+
+def Val.recordField? : Val → String → Option Val
+  | .record _ fields, name =>
+      (fields.find? fun field => field.1 = name).map (·.2)
+  | _, _ => none
+
+def Val.recordForTag? (v : Val) (tag : Int) : Option Val :=
+  match v with
+  | .record valueTag _ => if valueTag = tag then some v else none
+  | _ => none
 
 /-! ## The raw heap
 
@@ -139,6 +155,14 @@ inductive RawByte where
   | init : Int → RawByte
   deriving Repr, DecidableEq
 
+/-- One abstract record-typed extent. `value = none` is the typed but
+uninitialized state; an initialized value always carries the same tag. -/
+structure RecordCell where
+  tag : Int
+  size : Int
+  align : Int
+  value : Option Val
+
 /-- One allocation. `live` is kept rather than removed on free, so stale
 provenance stays distinguishable from fresh provenance: a released id is
 never handed out again. -/
@@ -150,6 +174,11 @@ structure Allocation where
   bytes; `some none` is an uninitialized cell; `some (some v)` is an
   initialized one (ADR 0031). -/
   cellsU64 : Int → Option (Option Int)
+  /-- Record cells are keyed by their starting offset. -/
+  cellsRecord : Int → Option RecordCell
+  /-- Per-byte ownership by a record start. This makes exclusion of byte
+  operations decidable without searching an unbounded partial map. -/
+  recordOwner : Int → Option Int
 
 /-- The raw heap: a fresh-provenance counter and a partial map from
 allocation ids. Ids at or above `next` are unallocated, which is what
@@ -169,7 +198,8 @@ def RawHeap.inBounds (μ : RawHeap) (a k : Int) : Bool :=
   match μ.allocs a with
   | some al =>
       let base := k - k.emod IntTy.u64.layout.align
-      al.live && decide (0 ≤ k) && decide (k < al.size) && decide (al.cellsU64 base = none)
+      al.live && decide (0 ≤ k) && decide (k < al.size) &&
+        decide (al.cellsU64 base = none) && decide (al.recordOwner k = none)
   | none => false
 
 /-- The byte at `(a, k)`, if that address is in a live allocation. -/
@@ -177,7 +207,8 @@ def RawHeap.byteAt (μ : RawHeap) (a k : Int) : Option RawByte :=
   match μ.allocs a with
   | some al =>
       let base := k - k.emod IntTy.u64.layout.align
-      if al.live ∧ 0 ≤ k ∧ k < al.size ∧ al.cellsU64 base = none then
+      if al.live ∧ 0 ≤ k ∧ k < al.size ∧ al.cellsU64 base = none ∧
+          al.recordOwner k = none then
         some (al.bytes.get k)
       else none
   | none => none
@@ -203,13 +234,15 @@ def RawHeap.store (μ : RawHeap) (a k : Int) (b : RawByte) : RawHeap :=
       if i = a then (μ.allocs i).map (fun al => { al with bytes := al.bytes.set k b })
       else μ.allocs i }
 
+/-- Every byte in `[k, k + size)` is currently ordinary raw storage. -/
+def RawHeap.rawExtent (μ : RawHeap) (a k size : Int) : Bool :=
+  decide (0 ≤ size) &&
+    (List.range size.toNat).all fun d => μ.inBounds a (k + (d : Int))
+
 /-- Whether one `u64` layout may change role into one typed cell. -/
 def RawHeap.cellConvertibleU64 (μ : RawHeap) (a k : Int) : Bool :=
-  match μ.allocs a with
-  | some al =>
-      al.live && decide (0 ≤ k) && decide (k % IntTy.u64.layout.align = 0) &&
-        decide (k + IntTy.u64.layout.size ≤ al.size) && decide (al.cellsU64 k = none)
-  | none => false
+  decide (k % IntTy.u64.layout.align = 0) &&
+    μ.rawExtent a k IntTy.u64.layout.size
 
 def RawHeap.cellAtU64 (μ : RawHeap) (a k : Int) : Option (Option Int) :=
   match μ.allocs a with
@@ -233,6 +266,75 @@ def RawHeap.removeCellU64 (μ : RawHeap) (a k : Int) : RawHeap :=
             if k ≤ j ∧ j < k + IntTy.u64.layout.size then .init 0 else al.bytes.get j⟩ })
       else μ.allocs i }
 
+/-- Whether an explicitly described record layout may occupy this raw extent.
+The front end proves the stronger layout well-formedness facts; the machine
+checks the dynamic size, alignment, bounds, and role exclusion it needs. -/
+def RawHeap.cellConvertibleRecord
+    (μ : RawHeap) (a k size align : Int) : Bool :=
+  decide (0 < size) && decide (0 < align) && decide (k % align = 0) &&
+    μ.rawExtent a k size
+
+def RawHeap.putRecordCell
+    (μ : RawHeap) (a k tag size align : Int) : RawHeap :=
+  { μ with allocs := fun i =>
+      if i = a then (μ.allocs i).map (fun al =>
+        { al with
+          cellsRecord := fun j =>
+            if j = k then some ⟨tag, size, align, none⟩ else al.cellsRecord j
+          recordOwner := fun j =>
+            if k ≤ j ∧ j < k + size then some k else al.recordOwner j })
+      else μ.allocs i }
+
+/-- The size of a live, matching, uninitialized record cell. -/
+def RawHeap.emptyRecordSize
+    (μ : RawHeap) (a k tag : Int) : Option Int :=
+  match μ.allocs a with
+  | some al =>
+      if al.live then
+        match al.cellsRecord k with
+        | some ⟨cellTag, size, _, none⟩ =>
+            if cellTag = tag then some size else none
+        | _ => none
+      else none
+  | none => none
+
+/-- The value of a live, matching, initialized record cell. -/
+def RawHeap.recordValueAt
+    (μ : RawHeap) (a k tag : Int) : Option Val :=
+  match μ.allocs a with
+  | some al =>
+      if al.live then
+        match al.cellsRecord k with
+        | some ⟨cellTag, _, _, some value⟩ =>
+            if cellTag = tag then some value else none
+        | _ => none
+      else none
+  | none => none
+
+/-- Change only the initialized/uninitialized state of an existing record
+cell. Rules call this only after checking the matching tag and state. -/
+def RawHeap.setRecordValue
+    (μ : RawHeap) (a k : Int) (value : Option Val) : RawHeap :=
+  { μ with allocs := fun i =>
+      if i = a then (μ.allocs i).map (fun al =>
+        { al with cellsRecord := fun j =>
+            if j = k then (al.cellsRecord j).map (fun cell => { cell with value })
+            else al.cellsRecord j })
+      else μ.allocs i }
+
+/-- Remove a matching empty record tag and explicitly zero its raw extent. -/
+def RawHeap.removeRecordCell
+    (μ : RawHeap) (a k size : Int) : RawHeap :=
+  { μ with allocs := fun i =>
+      if i = a then (μ.allocs i).map (fun al =>
+        { al with
+          cellsRecord := fun j => if j = k then none else al.cellsRecord j
+          recordOwner := fun j =>
+            if k ≤ j ∧ j < k + size then none else al.recordOwner j
+          bytes := ⟨al.bytes.len, fun j =>
+            if k ≤ j ∧ j < k + size then .init 0 else al.bytes.get j⟩ })
+      else μ.allocs i }
+
 /-- Mark an allocation dead. The entry stays, so its id is never reused
 and a pointer into it stays distinguishable from a fresh one. -/
 def RawHeap.release (μ : RawHeap) (a : Int) : RawHeap :=
@@ -245,7 +347,11 @@ def RawHeap.fresh (μ : RawHeap) (size : Int) : RawHeap :=
   { next := μ.next + 1,
     allocs := fun i =>
       if i = μ.next then
-        some ⟨size, true, ⟨size, fun _ => .uninit⟩, fun _ => none⟩
+        some {
+          size, live := true, bytes := ⟨size, fun _ => .uninit⟩,
+          cellsU64 := fun _ => none,
+          cellsRecord := fun _ => none,
+          recordOwner := fun _ => none }
       else μ.allocs i }
 
 /-- Terminal trap outcomes, distinct from normal termination. These are
@@ -256,6 +362,7 @@ obligation name into machine syntax (ADR 0005). -/
 inductive Trap where
   | overflow  (t : IntTy)
   | divByZero
+  | optionNone
   | indexOOB  (i len : Int)
   | narrowOOB (t : IntTy) (n : Int)
   | oom       (len : Int)
@@ -330,8 +437,15 @@ inductive Expr where
   pointer may sit outside its allocation without any outcome at all.
   Only a load or a store asks whether it is in bounds. -/
   | ptrAdd  (p d : Expr)
+  /-- Observe the arena-relative component of a pointer. -/
+  | ptrOffset (p : Expr)
   | someE   (e : Expr)
   | noneE
+  | ptrSomeE (e : Expr)
+  | ptrNoneE
+  | ptrIsSome (e : Expr)
+  | ptrValue (e : Expr)
+  | recordField (record : Expr) (field : String)
 
 /-- Statements. `while` carries no invariant/variant: loop annotations
 are ghost and erased (§4); the machine runs the loop, the verifier proves
@@ -342,6 +456,9 @@ only at statement level — `x = f(args)`, or `f(args)` for a discarded
 result — so expressions stay pure and big-step. -/
 inductive Stmt where
   | assign (x : String) (e : Expr)
+  /-- Direct POD construction. Field names and argument expressions are
+  parallel lists; a length mismatch is `undef` (checker duty). -/
+  | recordMake (dst : String) (tag : Int) (fields : List String) (args : List Expr)
   | store  (x : String) (idx : Expr) (val : Expr)
   | ite    (c : Expr) (thn els : List Stmt)
   | while  (c : Expr) (body : List Stmt)
@@ -374,6 +491,12 @@ inductive Stmt where
   | rawCellReadU64 (dst : String) (p : Expr)
   | rawCellTakeU64 (dst : String) (p : Expr)
   | rawCellDropU64 (p : Expr)
+  | rawIntoCellRecord (tag size align : Int) (p : Expr)
+  | rawFromCellRecord (tag : Int) (p : Expr)
+  | rawCellInitRecord (tag : Int) (p value : Expr)
+  | rawCellReadRecord (tag : Int) (dst : String) (p : Expr)
+  | rawCellTakeRecord (tag : Int) (dst : String) (p : Expr)
+  | rawCellDropRecord (tag : Int) (p : Expr)
 
 /-! ## Environments
 
@@ -715,6 +838,57 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | ptrAdd_abort₂ {ρ : Env} {ep ed : Expr} {a k : Int} {ab : Abort}
       (hp : Eval cap ρ ep (.ok (.ptr a k))) (hd : Eval cap ρ ed (.abort ab)) :
       Eval cap ρ (.ptrAdd ep ed) (.abort ab)
+  -- Pure raw-pointer observations and nullable raw-pointer values.
+  | ptrOffset_ok {ρ : Env} {e : Expr} {a k : Int}
+      (h : Eval cap ρ e (.ok (.ptr a k))) :
+      Eval cap ρ (.ptrOffset e) (.ok (.int k))
+  | ptrOffset_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k, v ≠ .ptr a k) :
+      Eval cap ρ (.ptrOffset e) (.abort .undef)
+  | ptrOffset_abort {ρ : Env} {e : Expr} {ab : Abort}
+      (h : Eval cap ρ e (.abort ab)) :
+      Eval cap ρ (.ptrOffset e) (.abort ab)
+  | ptrSomeE_ok {ρ : Env} {e : Expr} {a k : Int}
+      (h : Eval cap ρ e (.ok (.ptr a k))) :
+      Eval cap ρ (.ptrSomeE e) (.ok (.ptrOpt (some (a, k))))
+  | ptrSomeE_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k, v ≠ .ptr a k) :
+      Eval cap ρ (.ptrSomeE e) (.abort .undef)
+  | ptrSomeE_abort {ρ : Env} {e : Expr} {ab : Abort}
+      (h : Eval cap ρ e (.abort ab)) :
+      Eval cap ρ (.ptrSomeE e) (.abort ab)
+  | ptrNoneE {ρ : Env} :
+      Eval cap ρ .ptrNoneE (.ok (.ptrOpt none))
+  | ptrIsSome_ok {ρ : Env} {e : Expr} {o : Option (Int × Int)}
+      (h : Eval cap ρ e (.ok (.ptrOpt o))) :
+      Eval cap ρ (.ptrIsSome e) (.ok (.bool o.isSome))
+  | ptrIsSome_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ o, v ≠ .ptrOpt o) :
+      Eval cap ρ (.ptrIsSome e) (.abort .undef)
+  | ptrIsSome_abort {ρ : Env} {e : Expr} {ab : Abort}
+      (h : Eval cap ρ e (.abort ab)) :
+      Eval cap ρ (.ptrIsSome e) (.abort ab)
+  | ptrValue_ok {ρ : Env} {e : Expr} {a k : Int}
+      (h : Eval cap ρ e (.ok (.ptrOpt (some (a, k))))) :
+      Eval cap ρ (.ptrValue e) (.ok (.ptr a k))
+  | ptrValue_none {ρ : Env} {e : Expr}
+      (h : Eval cap ρ e (.ok (.ptrOpt none))) :
+      Eval cap ρ (.ptrValue e) (.abort (.trap .optionNone))
+  | ptrValue_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ o, v ≠ .ptrOpt o) :
+      Eval cap ρ (.ptrValue e) (.abort .undef)
+  | ptrValue_abort {ρ : Env} {e : Expr} {ab : Abort}
+      (h : Eval cap ρ e (.abort ab)) :
+      Eval cap ρ (.ptrValue e) (.abort ab)
+  | recordField_ok {ρ : Env} {e : Expr} {field : String} {v value : Val}
+      (h : Eval cap ρ e (.ok v)) (hf : v.recordField? field = some value) :
+      Eval cap ρ (.recordField e field) (.ok value)
+  | recordField_undef {ρ : Env} {e : Expr} {field : String} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hf : v.recordField? field = none) :
+      Eval cap ρ (.recordField e field) (.abort .undef)
+  | recordField_abort {ρ : Env} {e : Expr} {field : String} {ab : Abort}
+      (h : Eval cap ρ e (.abort ab)) :
+      Eval cap ρ (.recordField e field) (.abort ab)
   | alloc_ok {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
       (h₀ : 0 ≤ n) (hc : n ≤ cap) :
@@ -830,6 +1004,24 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
   | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
       Step P cap (.run (.assign x e :: k) ρ σ μ) a.toConfig
+  | recordMake_ok {ρ : Env} {dst : String} {tag : Int}
+      {fields : List String} {args : List Expr} {values : List Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (ha : EvalArgs cap ρ args (.ok values))
+      (hn : fields.length = values.length) :
+      Step P cap (.run (.recordMake dst tag fields args :: k) ρ σ μ)
+        (.run k (ρ.update dst (.record tag (fields.zip values))) σ μ)
+  | recordMake_undef_arity {ρ : Env} {dst : String} {tag : Int}
+      {fields : List String} {args : List Expr} {values : List Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (ha : EvalArgs cap ρ args (.ok values))
+      (hn : fields.length ≠ values.length) :
+      Step P cap (.run (.recordMake dst tag fields args :: k) ρ σ μ) .undef
+  | recordMake_abort {ρ : Env} {dst : String} {tag : Int}
+      {fields : List String} {args : List Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (ha : EvalArgs cap ρ args (.abort ab)) :
+      Step P cap (.run (.recordMake dst tag fields args :: k) ρ σ μ) ab.toConfig
   | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
       (ha : ρ x = some (.arr a)) (h₀ : 0 ≤ n) (h₁ : n < a.len) :
@@ -1138,6 +1330,127 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort ab)) :
       Step P cap (.run (.rawCellDropU64 e :: k) ρ σ μ) ab.toConfig
+  -- Abstract record cells (ADR 0054): the layout and record tag are explicit
+  -- machine operands; values remain abstract and byte-inaccessible.
+  | intoCellRecord_ok {ρ : Env} {tag size align : Int} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.cellConvertibleRecord a k' size align = true) :
+      Step P cap (.run (.rawIntoCellRecord tag size align e :: k) ρ σ μ)
+        (.run k ρ σ (μ.putRecordCell a k' tag size align))
+  | intoCellRecord_bad {ρ : Env} {tag size align : Int} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.cellConvertibleRecord a k' size align = false) :
+      Step P cap (.run (.rawIntoCellRecord tag size align e :: k) ρ σ μ) .undef
+  | intoCellRecord_undef_ptr {ρ : Env} {tag size align : Int} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawIntoCellRecord tag size align e :: k) ρ σ μ) .undef
+  | intoCellRecord_abort {ρ : Env} {tag size align : Int} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawIntoCellRecord tag size align e :: k) ρ σ μ) ab.toConfig
+  | fromCellRecord_ok {ρ : Env} {tag : Int} {e : Expr} {a k' size : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.emptyRecordSize a k' tag = some size) :
+      Step P cap (.run (.rawFromCellRecord tag e :: k) ρ σ μ)
+        (.run k ρ σ (μ.removeRecordCell a k' size))
+  | fromCellRecord_bad {ρ : Env} {tag : Int} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.emptyRecordSize a k' tag = none) :
+      Step P cap (.run (.rawFromCellRecord tag e :: k) ρ σ μ) .undef
+  | fromCellRecord_undef_ptr {ρ : Env} {tag : Int} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawFromCellRecord tag e :: k) ρ σ μ) .undef
+  | fromCellRecord_abort {ρ : Env} {tag : Int} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawFromCellRecord tag e :: k) ρ σ μ) ab.toConfig
+  | cellInitRecord_ok {ρ : Env} {tag : Int} {ep ev : Expr}
+      {a k' size : Int} {value : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok value))
+      (ht : ∃ stored, value.recordForTag? tag = some stored)
+      (hc : μ.emptyRecordSize a k' tag = some size) :
+      Step P cap (.run (.rawCellInitRecord tag ep ev :: k) ρ σ μ)
+        (.run k ρ σ (μ.setRecordValue a k' (some value)))
+  | cellInitRecord_bad {ρ : Env} {tag : Int} {ep ev : Expr}
+      {a k' : Int} {value : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok value))
+      (hbad : value.recordForTag? tag = none ∨ μ.emptyRecordSize a k' tag = none) :
+      Step P cap (.run (.rawCellInitRecord tag ep ev :: k) ρ σ μ) .undef
+  | cellInitRecord_abort_val {ρ : Env} {tag : Int} {ep ev : Expr}
+      {a k' : Int} {ab : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.abort ab)) :
+      Step P cap (.run (.rawCellInitRecord tag ep ev :: k) ρ σ μ) ab.toConfig
+  | cellInitRecord_undef_ptr {ρ : Env} {tag : Int} {ep ev : Expr} {value : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok value)) (hv : ∀ a k', value ≠ .ptr a k') :
+      Step P cap (.run (.rawCellInitRecord tag ep ev :: k) ρ σ μ) .undef
+  | cellInitRecord_abort_ptr {ρ : Env} {tag : Int} {ep ev : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.abort ab)) :
+      Step P cap (.run (.rawCellInitRecord tag ep ev :: k) ρ σ μ) ab.toConfig
+  | cellReadRecord_ok {ρ : Env} {tag : Int} {dst : String} {e : Expr}
+      {a k' : Int} {value : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.recordValueAt a k' tag = some value) :
+      Step P cap (.run (.rawCellReadRecord tag dst e :: k) ρ σ μ)
+        (.run k (ρ.update dst value) σ μ)
+  | cellReadRecord_bad {ρ : Env} {tag : Int} {dst : String} {e : Expr}
+      {a k' : Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.recordValueAt a k' tag = none) :
+      Step P cap (.run (.rawCellReadRecord tag dst e :: k) ρ σ μ) .undef
+  | cellReadRecord_undef_ptr {ρ : Env} {tag : Int} {dst : String} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawCellReadRecord tag dst e :: k) ρ σ μ) .undef
+  | cellReadRecord_abort {ρ : Env} {tag : Int} {dst : String} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawCellReadRecord tag dst e :: k) ρ σ μ) ab.toConfig
+  | cellTakeRecord_ok {ρ : Env} {tag : Int} {dst : String} {e : Expr}
+      {a k' : Int} {value : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.recordValueAt a k' tag = some value) :
+      Step P cap (.run (.rawCellTakeRecord tag dst e :: k) ρ σ μ)
+        (.run k (ρ.update dst value) σ (μ.setRecordValue a k' none))
+  | cellTakeRecord_bad {ρ : Env} {tag : Int} {dst : String} {e : Expr}
+      {a k' : Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.recordValueAt a k' tag = none) :
+      Step P cap (.run (.rawCellTakeRecord tag dst e :: k) ρ σ μ) .undef
+  | cellTakeRecord_undef_ptr {ρ : Env} {tag : Int} {dst : String} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawCellTakeRecord tag dst e :: k) ρ σ μ) .undef
+  | cellTakeRecord_abort {ρ : Env} {tag : Int} {dst : String} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawCellTakeRecord tag dst e :: k) ρ σ μ) ab.toConfig
+  | cellDropRecord_ok {ρ : Env} {tag : Int} {e : Expr}
+      {a k' : Int} {value : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.recordValueAt a k' tag = some value) :
+      Step P cap (.run (.rawCellDropRecord tag e :: k) ρ σ μ)
+        (.run k ρ σ (μ.setRecordValue a k' none))
+  | cellDropRecord_bad {ρ : Env} {tag : Int} {e : Expr}
+      {a k' : Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k')))
+      (hc : μ.recordValueAt a k' tag = none) :
+      Step P cap (.run (.rawCellDropRecord tag e :: k) ρ σ μ) .undef
+  | cellDropRecord_undef_ptr {ρ : Env} {tag : Int} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawCellDropRecord tag e :: k) ρ σ μ) .undef
+  | cellDropRecord_abort {ρ : Env} {tag : Int} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawCellDropRecord tag e :: k) ρ σ μ) ab.toConfig
   -- fall off the end of a body: return unit
   | nil_ret {ρ : Env} {μ : RawHeap} :
       Step P cap (.run [] ρ [] μ) (.done .unit)

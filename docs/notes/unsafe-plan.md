@@ -2152,13 +2152,22 @@ one-arena: a live node pointer is provenance plus an arena-relative offset, so
 the list needs no cross-allocation comparison rule. Map extraction is the only
 permission rearrangement visible to the proof.
 
-**Hardening gate before U10.** Record storage currently executes in the Rust
-interpreter and verifies through generated Lean, but the relational SVM and its
-functional evaluator still formalize only byte and `u64` typed extents. Extend
-that oracle with abstract record-tagged cells and add successful and `undef`
-differential subjects. This does not invalidate U9's aggregate-resource result,
-but prototype criterion 7 requires the third semantics before the raw-memory
-vertical slice is considered triangulated.
+**The pre-U10 semantic hardening gate is complete (2026-08-12, ADR 0056).**
+The relational SVM and its proved functional evaluator now carry abstract POD
+record values, nullable raw pointers, record construction/projection, and all
+six record-cell transitions. Each allocation records both the starting cell
+and per-byte extent ownership, so byte access and `u64` conversion cannot
+observe or overlap an interior record byte. Matching tags guard typed access;
+conversion back requires an empty cell and zero-fills the recorded extent.
+
+All expression and step agreement proofs, determinism, totality, and progress
+remain kernel-checked. Forty-seven direct machine guards cover the old raw paths
+plus record round trips, zero fill, misalignment, wrong tags, invalid states,
+dead allocations, interior-byte exclusion, and record/`u64` overlap in both
+directions. The differential oracle now compares 59 Rust/Lean subjects,
+including successful record projection and pointer-option outcomes plus
+uninitialized read, repeated initialization, and conversion from an occupied
+cell. Prototype criterion 7 is therefore met for the U9 record slice.
 
 ### U10 — MMIO and privileged-state profile
 

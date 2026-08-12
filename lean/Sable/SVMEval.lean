@@ -53,6 +53,27 @@ theorem EOut.bindPtr_ok_of_ne {v : Val} (f : Int → Int → EOut)
     (hv : ∀ a k, v ≠ .ptr a k) : (EOut.ok v).bindPtr f = .abort .undef := by
   cases v <;> simp [EOut.bindPtr] at * <;> exact absurd rfl (hv _ _)
 
+/-- Continue with a nullable raw pointer; ill-shaped is undef. -/
+def EOut.bindPtrOpt
+    (o : EOut) (f : Option (Int × Int) → EOut) : EOut :=
+  match o with
+  | .ok (.ptrOpt p) => f p
+  | .ok _           => .abort .undef
+  | .abort a        => .abort a
+
+@[simp] theorem EOut.bindPtrOpt_ptrOpt
+    (p : Option (Int × Int)) (f : Option (Int × Int) → EOut) :
+    (EOut.ok (.ptrOpt p)).bindPtrOpt f = f p := rfl
+
+@[simp] theorem EOut.bindPtrOpt_abort
+    (ab : Abort) (f : Option (Int × Int) → EOut) :
+    (EOut.abort ab).bindPtrOpt f = .abort ab := rfl
+
+theorem EOut.bindPtrOpt_ok_of_ne {v : Val}
+    (f : Option (Int × Int) → EOut) (hv : ∀ p, v ≠ .ptrOpt p) :
+    (EOut.ok v).bindPtrOpt f = .abort .undef := by
+  cases v <;> simp [EOut.bindPtrOpt] at * <;> exact absurd rfl (hv _)
+
 /-- Continue with the operand's boolean value; ill-shaped is undef. -/
 def EOut.bindBool (o : EOut) (f : Bool → EOut) : EOut :=
   match o with
@@ -155,8 +176,27 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
   | .ptrAdd ep ed =>
       (evalE cap ρ ep).bindPtr fun a k =>
         (evalE cap ρ ed).bindInt fun d => .ok (.ptr a (k + d))
+  | .ptrOffset e =>
+      (evalE cap ρ e).bindPtr fun _ k => .ok (.int k)
   | .someE e => (evalE cap ρ e).bindInt fun n => .ok (.opt (some n))
   | .noneE => .ok (.opt none)
+  | .ptrSomeE e =>
+      (evalE cap ρ e).bindPtr fun a k => .ok (.ptrOpt (some (a, k)))
+  | .ptrNoneE => .ok (.ptrOpt none)
+  | .ptrIsSome e =>
+      (evalE cap ρ e).bindPtrOpt fun p => .ok (.bool p.isSome)
+  | .ptrValue e =>
+      (evalE cap ρ e).bindPtrOpt fun p =>
+        match p with
+        | some (a, k) => .ok (.ptr a k)
+        | none => .abort (.trap .optionNone)
+  | .recordField e field =>
+      match evalE cap ρ e with
+      | .ok v =>
+          match v.recordField? field with
+          | some value => .ok value
+          | none => .abort .undef
+      | .abort ab => .abort ab
 
 /-! ## Agreement, direction 1: every derivation computes -/
 
@@ -257,6 +297,25 @@ theorem Eval.evalE_eq {cap : Int} {ρ : Env} {e : Expr} {out : EOut}
   | ptrAdd_abort₁ hp ihp => simp [evalE, ihp]
   | ptrAdd_undef₂ hp hd hv ihp ihd => simp [evalE, ihp, ihd, EOut.bindInt_ok_of_ne _ hv]
   | ptrAdd_abort₂ hp hd ihp ihd => simp [evalE, ihp, ihd]
+  | ptrOffset_ok h ih => simp [evalE, ih]
+  | ptrOffset_undef h hv ih => simp [evalE, ih, EOut.bindPtr_ok_of_ne _ hv]
+  | ptrOffset_abort h ih => simp [evalE, ih]
+  | ptrSomeE_ok h ih => simp [evalE, ih]
+  | ptrSomeE_undef h hv ih => simp [evalE, ih, EOut.bindPtr_ok_of_ne _ hv]
+  | ptrSomeE_abort h ih => simp [evalE, ih]
+  | ptrNoneE => rfl
+  | ptrIsSome_ok h ih => simp [evalE, ih]
+  | ptrIsSome_undef h hv ih =>
+      simp [evalE, ih, EOut.bindPtrOpt_ok_of_ne _ hv]
+  | ptrIsSome_abort h ih => simp [evalE, ih]
+  | ptrValue_ok h ih => simp [evalE, ih]
+  | ptrValue_none h ih => simp [evalE, ih]
+  | ptrValue_undef h hv ih =>
+      simp [evalE, ih, EOut.bindPtrOpt_ok_of_ne _ hv]
+  | ptrValue_abort h ih => simp [evalE, ih]
+  | recordField_ok h hf ih => simp [evalE, ih, hf]
+  | recordField_undef h hf ih => simp [evalE, ih, hf]
+  | recordField_abort h ih => simp [evalE, ih]
   | alloc_undef₁ h₁ hv ih₁ => simp [evalE, ih₁, EOut.bindInt_ok_of_ne _ hv]
   | alloc_abort₁ h ih => simp [evalE, ih]
   | alloc_undef₂ h₁ h₂ hv ih₁ ih₂ => simp [evalE, ih₁, ih₂, EOut.bindInt_ok_of_ne _ hv]
@@ -289,6 +348,8 @@ private theorem eval_bindInt {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → 
     | arr a => simpa [EOut.bindInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindInt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindInt] using Hundef _ ih nofun
+    | ptrOpt p => simpa [EOut.bindInt] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.bindInt] using Hundef _ ih nofun
 
 private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool → EOut}
     (ih : Eval cap ρ e (evalE cap ρ e))
@@ -308,6 +369,8 @@ private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool �
     | arr a => simpa [EOut.bindBool] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindBool] using Hundef _ ih nofun
+    | ptrOpt p => simpa [EOut.bindBool] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.bindBool] using Hundef _ ih nofun
 
 private theorem eval_bindPtr {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → Int → EOut}
     (ih : Eval cap ρ e (evalE cap ρ e))
@@ -327,6 +390,30 @@ private theorem eval_bindPtr {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → 
     | bool b => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | arr a => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | ptrOpt p => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.bindPtr] using Hundef _ ih nofun
+
+private theorem eval_bindPtrOpt {cap : Int} {ρ : Env} {e tgt : Expr}
+    {f : Option (Int × Int) → EOut}
+    (ih : Eval cap ρ e (evalE cap ρ e))
+    (Habort : ∀ a, Eval cap ρ e (.abort a) → Eval cap ρ tgt (.abort a))
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ p, v ≠ .ptrOpt p) →
+      Eval cap ρ tgt (.abort .undef))
+    (Hok : ∀ p, Eval cap ρ e (.ok (.ptrOpt p)) → Eval cap ρ tgt (f p)) :
+    Eval cap ρ tgt ((evalE cap ρ e).bindPtrOpt f) := by
+  cases ho : evalE cap ρ e with
+  | abort a => rw [ho] at ih; simpa using Habort a ih
+  | ok v =>
+    rw [ho] at ih
+    cases v with
+    | ptrOpt p => simpa using Hok p ih
+    | unit => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
+    | int n => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
+    | bool b => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
+    | arr a => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
+    | opt o => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
+    | ptr a k => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
 
 private theorem eval_bindInt₂ {cap : Int} {ρ : Env} {e₁ e₂ tgt : Expr}
     {f : Int → Int → EOut}
@@ -448,6 +535,9 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
           | bool b => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
           | ptr a k => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
           | opt o => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
+          | ptrOpt p => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
+          | record tag fields =>
+              simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
   | index x e ih =>
       simp only [evalE]
       refine eval_bindInt ih (fun a h => .index_abort h)
@@ -476,6 +566,39 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
         (fun v h hv => .ptrAdd_undef₁ h hv) fun a k hp => ?_
       exact eval_bindInt ihd (fun ab hd => .ptrAdd_abort₂ hp hd)
         (fun v hd hv => .ptrAdd_undef₂ hp hd hv) fun d hd => .ptrAdd_ok hp hd
+  | ptrOffset e ih =>
+      simp only [evalE]
+      exact eval_bindPtr ih (fun ab h => .ptrOffset_abort h)
+        (fun v h hv => .ptrOffset_undef h hv) fun a k h => .ptrOffset_ok h
+  | ptrSomeE e ih =>
+      simp only [evalE]
+      exact eval_bindPtr ih (fun ab h => .ptrSomeE_abort h)
+        (fun v h hv => .ptrSomeE_undef h hv) fun a k h => .ptrSomeE_ok h
+  | ptrNoneE => exact .ptrNoneE
+  | ptrIsSome e ih =>
+      simp only [evalE]
+      exact eval_bindPtrOpt ih (fun ab h => .ptrIsSome_abort h)
+        (fun v h hv => .ptrIsSome_undef h hv) fun p h => .ptrIsSome_ok h
+  | ptrValue e ih =>
+      simp only [evalE]
+      refine eval_bindPtrOpt ih (fun ab h => .ptrValue_abort h)
+        (fun v h hv => .ptrValue_undef h hv) fun p h => ?_
+      cases p with
+      | none => exact .ptrValue_none h
+      | some pair =>
+          rcases pair with ⟨a, k⟩
+          exact .ptrValue_ok h
+  | recordField e field ih =>
+      simp only [evalE]
+      cases he : evalE cap ρ e with
+      | abort ab =>
+          rw [he] at ih
+          exact .recordField_abort ih
+      | ok v =>
+          rw [he] at ih
+          cases hf : v.recordField? field with
+          | some value => simpa [hf] using Eval.recordField_ok ih hf
+          | none => simpa [hf] using Eval.recordField_undef ih hf
   | allocArray e₁ e₂ ih₁ ih₂ =>
       simp only [evalE]
       refine eval_bindInt₂ ih₁ ih₂ (fun a h => .alloc_abort₁ h)
@@ -609,6 +732,13 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
       some (match evalE cap ρ e with
         | .ok v => .run k (ρ.update x v) σ μ
         | .abort a => a.toConfig)
+  | .run (.recordMake dst tag fields args :: k) ρ σ μ =>
+      some (match evalArgs cap ρ args with
+        | .abort ab => ab.toConfig
+        | .ok values =>
+            if fields.length = values.length then
+              .run k (ρ.update dst (.record tag (fields.zip values))) σ μ
+            else .undef)
   | .run (.store x ei ev :: k) ρ σ μ =>
       some ((evalE cap ρ ei).stepInt fun n =>
         (evalE cap ρ ev).stepInt fun w =>
@@ -699,6 +829,40 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
         match μ.cellAtU64 a k' with
         | some (some _) => .run k ρ σ (μ.putCellU64 a k' none)
         | _ => .undef)
+  | .run (.rawIntoCellRecord tag size align e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        if μ.cellConvertibleRecord a k' size align then
+          .run k ρ σ (μ.putRecordCell a k' tag size align)
+        else .undef)
+  | .run (.rawFromCellRecord tag e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.emptyRecordSize a k' tag with
+        | some size => .run k ρ σ (μ.removeRecordCell a k' size)
+        | none => .undef)
+  | .run (.rawCellInitRecord tag ep ev :: k) ρ σ μ =>
+      some ((evalE cap ρ ep).stepPtr fun a k' =>
+        match evalE cap ρ ev with
+        | .abort ab => ab.toConfig
+        | .ok value =>
+            match value.recordForTag? tag, μ.emptyRecordSize a k' tag with
+            | some _, some _ => .run k ρ σ (μ.setRecordValue a k' (some value))
+            | _, _ => .undef)
+  | .run (.rawCellReadRecord tag dst e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.recordValueAt a k' tag with
+        | some value => .run k (ρ.update dst value) σ μ
+        | none => .undef)
+  | .run (.rawCellTakeRecord tag dst e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.recordValueAt a k' tag with
+        | some value =>
+            .run k (ρ.update dst value) σ (μ.setRecordValue a k' none)
+        | none => .undef)
+  | .run (.rawCellDropRecord tag e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.recordValueAt a k' tag with
+        | some _ => .run k ρ σ (μ.setRecordValue a k' none)
+        | none => .undef)
   | .done _ => none
   | .trapped _ => none
   | .undef => none
@@ -711,6 +875,9 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   cases h with
   | assign_ok h => simp [stepF, h.evalE_eq]
   | assign_abort h => simp [stepF, h.evalE_eq]
+  | recordMake_ok ha hn => simp [stepF, ha.evalArgs_eq, hn]
+  | recordMake_undef_arity ha hn => simp [stepF, ha.evalArgs_eq, hn]
+  | recordMake_abort ha => simp [stepF, ha.evalArgs_eq]
   | store_ok hi hv ha h₀ h₁ => simp [stepF, hi.evalE_eq, hv.evalE_eq, ha, h₀, h₁]
   | store_oob hi hv ha hoob =>
       simp only [stepF, hi.evalE_eq, hv.evalE_eq, EOut.stepInt_int, ha]
@@ -812,6 +979,41 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   | cellDropU64_bad h hc => simp [stepF, h.evalE_eq]
   | cellDropU64_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
   | cellDropU64_abort h => simp [stepF, h.evalE_eq]
+  | intoCellRecord_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | intoCellRecord_bad h hc => simp [stepF, h.evalE_eq, hc]
+  | intoCellRecord_undef_ptr h hv =>
+      simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | intoCellRecord_abort h => simp [stepF, h.evalE_eq]
+  | fromCellRecord_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | fromCellRecord_bad h hc => simp [stepF, h.evalE_eq, hc]
+  | fromCellRecord_undef_ptr h hv =>
+      simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | fromCellRecord_abort h => simp [stepF, h.evalE_eq]
+  | cellInitRecord_ok hp hv ht hc =>
+      rcases ht with ⟨stored, ht⟩
+      simp [stepF, hp.evalE_eq, hv.evalE_eq, ht, hc]
+  | cellInitRecord_bad hp hv hbad =>
+      simp only [stepF, hp.evalE_eq, hv.evalE_eq, EOut.stepPtr_ptr]
+      rcases hbad with ht | hc <;> split <;> simp_all
+  | cellInitRecord_abort_val hp hv => simp [stepF, hp.evalE_eq, hv.evalE_eq]
+  | cellInitRecord_undef_ptr hp hv =>
+      simp [stepF, hp.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellInitRecord_abort_ptr hp => simp [stepF, hp.evalE_eq]
+  | cellReadRecord_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | cellReadRecord_bad h hc => simp [stepF, h.evalE_eq, hc]
+  | cellReadRecord_undef_ptr h hv =>
+      simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellReadRecord_abort h => simp [stepF, h.evalE_eq]
+  | cellTakeRecord_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | cellTakeRecord_bad h hc => simp [stepF, h.evalE_eq, hc]
+  | cellTakeRecord_undef_ptr h hv =>
+      simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellTakeRecord_abort h => simp [stepF, h.evalE_eq]
+  | cellDropRecord_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | cellDropRecord_bad h hc => simp [stepF, h.evalE_eq, hc]
+  | cellDropRecord_undef_ptr h hv =>
+      simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellDropRecord_abort h => simp [stepF, h.evalE_eq]
 
 private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Int → Config}
@@ -831,6 +1033,8 @@ private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ 
     | ptr a k => simpa [EOut.stepInt] using Hundef _ ih nofun
     | arr a => simpa [EOut.stepInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepInt] using Hundef _ ih nofun
+    | ptrOpt p => simpa [EOut.stepInt] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.stepInt] using Hundef _ ih nofun
 
 private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Bool → Config}
@@ -850,6 +1054,8 @@ private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀
     | ptr a k => simpa [EOut.stepBool] using Hundef _ ih nofun
     | arr a => simpa [EOut.stepBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepBool] using Hundef _ ih nofun
+    | ptrOpt p => simpa [EOut.stepBool] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.stepBool] using Hundef _ ih nofun
 
 private theorem step_stepPtr {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Int → Int → Config}
@@ -869,6 +1075,8 @@ private theorem step_stepPtr {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ 
     | bool b => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | arr a => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | ptrOpt p => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.stepPtr] using Hundef _ ih nofun
 
 /-- Everything `stepF` computes is a step. -/
 theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
@@ -895,6 +1103,18 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           cases ho : evalE cap ρ e with
           | ok v => exact .assign_ok (ho ▸ evalE_eval cap ρ e)
           | abort a => exact .assign_abort (ho ▸ evalE_eval cap ρ e)
+      | recordMake dst tag fields args =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          cases ha : evalArgs cap ρ args with
+          | abort ab => exact .recordMake_abort (ha ▸ evalArgs_evalArgs cap ρ args)
+          | ok values =>
+              by_cases hn : fields.length = values.length
+              · simpa [hn] using Step.recordMake_ok (P := P) (k := k) (σ := σ)
+                  (ha ▸ evalArgs_evalArgs cap ρ args) hn
+              · simpa [hn] using Step.recordMake_undef_arity (P := P) (k := k)
+                  (σ := σ) (dst := dst) (tag := tag)
+                  (ha ▸ evalArgs_evalArgs cap ρ args) hn
       | store x ei ev =>
           simp only [stepF, Option.some.injEq] at h
           subst h
@@ -975,8 +1195,8 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           refine step_stepPtr (fun ab he => .free_abort he)
             (fun v he hv => .free_undef_ptr he hv) fun a k' he => ?_
           cases hf : μ.freeable a k' with
-          | true => rw [if_pos (by simp [hf])]; exact .free_ok he hf
-          | false => rw [if_neg (by simp [hf])]; exact .free_undef_dead he hf
+          | true => rw [if_pos (by simp)]; exact .free_ok he hf
+          | false => rw [if_neg (by simp)]; exact .free_undef_dead he hf
       | rawLoad8 dst e =>
           simp only [stepF, Option.some.injEq] at h
           subst h
@@ -1013,8 +1233,8 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           refine step_stepPtr (fun ab he => .intoCellU64_abort he)
             (fun v he hv => .intoCellU64_undef_ptr he hv) fun a k' he => ?_
           cases hc : μ.cellConvertibleU64 a k' with
-          | true => rw [if_pos (by simp [hc])]; exact .intoCellU64_ok he hc
-          | false => rw [if_neg (by simp [hc])]; exact .intoCellU64_bad he hc
+          | true => rw [if_pos (by simp)]; exact .intoCellU64_ok he hc
+          | false => rw [if_neg (by simp)]; exact .intoCellU64_bad he hc
       | rawFromCellU64 e =>
           simp only [stepF, Option.some.injEq] at h
           subst h
@@ -1070,6 +1290,68 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
               cases s with
               | none => simpa [hc] using Step.cellDropU64_bad he (by simp [hc])
               | some w => simpa [hc] using Step.cellDropU64_ok he hc
+      | rawIntoCellRecord tag size align e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .intoCellRecord_abort he)
+            (fun v he hv => .intoCellRecord_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.cellConvertibleRecord a k' size align with
+          | true =>
+              rw [if_pos (by simp)]
+              exact .intoCellRecord_ok he hc
+          | false =>
+              rw [if_neg (by simp)]
+              exact .intoCellRecord_bad he hc
+      | rawFromCellRecord tag e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .fromCellRecord_abort he)
+            (fun v he hv => .fromCellRecord_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.emptyRecordSize a k' tag with
+          | some size => simpa [hc] using Step.fromCellRecord_ok he hc
+          | none => simpa [hc] using Step.fromCellRecord_bad he hc
+      | rawCellInitRecord tag ep ev =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab hp => .cellInitRecord_abort_ptr hp)
+            (fun v hp hv => .cellInitRecord_undef_ptr hp hv) fun a k' hp => ?_
+          cases hv : evalE cap ρ ev with
+          | abort ab => exact .cellInitRecord_abort_val hp (hv ▸ evalE_eval cap ρ ev)
+          | ok value =>
+              have hvalue : Eval cap ρ ev (.ok value) := hv ▸ evalE_eval cap ρ ev
+              cases ht : value.recordForTag? tag with
+              | none => simpa [ht] using Step.cellInitRecord_bad hp hvalue (Or.inl ht)
+              | some stored =>
+                  cases hc : μ.emptyRecordSize a k' tag with
+                  | none =>
+                      simpa [ht, hc] using Step.cellInitRecord_bad hp hvalue (Or.inr hc)
+                  | some size =>
+                      simpa [ht, hc] using
+                        Step.cellInitRecord_ok hp hvalue ⟨stored, ht⟩ hc
+      | rawCellReadRecord tag dst e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .cellReadRecord_abort he)
+            (fun v he hv => .cellReadRecord_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.recordValueAt a k' tag with
+          | some value => simpa [hc] using Step.cellReadRecord_ok (dst := dst) he hc
+          | none => simpa [hc] using Step.cellReadRecord_bad (dst := dst) he hc
+      | rawCellTakeRecord tag dst e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .cellTakeRecord_abort he)
+            (fun v he hv => .cellTakeRecord_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.recordValueAt a k' tag with
+          | some value => simpa [hc] using Step.cellTakeRecord_ok (dst := dst) he hc
+          | none => simpa [hc] using Step.cellTakeRecord_bad (dst := dst) he hc
+      | rawCellDropRecord tag e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .cellDropRecord_abort he)
+            (fun v he hv => .cellDropRecord_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.recordValueAt a k' tag with
+          | some value => simpa [hc] using Step.cellDropRecord_ok he hc
+          | none => simpa [hc] using Step.cellDropRecord_bad he hc
 
 /-- The two presentations of the machine step agree. -/
 theorem step_iff_stepF {P : Prog} {cap : Int} {c c' : Config} :
@@ -1122,7 +1404,7 @@ def IntTy.render : IntTy → String
   | .i8 => "i8" | .i16 => "i16" | .i32 => "i32" | .i64 => "i64"
   | .u8 => "u8" | .u16 => "u16" | .u32 => "u32" | .u64 => "u64"
 
-def Val.render : Val → String
+partial def Val.render : Val → String
   | .unit => "unit"
   | .int n => s!"int {n}"
   | .bool b => s!"bool {b}"
@@ -1132,10 +1414,16 @@ def Val.render : Val → String
         ((List.range a.len.toNat).map fun i => toString (a.get (Int.ofNat i))) ++ "]"
   | .opt none => "opt none"
   | .opt (some n) => s!"opt some {n}"
+  | .ptrOpt none => "ptrOpt none"
+  | .ptrOpt (some (a, k)) => s!"ptrOpt some {a}+{k}"
+  | .record tag fields =>
+      "record " ++ toString tag ++ " {" ++ String.intercalate ", "
+        (fields.map fun (name, value) => name ++ "=" ++ value.render) ++ "}"
 
 def Trap.render : Trap → String
   | .overflow t => s!"trap overflow {t.render}"
   | .divByZero => "trap divByZero"
+  | .optionNone => "trap optionNone"
   | .indexOOB i len => s!"trap indexOOB {i} {len}"
   | .narrowOOB t n => s!"trap narrowOOB {t.render} {n}"
   | .oom len => s!"trap oom {len}"

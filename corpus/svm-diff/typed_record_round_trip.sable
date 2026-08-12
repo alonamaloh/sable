@@ -1,0 +1,54 @@
+// Abstract POD records in the formal SVM: nullable raw links and payload stay
+// values, never bytes. The empty typed extent is explicitly zero-filled when
+// it returns to the exposure's raw span.
+
+record Node #[layout(size := 24, align := 8)] {
+    #[offset(0)] option<raw<Node>> previous;
+    #[offset(8)] option<raw<Node>> next;
+    #[offset(16)] u64 payload;
+}
+
+fn round_trip() -> u64 {
+    mut [u8] bytes = alloc_array<u8>(24, 7);
+    mut u64 out = 0;
+    unsafe expose &mut bytes as (base, resource mem) {
+        raw<Node> p = raw_cast<Node>(base);
+        mut resource PointsTo<Node> cell = raw_into_cell<Node>(p, mem);
+        Node node = Node(none, some(p), 42);
+        raw_cell_init<Node>(p, node, &mut cell);
+        Node copy = raw_cell_read<Node>(p, &cell);
+        raw<Node> next = copy.next.value;
+        out = copy.payload + raw_pointer_offset<Node>(next);
+        Node taken = raw_cell_take<Node>(p, &mut cell);
+        resource RawSpan returned = raw_from_cell<Node>(p, cell);
+        mem = returned;
+    }
+    return out + widen<u64>(bytes[23]);
+}
+
+fn none_projection() -> bool {
+    Node node = Node(none, none, 7);
+    return node.next.is_some;
+}
+
+fn return_record() -> Node {
+    Node node = Node(none, none, 11);
+    return node;
+}
+
+fn return_none() -> option<raw<Node>> {
+    return none;
+}
+
+fn return_some() -> option<raw<Node>> {
+    unsafe static_alloc(24) as (base, resource mem);
+    unsafe {
+        raw<Node> p = raw_cast<Node>(base);
+    }
+    return some(p);
+}
+
+fn none_value() -> raw<Node> {
+    option<raw<Node>> p = none;
+    return p.value;
+}
