@@ -2072,8 +2072,28 @@ All U8 exit criteria are now met:
 
 ### U9 — aggregate resources and intrusive list
 
-Implement the real `ResourceMap` operations and an intrusive doubly linked list
-whose nodes live in one arena for the first version.
+**The U9a generic authority probe is complete (2026-08-12, ADR 0053).** A
+`ResourceMapView<K, V>` is a genuine partial map, while its affine token's
+hidden interpretation carries agreement and pairwise separation for every
+contained resource. Generic context theorems prove sealed take and put, exact
+view round trips, and framing against the rest of the affine context. A
+footprint-preserving mutable entry update is derived as take–mutate–put rather
+than added as another authority axiom.
+
+The same probe states an intrusive doubly linked list as ordinary raw links
+related to an abstract key sequence over
+`ResourceMap<Int, PointsToView<IntrusiveNode>>`; no heap or separating
+conjunction appears in that visible invariant. The first version deliberately
+uses one arena: map keys are offsets, every node pointer shares live
+provenance, equality reduces to offset equality, and ordering reduces to
+offset ordering. Cross-allocation pointer equality remains deferred.
+
+Next implement the real `ResourceMap` operations. Start with the existing
+`PointsTo<u64>` role to isolate generic aggregate plumbing, then add the typed
+record, `raw<Node>`, and `option<raw<Node>>` prerequisites the actual list
+forces. Do not substitute integer links or another specialized header role;
+that would evade U9's acceptance test. The final subject is an intrusive
+doubly linked list whose nodes live in one arena for the first version.
 
 Runtime state:
 
