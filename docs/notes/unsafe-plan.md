@@ -1946,6 +1946,22 @@ policy-bearing checked traversal operation that receives both ordinary
 `StoredChain`. Use that operation in the positive subject before attempting a
 loop or predecessor-link mutation.
 
+**The U8f2 compiler slice is complete (2026-08-12, ADR 0046).**
+`allocator_step_header(&mut state, limit, current)` now requires a
+non-sentinel `StoredChain state limit current` and transfers the exact stored
+header without adding a runtime instruction. The positive subject constructs
+the initial chain and proves its runtime header-size, ordering, and root-bound
+assertions from `StoredChain.step` plus the values actually read from memory;
+it remains 20/20 and dynamically returns 64. Sentinel traversal fails at the
+new named obligation. The complete single-worker corpus and focused
+regressions pass.
+
+Next write a read-only traversal loop that reinserts every inspected header
+before advancing. Its invariant must pair the ordinary `current` value with
+the tail `StoredChain`, and its variant must be `limit - current`. Stop before
+predecessor-link mutation, splitting, or leasing: first test whether loop havoc
+preserves this proof shape cleanly with zero `assume` and zero `defer`.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;

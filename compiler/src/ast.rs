@@ -206,6 +206,8 @@ pub enum ResOp {
     /// and a temporary affine handle used by a traversal step.
     AllocatorTakeHeader,
     AllocatorPutHeader,
+    /// Policy-bearing header extraction for one sorted traversal step.
+    AllocatorStepHeader,
     FreeBlockSplit,
     FreeBlockJoin,
     FreeBlockLease,
@@ -227,6 +229,7 @@ impl ResOp {
             "allocator_put_free" => Some(ResOp::AllocatorPutFree),
             "allocator_take_header" => Some(ResOp::AllocatorTakeHeader),
             "allocator_put_header" => Some(ResOp::AllocatorPutHeader),
+            "allocator_step_header" => Some(ResOp::AllocatorStepHeader),
             "free_block_split" => Some(ResOp::FreeBlockSplit),
             "free_block_join" => Some(ResOp::FreeBlockJoin),
             "free_block_lease" => Some(ResOp::FreeBlockLease),
@@ -249,6 +252,7 @@ impl ResOp {
             ResOp::AllocatorPutFree => "allocator_put_free",
             ResOp::AllocatorTakeHeader => "allocator_take_header",
             ResOp::AllocatorPutHeader => "allocator_put_header",
+            ResOp::AllocatorStepHeader => "allocator_step_header",
             ResOp::FreeBlockSplit => "free_block_split",
             ResOp::FreeBlockJoin => "free_block_join",
             ResOp::FreeBlockLease => "free_block_lease",

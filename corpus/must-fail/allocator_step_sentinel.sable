@@ -1,0 +1,7 @@
+// expect-error: allocator_step_sentinel.allocator_step_header.0
+// The root-length sentinel is not a header and may not be traversed.
+
+pub fn allocator_step_sentinel(resource &mut AllocatorState state) {
+    resource FreeHeader header = allocator_step_header(&mut state, 0, 0);
+    allocator_put_header(&mut state, header);
+}

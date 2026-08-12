@@ -3147,6 +3147,7 @@ fn is_reserved_name(name: &str) -> bool {
         "raw_header_clear",
         "allocator_take_header",
         "allocator_put_header",
+        "allocator_step_header",
         "static_alloc",
         "system_alloc",
         "system_dealloc",

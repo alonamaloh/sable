@@ -643,6 +643,104 @@ theorem AllocatorView.takeFree_putFields_canPutHeader
       FreeHeaderView.putFields, AllocatorView.takeFree,
       AllocatorView.leaseAt, BlockLeaseView.toFree] using htake.1.2
 
+def FreeHeaderView.hasFields
+    (header : FreeHeaderView) (size next : Int) : Prop :=
+  header.sizeCell.state = .init size ∧
+  header.nextCell.state = .init next
+
+def AllocatorView.storesHeader
+    (v : AllocatorView) (key : Int) (header : FreeHeaderView) : Prop :=
+  v.headers key = some header ∧
+  v.free key = none ∧
+  header.key = key ∧
+  header.wf ∧
+  header.allocator = v.allocator
+
+inductive AllocatorView.StoredChain
+    (v : AllocatorView) (limit : Int) : Int → Prop where
+  | nil : StoredChain v limit limit
+  | cons (key size next : Int) (header : FreeHeaderView)
+      (stored : v.storesHeader key header)
+      (fields : header.hasFields size next)
+      (key_nonneg : 0 ≤ key)
+      (header_fits : freeHeaderBytes ≤ size)
+      (ordered_disjoint : key + size ≤ next)
+      (next_bounded : next ≤ limit)
+      (tail : StoredChain v limit next) : StoredChain v limit key
+
+theorem AllocatorView.storesHeader_headerAt
+    {v : AllocatorView} {key : Int} {header : FreeHeaderView}
+    (h : v.storesHeader key header) : v.headerAt key = header := by
+  simp [AllocatorView.headerAt, h.1]
+
+theorem AllocatorView.storesHeader_canTake
+    {v : AllocatorView} {key : Int} {header : FreeHeaderView}
+    (h : v.storesHeader key header) : v.canTakeHeader key := by
+  have hat : v.headerAt key = header :=
+    AllocatorView.storesHeader_headerAt h
+  exact ⟨by simp [h.1], h.2.1, by simpa [hat] using h.2.2.1,
+    by simpa [hat] using h.2.2.2.1,
+    by simpa [hat] using h.2.2.2.2⟩
+
+theorem AllocatorView.StoredChain.step
+    {v : AllocatorView} {limit head : Int}
+    (chain : v.StoredChain limit head) (hne : head ≠ limit) :
+    ∃ header size next,
+      v.storesHeader head header ∧
+      header.hasFields size next ∧
+      freeHeaderBytes ≤ size ∧
+      head + size ≤ next ∧
+      next ≤ limit ∧
+      v.StoredChain limit next := by
+  cases chain with
+  | nil => exact (hne rfl).elim
+  | cons key size next header stored fields hkey hheader horder hbound tail =>
+      exact ⟨header, size, next, stored, fields, hheader, horder, hbound, tail⟩
+
+theorem AllocatorView.StoredChain.takeable
+    {v : AllocatorView} {limit head : Int}
+    (chain : v.StoredChain limit head) (hne : head ≠ limit) :
+    v.canTakeHeader head := by
+  obtain ⟨header, _, _, stored, _⟩ := chain.step hne
+  exact AllocatorView.storesHeader_canTake stored
+
+theorem AllocatorView.StoredChain.step_variant
+    {v : AllocatorView} {limit head : Int}
+    (chain : v.StoredChain limit head) (hne : head ≠ limit) :
+    ∃ next, 0 ≤ limit - next ∧ limit - next < limit - head ∧
+      v.StoredChain limit next := by
+  obtain ⟨_, size, next, _, _, hheader, horder, hbound, tail⟩ :=
+    chain.step hne
+  refine ⟨next, by omega, ?_, tail⟩
+  simp [freeHeaderBytes, u64.layout] at hheader
+  omega
+
+theorem AllocatorView.StoredChain.extract_restore
+    {v : AllocatorView} {limit head : Int}
+    (chain : v.StoredChain limit head) (hne : head ≠ limit) :
+    (v.takeHeader head).putHeader (v.headerAt head) = v := by
+  exact AllocatorView.takeHeader_putHeader v head (chain.takeable hne)
+
+theorem AllocatorView.StoredChain.singleAfterPut
+    {v : AllocatorView} {header : FreeHeaderView} {size limit : Int}
+    (hput : v.canPutHeader header)
+    (hfields : header.hasFields size limit)
+    (hkey : 0 ≤ header.key)
+    (hsize : freeHeaderBytes ≤ size)
+    (hbound : header.key + size ≤ limit) :
+    (v.putHeader header).StoredChain limit header.key := by
+  apply AllocatorView.StoredChain.cons header.key size limit header
+  · exact ⟨by simp [AllocatorView.putHeader],
+      by simpa [AllocatorView.putHeader] using hput.2.2.1,
+      rfl, hput.2.1,
+      by change header.allocator = v.allocator; exact hput.1⟩
+  · exact hfields
+  · exact hkey
+  · exact hsize
+  · exact hbound
+  · omega
+  · exact AllocatorView.StoredChain.nil
+
 @[simp] theorem FreeBlockView.split_joinable (v : FreeBlockView) (n : Int) :
     (v.prefix n).joinable (v.suffix n) := by
   simp [FreeBlockView.joinable, FreeBlockView.prefix, FreeBlockView.suffix]

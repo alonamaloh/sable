@@ -2650,6 +2650,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let op = *op;
             let op_span = *op_span;
             let arity = match op {
+                ResOp::AllocatorStepHeader => 3,
                 ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf
                 | ResOp::AllocatorTake | ResOp::AllocatorPut
                 | ResOp::AllocatorTakeFree | ResOp::AllocatorPutFree
@@ -2807,6 +2808,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     transfer(ctx, &args[1], None)?;
                     check_borrow_conflicts(ctx, args, None)?;
                     Ty::Unit
+                }
+                ResOp::AllocatorStepHeader => {
+                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], want)?;
+                    check_expr(ctx, &mut args[0], Some(want))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    check_expr(ctx, &mut args[2], Some(Ty::Int(IntTy::U64)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::FreeHeader)
                 }
                 ResOp::FreeBlockSplit => {
                     let block = Ty::ResRef(ResKind::FreeBlock, Mutability::Mut);
