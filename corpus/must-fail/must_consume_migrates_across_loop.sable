@@ -1,0 +1,32 @@
+// expect-error: resource.loop_shape
+// Keeping every resource live is not enough at a loop backedge. The
+// must-consume obligation travels with its original token, and restoring
+// the loop-head snapshot must not erase its new location.
+
+fn consume(resource RawSpan s) {
+}
+
+class Twin {
+    #[must_consume] resource RawSpan required;
+    resource RawSpan other;
+
+    /// pre  #[label(a)] a.len ≥ 0
+    /// pre  #[label(b)] b.len ≥ 0
+    init of(resource RawSpan a, resource RawSpan b) {
+        self.required = a;
+        self.other = b;
+    }
+
+    deinit {
+        mut u64 n = 1;
+        /// invariant n ≤ 1
+        /// variant n
+        while (n > 0) {
+            resource RawSpan t = self.required;
+            self.required = self.other;
+            self.other = t;
+            n = 0;
+        }
+        consume(self.required);
+    }
+}

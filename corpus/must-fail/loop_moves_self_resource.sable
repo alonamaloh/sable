@@ -1,0 +1,27 @@
+// expect-error: resource.loop_shape
+// A field is a place in its own right. Moving `self.span` in the loop
+// must not be overlooked just because its flow-state entry is named
+// `self.span` while the place root is `self`.
+
+fn consume(resource RawSpan s) {
+}
+
+class Holder {
+    resource RawSpan span;
+
+    /// pre s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+
+    deinit {
+        mut u64 n = 1;
+        /// invariant n ≤ 1
+        /// variant n
+        while (n > 0) {
+            consume(self.span);
+            n = 0;
+        }
+        consume(self.span);
+    }
+}

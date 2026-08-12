@@ -235,6 +235,26 @@ the same thing, and the destructor is the one member where fields may
 legally move out. Templates now run the same three checks, and a doubled
 `unsafe_regions` increment in that path is gone.
 
+## Fourth pass: one identity at state boundaries
+
+`VarInfo` records a field under a rendered pseudo-variable key such as
+`self.span`; `Place` represents the same field as root `self` plus path
+`span`. Loop and branch shape checks, and exposure-scope cleanup, asked
+whether a snapshot contained only `place.root`. For a field that meant
+looking for `self`, which does not exist. A loop could consume a field and
+then restore it as live, while closing an exposure could delete an outer
+field's move marker. `Place::state_key` is now the single conversion used
+where place-keyed move state meets name-keyed flow state.
+
+Two related losses sat behind that mismatch. Closing an exposure deleted
+body locals without first rejecting a must-consume token held by one, and
+loop restoration checked affine liveness but not an obligation that
+migrated while every place remained live. Scope exit now rejects an
+outstanding obligation before removing locals; a loop backedge must agree
+with the head on brands and obligations before the zero-iteration snapshot
+is restored. The resource views still change under loop invariants — only
+the static ownership and lifetime shape must agree.
+
 ## Consequences
 
 - `Ctx::place_ty` replaces the per-category place queries; `affine_kind`

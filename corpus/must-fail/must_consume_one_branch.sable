@@ -1,8 +1,7 @@
-// expect-error: resource.abandoned
-// A `#[must_consume]` obligation is a state of the *place*, and it joins
-// path-sensitively: outstanding after a branch iff some reaching path left
-// it outstanding. Consuming the token on one path says nothing about the
-// other, and the union of moved places would have called this consumed.
+// expect-error: resource.branch_shape
+// A `#[must_consume]` resource field is part of the branch's resource
+// shape. Consuming it on one path and not the other leaves different
+// authority live, so the mismatch is rejected at the branch itself.
 
 fn eat(resource RawSpan s) {
 }

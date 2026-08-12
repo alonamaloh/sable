@@ -1681,7 +1681,7 @@ that falsifies its own invariant, so a second drop traps, and
 each path destroys at all. The second cannot live in `corpus/verifies` — a
 verifying file may not contain a deliberately failing call.
 
-**A third pass** closed the last four: branch and loop joins carried only part of
+**A third pass** closed four more: branch and loop joins carried only part of
 the per-place state, so traversal order decided the rest (and because the move set
 is a *union* over reaching branches, "consumed on one path" read as consumed — a
 destructor that closed a handle only inside an `if` was accepted); the extern
@@ -1703,7 +1703,25 @@ marker exists to protect. The standing limitation is now stated rather than
 implied: passing a marked token by value discharges the obligation, so the marker
 means *must leave this frame*, not *must reach a consuming primitive* — a
 do-nothing sink satisfies it, and fixing that needs the marker on a type, which
-is what `SystemDealloc` will force in U7b/U8.
+is what `SystemDealloc` will force before U8.
+
+### U7d — place-state closure *(done 2026-08-12, ADR 0030)*
+
+The last representation boundary is explicit now: `Place::state_key` maps
+`root + fields` to the complete `VarInfo` key, so `self.span` is never tested as
+though its state lived under `self`. Loop and branch shape checks use it, and
+exposure cleanup preserves move markers for outer fields. Cleanup also rejects
+a must-consume token held by a disappearing local before deleting the scope.
+Finally, a loop backedge must preserve brands and obligations as well as affine
+liveness, so restoring the zero-iteration snapshot cannot erase a token that
+migrated while every place remained live.
+
+This changes the staging ahead. U7b's first allocator uses only a
+program-lifetime static root and introduces no `SystemDealloc`. Before U8 adds
+deallocation authority, mandatory consumption must move from a field annotation
+to the resource type (or an equivalent declaration), propagate through owned
+parameters, and be discharged only by a declared consuming operation. A
+do-nothing by-value sink must not satisfy `SystemDealloc`.
 
 ### U7b — typed cells, layout, and static bump arena
 
@@ -1715,6 +1733,10 @@ Add:
 - init/read-copy/take/drop-in-place operations;
 - root/static allocation sources;
 - a program-lifetime static bump arena.
+
+Do not introduce `SystemDealloc` on this rung. The static root is deliberately
+non-deallocating; that keeps typed-storage state and layout separate from the
+interprocedural mandatory-consumption rule that U8 will need.
 
 Use fixed-width integers first. Add one explicitly laid-out record only after the
 integer path works.
@@ -1732,6 +1754,9 @@ Exit criteria:
 ### U8 — in-band free-list allocator
 
 Add allocator identities, `BlockLease`, in-band headers, free, and coalescing.
+Before adding those operations, make must-consume a resource-type property that
+propagates through owned parameters and reaches an explicitly consuming sink;
+then introduce `SystemDealloc` under that rule.
 
 Exit criteria:
 

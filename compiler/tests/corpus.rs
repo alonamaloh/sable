@@ -12,10 +12,16 @@ use std::thread;
 /// strings. The Lean checks dominate wall clock and the files are
 /// independent, so this is a near-linear speedup.
 fn parallel<T: Send>(items: Vec<T>, work: impl Fn(&T) -> Vec<String> + Sync) -> Vec<String> {
-    let n = thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4)
-        .min(8);
+    let n = std::env::var("SABLE_TEST_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+                .min(8)
+        });
     let items = Mutex::new(items.into_iter());
     let failures = Mutex::new(Vec::new());
     thread::scope(|s| {

@@ -1,0 +1,23 @@
+// expect-error: resource.use_after_move
+// Closing an exposure removes only places declared inside it. A move from
+// an outer `self` field survives the closing brace and remains a move.
+
+fn consume(resource RawSpan s) {
+}
+
+class Holder {
+    resource RawSpan span;
+
+    /// pre s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+
+    deinit {
+        mut [u8] bytes = alloc_array<u8>(1, 0);
+        unsafe expose &mut bytes as (p, resource mem) {
+            consume(self.span);
+        }
+        consume(self.span);
+    }
+}

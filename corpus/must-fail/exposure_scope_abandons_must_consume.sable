@@ -1,0 +1,19 @@
+// expect-error: resource.abandoned
+// An exposure is a scope, but scope exit is not a way to discharge a
+// must-consume token. A local holding one must hand it on before it dies.
+
+class Holder {
+    #[must_consume] resource RawSpan required;
+
+    /// pre s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.required = s;
+    }
+
+    deinit {
+        mut [u8] bytes = alloc_array<u8>(1, 0);
+        unsafe expose &mut bytes as (p, resource mem) {
+            resource RawSpan forgotten = self.required;
+        }
+    }
+}

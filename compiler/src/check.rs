@@ -138,8 +138,10 @@ fn class_tbounds(c: &ClassDecl) -> HashMap<String, (String, u8)> {
 
 /// An extern's signature must be ABI-representable and must not be able
 /// to hand storage back: retained pointers and ownership transfer to
-/// foreign code are out of scope for v1, so the *signature* forbids them
-/// rather than a rule about what the foreign code does (ADR 0027).
+/// foreign code are out of scope for v1. For a verified Sable callee the
+/// signature establishes nonescape; for foreign code it is an audited
+/// promise, because C could retain a pointer in state Sable cannot see
+/// (ADR 0027).
 fn check_extern_signature(f: &Fn) -> CResult<()> {
     // A whitelist, not a blacklist. Forbidding raw and resource returns
     // named the *storage* cases and missed the container: a class may hold
@@ -1242,7 +1244,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         // consumed inside a branch never outlives it.
                         let differ = first
                             .symmetric_difference(other)
-                            .find(|p| ctx.is_resource_place(p) && before.contains_key(&p.root));
+                            .find(|p| ctx.is_resource_place(p) && snapshot_has_place(&before, p));
                         if let Some(p) = differ {
                             return Err(Diagnostic {
                                 name: "resource.branch_shape".into(),
@@ -1307,7 +1309,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // shape. One declared and consumed inside the body is
                 // per-iteration scratch, not something the backedge owes.
                 if let Some(p) = ctx.moved.symmetric_difference(&before_moved).find(|p| {
-                    ctx.place_ty(p).is_some_and(is_affine) && before.contains_key(&p.root)
+                    ctx.place_ty(p).is_some_and(is_affine) && snapshot_has_place(&before, p)
                 }) {
                     return Err(Diagnostic {
                         name: format!("{}.loop_shape", ctx.affine_kind(p)),
@@ -1322,6 +1324,51 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                                 .into(),
                         )],
                     });
+                }
+                // The values may all still be live while ownership state
+                // migrates between them. Restoring the loop-head snapshot
+                // would then forget which value names loaned storage or
+                // carries a must-consume token. Those are part of the
+                // static backedge shape, unlike initialization (the loop
+                // may run zero times) and resource views (loop invariants
+                // describe how those change).
+                let after = snapshot(ctx);
+                for (name, was) in &before {
+                    let Some(now) = after.get(name) else {
+                        continue;
+                    };
+                    if was.branded != now.branded {
+                        return Err(Diagnostic {
+                            name: "expose.brand_escapes".into(),
+                            title: format!("the loop changes the loan state of `{name}`"),
+                            span: *kw_span,
+                            label: "the next iteration would name a different exposure lifetime"
+                                .into(),
+                            notes: vec![(
+                                "note".into(),
+                                "a loop must leave loan brands on the same places at the backedge; \
+                                 only the resource views may change under an invariant"
+                                    .into(),
+                            )],
+                        });
+                    }
+                    if was.obligation != now.obligation {
+                        return Err(Diagnostic {
+                            name: "resource.loop_shape".into(),
+                            title: format!(
+                                "the loop changes the must-consume state of `{name}`"
+                            ),
+                            span: *kw_span,
+                            label: "the backedge leaves the obligation on a different place".into(),
+                            notes: vec![(
+                                "note".into(),
+                                "a loop must leave must-consume obligations on the same places at \
+                                 the backedge; restoring the loop-head state must not forget a \
+                                 token that moved elsewhere"
+                                    .into(),
+                            )],
+                        });
+                    }
                 }
                 // The body may run zero times, so the state after the loop
                 // is the state before it. A body that consumed something
@@ -1609,8 +1656,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 //
                 // Names stay reserved in `ctx.declared`, so nothing later
                 // reuses one and reads as a reference to what is gone.
+                reject_scoped_obligations(ctx, &declared_before, *kw_span)?;
                 ctx.vars.retain(|name, _| declared_before.contains(name));
-                ctx.moved.retain(|p| declared_before.contains(&p.root));
+                ctx.moved
+                    .retain(|p| declared_before.contains(&p.state_key()));
             }
             Stmt::Assert(_) => {
                 // Proof language: elaborated by Lean (well-formedness def)
@@ -3260,6 +3309,13 @@ impl Place {
         }
         s
     }
+
+    /// The `VarInfo` entry that carries this place's flow state. Fields
+    /// of `self` are represented as pseudo-variables (`self.f`), so using
+    /// only `root` would ask for `self`, an entry that does not exist.
+    fn state_key(&self) -> String {
+        self.render()
+    }
 }
 
 /// The place an argument borrows, and whether the borrow is mutable. A
@@ -3466,8 +3522,14 @@ fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<b
         reject_brand_escape(ctx, e, how, span)?;
     }
     let source = match &e.kind {
-        ExprKind::Var(n) => Some(n.clone()),
-        ExprKind::SelfField { field } => Some(format!("self.{field}")),
+        ExprKind::Var(n) => Some(Place::local(n).state_key()),
+        ExprKind::SelfField { field } => Some(
+            Place {
+                root: "self".to_string(),
+                fields: vec![field.clone()],
+            }
+            .state_key(),
+        ),
         _ => None,
     };
     let mut carries = false;
@@ -3489,8 +3551,8 @@ const MARKED_NONE: &[(String, Span)] = &[];
 
 /// Everything the checker knows about a place, as one value.
 ///
-/// Branch and loop joins are defined over this rather than over a chosen
-/// subset, so a fact added later joins with the rest instead of leaking
+/// Branch joins and loop backedge checks use this rather than a chosen
+/// subset, so a fact added later travels with the rest instead of leaking
 /// out of whichever path was walked last (ADR 0030). Move state is the
 /// exception and lives in `Ctx::moved`, because it is keyed by `Place`
 /// rather than by name — a field is a place its object's name cannot
@@ -3518,6 +3580,10 @@ fn snapshot(ctx: &Ctx) -> HashMap<String, PlaceState> {
         .collect()
 }
 
+fn snapshot_has_place(snap: &HashMap<String, PlaceState>, place: &Place) -> bool {
+    snap.contains_key(&place.state_key())
+}
+
 fn restore(ctx: &mut Ctx, snap: &HashMap<String, PlaceState>) {
     for (name, v) in ctx.vars.iter_mut() {
         if let Some(st) = snap.get(name) {
@@ -3530,6 +3596,39 @@ fn restore(ctx: &mut Ctx, snap: &HashMap<String, PlaceState>) {
             v.initialized = false;
         }
     }
+}
+
+/// An exposure is a real scope: its bindings and body locals disappear
+/// when the loan closes. A must-consume token may not disappear with a
+/// local, though; it must be consumed inside the exposure or moved into a
+/// place that survives it.
+fn reject_scoped_obligations(
+    ctx: &Ctx,
+    declared_before: &HashSet<String>,
+    span: Span,
+) -> CResult<()> {
+    let mut abandoned: Vec<&String> = ctx
+        .vars
+        .iter()
+        .filter(|(name, v)| !declared_before.contains(*name) && v.obligation)
+        .map(|(name, _)| name)
+        .collect();
+    abandoned.sort();
+    let Some(name) = abandoned.first() else {
+        return Ok(());
+    };
+    Err(Diagnostic {
+        name: "resource.abandoned".into(),
+        title: format!("closing the exposure abandons `{name}`"),
+        span,
+        label: "this local scope ends with a must-consume token".into(),
+        notes: vec![(
+            "note".into(),
+            "consume the authority inside the exposure or move it into a place that \
+             survives the closing brace"
+                .into(),
+        )],
+    })
 }
 
 /// Whether a field carries the `#[must_consume]` marker.
@@ -3677,12 +3776,7 @@ impl<'a> Ctx<'a> {
     /// pseudo-var, which is where a field's type lives; nothing deeper
     /// than one projection is nameable yet.
     fn place_ty(&self, p: &Place) -> Option<Ty> {
-        let name = match p.fields.as_slice() {
-            [] => p.root.clone(),
-            [f] => format!("{}.{}", p.root, f),
-            _ => return None,
-        };
-        self.vars.get(name.as_str()).map(|v| v.ty)
+        self.vars.get(&p.state_key()).map(|v| v.ty)
     }
 
     /// Whether this place names a resource.
