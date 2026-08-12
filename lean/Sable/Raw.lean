@@ -846,6 +846,33 @@ theorem AllocatorView.returnable_takeAdjacentHeader_clearInterior
       apply successorClear k hafter
       omega
 
+/-- After taking an adjacent stored predecessor, its empty interior and the
+returned lease's collision frame combine into one empty interior. The lease
+key itself is empty by `returnable`; all later keys come from the lease's
+strict interior frame. -/
+theorem AllocatorView.takeHeader_returnableAdjacent_clearInterior
+    {v : AllocatorView} {lease : BlockLeaseView}
+    {previous size : Int}
+    (hreturn : v.returnable lease)
+    (adjacent : previous + size = lease.key)
+    (previousClear : (v.takeHeader previous).clearInterior previous size) :
+    (v.takeHeader previous).clearInterior
+      previous (size + lease.span.len) := by
+  intro k hlo hhi
+  by_cases hbefore : k < lease.key
+  · apply previousClear k hlo
+    omega
+  · by_cases hat : k = lease.key
+    · subst k
+      have hne : lease.key ≠ previous := by omega
+      exact ⟨hreturn.1.2.1,
+        by simpa [AllocatorView.takeHeader, hne] using hreturn.1.2.2⟩
+    · have hafter : lease.key < k := by omega
+      obtain ⟨hfree, hheaders⟩ := hreturn.2.2.2.2 k hafter (by omega)
+      have hne : k ≠ previous := by omega
+      exact ⟨hfree,
+        by simpa [AllocatorView.takeHeader, hne] using hheaders⟩
+
 theorem AllocatorView.clearInterior_takeHeader
     {v : AllocatorView} {key size : Int}
     (hclear : v.clearInterior key size) :
@@ -1816,6 +1843,76 @@ theorem AllocatorView.InsertionLocation.insertAfter
           omega
         simp [AllocatorView.takeHeader, AllocatorView.putHeader,
           hkPrevious, hkInserted, hkRelinked]
+      exact priorPath.splice location.1 agree rebuilt
+
+/-- Replace the stored predecessor at an insertion location with another
+header at the same key. This is the list-structural core of predecessor
+coalescing: the caller proves the larger byte extent and fields, while this
+lemma preserves the untouched suffix and splices the unchanged prefix back
+over the replacement. -/
+theorem AllocatorView.InsertionLocation.replacePredecessor
+    {v : AllocatorView}
+    {limit start key gapSize previous current previousSize replacementSize : Int}
+    (location : v.InsertionLocation
+      limit start key gapSize previous current)
+    (notHead : current ≠ start)
+    {predecessor replacement : FreeHeaderView}
+    (predecessorStored : v.storesHeader previous predecessor)
+    (predecessorFields : predecessor.hasFields previousSize current)
+    (replacementKey : replacement.key = previous)
+    (replacementFields : replacement.hasFields replacementSize current)
+    (replacementExtent : replacement.toFree.span.len = replacementSize)
+    (replacementClear :
+      (v.takeHeader previous).clearInterior replacement.key replacementSize)
+    (replacementRoot : replacement.sizeCell.alloc =
+      (v.takeHeader previous).root.alloc)
+    (canPutReplacement :
+      (v.takeHeader previous).canPutHeader replacement)
+    (replacementNonneg : 0 ≤ replacement.key)
+    (replacementMin : freeHeaderBytes ≤ replacementSize)
+    (replacementOrder : replacement.key + replacementSize ≤ current) :
+    ((v.takeHeader previous).putHeader replacement
+      ).StoredChain limit start := by
+  cases pathEq : location.2.1 with
+  | nil => exact (notHead rfl).elim
+  | step priorPath predecessorNotEnd pathStored pathFields beforeKey =>
+      have previousChain : v.StoredChain limit previous := by
+        simpa using priorPath.tail location.1
+      have previousMatch := previousChain.takeMatchingHead
+        predecessorNotEnd predecessorStored predecessorFields
+      have previousMin := previousMatch.2.2.1
+      have previousCurrent : previous < current := by
+        have previousOrder := previousMatch.2.2.2.1
+        simp [freeHeaderBytes, u64.layout] at previousMin
+        omega
+      have currentChain : v.StoredChain limit current :=
+        location.currentChain
+      have tailAfterTake :
+          (v.takeHeader previous).StoredChain limit current :=
+        currentChain.takeHeaderBefore previousCurrent
+      have rebuiltAtKey :
+          ((v.takeHeader previous).putHeader replacement).StoredChain
+            limit replacement.key := by
+        apply AllocatorView.StoredChain.prependAfterPut
+          tailAfterTake canPutReplacement replacementFields
+          replacementExtent replacementClear replacementRoot
+          replacementNonneg replacementMin replacementOrder
+        exact currentChain.head_le_limit
+      have rebuilt :
+          ((v.takeHeader previous).putHeader replacement).StoredChain
+            limit previous := by
+        rw [replacementKey] at rebuiltAtKey
+        exact rebuiltAtKey
+      have agree : v.AgreesBelow
+          ((v.takeHeader previous).putHeader replacement) previous := by
+        refine ⟨rfl, rfl, ?_⟩
+        intro k hk
+        have hkPrevious : k ≠ previous := by omega
+        have hkReplacement : k ≠ replacement.key := by
+          rw [replacementKey]
+          omega
+        simp [AllocatorView.takeHeader, AllocatorView.putHeader,
+          hkPrevious, hkReplacement]
       exact priorPath.splice location.1 agree rebuilt
 
 /-- First-fit together with the runtime predecessor needed by a later unlink.

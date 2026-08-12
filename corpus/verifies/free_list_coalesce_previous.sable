@@ -1,0 +1,389 @@
+// U8g3 predecessor-only coalescing inside a sorted free list. The returned
+// lease begins exactly where its stored predecessor ends and remains strictly
+// before the successor, so both byte authorities become one replacement
+// header at the predecessor's original key.
+
+use free_list_insert_after;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] limit = state.root.len
+/// pre  #[label(chain)]
+///        Sable.AllocatorView.StoredChain state limit head
+/// pre  #[label(returnable)] state.returnable lease
+/// pre  #[label(key)] lease.key = key
+/// pre  #[label(size)] lease.span.len = size
+/// pre  #[label(header)] Sable.freeHeaderBytes ≤ size ∧
+///        key % u64.layout.align = 0
+/// pre  #[label(location)] Sable.AllocatorView.InsertionLocation
+///        state limit head key size previous current
+/// pre  #[label(interior)] current != head
+/// pre  #[label(adjacent)] ∃ predecessor previousSize,
+///        state.storesHeader previous predecessor ∧
+///        predecessor.hasFields previousSize current ∧
+///        previous + previousSize = key
+/// pre  #[label(before)] key + size < current
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state limit head
+pub fn free_list_coalesce_previous(raw<u8> base,
+                                   resource &mut AllocatorState state,
+                                   u64 limit, u64 head,
+                                   u64 key, u64 size,
+                                   u64 previous, u64 current,
+                                   resource BlockLease lease) {
+    resource FreeBlock right = block_lease_free(lease);
+    mut resource FreeHeader predecessor =
+        allocator_take_header(&mut state, previous);
+    mut u64 previous_size = 0;
+    unsafe {
+        raw<u8> predecessor_ptr = raw_offset(base, previous);
+        previous_size = raw_header_size(predecessor_ptr, &predecessor);
+        raw_header_clear(predecessor_ptr, &mut predecessor);
+        resource FreeBlock left =
+            raw_from_free_header(predecessor_ptr, predecessor);
+    }
+    resource FreeBlock joined = free_block_join(left, right);
+    u64 joined_size = previous_size + size;
+    unsafe {
+        raw<u8> joined_ptr = raw_offset(base, previous);
+        mut resource FreeHeader header =
+            raw_into_free_header(joined_ptr, joined);
+        raw_header_init(joined_ptr, joined_size, current, &mut header);
+    }
+    allocator_put_header(&mut state, header);
+}
+
+/// discharge free_list_coalesce_previous.block_lease_free by
+///   exact ⟨h_pre_returnable.2.1,
+///     h_pre_returnable.2.2.1⟩
+
+/// discharge free_list_coalesce_previous.allocator_take_header.previous by
+///   obtain ⟨predecessor, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   exact Sable.AllocatorView.storesHeader_canTake hstored
+
+/// discharge free_list_coalesce_previous.free_header.size by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨_, _, hkeyoff, _, _, _, _, _⟩ := hwf
+///   rw [hnode]
+///   constructor
+///   · unfold Sable.PointsToView.names
+///     constructor
+///     · calc
+///         (Sable.RawPtr.add base previous).alloc = base.alloc := rfl
+///         _ = _old_state.root.alloc := h_pre_base.1
+///         _ = node.sizeCell.alloc := hstored.2.2.2.2.2.symm
+///     · calc
+///         (Sable.RawPtr.add base previous).off =
+///             base.off + previous := rfl
+///         _ = previous := by rw [h_pre_base.2]; omega
+///         _ = node.key := hstored.2.2.1.symm
+///         _ = node.sizeCell.off := hkeyoff
+///   · rw [hfields.1]
+///     simp
+
+/// discharge free_list_coalesce_previous.free_header.clear by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨hsizewf, _, hkeyoff, halloc, _, hoff, _, _⟩ := hwf
+///   have hlayout : node.sizeCell.layout = Sable.u64.layout :=
+///     hsizewf.1
+///   rw [hnode]
+///   constructor
+///   · unfold Sable.PointsToView.names
+///     constructor
+///     · calc
+///         (Sable.RawPtr.add base previous).alloc = base.alloc := rfl
+///         _ = _old_state.root.alloc := h_pre_base.1
+///         _ = node.sizeCell.alloc := hstored.2.2.2.2.2.symm
+///     · calc
+///         (Sable.RawPtr.add base previous).off =
+///             base.off + previous := rfl
+///         _ = previous := by rw [h_pre_base.2]; omega
+///         _ = node.key := hstored.2.2.1.symm
+///         _ = node.sizeCell.off := hkeyoff
+///   constructor
+///   · rw [hfields.1]
+///     simp
+///   constructor
+///   · calc
+///       node.nextCell.alloc = node.sizeCell.alloc := halloc.symm
+///       _ = _old_state.root.alloc := hstored.2.2.2.2.2
+///       _ = base.alloc := h_pre_base.1.symm
+///       _ = (Sable.RawPtr.add base previous).alloc := rfl
+///   constructor
+///   · calc
+///       node.nextCell.off =
+///           node.sizeCell.off + node.sizeCell.layout.size := hoff.symm
+///       _ = node.key + Sable.u64.layout.size := by
+///         rw [← hkeyoff, hlayout]
+///       _ = previous + Sable.u64.layout.size := by
+///         rw [hstored.2.2.1]
+///       _ = (Sable.RawPtr.add base previous).off +
+///           Sable.u64.layout.size := by
+///         rw [Sable.RawPtr.add_off, h_pre_base.2]
+///         omega
+///   · rw [hfields.2]
+///     simp
+
+/// discharge free_list_coalesce_previous.free_header.to_block by
+///   rw [h_predecessor_clear]
+///   constructor
+///   · simpa [Sable.FreeHeaderView.clearFields,
+///       Sable.PointsToView.names] using
+///       h_fact_sable_pointstoview_names.1
+///   constructor
+///   · simp [Sable.FreeHeaderView.clearFields]
+///   constructor
+///   · simpa [Sable.FreeHeaderView.clearFields] using
+///       h_fact_sable_pointstoview_names.2.2.1
+///   constructor
+///   · simpa [Sable.FreeHeaderView.clearFields] using
+///       h_fact_sable_pointstoview_names.2.2.2.1
+///   · simp [Sable.FreeHeaderView.clearFields]
+
+/// discharge free_list_coalesce_previous.free_block_join by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨_, _, hkeyoff, _, _, _, _, _⟩ := hwf
+///   rw [h_free6_block, h_predecessor_clear, hnode,
+///     h_free1_free]
+///   unfold Sable.FreeBlockView.joinable
+///   constructor
+///   · change node.allocator = lease.allocator
+///     exact hstored.2.2.2.2.1.trans
+///       h_pre_returnable.1.1.symm
+///   constructor
+///   · change node.sizeCell.alloc = lease.span.alloc
+///     exact hstored.2.2.2.2.2.trans
+///       h_pre_returnable.2.2.2.1.symm
+///   constructor
+///   · change node.sizeCell.off +
+///       node.clearFields.toFree.span.len = lease.span.off
+///     rw [Sable.FreeHeaderView.clearFields_toFree_span_len,
+///       hmatch.1, ← hkeyoff, hstored.2.2.1,
+///       hadjacent]
+///     exact h_pre_key.symm.trans h_pre_returnable.2.1
+///   · change lease.key =
+///       node.key + node.clearFields.toFree.span.len
+///     rw [Sable.FreeHeaderView.clearFields_toFree_span_len,
+///       hmatch.1, hstored.2.2.1, hadjacent, h_pre_key]
+
+/// discharge free_list_coalesce_previous.overflow.previous_size_size by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hvalue : previousSize = _value4 := by
+///     rw [hnode, hfields.1] at h_value4_header_size
+///     injection h_value4_header_size
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   have hprevious : 0 ≤ previous := by
+///     calc
+///       0 ≤ node.sizeCell.off := hwf.1.2.1
+///       _ = node.key := hwf.2.2.1.symm
+///       _ = previous := hstored.2.2.1
+///   have hcurrent := h_pre_location.currentChain.head_le_limit
+///   constructor <;> omega
+
+/// discharge free_list_coalesce_previous.free_header.from_block by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨hsizewf, _, hkeyoff, _, _, _, _, _⟩ := hwf
+///   rw [h_free7_join]
+///   constructor
+///   · rw [h_free6_block, h_predecessor_clear, hnode]
+///     change base.alloc = node.sizeCell.alloc
+///     exact h_pre_base.1.trans hstored.2.2.2.2.2.symm
+///   constructor
+///   · rw [h_free6_block, h_predecessor_clear, hnode]
+///     change base.off + previous = node.sizeCell.off
+///     rw [h_pre_base.2, ← hkeyoff, hstored.2.2.1]
+///     omega
+///   constructor
+///   · rw [Sable.RawPtr.add_off, h_pre_base.2]
+///     omega
+///   constructor
+///   · rw [Sable.RawPtr.add_off, h_pre_base.2]
+///     have halign := hsizewf.2.2.1
+///     rw [hsizewf.1, ← hkeyoff, hstored.2.2.1] at halign
+///     simpa using halign
+///   · rw [h_free6_block, h_predecessor_clear, hnode]
+///     change Sable.freeHeaderBytes ≤
+///       node.clearFields.toFree.span.len + _free1.span.len
+///     rw [Sable.FreeHeaderView.clearFields_toFree_span_len,
+///       hmatch.1]
+///     have hpositive : 0 < _free1.span.len := h_free1_wf.2
+///     omega
+
+/// discharge free_list_coalesce_previous.free_header.init by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hvalue : previousSize = _value4 := by
+///     rw [hnode, hfields.1] at h_value4_header_size
+///     injection h_value4_header_size
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hleft : _free6.span.len = _value4 := by
+///     rw [h_free6_block, h_predecessor_clear, hnode,
+///       Sable.FreeHeaderView.clearFields_toFree_span_len]
+///     exact hmatch.1.trans hvalue
+///   have hright : _free1.span.len = size := by
+///     rw [h_free1_free]
+///     exact h_pre_size
+///   have hjoined : _free7.span.len = _value4 + size := by
+///     rw [h_free7_join]
+///     change _free6.span.len + _free1.span.len = _value4 + size
+///     rw [hleft, hright]
+///   rw [h_header8_header]
+///   simp [Sable.FreeBlockView.toHeader, Sable.PointsToView.names,
+///     h_fact_sable_rawptr_add_base_pr, Sable.freeHeaderBytes,
+///     Sable.u64.layout]
+///   refine ⟨⟨h_fact_sable_rawptr_add_base_pr.1,
+///       h_fact_sable_rawptr_add_base_pr.2.1⟩,
+///     h_fact_sable_rawptr_add_base_pr.1.symm,
+///     h_fact_sable_rawptr_add_base_pr.2.1.symm, ?_⟩
+///   rw [hjoined]
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     at h_fact_sable_rawptr_add_base_pr ⊢
+///   omega
+
+/// discharge free_list_coalesce_previous.allocator_put_header by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have horiginal : state.canPutHeader _header3 := by
+///     rw [h_state_take_header, h_header3_take]
+///     exact Sable.AllocatorView.takeHeader_canPutHeader
+///       _old_state previous h_fact_sable_allocatorview_cant
+///   have holdKey : _header3.key = previous := by
+///     rw [hnode]
+///     exact hstored.2.2.1
+///   have hnewKey : header.key = previous := by
+///     rw [h_header_init, h_header8_header, h_free7_join,
+///       h_free6_block, h_predecessor_clear, hnode]
+///     exact hstored.2.2.1
+///   have howner : header.allocator = state.allocator := by
+///     rw [h_header_init, h_header8_header, h_free7_join,
+///       h_free6_block, h_predecessor_clear, hnode,
+///       h_state_take_header]
+///     exact hstored.2.2.2.2.1
+///   unfold Sable.AllocatorView.canPutHeader at horiginal ⊢
+///   refine ⟨howner, h_header_wf, ?_, ?_⟩
+///   · rw [hnewKey, ← holdKey]
+///     exact horiginal.2.2.1
+///   · rw [hnewKey, ← holdKey]
+///     exact horiginal.2.2.2
+
+/// discharge free_list_coalesce_previous.post.chain by
+///   obtain ⟨node, previousSize, hstored, hfields,
+///       hadjacent⟩ := h_pre_adjacent
+///   have hnode : _header3 = node := by
+///     rw [h_header3_take,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hvalue : previousSize = _value4 := by
+///     rw [hnode, hfields.1] at h_value4_header_size
+///     injection h_value4_header_size
+///   have hmatch :=
+///     (h_pre_location.predecessorChain
+///       (by simpa using h_pre_interior)).takeMatchingHead
+///       (h_pre_location.predecessorNotEnd
+///         (by simpa using h_pre_interior)) hstored hfields
+///   have hleft : _free6.span.len = _value4 := by
+///     rw [h_free6_block, h_predecessor_clear, hnode,
+///       Sable.FreeHeaderView.clearFields_toFree_span_len]
+///     exact hmatch.1.trans hvalue
+///   have hright : _free1.span.len = size := by
+///     rw [h_free1_free]
+///     exact h_pre_size
+///   have hjoined : _free7.span.len = _value4 + size := by
+///     rw [h_free7_join]
+///     change _free6.span.len + _free1.span.len = _value4 + size
+///     rw [hleft, hright]
+///   have hheaderKey : header.key = previous := by
+///     rw [h_header_init, h_header8_header, h_free7_join,
+///       h_free6_block, h_predecessor_clear, hnode]
+///     exact hstored.2.2.1
+///   have hheaderFields :
+///       header.hasFields (_value4 + size) current := by
+///     simp [h_header_init, Sable.FreeHeaderView.hasFields,
+///       Sable.FreeHeaderView.putFields]
+///   have hheaderExtent :
+///       header.toFree.span.len = _value4 + size := by
+///     rw [h_header_init, h_header8_header,
+///       Sable.FreeBlockView.toHeader_putFields_toFree_span_len]
+///     exact hjoined
+///   have hadjacentLease :
+///       previous + previousSize = lease.key :=
+///     hadjacent.trans h_pre_key.symm
+///   have hcombined :=
+///     Sable.AllocatorView.takeHeader_returnableAdjacent_clearInterior
+///       h_pre_returnable hadjacentLease hmatch.2.1
+///   have hheaderClear :
+///       (_old_state.takeHeader previous).clearInterior
+///         header.key (_value4 + size) := by
+///     rw [hheaderKey, ← hvalue, ← h_pre_size]
+///     exact hcombined
+///   have hheaderRoot : header.sizeCell.alloc =
+///       (_old_state.takeHeader previous).root.alloc := by
+///     rw [h_header_init, h_header8_header, h_free7_join,
+///       h_free6_block, h_predecessor_clear, hnode]
+///     exact hstored.2.2.2.2.2
+///   have hheaderMin :
+///       Sable.freeHeaderBytes ≤ _value4 + size := by
+///     omega
+///   have hheaderOrder :
+///       header.key + (_value4 + size) ≤ current := by
+///     rw [hheaderKey, ← hvalue]
+///     omega
+///   have hcan :
+///       (_old_state.takeHeader previous).canPutHeader header := by
+///     rw [← h_state_take_header]
+///     exact h_fact_sable_allocatorview_canp
+///   rw [h_state_put_header, h_state_take_header]
+///   exact h_pre_location.replacePredecessor
+///     (by simpa using h_pre_interior)
+///     hstored hfields hheaderKey hheaderFields hheaderExtent
+///     hheaderClear hheaderRoot hcan
+///     (by rw [hheaderKey]; exact h_previous_range.1)
+///     hheaderMin hheaderOrder
