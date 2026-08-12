@@ -1,9 +1,11 @@
 # ADR 0058 — LLVM lowering consumes the verified program
 
-**Decided and implemented 2026-08-12; scalar v0 complete.** Unsafe Sable v1 had
-a defensible formal stopping point but no native-code path. This backend makes
-verified scalar programs runnable without making LLVM part of the verifier or
-introducing a second, subtly different front-end pipeline.
+**Decided and implemented 2026-08-12; scalar v0 complete. G1.3 Boolean-option
+extension implemented and closed 2026-08-13.** Unsafe Sable v1 had a defensible
+formal stopping point but no native-code path. This backend makes verified
+programs in its deliberately narrow runtime subset runnable without making LLVM
+part of the verifier or introducing a second, subtly different front-end
+pipeline.
 
 ## Decision
 
@@ -30,7 +32,7 @@ exact source-graph bytes. A later optimization pipeline may transform that
 program only through separately defined lowering steps; it may not obtain
 authority by constructing `VerifiedProgram` directly.
 
-## Initial executable subset
+## Initial scalar executable subset
 
 Version 0 deliberately starts with the scalar core:
 
@@ -92,7 +94,9 @@ failures, not a stable calling convention for Sable functions.
 The `v1` numeric schema is fixed independently of Rust enum layout. Failure
 `kind` values are 1 add overflow, 2 subtract overflow, 3 multiply overflow,
 4 negation overflow, 5 division/remainder by zero, 6 signed division overflow,
-and 7 narrowing out of range. Integer type codes are 1 through 8 for
+7 narrowing out of range, and 8 option value of none. Kind 8 has zero
+`type_info`, `lhs_bits`, and `rhs_bits`: there is no integer operation to
+describe. Integer type codes are 1 through 8 for
 `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, and `i64`, respectively.
 `type_info` packs the result/destination code in bits 0–7, the left/source code
 in bits 8–15, and the optional right code in bits 16–23. Operand payloads are
@@ -133,7 +137,7 @@ widening/narrowing, and the versioned weak trap hook plus mandatory
 `llvm.trap`. Its structural tests pin guard dominance, the `min % -1` bypass,
 raw trap payloads, and the absence of poison promises.
 
-The complete low-concurrency command
+Scalar v0's complete low-concurrency command
 `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture` is green.
 It includes 26/26 library tests, 6/6 verified LLVM CLI tests, and a 1/1 native
@@ -144,14 +148,53 @@ and a loop condition designed to detect accidental hoisting out of its header.
 Verification failure and audited-assumption rejection leave existing output
 untouched.
 
-The native trap fixture exercises all seven published kinds at both
+The scalar native trap fixture exercises its seven published kinds at both
 optimization levels, with exact kind, type-info, and raw-operand payloads. Its
 strong hook returns, and the following `llvm.trap` still terminates each
 process. The same serial regression kept the SVM Rust/Lean differential green
 at 69/69, completed the full verifier/dynamic corpus in 220.78s, and passed the
 randomized allocator, grind-budget, LSP, and documentation tests. That closes
-the scalar v0 milestone. It does not extend the accepted subset to aggregates:
-aggregate storage, lowering, and ABIs remain M46+ decisions.
+the scalar v0 milestone. At that checkpoint it did not extend the accepted
+subset to aggregates; G1.3 subsequently adds the one internal Boolean-option
+representation below without declaring an aggregate ABI.
+
+## G1.3 amendment: internal Boolean options
+
+The first aggregate backend slice is exactly G1.1's ordinary-function
+`option<bool>` intersection. LLVM spells the value
+`%sable.option.bool = type { i8, i8 }`: the first byte is a presence tag and
+the second is a canonical Boolean payload. `none` is `zeroinitializer`, so both
+bytes are zero. `some(false)` and `some(true)` set the tag to one and store
+payload zero or one after extending the checked `i1` Boolean. The named type is
+emitted once, deterministically before function definitions, and the internal
+name mangling uses the versionable component `ob`.
+
+Internal Sable functions may return this value and direct calls may transport
+it. Explicit and inferred locals use aggregate slots, loads, and stores through
+branches and assignment. `.is_some` compares the tag with zero. `.value`
+extracts the tag, branches to the common failure helper on absence, and extracts
+and truncates the payload only in the dominated success block. The failure is
+kind 8 with exact zero type metadata and operand payloads; the weak diagnostic
+hook may return, but the internal helper still executes mandatory `llvm.trap`.
+
+This is not a public option ABI. Option parameters and entry points remain
+rejected, audited externs cannot return or consume the value, and option-valued
+fields or trait methods, classes and method calls, residual generic metadata or
+type arguments, and all non-Boolean option payloads remain outside the emitter.
+The internal named type and `ob` spelling may change before any stable Sable or
+C ABI exists.
+
+The combined G1.2/G1.3 closure command was
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. It passed
+129/129 library tests; all 374 corpus subjects (80 verifies, 231 must-fail, 45
+dynamic, 18 dynamic-fail) in 414.80s; LLVM CLI 6/6, with the exact
+zero-metadata/zero-payload kind-8 trap and mandatory `llvm.trap`; the 1/1 exact
+`VerifiedProgram` interpreter↔Clang differential, now looping over scalar,
+control-flow, arithmetic, and Boolean-option subjects at both `-O0` and `-O2`
+and observing 42 from the option subject; SVM differential 76/76; and the
+randomized allocator, grind-budget, LSP, and documentation gates. G1.2 and
+G1.3 are closed.
 
 ## Consequences
 
@@ -159,7 +202,8 @@ This path gets Sable to native toolchains without expanding the trusted proof
 base: Lean still checks contracts, while the new emitter is an additional
 compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
-The cost is an intentionally narrow scalar backend and explicit traps/control
-flow where less careful LLVM frontends often rely on poison. Aggregate ABIs,
-extern interoperability, optimization, debug information, object emission,
-and stable cross-module symbols remain separate decisions.
+The cost is an intentionally narrow scalar-plus-Boolean-option backend and
+explicit traps/control flow where less careful LLVM frontends often rely on
+poison. Broader aggregate representations and every aggregate ABI, extern
+interoperability, optimization, debug information, object emission, and stable
+cross-module symbols remain separate decisions.

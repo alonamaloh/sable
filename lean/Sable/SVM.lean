@@ -107,15 +107,16 @@ def IntTy.wrap (t : IntTy) (n : Int) : Int :=
 /-- Machine values. Integers are exact (`Int`); their widths live in the
 typed syntax, and per-operation rules enforce representability — the
 value plane never wraps. Arrays are `Sable.Seq Int` (owned `[T]` of a
-scalar element type; the ghost lift is then the identity). Integer options
-retain their original compact form; nullable raw pointers and POD records
-are abstract values with no byte representation (ADR 0054). -/
+scalar element type; the ghost lift is then the identity). Ordinary options
+contain machine values recursively, so integer and Boolean payloads share
+one semantics; nullable raw pointers and POD records remain distinct
+abstract values with no byte representation (ADR 0054). -/
 inductive Val where
   | unit
   | int  (n : Int)
   | bool (b : Bool)
   | arr  (a : Seq Int)
-  | opt  (o : Option Int)
+  | opt  (o : Option Val)
   /-- A raw pointer: provenance plus a byte offset, never a machine
   address. Two live pointers may name the same address only if they name
   the same allocation, which is what makes `free` able to invalidate
@@ -407,8 +408,9 @@ def CmpOp.denote : CmpOp → Int → Int → Bool
 representability check happens (the compiler's typed AST provides it).
 Arrays are referred to by variable, matching the compiler's AST.
 Scoped out: function calls (A-normalized to statements, ADR 0005),
-method calls, class constructors, borrows as distinct values, `sat(·)`,
-option accessors. -/
+method calls, class constructors, borrows as distinct values, and `sat(·)`.
+Ordinary and nullable-pointer options have distinct constructors so an
+ill-shaped accessor is still `undef` rather than silently crossing domains. -/
 inductive Expr where
   | intLit  (t : IntTy) (n : Int)
   | boolLit (b : Bool)
@@ -441,6 +443,8 @@ inductive Expr where
   | ptrOffset (p : Expr)
   | someE   (e : Expr)
   | noneE
+  | optIsSome (e : Expr)
+  | optValue (e : Expr)
   | ptrSomeE (e : Expr)
   | ptrNoneE
   | ptrIsSome (e : Expr)
@@ -654,7 +658,7 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | checked_some {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
       (hr : t.inRange (op.denote a b)) :
-      Eval cap ρ (.checkedArith op t e₁ e₂) (.ok (.opt (some (op.denote a b))))
+      Eval cap ρ (.checkedArith op t e₁ e₂) (.ok (.opt (some (.int (op.denote a b)))))
   | checked_none {ρ : Env} {op : ArithOp} {t : IntTy} {e₁ e₂ : Expr} {a b : Int}
       (h₁ : Eval cap ρ e₁ (.ok (.int a))) (h₂ : Eval cap ρ e₂ (.ok (.int b)))
       (hr : ¬ t.inRange (op.denote a b)) :
@@ -924,18 +928,37 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | alloc_abort₂ {ρ : Env} {e₁ e₂ : Expr} {n : Int} {a : Abort}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
       Eval cap ρ (.allocArray e₁ e₂) (.abort a)
-  -- options (integer payload)
-  | someE_ok {ρ : Env} {e : Expr} {n : Int}
-      (h : Eval cap ρ e (.ok (.int n))) :
-      Eval cap ρ (.someE e) (.ok (.opt (some n)))
-  | someE_undef {ρ : Env} {e : Expr} {v : Val}
-      (h : Eval cap ρ e (.ok v)) (hv : ∀ n, v ≠ .int n) :
-      Eval cap ρ (.someE e) (.abort .undef)
+  -- Ordinary options contain values recursively. Shape is checked only by
+  -- the accessors: `some(e)` accepts every value that `e` can produce.
+  | someE_ok {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) :
+      Eval cap ρ (.someE e) (.ok (.opt (some v)))
   | someE_abort {ρ : Env} {e : Expr} {a : Abort}
       (h : Eval cap ρ e (.abort a)) :
       Eval cap ρ (.someE e) (.abort a)
   | noneE {ρ : Env} :
       Eval cap ρ .noneE (.ok (.opt none))
+  | optIsSome_ok {ρ : Env} {e : Expr} {o : Option Val}
+      (h : Eval cap ρ e (.ok (.opt o))) :
+      Eval cap ρ (.optIsSome e) (.ok (.bool o.isSome))
+  | optIsSome_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ o, v ≠ .opt o) :
+      Eval cap ρ (.optIsSome e) (.abort .undef)
+  | optIsSome_abort {ρ : Env} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.optIsSome e) (.abort a)
+  | optValue_ok {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok (.opt (some v)))) :
+      Eval cap ρ (.optValue e) (.ok v)
+  | optValue_none {ρ : Env} {e : Expr}
+      (h : Eval cap ρ e (.ok (.opt none))) :
+      Eval cap ρ (.optValue e) (.abort (.trap .optionNone))
+  | optValue_undef {ρ : Env} {e : Expr} {v : Val}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ o, v ≠ .opt o) :
+      Eval cap ρ (.optValue e) (.abort .undef)
+  | optValue_abort {ρ : Env} {e : Expr} {a : Abort}
+      (h : Eval cap ρ e (.abort a)) :
+      Eval cap ρ (.optValue e) (.abort a)
 
 /-- Outcome of evaluating an argument list. -/
 inductive AOut where

@@ -122,7 +122,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (scalar v0 complete)
+## Native lowering boundary (scalar v0 and G1.3 Boolean options complete)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -151,7 +151,7 @@ these checks.
 
 Output carries the exact artifact and proof-environment identities, uses
 versionable length-prefixed internal mangling, and file publication is atomic.
-The complete low-concurrency regression
+Scalar v0's complete low-concurrency regression
 (`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`) is green:
 26/26 library tests and 6/6 verified LLVM CLI tests, followed by a 1/1 native
@@ -164,8 +164,26 @@ at both optimization levels; a returning hook still cannot suppress the
 mandatory `llvm.trap`. The same serial run kept the SVM differential green at
 69/69, completed the full verifier/dynamic corpus in 220.78s, and passed the
 randomized allocator, grind-budget, LSP, and documentation tests. LLVM remains
-optional for emitting IR. Aggregate lowering and aggregate ABIs remain outside
-this completed scalar boundary and are future M46+ work.
+optional for emitting IR. At that checkpoint, aggregate lowering and aggregate
+ABIs remained outside the completed scalar boundary.
+
+G1.3 adds one internal aggregate representation without declaring an ABI:
+`%sable.option.bool = type { i8, i8 }`, with a tag byte followed by a
+canonicalized Boolean payload byte. `none` is `zeroinitializer` (tag zero,
+payload zero); `some(false)` and `some(true)` have tag one and payload zero or
+one. Internal returns, direct calls, explicit/inferred locals, branches,
+assignment, loads/stores, and returns transport the value as a unit. `.is_some`
+tests the tag, while `.value` branches to the trap path before extracting the
+payload. Kind 8 reports option absence with zero type metadata and operand
+payloads, and the common trap helper still invokes mandatory `llvm.trap` after
+the weak diagnostic hook returns. The `ob` mangling component is internal and
+versionable like the named IR type.
+
+The validation boundary stays narrower than the IR type: no option parameter,
+entry, or extern ABI exists; option-valued fields and trait methods,
+classes/method calls, residual generic forms, and every non-Boolean option
+payload remain rejected. The combined closure evidence appears with G1.2/G1.3
+below.
 
 ## Key invariants
 
@@ -244,9 +262,10 @@ this completed scalar boundary and are future M46+ work.
   Lean's payload-specific `default` (`0` for integers and `false` for `Bool`),
   while executable unguarded access still traps.
 
-  The formal SVM and LLVM emitter remain separate fail-closed consumers and
-  reject Boolean options; carrying this exact feature through those boundaries
-  is G1.2 and G1.3. G1.1's complete low-concurrency closure command was
+  At the G1.1 checkpoint, the formal SVM and LLVM emitter remained separate
+  fail-closed consumers and rejected Boolean options; carrying this exact
+  feature through those boundaries was assigned to G1.2 and G1.3. G1.1's
+  complete low-concurrency closure command was
   `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
   SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. It
   passed 116/116 library tests; all 374 corpus subjects (80 verifies, 231
@@ -255,6 +274,54 @@ this completed scalar boundary and are future M46+ work.
   subject at 1/1; LLVM CLI 6/6; the exact `VerifiedProgram` interpreter↔Clang
   differential at `-O0` and `-O2` 1/1; and SVM differential 69/69. Randomized
   allocator, grind-budget, LSP, and documentation gates were green. G1.1 is closed.
+- **The formal option value is recursive; the source-to-SVM boundary is not.**
+  G1.2 changes the Lean machine value from an integer-specialized option to
+  `Val.opt : Option Val`. Its relational rules and proved executable evaluator
+  give `some`, `none`, `.is_some`, and `.value` payload-generic semantics.
+  `some(e)` preserves any successfully evaluated machine value; an accessor on
+  a value of the wrong outer shape reaches `undef`; and `.value` on `none`
+  reaches `Trap.optionNone`. The renderer preserves the established integer
+  wire observations (`opt none`, `opt some 7`) and adds compact Boolean ones
+  (`opt some false`, `opt some true`). Direct Lean guards pin absence,
+  `some(false)`, `some(true)`, extraction, both failure classes, and the old
+  integer spelling independently of the rule/evaluator agreement theorem.
+
+  That uniform formal representation is not permission for a recursive source
+  aggregate. The Rust lowerer admits only the ordinary-function intersection
+  already checked in G1.1: concrete integer/Boolean option returns and locals,
+  contextual constructors, assignment and A-normal call-result transport, and
+  ordinary accessors. It independently rejects option parameters and fields,
+  trait option returns, record and nested payloads, residual or Boolean generic
+  arguments, Boolean arrays, classes and method calls, and the audited extern
+  ABI. Thus the formal core can grow without an unreviewed compiler path
+  inheriting that generality. At the G1.2 checkpoint LLVM remained fail closed.
+
+  The initial focused gate passed a one-job Lake build covering `SVM`,
+  `SVMEval`, `SVMOptionTests`, the raw and UART suites, and the `Sable` package,
+  plus the Rust↔Lean differential at 76/76. G1.2 is closed by the combined
+  serial evidence below.
+- **LLVM Boolean options are canonical internal values, not a public ABI.**
+  G1.3 lowers only G1.1's ordinary-function `option<bool>` intersection to
+  `%sable.option.bool = type { i8, i8 }`. Canonical `none` is all zero;
+  `some(false)` and `some(true)` set the tag to one and carry payload zero or
+  one. The value crosses internal returns and calls and lives in ordinary local
+  slots across control flow. `.is_some` reads the tag; guarded `.value` reaches
+  kind-8 `optionNone` on absence with exact zero metadata/payloads, and extracts
+  the Boolean only on the success edge. No option parameter/entry/extern ABI,
+  option field or trait method, class/method call, residual generic form, or
+  non-Boolean option payload is accepted.
+
+  The combined G1.2/G1.3 closure command was
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+  SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. It
+  passed 129/129 library tests; all 374 corpus subjects (80 verifies, 231
+  must-fail, 45 dynamic, 18 dynamic-fail) in 414.80s; LLVM CLI 6/6, including
+  the exact zero-metadata/zero-payload kind-8 trap followed by mandatory
+  `llvm.trap`; the 1/1 exact-`VerifiedProgram` interpreter↔Clang differential,
+  which loops over scalar, control-flow, arithmetic, and Boolean-option subjects
+  at `-O0` and `-O2` and observes 42 from the option subject; and SVM
+  differential 76/76. Randomized allocator, grind-budget, LSP, and
+  documentation gates were green. G1.2 and G1.3 are closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across
@@ -344,6 +411,12 @@ two-directional agreement, determinism, and progress results. A bare wrapper
 run renders byte-for-byte like the old core outcome; a selected run extends the
 canonical observation with profile id, oracle cursor, and ordered MMIO trace.
 
+Ordinary options occupy one recursive value form, `Val.opt : Option Val`, in
+both presentations. Generic machine constructors and accessors preserve the
+payload value, while outer-shape confusion is `undef` and extracting absence is
+`Trap.optionNone`. Nullable raw-pointer options remain a distinct value form,
+so an accessor cannot cross the ordinary/raw option boundary accidentally.
+
 The harness (`compiler/tests/svm_diff.rs`, ADR 0017) lowers every function in
 `corpus/svm-diff/` to Lean terms (`compiler/src/svm.rs`), runs each on both
 `interp.rs` and the appropriate Lean evaluator, and compares those canonical
@@ -353,10 +426,12 @@ machine's supported subset is a hard failure, never a skip. `test_uart`
 selection remains a machine statement through explicit and inferred
 declarations, assignment, and discard. Authority-only resource operations erase
 only when every operand is syntactically runtime-inert; a potentially trapping
-or effectful operand is rejected instead of silently dropped. The serial gate
-covers 69/69 subjects, including UART success, budget exhaustion, readiness
-clearing, ordered traces, invalid writes, profile reselection (including its
-precedence over script-expression traps), and all three selection contexts.
+or effectful operand is rejected instead of silently dropped. The one-worker
+differential run currently covers 76/76 subjects, including Boolean option
+absence/presence, local assignment, accessor results, and A-normal call
+transport, plus UART success, budget exhaustion, readiness clearing, ordered
+traces, invalid writes, profile reselection (including its precedence over
+script-expression traps), and all three selection contexts.
 
 ## Repo layout
 

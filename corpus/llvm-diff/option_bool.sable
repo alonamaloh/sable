@@ -1,0 +1,36 @@
+// G1.3 native Boolean-option subject.  This keeps the first aggregate ABI
+// internal: ordinary functions return the value, while locals carry it across
+// branches, assignment, loads/stores, and direct calls.
+
+fn false_option() -> option<bool> {
+    return some(false);
+}
+
+fn branch_transport() -> option<bool> {
+    mut option<bool> choice = none;
+    if (true) {
+        choice = false_option();
+    } else {
+        choice = some(true);
+    }
+    return choice;
+}
+
+fn option_entry() -> i32 {
+    var copied = branch_transport();
+    option<bool> empty = none;
+    option<bool> truth = some(true);
+
+    if (copied.is_some) {
+        if (!copied.value) {
+            if (!empty.is_some) {
+                if (truth.is_some) {
+                    if (truth.value) {
+                        return 42;
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}

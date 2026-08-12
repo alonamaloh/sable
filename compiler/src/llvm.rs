@@ -1,4 +1,5 @@
-//! Strict textual LLVM IR lowering for the verified scalar core (ADR 0058).
+//! Strict textual LLVM IR lowering for the verified scalar and Boolean-option
+//! core (ADR 0058).
 //!
 //! This first slice handles scalar storage, calls, comparisons, and structured
 //! control flow.  A construct is either lowered with its Sable meaning or
@@ -6,7 +7,7 @@
 //! unchecked arithmetic.
 
 use crate::VerifiedProgram;
-use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, Stmt, Ty, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, Stmt, Ty, UnOp, ValueTy};
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -296,6 +297,15 @@ fn validate_acyclic(program: &Program, selected: &[usize]) -> Result<(), Vec<Bac
 }
 
 fn validate_function(program: &Program, function: &Fn) -> Result<(), Vec<BackendError>> {
+    if !function.type_params.is_empty() || !function.type_bounds.is_empty() {
+        return Err(vec![unsupported(
+            function.name_span,
+            format!(
+                "function `{}` retains generic declaration metadata after monomorphization",
+                function.name
+            ),
+        )]);
+    }
     if function.extern_info.is_some() {
         return Err(vec![unsupported(
             function.name_span,
@@ -308,7 +318,7 @@ fn validate_function(program: &Program, function: &Fn) -> Result<(), Vec<Backend
     for parameter in &function.params {
         require_value_scalar(parameter.ty, parameter.span, "function parameter")?;
     }
-    require_scalar(function.ret, function.name_span, "function return type")?;
+    require_runtime_type(function.ret, function.name_span, "function return type")?;
     validate_block(program, &function.body)
 }
 
@@ -321,7 +331,7 @@ fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<Back
                 init,
                 ..
             } => {
-                require_value_scalar(*ty, *name_span, "local variable")?;
+                require_local_value(*ty, *name_span, "local variable")?;
                 if let Some(value) = init {
                     validate_expr(program, value)?;
                 }
@@ -338,7 +348,7 @@ fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<Back
                         "inferred local is missing its checked type",
                     )]);
                 };
-                require_value_scalar(ty, *name_span, "inferred local")?;
+                require_local_value(ty, *name_span, "inferred local")?;
                 validate_expr(program, init)?;
             }
             Stmt::Assign { value, .. }
@@ -391,16 +401,37 @@ fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<Back
 
 fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<BackendError>> {
     match &expression.kind {
-        ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::Var(_) => {
+        ExprKind::IntLit(_) => {
+            let Some(Ty::Int(integer)) = expression.ty else {
+                return Err(vec![unsupported(
+                    expression.span,
+                    "integer literal is missing its checked integer type",
+                )]);
+            };
+            require_concrete_integer(integer, expression.span, "integer literal")
+        }
+        ExprKind::BoolLit(_) => require_expr_type(expression, Ty::Bool, "Boolean literal"),
+        ExprKind::Var(_) => {
             let ty = expression.ty.ok_or_else(|| {
                 vec![unsupported(
                     expression.span,
                     "expression is missing its checked type",
                 )]
             })?;
-            require_scalar(ty, expression.span, "expression")
+            require_runtime_type(ty, expression.span, "expression")
         }
-        ExprKind::Call { callee, args, .. } => {
+        ExprKind::Call {
+            callee,
+            type_args,
+            args,
+            ..
+        } => {
+            if !type_args.is_empty() {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!("call to `{callee}` retains type arguments after monomorphization"),
+                )]);
+            }
             let Some(function) = program.fns.iter().find(|function| function.name == *callee)
             else {
                 return Err(vec![unsupported(
@@ -417,7 +448,8 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             for argument in args {
                 validate_expr(program, argument)?;
             }
-            require_scalar(function.ret, expression.span, "call result")
+            require_runtime_type(function.ret, expression.span, "call result")?;
+            require_expr_type(expression, function.ret, "call result")
         }
         ExprKind::Unary {
             op: UnOp::Not,
@@ -536,9 +568,40 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             }
             require_expr_type(expression, Ty::Int(*target), "narrow result")
         }
+        ExprKind::SomeE(inner) => {
+            require_expr_type(
+                expression,
+                Ty::Option(ValueTy::Bool),
+                "Boolean option construction",
+            )?;
+            validate_bool_expr(program, inner, "Boolean option payload")
+        }
+        ExprKind::NoneE => require_expr_type(
+            expression,
+            Ty::Option(ValueTy::Bool),
+            "Boolean option construction",
+        ),
+        ExprKind::IsSome { operand } => {
+            validate_expr(program, operand)?;
+            require_expr_type(
+                operand,
+                Ty::Option(ValueTy::Bool),
+                "option accessor operand",
+            )?;
+            require_expr_type(expression, Ty::Bool, "`.is_some` result")
+        }
+        ExprKind::OptValue { operand } => {
+            validate_expr(program, operand)?;
+            require_expr_type(
+                operand,
+                Ty::Option(ValueTy::Bool),
+                "option accessor operand",
+            )?;
+            require_expr_type(expression, Ty::Bool, "Boolean option payload")
+        }
         _ => Err(vec![unsupported(
             expression.span,
-            "expression is outside the scalar LLVM subset",
+            "expression is outside the scalar/Boolean-option LLVM subset",
         )]),
     }
 }
@@ -563,15 +626,34 @@ fn require_expr_type(expression: &Expr, expected: Ty, role: &str) -> Result<(), 
     }
 }
 
-fn require_scalar(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
+fn require_runtime_type(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
     if matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
-        || matches!(ty, Ty::Bool | Ty::Unit)
+        || matches!(ty, Ty::Bool | Ty::Unit | Ty::Option(ValueTy::Bool))
     {
         Ok(())
     } else {
         Err(vec![unsupported(
             span,
-            format!("{role} type `{}` is not scalar", ty.name()),
+            format!(
+                "{role} type `{}` has no supported LLVM runtime representation",
+                ty.name()
+            ),
+        )])
+    }
+}
+
+fn require_local_value(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
+    if matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+        || matches!(ty, Ty::Bool | Ty::Option(ValueTy::Bool))
+    {
+        Ok(())
+    } else {
+        Err(vec![unsupported(
+            span,
+            format!(
+                "{role} type `{}` has no supported LLVM local representation",
+                ty.name()
+            ),
         )])
     }
 }
@@ -615,6 +697,12 @@ const TRAP_NEG_OVERFLOW: u32 = 4;
 const TRAP_DIV_ZERO: u32 = 5;
 const TRAP_DIV_OVERFLOW: u32 = 6;
 const TRAP_NARROW_RANGE: u32 = 7;
+const TRAP_OPTION_NONE: u32 = 8;
+
+/// Internal aggregate representation for the first non-integer option slice.
+/// This is deliberately not a C ABI promise: byte fields make the layout
+/// unambiguous inside generated LLVM while ordinary Sable `bool` remains i1.
+const LLVM_OPTION_BOOL: &str = "%sable.option.bool";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OverflowIntrinsic {
@@ -683,6 +771,7 @@ impl OverflowIntrinsic {
 struct ModuleSupport {
     overflow_intrinsics: BTreeSet<OverflowIntrinsic>,
     needs_trap: bool,
+    needs_option_bool: bool,
 }
 
 impl ModuleSupport {
@@ -695,7 +784,15 @@ impl ModuleSupport {
         self.needs_trap = true;
     }
 
+    fn require_option_bool(&mut self) {
+        self.needs_option_bool = true;
+    }
+
     fn emit(&self, out: &mut String) {
+        if self.needs_option_bool {
+            out.push_str(LLVM_OPTION_BOOL);
+            out.push_str(" = type { i8, i8 }\n\n");
+        }
         for intrinsic in &self.overflow_intrinsics {
             out.push_str(&intrinsic.declaration());
             out.push('\n');
@@ -706,7 +803,8 @@ impl ModuleSupport {
             }
             out.push_str(
                 "; __sable_rt_trap_v1 kinds: 1 add, 2 sub, 3 mul, 4 neg, \
-                 5 div/rem zero, 6 signed div overflow, 7 narrow range\n\
+                 5 div/rem zero, 6 signed div overflow, 7 narrow range, \
+                 8 option value of none\n\
                  ; type_info bytes: result/destination, lhs/source, rhs; \
                  type codes u8..u64,i8..i64 = 1..8\n\
                  declare void @llvm.trap() cold noreturn nounwind\n\n\
@@ -771,6 +869,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit(mut self, out: &mut String) -> Result<(), Vec<BackendError>> {
+        if self.function.ret == Ty::Option(ValueTy::Bool) {
+            self.support.require_option_bool();
+        }
         let parameters = self
             .function
             .params
@@ -797,6 +898,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let mut declarations = Vec::new();
         collect_local_declarations(&self.function.body, &mut declarations);
         for (name, ty) in parameters.iter().chain(declarations.iter()) {
+            if *ty == Ty::Option(ValueTy::Bool) {
+                self.support.require_option_bool();
+            }
             let slot = self.new_slot();
             self.instruction(format!("{slot} = alloca {}", llvm_ty(*ty)));
             self.locals.insert(name.clone(), Local { ty: *ty, slot });
@@ -1043,6 +1147,79 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 Ok(Value {
                     ty,
                     operand: Some(temp),
+                })
+            }
+            ExprKind::SomeE(inner) => {
+                self.support.require_option_bool();
+                let value = self.emit_expr(inner)?;
+                let payload = self.new_temp();
+                self.instruction(format!(
+                    "{payload} = zext i1 {} to i8",
+                    value.operand.expect("validated Boolean option payload")
+                ));
+                let tagged = self.new_temp();
+                self.instruction(format!(
+                    "{tagged} = insertvalue {LLVM_OPTION_BOOL} zeroinitializer, i8 1, 0"
+                ));
+                let result = self.new_temp();
+                self.instruction(format!(
+                    "{result} = insertvalue {LLVM_OPTION_BOOL} {tagged}, i8 {payload}, 1"
+                ));
+                Ok(Value {
+                    ty: Ty::Option(ValueTy::Bool),
+                    operand: Some(result),
+                })
+            }
+            ExprKind::NoneE => {
+                self.support.require_option_bool();
+                Ok(Value {
+                    ty: Ty::Option(ValueTy::Bool),
+                    operand: Some("zeroinitializer".into()),
+                })
+            }
+            ExprKind::IsSome { operand } => {
+                self.support.require_option_bool();
+                let option = self.emit_expr(operand)?;
+                let option = option
+                    .operand
+                    .expect("validated Boolean option accessor operand");
+                let tag = self.new_temp();
+                self.instruction(format!(
+                    "{tag} = extractvalue {LLVM_OPTION_BOOL} {option}, 0"
+                ));
+                let present = self.new_temp();
+                self.instruction(format!("{present} = icmp ne i8 {tag}, 0"));
+                Ok(Value {
+                    ty: Ty::Bool,
+                    operand: Some(present),
+                })
+            }
+            ExprKind::OptValue { operand } => {
+                self.support.require_option_bool();
+                let option = self.emit_expr(operand)?;
+                let option = option
+                    .operand
+                    .expect("validated Boolean option accessor operand");
+                let tag = self.new_temp();
+                self.instruction(format!(
+                    "{tag} = extractvalue {LLVM_OPTION_BOOL} {option}, 0"
+                ));
+                let absent = self.new_temp();
+                self.instruction(format!("{absent} = icmp eq i8 {tag}, 0"));
+                self.emit_untyped_trap_guard(&absent, TRAP_OPTION_NONE);
+
+                // Extract only on the success edge. Besides pinning the
+                // source evaluation order, this keeps the partial operation's
+                // runtime guard visibly dominant in unoptimized IR.
+                let payload = self.new_temp();
+                self.instruction(format!(
+                    "{payload} = extractvalue {LLVM_OPTION_BOOL} {option}, 1"
+                ));
+                let result = self.new_temp();
+                self.instruction(format!("{result} = trunc i8 {payload} to i1"));
+                Ok(Value {
+                    ty: Ty::Bool,
+                    operand: Some(result),
                 })
             }
             ExprKind::Unary {
@@ -1532,7 +1709,6 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         lhs: &str,
         rhs: Option<(IntTy, &str)>,
     ) {
-        self.support.require_trap();
         // The ABI carries raw source-width operand bits.  Zero extension is
         // intentional even for signed inputs: diagnostics can reconstruct the
         // signed value from `type_info`, while the payload remains lossless.
@@ -1540,6 +1716,28 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let rhs_bits = rhs
             .map(|(ty, value)| self.emit_raw_bits(ty, value))
             .unwrap_or_else(|| "0".into());
+        self.emit_trap_branch(
+            failure,
+            kind,
+            packed_type_info(info_type, lhs_type, rhs.map(|(ty, _)| ty)),
+            &lhs_bits,
+            &rhs_bits,
+        );
+    }
+
+    fn emit_untyped_trap_guard(&mut self, failure: &str, kind: u32) {
+        self.emit_trap_branch(failure, kind, 0, "0", "0");
+    }
+
+    fn emit_trap_branch(
+        &mut self,
+        failure: &str,
+        kind: u32,
+        type_info: u32,
+        lhs_bits: &str,
+        rhs_bits: &str,
+    ) {
+        self.support.require_trap();
         let trap_label = self.new_label("trap");
         let continue_label = self.new_label("trap.ok");
         self.terminate(format!(
@@ -1548,8 +1746,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
 
         self.start_block(trap_label);
         self.instruction(format!(
-            "call void @__sable_rt_fail_v1(i32 {kind}, i32 {}, i64 {lhs_bits}, i64 {rhs_bits})",
-            packed_type_info(info_type, lhs_type, rhs.map(|(ty, _)| ty))
+            "call void @__sable_rt_fail_v1(i32 {kind}, i32 {type_info}, i64 {lhs_bits}, i64 {rhs_bits})"
         ));
         self.terminate("unreachable");
 
@@ -1695,7 +1892,8 @@ fn llvm_ty(ty: Ty) -> String {
         Ty::Int(integer) => format!("i{}", integer.bits()),
         Ty::Bool => "i1".into(),
         Ty::Unit => "void".into(),
-        _ => unreachable!("non-scalar type validated out"),
+        Ty::Option(ValueTy::Bool) => LLVM_OPTION_BOOL.into(),
+        _ => unreachable!("type without an LLVM runtime representation validated out"),
     }
 }
 
@@ -1731,7 +1929,8 @@ fn type_code(ty: Ty) -> &'static str {
         Ty::Int(IntTy::I64) => "i64",
         Ty::Bool => "b",
         Ty::Unit => "v",
-        _ => unreachable!("non-scalar type validated out"),
+        Ty::Option(ValueTy::Bool) => "ob",
+        _ => unreachable!("type without an LLVM runtime representation validated out"),
     }
 }
 
@@ -1886,7 +2085,7 @@ fn diag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Param, Program, ProofReuse, ValueTy};
+    use crate::ast::{ExternInfo, GenericTy, Param, Program, ProofReuse, TypeArg, ValueTy};
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
         Expr {
@@ -1939,6 +2138,14 @@ mod tests {
 
     fn variable(name: &str, integer: IntTy) -> Expr {
         expression(ExprKind::Var(name.into()), Ty::Int(integer))
+    }
+
+    fn bool_option(kind: ExprKind) -> Expr {
+        expression(kind, Ty::Option(ValueTy::Bool))
+    }
+
+    fn bool_option_variable(name: &str) -> Expr {
+        bool_option(ExprKind::Var(name.into()))
     }
 
     fn binary(operator: BinOp, integer: IntTy, lhs: Expr, rhs: Expr) -> Expr {
@@ -2006,6 +2213,267 @@ mod tests {
         assert!(ir.contains("define i32 @main()"));
         assert!(!ir.contains("llvm.assume"));
         assert!(!ir.contains(" nsw "));
+        assert!(!ir.contains(LLVM_OPTION_BOOL));
+    }
+
+    #[test]
+    fn boolean_option_is_canonical_and_transports_across_cfg_calls_and_locals() {
+        let option = Ty::Option(ValueTy::Bool);
+        let make_false = function(
+            "make_false",
+            option,
+            vec![Stmt::Return {
+                value: Some(bool_option(ExprKind::SomeE(Box::new(expression(
+                    ExprKind::BoolLit(false),
+                    Ty::Bool,
+                ))))),
+                span: Span::new(0, 1),
+            }],
+        );
+        let forward = function(
+            "forward",
+            option,
+            vec![
+                Stmt::Decl {
+                    ty: option,
+                    name: "result".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(bool_option(ExprKind::NoneE)),
+                    mutable: true,
+                },
+                Stmt::If {
+                    cond: expression(ExprKind::BoolLit(true), Ty::Bool),
+                    then_block: vec![Stmt::Assign {
+                        name: "result".into(),
+                        name_span: Span::new(0, 1),
+                        value: call("make_false", option),
+                    }],
+                    else_block: Some(vec![Stmt::Assign {
+                        name: "result".into(),
+                        name_span: Span::new(0, 1),
+                        value: bool_option(ExprKind::SomeE(Box::new(expression(
+                            ExprKind::BoolLit(true),
+                            Ty::Bool,
+                        )))),
+                    }]),
+                },
+                Stmt::Return {
+                    value: Some(bool_option_variable("result")),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        let consume = function(
+            "consume",
+            Ty::Bool,
+            vec![
+                Stmt::VarDecl {
+                    name: "value".into(),
+                    name_span: Span::new(0, 1),
+                    init: call("forward", option),
+                    mutable: false,
+                    ty: Some(option),
+                },
+                Stmt::If {
+                    cond: expression(
+                        ExprKind::IsSome {
+                            operand: Box::new(bool_option_variable("value")),
+                        },
+                        Ty::Bool,
+                    ),
+                    then_block: vec![Stmt::Return {
+                        value: Some(expression(
+                            ExprKind::OptValue {
+                                operand: Box::new(bool_option_variable("value")),
+                            },
+                            Ty::Bool,
+                        )),
+                        span: Span::new(0, 1),
+                    }],
+                    else_block: None,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+
+        let ir = emit_program(
+            &program(vec![make_false, forward, consume]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ir.matches("%sable.option.bool = type { i8, i8 }").count(),
+            1
+        );
+        let named_type = ir.find("%sable.option.bool = type").unwrap();
+        let first_definition = ir.find("define internal").unwrap();
+        assert!(named_type < first_definition);
+        assert!(ir.contains(
+            "define internal %sable.option.bool @__sable_v0_f_10_make_false__p___r_ob()"
+        ));
+        assert!(ir.contains("alloca %sable.option.bool"));
+        assert!(ir.contains("store %sable.option.bool zeroinitializer"));
+        assert!(ir.contains("call %sable.option.bool @__sable_v0_f_10_make_false__p___r_ob()"));
+        assert!(ir.contains("load %sable.option.bool"));
+        assert!(ir.contains("ret %sable.option.bool"));
+        assert!(ir.contains("zext i1 0 to i8"));
+        assert!(ir.contains("insertvalue %sable.option.bool zeroinitializer, i8 1, 0"));
+        assert!(ir.contains("insertvalue %sable.option.bool"));
+        assert!(ir.contains("extractvalue %sable.option.bool"));
+        assert!(ir.contains("icmp ne i8"));
+
+        let consume = ir
+            .find("define internal i1 @__sable_v0_f_7_consume__p___r_b()")
+            .map(|start| &ir[start..])
+            .expect("Boolean-option consumer is emitted");
+        let absent = consume.find("icmp eq i8").unwrap();
+        let branch = consume[absent..].find("br i1").unwrap() + absent;
+        let trap = consume
+            .find("@__sable_rt_fail_v1(i32 8, i32 0, i64 0, i64 0)")
+            .unwrap();
+        let continuation = consume.find("trap.ok:").unwrap();
+        let payload = consume[continuation..]
+            .find("extractvalue %sable.option.bool")
+            .unwrap()
+            + continuation;
+        let canonical_bool = consume[payload..].find("trunc i8").unwrap() + payload;
+        assert!(absent < branch && branch < trap && trap < continuation);
+        assert!(continuation < payload && payload < canonical_bool);
+        for forbidden in [" nsw ", " nuw ", " exact ", " inbounds ", "llvm.assume"] {
+            assert!(
+                !ir.contains(forbidden),
+                "forbidden LLVM promise: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_option_does_not_open_parameters_entries_or_other_payloads() {
+        let option = Ty::Option(ValueTy::Bool);
+        let mut parameterized = function(
+            "parameterized",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        parameterized.params = vec![parameter("value", option)];
+        let parameter_error =
+            emit_program(&program(vec![parameterized]), 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(parameter_error[0].name, "backend.unsupported");
+        assert!(parameter_error[0].label.contains("function parameter"));
+
+        for unsupported_return in [
+            Ty::Option(ValueTy::Int(IntTy::I32)),
+            Ty::Option(ValueTy::Record(0)),
+            Ty::Option(ValueTy::Param(crate::ast::TypeParamId::from_legacy(0))),
+            Ty::OptionRaw(0),
+            Ty::Record(0),
+        ] {
+            let error = emit_program(
+                &program(vec![function(
+                    "unsupported",
+                    unsupported_return,
+                    Vec::new(),
+                )]),
+                1,
+                &EmitOptions::default(),
+            )
+            .unwrap_err();
+            assert_eq!(error[0].name, "backend.unsupported");
+            assert!(error[0].label.contains("runtime representation"));
+        }
+
+        let option_entry = function(
+            "option_entry",
+            option,
+            vec![Stmt::Return {
+                value: Some(bool_option(ExprKind::NoneE)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let entry_error = emit_program(
+            &program(vec![option_entry]),
+            1,
+            &EmitOptions {
+                entry: Some("option_entry".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(entry_error[0].name, "backend.entry_signature");
+
+        let mut audited = function("foreign_option", option, Vec::new());
+        audited.extern_info = Some(ExternInfo {
+            abi: "C".into(),
+            audit_id: "test".into(),
+            reason: "unit test".into(),
+            span: Span::new(0, 1),
+        });
+        let extern_error =
+            emit_program(&program(vec![audited]), 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(extern_error[0].name, "backend.unsupported");
+        assert!(extern_error[0].label.contains("audited extern"));
+    }
+
+    #[test]
+    fn residual_recursive_generic_shapes_remain_fail_closed() {
+        let callee = function(
+            "callee",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let residual_call = expression(
+            ExprKind::Call {
+                callee: "callee".into(),
+                callee_span: Span::new(0, 1),
+                type_args: vec![TypeArg {
+                    ty: GenericTy::Option(Box::new(GenericTy::Option(Box::new(GenericTy::Bool)))),
+                    span: Span::new(0, 1),
+                }],
+                args: Vec::new(),
+            },
+            Ty::Bool,
+        );
+        let caller = function(
+            "caller",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(residual_call),
+                span: Span::new(0, 1),
+            }],
+        );
+        let error =
+            emit_program(&program(vec![callee, caller]), 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(error[0].name, "backend.unsupported");
+        assert!(error[0].label.contains("retains type arguments"));
+
+        let mut residual_function = function(
+            "generic",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        residual_function.type_params.push("T".into());
+        residual_function.type_bounds.push(None);
+        let error = emit_program(
+            &program(vec![residual_function]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error[0].name, "backend.unsupported");
+        assert!(error[0].label.contains("generic declaration metadata"));
     }
 
     #[test]

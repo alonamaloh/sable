@@ -17,3 +17,40 @@ Writing the first 73 rules of the SVM (`lean/Sable/SVM.lean`) forced eleven deci
 11. **Minor batch**: out-of-range literals are checker duty; unary minus on unsigned is a type error; `alloc_array` lengths are `u64` (nonnegative by typing); `bool ==` and mixed-width comparisons are checker restrictions, the machine compares on ℤ; `a.len` is `u64`-typed with `len ≤ u64.max` as a machine axiom.
 
 Next SVM-track steps (unchanged): determinism proof, functional evaluator + agreement proof (the differential-testing oracle), then calls/frames under resolution 4. The formalization must be updated to add the `undef` outcome.
+
+## G1.2 amendment: ordinary option shape and failure outcomes (2026-08-13)
+
+The formal SVM now represents an ordinary option as
+`Val.opt : Option Val`, rather than `Option Int`. Its `someE` and `noneE`
+constructors and `optIsSome`/`optValue` accessors are generic over machine
+values in both the relational semantics and the proved functional evaluator.
+This fixes two outcome choices under resolutions 1 and 10:
+
+1. Applying an ordinary-option accessor to a value with the wrong outer shape
+   is type confusion and therefore reaches `undef`.
+2. Applying `.value` to a well-shaped absent option reaches the observable
+   language trap `Trap.optionNone`, not `undef`.
+
+Ordinary options and nullable raw-pointer options remain distinct value forms,
+so crossing those accessor domains is also shape confusion. Rendering remains
+compatible for existing integer observations (`opt none`, `opt some 7`) and
+adds compact Boolean observations (`opt some false`, `opt some true`).
+
+The recursive formal value does not widen the checked source or ABI surface.
+Rust lowering accepts only concrete integer/Boolean options in G1.1's
+ordinary-function return/local intersection, including contextual
+construction, assignment, A-normal call transport, and access. Option
+parameters and fields, trait returns, record/nested payloads, Boolean arrays,
+residual or Boolean generic arguments, classes/method calls, and audited
+externs remain fail closed. The preclosure focused evidence was green: one-job Lake build,
+`cargo check`, 123/123 Rust library tests, 13/13 focused SVM units, and exact
+Rust↔Lean differential agreement on 76/76 subjects.
+
+G1.2 closed together with G1.3 under
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. The run
+passed 129/129 library tests; all 374 corpus subjects (80 verifies, 231
+must-fail, 45 dynamic, 18 dynamic-fail) in 414.80s; LLVM CLI 6/6; the
+exact-`VerifiedProgram` interpreter↔Clang differential over four subjects at
+both `-O0` and `-O2`; SVM differential 76/76; and the randomized allocator,
+grind-budget, LSP, and documentation gates. G1.2 is closed.

@@ -170,6 +170,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
              i32 6, label %sub_overflow\n\
              i32 7, label %mul_overflow\n\
              i32 8, label %neg_overflow\n\
+             i32 9, label %option_none\n\
            ]\n\
          add_overflow:\n\
            %add_result = call i8 @__sable_v0_f_9_add_guard__p_i8_i8__r_i8(i8 127, i8 1)\n\
@@ -191,6 +192,9 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
            ret i32 0\n\
          neg_overflow:\n\
            %neg_result = call i64 @__sable_v0_f_9_neg_guard__p_i64__r_i64(i64 -9223372036854775808)\n\
+           ret i32 0\n\
+         option_none:\n\
+           %option_result = call i1 @__sable_v0_f_18_option_value_guard__p_b__r_b(i1 0)\n\
            ret i32 0\n\
          unexpected:\n\
            ret i32 99\n\
@@ -257,6 +261,16 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             kind: 7,
             type_info: 1_797, // destination i8 | (source i32 << 8)
             lhs_bits: 300,
+            rhs_bits: 0,
+        },
+        TrapCase {
+            label: "option value of none",
+            arguments: &[
+                "option", "value", "of", "none", "must", "trap", "kind", "eight",
+            ],
+            kind: 8,
+            type_info: 0,
+            lhs_bits: 0,
             rhs_bits: 0,
         },
     ];

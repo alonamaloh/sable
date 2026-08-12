@@ -13,6 +13,9 @@ deliberately deferred rather than required before the usability roadmap.
 On that boundary, M45's scalar LLVM v0 backend is also complete: lowering starts
 from the exact Lean-authorized `VerifiedProgram`, preserves checked scalar
 semantics under optimization, and has interpreter/native plus trap-ABI gates.
+G1.1's verified/interpreted `option<bool>` slice is closed, and G1.2/G1.3 now
+carry its ordinary-function intersection through the formal SVM and native
+LLVM. Their combined full serial closure gate is green.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -136,7 +139,7 @@ Next: the JSON *parser* (token stream → structural validation — wants the ha
 
 ### M11 — option consumption (ADR 0008) *(complete, 2026-08-09)*
 
-The gap the JSON parser forces, resolved C++-`std::optional`-style — **no pattern matching in the program language, as a standing design principle** (a `match` statement was considered and rejected): option-typed locals, `.is_some` (bool), and `.value` (payload, under an `option.some` obligation — junk-on-none in the model like `Seq.get` off-range, trap in `sable test`). The prelude (`lean/Sable/OptionAcc.lean`) defines the same accessors over `Option Int`, so **the identical postfix syntax elaborates in clause text**: new contracts read `post result.is_some → result.value = x + 1` — the spec and the code converge on one accessor style, with no `match` in either. `corpus/verifies/option_access.sable` verifies fully automatically (20 obligations, someness VCs discharging from branch facts, unreachable-else vacuity included); guards: `must-fail/option_value_unguarded` (unguarded `.value` is a verification error) and `test-fails/option_value_trap` (dynamic trap). (A wart found here — the monitor parsing `↔` at `=`-precedence — was fixed immediately after: the monitor now parses `↔` at Lean's exact precedence, loosest of all connectives, because the monitor evaluating a *differently-parenthesized* proposition than the one Lean verified would be a monitoring-soundness bug. `test_option_access.sable` carries a precedence-witness clause whose truth value differs under any tighter parse.)
+The gap the JSON parser forces, resolved C++-`std::optional`-style — **no pattern matching in the program language, as a standing design principle** (a `match` statement was considered and rejected): option-typed locals, `.is_some` (bool), and `.value` (payload, under an `option.some` obligation — junk-on-none in the model like `Seq.get` off-range, trap in `sable test`). The prelude (`lean/Sable/OptionAcc.lean`) defines the same polymorphic accessors over `Option α` (originally exercised with `Option Int`), so **the identical postfix syntax elaborates in clause text**: new contracts read `post result.is_some → result.value = x + 1` — the spec and the code converge on one accessor style, with no `match` in either. `corpus/verifies/option_access.sable` verifies fully automatically (20 obligations, someness VCs discharging from branch facts, unreachable-else vacuity included); guards: `must-fail/option_value_unguarded` (unguarded `.value` is a verification error) and `test-fails/option_value_trap` (dynamic trap). (A wart found here — the monitor parsing `↔` at `=`-precedence — was fixed immediately after: the monitor now parses `↔` at Lean's exact precedence, loosest of all connectives, because the monitor evaluating a *differently-parenthesized* proposition than the one Lean verified would be a monitoring-soundness bug. `test_option_access.sable` carries a precedence-witness clause whose truth value differs under any tighter parse.)
 
 ### M12 — the JSON parser *(layer 1 complete, 2026-08-09)*
 
@@ -657,9 +660,10 @@ backend support belongs to M46 and later.
 
 ## Post-U10 usability sequence
 
-Unsafe Sable v1 and the scalar LLVM v0 boundary are now complete. The next work
-starts the aggregate-generics/backend track at M46+. The order remains a
-working hypothesis, not a promise that evidence cannot reorder it:
+Unsafe Sable v1, the scalar LLVM v0 boundary, and the first end-to-end Boolean
+option slice are now complete. The next work broadens the
+aggregate-generics/backend track at M46+. The order remains a working
+hypothesis, not a promise that evidence cannot reorder it:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
    interpreter/native differentials and end-to-end trap tests as later work
@@ -696,9 +700,9 @@ working hypothesis, not a promise that evidence cannot reorder it:
      subjects in 424.42s; LLVM CLI 6/6; exact-`VerifiedProgram`
      interpreter↔Clang differential at `-O0` and `-O2`; SVM 69/69; allocator,
      grind-budget, and LSP gates green.
-   - **G1 — Boolean/POD aggregates (in progress):** establish the first
-     non-integer aggregate storage, value, verification, interpreter, and LLVM
-     paths.
+   - **G1 — Boolean/POD aggregates (first slice complete; broader work in
+     progress):** establish non-integer aggregate storage, value, verification,
+     interpreter, and LLVM paths one fenced representation at a time.
 
      **G1.0 — representation and proof provenance (complete):** declaration
      parameters now use `Ty::Param(TypeParamId)`, and
@@ -748,8 +752,8 @@ working hypothesis, not a promise that evidence cannot reorder it:
      This slice does not admit Boolean arrays or `alloc_array<bool>`, any
      option-typed parameter, option-valued class or record fields, trait or impl
      method option returns, record or nested option payloads, or Boolean generic
-     type arguments. The formal SVM and LLVM emitter independently reject the
-     new type.
+     type arguments. At the G1.1 checkpoint, the formal SVM and LLVM emitter
+     independently rejected the new type.
 
      The complete low-concurrency closure command was
      `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
@@ -762,13 +766,54 @@ working hypothesis, not a promise that evidence cannot reorder it:
      1/1; and SVM differential 69/69. Randomized allocator, grind-budget, LSP,
      and documentation gates were green. G1.1 is closed.
 
-     **G1.2 — formal SVM Boolean options (next):** extend the relational and
-     executable machine models together, prove their agreement, and add the
-     interpreter/SVM differential before removing the lowering rejection.
+     **G1.2 — formal SVM Boolean options (complete):** the formal value plane now uses
+     `Val.opt : Option Val`, replacing the old integer-specialized payload.
+     `some`, `none`, `.is_some`, and `.value` are generic over machine values in
+     both the inductive relation and the functional evaluator, and their
+     two-directional agreement proof remains intact. A non-option operand is
+     `undef`; extracting `none` is `Trap.optionNone`. Rendering preserves
+     `opt none` and the historical integer spelling `opt some 7`, while adding
+     `opt some false` and `opt some true`. Direct guards pin present false,
+     present true, absence, extraction, both failure classes, and integer wire
+     compatibility.
 
-     **G1.3 — LLVM Boolean options:** lower the same checked value as a tagged
-     option with an explicit absent-value trap path, then close native `-O0` and
-     `-O2` differentials before broadening aggregate payloads.
+     The formal core's recursive representation deliberately exceeds source
+     authorization. Rust lowering accepts only G1.1's ordinary-function
+     intersection: concrete integer/Boolean option returns and explicit or
+     inferred locals, contextual constructors, assignment and A-normal
+     call-result transport, `.is_some`, and `.value`. Option parameters and
+     fields, trait returns, record/nested payloads, Boolean arrays, residual or
+     Boolean generic arguments, classes and method calls, and audited extern
+     calls remain independently rejected. No option ABI was introduced.
+
+     Its focused one-job Lake build covers `SVM`, `SVMEval`, `SVMOptionTests`,
+     the raw/UART suites, and the `Sable` package, while the Rust↔Lean SVM
+     differential agrees on 76/76 subjects.
+
+     **G1.3 — LLVM Boolean options (complete):** the matching native value is
+     the internal named type `%sable.option.bool = type { i8, i8 }`, tag then
+     canonicalized payload. `none` is all zero; `some(false)` and `some(true)`
+     use tag one and payload zero or one. Internal returns, direct calls, and
+     explicit/inferred locals transport it through branches, assignment,
+     loads/stores, and returns. `.is_some` tests the tag; `.value` branches to
+     trap kind 8 with zero metadata and operand payloads before extracting on
+     the success edge. `ob` is an internal/versionable mangling component, not
+     an ABI promise.
+
+     The emitter still rejects option parameters, option entry/extern ABI,
+     option fields and trait methods, classes/method calls, residual generics,
+     and every non-Boolean option payload. The combined G1.2/G1.3 closure
+     command was `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. It passed 129/129 library tests; all 374
+     corpus subjects (80 verifies, 231 must-fail, 45 dynamic, 18 dynamic-fail)
+     in 414.80s; LLVM CLI 6/6, including exact zero metadata/payload for the
+     kind-8 option-none trap and mandatory `llvm.trap`; the 1/1 exact
+     `VerifiedProgram` interpreter↔Clang differential, now looping over four
+     subjects (scalar, control flow, arithmetic, and Boolean option) at `-O0`
+     and `-O2`, with 42 from the option subject; and SVM differential 76/76.
+     Randomized allocator, grind-budget, LSP, and documentation gates were
+     green. G1.2 and G1.3 are closed.
    - **G2 — affine options:** carry ownership and destruction correctly through
      present/absent aggregate values.
    - **G3 — slots and `Vec`:** make generic element storage and movement real
@@ -789,7 +834,7 @@ working hypothesis, not a promise that evidence cannot reorder it:
 
 ## Parallel track (low intensity)
 
-The SVM semantic oracle — **checkpoint reached, with the first profile composition complete**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers checked Sable through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator. Calls/frames, byte raw memory, abstract `u64` cells, and abstract POD record cells all live in both core presentations. ADR 0056 adds nullable pointers, record construction/projection, tag-checked record storage, and per-byte extent exclusion without adding a byte representation. Forty-seven direct guards pin those outcomes independently of agreement. ADR 0057 composes `SVMUart` around the core: bare executions remain byte-for-byte compatible, while selected executions add an oracle cursor and ordered MMIO observation. The differential set is now green at 69/69 subjects, including profile reselection precedence and profile selection through assignment, discard, and inferred declaration. The older ghost-transition erasure theorem and class track remain separate future work.
+The SVM semantic oracle — **checkpoint reached, with the first profile composition complete**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers checked Sable through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator. Calls/frames, byte raw memory, abstract `u64` cells, and abstract POD record cells all live in both core presentations. ADR 0056 adds nullable pointers, record construction/projection, tag-checked record storage, and per-byte extent exclusion without adding a byte representation. Forty-seven direct raw/record guards pin those outcomes independently of agreement. G1.2 adds recursive ordinary options (`Val.opt : Option Val`) and direct guards for Boolean payloads, option access, wrong-shape `undef`, absent-value `optionNone`, and integer wire compatibility. ADR 0057 composes `SVMUart` around the core: bare executions remain byte-for-byte compatible, while selected executions add an oracle cursor and ordered MMIO observation. The closure differential is green at 76/76 subjects, including Boolean option absence/presence, assignment, accessors, and call transport as well as profile reselection precedence and profile selection through assignment, discard, and inferred declaration. The older ghost-transition erasure theorem and class track remain separate future work.
 
 ## Testing strategy
 

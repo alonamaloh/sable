@@ -166,8 +166,8 @@ trap on absent access.
 This addition does not admit Boolean arrays or `alloc_array<bool>`, any
 option-typed parameter, option-valued class or record fields, trait or impl
 method option returns, record or nested option payloads, or generic Boolean
-instances. The formal SVM and LLVM emitter continue to reject `option<bool>`
-independently.
+instances. At the G1.1 checkpoint, the formal SVM and LLVM emitter independently
+rejected `option<bool>`.
 
 G1.1's complete low-concurrency closure command was
 `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
@@ -178,3 +178,41 @@ dynamic, 18 dynamic-fail) in 409.31s; the focused `option_bool` verification at
 6/6; the exact `VerifiedProgram` interpreter↔Clang differential at `-O0` and
 `-O2` 1/1; and SVM differential 69/69. The randomized allocator,
 grind-budget, LSP, and documentation gates were green. G1.1 is closed.
+
+## G1.2 amendment: a generic machine value is not generic proof reuse (2026-08-13)
+
+G1.2 makes the formal SVM's ordinary option representation payload-generic:
+`Val.opt` now contains `Option Val`, and the formal `some`/`none`/accessor rules
+operate uniformly on that recursive value. This is a machine-model
+factorization, not a widening of ADR 0009's concept or monomorphization domain.
+In particular, no Boolean type argument receives
+`ProofReuse::Adr0009IntModel`, and residual or Boolean generic arguments remain
+hard errors at the Rust SVM-lowering boundary.
+
+The lowerer accepts only concrete integer and Boolean options in G1.1's
+ordinary-function return/local slice. Option parameters and fields, trait
+returns, record/nested payloads, Boolean arrays, classes and method calls, and
+audited externs remain outside the model. The formal core can consequently use
+one recursive semantic object without allowing a future source aggregate or
+generic instance to inherit lowering by representation accident.
+
+The preclosure focused evidence passed the one-job Lake build, `cargo check`,
+123/123 Rust library tests, 13/13 focused Rust SVM units, and the exact SVM
+differential at 76/76.
+
+G1.3 applies the same separation at the LLVM boundary. The emitter recognizes
+only the already-concrete `option<bool>` type and rejects residual declaration
+metadata and call-site type arguments before lowering. Its internal `ob`
+mangling and `%sable.option.bool` IR type authorize no Boolean generic instance,
+no non-Boolean option, and no option parameter/extern ABI. In particular, this
+backend representation neither mints nor broadens
+`ProofReuse::Adr0009IntModel`.
+
+G1.2 and G1.3 closed under
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`: 129/129
+library tests; all 374 corpus subjects (80 verifies, 231 must-fail, 45 dynamic,
+18 dynamic-fail) in 414.80s; LLVM CLI 6/6; the exact-`VerifiedProgram`
+interpreter↔Clang differential over four subjects at `-O0` and `-O2`; SVM
+differential 76/76; and randomized allocator, grind-budget, LSP, and
+documentation gates. Both stages are closed without widening concepts.

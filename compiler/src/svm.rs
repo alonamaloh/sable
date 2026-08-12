@@ -5,8 +5,8 @@
 //! `Config.render` on the Lean side character for character.
 //!
 //! Lowering is deliberately strict: anything outside the formalized
-//! subset — calls, classes, option accessors, array literals, loop
-//! invariants — is a hard error, never a silent skip, so the harness
+//! subset — class members, option-valued parameters/storage, array literals,
+//! loop invariants — is a hard error, never a silent skip, so the harness
 //! cannot compare less than it claims to. The mandatory loop `variant`
 //! is the one asymmetry: erased here (ghost, design §4) but monitored
 //! by the interpreter, so a diff program's variants must hold.
@@ -29,22 +29,41 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
-/// The current SVM represents arrays and ordinary options with integer
-/// machine values. Keep that representation boundary explicit while G1 grows
-/// the checked AST's payload vocabulary: a new payload kind must not inherit
-/// integer lowering merely because the emitted constructor is untyped.
-fn validate_fn_payloads(f: &Fn) -> Result<(), String> {
+/// Keep the G1.2 representation boundary explicit: arrays remain concrete-
+/// integer-only, while ordinary options additionally admit `bool`.  The Lean
+/// constructors are intentionally untyped, so every checked payload must be
+/// classified here instead of inheriting lowering by accident.
+fn validate_fn_payloads(ctx: &LowerCtx<'_>, f: &Fn) -> Result<(), String> {
+    if !f.type_params.is_empty() {
+        return Err(format!(
+            "svm.type_parameter_unsupported: `{}` is still a generic declaration",
+            f.name
+        ));
+    }
     for param in &f.params {
         validate_ty_payload(param.ty, &format!("parameter `{}`", param.name))?;
+        if matches!(param.ty, Ty::Option(_)) {
+            return Err(format!(
+                "svm.option_position_unsupported: parameter `{}` is option-typed; \
+                 ordinary options are returns and locals only",
+                param.name
+            ));
+        }
     }
     validate_ty_payload(f.ret, &format!("return type of `{}`", f.name))?;
-    validate_stmt_payloads(&f.body)
+    if f.extern_info.is_some() {
+        return Err(format!(
+            "`{}` is an audited extern: the machine has no semantics for a foreign call",
+            f.name
+        ));
+    }
+    validate_stmt_payloads(ctx, &f.body)
 }
 
 fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
-        Ty::Array(payload, _) => validate_payload(payload, context, "array"),
-        Ty::Option(payload) => validate_payload(payload, context, "option"),
+        Ty::Array(payload, _) => validate_array_payload(payload, context),
+        Ty::Option(payload) => validate_option_payload(payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "svm.type_parameter_unsupported: {context} contains an unresolved type parameter"
         )),
@@ -52,43 +71,270 @@ fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
     }
 }
 
-fn validate_payload(payload: ValueTy, context: &str, aggregate: &str) -> Result<(), String> {
+fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
     match payload {
         ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         _ => Err(format!(
-            "svm.aggregate_payload_unsupported: {context} has {aggregate} payload `{}`; \
+            "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
              the SVM currently lowers only concrete integer payloads",
             payload.name()
         )),
     }
 }
 
-fn validate_stmt_payloads(stmts: &[Stmt]) -> Result<(), String> {
+fn validate_option_payload(payload: ValueTy, context: &str) -> Result<(), String> {
+    match payload {
+        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        ValueTy::Bool => Ok(()),
+        _ => Err(format!(
+            "svm.aggregate_payload_unsupported: {context} has option payload `{}`; \
+             the SVM currently lowers only concrete integer and Boolean option payloads",
+            payload.name()
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SvmOptionRepr {
+    Ordinary(ValueTy),
+    RawRecord(usize),
+}
+
+/// Classify an option constructor from its checked outer annotation.  The
+/// Lean syntax is deliberately untyped, so accepting a missing or unrelated
+/// annotation here would let a malformed public AST manufacture a value that
+/// the source checker could never produce.
+fn svm_option_repr(expr: &Expr, constructor: &str) -> Result<SvmOptionRepr, String> {
+    match expr.ty {
+        Some(Ty::Option(payload)) => {
+            validate_option_payload(payload, &format!("`{constructor}` result"))?;
+            Ok(SvmOptionRepr::Ordinary(payload))
+        }
+        Some(Ty::OptionRaw(record)) => Ok(SvmOptionRepr::RawRecord(record)),
+        Some(ty) => Err(format!(
+            "svm.option_constructor_type: `{constructor}` result has type `{}`; \
+             expected an ordinary or nullable-raw option annotation",
+            ty.name()
+        )),
+        None => Err(format!(
+            "svm.option_constructor_type: `{constructor}` result carries no type; \
+             expected an ordinary or nullable-raw option annotation"
+        )),
+    }
+}
+
+fn ordinary_option_payload_ty(payload: ValueTy) -> Result<Ty, String> {
+    match payload {
+        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
+        ValueTy::Bool => Ok(Ty::Bool),
+        _ => Err(format!(
+            "svm.aggregate_payload_unsupported: option constructor has payload `{}`; \
+             the SVM currently lowers only concrete integer and Boolean option payloads",
+            payload.name()
+        )),
+    }
+}
+
+fn validate_some_constructor(expr: &Expr, inner: &Expr) -> Result<SvmOptionRepr, String> {
+    let repr = svm_option_repr(expr, "some")?;
+    let expected = match repr {
+        SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+        SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
+    };
+    match inner.ty {
+        Some(actual) if actual == expected => Ok(repr),
+        Some(actual) => Err(format!(
+            "svm.option_constructor_payload: `some(...)` is annotated `{}` but its payload has \
+             type `{}`; malformed checked AST",
+            expr.ty.expect("classified option result").name(),
+            actual.name()
+        )),
+        None => Err(format!(
+            "svm.option_constructor_payload: `some(...)` payload carries no type; \
+             expected `{}` from the result annotation",
+            expected.name()
+        )),
+    }
+}
+
+fn validate_option_accessor(
+    expr: &Expr,
+    operand: &Expr,
+    value: bool,
+) -> Result<SvmOptionRepr, String> {
+    let accessor = if value { ".value" } else { ".is_some" };
+    let repr = match operand.ty {
+        Some(Ty::Option(payload)) => {
+            validate_option_payload(payload, "option accessor operand")?;
+            SvmOptionRepr::Ordinary(payload)
+        }
+        Some(Ty::OptionRaw(record)) => SvmOptionRepr::RawRecord(record),
+        Some(ty) => {
+            return Err(format!(
+                "svm.option_accessor_operand: `{accessor}` operand has type `{}`; \
+                 expected an ordinary or nullable-raw option annotation",
+                ty.name()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "svm.option_accessor_operand: `{accessor}` operand carries no type; \
+                 expected an ordinary or nullable-raw option annotation"
+            ));
+        }
+    };
+    let expected = if value {
+        match repr {
+            SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+            SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
+        }
+    } else {
+        Ty::Bool
+    };
+    match expr.ty {
+        Some(actual) if actual == expected => Ok(repr),
+        Some(actual) => Err(format!(
+            "svm.option_accessor_result: `{accessor}` is annotated `{}`; expected `{}` \
+             from its operand type",
+            actual.name(),
+            expected.name()
+        )),
+        None => Err(format!(
+            "svm.option_accessor_result: `{accessor}` carries no result type; \
+             expected `{}` from its operand type",
+            expected.name()
+        )),
+    }
+}
+
+/// Re-check positional exclusions from the checked-language boundary.  The
+/// differential harness must remain strict even if it is ever handed a
+/// malformed or prematurely widened checked AST.
+fn validate_program_option_positions(program: &Program) -> Result<(), String> {
+    fn validate_function_positions(
+        function: &Fn,
+        context: &str,
+        trait_member: bool,
+    ) -> Result<(), String> {
+        for parameter in &function.params {
+            if let Ty::Option(payload) = parameter.ty {
+                validate_option_payload(payload, context)?;
+                return Err(format!(
+                    "svm.option_position_unsupported: {context} parameter `{}` is option-typed; \
+                     ordinary options are returns and locals only",
+                    parameter.name
+                ));
+            }
+        }
+        if trait_member {
+            if let Ty::Option(payload) = function.ret {
+                validate_option_payload(payload, context)?;
+                return Err(format!(
+                    "svm.option_position_unsupported: {context} returns an ordinary option; \
+                     trait option returns are not in the SVM model"
+                ));
+            }
+        }
+        if function.extern_info.is_some() {
+            return Err(format!(
+                "`{}` is an audited extern: the machine has no semantics for a foreign call",
+                function.name
+            ));
+        }
+        Ok(())
+    }
+
+    for function in program.fns.iter().chain(&program.fn_templates) {
+        validate_function_positions(function, &format!("function `{}`", function.name), false)?;
+    }
+    for class in program.classes.iter().chain(&program.class_templates) {
+        for field in &class.fields {
+            if let Ty::Option(payload) = field.ty {
+                validate_option_payload(payload, &format!("class `{}`", class.name))?;
+                return Err(format!(
+                    "svm.option_position_unsupported: class `{}.{}` has an option-typed field; \
+                     option-valued fields are not in the SVM model",
+                    class.name, field.name
+                ));
+            }
+        }
+        for initializer in &class.inits {
+            validate_function_positions(
+                initializer,
+                &format!("initializer `{}::{}`", class.name, initializer.name),
+                false,
+            )?;
+        }
+        for method in &class.methods {
+            validate_function_positions(
+                &method.f,
+                &format!("method `{}.{}`", class.name, method.f.name),
+                false,
+            )?;
+        }
+    }
+    for record in &program.records {
+        for field in &record.fields {
+            if let Ty::Option(payload) = field.ty {
+                validate_option_payload(payload, &format!("record `{}`", record.name))?;
+                return Err(format!(
+                    "svm.option_position_unsupported: record `{}.{}` has an option-typed field; \
+                     option-valued fields are not in the SVM model",
+                    record.name, field.name
+                ));
+            }
+        }
+    }
+    for trait_ in &program.traits {
+        for method in &trait_.methods {
+            validate_function_positions(
+                method,
+                &format!("trait method `{}::{}`", trait_.name, method.name),
+                true,
+            )?;
+        }
+    }
+    for implementation in &program.impls {
+        for function in &implementation.fns {
+            validate_function_positions(
+                function,
+                &format!(
+                    "trait implementation method `{}::{}`",
+                    implementation.trait_name, function.name
+                ),
+                true,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
             Stmt::Decl { ty, init, name, .. } => {
                 validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
                 if let Some(init) = init {
-                    validate_expr_payloads(init)?;
+                    validate_expr_payloads(ctx, init)?;
                 }
             }
             Stmt::Assign { value, .. }
             | Stmt::ExprStmt(value)
-            | Stmt::FieldAssign { value, .. } => validate_expr_payloads(value)?,
+            | Stmt::FieldAssign { value, .. } => validate_expr_payloads(ctx, value)?,
             Stmt::If {
                 cond,
                 then_block,
                 else_block,
             } => {
-                validate_expr_payloads(cond)?;
-                validate_stmt_payloads(then_block)?;
+                validate_expr_payloads(ctx, cond)?;
+                validate_stmt_payloads(ctx, then_block)?;
                 if let Some(else_block) = else_block {
-                    validate_stmt_payloads(else_block)?;
+                    validate_stmt_payloads(ctx, else_block)?;
                 }
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
-                    validate_expr_payloads(value)?;
+                    validate_expr_payloads(ctx, value)?;
                 }
             }
             Stmt::Assert(_) => {}
@@ -96,35 +342,131 @@ fn validate_stmt_payloads(stmts: &[Stmt]) -> Result<(), String> {
                 if let Some(ty) = ty {
                     validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
                 }
-                validate_expr_payloads(init)?;
+                validate_expr_payloads(ctx, init)?;
             }
             Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
-                validate_expr_payloads(index)?;
-                validate_expr_payloads(value)?;
+                validate_expr_payloads(ctx, index)?;
+                validate_expr_payloads(ctx, value)?;
             }
             Stmt::While { cond, body, .. } => {
-                validate_expr_payloads(cond)?;
-                validate_stmt_payloads(body)?;
+                validate_expr_payloads(ctx, cond)?;
+                validate_stmt_payloads(ctx, body)?;
             }
             Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
-                validate_stmt_payloads(body)?;
+                validate_stmt_payloads(ctx, body)?;
             }
             Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
-                validate_expr_payloads(size)?;
+                validate_expr_payloads(ctx, size)?;
             }
             Stmt::SystemDealloc {
                 ptr, res, release, ..
             } => {
-                validate_expr_payloads(ptr)?;
-                validate_expr_payloads(res)?;
-                validate_expr_payloads(release)?;
+                validate_expr_payloads(ctx, ptr)?;
+                validate_expr_payloads(ctx, res)?;
+                validate_expr_payloads(ctx, release)?;
             }
         }
     }
     Ok(())
 }
 
-fn validate_expr_payloads(expr: &Expr) -> Result<(), String> {
+/// Resolve an A-normal call against the same executable program that will be
+/// emitted, and re-check all cached types.  Call and option constructors in the
+/// Lean core are untyped, so a forged result annotation must not be able to
+/// turn a scalar return into an option (or vice versa).
+fn validate_call_signature(
+    ctx: &LowerCtx<'_>,
+    call: &Expr,
+    callee: &str,
+    args: &[Expr],
+) -> Result<(), String> {
+    let ExprKind::Call { type_args, .. } = &call.kind else {
+        return Err("svm.call_shape: call validator received a non-call expression".into());
+    };
+    if !type_args.is_empty() {
+        return Err(
+            "svm.type_parameter_unsupported: generic type arguments escaped monomorphization"
+                .into(),
+        );
+    }
+    let mut matches = ctx
+        .program
+        .fns
+        .iter()
+        .filter(|function| function.name == callee);
+    let Some(function) = matches.next() else {
+        return Err(format!(
+            "svm.call_target: call target `{callee}` is absent from the executable program"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "svm.call_target: call target `{callee}` is ambiguous in the executable program"
+        ));
+    }
+    match call.ty {
+        Some(actual) if actual == function.ret => {}
+        Some(actual) => {
+            return Err(format!(
+                "svm.call_result_type: call to `{callee}` is annotated `{}`; callee returns `{}`",
+                actual.name(),
+                function.ret.name()
+            ));
+        }
+        None => {
+            return Err(format!(
+                "svm.call_result_type: call to `{callee}` carries no result type; callee returns `{}`",
+                function.ret.name()
+            ));
+        }
+    }
+    if args.len() != function.params.len() {
+        return Err(format!(
+            "svm.call_arity: call to `{callee}` supplies {} argument(s); callee expects {}",
+            args.len(),
+            function.params.len()
+        ));
+    }
+    for (index, (arg, parameter)) in args.iter().zip(&function.params).enumerate() {
+        // Resource authority is erased from the machine. A checked resource
+        // place intentionally may have no cached expression type; when one is
+        // present it must still agree with the formal slot.
+        let erased_resource_place = parameter.ty.is_resource()
+            && arg.ty.is_none()
+            && matches!(
+                arg.kind,
+                ExprKind::Var(_) | ExprKind::SelfField { .. } | ExprKind::Borrow { .. }
+            );
+        if erased_resource_place {
+            continue;
+        }
+        match arg.ty {
+            Some(actual) if actual == parameter.ty => {}
+            Some(actual) => {
+                return Err(format!(
+                    "svm.call_argument_type: argument {} to `{callee}` is annotated `{}`; \
+                     parameter `{}` has type `{}`",
+                    index + 1,
+                    actual.name(),
+                    parameter.name,
+                    parameter.ty.name()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "svm.call_argument_type: argument {} to `{callee}` carries no type; \
+                     parameter `{}` has type `{}`",
+                    index + 1,
+                    parameter.name,
+                    parameter.ty.name()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
     if let Some(ty) = expr.ty {
         validate_ty_payload(ty, "expression annotation")?;
     }
@@ -148,12 +490,12 @@ fn validate_expr_payloads(expr: &Expr) -> Result<(), String> {
                     );
                 }
             }
-            validate_expr_payloads(index)?;
+            validate_expr_payloads(ctx, index)?;
         }
         ExprKind::AllocArray { elem, len, init } => {
-            validate_payload(*elem, "alloc_array", "array")?;
-            validate_expr_payloads(len)?;
-            validate_expr_payloads(init)?;
+            validate_array_payload(*elem, "alloc_array")?;
+            validate_expr_payloads(ctx, len)?;
+            validate_expr_payloads(ctx, init)?;
         }
         ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
             if matches!(target, IntTy::TParam(_)) {
@@ -162,12 +504,26 @@ fn validate_expr_payloads(expr: &Expr) -> Result<(), String> {
                         .into(),
                 );
             }
-            validate_expr_payloads(arg)?;
+            validate_expr_payloads(ctx, arg)?;
         }
         ExprKind::Call {
-            type_args, args, ..
+            callee,
+            type_args,
+            args,
+            ..
+        } => {
+            if !type_args.is_empty() {
+                return Err(
+                    "svm.type_parameter_unsupported: generic type arguments escaped monomorphization"
+                        .into(),
+                );
+            }
+            validate_call_signature(ctx, expr, callee, args)?;
+            for arg in args {
+                validate_expr_payloads(ctx, arg)?;
+            }
         }
-        | ExprKind::CtorCall {
+        ExprKind::CtorCall {
             type_args, args, ..
         } => {
             if !type_args.is_empty() {
@@ -177,16 +533,28 @@ fn validate_expr_payloads(expr: &Expr) -> Result<(), String> {
                 );
             }
             for arg in args {
-                validate_expr_payloads(arg)?;
+                validate_expr_payloads(ctx, arg)?;
             }
         }
-        ExprKind::Unary { operand, .. }
-        | ExprKind::IsSome { operand }
-        | ExprKind::OptValue { operand }
-        | ExprKind::SomeE(operand) => validate_expr_payloads(operand)?,
+        ExprKind::SomeE(operand) => {
+            validate_some_constructor(expr, operand)?;
+            validate_expr_payloads(ctx, operand)?;
+        }
+        ExprKind::NoneE => {
+            svm_option_repr(expr, "none")?;
+        }
+        ExprKind::IsSome { operand } => {
+            validate_option_accessor(expr, operand, false)?;
+            validate_expr_payloads(ctx, operand)?;
+        }
+        ExprKind::OptValue { operand } => {
+            validate_option_accessor(expr, operand, true)?;
+            validate_expr_payloads(ctx, operand)?;
+        }
+        ExprKind::Unary { operand, .. } => validate_expr_payloads(ctx, operand)?,
         ExprKind::Binary { lhs, rhs, .. } => {
-            validate_expr_payloads(lhs)?;
-            validate_expr_payloads(rhs)?;
+            validate_expr_payloads(ctx, lhs)?;
+            validate_expr_payloads(ctx, rhs)?;
         }
         ExprKind::RawOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
@@ -196,17 +564,16 @@ fn validate_expr_payloads(expr: &Expr) -> Result<(), String> {
         | ExprKind::RecordLit { args, .. }
         | ExprKind::ArrayLit(args) => {
             for arg in args {
-                validate_expr_payloads(arg)?;
+                validate_expr_payloads(ctx, arg)?;
             }
         }
         ExprKind::SelfFieldIndex { index, .. } | ExprKind::ClassFieldIndex { index, .. } => {
-            validate_expr_payloads(index)?;
+            validate_expr_payloads(ctx, index)?;
         }
         ExprKind::IntLit(_)
         | ExprKind::BoolLit(_)
         | ExprKind::Var(_)
         | ExprKind::Len { .. }
-        | ExprKind::NoneE
         | ExprKind::SelfField { .. }
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::ClassField { .. }
@@ -222,8 +589,10 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
     if !f.params.is_empty() {
         return Err("differential subjects must take no parameters".into());
     }
-    validate_fn_payloads(f)?;
-    lower_block(&LowerCtx { program }, &f.body)
+    let ctx = LowerCtx { program };
+    validate_program_option_positions(program)?;
+    validate_fn_payloads(&ctx, f)?;
+    lower_block(&ctx, &f.body)
 }
 
 /// Lower any function to a `Prog.ofList` entry: `("name", ⟨[params],
@@ -232,7 +601,8 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
 /// caller has no machine analog yet).
 pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
     let ctx = LowerCtx { program };
-    validate_fn_payloads(f)?;
+    validate_program_option_positions(program)?;
+    validate_fn_payloads(&ctx, f)?;
     for p in &f.params {
         match p.ty {
             Ty::Int(_) | Ty::Bool => {}
@@ -246,15 +616,6 @@ pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
                 ));
             }
         }
-    }
-    // An extern has no body: the machine would run it as a no-op, which
-    // is a silent divergence from whatever the interpreter's shim does.
-    // Unsupported means a hard failure, not a quiet one (ADR 0017).
-    if f.extern_info.is_some() {
-        return Err(format!(
-            "`{}` is an audited extern: the machine has no semantics for a foreign call",
-            f.name
-        ));
     }
     let params: Vec<String> = f.params.iter().map(|p| format!("\"{}\"", p.name)).collect();
     Ok(format!(
@@ -520,7 +881,7 @@ fn lower_stmt_erasing(
                     return Err("`uart_status` produces a value".into());
                 }
             }),
-            ExprKind::Call { callee, args, .. } => Some(lower_call(ctx, &None, callee, args)?),
+            ExprKind::Call { .. } => Some(lower_call(ctx, &None, e)?),
             ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args)?,
             _ => {
                 return Err("expression statements are outside the SVM core subset".into());
@@ -643,7 +1004,7 @@ fn lower_erased_resource_bind(
         ExprKind::Var(_) => Ok(None),
         ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args),
         ExprKind::RawOp { .. } => Ok(Some(lower_bind(ctx, name, e)?)),
-        ExprKind::Call { callee, args, .. } => Ok(Some(lower_call(ctx, &None, callee, args)?)),
+        ExprKind::Call { .. } => Ok(Some(lower_call(ctx, &None, e)?)),
         _ => Err("resource-valued expression is outside the SVM core subset".into()),
     }
 }
@@ -652,9 +1013,7 @@ fn lower_erased_resource_bind(
 /// is exactly a call; calls nested deeper stay outside the subset.
 fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String> {
     match &e.kind {
-        ExprKind::Call { callee, args, .. } => {
-            lower_call(ctx, &Some(name.to_string()), callee, args)
-        }
+        ExprKind::Call { .. } => lower_call(ctx, &Some(name.to_string()), e),
         ExprKind::DeviceOp {
             op: DeviceOp::UartStatus,
             ..
@@ -779,12 +1138,11 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
     }
 }
 
-fn lower_call(
-    ctx: &LowerCtx<'_>,
-    dst: &Option<String>,
-    callee: &str,
-    args: &[Expr],
-) -> Result<String, String> {
+fn lower_call(ctx: &LowerCtx<'_>, dst: &Option<String>, call: &Expr) -> Result<String, String> {
+    let ExprKind::Call { callee, args, .. } = &call.kind else {
+        unreachable!("lower_call requires an ordinary call expression")
+    };
+    validate_call_signature(ctx, call, callee, args)?;
     let lowered: Result<Vec<String>, String> =
         args.iter().map(|arg| lower_expr(ctx, arg)).collect();
     let d = match dst {
@@ -887,36 +1245,40 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
         ExprKind::Narrow { target, arg } => {
             format!("(.narrow {} {})", lean_ty(*target)?, lower_expr(ctx, arg)?)
         }
-        ExprKind::SomeE(inner) => {
-            if let Some(Ty::OptionRaw(ri)) = e.ty {
-                ctx.record(ri)?;
+        ExprKind::SomeE(inner) => match validate_some_constructor(e, inner)? {
+            SvmOptionRepr::RawRecord(record) => {
+                ctx.record(record)?;
                 format!("(.ptrSomeE {})", lower_expr(ctx, inner)?)
-            } else {
+            }
+            SvmOptionRepr::Ordinary(_) => {
                 format!("(.someE {})", lower_expr(ctx, inner)?)
             }
-        }
-        ExprKind::NoneE => {
-            if let Some(Ty::OptionRaw(ri)) = e.ty {
-                ctx.record(ri)?;
+        },
+        ExprKind::NoneE => match svm_option_repr(e, "none")? {
+            SvmOptionRepr::RawRecord(record) => {
+                ctx.record(record)?;
                 "(.ptrNoneE)".into()
-            } else {
-                "(.noneE)".into()
             }
-        }
-        ExprKind::IsSome { operand } => {
-            let Some(Ty::OptionRaw(ri)) = operand.ty else {
-                return Err("integer option accessors are outside the SVM core subset".into());
-            };
-            ctx.record(ri)?;
-            format!("(.ptrIsSome {})", lower_expr(ctx, operand)?)
-        }
-        ExprKind::OptValue { operand } => {
-            let Some(Ty::OptionRaw(ri)) = operand.ty else {
-                return Err("integer option accessors are outside the SVM core subset".into());
-            };
-            ctx.record(ri)?;
-            format!("(.ptrValue {})", lower_expr(ctx, operand)?)
-        }
+            SvmOptionRepr::Ordinary(_) => "(.noneE)".into(),
+        },
+        ExprKind::IsSome { operand } => match validate_option_accessor(e, operand, false)? {
+            SvmOptionRepr::Ordinary(_) => {
+                format!("(.optIsSome {})", lower_expr(ctx, operand)?)
+            }
+            SvmOptionRepr::RawRecord(record) => {
+                ctx.record(record)?;
+                format!("(.ptrIsSome {})", lower_expr(ctx, operand)?)
+            }
+        },
+        ExprKind::OptValue { operand } => match validate_option_accessor(e, operand, true)? {
+            SvmOptionRepr::Ordinary(_) => {
+                format!("(.optValue {})", lower_expr(ctx, operand)?)
+            }
+            SvmOptionRepr::RawRecord(record) => {
+                ctx.record(record)?;
+                format!("(.ptrValue {})", lower_expr(ctx, operand)?)
+            }
+        },
         ExprKind::RecordField { obj, field, .. } => {
             format!("(.recordField (.var \"{obj}\") \"{field}\")")
         }
@@ -1046,8 +1408,9 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
             value: Some(value), ..
         } => match value.as_ref() {
             // Preserve the established integer-option wire spelling while
-            // the formal machine remains integer-only in G1.1.
+            // adding an unambiguous Boolean spelling for G1.2.
             RtVal::Int(n) => format!("opt some {n}"),
+            RtVal::Bool(b) => format!("opt some {b}"),
             value => format!("opt some {}", render_rt_val(program, value)),
         },
         RtVal::PtrOpt(None) => "ptrOpt none".into(),
@@ -1173,10 +1536,9 @@ mod tests {
     }
 
     #[test]
-    fn lowering_rejects_every_non_integer_option_payload() {
+    fn lowering_rejects_unmodeled_option_payloads() {
         let program = empty_program();
         let unsupported = [
-            ValueTy::Bool,
             ValueTy::Record(0),
             ValueTy::Param(TypeParamId::from_legacy(0)),
             ValueTy::Int(IntTy::TParam(0)),
@@ -1185,12 +1547,489 @@ mod tests {
         for payload in unsupported {
             let function = checked_fn(Ty::Option(payload), Vec::new());
             let error = lower_fn(&program, &function)
-                .expect_err("a non-integer option must not inherit integer SVM lowering");
+                .expect_err("an unmodeled option must not inherit recursive SVM lowering");
             assert!(
                 error.starts_with("svm.aggregate_payload_unsupported:"),
                 "{payload:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn lowering_supports_boolean_option_construction_and_accessors() {
+        let program = empty_program();
+        let ctx = LowerCtx { program: &program };
+        let bool_option = Ty::Option(ValueTy::Bool);
+
+        let some_false = expr(
+            ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
+            bool_option,
+        );
+        assert_eq!(
+            lower_expr(&ctx, &some_false).unwrap(),
+            "(.someE (.boolLit false))"
+        );
+        assert_eq!(
+            lower_expr(&ctx, &expr(ExprKind::NoneE, bool_option)).unwrap(),
+            "(.noneE)"
+        );
+
+        let option_var = || expr(ExprKind::Var("choice".into()), bool_option);
+        let is_some = expr(
+            ExprKind::IsSome {
+                operand: Box::new(option_var()),
+            },
+            Ty::Bool,
+        );
+        let value = expr(
+            ExprKind::OptValue {
+                operand: Box::new(option_var()),
+            },
+            Ty::Bool,
+        );
+        assert_eq!(
+            lower_expr(&ctx, &is_some).unwrap(),
+            "(.optIsSome (.var \"choice\"))"
+        );
+        assert_eq!(
+            lower_expr(&ctx, &value).unwrap(),
+            "(.optValue (.var \"choice\"))"
+        );
+    }
+
+    #[test]
+    fn option_constructors_require_coherent_checked_annotations() {
+        let program = empty_program();
+        let ctx = LowerCtx { program: &program };
+        let bool_option = Ty::Option(ValueTy::Bool);
+
+        let wrong_payload = expr(
+            ExprKind::SomeE(Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::I32)))),
+            bool_option,
+        );
+        let nested_payload = expr(
+            ExprKind::SomeE(Box::new(expr(
+                ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
+                bool_option,
+            ))),
+            bool_option,
+        );
+        let non_option_result = expr(ExprKind::NoneE, Ty::Bool);
+        let missing_result = Expr {
+            kind: ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
+            span: Span::new(0, 0),
+            ty: None,
+        };
+        let missing_payload = expr(
+            ExprKind::SomeE(Box::new(Expr {
+                kind: ExprKind::BoolLit(false),
+                span: Span::new(0, 0),
+                ty: None,
+            })),
+            bool_option,
+        );
+
+        for (malformed, diagnostic) in [
+            (&wrong_payload, "svm.option_constructor_payload:"),
+            (&nested_payload, "svm.option_constructor_payload:"),
+            (&non_option_result, "svm.option_constructor_type:"),
+            (&missing_result, "svm.option_constructor_type:"),
+            (&missing_payload, "svm.option_constructor_payload:"),
+        ] {
+            let preflight = validate_expr_payloads(&ctx, malformed)
+                .expect_err("malformed public AST must fail SVM preflight");
+            assert!(preflight.starts_with(diagnostic), "{preflight}");
+            let lowering = lower_expr(&ctx, malformed)
+                .expect_err("direct expression lowering must enforce the same boundary");
+            assert!(lowering.starts_with(diagnostic), "{lowering}");
+        }
+
+        let valid_bool = expr(
+            ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
+            bool_option,
+        );
+        let valid_int = expr(
+            ExprKind::SomeE(Box::new(expr(ExprKind::IntLit(7), Ty::Int(IntTy::I32)))),
+            Ty::Option(ValueTy::Int(IntTy::I32)),
+        );
+        let valid_none = expr(ExprKind::NoneE, bool_option);
+        for valid in [&valid_bool, &valid_int, &valid_none] {
+            validate_expr_payloads(&ctx, valid).expect("coherent ordinary option constructor");
+            lower_expr(&ctx, valid).expect("coherent ordinary option lowering");
+        }
+
+        let valid_raw = expr(
+            ExprKind::SomeE(Box::new(expr(
+                ExprKind::Var("pointer".into()),
+                Ty::RawRecord(0),
+            ))),
+            Ty::OptionRaw(0),
+        );
+        validate_expr_payloads(&ctx, &valid_raw).expect("coherent nullable-raw constructor");
+        validate_expr_payloads(&ctx, &expr(ExprKind::NoneE, Ty::OptionRaw(0)))
+            .expect("coherent nullable-raw none constructor");
+
+        let unsupported = expr(ExprKind::NoneE, Ty::Option(ValueTy::Record(0)));
+        let error = validate_expr_payloads(&ctx, &unsupported)
+            .expect_err("record option payload must remain outside G1.2");
+        assert!(
+            error.starts_with("svm.aggregate_payload_unsupported:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn option_accessors_require_coherent_checked_annotations() {
+        let program = empty_program();
+        let ctx = LowerCtx { program: &program };
+        let bool_option = Ty::Option(ValueTy::Bool);
+        let int_option = Ty::Option(ValueTy::Int(IntTy::I32));
+        let bool_operand = || expr(ExprKind::Var("choice".into()), bool_option);
+        let int_operand = || expr(ExprKind::Var("number".into()), int_option);
+
+        let wrong_is_some_result = expr(
+            ExprKind::IsSome {
+                operand: Box::new(bool_operand()),
+            },
+            Ty::Int(IntTy::I32),
+        );
+        let wrong_bool_value_result = expr(
+            ExprKind::OptValue {
+                operand: Box::new(bool_operand()),
+            },
+            Ty::Int(IntTy::I32),
+        );
+        let wrong_int_value_result = expr(
+            ExprKind::OptValue {
+                operand: Box::new(int_operand()),
+            },
+            Ty::Bool,
+        );
+        let missing_result = Expr {
+            kind: ExprKind::OptValue {
+                operand: Box::new(bool_operand()),
+            },
+            span: Span::new(0, 0),
+            ty: None,
+        };
+        let missing_operand = expr(
+            ExprKind::IsSome {
+                operand: Box::new(Expr {
+                    kind: ExprKind::Var("choice".into()),
+                    span: Span::new(0, 0),
+                    ty: None,
+                }),
+            },
+            Ty::Bool,
+        );
+        let non_option_operand = expr(
+            ExprKind::OptValue {
+                operand: Box::new(expr(ExprKind::BoolLit(false), Ty::Bool)),
+            },
+            Ty::Bool,
+        );
+
+        for (malformed, diagnostic) in [
+            (&wrong_is_some_result, "svm.option_accessor_result:"),
+            (&wrong_bool_value_result, "svm.option_accessor_result:"),
+            (&wrong_int_value_result, "svm.option_accessor_result:"),
+            (&missing_result, "svm.option_accessor_result:"),
+            (&missing_operand, "svm.option_accessor_operand:"),
+            (&non_option_operand, "svm.option_accessor_operand:"),
+        ] {
+            let preflight = validate_expr_payloads(&ctx, malformed)
+                .expect_err("malformed public AST must fail SVM preflight");
+            assert!(preflight.starts_with(diagnostic), "{preflight}");
+            let lowering = lower_expr(&ctx, malformed)
+                .expect_err("direct expression lowering must enforce the same boundary");
+            assert!(lowering.starts_with(diagnostic), "{lowering}");
+        }
+
+        let valid = [
+            expr(
+                ExprKind::IsSome {
+                    operand: Box::new(bool_operand()),
+                },
+                Ty::Bool,
+            ),
+            expr(
+                ExprKind::OptValue {
+                    operand: Box::new(bool_operand()),
+                },
+                Ty::Bool,
+            ),
+            expr(
+                ExprKind::OptValue {
+                    operand: Box::new(int_operand()),
+                },
+                Ty::Int(IntTy::I32),
+            ),
+        ];
+        for accessor in &valid {
+            validate_expr_payloads(&ctx, accessor).expect("coherent ordinary option accessor");
+            lower_expr(&ctx, accessor).expect("coherent ordinary option accessor lowering");
+        }
+
+        let raw_operand = || expr(ExprKind::Var("pointer".into()), Ty::OptionRaw(0));
+        validate_expr_payloads(
+            &ctx,
+            &expr(
+                ExprKind::IsSome {
+                    operand: Box::new(raw_operand()),
+                },
+                Ty::Bool,
+            ),
+        )
+        .expect("coherent nullable-raw presence test");
+        validate_expr_payloads(
+            &ctx,
+            &expr(
+                ExprKind::OptValue {
+                    operand: Box::new(raw_operand()),
+                },
+                Ty::RawRecord(0),
+            ),
+        )
+        .expect("coherent nullable-raw projection");
+    }
+
+    #[test]
+    fn canonical_boolean_option_spelling_is_not_integer_or_nested_bool() {
+        let program = empty_program();
+        let absent = RtVal::Opt {
+            payload: ValueTy::Bool,
+            value: None,
+        };
+        let false_value = RtVal::Opt {
+            payload: ValueTy::Bool,
+            value: Some(Box::new(RtVal::Bool(false))),
+        };
+        let true_value = RtVal::Opt {
+            payload: ValueTy::Bool,
+            value: Some(Box::new(RtVal::Bool(true))),
+        };
+
+        assert_eq!(render_rt_val(&program, &absent), "opt none");
+        assert_eq!(render_rt_val(&program, &false_value), "opt some false");
+        assert_eq!(render_rt_val(&program, &true_value), "opt some true");
+    }
+
+    #[test]
+    fn lowering_rejects_option_parameters_independently() {
+        let program = empty_program();
+        let mut function = checked_fn(Ty::Bool, Vec::new());
+        function.params.push(Param {
+            name: "choice".into(),
+            ty: Ty::Option(ValueTy::Bool),
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+
+        let error = lower_fn_entry(&program, &function)
+            .expect_err("G1.2 does not introduce an option parameter ABI");
+        assert!(
+            error.starts_with("svm.option_position_unsupported:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn lowering_rejects_residual_generic_declarations() {
+        let program = empty_program();
+        let mut function = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
+        function.type_params.push("T".into());
+        function.type_bounds.push(None);
+
+        let error = lower_fn(&program, &function)
+            .expect_err("the SVM accepts only post-monomorphization declarations");
+        assert!(
+            error.starts_with("svm.type_parameter_unsupported:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_normal_calls_require_coherent_executable_signatures() {
+        let mut program = empty_program();
+        let mut choose = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
+        choose.name = "choose".into();
+        choose.params.push(Param {
+            name: "selector".into(),
+            ty: Ty::Int(IntTy::I32),
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+        program.fns.push(choose);
+        let ctx = LowerCtx { program: &program };
+        let call = |args: Vec<Expr>, ty: Option<Ty>| Expr {
+            kind: ExprKind::Call {
+                callee: "choose".into(),
+                callee_span: Span::new(0, 0),
+                type_args: Vec::new(),
+                args,
+            },
+            span: Span::new(0, 0),
+            ty,
+        };
+        let selector = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32));
+
+        let valid = call(vec![selector()], Some(Ty::Option(ValueTy::Bool)));
+        validate_expr_payloads(&ctx, &valid).expect("checked option-returning call");
+        assert_eq!(
+            lower_call(&ctx, &Some("choice".into()), &valid).unwrap(),
+            "(.call (some \"choice\") \"choose\" [(.intLit .i32 0)])"
+        );
+
+        let wrong_result = call(vec![selector()], Some(Ty::Int(IntTy::I32)));
+        let missing_result = call(vec![selector()], None);
+        let wrong_arity = call(Vec::new(), Some(Ty::Option(ValueTy::Bool)));
+        let wrong_argument = call(
+            vec![expr(ExprKind::BoolLit(false), Ty::Bool)],
+            Some(Ty::Option(ValueTy::Bool)),
+        );
+        let missing_argument = call(
+            vec![Expr {
+                kind: ExprKind::IntLit(0),
+                span: Span::new(0, 0),
+                ty: None,
+            }],
+            Some(Ty::Option(ValueTy::Bool)),
+        );
+        for (malformed, diagnostic) in [
+            (&wrong_result, "svm.call_result_type:"),
+            (&missing_result, "svm.call_result_type:"),
+            (&wrong_arity, "svm.call_arity:"),
+            (&wrong_argument, "svm.call_argument_type:"),
+            (&missing_argument, "svm.call_argument_type:"),
+        ] {
+            let preflight = validate_expr_payloads(&ctx, malformed)
+                .expect_err("malformed call must fail SVM preflight");
+            assert!(preflight.starts_with(diagnostic), "{preflight}");
+            let lowering = lower_call(&ctx, &Some("choice".into()), malformed)
+                .expect_err("direct call lowering must enforce the same signature");
+            assert!(lowering.starts_with(diagnostic), "{lowering}");
+        }
+
+        let mut resource_program = empty_program();
+        let mut consume = checked_fn(Ty::Unit, Vec::new());
+        consume.name = "consume".into();
+        consume.params.push(Param {
+            name: "authority".into(),
+            ty: Ty::Res(ResKind::Uart),
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+        resource_program.fns.push(consume);
+        let resource_ctx = LowerCtx {
+            program: &resource_program,
+        };
+        let erased_resource_call = Expr {
+            kind: ExprKind::Call {
+                callee: "consume".into(),
+                callee_span: Span::new(0, 0),
+                type_args: Vec::new(),
+                args: vec![Expr {
+                    kind: ExprKind::Var("uart".into()),
+                    span: Span::new(0, 0),
+                    ty: None,
+                }],
+            },
+            span: Span::new(0, 0),
+            ty: Some(Ty::Unit),
+        };
+        validate_expr_payloads(&resource_ctx, &erased_resource_call)
+            .expect("erased resource places intentionally need no cached value type");
+    }
+
+    #[test]
+    fn lowering_rejects_boolean_and_nested_residual_type_arguments() {
+        let program = empty_program();
+        let ctx = LowerCtx { program: &program };
+        for generic in [
+            GenericTy::Bool,
+            GenericTy::Option(Box::new(GenericTy::Bool)),
+        ] {
+            let call = expr(
+                ExprKind::Call {
+                    callee: "identity".into(),
+                    callee_span: Span::new(0, 0),
+                    type_args: vec![TypeArg {
+                        ty: generic.clone(),
+                        span: Span::new(0, 0),
+                    }],
+                    args: Vec::new(),
+                },
+                Ty::Bool,
+            );
+            let error = validate_expr_payloads(&ctx, &call)
+                .expect_err("all residual generic use sites are outside the SVM input");
+            assert_eq!(
+                error,
+                "svm.type_parameter_unsupported: generic type arguments escaped monomorphization"
+            );
+        }
+    }
+
+    #[test]
+    fn lowering_rejects_option_fields_and_trait_returns_independently() {
+        let mut class_program = empty_program();
+        class_program.classes.push(ClassDecl {
+            is_pub: false,
+            name: "Holder".into(),
+            name_span: Span::new(0, 0),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            fields: vec![Field {
+                name: "choice".into(),
+                ty: Ty::Option(ValueTy::Bool),
+                span: Span::new(0, 0),
+                must_consume: false,
+            }],
+            invariants: Vec::new(),
+            inits: Vec::new(),
+            methods: Vec::new(),
+            deinit: None,
+            span: Span::new(0, 0),
+        });
+        let field_error = validate_program_option_positions(&class_program)
+            .expect_err("G1.2 does not introduce option-valued class storage");
+        assert!(
+            field_error.starts_with("svm.option_position_unsupported:"),
+            "{field_error}"
+        );
+
+        let mut trait_program = empty_program();
+        trait_program.traits.push(TraitDecl {
+            is_pub: false,
+            name: "Chooser".into(),
+            name_span: Span::new(0, 0),
+            specs: Vec::new(),
+            methods: vec![checked_fn(Ty::Option(ValueTy::Bool), Vec::new())],
+            span: Span::new(0, 0),
+        });
+        let trait_error = validate_program_option_positions(&trait_program)
+            .expect_err("G1.2 does not widen trait result semantics");
+        assert!(
+            trait_error.starts_with("svm.option_position_unsupported:"),
+            "{trait_error}"
+        );
+    }
+
+    #[test]
+    fn lowering_rejects_externs_before_they_can_become_empty_bodies() {
+        let program = empty_program();
+        let mut function = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
+        function.extern_info = Some(ExternInfo {
+            abi: "C".into(),
+            audit_id: "test-only".into(),
+            reason: "exercise the lowering boundary".into(),
+            span: Span::new(0, 0),
+        });
+
+        let error = lower_fn_entry(&program, &function)
+            .expect_err("an extern must not lower as a no-op function");
+        assert!(error.contains("audited extern"), "{error}");
     }
 
     #[test]

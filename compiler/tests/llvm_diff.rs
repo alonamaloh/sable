@@ -35,6 +35,11 @@ const CASES: &[Case] = &[
         source: "arithmetic.sable",
         entry: "arithmetic_entry",
     },
+    Case {
+        label: "option-bool",
+        source: "option_bool.sable",
+        entry: "option_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {

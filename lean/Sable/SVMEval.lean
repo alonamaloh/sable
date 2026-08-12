@@ -74,6 +74,26 @@ theorem EOut.bindPtrOpt_ok_of_ne {v : Val}
     (EOut.ok v).bindPtrOpt f = .abort .undef := by
   cases v <;> simp [EOut.bindPtrOpt] at * <;> exact absurd rfl (hv _)
 
+/-- Continue with an ordinary option; ill-shaped is undef. The payload is
+itself a machine value, so this helper covers integer, Boolean, and future
+recursive option payloads uniformly. -/
+def EOut.bindOpt (o : EOut) (f : Option Val → EOut) : EOut :=
+  match o with
+  | .ok (.opt value) => f value
+  | .ok _            => .abort .undef
+  | .abort a         => .abort a
+
+@[simp] theorem EOut.bindOpt_opt (value : Option Val) (f : Option Val → EOut) :
+    (EOut.ok (.opt value)).bindOpt f = f value := rfl
+
+@[simp] theorem EOut.bindOpt_abort (a : Abort) (f : Option Val → EOut) :
+    (EOut.abort a).bindOpt f = .abort a := rfl
+
+theorem EOut.bindOpt_ok_of_ne {v : Val} (f : Option Val → EOut)
+    (hv : ∀ value, v ≠ .opt value) :
+    (EOut.ok v).bindOpt f = .abort .undef := by
+  cases v <;> simp [EOut.bindOpt] at * <;> exact absurd rfl (hv _)
+
 /-- Continue with the operand's boolean value; ill-shaped is undef. -/
 def EOut.bindBool (o : EOut) (f : Bool → EOut) : EOut :=
   match o with
@@ -127,7 +147,7 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
   | .checkedArith op t e₁ e₂ =>
       (evalE cap ρ e₁).bindInt fun a =>
         (evalE cap ρ e₂).bindInt fun b =>
-          if t.inRange (op.denote a b) then .ok (.opt (some (op.denote a b)))
+          if t.inRange (op.denote a b) then .ok (.opt (some (.int (op.denote a b))))
           else .ok (.opt none)
   | .div t e₁ e₂ =>
       (evalE cap ρ e₁).bindInt fun a =>
@@ -178,8 +198,18 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
         (evalE cap ρ ed).bindInt fun d => .ok (.ptr a (k + d))
   | .ptrOffset e =>
       (evalE cap ρ e).bindPtr fun _ k => .ok (.int k)
-  | .someE e => (evalE cap ρ e).bindInt fun n => .ok (.opt (some n))
+  | .someE e =>
+      match evalE cap ρ e with
+      | .ok value => .ok (.opt (some value))
+      | .abort a => .abort a
   | .noneE => .ok (.opt none)
+  | .optIsSome e =>
+      (evalE cap ρ e).bindOpt fun value => .ok (.bool value.isSome)
+  | .optValue e =>
+      (evalE cap ρ e).bindOpt fun value =>
+        match value with
+        | some payload => .ok payload
+        | none => .abort (.trap .optionNone)
   | .ptrSomeE e =>
       (evalE cap ρ e).bindPtr fun a k => .ok (.ptrOpt (some (a, k)))
   | .ptrNoneE => .ok (.ptrOpt none)
@@ -321,9 +351,17 @@ theorem Eval.evalE_eq {cap : Int} {ρ : Env} {e : Expr} {out : EOut}
   | alloc_undef₂ h₁ h₂ hv ih₁ ih₂ => simp [evalE, ih₁, ih₂, EOut.bindInt_ok_of_ne _ hv]
   | alloc_abort₂ h₁ h₂ ih₁ ih₂ => simp [evalE, ih₁, ih₂]
   | someE_ok h ih => simp [evalE, ih]
-  | someE_undef h hv ih => simp [evalE, ih, EOut.bindInt_ok_of_ne _ hv]
   | someE_abort h ih => simp [evalE, ih]
   | noneE => rfl
+  | optIsSome_ok h ih => simp [evalE, ih]
+  | optIsSome_undef h hv ih =>
+      simp [evalE, ih, EOut.bindOpt_ok_of_ne _ hv]
+  | optIsSome_abort h ih => simp [evalE, ih]
+  | optValue_ok h ih => simp [evalE, ih]
+  | optValue_none h ih => simp [evalE, ih]
+  | optValue_undef h hv ih =>
+      simp [evalE, ih, EOut.bindOpt_ok_of_ne _ hv]
+  | optValue_abort h ih => simp [evalE, ih]
 
 /-! ## Agreement, direction 2: everything `evalE` computes derives
 
@@ -414,6 +452,28 @@ private theorem eval_bindPtrOpt {cap : Int} {ρ : Env} {e tgt : Expr}
     | opt o => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
+
+private theorem eval_bindOpt {cap : Int} {ρ : Env} {e tgt : Expr}
+    {f : Option Val → EOut}
+    (ih : Eval cap ρ e (evalE cap ρ e))
+    (Habort : ∀ a, Eval cap ρ e (.abort a) → Eval cap ρ tgt (.abort a))
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ value, v ≠ .opt value) →
+      Eval cap ρ tgt (.abort .undef))
+    (Hok : ∀ value, Eval cap ρ e (.ok (.opt value)) → Eval cap ρ tgt (f value)) :
+    Eval cap ρ tgt ((evalE cap ρ e).bindOpt f) := by
+  cases ho : evalE cap ρ e with
+  | abort a => rw [ho] at ih; simpa using Habort a ih
+  | ok v =>
+    rw [ho] at ih
+    cases v with
+    | opt value => simpa using Hok value ih
+    | unit => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | int n => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | bool b => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | arr a => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | ptr a k => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | ptrOpt p => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | record tag fields => simpa [EOut.bindOpt] using Hundef _ ih nofun
 
 private theorem eval_bindInt₂ {cap : Int} {ρ : Env} {e₁ e₂ tgt : Expr}
     {f : Int → Int → EOut}
@@ -611,10 +671,25 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
         · rw [if_pos hc]; exact .alloc_ok h₁ h₂ (by omega) hc
         · rw [if_neg hc]; exact .alloc_oom h₁ h₂ (by omega) (by omega)
   | someE e ih =>
-      simp only [evalE]
-      exact eval_bindInt ih (fun a h => .someE_abort h)
-        (fun v h hv => .someE_undef h hv) fun n h => .someE_ok h
+      cases he : evalE cap ρ e with
+      | ok value =>
+          rw [he] at ih
+          simpa [evalE, he] using Eval.someE_ok ih
+      | abort a =>
+          rw [he] at ih
+          simpa [evalE, he] using Eval.someE_abort ih
   | noneE => exact .noneE
+  | optIsSome e ih =>
+      simp only [evalE]
+      exact eval_bindOpt ih (fun a h => .optIsSome_abort h)
+        (fun v h hv => .optIsSome_undef h hv) fun value h => .optIsSome_ok h
+  | optValue e ih =>
+      simp only [evalE]
+      refine eval_bindOpt ih (fun a h => .optValue_abort h)
+        (fun v h hv => .optValue_undef h hv) fun value h => ?_
+      cases value with
+      | none => exact .optValue_none h
+      | some payload => exact .optValue_ok h
 
 /-- The two presentations of expression evaluation agree. -/
 theorem eval_iff_evalE {cap : Int} {ρ : Env} {e : Expr} {out : EOut} :
@@ -1428,7 +1503,11 @@ partial def Val.render : Val → String
       "arr [" ++ String.intercalate ", "
         ((List.range a.len.toNat).map fun i => toString (a.get (Int.ofNat i))) ++ "]"
   | .opt none => "opt none"
-  | .opt (some n) => s!"opt some {n}"
+  /- Keep the established integer-option spelling byte-for-byte, and give
+  Boolean payloads the same compact scalar spelling. -/
+  | .opt (some (.int n)) => s!"opt some {n}"
+  | .opt (some (.bool b)) => s!"opt some {b}"
+  | .opt (some value) => "opt some " ++ value.render
   | .ptrOpt none => "ptrOpt none"
   | .ptrOpt (some (a, k)) => s!"ptrOpt some {a}+{k}"
   | .record tag fields =>

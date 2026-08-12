@@ -1,0 +1,52 @@
+// G1.2 differential subjects: recursive SVM options distinguish absence,
+// `some(false)`, and `some(true)`, and preserve Boolean payloads through
+// locals, assignment, accessors, and A-normal calls.
+
+fn choose_bool(i32 choice) -> option<bool> {
+    if (choice < 0) {
+        return none;
+    }
+    if (choice == 0) {
+        return some(false);
+    }
+    return some(true);
+}
+
+fn bool_option_none() -> option<bool> {
+    return none;
+}
+
+fn bool_option_false() -> option<bool> {
+    return some(false);
+}
+
+fn bool_option_true() -> option<bool> {
+    return some(true);
+}
+
+fn bool_option_local_assignment() -> bool {
+    mut option<bool> choice = none;
+    choice = some(false);
+    if (choice.is_some) {
+        return choice.value;
+    }
+    return true;
+}
+
+fn bool_option_call_false() -> bool {
+    var choice = choose_bool(0);
+    if (choice.is_some) {
+        return choice.value;
+    }
+    return true;
+}
+
+fn bool_option_call_none() -> bool {
+    option<bool> choice = choose_bool(-1);
+    return choice.is_some;
+}
+
+fn bool_option_call_true() -> option<bool> {
+    option<bool> choice = choose_bool(1);
+    return choice;
+}

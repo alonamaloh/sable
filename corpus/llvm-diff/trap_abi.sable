@@ -35,3 +35,12 @@ fn div_guard(i32 lhs, i32 rhs) -> i32 {
 fn narrow_guard(i32 value) -> i8 {
     return narrow<i8>(value);
 }
+
+/// pre present = true
+fn option_value_guard(bool present) -> bool {
+    mut option<bool> value = none;
+    if (present) {
+        value = some(false);
+    }
+    return value.value;
+}
