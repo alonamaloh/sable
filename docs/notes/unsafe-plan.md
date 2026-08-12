@@ -1810,6 +1810,21 @@ Next introduce allocator identities and `BlockLease`, then store the free-list
 metadata in the root's free blocks. The allocator retains `SystemDealloc` until
 its own destruction; client `free` consumes leases, not the system token.
 
+**The U8c authority shape is proved (2026-08-12, ADR 0037).** `BlockLease`
+is the refined byte authority itself, with allocator identity, block key, and
+`SpanView` in one view. Typed role changes preserve the allocator/key pair
+rather than degrading a lease to plain `PointsTo<u64>`. One affine allocator
+aggregate owns the dynamic free map; sealed `take` partitions one entry into a
+lease and sealed `put` reverses that transition. The standalone Lean probe
+proves partition, disjointness, round-trip restoration, and typed-role
+preservation.
+
+Next implement that narrow resource surface in the compiler. Do not expose a
+standalone lease-to-span escape hatch: mandatory leases terminate only by
+returning to their matching aggregate. Once the vertical slice is pinned by
+wrong-allocator, double-put, abandoned-lease, and typed-round-trip subjects,
+add allocator-owned free-block roles and the in-band header algorithm.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;
