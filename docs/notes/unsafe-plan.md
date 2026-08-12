@@ -1930,6 +1930,22 @@ Extraction must then supply the local `16 ≤ size`, `key + size ≤ next`, and
 the first-fit loop while those facts still come only from a concrete test's
 literal header values.
 
+**The U8f2 stored-chain shape is proved (2026-08-12, ADR 0045).** A structural
+`StoredChain state limit current` ties each reachable runtime key to the exact
+initialized header held by the aggregate and carries the sorted/disjoint local
+facts plus the tail witness. A non-sentinel step now derives header
+extractability, field witnesses, local bounds, and strict decrease of
+`limit - current`; reinserting the extracted header restores the entire
+allocator view by equality. The probe also constructs the initial one-node
+chain whose link is the root-length sentinel.
+
+Next integrate this predicate into the compiler surface. Keep the existing
+two-argument header take as the low-level authority transfer, but add a
+policy-bearing checked traversal operation that receives both ordinary
+`limit` and `current`, rejects the sentinel, and requires the matching
+`StoredChain`. Use that operation in the positive subject before attempting a
+loop or predecessor-link mutation.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;
