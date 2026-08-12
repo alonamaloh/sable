@@ -75,6 +75,17 @@ and passed the randomized allocator, grind-budget, LSP, and documentation
 tests. Aggregate values and their backend ABI remain future M46+ work. See
 [`docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md`](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md).
 
+M46/G0 is now underway with a fail-closed recursive generic-type checkpoint.
+The AST has recursive `GenericTy` values and opaque canonical type keys, and
+call/constructor type arguments retain both that shape and their source span.
+The accepted grammar is deliberately unchanged: uses still supply only an
+integer type or an in-scope type parameter, duplicate parameter names and more
+than 256 parameters are rejected, and monomorphization diagnoses any dormant
+unsupported shape. Generic-use traversal now includes record literals,
+`some(...)`, class destructors, and member contracts and variants. Structural instance
+identity and emitted-name collision detection are the next G0 slice, not part
+of this checkpoint.
+
 - **The bignum pillar** (M15–M16, the Tier-3 opener): arbitrary-precision `Nat` over base-2³² limbs with a normalizing representation invariant ([`corpus/verifies/bignum.sable`](corpus/verifies/bignum.sable)). The entire specification is one recursive ghost valuation, `natVal`, and one line per operation: `cmp` decides the order, `add`/`sub`/`mul` post `natVal result.limbs = natVal a.limbs ⊕ natVal b.limbs`, `div`/`rem` post `… = natVal a.limbs / natVal b.limbs` against Lean's own Euclidean division — with division built *compositionally* (double-and-subtract riding the contracts of the other verified ops, closed by one uniqueness lemma) — and `gcd` is Euclid in fifteen lines whose spec is kernel-check-proven to agree with Lean core's `Int.gcd`. **255 obligations across 10 functions, 73 hand discharges, zero escapes**, every clause monitored dynamically — the first benchmark where the mathematics itself was the test.
 - **The verified free-list allocator** (M41, ADR 0037–0052): releasable system roots fold into an affine aggregate; first-fit allocation returns an exact mandatory `BlockLease`; public return rejects the wrong allocator, repeated use, or substituted subregion metadata; and predecessor/successor coalescing clears real in-band headers and proves exact span joins ([`corpus/verifies/free_list_return.sable`](corpus/verifies/free_list_return.sable)). Six branch fixtures and a deterministic 144-return reference-model comparison exercise the runtime policy, while final destruction still requires the exact complete root authority. U10's sound loop audit forced the traversal/search proofs to state their restored resource frame explicitly; the walk, insert-location, and first-fit pairs are green at 33/33, 13/13, and 22/22 obligations respectively. The complete serial corpus is green in 297.65s, and the full serial Rust suite is green.
 - **Generic aggregate authority** (M42, ADR 0053): `ResourceMap<u64, PointsTo<u64>>` is one affine token over a pure partial-map view. Sealed take/put move exact typed-cell permissions without exposing separation logic; a 22-obligation wrapper-call round trip preserves both values and pointer identity through reverse-order extraction, then reconstructs and releases the original root ([`corpus/verifies/resource_map.sable`](corpus/verifies/resource_map.sable)).

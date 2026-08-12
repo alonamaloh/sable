@@ -18,6 +18,7 @@ type MResult<T> = Result<T, Diagnostic>;
 const DEPTH_CAP: usize = 32;
 
 pub fn monomorphize(program: &mut Program) -> MResult<()> {
+    validate_v1_type_args(program)?;
     let mut fn_templates: HashMap<String, Fn> = HashMap::new();
     let mut class_templates: HashMap<String, ClassDecl> = HashMap::new();
 
@@ -236,6 +237,9 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
         for m in &mut c.methods {
             ctx.rewrite_fn_uses(&mut m.f, 0)?;
         }
+        if let Some(deinit) = &mut c.deinit {
+            ctx.rewrite_stmts(deinit, 0)?;
+        }
     }
 
     // Expand the worklist to a fixed point.
@@ -265,6 +269,174 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
     ctx.new_classes.sort_by(|a, b| a.name.cmp(&b.name));
     program.fns.extend(ctx.new_fns);
     program.classes.extend(ctx.new_classes);
+    Ok(())
+}
+
+/// G0 stores recursive use-site types before current monomorphization can
+/// implement them. Validate the whole input before mutating it so even a
+/// dormant or unreachable template fails closed with the type argument's own
+/// span. Parameters remain valid here; concrete-use checks happen when a
+/// request is made.
+fn validate_v1_type_args(program: &Program) -> MResult<()> {
+    fn validate_args(args: &[TypeArg], arity: usize) -> MResult<()> {
+        for arg in args {
+            let ty = arg
+                .ty
+                .try_to_v1_int()
+                .map_err(|error| unsupported_type_arg(arg.span, error))?;
+            if let IntTy::TParam(index) = ty {
+                let parameter = TypeParamId::from_legacy(index);
+                if parameter.index() >= arity {
+                    return Err(unsupported_type_arg(
+                        arg.span,
+                        GenericTyError::TypeParameterOutOfBounds { parameter, arity },
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn expression(expr: &Expr, arity: usize) -> MResult<()> {
+        match &expr.kind {
+            ExprKind::Call {
+                type_args, args, ..
+            }
+            | ExprKind::CtorCall {
+                type_args, args, ..
+            } => {
+                validate_args(type_args, arity)?;
+                for arg in args {
+                    expression(arg, arity)?;
+                }
+            }
+            ExprKind::MethodCall { args, .. }
+            | ExprKind::TraitCall { args, .. }
+            | ExprKind::RawOp { args, .. }
+            | ExprKind::ResOp { args, .. }
+            | ExprKind::DeviceOp { args, .. }
+            | ExprKind::ArrayLit(args)
+            | ExprKind::RecordLit { args, .. } => {
+                for arg in args {
+                    expression(arg, arity)?;
+                }
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::IsSome { operand }
+            | ExprKind::OptValue { operand }
+            | ExprKind::SomeE(operand)
+            | ExprKind::Widen { arg: operand, .. }
+            | ExprKind::Narrow { arg: operand, .. } => expression(operand, arity)?,
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expression(lhs, arity)?;
+                expression(rhs, arity)?;
+            }
+            ExprKind::Index { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. } => expression(index, arity)?,
+            ExprKind::AllocArray { len, init, .. } => {
+                expression(len, arity)?;
+                expression(init, arity)?;
+            }
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Var(_)
+            | ExprKind::Len { .. }
+            | ExprKind::NoneE
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::Borrow { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn statements(stmts: &[Stmt], arity: usize) -> MResult<()> {
+        for statement in stmts {
+            match statement {
+                Stmt::Decl {
+                    init: Some(value), ..
+                }
+                | Stmt::Assign { value, .. }
+                | Stmt::ExprStmt(value)
+                | Stmt::VarDecl { init: value, .. }
+                | Stmt::FieldAssign { value, .. }
+                | Stmt::StaticAlloc { size: value, .. }
+                | Stmt::SystemAlloc { size: value, .. }
+                | Stmt::Return {
+                    value: Some(value), ..
+                } => expression(value, arity)?,
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
+                    expression(ptr, arity)?;
+                    expression(res, arity)?;
+                    expression(release, arity)?;
+                }
+                Stmt::Store { index, value, .. } | Stmt::FieldStore { index, value, .. } => {
+                    expression(index, arity)?;
+                    expression(value, arity)?;
+                }
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    expression(cond, arity)?;
+                    statements(then_block, arity)?;
+                    if let Some(else_block) = else_block {
+                        statements(else_block, arity)?;
+                    }
+                }
+                Stmt::While { cond, body, .. } => {
+                    expression(cond, arity)?;
+                    statements(body, arity)?;
+                }
+                Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => statements(body, arity)?,
+                Stmt::Decl { init: None, .. }
+                | Stmt::Return { value: None, .. }
+                | Stmt::Assert(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn function(function: &Fn, arity: usize) -> MResult<()> {
+        statements(&function.body, arity)
+    }
+
+    fn class(class: &ClassDecl) -> MResult<()> {
+        let arity = class.type_params.len();
+        for init in &class.inits {
+            function(init, arity)?;
+        }
+        for method in &class.methods {
+            function(&method.f, arity)?;
+        }
+        if let Some(deinit) = &class.deinit {
+            statements(deinit, arity)?;
+        }
+        Ok(())
+    }
+
+    for function_ in program.fns.iter().chain(&program.fn_templates) {
+        function(function_, function_.type_params.len())?;
+    }
+    for class_ in program.classes.iter().chain(&program.class_templates) {
+        class(class_)?;
+    }
+    for trait_ in &program.traits {
+        for method in &trait_.methods {
+            function(method, 1)?;
+        }
+    }
+    for impl_ in &program.impls {
+        for function_ in &impl_.fns {
+            function(function_, 0)?;
+        }
+    }
     Ok(())
 }
 
@@ -350,19 +522,35 @@ fn prepare_template_class(c: &mut ClassDecl, traits: &HashMap<String, TraitDecl>
         inv.text = subst_clause_text(&inv.text, &qual);
     }
     for f in c.inits.iter_mut() {
-        for cl in f.pres.iter_mut().chain(f.posts.iter_mut()) {
+        for cl in f
+            .pres
+            .iter_mut()
+            .chain(f.posts.iter_mut())
+            .chain(f.requires.iter_mut())
+        {
             cl.text = subst_clause_text(&cl.text, &qual);
+        }
+        if let Some(v) = &mut f.variant {
+            v.text = subst_clause_text(&v.text, &qual);
         }
         prepare_stmts(&mut f.body, &qual, &bound_params);
     }
     for m in c.methods.iter_mut() {
-        for cl in m.f.pres.iter_mut().chain(m.f.posts.iter_mut()) {
+        for cl in
+            m.f.pres
+                .iter_mut()
+                .chain(m.f.posts.iter_mut())
+                .chain(m.f.requires.iter_mut())
+        {
             cl.text = subst_clause_text(&cl.text, &qual);
         }
         if let Some(v) = &mut m.f.variant {
             v.text = subst_clause_text(&v.text, &qual);
         }
         prepare_stmts(&mut m.f.body, &qual, &bound_params);
+    }
+    if let Some(deinit) = &mut c.deinit {
+        prepare_stmts(deinit, &qual, &bound_params);
     }
 }
 
@@ -456,14 +644,16 @@ fn prepare_expr(e: &mut Expr, bound_params: &HashSet<String>) {
         | ExprKind::RawOp { args, .. }
         | ExprKind::ResOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
-        | ExprKind::ArrayLit(args) => {
+        | ExprKind::ArrayLit(args)
+        | ExprKind::RecordLit { args, .. } => {
             for a in args.iter_mut() {
                 prepare_expr(a, bound_params);
             }
         }
         ExprKind::Unary { operand, .. }
         | ExprKind::IsSome { operand }
-        | ExprKind::OptValue { operand } => prepare_expr(operand, bound_params),
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => prepare_expr(operand, bound_params),
         ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => {
             prepare_expr(arg, bound_params)
         }
@@ -510,6 +700,73 @@ pub fn mangle(template: &str, args: &[IntTy]) -> String {
     out
 }
 
+fn unsupported_type_arg(span: Span, error: GenericTyError) -> Diagnostic {
+    let reason = match error {
+        GenericTyError::NotV1Integer => {
+            "this recursive type shape is outside the current integer-only generic domain"
+        }
+        GenericTyError::UnsubstitutedTypeParameter(_) => {
+            "an unsubstituted type parameter reached a concrete instantiation"
+        }
+        GenericTyError::TypeParameterOutOfBounds { .. } => {
+            "the type parameter is outside this declaration's argument list"
+        }
+        GenericTyError::NonCanonicalLegacyParameter(_) => {
+            "a legacy embedded type parameter was not normalized"
+        }
+    };
+    Diagnostic {
+        name: "mono.type_arg_unsupported".into(),
+        title: "this generic type argument is not supported yet".into(),
+        span,
+        label: "G0 instantiation still accepts only `u8`..`u64` and `i8`..`i64`".into(),
+        notes: vec![(
+            "note".into(),
+            format!(
+                "{reason}; the recursive representation is present so later slices can enable \
+                 Boolean, aggregate, and nominal arguments without changing instance identity"
+            ),
+        )],
+    }
+}
+
+/// Consume recursive use-site arguments at the current integer-only mono
+/// boundary. Keeping this conversion fallible makes dormant G0 shapes reject
+/// with a source diagnostic rather than reaching integer helpers or mangling.
+fn take_concrete_v1_type_args(type_args: &mut Vec<TypeArg>) -> MResult<Vec<IntTy>> {
+    std::mem::take(type_args)
+        .into_iter()
+        .map(|TypeArg { ty, span }| {
+            ty.try_to_concrete_v1_int()
+                .map_err(|error| unsupported_type_arg(span, error))
+        })
+        .collect()
+}
+
+fn require_concrete_v1_type_args(type_args: &[TypeArg]) -> MResult<()> {
+    for arg in type_args {
+        arg.ty
+            .try_to_concrete_v1_int()
+            .map_err(|error| unsupported_type_arg(arg.span, error))?;
+    }
+    Ok(())
+}
+
+fn substitute_type_args(type_args: &mut [TypeArg], args: &[IntTy]) -> MResult<()> {
+    let substitutions: Vec<GenericTy> = args
+        .iter()
+        .copied()
+        .map(GenericTy::from_legacy_int)
+        .collect();
+    for arg in type_args {
+        arg.ty = arg
+            .ty
+            .substitute(&substitutions)
+            .map_err(|error| unsupported_type_arg(arg.span, error))?;
+    }
+    Ok(())
+}
+
 impl Mono {
     fn request(
         &mut self,
@@ -519,8 +776,14 @@ impl Mono {
         span: Span,
         depth: usize,
     ) -> MResult<String> {
-        if args.iter().any(|a| matches!(a, IntTy::TParam(_))) {
-            unreachable!("unsubstituted parameter in instantiation request");
+        if let Some(index) = args.iter().find_map(|arg| match arg {
+            IntTy::TParam(index) => Some(*index),
+            _ => None,
+        }) {
+            return Err(unsupported_type_arg(
+                span,
+                GenericTyError::UnsubstitutedTypeParameter(TypeParamId::from_legacy(index)),
+            ));
         }
         let (expected, bounds) = if is_class {
             let t = &self.class_templates[template];
@@ -600,6 +863,10 @@ impl Mono {
             for m in &mut c.methods {
                 self.subst_fn(&mut m.f, &req.args, &text_map, &bound_calls, req.depth)?;
             }
+            if let Some(deinit) = &mut c.deinit {
+                subst_stmts(deinit, &req.args, &text_map, &bound_calls)?;
+                self.rewrite_stmts(deinit, req.depth + 1)?;
+            }
             self.new_classes.push(c);
         } else {
             let template = self.fn_templates[&req.template].clone();
@@ -611,9 +878,6 @@ impl Mono {
             // Template-verified instances (ADR 0009): skip their own
             // obligations; owe the substituted `requires`.
             f.from_template = Some(req.template.clone());
-            for r in f.requires.iter_mut() {
-                r.text = subst_clause_text(&r.text, &text_map);
-            }
             self.subst_fn(&mut f, &req.args, &text_map, &bound_calls, req.depth)?;
             self.new_fns.push(f);
         }
@@ -662,7 +926,12 @@ impl Mono {
             subst_ty(&mut p.ty, args);
         }
         subst_ty(&mut f.ret, args);
-        for c in f.pres.iter_mut().chain(f.posts.iter_mut()) {
+        for c in f
+            .pres
+            .iter_mut()
+            .chain(f.posts.iter_mut())
+            .chain(f.requires.iter_mut())
+        {
             c.text = subst_clause_text(&c.text, text_map);
         }
         if let Some(v) = &mut f.variant {
@@ -740,6 +1009,7 @@ impl Mono {
                 for a in args.iter_mut() {
                     self.rewrite_expr(a, depth)?;
                 }
+                require_concrete_v1_type_args(type_args)?;
                 if self.fn_templates.contains_key(callee.as_str()) {
                     if type_args.is_empty() {
                         return Err(Diagnostic {
@@ -752,7 +1022,7 @@ impl Mono {
                             notes: vec![],
                         });
                     }
-                    let targs = std::mem::take(type_args);
+                    let targs = take_concrete_v1_type_args(type_args)?;
                     *callee = self.request(false, &callee.clone(), &targs, *callee_span, depth)?;
                 } else if !type_args.is_empty() {
                     return Err(Diagnostic {
@@ -774,6 +1044,7 @@ impl Mono {
                 for a in args.iter_mut() {
                     self.rewrite_expr(a, depth)?;
                 }
+                require_concrete_v1_type_args(type_args)?;
                 if self.class_templates.contains_key(class.as_str()) {
                     if type_args.is_empty() {
                         return Err(Diagnostic {
@@ -786,7 +1057,7 @@ impl Mono {
                             notes: vec![],
                         });
                     }
-                    let targs = std::mem::take(type_args);
+                    let targs = take_concrete_v1_type_args(type_args)?;
                     *class = self.request(true, &class.clone(), &targs, *class_span, depth)?;
                 } else if !type_args.is_empty() {
                     return Err(Diagnostic {
@@ -831,6 +1102,11 @@ impl Mono {
             ExprKind::ArrayLit(elems) => {
                 for el in elems.iter_mut() {
                     self.rewrite_expr(el, depth)?;
+                }
+            }
+            ExprKind::RecordLit { args, .. } => {
+                for arg in args.iter_mut() {
+                    self.rewrite_expr(arg, depth)?;
                 }
             }
             _ => {}
@@ -981,9 +1257,7 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
         | ExprKind::CtorCall {
             type_args, args: a, ..
         } => {
-            for t in type_args.iter_mut() {
-                subst_intty(t, args);
-            }
+            substitute_type_args(type_args, args)?;
             for x in a.iter_mut() {
                 subst_expr(x, args, bound_calls)?;
             }
@@ -1010,6 +1284,11 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
         ExprKind::ArrayLit(elems) => {
             for el in elems.iter_mut() {
                 subst_expr(el, args, bound_calls)?;
+            }
+        }
+        ExprKind::RecordLit { args: fields, .. } => {
+            for field in fields.iter_mut() {
+                subst_expr(field, args, bound_calls)?;
             }
         }
         _ => {}
@@ -1064,4 +1343,298 @@ pub(crate) fn subst_clause_text(text: &str, map: &HashMap<String, String>) -> St
         i += 1;
     }
     String::from_utf8(out).expect("substitution preserves UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::span::LineMap;
+
+    fn parse_program(source: &str) -> Program {
+        let lines = LineMap::new(source);
+        let scanned = crate::scan::scan(source);
+        let tokens = crate::lexer::lex(&scanned.program_text).expect("test source should lex");
+        crate::parser::parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
+            .expect("test source should parse")
+    }
+
+    fn parse_and_monomorphize(source: &str) -> Program {
+        let mut program = parse_program(source);
+        monomorphize(&mut program).expect("test source should monomorphize");
+        program
+    }
+
+    fn call_name(expr: &Expr) -> (&str, &[TypeArg]) {
+        let ExprKind::Call {
+            callee, type_args, ..
+        } = &expr.kind
+        else {
+            panic!("expected a call, found {:?}", expr.kind);
+        };
+        (callee, type_args)
+    }
+
+    #[test]
+    fn rewrites_generic_calls_nested_in_record_literals() {
+        let program = parse_and_monomorphize(
+            r#"
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+fn record_root() -> Pair {
+    return Pair(identity<u64>(20), identity<u64>(22));
+}
+"#,
+        );
+
+        let root = program
+            .fns
+            .iter()
+            .find(|f| f.name == "record_root")
+            .expect("root function");
+        let Stmt::Return {
+            value:
+                Some(Expr {
+                    kind: ExprKind::RecordLit { args, .. },
+                    ..
+                }),
+            ..
+        } = &root.body[0]
+        else {
+            panic!("expected the root to return a record literal");
+        };
+        assert_eq!(args.len(), 2);
+        for field in args {
+            let (callee, type_args) = call_name(field);
+            assert_eq!(callee, "identity_u64");
+            assert!(type_args.is_empty());
+        }
+        assert!(program.fns.iter().any(|f| f.name == "identity_u64"));
+    }
+
+    #[test]
+    fn substitutes_and_rewrites_generic_uses_in_class_deinits() {
+        let program = parse_and_monomorphize(
+            r#"
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+class Plain {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+
+    deinit {
+        u64 copy = identity<u64>(self.value);
+    }
+}
+
+class Generic<T> {
+    T value;
+
+    init make(T value) {
+        self.value = value;
+    }
+
+    deinit {
+        /// assert T.max = T.max
+        T copy = identity<T>(self.value);
+    }
+}
+
+fn class_roots() {
+    var plain = Plain::make(1);
+    var generic = Generic<u64>::make(2);
+}
+"#,
+        );
+
+        let plain = program
+            .classes
+            .iter()
+            .find(|class| class.name == "Plain")
+            .expect("non-generic root class");
+        let plain_deinit = plain.deinit.as_ref().expect("plain deinit");
+        let Stmt::Decl {
+            init: Some(plain_call),
+            ..
+        } = &plain_deinit[0]
+        else {
+            panic!("expected the plain deinit declaration");
+        };
+        let (callee, type_args) = call_name(plain_call);
+        assert_eq!(callee, "identity_u64");
+        assert!(type_args.is_empty());
+
+        let generic = program
+            .classes
+            .iter()
+            .find(|class| class.name == "Generic_u64")
+            .expect("instantiated generic class");
+        let generic_deinit = generic.deinit.as_ref().expect("generic deinit");
+        let Stmt::Assert(clause) = &generic_deinit[0] else {
+            panic!("expected the substituted deinit assertion");
+        };
+        assert_eq!(clause.text, "u64.max = u64.max");
+        let Stmt::Decl {
+            ty,
+            init: Some(generic_call),
+            ..
+        } = &generic_deinit[1]
+        else {
+            panic!("expected the generic deinit declaration");
+        };
+        assert_eq!(*ty, Ty::Int(IntTy::U64));
+        let (callee, type_args) = call_name(generic_call);
+        assert_eq!(callee, "identity_u64");
+        assert!(type_args.is_empty());
+        assert!(program.fns.iter().any(|f| f.name == "identity_u64"));
+    }
+
+    #[test]
+    fn rejects_dormant_noninteger_type_arguments_at_the_v1_boundary() {
+        let mut program = parse_program(
+            r#"
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn root() -> u8 {
+    return identity<u8>(7);
+}
+"#,
+        );
+        let root = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "root")
+            .expect("root function");
+        let Stmt::Return {
+            value: Some(expression),
+            ..
+        } = &mut root.body[0]
+        else {
+            panic!("expected the root return");
+        };
+        let ExprKind::Call { type_args, .. } = &mut expression.kind else {
+            panic!("expected a generic call");
+        };
+        let span = type_args[0].span;
+        type_args[0].ty = GenericTy::Bool;
+
+        let error = monomorphize(&mut program).expect_err("bool is outside G0's enabled domain");
+        assert_eq!(error.name, "mono.type_arg_unsupported");
+        assert_eq!(error.span, span);
+        assert!(error.label.contains("only `u8`..`u64`"));
+    }
+
+    #[test]
+    fn rejects_dormant_type_parameters_outside_the_enclosing_arity() {
+        let mut program = parse_program(
+            r#"
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn dormant<T>(T value) -> T {
+    return identity<T>(value);
+}
+"#,
+        );
+        let dormant = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "dormant")
+            .expect("dormant template");
+        let Stmt::Return {
+            value: Some(expression),
+            ..
+        } = &mut dormant.body[0]
+        else {
+            panic!("expected the dormant return");
+        };
+        let ExprKind::Call { type_args, .. } = &mut expression.kind else {
+            panic!("expected a generic call");
+        };
+        let span = type_args[0].span;
+        type_args[0].ty = GenericTy::Param(TypeParamId::from_legacy(1));
+
+        let error = monomorphize(&mut program).expect_err("parameter 1 exceeds arity 1");
+        assert_eq!(error.name, "mono.type_arg_unsupported");
+        assert_eq!(error.span, span);
+        assert!(error.notes[0].1.contains("outside this declaration"));
+    }
+
+    #[test]
+    fn prepares_trait_calls_nested_in_option_construction() {
+        let program = parse_and_monomorphize(
+            r#"
+trait Hashable {
+    /// spec hash : int → int
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for u64 {
+    /// def hash (x : int) : int := x
+    fn hash(u64 x) -> u64 {
+        return x;
+    }
+}
+
+fn wrapped_hash<K: Hashable>(K value) -> option<u64> {
+    return some(K::hash(value));
+}
+
+fn root() -> option<u64> {
+    return wrapped_hash<u64>(42);
+}
+"#,
+        );
+
+        let template = program
+            .fn_templates
+            .iter()
+            .find(|function| function.name == "wrapped_hash")
+            .expect("retained verified template");
+        let Stmt::Return {
+            value:
+                Some(Expr {
+                    kind: ExprKind::SomeE(inner),
+                    ..
+                }),
+            ..
+        } = &template.body[0]
+        else {
+            panic!("expected the template to return an option");
+        };
+        assert!(matches!(inner.kind, ExprKind::TraitCall { .. }));
+
+        let instance = program
+            .fns
+            .iter()
+            .find(|function| function.name == "wrapped_hash_u64")
+            .expect("concrete instance");
+        let Stmt::Return {
+            value:
+                Some(Expr {
+                    kind: ExprKind::SomeE(inner),
+                    ..
+                }),
+            ..
+        } = &instance.body[0]
+        else {
+            panic!("expected the instance to return an option");
+        };
+        assert!(matches!(inner.kind, ExprKind::Call { .. }));
+    }
 }

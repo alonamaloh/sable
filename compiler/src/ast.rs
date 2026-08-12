@@ -148,11 +148,11 @@ pub enum NominalKind {
 /// A source-level value-type shape carried through generic parsing and
 /// monomorphization.
 ///
-/// G0 does not yet store this in the existing AST type-argument fields and
-/// does not accept any new syntax. It is an owned structural representation
-/// for the migration away from integer-only `Vec<IntTy>` arguments. Nominal
-/// types are name-based because module-local class indices are not stable
-/// until merging and monomorphization have finished.
+/// G0 stores this at call and constructor type-argument sites without yet
+/// accepting any new syntax. It is an owned structural representation for the
+/// migration away from integer-only arguments. Nominal types are name-based
+/// because module-local class indices are not stable until merging and
+/// monomorphization have finished.
 ///
 /// `GenericTy::Int(IntTy::TParam(_))` is non-canonical. Use
 /// `GenericTy::from_legacy_int`, which normalizes it to `GenericTy::Param`.
@@ -989,7 +989,7 @@ pub enum ExprKind {
         callee: String,
         callee_span: Span,
         /// Explicit type arguments (`swap<i32>(...)`); consumed by mono.
-        type_args: Vec<IntTy>,
+        type_args: Vec<TypeArg>,
         args: Vec<Expr>,
     },
     /// `a[i]` where `a` names an array parameter.
@@ -1075,7 +1075,7 @@ pub enum ExprKind {
         class: String,
         class_span: Span,
         /// Explicit type arguments (`Vec<i32>::new()`); consumed by mono.
-        type_args: Vec<IntTy>,
+        type_args: Vec<TypeArg>,
         init: String,
         args: Vec<Expr>,
     },

@@ -35,6 +35,11 @@ mono (compiler/src/mono.rs)           monomorphization (ADR 0006/0007): expands
   │                                   plain contracted fns, impl spec defs become
   │                                   module ghost defs, K::m resolves to the impl;
   │                                   bounds checked here (mono.unsatisfied_bound).
+  │                                   G0 represents type arguments recursively with
+  │                                   source spans and opaque canonical type keys, while
+  │                                   the source grammar remains integer/parameter-only;
+  │                                   duplicate parameters and arity above 256 fail in
+  │                                   the parser, and dormant wider shapes fail in mono.
   │                                   No later stage sees a type variable.
   ▼
 typecheck (compiler/src/check.rs)     types, call graph, and one flow-sensitive
@@ -144,6 +149,14 @@ this completed scalar boundary and are future M46+ work.
 
 ## Key invariants
 
+- **Generic widening starts fail closed.** `GenericTy` is recursive, and each
+  call or constructor `TypeArg` retains its shape and source span, but this G0
+  checkpoint does not widen accepted source: only integer types and in-scope
+  parameters parse as arguments. Monomorphization rejects every other dormant
+  shape before checked types are built. Its preparation, substitution, and
+  generic-use walks cover record literals, `some(...)`, class destructors, and
+  member contracts and variants. Canonical type keys are opaque; structural instance
+  identity and an emitted-name collision registry remain the next slice.
 - **Verbatim splice.** Contract clauses appear in generated Lean exactly as written (module call-site substitution of parameter names by argument expressions). Generated theorems bind program variables under their source names so clauses elaborate unchanged. If a clause doesn't elaborate, the error must point at the `.sable` clause, not at generated code.
 - **Every obligation and every hypothesis is named by content.** Hypothesis names are content-anchored slugs (`h_pre_sorted_a`, `h_inv_<slug>`, `h_path_<slug>`, `h_<callee>_post_<slug>`, `h_cinv_<slug>`; same-slug collisions get `_2` suffixes rather than shadowing) — discharge scripts survive unrelated edits. Obligation names are `fn.kind.<expression-slug>`, or `fn.kind.<label>` where the clause carries `#[label(name)]` (stable semantic names; hypotheses become `h_inv_<label>` etc.). Lean theorem names are sanitized versions; user-facing names live in the source map.
 - **Class structures are emitted under mangled names** (`SableC_<name>`) so user class names can never collide with Lean root-namespace names (`class Nat` vs core `Nat`). Clauses never name the class — only values — so the verbatim-splice invariant is untouched; the prefix appears only in compiler-built binder types and `.mk` literals.

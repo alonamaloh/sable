@@ -655,8 +655,18 @@ working hypothesis, not a promise that evidence cannot reorder it:
    extends it.
 2. Generalize aggregate values and their lowering in forcing stages:
 
-   - **G0 — recursive types:** make the compiler's type operations recurse
-     structurally and fail closed before widening the accepted surface.
+   - **G0 — recursive types (underway):** make the compiler's type operations
+     recurse structurally and fail closed before widening the accepted surface.
+     The first checkpoint has landed: recursive `GenericTy`, opaque canonical
+     type keys, and spanned recursive `TypeArg` values at calls and constructors.
+     The grammar still accepts only integer types and in-scope type parameters;
+     the parser rejects duplicate parameter names and declarations above the
+     256-parameter ceiling, while mono rejects dormant unsupported shapes.
+     Preparation, substitution, and generic-use traversal now cover record
+     literals, `some(...)`, class destructors, and member contracts and variants. Focused
+     serial evidence is green: library 44/44, `vec` 84 obligations, `concepts`
+     17, `trait_hash` 10, and `hashmap` 112. Structural instance identity and
+     the emitted-name collision registry are the immediate next slice.
    - **G1 — Boolean/POD aggregates:** establish the first non-integer aggregate
      storage, value, verification, interpreter, and LLVM paths.
    - **G2 — affine options:** carry ownership and destruction correctly through

@@ -529,7 +529,9 @@ impl<'a> Parser<'a> {
     fn int_ty(&mut self) -> PResult<(IntTy, Span)> {
         let (name, span) = self.ident()?;
         if let Some(i) = self.tparams.iter().position(|p| *p == name) {
-            return Ok((IntTy::TParam(i as u8), span));
+            let index = u8::try_from(i)
+                .expect("type_param_list enforces the legacy type-parameter ceiling");
+            return Ok((IntTy::TParam(index), span));
         }
         IntTy::from_name(&name)
             .map(|t| (t, span))
@@ -561,6 +563,24 @@ impl<'a> Parser<'a> {
                     notes: vec![],
                 });
             }
+            if out.iter().any(|parameter| parameter == &name) {
+                return Err(Diagnostic {
+                    name: "parse.duplicate_type_param".into(),
+                    title: format!("duplicate type parameter `{name}`"),
+                    span,
+                    label: "type parameter names must be unique".into(),
+                    notes: vec![],
+                });
+            }
+            if out.len() == MAX_TYPE_PARAMS {
+                return Err(Diagnostic {
+                    name: "parse.too_many_type_params".into(),
+                    title: "too many type parameters".into(),
+                    span,
+                    label: format!("at most {MAX_TYPE_PARAMS} type parameters are supported"),
+                    notes: vec![],
+                });
+            }
             out.push(name);
             if self.at(&Tok::Colon) {
                 self.bump();
@@ -580,12 +600,14 @@ impl<'a> Parser<'a> {
     }
 
     /// `<i32, u8>` at a use site (concrete or in-scope-parameter types).
-    fn type_arg_list(&mut self) -> PResult<Vec<IntTy>> {
+    /// G0 retains this integer-only grammar while preserving each argument's
+    /// own span in the recursive generic-type representation.
+    fn type_arg_list(&mut self) -> PResult<Vec<TypeArg>> {
         self.expect(Tok::Lt)?;
         let mut out = Vec::new();
         loop {
-            let (t, _) = self.int_ty()?;
-            out.push(t);
+            let (ty, span) = self.int_ty()?;
+            out.push(TypeArg::from_legacy_int(ty, span));
             if self.at(&Tok::Comma) {
                 self.bump();
             } else {
@@ -919,7 +941,9 @@ impl<'a> Parser<'a> {
             return Ok((Ty::Bool, span));
         }
         if let Some(i) = self.tparams.iter().position(|p| *p == name) {
-            return Ok((Ty::Int(IntTy::TParam(i as u8)), span));
+            let index = u8::try_from(i)
+                .expect("type_param_list enforces the legacy type-parameter ceiling");
+            return Ok((Ty::Int(IntTy::TParam(index)), span));
         }
         IntTy::from_name(&name)
             .map(|t| (Ty::Int(t), span))
@@ -3705,5 +3729,102 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
             out.insert(array.clone());
         }
         ExprKind::IntLit(_) | ExprKind::BoolLit(_) | ExprKind::NoneE => {}
+    }
+}
+
+#[cfg(test)]
+mod generic_type_arg_tests {
+    use super::*;
+
+    fn parse_source(source: &str) -> PResult<Program> {
+        let scanned = crate::scan::scan(source);
+        let tokens = crate::lexer::lex(&scanned.program_text).unwrap();
+        let lines = LineMap::new(source);
+        parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
+    }
+
+    fn type_parameter_names(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("T{index}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn return_type_args(function: &Fn) -> &[TypeArg] {
+        let Stmt::Return {
+            value: Some(expression),
+            ..
+        } = &function.body[0]
+        else {
+            panic!("expected one return statement");
+        };
+        let ExprKind::Call { type_args, .. } = &expression.kind else {
+            panic!("expected a generic call");
+        };
+        type_args
+    }
+
+    #[test]
+    fn integer_only_type_argument_parser_preserves_argument_spans() {
+        let source = "fn concrete() -> i32 { return id<u8>(1); }\n\
+                      fn generic<T>(T x) -> T { return id<T>(x); }\n";
+        let program = parse_source(source).unwrap();
+
+        let concrete = &return_type_args(&program.fns[0])[0];
+        let concrete_start = source.find("u8>(1)").unwrap();
+        assert_eq!(concrete.ty, GenericTy::Int(IntTy::U8));
+        assert_eq!(
+            concrete.span,
+            Span::new(concrete_start, concrete_start + "u8".len())
+        );
+
+        let generic = &return_type_args(&program.fns[1])[0];
+        let generic_start = source.rfind("T>(x)").unwrap();
+        assert_eq!(generic.ty, GenericTy::Param(TypeParamId::from_legacy(0)));
+        assert_eq!(generic.span, Span::new(generic_start, generic_start + 1));
+    }
+
+    #[test]
+    fn type_parameter_ceiling_accepts_256_and_rejects_the_257th_name() {
+        let names = type_parameter_names(MAX_TYPE_PARAMS);
+        let last = format!("T{}", MAX_TYPE_PARAMS - 1);
+        let source = format!("fn wide<{names}>({last} x) -> {last} {{ return x; }}\n");
+        let program = parse_source(&source).unwrap();
+
+        assert_eq!(program.fns[0].type_params.len(), MAX_TYPE_PARAMS);
+        assert_eq!(program.fns[0].params[0].ty, Ty::Int(IntTy::TParam(u8::MAX)));
+        assert_eq!(program.fns[0].ret, Ty::Int(IntTy::TParam(u8::MAX)));
+
+        let names = type_parameter_names(MAX_TYPE_PARAMS + 1);
+        let source = format!("fn too_wide<{names}>() {{}}\n");
+        let overflow_name = format!("T{MAX_TYPE_PARAMS}");
+        let overflow_start = source.rfind(&overflow_name).unwrap();
+        let diagnostic = parse_source(&source).unwrap_err();
+
+        assert_eq!(diagnostic.name, "parse.too_many_type_params");
+        assert_eq!(diagnostic.title, "too many type parameters");
+        assert_eq!(
+            diagnostic.label,
+            format!("at most {MAX_TYPE_PARAMS} type parameters are supported")
+        );
+        assert_eq!(
+            diagnostic.span,
+            Span::new(overflow_start, overflow_start + overflow_name.len())
+        );
+    }
+
+    #[test]
+    fn duplicate_type_parameter_points_at_the_repeated_name() {
+        let source = "fn duplicate<T, U, T>() {}\n";
+        let duplicate_start = source.rfind("T>").unwrap();
+        let diagnostic = parse_source(source).unwrap_err();
+
+        assert_eq!(diagnostic.name, "parse.duplicate_type_param");
+        assert_eq!(diagnostic.title, "duplicate type parameter `T`");
+        assert_eq!(diagnostic.label, "type parameter names must be unique");
+        assert_eq!(
+            diagnostic.span,
+            Span::new(duplicate_start, duplicate_start + 1)
+        );
     }
 }
