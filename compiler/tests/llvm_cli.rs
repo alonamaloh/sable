@@ -54,37 +54,50 @@ fn verified_scalar_ir_is_pipe_clean_and_runs_when_clang_exists() {
     assert!(report.contains("verified:"));
     assert!(report.contains("status: fully verified"));
 
-    let Some(clang) = find_clang() else {
-        assert_ne!(
-            std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
-            Ok("1"),
-            "SABLE_REQUIRE_CLANG=1 but no clang executable was found"
-        );
-        return;
-    };
-    let temp = temp_dir("run");
-    let ir_path = temp.join("scalar.ll");
-    fs::write(&ir_path, ir).expect("write emitted IR fixture");
-    for optimization in ["-O0", "-O2"] {
-        let executable = temp.join(format!("scalar-{}", &optimization[1..]));
-        let compile = Command::new(&clang)
-            .args([optimization, "-x", "ir"])
-            .arg(&ir_path)
-            .arg("-o")
-            .arg(&executable)
-            .output()
-            .expect("run clang over emitted LLVM IR");
-        assert!(
-            compile.status.success(),
-            "clang {optimization} rejected emitted IR:\n{}",
-            String::from_utf8_lossy(&compile.stderr)
-        );
-        let status = Command::new(&executable)
-            .status()
-            .expect("run the compiled scalar entry");
-        assert_eq!(status.code(), Some(42), "wrong {optimization} result");
-    }
-    fs::remove_dir_all(&temp).expect("remove isolated LLVM test directory");
+    assert_clang_exit("scalar", &ir, 42);
+}
+
+#[test]
+fn verified_control_flow_and_short_circuit_run_at_o0_and_o2() {
+    let source = repo_root().join("corpus/llvm-diff/control_flow.sable");
+    let output = build_command()
+        .args([
+            "build",
+            "--emit-llvm",
+            "--entry",
+            "control_entry",
+            "-o",
+            "-",
+        ])
+        .arg(&source)
+        .output()
+        .expect("run the Sable control-flow LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM CFG build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    assert!(ir.contains("while.head"));
+    assert!(ir.contains("phi i1 [ 0,"));
+    assert!(ir.contains("phi i1 [ 1,"));
+    assert!(ir.contains("icmp ugt i32"));
+
+    let control = ir
+        .find("define internal i32 @__sable_v0_f_13_control_entry")
+        .map(|start| &ir[start..])
+        .expect("control entry is emitted");
+    let rhs_block = control
+        .find(".sc.rhs:\n")
+        .expect("short-circuit RHS has its own block");
+    let rhs_call = control[rhs_block..]
+        .find("call i1 @__sable_v0_f_15_unreachable_rhs")
+        .expect("the syntactic RHS call is inside the conditional RHS block");
+    let rhs_merge = control[rhs_block..]
+        .find(".sc.end:\n")
+        .expect("short-circuit RHS rejoins at a merge block");
+    assert!(rhs_call < rhs_merge);
+    assert_clang_exit("control", &ir, 42);
 }
 
 #[test]
@@ -151,6 +164,44 @@ fn find_clang() -> Option<PathBuf> {
     }
     let path = PathBuf::from("clang");
     command_works(&path).then_some(path)
+}
+
+fn assert_clang_exit(label: &str, ir: &str, expected: i32) {
+    let Some(clang) = find_clang() else {
+        assert_ne!(
+            std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
+            Ok("1"),
+            "SABLE_REQUIRE_CLANG=1 but no clang executable was found"
+        );
+        return;
+    };
+    let temp = temp_dir(label);
+    let ir_path = temp.join(format!("{label}.ll"));
+    fs::write(&ir_path, ir).expect("write emitted IR fixture");
+    for optimization in ["-O0", "-O2"] {
+        let executable = temp.join(format!("{label}-{}", &optimization[1..]));
+        let compile = Command::new(&clang)
+            .args([optimization, "-x", "ir"])
+            .arg(&ir_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("run clang over emitted LLVM IR");
+        assert!(
+            compile.status.success(),
+            "clang {optimization} rejected emitted IR:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let status = Command::new(&executable)
+            .status()
+            .expect("run the compiled LLVM entry");
+        assert_eq!(
+            status.code(),
+            Some(expected),
+            "wrong {label} {optimization} result"
+        );
+    }
+    fs::remove_dir_all(&temp).expect("remove isolated LLVM test directory");
 }
 
 fn command_works(path: &Path) -> bool {

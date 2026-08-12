@@ -107,14 +107,17 @@ monomorphization, checking, VC generation, and Lean evidence on one side of a
 single code-generation boundary rather than building a parallel frontend.
 
 The working `sable build --emit-llvm` path has no libLLVM dependency. The first
-landed slice accepts straight-line scalar literals, locals, calls, Boolean
-negation, and unit; it rejects unsupported code within the selected `--entry`
-call closure (or anywhere in whole-module mode). Output carries the exact
+landed slices accept scalar literals, locals, calls, Boolean negation, unit,
+`if`, `while`, signedness-aware comparisons, and CFG short circuiting; they
+reject unsupported code within the selected `--entry` call closure (or
+anywhere in whole-module mode). Local slots are hoisted to the entry block but
+their initializer stores remain at the source declaration, so loops neither
+grow the stack nor fabricate initialization. Output carries the exact
 artifact and proof-environment identities, uses versionable length-prefixed
-internal mangling, and file publication is atomic. The next slices will add
-control flow and checked arithmetic with explicit guards, never
+internal mangling, and file publication is atomic. The next slice adds checked
+arithmetic with explicit guards, never
 poison-producing flags or `llvm.assume`. The focused CLI gate compiles and runs
-the verified scalar subject under Clang `-O0` and `-O2`, while LLVM tools remain
+both verified scalar/CFG subjects under Clang `-O0` and `-O2`, while LLVM tools remain
 optional for emitting IR. The complete v0 boundary remains in progress.
 
 ## Key invariants

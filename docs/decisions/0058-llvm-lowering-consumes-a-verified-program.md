@@ -107,15 +107,17 @@ environment unless explicitly required (for example by
 `SABLE_REQUIRE_CLANG=1`); the ordinary emitter suite never acquires an LLVM
 tool dependency.
 
-The first slice is now implemented: the opaque `VerifiedProgram` boundary,
-root-bound entry selection, CLI, atomic output, provenance comments, and a
-strict straight-line scalar emitter. Its focused gates are green at 12/12
-library tests and 3/3 CLI tests; the CLI subject returns 42 when compiled by
-Clang at both `-O0` and `-O2`, while verification failure and
+The first two slices are now implemented: the opaque `VerifiedProgram`
+boundary, root-bound entry selection, CLI, atomic output, provenance comments,
+strict scalar lowering, and a real CFG for branches, loops, comparisons, and
+short circuiting. Local allocation is entry-hoisted while initialization stays
+at its source point. Their focused gates are green at 18/18 library tests and
+4/4 CLI tests; both scalar and CFG subjects return 42 when compiled by Clang at
+`-O0` and `-O2`, while verification failure and
 audited-assumption rejection both leave an existing output untouched. The
 complete one-worker verifier/dynamic corpus also remains green through the new
-handoff (205.93s). The remaining work should continue in reviewable slices: control flow
-and short circuiting; then exact arithmetic, conversions, and traps; finally
+handoff (205.93s). The remaining work should continue in reviewable slices:
+exact arithmetic, conversions, and traps; finally
 broader strict diagnostics, differential fixtures, and final user
 documentation. Until those slices and gates land, the complete v0 backend is
 still in progress.

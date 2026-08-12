@@ -1,0 +1,41 @@
+// CFG and short-circuit subject for the second native-backend slice.
+
+/// post result = false
+fn false_value() -> bool {
+    return false;
+}
+
+/// post result = true
+fn unreachable_rhs() -> bool {
+    return true;
+}
+
+/// post result = 42
+fn branch_return() -> i32 {
+    if (true) {
+        return 42;
+    }
+    return 7;
+}
+
+/// post result = 42
+fn control_entry() -> i32 {
+    mut u32 phase = 1;
+    mut i32 out = 0;
+    /// invariant phase <= 1
+    /// invariant phase = 0 -> out = 42
+    /// variant phase
+    while (phase > 0) {
+        if (false_value() && unreachable_rhs()) {
+            out = 1;
+        } else {
+            if (true || unreachable_rhs()) {
+                out = branch_return();
+            } else {
+                out = 2;
+            }
+        }
+        phase = 0;
+    }
+    return out;
+}

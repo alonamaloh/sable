@@ -55,9 +55,9 @@ Native lowering is the active in-progress milestone. Its first working slice
 is the handwritten, libLLVM-free command shown above (full form:
 `sable build --emit-llvm [--entry NAME] [-o FILE|-] file.sable`). It consumes
 only an opaque `VerifiedProgram` containing the exact AST accepted by Lean,
-emits straight-line scalar literals/locals/calls/Boolean negation/unit, and
-strictly rejects everything not yet implemented. Control flow and exact
-guarded arithmetic are the next slices; see
+emits scalar literals/locals/calls/Boolean negation/unit plus `if`, `while`,
+signedness-aware comparisons, and true short circuiting, and strictly rejects
+everything not yet implemented. Exact guarded arithmetic is the next slice; see
 [`docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md`](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md).
 
 - **The bignum pillar** (M15–M16, the Tier-3 opener): arbitrary-precision `Nat` over base-2³² limbs with a normalizing representation invariant ([`corpus/verifies/bignum.sable`](corpus/verifies/bignum.sable)). The entire specification is one recursive ghost valuation, `natVal`, and one line per operation: `cmp` decides the order, `add`/`sub`/`mul` post `natVal result.limbs = natVal a.limbs ⊕ natVal b.limbs`, `div`/`rem` post `… = natVal a.limbs / natVal b.limbs` against Lean's own Euclidean division — with division built *compositionally* (double-and-subtract riding the contracts of the other verified ops, closed by one uniqueness lemma) — and `gcd` is Euclid in fifteen lines whose spec is kernel-check-proven to agree with Lean core's `Int.gcd`. **255 obligations across 10 functions, 73 hand discharges, zero escapes**, every clause monitored dynamically — the first benchmark where the mathematics itself was the test.

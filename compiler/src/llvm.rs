@@ -1,11 +1,12 @@
 //! Strict textual LLVM IR lowering for the verified scalar core (ADR 0058).
 //!
-//! This first slice intentionally handles only straight-line scalar code.  A
-//! construct is either lowered with its Sable meaning or rejected with a
-//! source diagnostic; there is no silent fallback and no unchecked arithmetic.
+//! This first slice handles scalar storage, calls, comparisons, and structured
+//! control flow.  A construct is either lowered with its Sable meaning or
+//! rejected with a source diagnostic; there is no silent fallback and no
+//! unchecked arithmetic.
 
 use crate::VerifiedProgram;
-use crate::ast::{Expr, ExprKind, Fn, IntTy, Program, Stmt, Ty, UnOp};
+use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, Stmt, Ty, UnOp};
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use std::collections::{HashMap, HashSet};
@@ -343,17 +344,20 @@ fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<Back
             } => validate_expr(program, value)?,
             Stmt::Return { value: None, .. } | Stmt::Assert(_) => {}
             Stmt::Unsafe { body, .. } => validate_block(program, body)?,
-            Stmt::If { cond, .. } => {
-                return Err(vec![unsupported(
-                    cond.span,
-                    "`if` awaits the control-flow LLVM slice",
-                )]);
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                validate_bool_expr(program, cond, "`if` condition")?;
+                validate_block(program, then_block)?;
+                if let Some(else_block) = else_block {
+                    validate_block(program, else_block)?;
+                }
             }
-            Stmt::While { kw_span, .. } => {
-                return Err(vec![unsupported(
-                    *kw_span,
-                    "`while` awaits the control-flow LLVM slice",
-                )]);
+            Stmt::While { cond, body, .. } => {
+                validate_bool_expr(program, cond, "`while` condition")?;
+                validate_block(program, body)?;
             }
             Stmt::FieldAssign { field_span, .. } | Stmt::FieldStore { field_span, .. } => {
                 return Err(vec![unsupported(
@@ -414,15 +418,75 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
         ExprKind::Unary {
             op: UnOp::Not,
             operand,
-        } => validate_expr(program, operand),
-        ExprKind::Unary { .. } | ExprKind::Binary { .. } => Err(vec![unsupported(
+        } => validate_bool_expr(program, operand, "logical-not operand"),
+        ExprKind::Binary {
+            op: BinOp::And | BinOp::Or,
+            lhs,
+            rhs,
+            ..
+        } => {
+            validate_bool_expr(program, lhs, "short-circuit left operand")?;
+            validate_bool_expr(program, rhs, "short-circuit right operand")?;
+            require_expr_type(expression, Ty::Bool, "short-circuit result")
+        }
+        ExprKind::Binary {
+            op: op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne),
+            lhs,
+            rhs,
+            ..
+        } => {
+            validate_expr(program, lhs)?;
+            validate_expr(program, rhs)?;
+            let Some(Ty::Int(lhs_ty)) = lhs.ty else {
+                return Err(vec![unsupported(
+                    lhs.span,
+                    format!("left operand of `{}` is not a checked integer", op.symbol()),
+                )]);
+            };
+            if rhs.ty != Some(Ty::Int(lhs_ty)) {
+                return Err(vec![unsupported(
+                    rhs.span,
+                    format!(
+                        "right operand of `{}` does not have checked type `{}`",
+                        op.symbol(),
+                        lhs_ty.name()
+                    ),
+                )]);
+            }
+            require_expr_type(expression, Ty::Bool, "comparison result")
+        }
+        ExprKind::Unary { .. }
+        | ExprKind::Binary {
+            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem,
+            ..
+        } => Err(vec![unsupported(
             expression.span,
-            "checked arithmetic and comparisons await the guarded-arithmetic LLVM slice",
+            "checked arithmetic awaits the guarded-arithmetic LLVM slice",
         )]),
         _ => Err(vec![unsupported(
             expression.span,
             "expression is outside the straight-line scalar LLVM subset",
         )]),
+    }
+}
+
+fn validate_bool_expr(
+    program: &Program,
+    expression: &Expr,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    validate_expr(program, expression)?;
+    require_expr_type(expression, Ty::Bool, role)
+}
+
+fn require_expr_type(expression: &Expr, expected: Ty, role: &str) -> Result<(), Vec<BackendError>> {
+    if expression.ty == Some(expected) {
+        Ok(())
+    } else {
+        Err(vec![unsupported(
+            expression.span,
+            format!("{role} is missing checked type `{}`", expected.name()),
+        )])
     }
 }
 
@@ -467,8 +531,12 @@ struct FunctionEmitter<'a> {
     locals: HashMap<String, Local>,
     next_local: usize,
     next_temp: usize,
+    next_block: usize,
     lines: Vec<String>,
-    terminated: bool,
+    /// Name of the block currently accepting instructions.  `None` means
+    /// that its terminator has been emitted; a sibling or merge may still be
+    /// started afterwards.
+    current_block: Option<String>,
 }
 
 impl<'a> FunctionEmitter<'a> {
@@ -479,8 +547,9 @@ impl<'a> FunctionEmitter<'a> {
             locals: HashMap::new(),
             next_local: 0,
             next_temp: 0,
+            next_block: 0,
             lines: Vec::new(),
-            terminated: false,
+            current_block: Some("entry".into()),
         }
     }
 
@@ -499,28 +568,46 @@ impl<'a> FunctionEmitter<'a> {
             mangle(self.function)
         ));
 
-        for (index, parameter) in self.function.params.iter().enumerate() {
+        // LLVM permits allocas elsewhere, but keeping every stack slot in the
+        // entry block gives branch-local Sable declarations one deterministic
+        // representation without moving their initializer effects.
+        let parameters = self
+            .function
+            .params
+            .iter()
+            .map(|parameter| (parameter.name.clone(), parameter.ty))
+            .collect::<Vec<_>>();
+        let mut declarations = Vec::new();
+        collect_local_declarations(&self.function.body, &mut declarations);
+        for (name, ty) in parameters.iter().chain(declarations.iter()) {
             let slot = self.new_slot();
-            self.lines
-                .push(format!("  {slot} = alloca {}", llvm_ty(parameter.ty)));
-            self.lines.push(format!(
-                "  store {} %p{index}, ptr {slot}",
-                llvm_ty(parameter.ty)
-            ));
-            self.locals.insert(
-                parameter.name.clone(),
-                Local {
-                    ty: parameter.ty,
-                    slot,
-                },
-            );
+            self.instruction(format!("{slot} = alloca {}", llvm_ty(*ty)));
+            self.locals.insert(name.clone(), Local { ty: *ty, slot });
         }
+        for (index, (name, ty)) in parameters.iter().enumerate() {
+            let slot = self
+                .locals
+                .get(name)
+                .expect("parameter slot was preallocated")
+                .slot
+                .clone();
+            self.instruction(format!("store {} %p{index}, ptr {slot}", llvm_ty(*ty)));
+        }
+
         self.emit_block(&self.function.body)?;
-        if !self.terminated {
+        if self.current_block.is_some() {
             if self.function.ret == Ty::Unit {
-                self.lines.push("  ret void".into());
+                self.terminate("ret void");
             } else {
-                self.lines.push("  unreachable".into());
+                return Err(vec![diag(
+                    "backend.invalid_fallthrough",
+                    "non-unit function reaches the end during LLVM lowering",
+                    self.function.name_span,
+                    format!(
+                        "checked function `{}` has a reachable path without a return",
+                        self.function.name
+                    ),
+                )]);
             }
         }
         for line in &self.lines {
@@ -533,7 +620,7 @@ impl<'a> FunctionEmitter<'a> {
 
     fn emit_block(&mut self, statements: &[Stmt]) -> Result<(), Vec<BackendError>> {
         for statement in statements {
-            if self.terminated {
+            if self.current_block.is_none() {
                 break;
             }
             match statement {
@@ -555,11 +642,13 @@ impl<'a> FunctionEmitter<'a> {
                             format!("LLVM local `{name}` was not declared"),
                         )]);
                     };
-                    self.lines.push(format!(
-                        "  store {} {}, ptr {}",
-                        llvm_ty(local.ty),
+                    let ty = local.ty;
+                    let slot = local.slot.clone();
+                    self.instruction(format!(
+                        "store {} {}, ptr {}",
+                        llvm_ty(ty),
                         emitted.operand.expect("assignment value is non-unit"),
-                        local.slot
+                        slot
                     ));
                 }
                 Stmt::ExprStmt(expression) => {
@@ -568,18 +657,50 @@ impl<'a> FunctionEmitter<'a> {
                 Stmt::Return { value, .. } => {
                     if let Some(value) = value {
                         let emitted = self.emit_expr(value)?;
-                        self.lines.push(format!(
-                            "  ret {} {}",
-                            llvm_ty(emitted.ty),
-                            emitted.operand.expect("return value is non-unit")
-                        ));
+                        if emitted.ty != self.function.ret {
+                            return Err(vec![unsupported(
+                                value.span,
+                                format!(
+                                    "return has checked type `{}` but function `{}` returns `{}`",
+                                    emitted.ty.name(),
+                                    self.function.name,
+                                    self.function.ret.name()
+                                ),
+                            )]);
+                        }
+                        if emitted.ty == Ty::Unit {
+                            // A unit-returning call is still effectful.  Its
+                            // absent LLVM operand is consumed by `ret void`,
+                            // rather than being unwrapped as a scalar.
+                            self.terminate("ret void");
+                        } else {
+                            self.terminate(format!(
+                                "ret {} {}",
+                                llvm_ty(emitted.ty),
+                                emitted.operand.expect("non-unit return value")
+                            ));
+                        }
                     } else {
-                        self.lines.push("  ret void".into());
+                        if self.function.ret != Ty::Unit {
+                            return Err(vec![unsupported(
+                                self.function.name_span,
+                                format!(
+                                    "value-less return in non-unit function `{}`",
+                                    self.function.name
+                                ),
+                            )]);
+                        }
+                        self.terminate("ret void");
                     }
-                    self.terminated = true;
                 }
                 Stmt::Assert(_) => {}
                 Stmt::Unsafe { body, .. } => self.emit_block(body)?,
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => self.emit_if(cond, then_block, else_block.as_deref())?,
+                Stmt::While { cond, body, .. } => self.emit_while(cond, body)?,
                 _ => unreachable!("validated before lowering"),
             }
         }
@@ -592,21 +713,92 @@ impl<'a> FunctionEmitter<'a> {
         ty: Ty,
         init: Option<&Expr>,
     ) -> Result<(), Vec<BackendError>> {
-        let slot = self.new_slot();
-        self.lines
-            .push(format!("  {slot} = alloca {}", llvm_ty(ty)));
+        let Some(local) = self.locals.get(name) else {
+            return Err(vec![unsupported(
+                self.function.name_span,
+                format!("LLVM local `{name}` has no preallocated slot"),
+            )]);
+        };
+        let slot = local.slot.clone();
         if let Some(init) = init {
             let value = self.emit_expr(init)?;
-            self.lines.push(format!(
-                "  store {} {}, ptr {slot}",
+            self.instruction(format!(
+                "store {} {}, ptr {slot}",
                 llvm_ty(ty),
                 value.operand.expect("local initializer is non-unit")
             ));
-        } else {
-            self.lines
-                .push(format!("  store {} 0, ptr {slot}", llvm_ty(ty)));
         }
-        self.locals.insert(name.to_owned(), Local { ty, slot });
+        Ok(())
+    }
+
+    fn emit_if(
+        &mut self,
+        condition: &Expr,
+        then_block: &[Stmt],
+        else_block: Option<&[Stmt]>,
+    ) -> Result<(), Vec<BackendError>> {
+        let condition = self.emit_expr(condition)?;
+        let then_label = self.new_label("if.then");
+        let merge_label = self.new_label("if.end");
+        let false_label = else_block
+            .map(|_| self.new_label("if.else"))
+            .unwrap_or_else(|| merge_label.clone());
+        self.terminate(format!(
+            "br i1 {}, label %{then_label}, label %{false_label}",
+            condition.operand.expect("validated boolean condition")
+        ));
+
+        self.start_block(then_label);
+        self.emit_block(then_block)?;
+        let then_reaches_merge = self.current_block.is_some();
+        if then_reaches_merge {
+            self.terminate(format!("br label %{merge_label}"));
+        }
+
+        let else_reaches_merge = if let Some(else_block) = else_block {
+            self.start_block(false_label);
+            self.emit_block(else_block)?;
+            let reaches = self.current_block.is_some();
+            if reaches {
+                self.terminate(format!("br label %{merge_label}"));
+            }
+            reaches
+        } else {
+            // The condition's false edge targets the merge directly.
+            true
+        };
+
+        if then_reaches_merge || else_reaches_merge {
+            self.start_block(merge_label);
+        }
+        Ok(())
+    }
+
+    fn emit_while(&mut self, condition: &Expr, body: &[Stmt]) -> Result<(), Vec<BackendError>> {
+        let header_label = self.new_label("while.head");
+        self.terminate(format!("br label %{header_label}"));
+        self.start_block(header_label.clone());
+
+        // The condition is deliberately emitted in the header, not in the
+        // preheader: calls and short-circuit RHS effects happen on every
+        // iteration, exactly as they do in Sable.
+        let condition = self.emit_expr(condition)?;
+        let body_label = self.new_label("while.body");
+        let exit_label = self.new_label("while.end");
+        self.terminate(format!(
+            "br i1 {}, label %{body_label}, label %{exit_label}",
+            condition.operand.expect("validated boolean condition")
+        ));
+
+        self.start_block(body_label);
+        self.emit_block(body)?;
+        if self.current_block.is_some() {
+            self.terminate(format!("br label %{header_label}"));
+        }
+
+        // The header's false edge always reaches this block, even when every
+        // body path returns.
+        self.start_block(exit_label);
         Ok(())
     }
 
@@ -630,8 +822,7 @@ impl<'a> FunctionEmitter<'a> {
                 let ty = local.ty;
                 let slot = local.slot.clone();
                 let temp = self.new_temp();
-                self.lines
-                    .push(format!("  {temp} = load {}, ptr {slot}", llvm_ty(ty)));
+                self.instruction(format!("{temp} = load {}, ptr {slot}", llvm_ty(ty)));
                 Ok(Value {
                     ty,
                     operand: Some(temp),
@@ -643,8 +834,8 @@ impl<'a> FunctionEmitter<'a> {
             } => {
                 let operand = self.emit_expr(operand)?;
                 let temp = self.new_temp();
-                self.lines.push(format!(
-                    "  {temp} = xor i1 {}, true",
+                self.instruction(format!(
+                    "{temp} = xor i1 {}, true",
                     operand.operand.expect("boolean operand")
                 ));
                 Ok(Value {
@@ -675,22 +866,125 @@ impl<'a> FunctionEmitter<'a> {
                     lowered.join(", ")
                 );
                 if function.ret == Ty::Unit {
-                    self.lines.push(format!("  {call}"));
+                    self.instruction(call);
                     Ok(Value {
                         ty: Ty::Unit,
                         operand: None,
                     })
                 } else {
                     let temp = self.new_temp();
-                    self.lines.push(format!("  {temp} = {call}"));
+                    self.instruction(format!("{temp} = {call}"));
                     Ok(Value {
                         ty: function.ret,
                         operand: Some(temp),
                     })
                 }
             }
+            ExprKind::Binary {
+                op: op @ (BinOp::And | BinOp::Or),
+                lhs,
+                rhs,
+                ..
+            } => self.emit_short_circuit(*op, lhs, rhs),
+            ExprKind::Binary {
+                op: op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne),
+                lhs,
+                rhs,
+                ..
+            } => {
+                let lhs = self.emit_expr(lhs)?;
+                let rhs = self.emit_expr(rhs)?;
+                let Ty::Int(integer) = lhs.ty else {
+                    unreachable!("validated comparison operand")
+                };
+                let predicate = match op {
+                    BinOp::Eq => "eq",
+                    BinOp::Ne => "ne",
+                    BinOp::Lt if integer.signed() => "slt",
+                    BinOp::Le if integer.signed() => "sle",
+                    BinOp::Gt if integer.signed() => "sgt",
+                    BinOp::Ge if integer.signed() => "sge",
+                    BinOp::Lt => "ult",
+                    BinOp::Le => "ule",
+                    BinOp::Gt => "ugt",
+                    BinOp::Ge => "uge",
+                    _ => unreachable!("comparison operator validated above"),
+                };
+                let temp = self.new_temp();
+                self.instruction(format!(
+                    "{temp} = icmp {predicate} {} {}, {}",
+                    llvm_ty(lhs.ty),
+                    lhs.operand.expect("integer comparison lhs"),
+                    rhs.operand.expect("integer comparison rhs")
+                ));
+                Ok(Value {
+                    ty: Ty::Bool,
+                    operand: Some(temp),
+                })
+            }
             _ => unreachable!("validated before lowering"),
         }
+    }
+
+    fn emit_short_circuit(
+        &mut self,
+        operator: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<Value, Vec<BackendError>> {
+        let lhs = self.emit_expr(lhs)?;
+        let lhs_end = self.current_label().to_owned();
+        let rhs_label = self.new_label("sc.rhs");
+        let merge_label = self.new_label("sc.end");
+        let lhs_operand = lhs.operand.expect("validated boolean lhs");
+        match operator {
+            BinOp::And => self.terminate(format!(
+                "br i1 {lhs_operand}, label %{rhs_label}, label %{merge_label}"
+            )),
+            BinOp::Or => self.terminate(format!(
+                "br i1 {lhs_operand}, label %{merge_label}, label %{rhs_label}"
+            )),
+            _ => unreachable!("short-circuit operator"),
+        }
+
+        self.start_block(rhs_label);
+        let rhs = self.emit_expr(rhs)?;
+        let rhs_end = self.current_label().to_owned();
+        let rhs_operand = rhs.operand.expect("validated boolean rhs");
+        self.terminate(format!("br label %{merge_label}"));
+
+        self.start_block(merge_label);
+        let temp = self.new_temp();
+        let short_value = if operator == BinOp::And { "0" } else { "1" };
+        self.instruction(format!(
+            "{temp} = phi i1 [ {short_value}, %{lhs_end} ], [ {rhs_operand}, %{rhs_end} ]"
+        ));
+        Ok(Value {
+            ty: Ty::Bool,
+            operand: Some(temp),
+        })
+    }
+
+    fn instruction(&mut self, instruction: impl Into<String>) {
+        debug_assert!(self.current_block.is_some(), "instruction after terminator");
+        self.lines.push(format!("  {}", instruction.into()));
+    }
+
+    fn terminate(&mut self, terminator: impl Into<String>) {
+        self.instruction(terminator);
+        self.current_block = None;
+    }
+
+    fn start_block(&mut self, label: String) {
+        debug_assert!(self.current_block.is_none(), "new block before terminator");
+        self.lines.push(format!("{label}:"));
+        self.current_block = Some(label);
+    }
+
+    fn current_label(&self) -> &str {
+        self.current_block
+            .as_deref()
+            .expect("expression lowering left a terminated block")
     }
 
     fn new_slot(&mut self) -> String {
@@ -703,6 +997,37 @@ impl<'a> FunctionEmitter<'a> {
         let temp = format!("%t{}", self.next_temp);
         self.next_temp += 1;
         temp
+    }
+
+    fn new_label(&mut self, role: &str) -> String {
+        let label = format!("b{}.{}", self.next_block, role);
+        self.next_block += 1;
+        label
+    }
+}
+
+fn collect_local_declarations(statements: &[Stmt], declarations: &mut Vec<(String, Ty)>) {
+    for statement in statements {
+        match statement {
+            Stmt::Decl { name, ty, .. } => declarations.push((name.clone(), *ty)),
+            Stmt::VarDecl { name, ty, .. } => {
+                declarations.push((name.clone(), ty.expect("validated inferred type")));
+            }
+            Stmt::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_local_declarations(then_block, declarations);
+                if let Some(else_block) = else_block {
+                    collect_local_declarations(else_block, declarations);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Unsafe { body, .. } => {
+                collect_local_declarations(body, declarations);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -928,6 +1253,27 @@ mod tests {
         }
     }
 
+    fn parameter(name: &str, ty: Ty) -> Param {
+        Param {
+            name: name.into(),
+            ty,
+            span: Span::new(0, 1),
+            consumes: false,
+        }
+    }
+
+    fn call(name: &str, ty: Ty) -> Expr {
+        expression(
+            ExprKind::Call {
+                callee: name.into(),
+                callee_span: Span::new(0, 1),
+                type_args: Vec::new(),
+                args: Vec::new(),
+            },
+            ty,
+        )
+    }
+
     fn program(fns: Vec<Fn>) -> Program {
         Program {
             fns,
@@ -974,7 +1320,6 @@ mod tests {
 
     #[test]
     fn rejects_arithmetic_until_it_is_guarded() {
-        use crate::ast::BinOp;
         let int = Ty::Int(IntTy::I32);
         let binary = expression(
             ExprKind::Binary {
@@ -1011,5 +1356,209 @@ mod tests {
         let error = emit_program(&program, 1, &EmitOptions::default()).unwrap_err();
         assert_eq!(error[0].name, "backend.unsupported");
         assert!(error[0].label.contains("generic function template"));
+    }
+
+    #[test]
+    fn comparisons_use_the_checked_integer_signedness() {
+        let mut signed = function(
+            "signed_less",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(
+                    ExprKind::Binary {
+                        op: BinOp::Lt,
+                        op_span: Span::new(0, 1),
+                        lhs: Box::new(expression(ExprKind::Var("x".into()), Ty::Int(IntTy::I32))),
+                        rhs: Box::new(expression(ExprKind::Var("y".into()), Ty::Int(IntTy::I32))),
+                    },
+                    Ty::Bool,
+                )),
+                span: Span::new(0, 1),
+            }],
+        );
+        signed.params = vec![
+            parameter("x", Ty::Int(IntTy::I32)),
+            parameter("y", Ty::Int(IntTy::I32)),
+        ];
+
+        let mut unsigned = function(
+            "unsigned_less",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(
+                    ExprKind::Binary {
+                        op: BinOp::Lt,
+                        op_span: Span::new(0, 1),
+                        lhs: Box::new(expression(ExprKind::Var("x".into()), Ty::Int(IntTy::U8))),
+                        rhs: Box::new(expression(ExprKind::Var("y".into()), Ty::Int(IntTy::U8))),
+                    },
+                    Ty::Bool,
+                )),
+                span: Span::new(0, 1),
+            }],
+        );
+        unsigned.params = vec![
+            parameter("x", Ty::Int(IntTy::U8)),
+            parameter("y", Ty::Int(IntTy::U8)),
+        ];
+
+        let ir =
+            emit_program(&program(vec![signed, unsigned]), 1, &EmitOptions::default()).unwrap();
+        assert!(ir.contains("icmp slt i32"));
+        assert!(ir.contains("icmp ult i8"));
+    }
+
+    #[test]
+    fn if_with_one_returning_branch_keeps_its_merge_live() {
+        let int = Ty::Int(IntTy::I32);
+        let mut choose = function(
+            "choose",
+            int,
+            vec![
+                Stmt::If {
+                    cond: expression(ExprKind::Var("flag".into()), Ty::Bool),
+                    then_block: vec![Stmt::Return {
+                        value: Some(expression(ExprKind::IntLit(1), int)),
+                        span: Span::new(0, 1),
+                    }],
+                    else_block: None,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::IntLit(2), int)),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        choose.params = vec![parameter("flag", Ty::Bool)];
+
+        let ir = emit_program(&program(vec![choose]), 1, &EmitOptions::default()).unwrap();
+        assert!(ir.contains("label %b0.if.then, label %b1.if.end"));
+        assert!(ir.contains("b0.if.then:\n  ret i32 1"));
+        assert!(ir.contains("b1.if.end:\n  ret i32 2"));
+    }
+
+    #[test]
+    fn short_circuit_phi_uses_the_actual_operand_predecessors() {
+        let left = function(
+            "left",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let right = function(
+            "right",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let both = function(
+            "both",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(
+                    ExprKind::Binary {
+                        op: BinOp::And,
+                        op_span: Span::new(0, 1),
+                        lhs: Box::new(call("left", Ty::Bool)),
+                        rhs: Box::new(call("right", Ty::Bool)),
+                    },
+                    Ty::Bool,
+                )),
+                span: Span::new(0, 1),
+            }],
+        );
+
+        let ir = emit_program(
+            &program(vec![left, right, both]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap();
+        assert!(ir.contains("br i1 %t0, label %b0.sc.rhs, label %b1.sc.end"));
+        assert!(ir.contains("b0.sc.rhs:\n  %t1 = call i1"));
+        assert!(ir.contains("phi i1 [ 0, %entry ], [ %t1, %b0.sc.rhs ]"));
+    }
+
+    #[test]
+    fn while_rechecks_its_condition_and_accepts_a_returning_body() {
+        let int = Ty::Int(IntTy::I32);
+        let mut loop_once = function(
+            "loop_once",
+            int,
+            vec![
+                Stmt::While {
+                    cond: expression(ExprKind::Var("keep_going".into()), Ty::Bool),
+                    invariants: Vec::new(),
+                    variant: None,
+                    kw_span: Span::new(0, 1),
+                    body: vec![Stmt::Return {
+                        value: Some(expression(ExprKind::IntLit(7), int)),
+                        span: Span::new(0, 1),
+                    }],
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::IntLit(9), int)),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        loop_once.params = vec![parameter("keep_going", Ty::Bool)];
+
+        let ir = emit_program(&program(vec![loop_once]), 1, &EmitOptions::default()).unwrap();
+        assert!(ir.contains("br label %b0.while.head\nb0.while.head:\n  %t0 = load i1"));
+        assert!(ir.contains("b1.while.body:\n  ret i32 7"));
+        assert!(ir.contains("b2.while.end:\n  ret i32 9"));
+    }
+
+    #[test]
+    fn returning_a_unit_call_preserves_the_call_then_returns_void() {
+        let sink = function(
+            "sink",
+            Ty::Unit,
+            vec![Stmt::Return {
+                value: None,
+                span: Span::new(0, 1),
+            }],
+        );
+        let wrapper = function(
+            "wrapper",
+            Ty::Unit,
+            vec![Stmt::Return {
+                value: Some(call("sink", Ty::Unit)),
+                span: Span::new(0, 1),
+            }],
+        );
+
+        let ir = emit_program(&program(vec![sink, wrapper]), 1, &EmitOptions::default()).unwrap();
+        assert!(ir.contains("call void @__sable_v0_f_4_sink__p___r_v()\n  ret void"));
+    }
+
+    #[test]
+    fn uninitialized_declaration_has_no_speculative_zero_store() {
+        let local = function(
+            "local",
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: Ty::Int(IntTy::I32),
+                    name: "x".into(),
+                    name_span: Span::new(0, 1),
+                    init: None,
+                    mutable: true,
+                },
+                Stmt::Return {
+                    value: None,
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+
+        let ir = emit_program(&program(vec![local]), 1, &EmitOptions::default()).unwrap();
+        assert!(ir.contains("%v0 = alloca i32"));
+        assert!(!ir.contains("store i32 0, ptr %v0"));
     }
 }

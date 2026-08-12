@@ -574,15 +574,19 @@ capability, rather than to a caller-supplied module view.
 
 The landed subset covers scalar literals, locals, assignment, direct
 nonrecursive calls, Boolean negation, unit procedures, returns, proof-assert
-erasure, and otherwise-scalar `unsafe` blocks. Entry mode emits only the
+erasure, otherwise-scalar `unsafe` blocks, `if`, `while`, signedness-aware
+comparisons, and CFG short circuiting. Per-block reachability handles nested
+returns; loop conditions remain in the header and are re-evaluated each trip;
+entry-hoisted local slots retain declaration-site initializer stores. Entry
+mode emits only the
 transitive call closure plus an `i32 @main` bridge; whole-module mode rejects
 generic/class/record/trait declarations instead of silently omitting them.
 Output embeds its artifact and immutable proof-environment identities, stdout
 is pipe-clean, and `-o` publishes through a same-directory temporary file. The
-focused evidence is 12/12 library tests and 3/3 CLI tests; the latter proves a
+focused evidence is 18/18 library tests and 4/4 CLI tests; the latter proves a
 failed verification preserves an existing output, rejects audited assumptions
-without overwriting output, and runs the verified 42-returning subject
-successfully under Clang `-O0` and `-O2`.
+without overwriting output, and runs both verified 42-returning scalar and CFG
+subjects successfully under Clang `-O0` and `-O2`.
 The complete one-worker verifier/dynamic corpus remains green through the new
 verified-program handoff (205.93s).
 
@@ -602,9 +606,8 @@ atomic. Deterministic emitter tests require no LLVM installation; optional
 future differential runs will compare supported subjects with the interpreter
 under Clang `-O0` and `-O2`; the current Clang gate pins the scalar entry's
 expected exit value directly.
-Control flow, short circuiting, conversions, guarded arithmetic, Euclidean
-division/remainder, and versioned runtime traps remain the next implementation
-slices.
+Conversions, guarded arithmetic, Euclidean division/remainder, and versioned
+runtime traps remain the next implementation slices.
 
 ## Post-U10 usability sequence
 
