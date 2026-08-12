@@ -2088,12 +2088,25 @@ uses one arena: map keys are offsets, every node pointer shares live
 provenance, equality reduces to offset equality, and ordering reduces to
 offset ordering. Cross-allocation pointer equality remains deferred.
 
-Next implement the real `ResourceMap` operations. Start with the existing
-`PointsTo<u64>` role to isolate generic aggregate plumbing, then add the typed
-record, `raw<Node>`, and `option<raw<Node>>` prerequisites the actual list
-forces. Do not substitute integer links or another specialized header role;
-that would evade U9's acceptance test. The final subject is an intrusive
-doubly linked list whose nodes live in one arena for the first version.
+**The U9b first compiler instance is complete (2026-08-12, ADR 0053).** The
+parameterized surface currently admits the proved
+`ResourceMap<u64, PointsTo<u64>>` instance. Empty, take, and put are sealed
+authority operations; take requires presence, put requires absence and consumes
+the cell, and every returned view is the exact stored permission. A three-
+function subject verifies 22 obligations through contracted wrapper calls,
+then reads both cells, reconstructs their spans, and releases the precise
+system root. Five static guards cover membership, affinity, and the deliberately
+narrow instantiation. Interpreter-only key shadows catch missing take and
+duplicate put across ordinary Sable call boundaries while remaining erased from
+the machine.
+
+The complete corpus remains green with one worker in 261.79 seconds.
+
+Next add the typed record, `raw<Node>`, and `option<raw<Node>>` prerequisites
+the actual list forces. Do not substitute integer links or another specialized
+header role; that would evade U9's acceptance test. The final subject is an
+intrusive doubly linked list whose nodes live in one arena for the first
+version.
 
 Runtime state:
 

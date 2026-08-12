@@ -67,8 +67,38 @@ an explicitly laid-out typed record, raw pointers to that record, and
 `FreeHeader` would avoid precisely the type-generic aggregate and pointer rules
 U9 is meant to test.
 
-The next slice should implement the smallest honest `ResourceMap` surface and
-exercise it first with the existing `PointsTo<u64>` role. That isolates parser,
-checker, VC-generation, and monitor plumbing. Typed records and raw-pointer
-options then extend the same surface before the intrusive-list algorithm is
-attempted.
+## First compiler instance
+
+The smallest honest compiler surface is now implemented:
+
+```sable
+mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+resource_map_put(&mut cells, key, cell);
+resource PointsTo<u64> cell = resource_map_take(&mut cells, key);
+```
+
+The spelling is parameterized, while this first slice deliberately admits only
+`ResourceMap<u64, PointsTo<u64>>`; every other instantiation gets the stable
+`resource.map_type` diagnostic. The map is affine rather than mandatory:
+abandoning contained cells leaks authority but cannot duplicate it. `put`
+consumes the cell and requires an absent key; `take` requires a present key,
+removes it, and returns the exact stored view. The compiler carries map
+well-formedness at every binding without exposing the hidden separation
+interpretation as a VC.
+
+`corpus/verifies/resource_map.sable` exercises the operations through public
+contracted wrappers, not only at one local expression site. Two initialized
+cells enter a map, leave in reverse order, retain their pointer identity and
+values, return to raw spans, rejoin, and satisfy exact system deallocation: 22
+obligations across three functions, all proved automatically. Static guards
+cover missing take, duplicate put, repeated take, use after put, and an
+unsupported instantiation. The dynamic sanitizer maintains only an erased
+key-membership shadow, including across ordinary Sable calls, and independently
+catches missing take and duplicate put; no authority value reaches the machine.
+
+The complete corpus passes with one worker in 261.79 seconds.
+
+The next slice is therefore no longer generic-map plumbing. It is the honest
+typed-node prerequisite already identified by the probe: one explicitly laid
+out record, `raw<Node>`, and pointer-valued options. Those extend this same map
+surface before the intrusive-list algorithm is attempted.
