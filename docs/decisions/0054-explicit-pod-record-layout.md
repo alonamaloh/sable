@@ -77,3 +77,20 @@ and the matching ResourceMap instance must agree in VC generation and dynamic
 execution. An integer-link encoding or another specialized allocator header is
 not an acceptable substitute. Cross-allocation pointer comparison, arbitrary
 classes in raw memory, packed records, and byte representation remain deferred.
+
+## Implementation evidence
+
+The slice is implemented. `corpus/verifies/typed_records.sable` covers direct
+construction and projection plus record-cell conversion, initialization,
+read/take, aggregate take/put, conversion back to raw bytes, span join, and
+exact system release: 19/19 obligations. Layout and type diagnostics have
+static must-fail subjects, while the interpreter rejects repeated record-cell
+initialization dynamically.
+
+`corpus/verifies/intrusive_list.sable` is the non-synthetic client: its node is
+exactly the three-field layout above, and both nullable links remain ordinary
+runtime values throughout traversal and unlink. The 34-obligation proof
+completes without assumptions or deferrals. The remaining semantic hardening
+is explicit rather than hidden: abstract record cells are not yet instructions
+of the relational SVM oracle. ADR 0055 makes closing that gap the gate before
+U10; it does not grant records a byte representation in the meantime.

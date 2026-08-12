@@ -2102,11 +2102,27 @@ the machine.
 
 The complete corpus remains green with one worker in 261.79 seconds.
 
-Next add the typed record, `raw<Node>`, and `option<raw<Node>>` prerequisites
-the actual list forces. Do not substitute integer links or another specialized
-header role; that would evade U9's acceptance test. The final subject is an
-intrusive doubly linked list whose nodes live in one arena for the first
-version.
+**The U9c typed-node prerequisite is complete (2026-08-12, ADR 0054).** POD
+records have checked explicit size, alignment, field offsets, fit, and
+nonoverlap. The initial raw-storable field set is fixed-width integers,
+`raw<Record>`, and `option<raw<Record>>`. Record values, typed raw pointers,
+record-tagged `PointsTo<Record>` extents, and the matching generic
+`ResourceMap<u64, PointsTo<Record>>` instance agree across the checker,
+interpreter, VC generator, and generated Lean. `typed_records.sable` exercises
+construction, projection, the complete record-cell lifecycle, aggregate
+take/put, span reconstruction, and exact system release in 19 obligations.
+Static and dynamic negative subjects pin malformed layouts, type confusion,
+and repeated initialization.
+
+**U9 is complete (2026-08-12, ADR 0055).** The acceptance subject uses the
+actual representation the probe demanded: two `IntrusiveNode` records in one
+48-byte arena, nullable raw previous/next links, and one
+`ResourceMap<u64, PointsTo<IntrusiveNode>>`. Its source-level
+`IntrusiveList` predicate relates the map to an abstract key sequence through
+the stored links. Traversal, head unlink, link rewrite, aggregate restoration,
+cell teardown, span join, and exact system deallocation verify in 34
+obligations with no `assume`, no `defer`, and no source-level heap or separating
+conjunction. The runtime subject returns the expected payload sum.
 
 Runtime state:
 
@@ -2131,7 +2147,18 @@ Exit criteria:
 - proof scripts remain about the abstract list and map, not global heap
   rearrangement.
 
-If this fails, revise the resource API before attempting MMIO or kernel work.
+All five criteria are met. The pointer rule exercised here is deliberately
+one-arena: a live node pointer is provenance plus an arena-relative offset, so
+the list needs no cross-allocation comparison rule. Map extraction is the only
+permission rearrangement visible to the proof.
+
+**Hardening gate before U10.** Record storage currently executes in the Rust
+interpreter and verifies through generated Lean, but the relational SVM and its
+functional evaluator still formalize only byte and `u64` typed extents. Extend
+that oracle with abstract record-tagged cells and add successful and `undef`
+differential subjects. This does not invalidate U9's aggregate-resource result,
+but prototype criterion 7 requires the third semantics before the raw-memory
+vertical slice is considered triangulated.
 
 ### U10 — MMIO and privileged-state profile
 

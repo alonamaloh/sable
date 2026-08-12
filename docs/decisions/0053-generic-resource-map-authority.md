@@ -98,7 +98,12 @@ catches missing take and duplicate put; no authority value reaches the machine.
 
 The complete corpus passes with one worker in 261.79 seconds.
 
-The next slice is therefore no longer generic-map plumbing. It is the honest
-typed-node prerequisite already identified by the probe: one explicitly laid
-out record, `raw<Node>`, and pointer-valued options. Those extend this same map
-surface before the intrusive-list algorithm is attempted.
+The typed-node extension subsequently generalized the admitted value resource
+to `PointsTo<Record>` without changing the authority rules. The same sealed
+take/put implementation now backs
+`ResourceMap<u64, PointsTo<IntrusiveNode>>`; only the view type and returned
+cell type vary. ADR 0055 records the resulting intrusive-list acceptance
+subject. That subject confirms the important architectural claim of this ADR:
+the aggregate abstraction did not need a node-specific operation, a borrow
+axiom, or a source-visible separation predicate when its first genuinely
+recursive client arrived.

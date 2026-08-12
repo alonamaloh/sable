@@ -431,13 +431,36 @@ The complete corpus passes with one worker in 261.79 seconds.
 
 The generic proof in `docs/notes/resource-map-probe.lean` remains the authority
 justification: take/put preserve hidden context validity and mutable entry
-update derives from take–mutate–put. The next U9 slice is now precisely the
-remaining representation prerequisite: an explicitly laid-out node record,
-`raw<Node>`, and `option<raw<Node>>`, followed by the one-arena intrusive list.
+update derives from take–mutate–put. M43 applies that unchanged abstraction to
+the typed-node client the probe was designed to force.
+
+### M43 — typed records and the intrusive-list acceptance subject *(2026-08-12, ADRs 0054–0055)*
+
+U9 is complete. POD records declare checked size, alignment, and field offsets;
+their initial raw-storable fields are fixed integers, `raw<Record>`, and
+`option<raw<Record>>`. Record values remain abstract rather than serialized.
+Typed record cells implement the same explicit into/init/read/take/drop/from
+lifecycle as `u64`, and `ResourceMap<u64, PointsTo<Record>>` reuses the generic
+aggregate rules unchanged. The 19-obligation typed-record vertical slice,
+layout/type must-fails, and dynamic repeated-init guard cover the prerequisite.
+
+`corpus/verifies/intrusive_list.sable` then places two 24-byte nodes in one
+system arena. Its visible invariant is a recursive relation between nullable
+raw links, a partial map of exact node permissions, and an abstract sequence.
+The function traverses both nodes, unlinks the head, rewrites the remaining
+back-link, re-establishes the one-node invariant, tears both cells down, joins
+the spans, and releases the precise 48-byte root. All 34 obligations verify
+without `assume` or `defer`; the dynamic subject returns 50.
+
+Before M44/U10, bring abstract record cells into the relational SVM, functional
+evaluator, direct outcome guards, and Rust/Lean differential corpus. Generated
+Lean and the interpreter already agree operationally at the language boundary,
+but the formal machine currently stops at typed `u64`; closing that explicit
+gap is the final unsafe-memory triangulation gate.
 
 ## Parallel track (low intensity)
 
-The SVM semantic oracle — **checkpoint reached**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers `corpus/svm-diff` (34 subjects: signed-extreme arithmetic, the normative evaluation-order traps, short-circuit guards, loops, OOM, options) through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator on every `cargo test` (~0.5s); the first run found zero divergences, and an injected lowering bug (`%` rewired to `/`) is caught as two. **Calls + frames landed** (A-normalized, ADR 0005 res. 4): `call dst f args` at statement level, a frame stack in the configuration, `EvalArgs` for left-to-right argument evaluation, and all agreement/determinism/progress theorems re-proven over the extended machine; the harness gained per-file program environments and eight call subjects (42 total, zero divergences — including recursion through ten frames and argument-order trap identity). **The byte raw heap landed** (ADR 0025): `RawHeap` in the configuration, `Val.ptr` as provenance plus offset, and `rawAlloc`/`rawFree`/`rawLoad8`/`rawStore8`/`rawTake8` plus a pure `ptrAdd`. The structural finding is that pointer arithmetic is *pure*, so it is an expression, and everything touching the heap is an A-normalized statement — which is why `Eval` needed no change at all and not one existing expression rule was reinterpreted. That claim is checked rather than asserted: the heap was threaded through the configuration in its own commit with no operations, and agreement both directions, determinism, totality, and progress re-proved with no tactic touched. Rule side conditions are stated as *decidable* predicates (`loadByte`, `freeable`, `inBounds`) because they are exactly what the machine must compute to tell a store from `undef`. 20 direct SVM subjects in `Sable/SVMRawTests.lean` pin the valid path and every route to `undef` — out of bounds, uninitialized, use after free, double free, interior free, non-pointer dereference, out-of-`u8` store — and both layers of defence are verified by injection: an evaluator that forgets `take8`'s write-back fails the agreement proof, while a rule and evaluator changed together consistently passes agreement and fails an outcome guard. Next steps there: ghost transitions for the erasure metatheorem, then classes.
+The SVM semantic oracle — **checkpoint reached**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers `corpus/svm-diff` (34 subjects: signed-extreme arithmetic, the normative evaluation-order traps, short-circuit guards, loops, OOM, options) through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator on every `cargo test` (~0.5s); the first run found zero divergences, and an injected lowering bug (`%` rewired to `/`) is caught as two. **Calls + frames landed** (A-normalized, ADR 0005 res. 4): `call dst f args` at statement level, a frame stack in the configuration, `EvalArgs` for left-to-right argument evaluation, and all agreement/determinism/progress theorems re-proven over the extended machine; the harness gained per-file program environments and eight call subjects (42 total, zero divergences — including recursion through ten frames and argument-order trap identity). **The byte raw heap landed** (ADR 0025): `RawHeap` in the configuration, `Val.ptr` as provenance plus offset, and `rawAlloc`/`rawFree`/`rawLoad8`/`rawStore8`/`rawTake8` plus a pure `ptrAdd`. The structural finding is that pointer arithmetic is *pure*, so it is an expression, and everything touching the heap is an A-normalized statement — which is why `Eval` needed no change at all and not one existing expression rule was reinterpreted. That claim is checked rather than asserted: the heap was threaded through the configuration in its own commit with no operations, and agreement both directions, determinism, totality, and progress re-proved with no tactic touched. Rule side conditions are stated as *decidable* predicates (`loadByte`, `freeable`, `inBounds`) because they are exactly what the machine must compute to tell a store from `undef`. 20 direct SVM subjects in `Sable/SVMRawTests.lean` pin the valid path and every route to `undef` — out of bounds, uninitialized, use after free, double free, interior free, non-pointer dereference, out-of-`u8` store — and both layers of defence are verified by injection: an evaluator that forgets `take8`'s write-back fails the agreement proof, while a rule and evaluator changed together consistently passes agreement and fails an outcome guard. Typed `u64` cells have since joined both layers; the immediate next step is record-tagged cells, followed by the older ghost-transition and class tracks.
 
 ## Testing strategy
 
