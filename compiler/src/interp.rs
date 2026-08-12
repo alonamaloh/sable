@@ -178,7 +178,7 @@ impl RawHeap {
         let covered = al
             .cells_u64
             .keys()
-            .any(|start| *start <= off && off < *start + 8);
+            .any(|start| *start <= off && off < *start + IntTy::U64.layout().size);
         if al.live && off >= 0 && (off as usize) < al.bytes.len() && !covered {
             Some(al)
         } else {
@@ -1400,12 +1400,13 @@ impl<'a> Interp<'a> {
                     }
                     RawOp::IntoCellU64 => {
                         let (a, o) = ptr_at(0);
-                        if o % 8 != 0 {
+                        let layout = IntTy::U64.layout();
+                        if o % layout.align != 0 {
                             return Err(bad(format!(
                                 "raw_into_cell_u64 needs 8-byte alignment: {a}+{o}"
                             )));
                         }
-                        for i in 0..8 {
+                        for i in 0..layout.size {
                             if self.raw.live_at(a, o + i).is_none() {
                                 return Err(bad(format!(
                                     "raw_into_cell_u64 needs eight raw bytes at {a}+{o}"
@@ -1422,6 +1423,7 @@ impl<'a> Interp<'a> {
                     }
                     RawOp::FromCellU64 => {
                         let (a, o) = ptr_at(0);
+                        let layout = IntTy::U64.layout();
                         let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
                             bad(format!("raw_from_cell_u64 names absent allocation {a}"))
                         })?;
@@ -1433,7 +1435,7 @@ impl<'a> Interp<'a> {
                         match al.cells_u64.get(&o) {
                             Some(None) => {
                                 al.cells_u64.remove(&o);
-                                for i in 0..8 {
+                                for i in 0..layout.size {
                                     al.bytes[(o + i) as usize] = Some(0);
                                 }
                                 Ok(RtVal::Unit)

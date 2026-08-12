@@ -5,6 +5,9 @@ storage and authority over it (ADRs 0025–0026). This decides the first typed
 storage slice: one `u64` cell, complete through the checker, logic, monitor,
 and SVM, before an allocator or a general layout mechanism is added.
 
+**Follow-up:** ADR 0032 resolves the deferred layout mechanism while retaining
+this ADR's `u64`-only operation surface.
+
 ## The boundary being tested
 
 `PointsTo<u64>` is affine authority over one abstract typed extent. Its proof

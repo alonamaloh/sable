@@ -667,8 +667,9 @@ impl<'a> Parser<'a> {
                     label: "the first typed-storage slice supports `PointsTo<u64>`".into(),
                     notes: vec![(
                         "note".into(),
-                        "general `Layout<T>` follows after the fixed-width vertical slice \
-                         works through the checker, logic, interpreter, and machine"
+                        "layout is now compiler-established proof vocabulary, but the \
+                         typed-cell operation surface remains `u64`-only until type tags \
+                         and one explicitly laid-out record are carried through every layer"
                             .into(),
                     )],
                 });

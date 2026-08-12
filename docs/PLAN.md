@@ -277,7 +277,19 @@ The first U7b slice is deliberately vertical rather than generic: `resource Poin
 
 Every enforcement layer moved together. The checker spends owned authority at both conversions; vcgen emits local provenance/alignment/state obligations over `PointsToView Int`; the interpreter tags typed extents and excludes raw byte access; and the SVM gained matching instructions in both its relational and executable presentations, with agreement, determinism, totality, and progress still kernel-checked. Direct guards cover zero-fill, misalignment, byte/typed alias exclusion, invalid state transitions, and dead allocations; the Rust↔Lean harness now agrees on 46 subjects, including valid and invalid typed paths. The corpus adds a fully verified init/read/take round trip, a verified drop path, dynamic zero-fill checks, and named failures for wrong extent, wrong state, raw-authority reuse, and unsupported `PointsTo<T>`.
 
-This is **not all of U7b**. The next slice should generalize the fixed layout into compiler-established `Layout<T>` and then add a non-deallocating program-lifetime static root plus a bump arena. `SystemDealloc` remains gated on resource-type mandatory consumption before U8; typed cells do not weaken that gate.
+This is **not all of U7b**. At this checkpoint the next slice was the
+compiler-established layout now recorded as M36; the remaining path is one
+explicit record probe, then a non-deallocating program-lifetime static root and
+bump arena. `SystemDealloc` remains gated on resource-type mandatory
+consumption before U8; typed cells do not weaken that gate.
+
+### M36 — compiler-established layout *(2026-08-12, ADR 0032)*
+
+The fixed eight-byte fact from M35 is now one canonical `Layout`: positive size plus nonzero power-of-two alignment, attached to every integer type model and visible in contracts as `u64.layout` or generic `T.layout`. It is proof vocabulary, not a program value or resource, so user code cannot forge geometry. Explicit projection lemmas keep automation from depending on reducible unfolding—the first typed-cell rerun caught that boundary immediately when `(u64.layout).size` initially remained opaque.
+
+`PointsToView` carries its layout and the `u64` well-formedness fact pins it to the canonical instance. Raw conversion creates that field, state transitions preserve it, and conversion back derives span length from it. The VC generator, interpreter, and SVM now consult their type-layout mapping instead of independently spelling `8`; the SVM has direct guards for the mapping, and the 46-subject differential suite still agrees. `corpus/verifies/layout.sable` exercises both concrete projection facts and template-level `T.layout` substitution (9/9 obligations).
+
+U7b still has two distinct pieces: probe one explicitly laid-out POD record without representation semantics, then add the non-deallocating static root and bump arena. The `SystemDealloc` gate before U8 is unchanged.
 
 ## Parallel track (low intensity)
 

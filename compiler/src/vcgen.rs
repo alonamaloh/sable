@@ -2158,9 +2158,11 @@ impl<'a> Generator<'a> {
                         let Val::View(m) = self.eval(&args[1]) else {
                             unreachable!("checked: span value")
                         };
+                        let layout = IntTy::U64.lean_layout();
                         let goal = format!(
                             "({p}).alloc = ({m}).alloc ∧ ({p}).off = ({m}).off \
-                             ∧ ({m}).len = 8 ∧ ({m}).off % 8 = 0"
+                             ∧ ({m}).len = ({layout}).size \
+                             ∧ ({m}).off % ({layout}).align = 0"
                         );
                         let ob = self.obligation(
                             &format!("{}.cell_u64.from_raw", self.fname),

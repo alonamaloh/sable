@@ -1,4 +1,5 @@
 import Sable.Bounds
+import Sable.Layout
 import Sable.IntModel
 import Sable.Auto
 import Sable.Seq

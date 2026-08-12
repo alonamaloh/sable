@@ -20,6 +20,15 @@ pub enum IntTy {
     TParam(u8),
 }
 
+/// Compiler-established storage geometry. This carries no byte
+/// representation; it is the executable counterpart of `Sable.Layout`
+/// (ADR 0032).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageLayout {
+    pub size: i128,
+    pub align: i128,
+}
+
 impl IntTy {
     pub fn name(self) -> &'static str {
         match self {
@@ -45,6 +54,16 @@ impl IntTy {
             IntTy::U64 | IntTy::I64 => 64,
             IntTy::TParam(_) => unreachable!("type parameter after monomorphization"),
         }
+    }
+    pub fn layout(self) -> StorageLayout {
+        let bytes = i128::from(self.bits() / 8);
+        StorageLayout {
+            size: bytes,
+            align: bytes,
+        }
+    }
+    pub fn lean_layout(self) -> String {
+        format!("{}.layout", self.name())
     }
     pub fn min(self) -> i128 {
         if self.signed() {
@@ -122,8 +141,9 @@ pub enum Ty {
 pub enum ResKind {
     RawSpan,
     /// One abstract `u64` typed extent. The source spelling is
-    /// `PointsTo<u64>`; wider generic layout follows only after this
-    /// complete vertical slice (ADR 0031).
+    /// `PointsTo<u64>`; layout is general proof vocabulary, while the
+    /// typed operation surface remains deliberately u64-only (ADRs
+    /// 0031–0032).
     PointsToU64,
     /// One open file description: the authority to use a descriptor, and
     /// the position that description is at (ADR 0028).

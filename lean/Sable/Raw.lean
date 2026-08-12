@@ -14,6 +14,7 @@ values lift to ℤ, and mixing in `Nat` costs coercions at every clause.
 -/
 
 import Sable.Seq
+import Sable.Layout
 
 namespace Sable
 
@@ -39,17 +40,18 @@ layout capability; the first slice fixes both to eight for `u64`. -/
 structure PointsToView (α : Type) where
   alloc : Int
   off : Int
+  layout : Layout
   state : CellState α
 
 /-- Shape facts carried by every `PointsTo<u64>` binding. -/
 def PointsToView.wfU64 (v : PointsToView Int) : Prop :=
-  0 ≤ v.off ∧ v.off % 8 = 0 ∧
+  v.layout = u64.layout ∧ 0 ≤ v.off ∧ v.off % v.layout.align = 0 ∧
     match v.state with
     | .uninit => True
     | .init x => 0 ≤ x ∧ x ≤ 18446744073709551615
 
 @[simp] theorem PointsToView.wfU64_iff (v : PointsToView Int) :
-    v.wfU64 ↔ (0 ≤ v.off ∧ v.off % 8 = 0 ∧
+    v.wfU64 ↔ (v.layout = u64.layout ∧ 0 ≤ v.off ∧ v.off % v.layout.align = 0 ∧
       match v.state with
       | .uninit => True
       | .init x => 0 ≤ x ∧ x ≤ 18446744073709551615) := Iff.rfl
@@ -66,12 +68,16 @@ def PointsToView.clear (v : PointsToView α) : PointsToView α :=
     (v.put x).alloc = v.alloc := rfl
 @[simp] theorem PointsToView.put_off (v : PointsToView α) (x : α) :
     (v.put x).off = v.off := rfl
+@[simp] theorem PointsToView.put_layout (v : PointsToView α) (x : α) :
+    (v.put x).layout = v.layout := rfl
 @[simp] theorem PointsToView.put_state (v : PointsToView α) (x : α) :
     (v.put x).state = .init x := rfl
 @[simp] theorem PointsToView.clear_alloc (v : PointsToView α) :
     v.clear.alloc = v.alloc := rfl
 @[simp] theorem PointsToView.clear_off (v : PointsToView α) :
     v.clear.off = v.off := rfl
+@[simp] theorem PointsToView.clear_layout (v : PointsToView α) :
+    v.clear.layout = v.layout := rfl
 @[simp] theorem PointsToView.clear_state (v : PointsToView α) :
     v.clear.state = .uninit := rfl
 
@@ -256,18 +262,20 @@ def PointsToView.names (v : PointsToView α) (p : RawPtr) : Prop :=
 
 /-- Reinterpret one checked raw extent as an uninitialized `u64` cell. -/
 def SpanView.toCellU64 (v : SpanView) : PointsToView Int :=
-  { alloc := v.alloc, off := v.off, state := .uninit }
+  { alloc := v.alloc, off := v.off, layout := u64.layout, state := .uninit }
 
 /-- Return an uninitialized typed cell to eight initialized zero bytes.
 This is explicit cleanup; no typed value is serialized by the operation. -/
 def PointsToView.toSpanU64 (v : PointsToView Int) : SpanView :=
-  { alloc := v.alloc, off := v.off, len := 8,
-    bytes := ⟨8, fun _ => .init 0⟩ }
+  { alloc := v.alloc, off := v.off, len := v.layout.size,
+    bytes := ⟨v.layout.size, fun _ => .init 0⟩ }
 
 @[simp] theorem SpanView.toCellU64_alloc (v : SpanView) :
     v.toCellU64.alloc = v.alloc := rfl
 @[simp] theorem SpanView.toCellU64_off (v : SpanView) :
     v.toCellU64.off = v.off := rfl
+@[simp] theorem SpanView.toCellU64_layout (v : SpanView) :
+    v.toCellU64.layout = u64.layout := rfl
 @[simp] theorem SpanView.toCellU64_state (v : SpanView) :
     v.toCellU64.state = .uninit := rfl
 @[simp] theorem PointsToView.toSpanU64_alloc (v : PointsToView Int) :
@@ -275,7 +283,7 @@ def PointsToView.toSpanU64 (v : PointsToView Int) : SpanView :=
 @[simp] theorem PointsToView.toSpanU64_off (v : PointsToView Int) :
     v.toSpanU64.off = v.off := rfl
 @[simp] theorem PointsToView.toSpanU64_len (v : PointsToView Int) :
-    v.toSpanU64.len = 8 := rfl
+    v.toSpanU64.len = v.layout.size := rfl
 @[simp] theorem PointsToView.toSpanU64_get (v : PointsToView Int) (k : Int) :
     v.toSpanU64.bytes.get k = .init 0 := rfl
 

@@ -1735,9 +1735,17 @@ zero-fills eight bytes as cleanup, without choosing a representation for an
 initialized `u64`. Positive, negative, dynamic, direct-SVM, and differential
 subjects cover the slice.
 
+**Slice U7b2 is complete (2026-08-12, ADR 0032):** layout is now
+compiler-established proof vocabulary. `Layout` records positive size and
+nonzero power-of-two alignment; every fixed-width integer has a canonical
+kernel-checked instance; generic clauses use `T.layout`, and concrete clauses
+use `u64.layout`. `PointsToView` carries the layout, and the VC generator,
+interpreter, and SVM take the `u64` cell geometry from their canonical type
+mapping rather than duplicating the literal eight. This adds no byte
+representation and no forgeable runtime layout value.
+
 Remaining U7b work:
 
-- `Layout<T>`;
 - root/static allocation sources;
 - a program-lifetime static bump arena.
 
@@ -1745,9 +1753,8 @@ Do not introduce `SystemDealloc` on this rung. The static root is deliberately
 non-deallocating; that keeps typed-storage state and layout separate from the
 interprocedural mandatory-consumption rule that U8 will need.
 
-Generalize the now-working fixed-width integer path through `Layout<T>`. Add one
-explicitly laid-out record only after the layout generalization works; do not
-introduce byte serialization while doing so.
+Probe one explicitly laid-out record next; do not introduce byte serialization
+while doing so.
 
 Exit criteria:
 

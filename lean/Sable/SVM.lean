@@ -39,6 +39,7 @@ integers" invariant. Division is Euclidean (`Int.ediv`/`Int.emod`,
 ADR 0004).
 -/
 import Sable.Seq
+import Sable.Layout
 
 namespace Sable
 namespace SVM
@@ -75,6 +76,17 @@ def IntTy.bits : IntTy → Nat
   | .i16 | .u16 => 16
   | .i32 | .u32 => 32
   | .i64 | .u64 => 64
+
+/-- Compiler-established geometry. It carries no representation relation. -/
+def IntTy.layout : IntTy → Sable.Layout
+  | .u8 => Sable.u8.layout
+  | .i8 => Sable.i8.layout
+  | .u16 => Sable.u16.layout
+  | .i16 => Sable.i16.layout
+  | .u32 => Sable.u32.layout
+  | .i32 => Sable.i32.layout
+  | .u64 => Sable.u64.layout
+  | .i64 => Sable.i64.layout
 
 /-- The representability side condition every partial arithmetic rule
 checks (design §2.2). -/
@@ -156,7 +168,7 @@ the difference between a store and `undef`. -/
 def RawHeap.inBounds (μ : RawHeap) (a k : Int) : Bool :=
   match μ.allocs a with
   | some al =>
-      let base := k - k.emod 8
+      let base := k - k.emod IntTy.u64.layout.align
       al.live && decide (0 ≤ k) && decide (k < al.size) && decide (al.cellsU64 base = none)
   | none => false
 
@@ -164,7 +176,7 @@ def RawHeap.inBounds (μ : RawHeap) (a k : Int) : Bool :=
 def RawHeap.byteAt (μ : RawHeap) (a k : Int) : Option RawByte :=
   match μ.allocs a with
   | some al =>
-      let base := k - k.emod 8
+      let base := k - k.emod IntTy.u64.layout.align
       if al.live ∧ 0 ≤ k ∧ k < al.size ∧ al.cellsU64 base = none then
         some (al.bytes.get k)
       else none
@@ -191,12 +203,12 @@ def RawHeap.store (μ : RawHeap) (a k : Int) (b : RawByte) : RawHeap :=
       if i = a then (μ.allocs i).map (fun al => { al with bytes := al.bytes.set k b })
       else μ.allocs i }
 
-/-- Whether eight aligned raw bytes may change role into one typed cell. -/
+/-- Whether one `u64` layout may change role into one typed cell. -/
 def RawHeap.cellConvertibleU64 (μ : RawHeap) (a k : Int) : Bool :=
   match μ.allocs a with
   | some al =>
-      al.live && decide (0 ≤ k) && decide (k % 8 = 0) &&
-        decide (k + 8 ≤ al.size) && decide (al.cellsU64 k = none)
+      al.live && decide (0 ≤ k) && decide (k % IntTy.u64.layout.align = 0) &&
+        decide (k + IntTy.u64.layout.size ≤ al.size) && decide (al.cellsU64 k = none)
   | none => false
 
 def RawHeap.cellAtU64 (μ : RawHeap) (a k : Int) : Option (Option Int) :=
@@ -218,7 +230,7 @@ def RawHeap.removeCellU64 (μ : RawHeap) (a k : Int) : RawHeap :=
         { al with
           cellsU64 := fun j => if j = k then none else al.cellsU64 j
           bytes := ⟨al.bytes.len, fun j =>
-            if k ≤ j ∧ j < k + 8 then .init 0 else al.bytes.get j⟩ })
+            if k ≤ j ∧ j < k + IntTy.u64.layout.size then .init 0 else al.bytes.get j⟩ })
       else μ.allocs i }
 
 /-- Mark an allocation dead. The entry stays, so its id is never reused

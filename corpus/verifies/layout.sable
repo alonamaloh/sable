@@ -1,0 +1,23 @@
+// Compiler-established layout is specification vocabulary (ADR 0032),
+// not a runtime value. Generic clauses see it through the integer model;
+// instantiation substitutes the concrete type's canonical layout.
+
+/// requires #[label(small_layout)] T.layout.size ≤ 8
+/// post result = x
+fn layout_id<T>(T x) -> T {
+    return x;
+}
+
+/// post result = 7
+/// post u64.layout.size = 8
+/// post u64.layout.align = 8
+fn layout_u64_probe() -> u64 {
+    return layout_id<u64>(7);
+}
+
+/// post result = 3
+/// post u16.layout.size = 2
+/// post u16.layout.align = 2
+fn layout_u16_probe() -> u16 {
+    return layout_id<u16>(3);
+}

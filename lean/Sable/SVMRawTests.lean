@@ -24,6 +24,10 @@ private def outcome (k : List Stmt) : String :=
 private def u64 (n : Int) : Expr := .intLit .u64 n
 private def u8 (n : Int) : Expr := .intLit .u8 n
 
+#guard IntTy.u64.layout = Sable.u64.layout
+#guard IntTy.u64.layout.size = 8
+#guard IntTy.u64.layout.align = 8
+
 /-! ## The valid path -/
 
 /- Allocate four bytes, write one, read it back. -/
