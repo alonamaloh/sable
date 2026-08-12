@@ -819,6 +819,33 @@ theorem AllocatorView.returnable_prefix
   apply hclear k hlo
   omega
 
+/-- After taking an adjacent stored successor, the returned lease's empty
+interior and the successor's stored-chain frame combine into one empty
+interior for their joined extent. The former header key is empty because it
+is precisely the header being taken. -/
+theorem AllocatorView.returnable_takeAdjacentHeader_clearInterior
+    {v : AllocatorView} {lease : BlockLeaseView}
+    {head size : Int} {header : FreeHeaderView}
+    (hreturn : v.returnable lease)
+    (adjacent : lease.key + lease.span.len = head)
+    (stored : v.storesHeader head header)
+    (successorClear : (v.takeHeader head).clearInterior head size) :
+    (v.takeHeader head).clearInterior
+      lease.key (lease.span.len + size) := by
+  intro k hlo hhi
+  by_cases hbefore : k < head
+  · obtain ⟨hfree, hheaders⟩ := hreturn.2.2.2.2 k hlo (by omega)
+    have hne : k ≠ head := by omega
+    exact ⟨hfree,
+      by simpa [AllocatorView.takeHeader, hne] using hheaders⟩
+  · by_cases hat : k = head
+    · subst k
+      exact ⟨by simpa [AllocatorView.takeHeader] using stored.2.1,
+        by simp [AllocatorView.takeHeader]⟩
+    · have hafter : head < k := by omega
+      apply successorClear k hafter
+      omega
+
 theorem AllocatorView.clearInterior_takeHeader
     {v : AllocatorView} {key size : Int}
     (hclear : v.clearInterior key size) :
