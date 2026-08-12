@@ -1,0 +1,8 @@
+// expect-error: resource.abandoned
+// Allocator-internal free authority is mandatory on every path.
+
+pub fn free_block_abandoned() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+}

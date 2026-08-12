@@ -1,0 +1,10 @@
+// expect-error: type.mismatch
+// Client BlockLease authority deliberately has no split operation.
+
+pub fn block_lease_cannot_split() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+    mut resource BlockLease lease = free_block_lease(block);
+    resource FreeBlock suffix = free_block_split(&mut lease, 4);
+}

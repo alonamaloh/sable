@@ -71,7 +71,7 @@ without confusing allocator coverage with immutable contents.
 
 The positive subject performs system allocation, aggregate take, a leased
 `u64` init/take/raw round trip, matching put, aggregate destruction, and system
-release. It proves 9/9 obligations with zero `assume` and zero `defer`, and its
+release. It proves 10/10 obligations with zero `assume` and zero `defer`, and its
 dynamic test returns 91.
 
 Negative subjects pin duplicate take, cross-allocator put, double put,

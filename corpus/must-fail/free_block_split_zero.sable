@@ -1,0 +1,13 @@
+// expect-error: free_block_split_zero.free_block_split.0
+// A split must leave two nonempty allocator blocks.
+
+pub fn free_block_split_zero() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock left = allocator_take_free(&mut state, 0);
+    resource FreeBlock right = free_block_split(&mut left, 0);
+    resource FreeBlock whole = free_block_join(left, right);
+    allocator_put_free(&mut state, whole);
+    resource RawSpan mem2 = allocator_destroy(state);
+    unsafe system_dealloc(base, mem2, release);
+}

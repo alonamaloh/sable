@@ -1,0 +1,147 @@
+// Allocator-internal FreeBlock roles (ADR 0039): split and join stay inside
+// the allocator; the client receives a nonsplittable BlockLease.
+
+/// post result = 37
+pub fn free_block_round_trip() -> u64 {
+    unsafe system_alloc(16) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock left_block = allocator_take_free(&mut state, 0);
+    resource FreeBlock suffix = free_block_split(&mut left_block, 8);
+    resource BlockLease lease = free_block_lease(left_block);
+    allocator_put_free(&mut state, suffix);
+
+    mut u64 out = 0;
+    unsafe {
+        mut resource LeasedPointsTo<u64> cell = raw_into_cell_u64(base, lease);
+        raw_cell_init_u64(base, 37, &mut cell);
+        out = raw_cell_take_u64(base, &mut cell);
+        resource BlockLease returned = raw_from_cell_u64(base, cell);
+    }
+
+    resource FreeBlock left = block_lease_free(returned);
+    resource FreeBlock right = allocator_take_free(&mut state, 8);
+    resource FreeBlock whole_free = free_block_join(left, right);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+    return out;
+}
+
+/// discharge free_block_round_trip.allocator_put_free by
+///   unfold Sable.AllocatorView.canPutFree
+///   exact ⟨h_free10_split.1.trans h_free8_owner, h_free10_wf⟩
+
+/// discharge free_block_round_trip.cell_u64.from_raw by
+///   rw [h_base_system, h_lease11_lease, h_left_block_prefix,
+///       h_free8_take, h_allocator_view6_create, h_mem_system]
+///   simp [Sable.SpanView.start, Sable.FreeBlockView.toLease,
+///     Sable.FreeBlockView.prefix, Sable.AllocatorView.takeFree,
+///     Sable.AllocatorView.leaseAt, Sable.AllocatorView.initial,
+///     Sable.BlockLeaseView.toFree, Sable.SpanView.uninit]
+
+/// discharge free_block_round_trip.cell_u64.init by
+///   rw [h_cell13_cell]
+///   simp [Sable.BlockLeaseView.toCellU64, Sable.PointsToView.names,
+///     h_fact_base_2_alloc_lease11_spa]
+
+/// discharge free_block_round_trip.cell_u64.take by
+///   rw [h_cell_init]
+///   constructor
+///   · simpa [Sable.LeasedPointsToU64View.put,
+///       Sable.PointsToView.names] using
+///       h_fact_sable_pointstoview_names.1
+///   · simp [Sable.LeasedPointsToU64View.put]
+
+/// discharge free_block_round_trip.cell_u64.to_raw by
+///   rw [h_cell_take]
+///   constructor
+///   · simpa [Sable.LeasedPointsToU64View.clear,
+///       Sable.PointsToView.names] using
+///       h_fact_sable_pointstoview_names.1
+///   · simp [Sable.LeasedPointsToU64View.clear]
+
+/// discharge free_block_round_trip.block_lease_free by
+///   rw [h_view17_span, h_cell_take, h_cell_init, h_cell13_cell]
+///   simpa [Sable.LeasedPointsToU64View.toLease,
+///     Sable.LeasedPointsToU64View.clear,
+///     Sable.LeasedPointsToU64View.put,
+///     Sable.BlockLeaseView.toCellU64] using h_lease11_whole.1
+
+/// discharge free_block_round_trip.allocator_take_free.8 by
+///   have h0 : _free8.key = 0 := by
+///     rw [h_free8_take, h_allocator_view6_create]
+///     rfl
+///   have h8 : _free10.key = 8 := by omega
+///   rw [← h8]
+///   exact h_state_takeable_free
+
+/// discharge free_block_round_trip.free_block_join by
+///   have h0 : _free8.key = 0 := by
+///     rw [h_free8_take, h_allocator_view6_create]
+///     rfl
+///   have h8 : _free10.key = 8 := by omega
+///   rw [h_free18_free, h_view17_span, h_cell_take, h_cell_init,
+///       h_cell13_cell, h_lease11_lease,
+///       h_free20_take, ← h8, h_state_entry_free,
+///       h_left_block_prefix, h_free10_suffix]
+///   simp [Sable.LeasedPointsToU64View.toLease,
+///     Sable.LeasedPointsToU64View.clear,
+///     Sable.LeasedPointsToU64View.put,
+///     Sable.BlockLeaseView.toCellU64, Sable.BlockLeaseView.toFree,
+///     Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix,
+///     Sable.FreeBlockView.suffix, h_free8_take,
+///     h_allocator_view6_create, h_mem_system,
+///     Sable.AllocatorView.takeFree, Sable.AllocatorView.leaseAt,
+///     Sable.AllocatorView.initial, Sable.SpanView.uninit]
+///   unfold Sable.FreeBlockView.joinable
+///   simp [Sable.FreeBlockView.prefix, Sable.FreeBlockView.suffix]
+
+/// discharge free_block_round_trip.allocator_put_free.2 by
+///   unfold Sable.AllocatorView.canPutFree
+///   constructor
+///   · rw [h_free21_owner, h_free18_owner]
+///     rw [h_view17_span, h_cell_take, h_cell_init, h_cell13_cell]
+///     simp [Sable.LeasedPointsToU64View.toLease,
+///       Sable.LeasedPointsToU64View.clear,
+///       Sable.LeasedPointsToU64View.put,
+///       Sable.BlockLeaseView.toCellU64]
+///     rw [h_lease11_owner,
+///         h_left_block_prefix]
+///     change _free8.allocator = state_3.allocator
+///     exact h_free8_owner.trans
+///       (h_state_owner_free_3.trans h_state_owner_free_2).symm
+///   · exact h_free21_wf
+
+/// discharge free_block_round_trip.allocator_destroy by
+///   subst _allocator_view6
+///   subst state
+///   subst _free8
+///   subst left_block
+///   subst _free10
+///   subst _lease11
+///   subst state_2
+///   subst _cell13
+///   subst cell
+///   subst cell_2
+///   subst _view17
+///   subst _free18
+///   subst state_3
+///   subst _free20
+///   subst _free21
+///   subst state_4
+///   exact Sable.AllocatorView.splitTypedLeaseRejoin_complete
+///     _allocator5 mem 8 37 h_fact_mem_off_0_0_mem_len.1 (by rfl)
+
+/// discharge free_block_round_trip.system_dealloc by
+///   have hroot : state_4.root = mem := by
+///     rw [h_state_put_free_2, h_state_take_free_2,
+///         h_state_put_free, h_state_take_free, h_allocator_view6_create]
+///     rfl
+///   simp [h_base_system, h_release_system, h_mem_system, hroot,
+///     h_view23_extent.1, h_view23_extent.2.1,
+///     h_view23_extent.2.2]
+
+/// discharge free_block_round_trip.post.result_37 by
+///   rw [h_cell_init] at h_value15_cell_value
+///   simp [Sable.LeasedPointsToU64View.put] at h_value15_cell_value
+///   omega

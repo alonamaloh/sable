@@ -2638,8 +2638,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let op_span = *op_span;
             let arity = match op {
                 ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf
-                | ResOp::AllocatorTake | ResOp::AllocatorPut => 2,
-                ResOp::TestWorld | ResOp::AllocatorCreate | ResOp::AllocatorDestroy => 1,
+                | ResOp::AllocatorTake | ResOp::AllocatorPut
+                | ResOp::AllocatorTakeFree | ResOp::AllocatorPutFree
+                | ResOp::FreeBlockSplit | ResOp::FreeBlockJoin => 2,
+                ResOp::TestWorld | ResOp::AllocatorCreate | ResOp::AllocatorDestroy
+                | ResOp::FreeBlockLease | ResOp::BlockLeaseFree => 1,
             };
             if args.len() != arity {
                 return Err(Diagnostic {
@@ -2754,6 +2757,52 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     transfer(ctx, &args[1], None)?;
                     check_borrow_conflicts(ctx, args, None)?;
                     Ty::Unit
+                }
+                ResOp::AllocatorTakeFree => {
+                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], want)?;
+                    check_expr(ctx, &mut args[0], Some(want))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::FreeBlock)
+                }
+                ResOp::AllocatorPutFree => {
+                    let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], state)?;
+                    check_expr(ctx, &mut args[0], Some(state))?;
+                    let block = Ty::Res(ResKind::FreeBlock);
+                    check_expr(ctx, &mut args[1], Some(block))?;
+                    transfer(ctx, &args[1], None)?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Unit
+                }
+                ResOp::FreeBlockSplit => {
+                    let block = Ty::ResRef(ResKind::FreeBlock, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], block)?;
+                    check_expr(ctx, &mut args[0], Some(block))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::FreeBlock)
+                }
+                ResOp::FreeBlockJoin => {
+                    let block = Ty::Res(ResKind::FreeBlock);
+                    for arg in args.iter_mut() {
+                        check_expr(ctx, arg, Some(block))?;
+                        transfer(ctx, arg, None)?;
+                    }
+                    Ty::Res(ResKind::FreeBlock)
+                }
+                ResOp::FreeBlockLease => {
+                    let block = Ty::Res(ResKind::FreeBlock);
+                    check_expr(ctx, &mut args[0], Some(block))?;
+                    transfer(ctx, &args[0], None)?;
+                    Ty::Res(ResKind::BlockLease)
+                }
+                ResOp::BlockLeaseFree => {
+                    let lease = Ty::Res(ResKind::BlockLease);
+                    check_expr(ctx, &mut args[0], Some(lease))?;
+                    transfer(ctx, &args[0], None)?;
+                    Ty::Res(ResKind::FreeBlock)
                 }
             }
         }

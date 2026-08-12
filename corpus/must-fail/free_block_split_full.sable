@@ -1,0 +1,13 @@
+// expect-error: free_block_split_full.free_block_split.8
+// Taking the full extent would manufacture an empty suffix role.
+
+pub fn free_block_split_full() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock left = allocator_take_free(&mut state, 0);
+    resource FreeBlock right = free_block_split(&mut left, 8);
+    resource FreeBlock whole = free_block_join(left, right);
+    allocator_put_free(&mut state, whole);
+    resource RawSpan mem2 = allocator_destroy(state);
+    unsafe system_dealloc(base, mem2, release);
+}

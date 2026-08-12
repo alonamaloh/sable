@@ -1,0 +1,17 @@
+// expect-error: free_block_wrong_owner.allocator_put_free
+// A FreeBlock may return only to the allocator whose identity it carries.
+
+pub fn free_block_wrong_owner() {
+    unsafe system_alloc(8) as (base_a, resource mem_a, resource release_a);
+    unsafe system_alloc(8) as (base_b, resource mem_b, resource release_b);
+    mut resource AllocatorState a = allocator_create(mem_a);
+    mut resource AllocatorState b = allocator_create(mem_b);
+    resource FreeBlock from_a = allocator_take_free(&mut a, 0);
+    resource FreeBlock from_b = allocator_take_free(&mut b, 0);
+    allocator_put_free(&mut a, from_b);
+    allocator_put_free(&mut b, from_a);
+    resource RawSpan whole_a = allocator_destroy(a);
+    resource RawSpan whole_b = allocator_destroy(b);
+    unsafe system_dealloc(base_a, whole_a, release_a);
+    unsafe system_dealloc(base_b, whole_b, release_b);
+}

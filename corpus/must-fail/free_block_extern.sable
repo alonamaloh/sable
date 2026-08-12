@@ -1,0 +1,5 @@
+// expect-error: resource.release_sealed
+// Foreign code cannot consume the erased allocator-internal block role.
+
+extern "C" #[audit(id := "test.fake-free-block.v1", reason := "negative subject")]
+fn fake_free_block(#[consumes] resource FreeBlock block);

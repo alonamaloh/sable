@@ -1,0 +1,15 @@
+// expect-error: free_block_join_nonadjacent.free_block_join
+// Blocks from one allocator still cannot be joined across a live gap.
+
+pub fn free_block_join_nonadjacent() {
+    unsafe system_alloc(16) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock left = allocator_take_free(&mut state, 0);
+    mut resource FreeBlock middle = free_block_split(&mut left, 8);
+    resource FreeBlock right = free_block_split(&mut middle, 4);
+    resource FreeBlock invalid = free_block_join(left, right);
+    resource FreeBlock whole = free_block_join(invalid, middle);
+    allocator_put_free(&mut state, whole);
+    resource RawSpan mem2 = allocator_destroy(state);
+    unsafe system_dealloc(base, mem2, release);
+}

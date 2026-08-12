@@ -1,0 +1,13 @@
+// expect-error: free_block_join_reversed.free_block_join
+// Join is ordered: the right block must start at the left block's end.
+
+pub fn free_block_join_reversed() {
+    unsafe system_alloc(16) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock left = allocator_take_free(&mut state, 0);
+    resource FreeBlock right = free_block_split(&mut left, 8);
+    resource FreeBlock whole = free_block_join(right, left);
+    allocator_put_free(&mut state, whole);
+    resource RawSpan mem2 = allocator_destroy(state);
+    unsafe system_dealloc(base, mem2, release);
+}

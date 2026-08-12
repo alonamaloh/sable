@@ -2710,6 +2710,16 @@ impl<'a> Generator<'a> {
                         let Val::View(root) = self.eval(&args[0]) else {
                             unreachable!("checked: raw span value")
                         };
+                        let goal = format!("({root}).off = 0 ∧ 0 < ({root}).len");
+                        let ob = self.obligation(
+                            &format!("{}.allocator_create", self.fname),
+                            "`allocator_create` needs a positive root span at offset zero"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
                         self.fresh += 1;
                         let identity = format!("_allocator{}", self.fresh);
                         self.binders.push((identity.clone(), "Int".into()));
@@ -2731,6 +2741,10 @@ impl<'a> Generator<'a> {
                         self.push_hyp_unique(
                             format!("h_{}_key0", state.trim_start_matches('_')),
                             format!("Sable.AllocatorView.canTake {state} 0"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_free0", state.trim_start_matches('_')),
+                            format!("Sable.AllocatorView.canTakeFree {state} 0"),
                         );
                         Val::View(state)
                     }
@@ -2852,6 +2866,263 @@ impl<'a> Generator<'a> {
                         );
                         self.env.insert(array.clone(), Val::View(restored));
                         Val::Unit
+                    }
+                    ResOp::AllocatorTakeFree => {
+                        let Val::View(state) = self.eval(&args[0]) else {
+                            unreachable!("checked: allocator state borrow")
+                        };
+                        let Val::Int(key) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 key")
+                        };
+                        let goal = format!("Sable.AllocatorView.canTakeFree ({state}) {key}");
+                        let ob = self.obligation(
+                            &format!("{}.allocator_take_free.{}", self.fname, slug(&key)),
+                            "`allocator_take_free` needs a free entry at this key".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: allocator borrow")
+                        };
+                        let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders.push((
+                            residual.clone(),
+                            ResKind::AllocatorState.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_take_free"),
+                            format!("{residual} = Sable.AllocatorView.take ({state}) {key}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_owner_free"),
+                            format!("({residual}).allocator = ({state}).allocator"),
+                        );
+                        self.env
+                            .insert(array.clone(), Val::View(residual.clone()));
+                        let block = self.hinted_sym("_free", hint);
+                        self.binders
+                            .push((block.clone(), ResKind::FreeBlock.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_take", block.trim_start_matches('_')),
+                            format!("{block} = Sable.AllocatorView.takeFree ({state}) {key}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", block.trim_start_matches('_')),
+                            format!("Sable.FreeBlockView.wf {block}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_owner", block.trim_start_matches('_')),
+                            format!("({block}).allocator = ({residual}).allocator"),
+                        );
+                        Val::View(block)
+                    }
+                    ResOp::AllocatorPutFree => {
+                        let Val::View(state) = self.eval(&args[0]) else {
+                            unreachable!("checked: allocator state borrow")
+                        };
+                        let Val::View(block) = self.eval(&args[1]) else {
+                            unreachable!("checked: free block value")
+                        };
+                        let goal = format!(
+                            "Sable.AllocatorView.canPutFree ({state}) ({block})"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.allocator_put_free", self.fname),
+                            "`allocator_put_free` needs a matching well-formed internal block"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: allocator borrow")
+                        };
+                        let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders.push((
+                            restored.clone(),
+                            ResKind::AllocatorState.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_put_free"),
+                            format!(
+                                "{restored} = Sable.AllocatorView.putFree ({state}) ({block})"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_owner_free"),
+                            format!("({restored}).allocator = ({state}).allocator"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_takeable_free"),
+                            format!(
+                                "Sable.AllocatorView.canTakeFree ({restored}) ({block}).key"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_entry_free"),
+                            format!(
+                                "Sable.AllocatorView.takeFree ({restored}) ({block}).key = {block}"
+                            ),
+                        );
+                        self.env.insert(array.clone(), Val::View(restored));
+                        Val::Unit
+                    }
+                    ResOp::FreeBlockSplit => {
+                        let Val::View(block) = self.eval(&args[0]) else {
+                            unreachable!("checked: free block borrow")
+                        };
+                        let Val::Int(n) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 split")
+                        };
+                        let goal = format!("0 < {n} ∧ {n} < ({block}).span.len");
+                        let mut ob = self.obligation(
+                            &format!("{}.free_block_split.{}", self.fname, slug(&n)),
+                            "`free_block_split` needs two nonempty result blocks".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        // Allocator identity is irrelevant to this numeric
+                        // bound and expanding aggregate-view equalities gives
+                        // simplification an enormous higher-order search
+                        // surface. Keep the fact for later transitions, but
+                        // leave it out of this local geometry VC.
+                        ob.hyps.retain(|(name, _)| !name.ends_with("_owner"));
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: free block borrow")
+                        };
+                        let prefix = self.hinted_sym("_free", Some(array.clone()));
+                        self.binders
+                            .push((prefix.clone(), ResKind::FreeBlock.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{array}_prefix"),
+                            format!("{prefix} = Sable.FreeBlockView.prefix ({block}) {n}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_wf"),
+                            format!("Sable.FreeBlockView.wf {prefix}"),
+                        );
+                        self.env.insert(array.clone(), Val::View(prefix));
+                        let suffix = self.hinted_sym("_free", hint);
+                        self.binders
+                            .push((suffix.clone(), ResKind::FreeBlock.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_suffix", suffix.trim_start_matches('_')),
+                            format!("{suffix} = Sable.FreeBlockView.suffix ({block}) {n}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", suffix.trim_start_matches('_')),
+                            format!("Sable.FreeBlockView.wf {suffix}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_split", suffix.trim_start_matches('_')),
+                            format!(
+                                "({suffix}).allocator = ({block}).allocator ∧ \
+                                 ({suffix}).key = ({block}).key + {n} ∧ \
+                                 ({suffix}).span.alloc = ({block}).span.alloc ∧ \
+                                 ({suffix}).span.off = ({block}).span.off + {n} ∧ \
+                                 ({suffix}).span.len = ({block}).span.len - {n}"
+                            ),
+                        );
+                        Val::View(suffix)
+                    }
+                    ResOp::FreeBlockJoin => {
+                        let Val::View(left) = self.eval(&args[0]) else {
+                            unreachable!("checked: free block value")
+                        };
+                        let Val::View(right) = self.eval(&args[1]) else {
+                            unreachable!("checked: free block value")
+                        };
+                        let goal = format!(
+                            "Sable.FreeBlockView.joinable ({left}) ({right})"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.free_block_join", self.fname),
+                            "`free_block_join` needs adjacent blocks from one allocator"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let joined = self.hinted_sym("_free", hint);
+                        self.binders
+                            .push((joined.clone(), ResKind::FreeBlock.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_join", joined.trim_start_matches('_')),
+                            format!(
+                                "{joined} = Sable.FreeBlockView.join ({left}) ({right})"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", joined.trim_start_matches('_')),
+                            format!("Sable.FreeBlockView.wf {joined}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_owner", joined.trim_start_matches('_')),
+                            format!("({joined}).allocator = ({left}).allocator"),
+                        );
+                        Val::View(joined)
+                    }
+                    ResOp::FreeBlockLease => {
+                        let Val::View(block) = self.eval(&args[0]) else {
+                            unreachable!("checked: free block value")
+                        };
+                        let lease = self.hinted_sym("_lease", hint);
+                        self.binders
+                            .push((lease.clone(), ResKind::BlockLease.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_lease", lease.trim_start_matches('_')),
+                            format!("{lease} = Sable.FreeBlockView.toLease ({block})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_owner", lease.trim_start_matches('_')),
+                            format!("({lease}).allocator = ({block}).allocator"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_whole", lease.trim_start_matches('_')),
+                            format!(
+                                "({lease}).key = ({lease}).span.off ∧ \
+                                 0 < ({lease}).span.len"
+                            ),
+                        );
+                        Val::View(lease)
+                    }
+                    ResOp::BlockLeaseFree => {
+                        let Val::View(lease) = self.eval(&args[0]) else {
+                            unreachable!("checked: block lease value")
+                        };
+                        let goal = format!(
+                            "({lease}).key = ({lease}).span.off ∧ 0 < ({lease}).span.len"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.block_lease_free", self.fname),
+                            "`block_lease_free` needs a positive whole-block lease".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let block = self.hinted_sym("_free", hint);
+                        self.binders
+                            .push((block.clone(), ResKind::FreeBlock.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_free", block.trim_start_matches('_')),
+                            format!("{block} = Sable.BlockLeaseView.toFree ({lease})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", block.trim_start_matches('_')),
+                            format!("Sable.FreeBlockView.wf {block}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_owner", block.trim_start_matches('_')),
+                            format!("({block}).allocator = ({lease}).allocator"),
+                        );
+                        Val::View(block)
                     }
                 }
             }
@@ -4225,6 +4496,10 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         // matching surface; sealed operations emit the local facts they
         // establish instead.
         ResKind::AllocatorState | ResKind::BlockLease | ResKind::LeasedPointsToU64 => vec![],
+        ResKind::FreeBlock => vec![(
+            format!("h_{name}_wf"),
+            format!("Sable.FreeBlockView.wf {binder}"),
+        )],
     }
 }
 

@@ -105,6 +105,9 @@ structure SpanView where
   len : Int
   bytes : Seq ByteState
 
+def SpanView.sameExtent (a b : SpanView) : Prop :=
+  a.alloc = b.alloc ∧ a.off = b.off ∧ a.len = b.len
+
 /-! Allocator aggregates and client leases (ADR 0037). The structures below
 are pure views. Affine authority and the hidden valid-composition invariant
 remain checker facts; only sealed compiler operations establish these view
@@ -121,6 +124,21 @@ structure LeasedPointsToU64View where
   allocator : Int
   key : Int
   cell : PointsToView Int
+
+/-- Allocator-internal block authority. Only this role may split/join. -/
+structure FreeBlockView where
+  allocator : Int
+  key : Int
+  span : SpanView
+
+def FreeBlockView.wf (v : FreeBlockView) : Prop :=
+  v.key = v.span.off ∧ 0 < v.span.len
+
+def FreeBlockView.toLease (v : FreeBlockView) : BlockLeaseView :=
+  { allocator := v.allocator, key := v.key, span := v.span }
+
+def BlockLeaseView.toFree (v : BlockLeaseView) : FreeBlockView :=
+  { allocator := v.allocator, key := v.key, span := v.span }
 
 def BlockLeaseView.toCellU64 (v : BlockLeaseView) : LeasedPointsToU64View :=
   { allocator := v.allocator, key := v.key,
@@ -196,8 +214,47 @@ def AllocatorView.canPut (v : AllocatorView) (lease : BlockLeaseView) : Prop :=
 def AllocatorView.put (v : AllocatorView) (lease : BlockLeaseView) : AllocatorView :=
   { v with free := fun k => if k = lease.key then some lease.span else v.free k }
 
-def SpanView.sameExtent (a b : SpanView) : Prop :=
-  a.alloc = b.alloc ∧ a.off = b.off ∧ a.len = b.len
+def AllocatorView.takeFree (v : AllocatorView) (key : Int) : FreeBlockView :=
+  (v.leaseAt key).toFree
+
+def AllocatorView.canTakeFree (v : AllocatorView) (key : Int) : Prop :=
+  v.canTake key ∧ (v.takeFree key).wf
+
+def AllocatorView.canPutFree (v : AllocatorView) (block : FreeBlockView) : Prop :=
+  block.allocator = v.allocator ∧ block.wf
+
+def AllocatorView.putFree (v : AllocatorView) (block : FreeBlockView) : AllocatorView :=
+  v.put block.toLease
+
+@[simp] theorem AllocatorView.takeFree_toLease
+    (v : AllocatorView) (key : Int) :
+    (v.takeFree key).toLease = v.leaseAt key := rfl
+
+@[simp] theorem AllocatorView.initial_takeFree_zero_span
+    (allocator : Int) (root : SpanView) :
+    ((AllocatorView.initial allocator root).takeFree 0).span = root := rfl
+
+@[simp] theorem AllocatorView.initial_takeFree_zero_key
+    (allocator : Int) (root : SpanView) :
+    ((AllocatorView.initial allocator root).takeFree 0).key = 0 := rfl
+
+@[simp] theorem AllocatorView.initial_takeFree_zero_allocator
+    (allocator : Int) (root : SpanView) :
+    ((AllocatorView.initial allocator root).takeFree 0).allocator = allocator := rfl
+
+@[simp] theorem AllocatorView.initial_canTakeFree_zero
+    (allocator : Int) (root : SpanView)
+    (hoff : root.off = 0) (hlen : 0 < root.len) :
+    (AllocatorView.initial allocator root).canTakeFree 0 := by
+  simp [AllocatorView.canTakeFree, AllocatorView.canTake,
+    AllocatorView.initial, AllocatorView.takeFree, AllocatorView.leaseAt,
+    BlockLeaseView.toFree, FreeBlockView.wf, hoff, hlen]
+
+@[simp] theorem FreeBlockView.toLease_toFree (v : FreeBlockView) :
+    v.toLease.toFree = v := rfl
+
+@[simp] theorem BlockLeaseView.toFree_toLease (v : BlockLeaseView) :
+    v.toFree.toLease = v := rfl
 
 def AllocatorView.releaseSpan (v : AllocatorView) : SpanView :=
   (v.free 0).getD v.root
@@ -424,6 +481,140 @@ theorem SpanView.wf_cat {v1 v2 : SpanView}
   obtain ⟨hl1, hb1⟩ := h1
   obtain ⟨hl2, hb2⟩ := h2
   exact ⟨by simp; omega, by simp; omega⟩
+
+/-! Allocator-internal block geometry (ADR 0039). -/
+
+def FreeBlockView.prefix (v : FreeBlockView) (n : Int) : FreeBlockView :=
+  { allocator := v.allocator, key := v.key, span := v.span.take n }
+
+def FreeBlockView.suffix (v : FreeBlockView) (n : Int) : FreeBlockView :=
+  { allocator := v.allocator, key := v.key + n, span := v.span.drop n }
+
+def FreeBlockView.join (left right : FreeBlockView) : FreeBlockView :=
+  { allocator := left.allocator, key := left.key,
+    span := left.span.cat right.span }
+
+def FreeBlockView.joinable (left right : FreeBlockView) : Prop :=
+  left.allocator = right.allocator ∧
+  left.span.alloc = right.span.alloc ∧
+  left.span.off + left.span.len = right.span.off ∧
+  right.key = left.key + left.span.len
+
+@[simp] theorem FreeBlockView.split_joinable (v : FreeBlockView) (n : Int) :
+    (v.prefix n).joinable (v.suffix n) := by
+  simp [FreeBlockView.joinable, FreeBlockView.prefix, FreeBlockView.suffix]
+
+theorem FreeBlockView.join_wf {left right : FreeBlockView}
+    (hleft : left.wf) (hright : right.wf)
+    (_hjoin : left.joinable right) : (left.join right).wf := by
+  obtain ⟨hleftKey, hleftLen⟩ := hleft
+  obtain ⟨_, hrightLen⟩ := hright
+  exact ⟨by simpa [FreeBlockView.join, FreeBlockView.wf] using hleftKey,
+    by simp [FreeBlockView.join]; omega⟩
+
+@[simp] theorem FreeBlockView.join_prefix_suffix_extent
+    (v : FreeBlockView) (n : Int) :
+    ((v.prefix n).join (v.suffix n)).span.sameExtent v.span := by
+  simp [FreeBlockView.join, FreeBlockView.prefix, FreeBlockView.suffix,
+    SpanView.sameExtent]
+  omega
+
+theorem FreeBlockView.prefix_wf {v : FreeBlockView} {n : Int}
+    (hv : v.wf) (hn : 0 < n) : (v.prefix n).wf := by
+  rcases hv with ⟨hkey, _⟩
+  exact ⟨by simpa [FreeBlockView.prefix] using hkey,
+    by simpa [FreeBlockView.wf, FreeBlockView.prefix] using hn⟩
+
+theorem FreeBlockView.suffix_wf {v : FreeBlockView} {n : Int}
+    (hv : v.wf) (hn : n < v.span.len) : (v.suffix n).wf := by
+  rcases hv with ⟨hkey, _⟩
+  constructor
+  · simp [FreeBlockView.suffix, hkey]
+  · simp [FreeBlockView.suffix]
+    omega
+
+@[simp] theorem AllocatorView.take_suffix_canPutFree
+    {v : AllocatorView} {key n : Int}
+    (htake : v.canTakeFree key) (hn : 0 < n ∧ n < (v.takeFree key).span.len) :
+    (v.take key).canPutFree ((v.takeFree key).suffix n) := by
+  constructor
+  · rfl
+  · exact FreeBlockView.suffix_wf htake.2 hn.2
+
+@[simp] theorem AllocatorView.putFree_canTake
+    (v : AllocatorView) (block : FreeBlockView) :
+    (v.putFree block).canTake block.key := by
+  simp [AllocatorView.putFree, AllocatorView.put,
+    AllocatorView.canTake, FreeBlockView.toLease]
+
+@[simp] theorem AllocatorView.putFree_takeFree
+    (v : AllocatorView) (block : FreeBlockView)
+    (howner : block.allocator = v.allocator) :
+    (v.putFree block).takeFree block.key = block := by
+  cases block
+  simp [AllocatorView.putFree, AllocatorView.put, AllocatorView.takeFree,
+    AllocatorView.leaseAt, FreeBlockView.toLease, BlockLeaseView.toFree] at howner ⊢
+  exact howner.symm
+
+@[simp] theorem AllocatorView.putFree_canTakeFree
+    (v : AllocatorView) (block : FreeBlockView)
+    (hput : v.canPutFree block) :
+    (v.putFree block).canTakeFree block.key := by
+  constructor
+  · exact v.putFree_canTake block
+  · rw [AllocatorView.putFree_takeFree v block hput.1]
+    exact hput.2
+
+/-- The first vertical FreeBlock subject as one algebraic normalization:
+take the root, split it, round-trip the prefix through the client role, park
+and retake the suffix, join, and reinsert the root. -/
+theorem AllocatorView.splitLeaseRejoin_complete
+    (allocator : Int) (root : SpanView) (n : Int)
+    (hoff : root.off = 0) :
+    let initial := AllocatorView.initial allocator root
+    let whole := initial.takeFree 0
+    let left := whole.prefix n
+    let right := whole.suffix n
+    let parked := (initial.take 0).putFree right
+    let residual := parked.take right.key
+    let joined := left.toLease.toFree.join (parked.takeFree right.key)
+    (residual.putFree joined).complete := by
+  simp [AllocatorView.complete, AllocatorView.releaseSpan,
+    SpanView.sameExtent, AllocatorView.initial, AllocatorView.takeFree,
+    AllocatorView.leaseAt, AllocatorView.take, AllocatorView.putFree,
+    AllocatorView.put, FreeBlockView.prefix, FreeBlockView.suffix,
+    FreeBlockView.join, FreeBlockView.toLease, BlockLeaseView.toFree, hoff]
+  constructor
+  · omega
+  · intro k hk
+    simp [hk]
+
+/-- The same split/rejoin normalization when the client temporarily gives
+the prefix a typed `u64` role. Cleanup restores an uninitialized extent;
+allocator completeness depends only on the exact extent and key. -/
+theorem AllocatorView.splitTypedLeaseRejoin_complete
+    (allocator : Int) (root : SpanView) (n x : Int)
+    (hoff : root.off = 0) (hn : n = u64.layout.size) :
+    let initial := AllocatorView.initial allocator root
+    let whole := initial.takeFree 0
+    let left := whole.prefix n
+    let right := whole.suffix n
+    let parked := (initial.take 0).putFree right
+    let residual := parked.take right.key
+    let returned := ((left.toLease.toCellU64.put x).clear).toLease.toFree
+    let joined := returned.join (parked.takeFree right.key)
+    (residual.putFree joined).complete := by
+  simp [AllocatorView.complete, AllocatorView.releaseSpan,
+    SpanView.sameExtent, AllocatorView.initial, AllocatorView.takeFree,
+    AllocatorView.leaseAt, AllocatorView.take, AllocatorView.putFree,
+    AllocatorView.put, FreeBlockView.prefix, FreeBlockView.suffix,
+    FreeBlockView.join, FreeBlockView.toLease, BlockLeaseView.toFree,
+    BlockLeaseView.toCellU64, LeasedPointsToU64View.put,
+    LeasedPointsToU64View.clear, LeasedPointsToU64View.toLease, hoff, hn]
+  constructor
+  · omega
+  · intro k hk
+    simp [hk]
 
 /-! ## Pointers
 

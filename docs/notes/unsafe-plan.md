@@ -1832,7 +1832,7 @@ complete raw root for the existing `SystemDealloc` path. The typed `u64` role
 is `LeasedPointsTo<u64>`, so allocator/key identity and the must-consume
 obligation survive init/read/take/drop and conversion back. Completeness tracks
 root geometry rather than freezing client byte contents. The positive vertical
-subject proves 9/9 and executes dynamically; seven negative subjects pin the
+subject proves 10/10 and executes dynamically; seven negative subjects pin the
 boundary, and the complete single-job suite passes.
 
 Next add an allocator-owned `FreeBlock` role plus sealed split/reinsert
@@ -1849,6 +1849,24 @@ aggregate take/put restoration.
 
 Next implement the sealed `FreeBlock` operations vertically, then add an
 identity-preserving typed header role for the in-band links.
+
+**The U8d compiler slice is complete (2026-08-12, ADR 0040).** Sealed
+aggregate take/put now traffic in mandatory `FreeBlock`; only that internal
+role may split and join, while explicit consuming role changes preserve the
+allocator/key/extent identity of a nonsplittable client `BlockLease`.
+`allocator_create` proves the zero-offset positive-root condition needed by
+the initial offset-derived key. The positive subject splits a 16-byte root,
+runs the 8-byte prefix through `LeasedPointsTo<u64>`, returns it, coalesces both
+blocks, and releases the system allocation: 15/15 obligations and a passing
+dynamic value check. Eight negative subjects pin abandonment, degenerate
+splits, bad adjacency/order, wrong ownership, client splitting, and extern
+smuggling.
+
+Next prove the smallest identity-preserving header role needed for in-band
+links. Keep list policy and traversal out of that proof: first establish that
+typing, updating, and clearing a header cannot change allocator identity,
+block key, or the remaining payload extent. Then implement one linked free-map
+walk vertically before adding allocation policy or randomized testing.
 
 Exit criteria:
 

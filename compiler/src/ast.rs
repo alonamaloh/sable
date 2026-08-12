@@ -164,6 +164,9 @@ pub enum ResKind {
     /// A leased block in its typed-u64 role. Allocator and key identity
     /// survive beside the ordinary typed-cell view.
     LeasedPointsToU64,
+    /// Allocator-internal byte authority. Unlike a client lease, this
+    /// role may split/join while maintaining offset-derived keys.
+    FreeBlock,
 }
 
 /// The sealed transformations of resource authority. These are not
@@ -195,6 +198,12 @@ pub enum ResOp {
     AllocatorTake,
     /// Consume a matching client lease and restore its free-map entry.
     AllocatorPut,
+    AllocatorTakeFree,
+    AllocatorPutFree,
+    FreeBlockSplit,
+    FreeBlockJoin,
+    FreeBlockLease,
+    BlockLeaseFree,
 }
 
 impl ResOp {
@@ -208,6 +217,12 @@ impl ResOp {
             "allocator_destroy" => Some(ResOp::AllocatorDestroy),
             "allocator_take" => Some(ResOp::AllocatorTake),
             "allocator_put" => Some(ResOp::AllocatorPut),
+            "allocator_take_free" => Some(ResOp::AllocatorTakeFree),
+            "allocator_put_free" => Some(ResOp::AllocatorPutFree),
+            "free_block_split" => Some(ResOp::FreeBlockSplit),
+            "free_block_join" => Some(ResOp::FreeBlockJoin),
+            "free_block_lease" => Some(ResOp::FreeBlockLease),
+            "block_lease_free" => Some(ResOp::BlockLeaseFree),
             _ => None,
         }
     }
@@ -222,6 +237,12 @@ impl ResOp {
             ResOp::AllocatorDestroy => "allocator_destroy",
             ResOp::AllocatorTake => "allocator_take",
             ResOp::AllocatorPut => "allocator_put",
+            ResOp::AllocatorTakeFree => "allocator_take_free",
+            ResOp::AllocatorPutFree => "allocator_put_free",
+            ResOp::FreeBlockSplit => "free_block_split",
+            ResOp::FreeBlockJoin => "free_block_join",
+            ResOp::FreeBlockLease => "free_block_lease",
+            ResOp::BlockLeaseFree => "block_lease_free",
         }
     }
 }
@@ -314,6 +335,7 @@ impl ResKind {
             "SystemDealloc" => Some(ResKind::SystemDealloc),
             "AllocatorState" => Some(ResKind::AllocatorState),
             "BlockLease" => Some(ResKind::BlockLease),
+            "FreeBlock" => Some(ResKind::FreeBlock),
             _ => None,
         }
     }
@@ -328,6 +350,7 @@ impl ResKind {
             ResKind::AllocatorState => "AllocatorState",
             ResKind::BlockLease => "BlockLease",
             ResKind::LeasedPointsToU64 => "LeasedPointsTo<u64>",
+            ResKind::FreeBlock => "FreeBlock",
         }
     }
 
@@ -344,6 +367,7 @@ impl ResKind {
                 | ResKind::AllocatorState
                 | ResKind::BlockLease
                 | ResKind::LeasedPointsToU64
+                | ResKind::FreeBlock
         )
     }
 
@@ -358,6 +382,7 @@ impl ResKind {
             ResKind::AllocatorState => "Sable.AllocatorView",
             ResKind::BlockLease => "Sable.BlockLeaseView",
             ResKind::LeasedPointsToU64 => "Sable.LeasedPointsToU64View",
+            ResKind::FreeBlock => "Sable.FreeBlockView",
         }
     }
 
@@ -370,6 +395,7 @@ impl ResKind {
                 | ResKind::AllocatorState
                 | ResKind::BlockLease
                 | ResKind::LeasedPointsToU64
+                | ResKind::FreeBlock
         )
     }
 }
