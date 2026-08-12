@@ -1498,6 +1498,122 @@ impl<'a> Interp<'a> {
                             ))),
                         }
                     }
+                    RawOp::IntoFreeHeader => {
+                        let (a, o) = ptr_at(0);
+                        let layout = IntTy::U64.layout();
+                        let header_len = 2 * layout.size;
+                        if o % layout.align != 0 {
+                            return Err(bad(format!(
+                                "raw_into_free_header needs 8-byte alignment: {a}+{o}"
+                            )));
+                        }
+                        for i in 0..header_len {
+                            if self.raw.live_at(a, o + i).is_none() {
+                                return Err(bad(format!(
+                                    "raw_into_free_header needs sixteen raw bytes at {a}+{o}"
+                                )));
+                            }
+                        }
+                        let al = self.raw.allocs.get_mut(&a).expect("live_at checked");
+                        al.cells_u64.insert(o, None);
+                        al.cells_u64.insert(o + layout.size, None);
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::FromFreeHeader => {
+                        let (a, o) = ptr_at(0);
+                        let layout = IntTy::U64.layout();
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_from_free_header names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!(
+                                "raw_from_free_header names dead allocation {a}"
+                            )));
+                        }
+                        if !matches!(al.cells_u64.get(&o), Some(None))
+                            || !matches!(al.cells_u64.get(&(o + layout.size)), Some(None))
+                        {
+                            return Err(bad(format!(
+                                "raw_from_free_header needs two uninitialized cells at {a}+{o}"
+                            )));
+                        }
+                        al.cells_u64.remove(&o);
+                        al.cells_u64.remove(&(o + layout.size));
+                        for i in 0..(2 * layout.size) {
+                            al.bytes[(o + i) as usize] = Some(0);
+                        }
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::HeaderInit => {
+                        let (a, o) = ptr_at(0);
+                        let size = int_at(1);
+                        let next = int_at(2);
+                        let layout = IntTy::U64.layout();
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_header_init names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!(
+                                "raw_header_init names dead allocation {a}"
+                            )));
+                        }
+                        if !matches!(al.cells_u64.get(&o), Some(None))
+                            || !matches!(al.cells_u64.get(&(o + layout.size)), Some(None))
+                        {
+                            return Err(bad(format!(
+                                "raw_header_init needs two uninitialized cells at {a}+{o}"
+                            )));
+                        }
+                        al.cells_u64.insert(o, Some(size));
+                        al.cells_u64.insert(o + layout.size, Some(next));
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::HeaderSize | RawOp::HeaderNext => {
+                        let (a, o) = ptr_at(0);
+                        let offset = if matches!(op, RawOp::HeaderSize) {
+                            o
+                        } else {
+                            o + IntTy::U64.layout().size
+                        };
+                        match self
+                            .raw
+                            .allocs
+                            .get(&a)
+                            .filter(|al| al.live)
+                            .and_then(|al| al.cells_u64.get(&offset))
+                        {
+                            Some(Some(w)) => Ok(RtVal::Int(*w)),
+                            _ => Err(bad(format!(
+                                "{} needs an initialized field at {a}+{offset}",
+                                op.name()
+                            ))),
+                        }
+                    }
+                    RawOp::HeaderClear => {
+                        let (a, o) = ptr_at(0);
+                        let layout = IntTy::U64.layout();
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_header_clear names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!(
+                                "raw_header_clear names dead allocation {a}"
+                            )));
+                        }
+                        if !matches!(al.cells_u64.get(&o), Some(Some(_)))
+                            || !matches!(
+                                al.cells_u64.get(&(o + layout.size)),
+                                Some(Some(_))
+                            )
+                        {
+                            return Err(bad(format!(
+                                "raw_header_clear needs two initialized cells at {a}+{o}"
+                            )));
+                        }
+                        al.cells_u64.insert(o, None);
+                        al.cells_u64.insert(o + layout.size, None);
+                        Ok(RtVal::Unit)
+                    }
                     RawOp::CellInitU64 => {
                         let (a, o) = ptr_at(0);
                         let w = int_at(1);

@@ -1,0 +1,28 @@
+// expect-error: free_header_read_uninit.free_header.size
+// Header fields cannot be read before initialization.
+
+pub fn free_header_read_uninit() -> u64 {
+    unsafe system_alloc(32) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+    mut u64 size = 0;
+    unsafe {
+        mut resource FreeHeader header = raw_into_free_header(base, block);
+        size = raw_header_size(base, &header);
+        raw_header_init(base, 32, 32, &mut header);
+        raw_header_clear(base, &mut header);
+        resource FreeBlock restored = raw_from_free_header(base, header);
+    }
+    allocator_put_free(&mut state, restored);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+    return size;
+}
+
+/// discharge free_header_read_uninit.free_header.from_block by
+///   rw [h_base_system, h_free8_take, h_allocator_view6_create,
+///       h_mem_system]
+///   simp [Sable.SpanView.start, Sable.AllocatorView.takeFree,
+///     Sable.AllocatorView.leaseAt, Sable.AllocatorView.initial,
+///     Sable.BlockLeaseView.toFree, Sable.freeHeaderBytes,
+///     Sable.u64.layout, Sable.SpanView.uninit]

@@ -167,6 +167,8 @@ pub enum ResKind {
     /// Allocator-internal byte authority. Unlike a client lease, this
     /// role may split/join while maintaining offset-derived keys.
     FreeBlock,
+    /// An internal free block while its two-word size/link header is typed.
+    FreeHeader,
 }
 
 /// The sealed transformations of resource authority. These are not
@@ -273,6 +275,14 @@ pub enum RawOp {
     CellReadU64,
     CellTakeU64,
     CellDropU64,
+    /// Convert the first two words of a FreeBlock to/from an in-band header.
+    IntoFreeHeader,
+    FromFreeHeader,
+    /// Initialize, inspect, or clear both typed header fields.
+    HeaderInit,
+    HeaderSize,
+    HeaderNext,
+    HeaderClear,
 }
 
 impl RawOp {
@@ -288,6 +298,12 @@ impl RawOp {
             "raw_cell_read_u64" => Some(RawOp::CellReadU64),
             "raw_cell_take_u64" => Some(RawOp::CellTakeU64),
             "raw_cell_drop_u64" => Some(RawOp::CellDropU64),
+            "raw_into_free_header" => Some(RawOp::IntoFreeHeader),
+            "raw_from_free_header" => Some(RawOp::FromFreeHeader),
+            "raw_header_init" => Some(RawOp::HeaderInit),
+            "raw_header_size" => Some(RawOp::HeaderSize),
+            "raw_header_next" => Some(RawOp::HeaderNext),
+            "raw_header_clear" => Some(RawOp::HeaderClear),
             _ => None,
         }
     }
@@ -304,6 +320,12 @@ impl RawOp {
             RawOp::CellReadU64 => "raw_cell_read_u64",
             RawOp::CellTakeU64 => "raw_cell_take_u64",
             RawOp::CellDropU64 => "raw_cell_drop_u64",
+            RawOp::IntoFreeHeader => "raw_into_free_header",
+            RawOp::FromFreeHeader => "raw_from_free_header",
+            RawOp::HeaderInit => "raw_header_init",
+            RawOp::HeaderSize => "raw_header_size",
+            RawOp::HeaderNext => "raw_header_next",
+            RawOp::HeaderClear => "raw_header_clear",
         }
     }
 
@@ -320,8 +342,11 @@ impl RawOp {
             RawOp::Store8 => 3,
             RawOp::Copy => 5,
             RawOp::IntoCellU64 | RawOp::FromCellU64 | RawOp::CellReadU64
-            | RawOp::CellTakeU64 | RawOp::CellDropU64 => 2,
+            | RawOp::CellTakeU64 | RawOp::CellDropU64
+            | RawOp::IntoFreeHeader | RawOp::FromFreeHeader
+            | RawOp::HeaderSize | RawOp::HeaderNext | RawOp::HeaderClear => 2,
             RawOp::CellInitU64 => 3,
+            RawOp::HeaderInit => 4,
         }
     }
 }
@@ -336,6 +361,7 @@ impl ResKind {
             "AllocatorState" => Some(ResKind::AllocatorState),
             "BlockLease" => Some(ResKind::BlockLease),
             "FreeBlock" => Some(ResKind::FreeBlock),
+            "FreeHeader" => Some(ResKind::FreeHeader),
             _ => None,
         }
     }
@@ -351,6 +377,7 @@ impl ResKind {
             ResKind::BlockLease => "BlockLease",
             ResKind::LeasedPointsToU64 => "LeasedPointsTo<u64>",
             ResKind::FreeBlock => "FreeBlock",
+            ResKind::FreeHeader => "FreeHeader",
         }
     }
 
@@ -368,6 +395,7 @@ impl ResKind {
                 | ResKind::BlockLease
                 | ResKind::LeasedPointsToU64
                 | ResKind::FreeBlock
+                | ResKind::FreeHeader
         )
     }
 
@@ -383,6 +411,7 @@ impl ResKind {
             ResKind::BlockLease => "Sable.BlockLeaseView",
             ResKind::LeasedPointsToU64 => "Sable.LeasedPointsToU64View",
             ResKind::FreeBlock => "Sable.FreeBlockView",
+            ResKind::FreeHeader => "Sable.FreeHeaderView",
         }
     }
 
@@ -396,6 +425,7 @@ impl ResKind {
                 | ResKind::BlockLease
                 | ResKind::LeasedPointsToU64
                 | ResKind::FreeBlock
+                | ResKind::FreeHeader
         )
     }
 }

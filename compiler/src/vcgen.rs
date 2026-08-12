@@ -2537,6 +2537,208 @@ impl<'a> Generator<'a> {
                         self.env.insert(name.clone(), Val::View(c2));
                         Val::Unit
                     }
+                    RawOp::IntoFreeHeader => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(block) = self.eval(&args[1]) else {
+                            unreachable!("checked: free block value")
+                        };
+                        let goal = format!(
+                            "({p}).alloc = ({block}).span.alloc ∧ \
+                             ({p}).off = ({block}).span.off ∧ 0 ≤ ({p}).off ∧ \
+                             ({p}).off % Sable.u64.layout.align = 0 ∧ \
+                             Sable.freeHeaderBytes ≤ ({block}).span.len"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.free_header.from_block", self.fname),
+                            "`raw_into_free_header` needs an aligned two-word block header"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let header = self.hinted_sym("_header", hint);
+                        self.binders
+                            .push((header.clone(), ResKind::FreeHeader.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_header", header.trim_start_matches('_')),
+                            format!("{header} = Sable.FreeBlockView.toHeader ({block})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", header.trim_start_matches('_')),
+                            format!("Sable.FreeHeaderView.wf {header}"),
+                        );
+                        Val::View(header)
+                    }
+                    RawOp::FromFreeHeader => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(header) = self.eval(&args[1]) else {
+                            unreachable!("checked: free header value")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({header}).sizeCell ({p}) ∧ \
+                             ({header}).sizeCell.state = Sable.CellState.uninit ∧ \
+                             ({header}).nextCell.alloc = ({p}).alloc ∧ \
+                             ({header}).nextCell.off = ({p}).off + Sable.u64.layout.size ∧ \
+                             ({header}).nextCell.state = Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.free_header.to_block", self.fname),
+                            "`raw_from_free_header` needs two cleared header cells".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let block = self.hinted_sym("_free", hint);
+                        self.binders
+                            .push((block.clone(), ResKind::FreeBlock.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_block", block.trim_start_matches('_')),
+                            format!("{block} = Sable.FreeHeaderView.toFree ({header})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", block.trim_start_matches('_')),
+                            format!("Sable.FreeBlockView.wf {block}"),
+                        );
+                        Val::View(block)
+                    }
+                    RawOp::HeaderInit => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::Int(size) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 size")
+                        };
+                        let Val::Int(next) = self.eval(&args[2]) else {
+                            unreachable!("checked: u64 next")
+                        };
+                        let Val::View(header) = self.eval(&args[3]) else {
+                            unreachable!("checked: free header borrow")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({header}).sizeCell ({p}) ∧ \
+                             ({header}).sizeCell.state = Sable.CellState.uninit ∧ \
+                             ({header}).nextCell.alloc = ({p}).alloc ∧ \
+                             ({header}).nextCell.off = ({p}).off + Sable.u64.layout.size ∧ \
+                             ({header}).nextCell.state = Sable.CellState.uninit ∧ \
+                             {size} = ({header}).sizeCell.layout.size + \
+                               ({header}).nextCell.layout.size + ({header}).payload.len"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.free_header.init", self.fname),
+                            "`raw_header_init` needs two empty cells and the exact block size"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array: name, .. } = &args[3].kind else {
+                            unreachable!("checked: free header borrow")
+                        };
+                        let h2 = self.hinted_sym("_header", Some(name.clone()));
+                        self.binders
+                            .push((h2.clone(), ResKind::FreeHeader.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{name}_init"),
+                            format!(
+                                "{h2} = Sable.FreeHeaderView.putFields ({header}) {size} {next}"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{name}_wf"),
+                            format!("Sable.FreeHeaderView.wf {h2}"),
+                        );
+                        self.env.insert(name.clone(), Val::View(h2));
+                        Val::Unit
+                    }
+                    RawOp::HeaderSize | RawOp::HeaderNext => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(header) = self.eval(&args[1]) else {
+                            unreachable!("checked: free header borrow")
+                        };
+                        let is_size = matches!(op, RawOp::HeaderSize);
+                        let field = if is_size { "sizeCell" } else { "nextCell" };
+                        let names = if is_size {
+                            format!("Sable.PointsToView.names ({header}).{field} ({p})")
+                        } else {
+                            format!(
+                                "({header}).{field}.alloc = ({p}).alloc ∧ \
+                                 ({header}).{field}.off = ({p}).off + Sable.u64.layout.size"
+                            )
+                        };
+                        let goal = format!(
+                            "({names}) ∧ ({header}).{field}.state ≠ Sable.CellState.uninit"
+                        );
+                        let label = if is_size { "size" } else { "next" };
+                        let ob = self.obligation(
+                            &format!("{}.free_header.{label}", self.fname),
+                            format!("`raw_header_{label}` needs an initialized header field"),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let value = self.hinted_sym("_value", hint);
+                        self.binders.push((value.clone(), "Int".into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_header_{label}", value.trim_start_matches('_')),
+                            format!(
+                                "({header}).{field}.state = Sable.CellState.init {value}"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_range", value.trim_start_matches('_')),
+                            range_prop(&value, IntTy::U64),
+                        );
+                        Val::Int(value)
+                    }
+                    RawOp::HeaderClear => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(header) = self.eval(&args[1]) else {
+                            unreachable!("checked: free header borrow")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({header}).sizeCell ({p}) ∧ \
+                             ({header}).sizeCell.state ≠ Sable.CellState.uninit ∧ \
+                             ({header}).nextCell.alloc = ({p}).alloc ∧ \
+                             ({header}).nextCell.off = ({p}).off + Sable.u64.layout.size ∧ \
+                             ({header}).nextCell.state ≠ Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.free_header.clear", self.fname),
+                            "`raw_header_clear` needs two initialized header fields".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
+                            unreachable!("checked: free header borrow")
+                        };
+                        let h2 = self.hinted_sym("_header", Some(name.clone()));
+                        self.binders
+                            .push((h2.clone(), ResKind::FreeHeader.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{name}_clear"),
+                            format!("{h2} = Sable.FreeHeaderView.clearFields ({header})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{name}_wf"),
+                            format!("Sable.FreeHeaderView.wf {h2}"),
+                        );
+                        self.env.insert(name.clone(), Val::View(h2));
+                        Val::Unit
+                    }
                 }
             }
             // The sealed resource transformations. Their contracts are
@@ -4499,6 +4701,10 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         ResKind::FreeBlock => vec![(
             format!("h_{name}_wf"),
             format!("Sable.FreeBlockView.wf {binder}"),
+        )],
+        ResKind::FreeHeader => vec![(
+            format!("h_{name}_wf"),
+            format!("Sable.FreeHeaderView.wf {binder}"),
         )],
     }
 }

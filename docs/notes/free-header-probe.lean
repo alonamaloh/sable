@@ -61,12 +61,13 @@ def FreeHeaderView.putNext (v : FreeHeaderView) (next : Int) : FreeHeaderView :=
 def FreeHeaderView.clearFields (v : FreeHeaderView) : FreeHeaderView :=
   { v with sizeCell := v.sizeCell.clear, nextCell := v.nextCell.clear }
 
-/-- A cleared typed word returns an uninitialized raw extent. -/
+/-- As with the existing typed-cell cleanup primitive, a cleared word returns
+an initialized zero-filled raw extent. -/
 def rawCell (v : PointsToView Int) : SpanView :=
   { alloc := v.alloc
     off := v.off
     len := v.layout.size
-    bytes := ⟨v.layout.size, fun _ => .uninit⟩ }
+    bytes := ⟨v.layout.size, fun _ => .init 0⟩ }
 
 /-- Reassemble both header words and the payload into one internal block. -/
 def FreeHeaderView.toFree (v : FreeHeaderView) : FreeBlockView :=

@@ -2575,6 +2575,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let cell_unique = Ty::ResRef(ResKind::PointsToU64, Mutability::Mut);
             let leased = Ty::Res(ResKind::BlockLease);
             let leased_cell = Ty::Res(ResKind::LeasedPointsToU64);
+            let free_block = Ty::Res(ResKind::FreeBlock);
+            let free_header = Ty::Res(ResKind::FreeHeader);
+            let free_header_shared = Ty::ResRef(ResKind::FreeHeader, Mutability::Shared);
+            let free_header_unique = Ty::ResRef(ResKind::FreeHeader, Mutability::Mut);
             let arg_kind = |i: usize| resource_arg_kind(ctx, &args[i]);
             let cell_kind = match op {
                 RawOp::IntoCellU64 => arg_kind(1),
@@ -2611,6 +2615,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     raw,
                     if leased_role { leased_cell_unique } else { cell_unique },
                 ],
+                RawOp::IntoFreeHeader => vec![raw, free_block],
+                RawOp::FromFreeHeader => vec![raw, free_header],
+                RawOp::HeaderInit => vec![raw, u64t, u64t, free_header_unique],
+                RawOp::HeaderSize | RawOp::HeaderNext => vec![raw, free_header_shared],
+                RawOp::HeaderClear => vec![raw, free_header_unique],
             };
             for (arg, w) in args.iter_mut().zip(&want) {
                 require_explicit_borrow(ctx, arg, *w)?;
@@ -2631,6 +2640,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::FromCellU64 => if leased_role { leased } else { span },
                 RawOp::CellInitU64 | RawOp::CellDropU64 => Ty::Unit,
                 RawOp::CellReadU64 | RawOp::CellTakeU64 => u64t,
+                RawOp::IntoFreeHeader => free_header,
+                RawOp::FromFreeHeader => free_block,
+                RawOp::HeaderInit | RawOp::HeaderClear => Ty::Unit,
+                RawOp::HeaderSize | RawOp::HeaderNext => u64t,
             }
         }
         ExprKind::ResOp { op, op_span, args } => {

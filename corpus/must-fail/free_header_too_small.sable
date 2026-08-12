@@ -1,0 +1,15 @@
+// expect-error: free_header_too_small.free_header.from_block
+// A runtime header needs both size and next words.
+
+pub fn free_header_too_small() {
+    unsafe system_alloc(8) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+    unsafe {
+        resource FreeHeader header = raw_into_free_header(base, block);
+        resource FreeBlock restored = raw_from_free_header(base, header);
+    }
+    allocator_put_free(&mut state, restored);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}

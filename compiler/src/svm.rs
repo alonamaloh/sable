@@ -105,6 +105,16 @@ fn lower_stmt_erasing(s: &Stmt, erased_resources: &[&str]) -> Result<Option<Stri
         // definite initialization guarantees assignment-before-read.
         Stmt::Decl { init: None, .. } => None,
         Stmt::Decl {
+            ty,
+            init: Some(Expr { kind: ExprKind::ResOp { .. }, .. }),
+            ..
+        } if ty.is_resource() => {
+            // Static authority bookkeeping may surround observable raw
+            // operations. Erase it in statement position; `lower_expr`
+            // still rejects a resource operation used as runtime data.
+            None
+        }
+        Stmt::Decl {
             name,
             init: Some(e),
             ..
@@ -256,6 +266,22 @@ fn lower_stmt_erasing(s: &Stmt, erased_resources: &[&str]) -> Result<Option<Stri
                 RawOp::CellDropU64 => {
                     format!("(.rawCellDropU64 {})", lower_expr(&args[0])?)
                 }
+                RawOp::HeaderInit => {
+                    let p = lower_expr(&args[0])?;
+                    let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                    format!(
+                        "(.rawCellInitU64 {p} {}), (.rawCellInitU64 {next_p} {})",
+                        lower_expr(&args[1])?,
+                        lower_expr(&args[2])?
+                    )
+                }
+                RawOp::HeaderClear => {
+                    let p = lower_expr(&args[0])?;
+                    let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                    format!(
+                        "(.rawCellDropU64 {p}), (.rawCellDropU64 {next_p})"
+                    )
+                }
                 RawOp::Copy => {
                     return Err("`raw_copy_nonoverlapping` has no single machine step: \
                                 the machine copies a byte at a time, and lowering it \
@@ -265,6 +291,7 @@ fn lower_stmt_erasing(s: &Stmt, erased_resources: &[&str]) -> Result<Option<Stri
                 _ => return Err(format!("`{}` produces a value", op.name())),
             }),
             ExprKind::Call { callee, args, .. } => Some(lower_call(&None, callee, args)?),
+            ExprKind::ResOp { .. } => None,
             _ => {
                 return Err("expression statements are outside the SVM core subset".into());
             }
@@ -301,6 +328,20 @@ fn lower_bind(name: &str, e: &Expr) -> Result<String, String> {
             RawOp::FromCellU64 => {
                 Ok(format!("(.rawFromCellU64 {})", lower_expr(&args[0])?))
             }
+            RawOp::IntoFreeHeader => {
+                let p = lower_expr(&args[0])?;
+                let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                Ok(format!(
+                    "(.rawIntoCellU64 {p}), (.rawIntoCellU64 {next_p})"
+                ))
+            }
+            RawOp::FromFreeHeader => {
+                let p = lower_expr(&args[0])?;
+                let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                Ok(format!(
+                    "(.rawFromCellU64 {p}), (.rawFromCellU64 {next_p})"
+                ))
+            }
             RawOp::CellReadU64 => Ok(format!(
                 "(.rawCellReadU64 \"{name}\" {})",
                 lower_expr(&args[0])?
@@ -309,6 +350,16 @@ fn lower_bind(name: &str, e: &Expr) -> Result<String, String> {
                 "(.rawCellTakeU64 \"{name}\" {})",
                 lower_expr(&args[0])?
             )),
+            RawOp::HeaderSize => Ok(format!(
+                "(.rawCellReadU64 \"{name}\" {})",
+                lower_expr(&args[0])?
+            )),
+            RawOp::HeaderNext => {
+                let p = lower_expr(&args[0])?;
+                Ok(format!(
+                    "(.rawCellReadU64 \"{name}\" (.ptrAdd {p} (.intLit .u64 8)))"
+                ))
+            }
             _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(e)?)),
         },
         _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(e)?)),

@@ -131,6 +131,34 @@ structure FreeBlockView where
   key : Int
   span : SpanView
 
+/-- A free block whose first two words carry runtime size and next-link
+metadata. The allocator identity and whole-block key remain alongside the
+typed cells and raw payload (ADR 0041). -/
+structure FreeHeaderView where
+  allocator : Int
+  key : Int
+  sizeCell : PointsToView Int
+  nextCell : PointsToView Int
+  payload : SpanView
+
+def freeHeaderBytes : Int := 2 * u64.layout.size
+
+def FreeHeaderView.wf (v : FreeHeaderView) : Prop :=
+  v.sizeCell.wfU64 ∧ v.nextCell.wfU64 ∧
+  v.key = v.sizeCell.off ∧
+  v.sizeCell.alloc = v.nextCell.alloc ∧
+  v.nextCell.alloc = v.payload.alloc ∧
+  v.sizeCell.off + v.sizeCell.layout.size = v.nextCell.off ∧
+  v.nextCell.off + v.nextCell.layout.size = v.payload.off ∧
+  0 ≤ v.payload.len
+
+def FreeHeaderView.putFields
+    (v : FreeHeaderView) (size next : Int) : FreeHeaderView :=
+  { v with sizeCell := v.sizeCell.put size, nextCell := v.nextCell.put next }
+
+def FreeHeaderView.clearFields (v : FreeHeaderView) : FreeHeaderView :=
+  { v with sizeCell := v.sizeCell.clear, nextCell := v.nextCell.clear }
+
 def FreeBlockView.wf (v : FreeBlockView) : Prop :=
   v.key = v.span.off ∧ 0 < v.span.len
 
@@ -500,6 +528,26 @@ def FreeBlockView.joinable (left right : FreeBlockView) : Prop :=
   left.span.off + left.span.len = right.span.off ∧
   right.key = left.key + left.span.len
 
+def FreeBlockView.toHeader (v : FreeBlockView) : FreeHeaderView :=
+  { allocator := v.allocator
+    key := v.key
+    sizeCell :=
+      { alloc := v.span.alloc, off := v.span.off,
+        layout := u64.layout, state := .uninit }
+    nextCell :=
+      { alloc := v.span.alloc, off := v.span.off + u64.layout.size,
+        layout := u64.layout, state := .uninit }
+    payload := v.span.drop freeHeaderBytes }
+
+def FreeHeaderView.rawCell (v : PointsToView Int) : SpanView :=
+  { alloc := v.alloc, off := v.off, len := v.layout.size,
+    bytes := ⟨v.layout.size, fun _ => .init 0⟩ }
+
+def FreeHeaderView.toFree (v : FreeHeaderView) : FreeBlockView :=
+  { allocator := v.allocator
+    key := v.key
+    span := (rawCell v.sizeCell).cat ((rawCell v.nextCell).cat v.payload) }
+
 @[simp] theorem FreeBlockView.split_joinable (v : FreeBlockView) (n : Int) :
     (v.prefix n).joinable (v.suffix n) := by
   simp [FreeBlockView.joinable, FreeBlockView.prefix, FreeBlockView.suffix]
@@ -511,6 +559,104 @@ theorem FreeBlockView.join_wf {left right : FreeBlockView}
   obtain ⟨_, hrightLen⟩ := hright
   exact ⟨by simpa [FreeBlockView.join, FreeBlockView.wf] using hleftKey,
     by simp [FreeBlockView.join]; omega⟩
+
+theorem FreeBlockView.toHeader_wf {v : FreeBlockView}
+    (hv : v.wf)
+    (hoff : 0 ≤ v.span.off)
+    (halign : v.span.off % u64.layout.align = 0)
+    (hlen : freeHeaderBytes ≤ v.span.len) : v.toHeader.wf := by
+  obtain ⟨hkey, _⟩ := hv
+  simp [FreeHeaderView.wf, FreeBlockView.toHeader, PointsToView.wfU64,
+    freeHeaderBytes, u64.layout] at ⊢ hlen halign
+  exact ⟨⟨hoff, halign⟩, ⟨by omega, halign⟩, hkey,
+    ⟨by omega, hlen⟩⟩
+
+theorem FreeHeaderView.putFields_wf {v : FreeHeaderView} {size next : Int}
+    (hv : v.wf)
+    (hsize : 0 ≤ size ∧ size ≤ 18446744073709551615)
+    (hnext : 0 ≤ next ∧ next ≤ 18446744073709551615) :
+    (v.putFields size next).wf := by
+  unfold FreeHeaderView.wf at hv ⊢
+  obtain ⟨hsizeCell, hnextCell, hrest⟩ := hv
+  obtain ⟨hsizeLayout, hsizeOff, hsizeAlign, _⟩ := hsizeCell
+  obtain ⟨hnextLayout, hnextOff, hnextAlign, _⟩ := hnextCell
+  exact ⟨
+    ⟨by simpa [FreeHeaderView.putFields] using hsizeLayout,
+      by simpa [FreeHeaderView.putFields] using hsizeOff,
+      by simpa [FreeHeaderView.putFields] using hsizeAlign,
+      by simpa [FreeHeaderView.putFields] using hsize⟩,
+    ⟨by simpa [FreeHeaderView.putFields] using hnextLayout,
+      by simpa [FreeHeaderView.putFields] using hnextOff,
+      by simpa [FreeHeaderView.putFields] using hnextAlign,
+      by simpa [FreeHeaderView.putFields] using hnext⟩,
+    by simpa [FreeHeaderView.putFields] using hrest⟩
+
+theorem FreeHeaderView.clearFields_wf {v : FreeHeaderView} (hv : v.wf) :
+    v.clearFields.wf := by
+  unfold FreeHeaderView.wf at hv ⊢
+  obtain ⟨hsizeCell, hnextCell, hrest⟩ := hv
+  obtain ⟨hsizeLayout, hsizeOff, hsizeAlign, _⟩ := hsizeCell
+  obtain ⟨hnextLayout, hnextOff, hnextAlign, _⟩ := hnextCell
+  exact ⟨
+    ⟨by simpa [FreeHeaderView.clearFields] using hsizeLayout,
+      by simpa [FreeHeaderView.clearFields] using hsizeOff,
+      by simpa [FreeHeaderView.clearFields] using hsizeAlign,
+      by simp [FreeHeaderView.clearFields, PointsToView.clear]⟩,
+    ⟨by simpa [FreeHeaderView.clearFields] using hnextLayout,
+      by simpa [FreeHeaderView.clearFields] using hnextOff,
+      by simpa [FreeHeaderView.clearFields] using hnextAlign,
+      by simp [FreeHeaderView.clearFields, PointsToView.clear]⟩,
+    by simpa [FreeHeaderView.clearFields] using hrest⟩
+
+theorem FreeHeaderView.toFree_wf {v : FreeHeaderView} (hv : v.wf) :
+    v.toFree.wf := by
+  obtain ⟨hsize, hnext, hkey, _, _, _, _, hpayload⟩ := hv
+  obtain ⟨hsizeLayout, _, _, _⟩ := hsize
+  obtain ⟨hnextLayout, _, _, _⟩ := hnext
+  constructor
+  · simpa [FreeHeaderView.toFree, FreeHeaderView.rawCell,
+      FreeBlockView.wf] using hkey
+  · simp [FreeHeaderView.toFree, FreeHeaderView.rawCell,
+      hsizeLayout, hnextLayout, u64.layout]
+    omega
+
+theorem FreeHeaderView.roundTrip_identity (v : FreeBlockView)
+    (size next : Int) :
+    let returned := (v.toHeader.putFields size next).clearFields.toFree
+    returned.allocator = v.allocator ∧ returned.key = v.key ∧
+    returned.span.sameExtent v.span := by
+  simp [FreeBlockView.toHeader, FreeHeaderView.putFields,
+    FreeHeaderView.clearFields, FreeHeaderView.toFree,
+    FreeHeaderView.rawCell, SpanView.sameExtent, freeHeaderBytes, u64.layout]
+  omega
+
+theorem FreeHeaderView.roundTrip_wf {v : FreeBlockView}
+    (size next : Int) (hv : v.wf) (hlen : freeHeaderBytes ≤ v.span.len) :
+    (v.toHeader.putFields size next).clearFields.toFree.wf := by
+  obtain ⟨hkey, hpos⟩ := hv
+  simp [FreeBlockView.toHeader, FreeHeaderView.putFields,
+    FreeHeaderView.clearFields, FreeHeaderView.toFree,
+    FreeHeaderView.rawCell, FreeBlockView.wf, freeHeaderBytes, u64.layout]
+    at ⊢ hlen
+  exact ⟨hkey, by omega⟩
+
+theorem AllocatorView.initialHeaderRoundTrip_complete
+    (allocator : Int) (root : SpanView) (size next : Int) :
+    let initial := AllocatorView.initial allocator root
+    let block := initial.takeFree 0
+    let returned := (block.toHeader.putFields size next).clearFields.toFree
+    ((initial.take 0).putFree returned).complete := by
+  simp [AllocatorView.complete, AllocatorView.releaseSpan,
+    SpanView.sameExtent, AllocatorView.initial, AllocatorView.takeFree,
+    AllocatorView.leaseAt, AllocatorView.take, AllocatorView.putFree,
+    AllocatorView.put, FreeBlockView.toHeader, FreeHeaderView.putFields,
+    FreeHeaderView.clearFields, FreeHeaderView.toFree,
+    FreeHeaderView.rawCell, FreeBlockView.toLease, BlockLeaseView.toFree,
+    freeHeaderBytes, u64.layout]
+  constructor
+  · omega
+  · intro k hk
+    simp [hk]
 
 @[simp] theorem FreeBlockView.join_prefix_suffix_extent
     (v : FreeBlockView) (n : Int) :

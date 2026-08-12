@@ -1,0 +1,5 @@
+// expect-error: resource.release_sealed
+// Foreign code cannot consume an erased composite header role.
+
+extern "C" #[audit(id := "test.fake-free-header.v1", reason := "negative subject")]
+fn fake_free_header(#[consumes] resource FreeHeader header);

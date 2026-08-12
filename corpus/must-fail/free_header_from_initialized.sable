@@ -1,0 +1,34 @@
+// expect-error: free_header_from_initialized.free_header.to_block
+// Typed header fields must be cleared before raw block authority returns.
+
+pub fn free_header_from_initialized() {
+    unsafe system_alloc(32) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+    unsafe {
+        mut resource FreeHeader header = raw_into_free_header(base, block);
+        raw_header_init(base, 32, 32, &mut header);
+        resource FreeBlock restored = raw_from_free_header(base, header);
+    }
+    allocator_put_free(&mut state, restored);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
+
+/// discharge free_header_from_initialized.free_header.from_block by
+///   rw [h_base_system, h_free8_take, h_allocator_view6_create,
+///       h_mem_system]
+///   simp [Sable.SpanView.start, Sable.AllocatorView.takeFree,
+///     Sable.AllocatorView.leaseAt, Sable.AllocatorView.initial,
+///     Sable.BlockLeaseView.toFree, Sable.freeHeaderBytes,
+///     Sable.u64.layout, Sable.SpanView.uninit]
+
+/// discharge free_header_from_initialized.free_header.init by
+///   have hlen : _free8.span.len = 32 := by
+///     rw [h_free8_take, h_allocator_view6_create, h_mem_system]
+///     rfl
+///   rw [h_header9_header]
+///   simp [Sable.FreeBlockView.toHeader, Sable.PointsToView.names,
+///     h_fact_base_2_alloc_free8_span, Sable.freeHeaderBytes,
+///     Sable.u64.layout]
+///   omega

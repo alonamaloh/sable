@@ -1,0 +1,9 @@
+use free_headers;
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+fn test_free_header_round_trip() {
+    expect_eq_u64(free_header_round_trip(), 64);
+}

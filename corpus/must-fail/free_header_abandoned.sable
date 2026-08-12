@@ -1,0 +1,11 @@
+// expect-error: resource.abandoned
+// The composite header carries mandatory internal authority.
+
+pub fn free_header_abandoned() {
+    unsafe system_alloc(32) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+    unsafe {
+        resource FreeHeader header = raw_into_free_header(base, block);
+    }
+}

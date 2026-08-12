@@ -1881,6 +1881,24 @@ Then probe one traversal step and choose a sentinel/link-order policy from the
 proof and runtime needs; do not bury that decision inside the eventual search
 loop.
 
+**The U8e compiler/runtime slice is complete (2026-08-12, ADR 0042).**
+`FreeHeader` is one mandatory static role over two real typed cells and the
+remaining raw payload. Unsafe conversion checks the aligned 16-byte minimum;
+initialization stores exact whole-block size plus next key; reads and clearing
+track each cell state; conversion back zero-fills the header words and restores
+one well-formed `FreeBlock`. Composite operations lower to pairs of the SVM's
+existing typed-cell instructions, so no parallel header-memory semantics was
+introduced. The positive path proves 13/13 and executes, seven negative
+subjects pin the boundary, two SVM subjects agree, and the full serial corpus
+passes.
+
+Next choose and prove the traversal policy. The likely candidate is a sorted
+offset-key list with `root.len` as its one-past-end sentinel: every live block
+key is strictly below it, it fits the stored `u64`, and adjacency/coalescing
+become local arithmetic. The proof must also make the runtime head explicit;
+`AllocatorState` erases, so the algorithm needs an ordinary `u64` head paired
+with that authority rather than pretending the ghost free map can be read.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;

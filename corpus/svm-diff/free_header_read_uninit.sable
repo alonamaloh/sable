@@ -1,0 +1,20 @@
+// Type-correct but state-invalid: both executable semantics must reject a read
+// before either in-band header word has been initialized.
+
+fn subj() -> u64 {
+    unsafe system_alloc(32) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+    mut u64 size = 0;
+    unsafe {
+        mut resource FreeHeader header = raw_into_free_header(base, block);
+        size = raw_header_size(base, &header);
+        raw_header_init(base, 32, 32, &mut header);
+        raw_header_clear(base, &mut header);
+        resource FreeBlock restored = raw_from_free_header(base, header);
+    }
+    allocator_put_free(&mut state, restored);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+    return size;
+}

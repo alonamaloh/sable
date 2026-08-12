@@ -1,0 +1,23 @@
+// A source-level header operation expands to the already formalized typed-cell
+// machine instructions at base and base+8. Both executable semantics must see
+// the same two runtime words and cleanup effects.
+
+fn subj() -> u64 {
+    unsafe system_alloc(32) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+    mut u64 size = 0;
+    mut u64 next = 0;
+    unsafe {
+        mut resource FreeHeader header = raw_into_free_header(base, block);
+        raw_header_init(base, 32, 17, &mut header);
+        size = raw_header_size(base, &header);
+        next = raw_header_next(base, &header);
+        raw_header_clear(base, &mut header);
+        resource FreeBlock restored = raw_from_free_header(base, header);
+    }
+    allocator_put_free(&mut state, restored);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+    return size + next;
+}

@@ -1,0 +1,18 @@
+// expect-error: free_header_misaligned.free_header.from_block
+// Both typed words require the free block itself to start u64-aligned.
+
+pub fn free_header_misaligned() {
+    unsafe system_alloc(32) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock left = allocator_take_free(&mut state, 0);
+    resource FreeBlock block = free_block_split(&mut left, 1);
+    raw<u8> interior = raw_offset(base, 1);
+    unsafe {
+        resource FreeHeader header = raw_into_free_header(interior, block);
+        resource FreeBlock restored = raw_from_free_header(interior, header);
+    }
+    resource FreeBlock whole_free = free_block_join(left, restored);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
