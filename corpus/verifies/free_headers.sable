@@ -89,7 +89,10 @@ pub fn free_header_round_trip() -> u64 {
 ///       h_header9_header]
 ///     change _free8.allocator = state.allocator
 ///     exact h_free8_owner
+///   constructor
 ///   · exact h_free14_wf
+///   · simp [h_state_take_free, h_allocator_view6_create,
+///       Sable.AllocatorView.take, Sable.AllocatorView.initial]
 
 /// discharge free_header_round_trip.allocator_destroy by
 ///   subst _allocator_view6

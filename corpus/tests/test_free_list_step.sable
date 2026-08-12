@@ -1,0 +1,9 @@
+use free_list_step;
+
+/// pre actual = expected
+fn expect_eq_u64(u64 actual, u64 expected) {
+}
+
+fn test_free_list_one_step() {
+    expect_eq_u64(free_list_one_step(), 64);
+}

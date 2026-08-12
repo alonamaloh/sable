@@ -3172,6 +3172,108 @@ impl<'a> Generator<'a> {
                         self.env.insert(array.clone(), Val::View(restored));
                         Val::Unit
                     }
+                    ResOp::AllocatorTakeHeader => {
+                        let Val::View(state) = self.eval(&args[0]) else {
+                            unreachable!("checked: allocator state borrow")
+                        };
+                        let Val::Int(key) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 key")
+                        };
+                        let goal = format!(
+                            "Sable.AllocatorView.canTakeHeader ({state}) {key}"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.allocator_take_header.{}", self.fname, slug(&key)),
+                            "`allocator_take_header` needs a stored header at this key".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: allocator borrow")
+                        };
+                        let residual =
+                            self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders.push((
+                            residual.clone(),
+                            ResKind::AllocatorState.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_take_header"),
+                            format!(
+                                "{residual} = Sable.AllocatorView.takeHeader ({state}) {key}"
+                            ),
+                        );
+                        self.env.insert(array.clone(), Val::View(residual.clone()));
+                        let header = self.hinted_sym("_header", hint);
+                        self.binders
+                            .push((header.clone(), ResKind::FreeHeader.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_take", header.trim_start_matches('_')),
+                            format!(
+                                "{header} = Sable.AllocatorView.headerAt ({state}) {key}"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", header.trim_start_matches('_')),
+                            format!("Sable.FreeHeaderView.wf {header}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_owner", header.trim_start_matches('_')),
+                            format!("({header}).allocator = ({residual}).allocator"),
+                        );
+                        Val::View(header)
+                    }
+                    ResOp::AllocatorPutHeader => {
+                        let Val::View(state) = self.eval(&args[0]) else {
+                            unreachable!("checked: allocator state borrow")
+                        };
+                        let Val::View(header) = self.eval(&args[1]) else {
+                            unreachable!("checked: free header value")
+                        };
+                        let goal = format!(
+                            "Sable.AllocatorView.canPutHeader ({state}) ({header})"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.allocator_put_header", self.fname),
+                            "`allocator_put_header` needs a matching well-formed header slot"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: allocator borrow")
+                        };
+                        let restored =
+                            self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders.push((
+                            restored.clone(),
+                            ResKind::AllocatorState.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_put_header"),
+                            format!(
+                                "{restored} = Sable.AllocatorView.putHeader ({state}) ({header})"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_takeable_header"),
+                            format!(
+                                "Sable.AllocatorView.canTakeHeader ({restored}) ({header}).key"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_entry_header"),
+                            format!(
+                                "Sable.AllocatorView.headerAt ({restored}) ({header}).key = {header}"
+                            ),
+                        );
+                        self.env.insert(array.clone(), Val::View(restored));
+                        Val::Unit
+                    }
                     ResOp::FreeBlockSplit => {
                         let Val::View(block) = self.eval(&args[0]) else {
                             unreachable!("checked: free block borrow")

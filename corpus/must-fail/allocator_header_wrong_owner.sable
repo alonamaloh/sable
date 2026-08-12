@@ -1,0 +1,7 @@
+// expect-error: allocator_header_wrong_owner.allocator_put_header
+// Header authority may return only to its matching allocator aggregate.
+
+pub fn allocator_header_wrong_owner(resource &mut AllocatorState target,
+                                    resource FreeHeader header) {
+    allocator_put_header(&mut target, header);
+}

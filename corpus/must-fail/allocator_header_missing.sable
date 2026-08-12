@@ -1,0 +1,12 @@
+// expect-error: allocator_header_missing.allocator_take_header.0
+// A free byte entry is not an initialized stored header entry.
+
+pub fn allocator_header_missing(resource &mut AllocatorState state) {
+    resource FreeHeader header = allocator_take_header(&mut state, 0);
+    allocator_put_header(&mut state, header);
+}
+
+/// discharge allocator_header_missing.allocator_put_header by
+///   rw [h_state_take_header, h_header2_take]
+///   exact Sable.AllocatorView.takeHeader_canPutHeader
+///     _old_state 0 h_fact_sable_allocatorview_cant

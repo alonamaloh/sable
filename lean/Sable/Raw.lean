@@ -218,12 +218,15 @@ structure AllocatorView where
   allocator : Int
   root : SpanView
   free : Int → Option SpanView
+  headers : Int → Option FreeHeaderView
 
 def AllocatorView.initial (allocator : Int) (root : SpanView) : AllocatorView :=
-  { allocator, root, free := fun key => if key = 0 then some root else none }
+  { allocator, root,
+    free := fun key => if key = 0 then some root else none,
+    headers := fun _ => none }
 
 def AllocatorView.canTake (v : AllocatorView) (key : Int) : Prop :=
-  v.free key ≠ none
+  v.free key ≠ none ∧ v.headers key = none
 
 def AllocatorView.leaseAt (v : AllocatorView) (key : Int) : BlockLeaseView :=
   { allocator := v.allocator, key, span := (v.free key).getD v.root }
@@ -232,7 +235,8 @@ def AllocatorView.take (v : AllocatorView) (key : Int) : AllocatorView :=
   { v with free := fun k => if k = key then none else v.free k }
 
 def AllocatorView.canPut (v : AllocatorView) (lease : BlockLeaseView) : Prop :=
-  lease.allocator = v.allocator ∧ v.free lease.key = none
+  lease.allocator = v.allocator ∧ v.free lease.key = none ∧
+    v.headers lease.key = none
 
 @[simp] theorem AllocatorView.canPut_typedRoundTrip
     (v : AllocatorView) (lease : BlockLeaseView) (x : Int) :
@@ -249,7 +253,8 @@ def AllocatorView.canTakeFree (v : AllocatorView) (key : Int) : Prop :=
   v.canTake key ∧ (v.takeFree key).wf
 
 def AllocatorView.canPutFree (v : AllocatorView) (block : FreeBlockView) : Prop :=
-  block.allocator = v.allocator ∧ block.wf
+  block.allocator = v.allocator ∧ block.wf ∧
+    v.headers block.key = none
 
 def AllocatorView.putFree (v : AllocatorView) (block : FreeBlockView) : AllocatorView :=
   v.put block.toLease
@@ -289,12 +294,14 @@ def AllocatorView.releaseSpan (v : AllocatorView) : SpanView :=
 
 def AllocatorView.complete (v : AllocatorView) : Prop :=
   v.free 0 ≠ none ∧ v.releaseSpan.sameExtent v.root ∧
-    ∀ k, k ≠ 0 → v.free k = none
+    (∀ k, k ≠ 0 → v.free k = none) ∧
+    ∀ k, v.headers k = none
 
 def AllocatorView.wf (v : AllocatorView) : Prop :=
   (0 ≤ v.root.len ∧ v.root.len ≤ v.root.bytes.len) ∧
-    ∀ k span, v.free k = some span →
-      0 ≤ span.len ∧ span.len ≤ span.bytes.len
+    (∀ k span, v.free k = some span →
+      0 ≤ span.len ∧ span.len ≤ span.bytes.len) ∧
+    ∀ k header, v.headers k = some header → header.wf
 
 @[simp] theorem AllocatorView.initial_complete (allocator : Int) (root : SpanView) :
     (AllocatorView.initial allocator root).complete := by
@@ -323,29 +330,35 @@ def AllocatorView.wf (v : AllocatorView) : Prop :=
 @[simp] theorem AllocatorView.put_root (v : AllocatorView)
     (lease : BlockLeaseView) : (v.put lease).root = v.root := rfl
 
-@[simp] theorem AllocatorView.take_canPut (v : AllocatorView) (key : Int) :
+@[simp] theorem AllocatorView.take_canPut (v : AllocatorView) (key : Int)
+    (h : v.canTake key) :
     (v.take key).canPut (v.leaseAt key) := by
   constructor
   · rfl
+  constructor
   · simp [AllocatorView.take, AllocatorView.leaseAt]
+  · change v.headers key = none
+    exact h.2
 
 @[simp] theorem AllocatorView.initial_wf (allocator : Int) (root : SpanView)
     (hroot : 0 ≤ root.len ∧ root.len ≤ root.bytes.len) :
     (AllocatorView.initial allocator root).wf := by
   constructor
   · exact hroot
+  constructor
   · intro k span hentry
     by_cases hk : k = 0
     · subst k
       simp [AllocatorView.initial] at hentry
       simpa [hentry] using hroot
     · simp [AllocatorView.initial, hk] at hentry
+  · simp [AllocatorView.initial]
 
 @[simp] theorem AllocatorView.take_put (v : AllocatorView) (key : Int)
     (h : v.canTake key) :
     (v.take key).put (v.leaseAt key) = v := by
   cases v with
-  | mk allocator root free =>
+  | mk allocator root free headers =>
       simp only [AllocatorView.put, AllocatorView.take]
       congr 1
       funext k
@@ -354,7 +367,7 @@ def AllocatorView.wf (v : AllocatorView) : Prop :=
         simp only [if_pos]
         simp [AllocatorView.leaseAt]
         cases heq : free key with
-        | none => exact (h heq).elim
+        | none => exact (h.1 heq).elim
         | some span => rfl
       · simp [AllocatorView.leaseAt, hk]
 
@@ -548,6 +561,88 @@ def FreeHeaderView.toFree (v : FreeHeaderView) : FreeBlockView :=
     key := v.key
     span := (rawCell v.sizeCell).cat ((rawCell v.nextCell).cat v.payload) }
 
+def AllocatorView.headerAt (v : AllocatorView) (key : Int) : FreeHeaderView :=
+  (v.headers key).getD (v.takeFree key).toHeader
+
+def AllocatorView.canTakeHeader (v : AllocatorView) (key : Int) : Prop :=
+  v.headers key ≠ none ∧ v.free key = none ∧
+    (v.headerAt key).key = key ∧ (v.headerAt key).wf ∧
+    (v.headerAt key).allocator = v.allocator
+
+def AllocatorView.takeHeader (v : AllocatorView) (key : Int) : AllocatorView :=
+  { v with headers := fun k => if k = key then none else v.headers k }
+
+def AllocatorView.canPutHeader
+    (v : AllocatorView) (header : FreeHeaderView) : Prop :=
+  header.allocator = v.allocator ∧ header.wf ∧
+    v.free header.key = none ∧ v.headers header.key = none
+
+def AllocatorView.putHeader
+    (v : AllocatorView) (header : FreeHeaderView) : AllocatorView :=
+  { v with headers := fun k =>
+      if k = header.key then some header else v.headers k }
+
+@[simp] theorem AllocatorView.putHeader_headerAt
+    (v : AllocatorView) (header : FreeHeaderView) :
+    (v.putHeader header).headerAt header.key = header := by
+  simp [AllocatorView.putHeader, AllocatorView.headerAt]
+
+@[simp] theorem AllocatorView.putHeader_canTakeHeader
+    (v : AllocatorView) (header : FreeHeaderView)
+    (hput : v.canPutHeader header) :
+    (v.putHeader header).canTakeHeader header.key := by
+  unfold AllocatorView.canPutHeader at hput
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · simp [AllocatorView.putHeader]
+  · simpa [AllocatorView.putHeader] using hput.2.2.1
+  · rw [AllocatorView.putHeader_headerAt]
+  · simpa using hput.2.1
+  · rw [AllocatorView.putHeader_headerAt]
+    change header.allocator = v.allocator
+    exact hput.1
+
+@[simp] theorem AllocatorView.takeHeader_canPutHeader
+    (v : AllocatorView) (key : Int) (htake : v.canTakeHeader key) :
+    (v.takeHeader key).canPutHeader (v.headerAt key) := by
+  rcases htake with ⟨_, hfree, hkey, hwf, howner⟩
+  refine ⟨howner, hwf, ?_, ?_⟩
+  · rw [hkey]
+    simpa [AllocatorView.takeHeader] using hfree
+  · rw [hkey]
+    simp [AllocatorView.takeHeader]
+
+@[simp] theorem AllocatorView.takeHeader_putHeader
+    (v : AllocatorView) (key : Int) (htake : v.canTakeHeader key) :
+    (v.takeHeader key).putHeader (v.headerAt key) = v := by
+  have hkey : (v.headerAt key).key = key := htake.2.2.1
+  cases v with
+  | mk allocator root free headers =>
+      simp only [AllocatorView.putHeader, AllocatorView.takeHeader]
+      congr 1
+      funext k
+      by_cases hk : k = key
+      · subst k
+        simp only [hkey, if_pos]
+        simp [AllocatorView.headerAt]
+        cases heq : headers key with
+        | none => exact (htake.1 heq).elim
+        | some header => simp
+      · simp [hkey, hk]
+
+theorem AllocatorView.takeFree_putFields_canPutHeader
+    (v : AllocatorView) (key size next : Int)
+    (htake : v.canTakeFree key)
+    (hwf : ((v.takeFree key).toHeader.putFields size next).wf) :
+    (v.take key).canPutHeader
+      ((v.takeFree key).toHeader.putFields size next) := by
+  refine ⟨rfl, hwf, ?_, ?_⟩
+  · simp [AllocatorView.take, FreeBlockView.toHeader,
+      FreeHeaderView.putFields, AllocatorView.takeFree,
+      AllocatorView.leaseAt, BlockLeaseView.toFree]
+  · simpa [AllocatorView.take, FreeBlockView.toHeader,
+      FreeHeaderView.putFields, AllocatorView.takeFree,
+      AllocatorView.leaseAt, BlockLeaseView.toFree] using htake.1.2
+
 @[simp] theorem FreeBlockView.split_joinable (v : FreeBlockView) (n : Int) :
     (v.prefix n).joinable (v.suffix n) := by
   simp [FreeBlockView.joinable, FreeBlockView.prefix, FreeBlockView.suffix]
@@ -658,6 +753,29 @@ theorem AllocatorView.initialHeaderRoundTrip_complete
   · intro k hk
     simp [hk]
 
+theorem AllocatorView.initialStoredHeaderRoundTrip_complete
+    (allocator : Int) (root : SpanView) (size next : Int) :
+    let initial := AllocatorView.initial allocator root
+    let block := initial.takeFree 0
+    let header := block.toHeader.putFields size next
+    let parked := (initial.take 0).putHeader header
+    let extracted := parked.takeHeader 0
+    let returned := (parked.headerAt 0).clearFields.toFree
+    (extracted.putFree returned).complete := by
+  simp [AllocatorView.complete, AllocatorView.releaseSpan,
+    SpanView.sameExtent, AllocatorView.initial, AllocatorView.takeFree,
+    AllocatorView.leaseAt, AllocatorView.take, AllocatorView.putFree,
+    AllocatorView.put, AllocatorView.putHeader, AllocatorView.takeHeader,
+    AllocatorView.headerAt, FreeBlockView.toHeader,
+    FreeHeaderView.putFields, FreeHeaderView.clearFields,
+    FreeHeaderView.toFree, FreeHeaderView.rawCell,
+    FreeBlockView.toLease, BlockLeaseView.toFree,
+    freeHeaderBytes, u64.layout]
+  constructor
+  · omega
+  · intro k hk
+    simp [hk]
+
 @[simp] theorem FreeBlockView.join_prefix_suffix_extent
     (v : FreeBlockView) (n : Int) :
     ((v.prefix n).join (v.suffix n)).span.sameExtent v.span := by
@@ -681,17 +799,22 @@ theorem FreeBlockView.suffix_wf {v : FreeBlockView} {n : Int}
 
 @[simp] theorem AllocatorView.take_suffix_canPutFree
     {v : AllocatorView} {key n : Int}
-    (htake : v.canTakeFree key) (hn : 0 < n ∧ n < (v.takeFree key).span.len) :
+    (htake : v.canTakeFree key) (hn : 0 < n ∧ n < (v.takeFree key).span.len)
+    (habsent : v.headers ((v.takeFree key).suffix n).key = none) :
     (v.take key).canPutFree ((v.takeFree key).suffix n) := by
   constructor
   · rfl
+  constructor
   · exact FreeBlockView.suffix_wf htake.2 hn.2
+  · exact habsent
 
 @[simp] theorem AllocatorView.putFree_canTake
-    (v : AllocatorView) (block : FreeBlockView) :
+    (v : AllocatorView) (block : FreeBlockView)
+    (hput : v.canPutFree block) :
     (v.putFree block).canTake block.key := by
-  simp [AllocatorView.putFree, AllocatorView.put,
-    AllocatorView.canTake, FreeBlockView.toLease]
+  constructor
+  · simp [AllocatorView.putFree, AllocatorView.put, FreeBlockView.toLease]
+  · simpa [AllocatorView.putFree, AllocatorView.put] using hput.2.2
 
 @[simp] theorem AllocatorView.putFree_takeFree
     (v : AllocatorView) (block : FreeBlockView)
@@ -707,9 +830,9 @@ theorem FreeBlockView.suffix_wf {v : FreeBlockView} {n : Int}
     (hput : v.canPutFree block) :
     (v.putFree block).canTakeFree block.key := by
   constructor
-  · exact v.putFree_canTake block
+  · exact v.putFree_canTake block hput
   · rw [AllocatorView.putFree_takeFree v block hput.1]
-    exact hput.2
+    exact hput.2.1
 
 /-- The first vertical FreeBlock subject as one algebraic normalization:
 take the root, split it, round-trip the prefix through the client role, park

@@ -1913,6 +1913,23 @@ full first-fit loop. Keep predecessor-link mutation and allocation policy out
 of that slice so the relationship between the ordinary head/current offsets
 and the erased aggregate authority is explicit and independently tested.
 
+**The U8f1 stored-header transfer slice is complete (2026-08-12, ADR 0044).**
+`AllocatorState` can now park initialized `FreeHeader` authority in a map
+disjoint from raw free spans and temporarily extract it at an ordinary runtime
+`u64` key. The real typed cells remain in place while only affine authority
+moves. Aggregate completion requires every stored header to be cleared and
+returned; map-disjointness prevents a header and byte/block role from claiming
+the same key. The positive subject proves 20/20, executes to 64, and restores
+the system root; missing-entry and wrong-owner subjects fail at the intended
+sealed operations. The full single-worker corpus and all focused regressions
+pass.
+
+Next lift ADR 0043's finite sorted-chain predicate into `AllocatorView`.
+Extraction must then supply the local `16 ≤ size`, `key + size ≤ next`, and
+`next ≤ root.len` facts, while reinsertion preserves the chain. Do not write
+the first-fit loop while those facts still come only from a concrete test's
+literal header values.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;

@@ -2653,6 +2653,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf
                 | ResOp::AllocatorTake | ResOp::AllocatorPut
                 | ResOp::AllocatorTakeFree | ResOp::AllocatorPutFree
+                | ResOp::AllocatorTakeHeader | ResOp::AllocatorPutHeader
                 | ResOp::FreeBlockSplit | ResOp::FreeBlockJoin => 2,
                 ResOp::TestWorld | ResOp::AllocatorCreate | ResOp::AllocatorDestroy
                 | ResOp::FreeBlockLease | ResOp::BlockLeaseFree => 1,
@@ -2785,6 +2786,24 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let block = Ty::Res(ResKind::FreeBlock);
                     check_expr(ctx, &mut args[1], Some(block))?;
+                    transfer(ctx, &args[1], None)?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Unit
+                }
+                ResOp::AllocatorTakeHeader => {
+                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], want)?;
+                    check_expr(ctx, &mut args[0], Some(want))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::FreeHeader)
+                }
+                ResOp::AllocatorPutHeader => {
+                    let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    require_explicit_borrow(ctx, &args[0], state)?;
+                    check_expr(ctx, &mut args[0], Some(state))?;
+                    let header = Ty::Res(ResKind::FreeHeader);
+                    check_expr(ctx, &mut args[1], Some(header))?;
                     transfer(ctx, &args[1], None)?;
                     check_borrow_conflicts(ctx, args, None)?;
                     Ty::Unit

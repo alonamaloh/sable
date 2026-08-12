@@ -29,7 +29,9 @@ pub fn free_block_round_trip() -> u64 {
 
 /// discharge free_block_round_trip.allocator_put_free by
 ///   unfold Sable.AllocatorView.canPutFree
-///   exact ⟨h_free10_split.1.trans h_free8_owner, h_free10_wf⟩
+///   refine ⟨h_free10_split.1.trans h_free8_owner, h_free10_wf, ?_⟩
+///   simp [h_state_take_free, h_allocator_view6_create,
+///     Sable.AllocatorView.take, Sable.AllocatorView.initial]
 
 /// discharge free_block_round_trip.cell_u64.from_raw by
 ///   rw [h_base_system, h_lease11_lease, h_left_block_prefix,
@@ -110,7 +112,12 @@ pub fn free_block_round_trip() -> u64 {
 ///     change _free8.allocator = state_3.allocator
 ///     exact h_free8_owner.trans
 ///       (h_state_owner_free_3.trans h_state_owner_free_2).symm
+///   constructor
 ///   · exact h_free21_wf
+///   · simp [h_state_take_free_2, h_state_put_free,
+///       h_state_take_free, h_allocator_view6_create,
+///       Sable.AllocatorView.take, Sable.AllocatorView.putFree,
+///       Sable.AllocatorView.put, Sable.AllocatorView.initial]
 
 /// discharge free_block_round_trip.allocator_destroy by
 ///   subst _allocator_view6

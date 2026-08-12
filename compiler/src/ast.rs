@@ -202,6 +202,10 @@ pub enum ResOp {
     AllocatorPut,
     AllocatorTakeFree,
     AllocatorPutFree,
+    /// Move one initialized in-band header between the allocator aggregate
+    /// and a temporary affine handle used by a traversal step.
+    AllocatorTakeHeader,
+    AllocatorPutHeader,
     FreeBlockSplit,
     FreeBlockJoin,
     FreeBlockLease,
@@ -221,6 +225,8 @@ impl ResOp {
             "allocator_put" => Some(ResOp::AllocatorPut),
             "allocator_take_free" => Some(ResOp::AllocatorTakeFree),
             "allocator_put_free" => Some(ResOp::AllocatorPutFree),
+            "allocator_take_header" => Some(ResOp::AllocatorTakeHeader),
+            "allocator_put_header" => Some(ResOp::AllocatorPutHeader),
             "free_block_split" => Some(ResOp::FreeBlockSplit),
             "free_block_join" => Some(ResOp::FreeBlockJoin),
             "free_block_lease" => Some(ResOp::FreeBlockLease),
@@ -241,6 +247,8 @@ impl ResOp {
             ResOp::AllocatorPut => "allocator_put",
             ResOp::AllocatorTakeFree => "allocator_take_free",
             ResOp::AllocatorPutFree => "allocator_put_free",
+            ResOp::AllocatorTakeHeader => "allocator_take_header",
+            ResOp::AllocatorPutHeader => "allocator_put_header",
             ResOp::FreeBlockSplit => "free_block_split",
             ResOp::FreeBlockJoin => "free_block_join",
             ResOp::FreeBlockLease => "free_block_lease",
