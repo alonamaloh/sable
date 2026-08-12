@@ -1,0 +1,74 @@
+// A safe, fixed-width bump arena over one program-lifetime raw root.
+//
+// The arena never manufactures authority.  It owns the unallocated suffix
+// and `alloc_u64` carves exactly one aligned u64-sized span from its front.
+// The caller may retain the root pointer, but only the returned RawSpan grants
+// access to the corresponding bytes.
+
+pub class BumpArena {
+    u64 cap;
+    u64 cursor;
+    resource RawSpan free;
+
+    /// invariant cursor ≤ cap
+    /// invariant cursor % u64.layout.align = 0
+    /// invariant free.off = cursor
+    /// invariant free.len = cap - cursor
+
+    /// pre  #[label(root)] root.off = 0 ∧ root.len = n
+    /// post self.cap = n
+    /// post self.cursor = 0
+    /// post self.free.alloc = root.alloc
+    init from_root(u64 n, resource RawSpan root) {
+        self.cap = n;
+        self.cursor = 0;
+        self.free = root;
+    }
+
+    /// post result = self.cursor
+    fn next_offset(&self) -> u64 {
+        return self.cursor;
+    }
+
+    /// pre  #[label(space)] self.cursor + u64.layout.size ≤ self.cap
+    /// post result.off = (old self).cursor
+    /// post result.len = u64.layout.size
+    /// post result.alloc = self.free.alloc
+    /// post self.free.alloc = (old self).free.alloc
+    /// post self.cap = (old self).cap
+    /// post self.cursor = (old self).cursor + u64.layout.size
+    fn alloc_u64(&mut self) -> resource RawSpan {
+        mut resource RawSpan block = self.free;
+        resource RawSpan rest = split_off(&mut block, 8);
+        self.free = rest;
+        self.cursor = self.cursor + 8;
+        return block;
+    }
+}
+
+/// post result = 42
+pub fn bump_two_u64() -> u64 {
+    unsafe static_alloc(16) as (base, resource root);
+    var mut arena = BumpArena::from_root(16, root);
+
+    u64 off0 = arena.next_offset();
+    resource RawSpan bytes0 = arena.alloc_u64();
+    u64 off1 = arena.next_offset();
+    resource RawSpan bytes1 = arena.alloc_u64();
+
+    raw<u8> p0 = raw_offset(base, off0);
+    raw<u8> p1 = raw_offset(base, off1);
+    mut u64 a = 0;
+    mut u64 b = 0;
+    unsafe {
+        mut resource PointsTo<u64> cell0 = raw_into_cell_u64(p0, bytes0);
+        mut resource PointsTo<u64> cell1 = raw_into_cell_u64(p1, bytes1);
+        raw_cell_init_u64(p0, 19, &mut cell0);
+        raw_cell_init_u64(p1, 23, &mut cell1);
+        a = raw_cell_take_u64(p0, &mut cell0);
+        b = raw_cell_take_u64(p1, &mut cell1);
+        resource RawSpan raw0 = raw_from_cell_u64(p0, cell0);
+        resource RawSpan raw1 = raw_from_cell_u64(p1, cell1);
+    }
+    return a + b;
+}

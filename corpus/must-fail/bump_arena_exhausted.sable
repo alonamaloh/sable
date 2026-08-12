@@ -1,0 +1,42 @@
+// expect-error: exhausted.call_pre.BumpArena_alloc_u64.space.3
+
+// Must-fail subjects are checked without a module search path, so keep the
+// small allocator shape here and pin the public capacity obligation directly.
+class BumpArena {
+    u64 cap;
+    u64 cursor;
+    resource RawSpan free;
+
+    /// invariant cursor ≤ cap
+    /// invariant cursor % u64.layout.align = 0
+    /// invariant free.off = cursor
+    /// invariant free.len = cap - cursor
+
+    /// pre  root.off = 0 ∧ root.len = n
+    /// post self.cap = n
+    /// post self.cursor = 0
+    init from_root(u64 n, resource RawSpan root) {
+        self.cap = n;
+        self.cursor = 0;
+        self.free = root;
+    }
+
+    /// pre  #[label(space)] self.cursor + u64.layout.size ≤ self.cap
+    /// post self.cap = (old self).cap
+    /// post self.cursor = (old self).cursor + u64.layout.size
+    fn alloc_u64(&mut self) -> resource RawSpan {
+        mut resource RawSpan block = self.free;
+        resource RawSpan rest = split_off(&mut block, 8);
+        self.free = rest;
+        self.cursor = self.cursor + 8;
+        return block;
+    }
+}
+
+fn exhausted() {
+    unsafe static_alloc(16) as (base, resource root);
+    var mut arena = BumpArena::from_root(16, root);
+    resource RawSpan a = arena.alloc_u64();
+    resource RawSpan b = arena.alloc_u64();
+    resource RawSpan c = arena.alloc_u64();
+}

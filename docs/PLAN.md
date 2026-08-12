@@ -297,6 +297,32 @@ U7b still has two distinct pieces: probe one explicitly laid-out POD record with
 
 The implementation is vertical but small: `SpanView.uninit` on the proof side, a live fresh allocation in the interpreter, and direct lowering to the SVM's already-proven `.rawAlloc`. The source example builds a `PointsTo<u64>` on the root and verifies 5/5 obligations; its dynamic test passes, two stable diagnostics reject a nonliteral or zero size, and the differential harness now agrees on 47 subjects. Next is the safe resource-only bump allocator over this root. The explicit POD record remains a green Lean probe, deferred at the source level because treating it as an ordinary class would prematurely require class values in the SVM.
 
+### M38 — safe static bump arena *(2026-08-12, ADR 0034)*
+
+`BumpArena` owns the unused suffix of one program-lifetime root under four
+small invariants: bounded and aligned cursor, plus exact suffix offset and
+length. Its public `alloc_u64` operation is entirely safe library code: move
+the suffix out, use the sealed `split_off`, restore the remainder, and advance
+by the canonical `u64.layout.size`. The mutating method's contract explicitly
+frames capacity and allocation provenance, so repeated calls compose and each
+returned `RawSpan` is provably the extent at the offset observed immediately
+before it.
+
+The verified subject keeps two allocations live simultaneously, derives their
+pointers from the retained root pointer, converts both to abstract typed cells,
+and proves the result is 42 (33/33 obligations, no proof script). Dynamic
+execution covers the same path, and a must-fail subject pins exhaustion at the
+third allocation. The arena itself contains no unsafe block: only root
+acquisition, typed role conversion, and raw access remain unsafe. U7b's static
+bump-arena exit criteria are met without deallocation. The source-level POD
+record remains deliberately deferred behind runtime semantics; its explicit
+layout/state-transition probe is green in Lean.
+
+The next gate is U8a: make mandatory consumption a resource-type property that
+propagates through owned calls and is discharged only at declared consuming
+operations. `SystemDealloc`, leases, free, and coalescing remain blocked until
+that rule is demonstrated against a do-nothing sink.
+
 ## Parallel track (low intensity)
 
 The SVM semantic oracle — **checkpoint reached**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers `corpus/svm-diff` (34 subjects: signed-extreme arithmetic, the normative evaluation-order traps, short-circuit guards, loops, OOM, options) through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator on every `cargo test` (~0.5s); the first run found zero divergences, and an injected lowering bug (`%` rewired to `/`) is caught as two. **Calls + frames landed** (A-normalized, ADR 0005 res. 4): `call dst f args` at statement level, a frame stack in the configuration, `EvalArgs` for left-to-right argument evaluation, and all agreement/determinism/progress theorems re-proven over the extended machine; the harness gained per-file program environments and eight call subjects (42 total, zero divergences — including recursion through ten frames and argument-order trap identity). **The byte raw heap landed** (ADR 0025): `RawHeap` in the configuration, `Val.ptr` as provenance plus offset, and `rawAlloc`/`rawFree`/`rawLoad8`/`rawStore8`/`rawTake8` plus a pure `ptrAdd`. The structural finding is that pointer arithmetic is *pure*, so it is an expression, and everything touching the heap is an A-normalized statement — which is why `Eval` needed no change at all and not one existing expression rule was reinterpreted. That claim is checked rather than asserted: the heap was threaded through the configuration in its own commit with no operations, and agreement both directions, determinism, totality, and progress re-proved with no tactic touched. Rule side conditions are stated as *decidable* predicates (`loadByte`, `freeable`, `inBounds`) because they are exactly what the machine must compute to tell a store from `undef`. 20 direct SVM subjects in `Sable/SVMRawTests.lean` pin the valid path and every route to `undef` — out of bounds, uninitialized, use after free, double free, interior free, non-pointer dereference, out-of-`u8` store — and both layers of defence are verified by injection: an evaluator that forgets `take8`'s write-back fails the agreement proof, while a rule and evaluator changed together consistently passes agreement and fails an outcome guard. Next steps there: ghost transitions for the erasure metatheorem, then classes.

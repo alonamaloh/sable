@@ -1,0 +1,22 @@
+// Arena resource views and compiler layout descriptors are ghost-only.
+// expect-skip: root.off = 0 ∧ root.len = n
+// expect-skip: self.free.alloc = root.alloc
+// expect-skip: cursor % u64.layout.align = 0
+// expect-skip: free.off = cursor
+// expect-skip: free.len = cap - cursor
+// expect-skip: self.cursor + u64.layout.size ≤ self.cap
+// expect-skip: result.off = (old self).cursor
+// expect-skip: result.len = u64.layout.size
+// expect-skip: result.alloc = self.free.alloc
+// expect-skip: self.free.alloc = (old self).free.alloc
+// expect-skip: self.cursor = (old self).cursor + u64.layout.size
+
+use bump_arena;
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+fn test_bump_two_u64() {
+    expect_eq_u64(bump_two_u64(), 42);
+}

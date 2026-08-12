@@ -1754,16 +1754,23 @@ loan-branded and the resource may move into the bump arena. VCgen uses
 its existing fresh raw allocation instruction. Repeated execution creates
 another leaking program-lifetime root rather than reacquiring a singleton.
 
-Remaining U7b work:
-
-- a program-lifetime static bump arena.
+**Slice U7b4 is complete (2026-08-12, ADR 0034):** `BumpArena` owns the
+unallocated suffix of a program-lifetime root and carves one aligned
+`u64.layout` extent per call. The implementation is ordinary safe source code
+over `split_off`; its contract frames capacity and provenance so allocations
+compose and a caller can relate the returned span to the root pointer plus the
+pre-allocation cursor. Two blocks remain live and become typed cells in the
+verified subject; a third allocation from a 16-byte arena fails at the public
+space precondition.
 
 Do not introduce `SystemDealloc` on this rung. The static root is deliberately
 non-deallocating; that keeps typed-storage state and layout separate from the
 interprocedural mandatory-consumption rule that U8 will need.
 
-Probe one explicitly laid-out record next; do not introduce byte serialization
-while doing so.
+The explicitly laid-out record probe is green in Lean. Source-level POD values
+remain deferred until they have direct runtime semantics; do not model them as
+ordinary classes merely to satisfy the example, and do not introduce byte
+serialization while doing so.
 
 Exit criteria:
 
