@@ -1,0 +1,12 @@
+// expect-error: mono.type_arg_unsupported
+// G0 parses and identifies recursive non-integer type arguments, but the
+// integer-only monomorphization boundary must continue to reject them until
+// G1 gives their instantiated declarations and proofs concrete semantics.
+
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn use_bool() -> bool {
+    return identity<bool>(true);
+}

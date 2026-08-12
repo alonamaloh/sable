@@ -31,6 +31,15 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
     let impl_decls = std::mem::take(&mut program.impls);
     let mut traits: HashMap<String, TraitDecl> = HashMap::new();
     for t in trait_decls {
+        if traits.contains_key(&t.name) {
+            return Err(Diagnostic {
+                name: "trait.duplicate".into(),
+                title: format!("trait `{}` is defined twice", t.name),
+                span: t.name_span,
+                label: "second definition here".into(),
+                notes: vec![],
+            });
+        }
         traits.insert(t.name.clone(), t);
     }
     let mut impls: HashMap<(String, String), ImplInfo> = HashMap::new();
@@ -60,13 +69,27 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
         // Spec functions: every trait `spec` needs exactly one ghost def.
         let mut specs: HashMap<String, String> = HashMap::new();
         let mut ghost_by_name: HashMap<String, GhostItem> = HashMap::new();
-        for g in &im.ghosts {
+        let mut ghost_decls: Vec<&GhostItem> = im.ghosts.iter().collect();
+        ghost_decls.sort_by_key(|ghost| (ghost.span.start, ghost.span.end));
+        for g in ghost_decls {
             let lead: String = g
                 .text
                 .trim_start()
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                 .collect();
+            if ghost_by_name.contains_key(&lead) {
+                return Err(Diagnostic {
+                    name: "impl.duplicate_spec".into(),
+                    title: format!(
+                        "`impl {} for {tyname}` defines spec `{lead}` twice",
+                        im.trait_name
+                    ),
+                    span: g.span,
+                    label: "second definition here".into(),
+                    notes: vec![],
+                });
+            }
             ghost_by_name.insert(lead, g.clone());
         }
         for sp in &tr.specs {
@@ -93,11 +116,22 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             });
             specs.insert(sp.name.clone(), mangled);
         }
-        if let Some(extra) = ghost_by_name.keys().next() {
+        if let Some((extra, ghost)) =
+            ghost_by_name
+                .iter()
+                .min_by(|(name_a, ghost_a), (name_b, ghost_b)| {
+                    ghost_a
+                        .span
+                        .start
+                        .cmp(&ghost_b.span.start)
+                        .then_with(|| ghost_a.span.end.cmp(&ghost_b.span.end))
+                        .then_with(|| name_a.cmp(name_b))
+                })
+        {
             return Err(Diagnostic {
                 name: "impl.unknown_spec".into(),
                 title: format!("`{extra}` is not a spec of trait `{}`", im.trait_name),
-                span: im.span,
+                span: ghost.span,
                 label: "impl ghost defs must match the trait's `spec` clauses".into(),
                 notes: vec![],
             });
@@ -111,9 +145,23 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             text_map.insert(format!("Self::{spname}"), mangled.clone());
         }
         let mut impl_fns: HashMap<String, Fn> = HashMap::new();
-        for f in im.fns {
+        let mut method_decls = im.fns;
+        method_decls.sort_by_key(|method| (method.name_span.start, method.name_span.end));
+        for f in method_decls {
             if !f.pres.is_empty() || !f.posts.is_empty() || f.variant.is_some() {
                 unreachable!("parser rejects contracts in impl bodies");
+            }
+            if impl_fns.contains_key(&f.name) {
+                return Err(Diagnostic {
+                    name: "impl.duplicate_fn".into(),
+                    title: format!(
+                        "`impl {} for {tyname}` defines method `{}` twice",
+                        im.trait_name, f.name
+                    ),
+                    span: f.name_span,
+                    label: "second definition here".into(),
+                    notes: vec![],
+                });
             }
             impl_fns.insert(f.name.clone(), f);
         }
@@ -169,11 +217,22 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             }
             program.fns.push(body_fn);
         }
-        if let Some(extra) = impl_fns.keys().next() {
+        if let Some((extra, method)) =
+            impl_fns
+                .iter()
+                .min_by(|(name_a, method_a), (name_b, method_b)| {
+                    method_a
+                        .name_span
+                        .start
+                        .cmp(&method_b.name_span.start)
+                        .then_with(|| method_a.name_span.end.cmp(&method_b.name_span.end))
+                        .then_with(|| name_a.cmp(name_b))
+                })
+        {
             return Err(Diagnostic {
                 name: "impl.extra_fn".into(),
                 title: format!("`{extra}` is not a method of trait `{}`", im.trait_name),
-                span: im.span,
+                span: method.name_span,
                 label: "impls define exactly the trait's methods".into(),
                 notes: vec![],
             });
@@ -1616,6 +1675,174 @@ mod tests {
             panic!("expected a call, found {:?}", expr.kind);
         };
         (callee, type_args)
+    }
+
+    #[test]
+    fn rejects_duplicate_traits_at_the_second_declaration() {
+        let source = r#"
+trait Repeated {}
+
+trait Repeated {}
+"#;
+        let mut program = parse_program(source);
+        let expected_span = program.traits[1].name_span;
+        let error =
+            monomorphize(&mut program).expect_err("duplicate traits must not overwrite each other");
+
+        assert_eq!(error.name, "trait.duplicate");
+        assert_eq!(error.span, expected_span);
+        assert_eq!(error.label, "second definition here");
+    }
+
+    #[test]
+    fn keeps_trait_and_function_names_in_separate_namespaces() {
+        let program = parse_and_monomorphize(
+            r#"
+trait SharedName {}
+
+fn SharedName() {}
+"#,
+        );
+
+        assert!(
+            program
+                .traits
+                .iter()
+                .any(|trait_| trait_.name == "SharedName")
+        );
+        assert!(
+            program
+                .fns
+                .iter()
+                .any(|function| function.name == "SharedName")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_impl_spec_heads_at_the_second_declaration() {
+        let source = r#"
+trait Measured {
+    /// spec measure : int → int
+    fn read(Self value) -> u64;
+}
+
+impl Measured for u64 {
+    /// def measure (x : int) : int := x
+    /// def measure (x : int) : int := x + 1
+    fn read(u64 value) -> u64 {
+        return value;
+    }
+}
+"#;
+        let mut program = parse_program(source);
+        let mut spans: Vec<Span> = program.impls[0]
+            .ghosts
+            .iter()
+            .map(|ghost| ghost.span)
+            .collect();
+        spans.sort_by_key(|span| (span.start, span.end));
+        let error = monomorphize(&mut program)
+            .expect_err("duplicate impl specs must not overwrite each other");
+
+        assert_eq!(error.name, "impl.duplicate_spec");
+        assert_eq!(error.span, spans[1]);
+        assert!(error.title.contains("spec `measure` twice"));
+    }
+
+    #[test]
+    fn rejects_duplicate_impl_methods_at_the_second_declaration() {
+        let source = r#"
+trait Runnable {
+    fn run(Self value) -> u64;
+}
+
+impl Runnable for u64 {
+    fn run(u64 value) -> u64 {
+        return value;
+    }
+
+    fn run(u64 value) -> u64 {
+        return value;
+    }
+}
+"#;
+        let mut program = parse_program(source);
+        let mut spans: Vec<Span> = program.impls[0]
+            .fns
+            .iter()
+            .map(|method| method.name_span)
+            .collect();
+        spans.sort_by_key(|span| (span.start, span.end));
+        let error = monomorphize(&mut program)
+            .expect_err("duplicate impl methods must not overwrite each other");
+
+        assert_eq!(error.name, "impl.duplicate_fn");
+        assert_eq!(error.span, spans[1]);
+        assert!(error.title.contains("method `run` twice"));
+    }
+
+    #[test]
+    fn reports_the_earliest_extra_impl_spec() {
+        let source = r#"
+trait Runnable {
+    fn run(Self value) -> u64;
+}
+
+impl Runnable for u64 {
+    /// def zeta (x : int) : int := x
+    /// def alpha (x : int) : int := x
+    fn run(u64 value) -> u64 {
+        return value;
+    }
+}
+"#;
+        let mut program = parse_program(source);
+        let expected_span = program.impls[0]
+            .ghosts
+            .iter()
+            .min_by_key(|ghost| (ghost.span.start, ghost.span.end))
+            .expect("two impl specs")
+            .span;
+        let error = monomorphize(&mut program).expect_err("extra specs must be rejected");
+
+        assert_eq!(error.name, "impl.unknown_spec");
+        assert_eq!(error.span, expected_span);
+        assert!(error.title.contains("`zeta`"));
+    }
+
+    #[test]
+    fn reports_the_earliest_extra_impl_method() {
+        let source = r#"
+trait Runnable {
+    fn run(Self value) -> u64;
+}
+
+impl Runnable for u64 {
+    fn run(u64 value) -> u64 {
+        return value;
+    }
+
+    fn zeta(u64 value) -> u64 {
+        return value;
+    }
+
+    fn alpha(u64 value) -> u64 {
+        return value;
+    }
+}
+"#;
+        let mut program = parse_program(source);
+        let expected_span = program.impls[0]
+            .fns
+            .iter()
+            .find(|method| method.name == "zeta")
+            .expect("zeta method")
+            .name_span;
+        let error = monomorphize(&mut program).expect_err("extra methods must be rejected");
+
+        assert_eq!(error.name, "impl.extra_fn");
+        assert_eq!(error.span, expected_span);
+        assert!(error.title.contains("`zeta`"));
     }
 
     #[test]

@@ -11,6 +11,62 @@ use crate::lexer::{Tok, Token};
 use crate::scan::{Clause, ClauseKind, ProofBlock};
 use crate::span::{LineMap, Span};
 
+const MAX_GENERIC_TYPE_DEPTH: usize = 64;
+const MAX_GENERIC_TYPE_ARGS: usize = 256;
+const MAX_GENERIC_TYPE_NODES: usize = 4096;
+/// Recovery only needs to see far enough past a hard limit to distinguish a
+/// real generic call from a comparison. This accepts the one-step-over-limit
+/// diagnostics while bounding its own token and frame storage.
+const MAX_GENERIC_RECOVERY_TOKENS: usize = MAX_GENERIC_TYPE_NODES * 4;
+
+/// A nominal class visible while parsing recursive generic arguments.
+///
+/// This is intentionally separate from `class_names`: that list is an index
+/// table for the checked `Ty` model and therefore excludes local generic
+/// templates. Recursive use-site types need to recognize those templates
+/// without assigning them a premature checked-class index.
+#[derive(Debug, Clone)]
+struct GenericClassName {
+    name: String,
+    arity: usize,
+}
+
+#[derive(Debug, Clone)]
+struct GenericTypeSyntax {
+    kind: GenericTypeSyntaxKind,
+    span: Span,
+}
+
+#[derive(Debug, Clone)]
+enum GenericTypeSyntaxKind {
+    Named {
+        name: String,
+        name_span: Span,
+        args: Option<Vec<GenericTypeSyntax>>,
+    },
+    Array(Box<GenericTypeSyntax>),
+}
+
+#[derive(Debug)]
+struct ParsedTypeArgList {
+    args: Vec<GenericTypeSyntax>,
+    /// Token index immediately after the closing `>`.
+    end: usize,
+}
+
+#[derive(Debug, Default)]
+struct GenericTypeBudget {
+    nodes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GenericRecoveryFrame {
+    ListNeedType,
+    ListNeedSeparator,
+    ArrayNeedType,
+    ArrayNeedClose,
+}
+
 pub struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
@@ -30,6 +86,10 @@ pub struct Parser<'a> {
     /// Names of classes declared anywhere in the file (pre-scanned so
     /// `&Nat` parameters and `-> Nat` returns resolve — ADR 0010).
     class_names: Vec<String>,
+    /// Classes usable as recursive generic arguments, including local
+    /// generic templates together with their declaration arity. Keeping this
+    /// separate preserves the checked-class indices in `class_names`.
+    generic_class_names: Vec<GenericClassName>,
     /// Names of POD records declared anywhere in the file. As with classes,
     /// a pre-scan permits self-referential `raw<R>` fields and forward uses.
     record_names: Vec<String>,
@@ -37,24 +97,110 @@ pub struct Parser<'a> {
 
 type PResult<T> = Result<T, Diagnostic>;
 
+/// Pre-scan class declarations so recursive generic arguments may refer
+/// forward to templates. The full declaration parser remains authoritative;
+/// malformed parameter lists simply receive a placeholder arity here and are
+/// diagnosed when their declaration is reached.
+fn pre_scan_generic_class_names(
+    tokens: &[Token],
+    extern_classes: &[String],
+    extern_generic_classes: &[(String, usize)],
+) -> Vec<GenericClassName> {
+    let mut classes: Vec<GenericClassName> = extern_classes
+        .iter()
+        .map(|name| GenericClassName {
+            name: name.clone(),
+            arity: 0,
+        })
+        .collect();
+    classes.extend(
+        extern_generic_classes
+            .iter()
+            .map(|(name, arity)| GenericClassName {
+                name: name.clone(),
+                arity: *arity,
+            }),
+    );
+
+    for index in 0..tokens.len().saturating_sub(1) {
+        if !matches!(tokens[index].tok, Tok::KwClass) {
+            continue;
+        }
+        let Tok::Ident(name) = &tokens[index + 1].tok else {
+            continue;
+        };
+        let arity = if tokens.get(index + 2).map(|token| &token.tok) == Some(&Tok::Lt) {
+            pre_scan_type_parameter_arity(tokens, index + 2).unwrap_or(0)
+        } else {
+            0
+        };
+        if let Some(existing) = classes.iter_mut().find(|class| class.name == *name) {
+            existing.arity = arity;
+        } else {
+            classes.push(GenericClassName {
+                name: name.clone(),
+                arity,
+            });
+        }
+    }
+    classes
+}
+
+fn pre_scan_type_parameter_arity(tokens: &[Token], lt: usize) -> Option<usize> {
+    if tokens.get(lt).map(|token| &token.tok) != Some(&Tok::Lt) {
+        return None;
+    }
+    let mut index = lt + 1;
+    let mut arity = 0usize;
+    loop {
+        if !matches!(
+            tokens.get(index).map(|token| &token.tok),
+            Some(Tok::Ident(_))
+        ) {
+            return None;
+        }
+        arity = arity.checked_add(1)?;
+        index += 1;
+        if tokens.get(index).map(|token| &token.tok) == Some(&Tok::Colon) {
+            index += 1;
+            if !matches!(
+                tokens.get(index).map(|token| &token.tok),
+                Some(Tok::Ident(_))
+            ) {
+                return None;
+            }
+            index += 1;
+        }
+        match tokens.get(index).map(|token| &token.tok) {
+            Some(Tok::Comma) => index += 1,
+            Some(Tok::Gt) => return Some(arity),
+            _ => return None,
+        }
+    }
+}
+
 pub fn parse(
     tokens: &[Token],
     blocks: &[ProofBlock],
     lines: &LineMap,
     text: &str,
 ) -> PResult<Program> {
-    parse_module(tokens, blocks, lines, text, &[], &[])
+    parse_module(tokens, blocks, lines, text, &[], &[], &[])
 }
 
-/// Parse one module. `extern_classes` are classes from already-loaded
-/// imports (ADR 0013), in merged-index order: this module's own classes
-/// get indices after them, matching the loader's merge.
+/// Parse one module. `extern_classes` are non-generic classes from
+/// already-loaded imports (ADR 0013), in merged-index order: this module's own
+/// classes get indices after them, matching the loader's merge.
+/// `extern_generic_classes` is deliberately separate: templates need a name
+/// and arity for recursive generic arguments, but must not acquire a checked
+/// class index before monomorphization.
 pub fn parse_module(
     tokens: &[Token],
     blocks: &[ProofBlock],
     lines: &LineMap,
     text: &str,
     extern_classes: &[String],
+    extern_generic_classes: &[(String, usize)],
     extern_records: &[String],
 ) -> PResult<Program> {
     // Non-generic classes only, in declaration order — this matches
@@ -69,6 +215,8 @@ pub fn parse_module(
             }
         }
     }
+    let generic_class_names =
+        pre_scan_generic_class_names(tokens, extern_classes, extern_generic_classes);
     let mut record_names: Vec<String> = extern_records.to_vec();
     for w in tokens.windows(2) {
         if matches!(w[0].tok, Tok::KwRecord) {
@@ -89,6 +237,7 @@ pub fn parse_module(
         text,
         tparams: Vec::new(),
         class_names,
+        generic_class_names,
         record_names,
     };
     let mut fns = Vec::new();
@@ -477,42 +626,468 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// Disambiguate `f<i32>(...)` / `C<i32>::...` from comparisons:
-    /// only a `<`-list of type names closed by `>` and followed by `(`
-    /// or `::` parses as type arguments.
-    fn at_generic_args(&self) -> bool {
+    fn token_at(&self, index: usize) -> &Token {
+        self.tokens
+            .get(index)
+            .unwrap_or_else(|| self.tokens.last().expect("the lexer emits EOF"))
+    }
+
+    fn expected_generic_type(&self, index: usize) -> Diagnostic {
+        let token = self.token_at(index);
+        Diagnostic {
+            name: "parse.expected_generic_type".into(),
+            title: format!(
+                "expected a generic type, found {}",
+                token.tok.describe()
+            ),
+            span: token.span,
+            label: "expected an integer, `bool`, a type parameter, a visible nominal type, `[T]`, or `option<T>`"
+                .into(),
+            notes: vec![],
+        }
+    }
+
+    fn generic_type_separator_error(&self, index: usize) -> Diagnostic {
+        let token = self.token_at(index);
+        Diagnostic {
+            name: "parse.generic_type_separator".into(),
+            title: format!(
+                "expected `,` or `>` in generic arguments, found {}",
+                token.tok.describe()
+            ),
+            span: token.span,
+            label: "separate type arguments with `,` and close the list with `>`".into(),
+            notes: vec![],
+        }
+    }
+
+    fn generic_type_depth_error(&self, index: usize) -> Diagnostic {
+        Diagnostic {
+            name: "parse.generic_type_too_deep".into(),
+            title: "generic type is nested too deeply".into(),
+            span: self.token_at(index).span,
+            label: format!(
+                "at most {MAX_GENERIC_TYPE_DEPTH} recursive type nodes may occur on one path"
+            ),
+            notes: vec![],
+        }
+    }
+
+    fn generic_type_size_error(&self, index: usize) -> Diagnostic {
+        Diagnostic {
+            name: "parse.generic_type_too_large".into(),
+            title: "generic type is too large".into(),
+            span: self.token_at(index).span,
+            label: format!(
+                "at most {MAX_GENERIC_TYPE_NODES} nodes are allowed in one outer type argument"
+            ),
+            notes: vec![],
+        }
+    }
+
+    fn too_many_generic_type_args(&self, index: usize) -> Diagnostic {
+        Diagnostic {
+            name: "parse.too_many_type_args".into(),
+            title: "too many generic type arguments".into(),
+            span: self.token_at(index).span,
+            label: format!("at most {MAX_GENERIC_TYPE_ARGS} arguments are allowed in one list"),
+            notes: vec![],
+        }
+    }
+
+    /// Parse one bounded recursive type from `index`. This syntax routine is
+    /// shared by lookahead and AST construction, so nested closing `>` tokens
+    /// cannot be interpreted differently by the two paths.
+    fn parse_generic_type_syntax_at(
+        &self,
+        index: &mut usize,
+        depth: usize,
+        budget: &mut GenericTypeBudget,
+    ) -> PResult<GenericTypeSyntax> {
+        if depth > MAX_GENERIC_TYPE_DEPTH {
+            return Err(self.generic_type_depth_error(*index));
+        }
+        if budget.nodes == MAX_GENERIC_TYPE_NODES {
+            return Err(self.generic_type_size_error(*index));
+        }
+        budget.nodes += 1;
+
+        let token = self.token_at(*index).clone();
+        match token.tok {
+            Tok::Ident(name) => {
+                *index += 1;
+                let mut span = token.span;
+                let args = if self.token_at(*index).tok == Tok::Lt {
+                    let (args, close) =
+                        self.parse_nested_generic_type_list(index, depth + 1, budget)?;
+                    span = span.join(close);
+                    Some(args)
+                } else {
+                    None
+                };
+                Ok(GenericTypeSyntax {
+                    kind: GenericTypeSyntaxKind::Named {
+                        name,
+                        name_span: token.span,
+                        args,
+                    },
+                    span,
+                })
+            }
+            Tok::LBracket => {
+                *index += 1;
+                let element = self.parse_generic_type_syntax_at(index, depth + 1, budget)?;
+                if self.token_at(*index).tok != Tok::RBracket {
+                    let found = self.token_at(*index);
+                    return Err(Diagnostic {
+                        name: "parse.generic_array_close".into(),
+                        title: format!(
+                            "expected `]` after generic array element, found {}",
+                            found.tok.describe()
+                        ),
+                        span: found.span,
+                        label: "close the generic array type with `]`".into(),
+                        notes: vec![],
+                    });
+                }
+                let close = self.token_at(*index).span;
+                *index += 1;
+                Ok(GenericTypeSyntax {
+                    kind: GenericTypeSyntaxKind::Array(Box::new(element)),
+                    span: token.span.join(close),
+                })
+            }
+            _ => Err(self.expected_generic_type(*index)),
+        }
+    }
+
+    /// Parse a nested `<...>` list. Every nested list has its own arity cap,
+    /// while all of its nodes charge the enclosing outer-argument budget.
+    fn parse_nested_generic_type_list(
+        &self,
+        index: &mut usize,
+        child_depth: usize,
+        budget: &mut GenericTypeBudget,
+    ) -> PResult<(Vec<GenericTypeSyntax>, Span)> {
+        debug_assert_eq!(self.token_at(*index).tok, Tok::Lt);
+        *index += 1;
+        if self.token_at(*index).tok == Tok::Gt {
+            return Err(self.expected_generic_type(*index));
+        }
+
+        let mut args = Vec::new();
+        loop {
+            if args.len() == MAX_GENERIC_TYPE_ARGS {
+                return Err(self.too_many_generic_type_args(*index));
+            }
+            args.push(self.parse_generic_type_syntax_at(index, child_depth, budget)?);
+            match &self.token_at(*index).tok {
+                Tok::Comma => *index += 1,
+                Tok::Gt => {
+                    let close = self.token_at(*index).span;
+                    *index += 1;
+                    return Ok((args, close));
+                }
+                _ => return Err(self.generic_type_separator_error(*index)),
+            }
+        }
+    }
+
+    /// Parse the outer use-site `<...>` list. The node budget resets for each
+    /// argument, as promised by the public limit.
+    fn parse_type_arg_syntax_list_at(&self, start: usize) -> PResult<ParsedTypeArgList> {
+        debug_assert_eq!(self.token_at(start).tok, Tok::Lt);
+        let mut index = start + 1;
+        if self.token_at(index).tok == Tok::Gt {
+            return Err(self.expected_generic_type(index));
+        }
+
+        let mut args = Vec::new();
+        loop {
+            if args.len() == MAX_GENERIC_TYPE_ARGS {
+                return Err(self.too_many_generic_type_args(index));
+            }
+            let mut budget = GenericTypeBudget::default();
+            args.push(self.parse_generic_type_syntax_at(&mut index, 1, &mut budget)?);
+            match &self.token_at(index).tok {
+                Tok::Comma => index += 1,
+                Tok::Gt => {
+                    index += 1;
+                    return Ok(ParsedTypeArgList { args, end: index });
+                }
+                _ => return Err(self.generic_type_separator_error(index)),
+            }
+        }
+    }
+
+    fn generic_class_arity(&self, name: &str) -> Option<usize> {
+        self.generic_class_names
+            .iter()
+            .find(|class| class.name == name)
+            .map(|class| class.arity)
+    }
+
+    fn generic_type_arity_error(
+        &self,
+        name: &str,
+        expected: usize,
+        actual: usize,
+        span: Span,
+        diagnostic_name: &str,
+    ) -> Diagnostic {
+        Diagnostic {
+            name: diagnostic_name.into(),
+            title: format!("wrong number of type arguments for `{name}`"),
+            span,
+            label: format!("expected {expected}, found {actual}"),
+            notes: vec![],
+        }
+    }
+
+    fn lower_generic_type(&self, syntax: &GenericTypeSyntax) -> PResult<GenericTy> {
+        let GenericTypeSyntaxKind::Named {
+            name,
+            name_span,
+            args,
+        } = &syntax.kind
+        else {
+            let GenericTypeSyntaxKind::Array(element) = &syntax.kind else {
+                unreachable!()
+            };
+            return Ok(GenericTy::Array(Box::new(
+                self.lower_generic_type(element)?,
+            )));
+        };
+
+        let actual = args.as_ref().map_or(0, Vec::len);
+        if let Some(integer) = IntTy::from_name(name) {
+            if args.is_some() {
+                return Err(self.generic_type_arity_error(
+                    name,
+                    0,
+                    actual,
+                    syntax.span,
+                    "parse.primitive_type_args",
+                ));
+            }
+            return Ok(GenericTy::Int(integer));
+        }
+        if name == "bool" {
+            if args.is_some() {
+                return Err(self.generic_type_arity_error(
+                    name,
+                    0,
+                    actual,
+                    syntax.span,
+                    "parse.primitive_type_args",
+                ));
+            }
+            return Ok(GenericTy::Bool);
+        }
+        if let Some(parameter) = self.tparams.iter().position(|candidate| candidate == name) {
+            if args.is_some() {
+                return Err(self.generic_type_arity_error(
+                    name,
+                    0,
+                    actual,
+                    syntax.span,
+                    "parse.type_parameter_args",
+                ));
+            }
+            return Ok(GenericTy::Param(
+                TypeParamId::new(parameter)
+                    .expect("type_param_list enforces the type-parameter ceiling"),
+            ));
+        }
+        if name == "option" {
+            if actual != 1 {
+                return Err(self.generic_type_arity_error(
+                    name,
+                    1,
+                    actual,
+                    syntax.span,
+                    "parse.option_type_arity",
+                ));
+            }
+            let element = self.lower_generic_type(&args.as_ref().expect("one argument")[0])?;
+            return Ok(GenericTy::Option(Box::new(element)));
+        }
+        if let Some(expected) = self.generic_class_arity(name) {
+            if actual != expected {
+                let diagnostic_name = if args.is_none() && expected != 0 {
+                    "parse.unsaturated_generic_class"
+                } else if args.is_some() && expected == 0 {
+                    "parse.nongeneric_class_type_args"
+                } else {
+                    "parse.generic_class_arity"
+                };
+                return Err(self.generic_type_arity_error(
+                    name,
+                    expected,
+                    actual,
+                    syntax.span,
+                    diagnostic_name,
+                ));
+            }
+            let lowered = match args {
+                Some(args) => args
+                    .iter()
+                    .map(|argument| self.lower_generic_type(argument))
+                    .collect::<PResult<Vec<_>>>()?,
+                None => Vec::new(),
+            };
+            return Ok(GenericTy::Class {
+                name: name.clone(),
+                args: lowered.into_boxed_slice(),
+            });
+        }
+        if self.record_names.iter().any(|record| record == name) {
+            if args.is_some() {
+                return Err(self.generic_type_arity_error(
+                    name,
+                    0,
+                    actual,
+                    syntax.span,
+                    "parse.record_type_args",
+                ));
+            }
+            return Ok(GenericTy::Record(name.clone()));
+        }
+        Err(Diagnostic {
+            name: "parse.unknown_generic_type".into(),
+            title: format!("unknown generic type `{name}`"),
+            span: *name_span,
+            label: "not an integer, `bool`, an in-scope type parameter, or a visible nominal type"
+                .into(),
+            notes: vec![],
+        })
+    }
+
+    /// Limit-free, non-recursive syntax probe used only after the bounded
+    /// parser reports an error. It carries limit diagnostics out when the
+    /// candidate is otherwise a complete generic call. Expression operators
+    /// and misplaced brackets terminate the probe, so a later comparison
+    /// cannot be mistaken for this candidate's close.
+    fn malformed_generic_list_has_call_follower(&self, start: usize) -> bool {
+        debug_assert_eq!(self.token_at(start).tok, Tok::Lt);
+        let mut index = start + 1;
+        let recovery_end = start.saturating_add(MAX_GENERIC_RECOVERY_TOKENS);
+        let mut frames = vec![GenericRecoveryFrame::ListNeedType];
+        loop {
+            if index > recovery_end || frames.len() > MAX_GENERIC_TYPE_DEPTH + 1 {
+                return false;
+            }
+            let Some(frame) = frames.last().copied() else {
+                return matches!(&self.token_at(index).tok, Tok::LParen | Tok::ColonColon);
+            };
+            match frame {
+                GenericRecoveryFrame::ListNeedType | GenericRecoveryFrame::ArrayNeedType => {
+                    match &self.token_at(index).tok {
+                        Tok::Ident(_) => {
+                            index += 1;
+                            if self.token_at(index).tok == Tok::Lt {
+                                index += 1;
+                                frames.push(GenericRecoveryFrame::ListNeedType);
+                            } else {
+                                *frames.last_mut().expect("frame exists") = match frame {
+                                    GenericRecoveryFrame::ListNeedType => {
+                                        GenericRecoveryFrame::ListNeedSeparator
+                                    }
+                                    GenericRecoveryFrame::ArrayNeedType => {
+                                        GenericRecoveryFrame::ArrayNeedClose
+                                    }
+                                    _ => unreachable!(),
+                                };
+                            }
+                        }
+                        Tok::LBracket => {
+                            index += 1;
+                            frames.push(GenericRecoveryFrame::ArrayNeedType);
+                        }
+                        _ => return false,
+                    }
+                }
+                GenericRecoveryFrame::ListNeedSeparator => match &self.token_at(index).tok {
+                    Tok::Comma => {
+                        index += 1;
+                        *frames.last_mut().expect("frame exists") =
+                            GenericRecoveryFrame::ListNeedType;
+                    }
+                    Tok::Gt => {
+                        index += 1;
+                        frames.pop();
+                        if let Some(parent) = frames.last_mut() {
+                            *parent = match parent {
+                                GenericRecoveryFrame::ListNeedType => {
+                                    GenericRecoveryFrame::ListNeedSeparator
+                                }
+                                GenericRecoveryFrame::ArrayNeedType => {
+                                    GenericRecoveryFrame::ArrayNeedClose
+                                }
+                                _ => return false,
+                            };
+                        }
+                    }
+                    _ => return false,
+                },
+                GenericRecoveryFrame::ArrayNeedClose => {
+                    if self.token_at(index).tok != Tok::RBracket {
+                        return false;
+                    }
+                    index += 1;
+                    frames.pop();
+                    let Some(parent) = frames.last_mut() else {
+                        return false;
+                    };
+                    *parent = match parent {
+                        GenericRecoveryFrame::ListNeedType => {
+                            GenericRecoveryFrame::ListNeedSeparator
+                        }
+                        GenericRecoveryFrame::ArrayNeedType => GenericRecoveryFrame::ArrayNeedClose,
+                        _ => return false,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Disambiguate `f<T>(...)` / `C<T>::...` from comparisons. The same
+    /// bounded recursive grammar used by `type_arg_list` performs lookahead;
+    /// only a complete list followed by `(` or `::` is a generic use.
+    fn at_generic_args(&self) -> PResult<bool> {
         // Builtin angle-bracket forms have dedicated arms.
         if matches!(self.peek(), Tok::Ident(n) if n == "widen" || n == "narrow" || n == "alloc_array")
         {
-            return false;
+            return Ok(false);
         }
-        let mut i = self.pos + 1;
-        if self.tokens.get(i).map(|t| &t.tok) != Some(&Tok::Lt) {
-            return false;
+        let start = self.pos + 1;
+        if self.tokens.get(start).map(|token| &token.tok) != Some(&Tok::Lt) {
+            return Ok(false);
         }
-        i += 1;
-        loop {
-            match self.tokens.get(i).map(|t| &t.tok) {
-                Some(Tok::Ident(n))
-                    if IntTy::from_name(n).is_some()
-                        || self.tparams.iter().any(|p| p == n)
-                        || self.record_names.iter().any(|r| r == n) => {}
-                _ => return false,
+        let parsed = match self.parse_type_arg_syntax_list_at(start) {
+            Ok(parsed) => parsed,
+            Err(error) if self.malformed_generic_list_has_call_follower(start) => {
+                return Err(error);
             }
-            i += 1;
-            match self.tokens.get(i).map(|t| &t.tok) {
-                Some(Tok::Comma) => i += 1,
-                Some(Tok::Gt) => {
-                    i += 1;
-                    break;
+            Err(_) => return Ok(false),
+        };
+        let follower = &self.token_at(parsed.end).tok;
+        if !matches!(follower, Tok::LParen | Tok::ColonColon) {
+            return Ok(false);
+        }
+        for argument in &parsed.args {
+            if let Err(error) = self.lower_generic_type(argument) {
+                // Preserve the historical comparison disambiguation for an
+                // arbitrary identifier: `x < y > (z)` is not a generic call
+                // merely because its punctuation happens to fit. `::`, on
+                // the other hand, cannot continue a comparison.
+                if error.name == "parse.unknown_generic_type" && follower == &Tok::LParen {
+                    return Ok(false);
                 }
-                _ => return false,
+                return Err(error);
             }
         }
-        matches!(
-            self.tokens.get(i).map(|t| &t.tok),
-            Some(Tok::LParen) | Some(Tok::ColonColon)
-        )
+        Ok(true)
     }
 
     fn ident(&mut self) -> PResult<(String, Span)> {
@@ -599,22 +1174,23 @@ impl<'a> Parser<'a> {
         Ok((out, bounds))
     }
 
-    /// `<i32, u8>` at a use site (concrete or in-scope-parameter types).
-    /// G0 retains this integer-only grammar while preserving each argument's
-    /// own span in the recursive generic-type representation.
+    /// A bounded recursive `<...>` list at a generic use site. Checked `Ty`
+    /// contexts deliberately do not call this routine: G0 only records the
+    /// richer use-site shape, and monomorphization remains the hard semantic
+    /// gate for the currently enabled integer-only domain.
     fn type_arg_list(&mut self) -> PResult<Vec<TypeArg>> {
-        self.expect(Tok::Lt)?;
-        let mut out = Vec::new();
-        loop {
-            let (ty, span) = self.int_ty()?;
-            out.push(TypeArg::from_legacy_int(ty, span));
-            if self.at(&Tok::Comma) {
-                self.bump();
-            } else {
-                break;
-            }
-        }
-        self.expect(Tok::Gt)?;
+        let parsed = self.parse_type_arg_syntax_list_at(self.pos)?;
+        let out = parsed
+            .args
+            .iter()
+            .map(|argument| {
+                Ok(TypeArg {
+                    ty: self.lower_generic_type(argument)?,
+                    span: argument.span,
+                })
+            })
+            .collect::<PResult<Vec<_>>>()?;
+        self.pos = parsed.end;
         Ok(out)
     }
 
@@ -2638,7 +3214,7 @@ impl<'a> Parser<'a> {
                     let e = self.expr()?;
                     self.expect(Tok::Semi)?;
                     Ok(Stmt::ExprStmt(e))
-                } else if self.at_generic_args() {
+                } else if self.at_generic_args()? {
                     // `clamp<i32>(...);` — a generic call for effect.
                     let e = self.expr()?;
                     self.expect(Tok::Semi)?;
@@ -3314,7 +3890,7 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
-            Tok::Ident(head) if self.at_generic_args() => {
+            Tok::Ident(head) if self.at_generic_args()? => {
                 let head_span = self.peek_span();
                 self.bump();
                 let type_args = self.type_arg_list()?;
@@ -3743,6 +4319,24 @@ mod generic_type_arg_tests {
         parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
     }
 
+    fn parse_source_with_extern_generic_classes(
+        source: &str,
+        classes: &[(String, usize)],
+    ) -> PResult<Program> {
+        let scanned = crate::scan::scan(source);
+        let tokens = crate::lexer::lex(&scanned.program_text).unwrap();
+        let lines = LineMap::new(source);
+        parse_module(
+            &tokens,
+            &scanned.blocks,
+            &lines,
+            &scanned.program_text,
+            &[],
+            classes,
+            &[],
+        )
+    }
+
     fn type_parameter_names(count: usize) -> String {
         (0..count)
             .map(|index| format!("T{index}"))
@@ -3765,23 +4359,317 @@ mod generic_type_arg_tests {
     }
 
     #[test]
-    fn integer_only_type_argument_parser_preserves_argument_spans() {
-        let source = "fn concrete() -> i32 { return id<u8>(1); }\n\
+    fn recursive_type_argument_parser_preserves_full_outer_spans() {
+        let source = "record R #[layout(size := 1, align := 1)] {\n\
+                          #[offset(0)] u8 value;\n\
+                      }\n\
+                      class Pair<A, B> {}\n\
+                      fn concrete() -> i32 { return id<Pair<bool, option<[R]>>>(1); }\n\
                       fn generic<T>(T x) -> T { return id<T>(x); }\n";
         let program = parse_source(source).unwrap();
 
         let concrete = &return_type_args(&program.fns[0])[0];
-        let concrete_start = source.find("u8>(1)").unwrap();
-        assert_eq!(concrete.ty, GenericTy::Int(IntTy::U8));
+        let concrete_text = "Pair<bool, option<[R]>>";
+        let concrete_start = source.find(concrete_text).unwrap();
+        assert_eq!(
+            concrete.ty,
+            GenericTy::Class {
+                name: "Pair".into(),
+                args: vec![
+                    GenericTy::Bool,
+                    GenericTy::Option(Box::new(GenericTy::Array(Box::new(GenericTy::Record(
+                        "R".into()
+                    ))))),
+                ]
+                .into_boxed_slice(),
+            }
+        );
         assert_eq!(
             concrete.span,
-            Span::new(concrete_start, concrete_start + "u8".len())
+            Span::new(concrete_start, concrete_start + concrete_text.len())
         );
 
         let generic = &return_type_args(&program.fns[1])[0];
         let generic_start = source.rfind("T>(x)").unwrap();
         assert_eq!(generic.ty, GenericTy::Param(TypeParamId::from_legacy(0)));
         assert_eq!(generic.span, Span::new(generic_start, generic_start + 1));
+    }
+
+    #[test]
+    fn recursive_arguments_support_multiple_outer_shapes_and_nested_closing_angles() {
+        let source = "fn shapes() -> i32 {\n\
+                          return id<[i32], option<option<bool>>>(0);\n\
+                      }\n";
+        let program = parse_source(source).unwrap();
+        let arguments = return_type_args(&program.fns[0]);
+
+        assert_eq!(
+            arguments[0].ty,
+            GenericTy::Array(Box::new(GenericTy::Int(IntTy::I32)))
+        );
+        assert_eq!(
+            arguments[1].ty,
+            GenericTy::Option(Box::new(GenericTy::Option(Box::new(GenericTy::Bool))))
+        );
+        for (argument, text) in arguments.iter().zip(["[i32]", "option<option<bool>>"]) {
+            assert_eq!(&source[argument.span.start..argument.span.end], text);
+        }
+    }
+
+    #[test]
+    fn forward_generic_classes_and_nested_parameters_work_in_constructor_uses() {
+        let source = "fn build<T>(T value) {\n\
+                          Pair<option<T>, [bool]>::new();\n\
+                      }\n\
+                      class Pair<A: AnyTrait, B> {}\n";
+        let program = parse_source(source).unwrap();
+        let Stmt::ExprStmt(expression) = &program.fns[0].body[0] else {
+            panic!("expected a constructor expression statement");
+        };
+        let ExprKind::CtorCall { type_args, .. } = &expression.kind else {
+            panic!("expected a generic constructor call");
+        };
+
+        assert_eq!(
+            type_args[0].ty,
+            GenericTy::Option(Box::new(GenericTy::Param(TypeParamId::from_legacy(0))))
+        );
+        assert_eq!(type_args[1].ty, GenericTy::Array(Box::new(GenericTy::Bool)));
+        assert_eq!(
+            &source[type_args[0].span.start..type_args[0].span.end],
+            "option<T>"
+        );
+        assert_eq!(
+            &source[type_args[1].span.start..type_args[1].span.end],
+            "[bool]"
+        );
+    }
+
+    #[test]
+    fn imported_generic_class_arities_are_visible_without_checked_class_indices() {
+        let source = "fn use_box() -> i32 { return id<Box<i32>>(0); }\n";
+        let program =
+            parse_source_with_extern_generic_classes(source, &[("Box".into(), 1)]).unwrap();
+        let argument = &return_type_args(&program.fns[0])[0];
+
+        assert_eq!(
+            argument.ty,
+            GenericTy::Class {
+                name: "Box".into(),
+                args: vec![GenericTy::Int(IntTy::I32)].into_boxed_slice(),
+            }
+        );
+        assert_eq!(&source[argument.span.start..argument.span.end], "Box<i32>");
+    }
+
+    #[test]
+    fn unknown_comparison_operand_does_not_become_a_generic_type() {
+        let source = "fn compare(i32 x, i32 y, i32 z) -> bool {\n\
+                          return x < y > (z);\n\
+                      }\n";
+        let diagnostic = parse_source(source).unwrap_err();
+        let greater = source.find("> (z)").unwrap();
+
+        assert_eq!(diagnostic.name, "parse.chained_comparison");
+        assert_eq!(diagnostic.span, Span::new(greater, greater + 1));
+    }
+
+    #[test]
+    fn generic_recovery_does_not_scan_past_boolean_comparison_operators() {
+        let source = "fn compare(i32 x, i32 y, i32 z) -> bool {\n\
+                          return x < y && y > (z);\n\
+                      }\n";
+        let program = parse_source(source).unwrap();
+        let Stmt::Return {
+            value: Some(expression),
+            ..
+        } = &program.fns[0].body[0]
+        else {
+            panic!("expected a return expression");
+        };
+        let ExprKind::Binary { op: BinOp::And, .. } = &expression.kind else {
+            panic!("expected two comparisons joined by &&");
+        };
+    }
+
+    #[test]
+    fn generic_recovery_probe_has_its_own_token_budget() {
+        let arguments = vec!["i32"; MAX_GENERIC_RECOVERY_TOKENS].join(", ");
+        let source = format!("id<{arguments}>(0)");
+        let scanned = crate::scan::scan(&source);
+        let tokens = crate::lexer::lex(&scanned.program_text).unwrap();
+        let lines = LineMap::new(&source);
+        let parser = Parser {
+            tokens: &tokens,
+            pos: 0,
+            pending: Vec::new(),
+            pending_mut: false,
+            str_temps: 0,
+            blocks: &scanned.blocks,
+            consumed: vec![false; scanned.blocks.len()],
+            lines: &lines,
+            text: &scanned.program_text,
+            tparams: Vec::new(),
+            class_names: Vec::new(),
+            generic_class_names: Vec::new(),
+            record_names: Vec::new(),
+        };
+
+        assert!(!parser.malformed_generic_list_has_call_follower(1));
+    }
+
+    #[test]
+    fn constructor_syntax_reports_an_unknown_recursive_type() {
+        let source = "class Box<T> {}\n\
+                      fn bad() { Box<Missing>::new(); }\n";
+        let diagnostic = parse_source(source).unwrap_err();
+        let missing = source.find("Missing").unwrap();
+
+        assert_eq!(diagnostic.name, "parse.unknown_generic_type");
+        assert_eq!(diagnostic.title, "unknown generic type `Missing`");
+        assert_eq!(
+            diagnostic.span,
+            Span::new(missing, missing + "Missing".len())
+        );
+    }
+
+    #[test]
+    fn nominal_generic_argument_arity_errors_are_precise() {
+        let cases = [
+            (
+                "record R #[layout(size := 1, align := 1)] { #[offset(0)] u8 x; }\n\
+                 fn bad() -> i32 { return id<R<i32>>(0); }\n",
+                "parse.record_type_args",
+                "R<i32>",
+                "expected 0, found 1",
+            ),
+            (
+                "class Plain {}\n\
+                 fn bad() -> i32 { return id<Plain<i32>>(0); }\n",
+                "parse.nongeneric_class_type_args",
+                "Plain<i32>",
+                "expected 0, found 1",
+            ),
+            (
+                "class Box<T> {}\n\
+                 fn bad() -> i32 { return id<Box>(0); }\n",
+                "parse.unsaturated_generic_class",
+                "Box",
+                "expected 1, found 0",
+            ),
+            (
+                "class Pair<A, B> {}\n\
+                 fn bad() -> i32 { return id<Pair<i32>>(0); }\n",
+                "parse.generic_class_arity",
+                "Pair<i32>",
+                "expected 2, found 1",
+            ),
+            (
+                "fn bad() -> i32 { return id<option<i32, bool>>(0); }\n",
+                "parse.option_type_arity",
+                "option<i32, bool>",
+                "expected 1, found 2",
+            ),
+        ];
+
+        for (source, name, marked, label) in cases {
+            let diagnostic = parse_source(source).unwrap_err();
+            let start = source.rfind(marked).unwrap();
+            assert_eq!(diagnostic.name, name);
+            assert_eq!(diagnostic.label, label);
+            assert_eq!(diagnostic.span, Span::new(start, start + marked.len()));
+        }
+    }
+
+    #[test]
+    fn outer_and_nested_type_argument_lists_are_capped_at_256() {
+        let at_limit = vec!["i32"; MAX_GENERIC_TYPE_ARGS].join(", ");
+        let source = format!("fn limit() -> i32 {{ return id<{at_limit}>(0); }}\n");
+        let program = parse_source(&source).unwrap();
+        assert_eq!(
+            return_type_args(&program.fns[0]).len(),
+            MAX_GENERIC_TYPE_ARGS
+        );
+
+        let mut outer = vec!["i32"; MAX_GENERIC_TYPE_ARGS];
+        outer.push("u8");
+        let source = format!(
+            "fn too_many() -> i32 {{ return id<{}>(0); }}\n",
+            outer.join(", ")
+        );
+        let diagnostic = parse_source(&source).unwrap_err();
+        let overflow = source.rfind("u8").unwrap();
+        assert_eq!(diagnostic.name, "parse.too_many_type_args");
+        assert_eq!(
+            diagnostic.label,
+            "at most 256 arguments are allowed in one list"
+        );
+        assert_eq!(diagnostic.span, Span::new(overflow, overflow + 2));
+
+        let mut nested = vec!["i32"; MAX_GENERIC_TYPE_ARGS];
+        nested.push("u8");
+        let source = format!(
+            "fn too_many() -> i32 {{ return id<option<{}>>(0); }}\n",
+            nested.join(", ")
+        );
+        let diagnostic = parse_source(&source).unwrap_err();
+        let overflow = source.rfind("u8").unwrap();
+        assert_eq!(diagnostic.name, "parse.too_many_type_args");
+        assert_eq!(diagnostic.span, Span::new(overflow, overflow + 2));
+    }
+
+    #[test]
+    fn recursive_type_depth_is_capped_at_64_nodes() {
+        let argument = format!(
+            "{}i32{}",
+            "option<".repeat(MAX_GENERIC_TYPE_DEPTH),
+            ">".repeat(MAX_GENERIC_TYPE_DEPTH)
+        );
+        let source = format!("fn deep() -> i32 {{ return id<{argument}>(0); }}\n");
+        let diagnostic = parse_source(&source).unwrap_err();
+        let leaf = source.rfind("i32").unwrap();
+
+        assert_eq!(diagnostic.name, "parse.generic_type_too_deep");
+        assert_eq!(
+            diagnostic.label,
+            "at most 64 recursive type nodes may occur on one path"
+        );
+        assert_eq!(diagnostic.span, Span::new(leaf, leaf + 3));
+    }
+
+    #[test]
+    fn each_outer_type_argument_has_a_4096_node_budget() {
+        let parameters = type_parameter_names(MAX_GENERIC_TYPE_ARGS);
+        let branch = format!("{}i32{}", "option<".repeat(16), ">".repeat(16));
+        let argument = format!("Many<{}>", vec![branch; MAX_GENERIC_TYPE_ARGS].join(", "));
+        let source = format!(
+            "class Many<{parameters}> {{}}\n\
+             fn large() -> i32 {{ return id<{argument}>(0); }}\n"
+        );
+        let diagnostic = parse_source(&source).unwrap_err();
+
+        assert_eq!(diagnostic.name, "parse.generic_type_too_large");
+        assert_eq!(
+            diagnostic.label,
+            "at most 4096 nodes are allowed in one outer type argument"
+        );
+        assert!(matches!(
+            &source[diagnostic.span.start..diagnostic.span.end],
+            "option" | "i32"
+        ));
+    }
+
+    #[test]
+    fn monomorphization_still_rejects_new_recursive_shapes_at_their_outer_span() {
+        let source = "fn id<T>(T value) -> T { return value; }\n\
+                      fn use_bool() -> bool { return id<bool>(true); }\n";
+        let mut program = parse_source(source).unwrap();
+        let expected_span = return_type_args(&program.fns[1])[0].span;
+        let diagnostic = crate::mono::monomorphize(&mut program).unwrap_err();
+
+        assert_eq!(diagnostic.name, "mono.type_arg_unsupported");
+        assert_eq!(diagnostic.span, expected_span);
+        assert_eq!(&source[diagnostic.span.start..diagnostic.span.end], "bool");
     }
 
     #[test]

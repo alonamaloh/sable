@@ -18,7 +18,138 @@ use crate::ast::{Program, UseDecl};
 use crate::diag::Diagnostic;
 use crate::span::{LineMap, Span};
 use crate::{lexer, parser, scan};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Copy)]
+enum ItemNamespace {
+    Runtime,
+    Trait,
+    Const,
+}
+
+#[derive(Clone, Copy)]
+struct ItemDecl<'a> {
+    namespace: ItemNamespace,
+    kind: &'static str,
+    name: &'a str,
+    span: Span,
+    is_pub: bool,
+}
+
+/// Reconstruct declaration order from spans because `Program` stores each
+/// declaration category in a separate vector. Functions, classes, and records
+/// share the runtime namespace; traits and constants each have their own.
+fn item_declarations(program: &Program) -> Vec<ItemDecl<'_>> {
+    let mut declarations = Vec::with_capacity(
+        program.fns.len()
+            + program.fn_templates.len()
+            + program.classes.len()
+            + program.class_templates.len()
+            + program.records.len()
+            + program.traits.len()
+            + program.consts.len(),
+    );
+    declarations.extend(
+        program
+            .fns
+            .iter()
+            .chain(&program.fn_templates)
+            .map(|f| ItemDecl {
+                namespace: ItemNamespace::Runtime,
+                kind: "function",
+                name: f.name.as_str(),
+                span: f.name_span,
+                is_pub: f.is_pub,
+            }),
+    );
+    declarations.extend(
+        program
+            .classes
+            .iter()
+            .chain(&program.class_templates)
+            .map(|c| ItemDecl {
+                namespace: ItemNamespace::Runtime,
+                kind: "class",
+                name: c.name.as_str(),
+                span: c.name_span,
+                is_pub: c.is_pub,
+            }),
+    );
+    declarations.extend(program.records.iter().map(|r| ItemDecl {
+        namespace: ItemNamespace::Runtime,
+        kind: "record",
+        name: r.name.as_str(),
+        span: r.name_span,
+        is_pub: r.is_pub,
+    }));
+    declarations.extend(program.traits.iter().map(|trait_| ItemDecl {
+        namespace: ItemNamespace::Trait,
+        kind: "trait",
+        name: trait_.name.as_str(),
+        span: trait_.name_span,
+        is_pub: trait_.is_pub,
+    }));
+    declarations.extend(program.consts.iter().map(|constant| ItemDecl {
+        namespace: ItemNamespace::Const,
+        kind: "constant",
+        name: constant.name.as_str(),
+        span: constant.name_span,
+        is_pub: constant.is_pub,
+    }));
+    declarations.sort_by_key(|declaration| declaration.span.start);
+    declarations
+}
+
+/// Whether a module declares `name` in any importable program namespace, and
+/// whether at least one such declaration is public. A restrictive import is a
+/// name filter, so a public item is importable even if a separate namespace has
+/// a private item with the same spelling; an actual reference is checked in its
+/// own namespace below.
+fn named_item_visibility(program: &Program, name: &str) -> Option<bool> {
+    let mut found = false;
+    let mut any_public = false;
+    for is_public in program
+        .fns
+        .iter()
+        .chain(&program.fn_templates)
+        .filter(|f| f.name == name)
+        .map(|f| f.is_pub)
+        .chain(
+            program
+                .classes
+                .iter()
+                .chain(&program.class_templates)
+                .filter(|c| c.name == name)
+                .map(|c| c.is_pub),
+        )
+        .chain(
+            program
+                .records
+                .iter()
+                .filter(|r| r.name == name)
+                .map(|r| r.is_pub),
+        )
+        .chain(
+            program
+                .traits
+                .iter()
+                .filter(|t| t.name == name)
+                .map(|t| t.is_pub),
+        )
+        .chain(
+            program
+                .consts
+                .iter()
+                .filter(|c| c.name == name)
+                .map(|c| c.is_pub),
+        )
+    {
+        found = true;
+        any_public |= is_public;
+    }
+    found.then_some(any_public)
+}
 
 pub struct ModuleInfo {
     /// Path as shown in diagnostics.
@@ -153,6 +284,9 @@ pub fn load(
         }
         return Err((d, loading.set));
     }
+    if let Some(d) = first_name_collision(&loading) {
+        return Err((d, loading.set));
+    }
     if let Err(d) = enforce_visibility(&loading) {
         return Err((d, loading.set));
     }
@@ -168,28 +302,24 @@ pub fn load(
 /// text) sees the whole DAG. Enforced on the per-module parses, before
 /// the flat merge erases ownership.
 fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
-    use crate::ast::{Expr, ExprKind, Stmt, Ty};
-    use std::collections::HashMap;
+    use crate::ast::{Expr, ExprKind, GenericTy, RawOp, ResKind, Stmt, Ty, TypeArg};
 
-    // Global item index: name → (owner module, pub).
-    let mut items: HashMap<&str, (usize, bool)> = HashMap::new();
+    // Each legal source namespace gets its own global index. Runtime items
+    // deliberately share one table; traits and constants do not participate
+    // in runtime-name resolution or runtime collision checks.
+    let mut runtime_items: HashMap<&str, (usize, bool)> = HashMap::new();
+    let mut trait_items: HashMap<&str, (usize, bool)> = HashMap::new();
     let mut consts: HashMap<&str, (usize, bool)> = HashMap::new();
     for (idx, p) in &loading.programs {
-        for f in &p.fns {
-            items.entry(f.name.as_str()).or_insert((*idx, f.is_pub));
-        }
-        for c in &p.classes {
-            items.entry(c.name.as_str()).or_insert((*idx, c.is_pub));
-        }
-        for r in &p.records {
-            items.entry(r.name.as_str()).or_insert((*idx, r.is_pub));
-        }
-        for t in &p.traits {
-            items.entry(t.name.as_str()).or_insert((*idx, t.is_pub));
-        }
-        for c in &p.consts {
-            consts.entry(c.name.as_str()).or_insert((*idx, c.is_pub));
-            items.entry(c.name.as_str()).or_insert((*idx, c.is_pub));
+        for declaration in item_declarations(p) {
+            let items = match declaration.namespace {
+                ItemNamespace::Runtime => &mut runtime_items,
+                ItemNamespace::Trait => &mut trait_items,
+                ItemNamespace::Const => &mut consts,
+            };
+            items
+                .entry(declaration.name)
+                .or_insert((*idx, declaration.is_pub));
         }
     }
 
@@ -202,104 +332,231 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
     };
 
     // May module `from` reference `name`?
-    let check = |from: usize, name: &str, span: Span| -> Result<(), Diagnostic> {
-        let Some(&(owner, is_pub)) = items.get(name) else {
-            return Ok(()); // unknown names are the checker's diagnostics
-        };
-        if owner == from {
-            return Ok(());
-        }
-        if !is_pub {
-            return Err(Diagnostic {
-                name: "module.private".into(),
-                title: format!("`{name}` is private to module `{}`", module_name(owner)),
-                span,
-                label: "not exported".into(),
-                notes: vec![(
-                    "note".into(),
-                    format!(
-                        "mark it `pub` in {} to export it",
-                        loading.set.modules[owner].display
-                    ),
-                )],
-            });
-        }
-        let edge = loading
-            .imports
-            .iter()
-            .find(|(f, _, dep)| *f == from && *dep == owner);
-        match edge {
-            None => Err(Diagnostic {
-                name: "module.not_imported".into(),
-                title: format!(
-                    "`{name}` is in module `{}`, which this module does not import",
-                    module_name(owner)
-                ),
-                span,
-                label: "no direct `use` for its module".into(),
-                notes: vec![(
-                    "note".into(),
-                    format!(
-                        "the program language sees direct imports only; add `use {};`",
-                        module_name(owner)
-                    ),
-                )],
-            }),
-            Some((_, u, _)) => match &u.names {
-                None => Ok(()),
-                Some(list) if list.iter().any(|n| n == name) => Ok(()),
-                Some(_) => Err(Diagnostic {
+    let check =
+        |from: usize, namespace: ItemNamespace, name: &str, span: Span| -> Result<(), Diagnostic> {
+            let items = match namespace {
+                ItemNamespace::Runtime => &runtime_items,
+                ItemNamespace::Trait => &trait_items,
+                ItemNamespace::Const => &consts,
+            };
+            let Some(&(owner, is_pub)) = items.get(name) else {
+                return Ok(()); // unknown names are the checker's diagnostics
+            };
+            if owner == from {
+                return Ok(());
+            }
+            if !is_pub {
+                return Err(Diagnostic {
+                    name: "module.private".into(),
+                    title: format!("`{name}` is private to module `{}`", module_name(owner)),
+                    span,
+                    label: "not exported".into(),
+                    notes: vec![(
+                        "note".into(),
+                        format!(
+                            "mark it `pub` in {} to export it",
+                            loading.set.modules[owner].display
+                        ),
+                    )],
+                });
+            }
+            let edge = loading
+                .imports
+                .iter()
+                .find(|(f, _, dep)| *f == from && *dep == owner);
+            match edge {
+                None => Err(Diagnostic {
                     name: "module.not_imported".into(),
                     title: format!(
-                        "`{name}` is not in this module's `use {}::{{…}}` list",
+                        "`{name}` is in module `{}`, which this module does not import",
                         module_name(owner)
                     ),
                     span,
-                    label: "not imported by the list".into(),
+                    label: "no direct `use` for its module".into(),
                     notes: vec![(
                         "note".into(),
-                        "a listed import is restrictive: add the name to the list, \
-                         or import the module wholesale"
-                            .into(),
+                        format!(
+                            "the program language sees direct imports only; add `use {};`",
+                            module_name(owner)
+                        ),
                     )],
                 }),
-            },
+                Some((_, u, _)) => match &u.names {
+                    None => Ok(()),
+                    Some(list) if list.iter().any(|n| n == name) => Ok(()),
+                    Some(_) => Err(Diagnostic {
+                        name: "module.not_imported".into(),
+                        title: format!(
+                            "`{name}` is not in this module's `use {}::{{…}}` list",
+                            module_name(owner)
+                        ),
+                        span,
+                        label: "not imported by the list".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "a listed import is restrictive: add the name to the list, \
+                         or import the module wholesale"
+                                .into(),
+                        )],
+                    }),
+                },
+            }
+        };
+
+    fn walk_type_args(type_args: &[TypeArg], refs: &mut Vec<(ItemNamespace, String, Span)>) {
+        fn walk_type(ty: &GenericTy, span: Span, refs: &mut Vec<(ItemNamespace, String, Span)>) {
+            match ty {
+                GenericTy::Record(name) => {
+                    refs.push((ItemNamespace::Runtime, name.clone(), span));
+                }
+                GenericTy::Class { name, args } => {
+                    refs.push((ItemNamespace::Runtime, name.clone(), span));
+                    for argument in args {
+                        walk_type(argument, span, refs);
+                    }
+                }
+                GenericTy::Array(element) | GenericTy::Option(element) => {
+                    walk_type(element, span, refs);
+                }
+                GenericTy::Int(_) | GenericTy::Param(_) | GenericTy::Bool => {}
+            }
         }
-    };
+
+        for argument in type_args {
+            walk_type(&argument.ty, argument.span, refs);
+        }
+    }
+
+    fn push_record_ref(
+        index: usize,
+        span: Span,
+        record_externs: &[String],
+        refs: &mut Vec<(ItemNamespace, String, Span)>,
+    ) {
+        if let Some(name) = record_externs.get(index) {
+            refs.push((ItemNamespace::Runtime, name.clone(), span));
+        }
+    }
+
+    /// Collect every nominal reference carried by a checked `Ty`. Keeping the
+    /// match exhaustive makes a new type form a visibility-pass compile error
+    /// rather than an accidental bypass.
+    fn walk_ty(
+        ty: &Ty,
+        span: Span,
+        externs: &[String],
+        record_externs: &[String],
+        refs: &mut Vec<(ItemNamespace, String, Span)>,
+    ) {
+        match ty {
+            Ty::Class(index) | Ty::ClassRef(index, _) => {
+                if let Some(name) = externs.get(*index) {
+                    refs.push((ItemNamespace::Runtime, name.clone(), span));
+                }
+            }
+            Ty::Record(index) | Ty::RawRecord(index) | Ty::OptionRaw(index) => {
+                push_record_ref(*index, span, record_externs, refs);
+            }
+            Ty::Res(kind) | Ty::ResRef(kind, _) => {
+                let record = match kind {
+                    ResKind::PointsToRecord(index) | ResKind::ResourceMapPointsToRecord(index) => {
+                        Some(*index)
+                    }
+                    ResKind::RawSpan
+                    | ResKind::PointsToU64
+                    | ResKind::OpenFile
+                    | ResKind::PosixWorld
+                    | ResKind::Uart
+                    | ResKind::SystemDealloc
+                    | ResKind::AllocatorState
+                    | ResKind::BlockLease
+                    | ResKind::LeasedPointsToU64
+                    | ResKind::FreeBlock
+                    | ResKind::FreeHeader
+                    | ResKind::ResourceMapPointsToU64 => None,
+                };
+                if let Some(index) = record {
+                    push_record_ref(index, span, record_externs, refs);
+                }
+            }
+            Ty::Int(_) | Ty::Bool | Ty::Array(_, _) | Ty::Option(_) | Ty::Raw(_) | Ty::Unit => {}
+        }
+    }
+
+    /// Return the nominal record tag carried by a typed raw operation. This is
+    /// deliberately exhaustive for the same fail-closed reason as `walk_ty`.
+    fn raw_op_record_index(op: RawOp) -> Option<usize> {
+        match op {
+            RawOp::IntoCellRecord(index)
+            | RawOp::FromCellRecord(index)
+            | RawOp::CellInitRecord(index)
+            | RawOp::CellReadRecord(index)
+            | RawOp::CellTakeRecord(index)
+            | RawOp::CellDropRecord(index)
+            | RawOp::CastRecord(index)
+            | RawOp::PointerOffsetRecord(index) => Some(index),
+            RawOp::Offset
+            | RawOp::Load8
+            | RawOp::Store8
+            | RawOp::Copy
+            | RawOp::IntoCellU64
+            | RawOp::FromCellU64
+            | RawOp::CellInitU64
+            | RawOp::CellReadU64
+            | RawOp::CellTakeU64
+            | RawOp::CellDropU64
+            | RawOp::IntoFreeHeader
+            | RawOp::FromFreeHeader
+            | RawOp::HeaderInit
+            | RawOp::HeaderSize
+            | RawOp::HeaderNext
+            | RawOp::HeaderClear => None,
+        }
+    }
 
     fn walk_expr(
         e: &Expr,
-        refs: &mut Vec<(String, Span)>,
+        refs: &mut Vec<(ItemNamespace, String, Span)>,
         const_names: &HashMap<&str, (usize, bool)>,
+        record_externs: &[String],
     ) {
         match &e.kind {
-            ExprKind::ResOp { args, .. }
-            | ExprKind::RawOp { args, .. }
-            | ExprKind::DeviceOp { args, .. } => {
+            ExprKind::ResOp { args, .. } | ExprKind::DeviceOp { args, .. } => {
                 for a in args {
-                    walk_expr(a, refs, const_names);
+                    walk_expr(a, refs, const_names, record_externs);
+                }
+            }
+            ExprKind::RawOp { op, op_span, args } => {
+                if let Some(index) = raw_op_record_index(*op) {
+                    push_record_ref(index, *op_span, record_externs, refs);
+                }
+                for a in args {
+                    walk_expr(a, refs, const_names, record_externs);
                 }
             }
             ExprKind::Call {
                 callee,
                 callee_span,
+                type_args,
                 args,
-                ..
             } => {
-                refs.push((callee.clone(), *callee_span));
+                refs.push((ItemNamespace::Runtime, callee.clone(), *callee_span));
+                walk_type_args(type_args, refs);
                 for a in args {
-                    walk_expr(a, refs, const_names);
+                    walk_expr(a, refs, const_names, record_externs);
                 }
             }
             ExprKind::CtorCall {
                 class,
                 class_span,
+                type_args,
                 args,
                 ..
             } => {
-                refs.push((class.clone(), *class_span));
+                refs.push((ItemNamespace::Runtime, class.clone(), *class_span));
+                walk_type_args(type_args, refs);
                 for a in args {
-                    walk_expr(a, refs, const_names);
+                    walk_expr(a, refs, const_names, record_externs);
                 }
             }
             ExprKind::RecordLit {
@@ -307,46 +564,50 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 record_span,
                 args,
             } => {
-                refs.push((record.clone(), *record_span));
+                refs.push((ItemNamespace::Runtime, record.clone(), *record_span));
                 for a in args {
-                    walk_expr(a, refs, const_names);
+                    walk_expr(a, refs, const_names, record_externs);
                 }
             }
             ExprKind::MethodCall { args, .. } | ExprKind::TraitCall { args, .. } => {
                 for a in args {
-                    walk_expr(a, refs, const_names);
+                    walk_expr(a, refs, const_names, record_externs);
                 }
             }
             ExprKind::Var(name) => {
                 // Bare tokens are how consts are referenced (the const
                 // pass substitutes them); only const names count.
                 if const_names.contains_key(name.as_str()) {
-                    refs.push((name.clone(), e.span));
+                    refs.push((ItemNamespace::Const, name.clone(), e.span));
                 }
             }
-            ExprKind::Unary { operand, .. } => walk_expr(operand, refs, const_names),
+            ExprKind::Unary { operand, .. } => {
+                walk_expr(operand, refs, const_names, record_externs)
+            }
             ExprKind::Binary { lhs, rhs, .. } => {
-                walk_expr(lhs, refs, const_names);
-                walk_expr(rhs, refs, const_names);
+                walk_expr(lhs, refs, const_names, record_externs);
+                walk_expr(rhs, refs, const_names, record_externs);
             }
             ExprKind::Index { index, .. }
             | ExprKind::ClassFieldIndex { index, .. }
-            | ExprKind::SelfFieldIndex { index, .. } => walk_expr(index, refs, const_names),
+            | ExprKind::SelfFieldIndex { index, .. } => {
+                walk_expr(index, refs, const_names, record_externs)
+            }
             ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => {
-                walk_expr(arg, refs, const_names)
+                walk_expr(arg, refs, const_names, record_externs)
             }
             ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
-                walk_expr(operand, refs, const_names)
+                walk_expr(operand, refs, const_names, record_externs)
             }
-            ExprKind::SomeE(inner) => walk_expr(inner, refs, const_names),
+            ExprKind::SomeE(inner) => walk_expr(inner, refs, const_names, record_externs),
             ExprKind::ArrayLit(elems) => {
                 for el in elems {
-                    walk_expr(el, refs, const_names);
+                    walk_expr(el, refs, const_names, record_externs);
                 }
             }
             ExprKind::AllocArray { len, init, .. } => {
-                walk_expr(len, refs, const_names);
-                walk_expr(init, refs, const_names);
+                walk_expr(len, refs, const_names, record_externs);
+                walk_expr(init, refs, const_names, record_externs);
             }
             ExprKind::IntLit(_)
             | ExprKind::BoolLit(_)
@@ -363,40 +624,50 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
 
     fn walk_stmts(
         stmts: &[Stmt],
-        refs: &mut Vec<(String, Span)>,
+        refs: &mut Vec<(ItemNamespace, String, Span)>,
         const_names: &HashMap<&str, (usize, bool)>,
+        externs: &[String],
+        record_externs: &[String],
     ) {
         for s in stmts {
             match s {
-                Stmt::Decl { init, .. } => {
+                Stmt::Decl {
+                    ty,
+                    name_span,
+                    init,
+                    ..
+                } => {
+                    walk_ty(ty, *name_span, externs, record_externs, refs);
                     if let Some(e) = init {
-                        walk_expr(e, refs, const_names);
+                        walk_expr(e, refs, const_names, record_externs);
                     }
                 }
-                Stmt::Assign { value, .. } => walk_expr(value, refs, const_names),
-                Stmt::VarDecl { init, .. } => walk_expr(init, refs, const_names),
-                Stmt::ExprStmt(e) => walk_expr(e, refs, const_names),
+                Stmt::Assign { value, .. } => walk_expr(value, refs, const_names, record_externs),
+                Stmt::VarDecl { init, .. } => walk_expr(init, refs, const_names, record_externs),
+                Stmt::ExprStmt(e) => walk_expr(e, refs, const_names, record_externs),
                 Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
-                    walk_expr(size, refs, const_names)
+                    walk_expr(size, refs, const_names, record_externs)
                 }
                 Stmt::SystemDealloc {
                     ptr, res, release, ..
                 } => {
-                    walk_expr(ptr, refs, const_names);
-                    walk_expr(res, refs, const_names);
-                    walk_expr(release, refs, const_names);
+                    walk_expr(ptr, refs, const_names, record_externs);
+                    walk_expr(res, refs, const_names, record_externs);
+                    walk_expr(release, refs, const_names, record_externs);
                 }
                 Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
-                    walk_stmts(body, refs, const_names)
+                    walk_stmts(body, refs, const_names, externs, record_externs)
                 }
-                Stmt::FieldAssign { value, .. } => walk_expr(value, refs, const_names),
+                Stmt::FieldAssign { value, .. } => {
+                    walk_expr(value, refs, const_names, record_externs)
+                }
                 Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
-                    walk_expr(index, refs, const_names);
-                    walk_expr(value, refs, const_names);
+                    walk_expr(index, refs, const_names, record_externs);
+                    walk_expr(value, refs, const_names, record_externs);
                 }
                 Stmt::Return { value, .. } => {
                     if let Some(e) = value {
-                        walk_expr(e, refs, const_names);
+                        walk_expr(e, refs, const_names, record_externs);
                     }
                 }
                 Stmt::If {
@@ -404,15 +675,15 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     then_block,
                     else_block,
                 } => {
-                    walk_expr(cond, refs, const_names);
-                    walk_stmts(then_block, refs, const_names);
+                    walk_expr(cond, refs, const_names, record_externs);
+                    walk_stmts(then_block, refs, const_names, externs, record_externs);
                     if let Some(eb) = else_block {
-                        walk_stmts(eb, refs, const_names);
+                        walk_stmts(eb, refs, const_names, externs, record_externs);
                     }
                 }
                 Stmt::While { cond, body, .. } => {
-                    walk_expr(cond, refs, const_names);
-                    walk_stmts(body, refs, const_names);
+                    walk_expr(cond, refs, const_names, record_externs);
+                    walk_stmts(body, refs, const_names, externs, record_externs);
                 }
                 Stmt::Assert(_) => {}
             }
@@ -432,40 +703,20 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             .find(|(i, _)| i == idx)
             .map(|(_, e)| e.as_slice())
             .unwrap_or(&[]);
-        let mut refs: Vec<(String, Span)> = Vec::new();
+        let mut refs: Vec<(ItemNamespace, String, Span)> = Vec::new();
 
-        let walk_fn = |f: &crate::ast::Fn, refs: &mut Vec<(String, Span)>| {
-            walk_stmts(&f.body, refs, &consts);
+        let walk_fn = |f: &crate::ast::Fn, refs: &mut Vec<(ItemNamespace, String, Span)>| {
+            walk_stmts(&f.body, refs, &consts, externs, record_externs);
             for (ty, span) in f
                 .params
                 .iter()
                 .map(|pa| (&pa.ty, pa.span))
                 .chain(std::iter::once((&f.ret, f.name_span)))
             {
-                match ty {
-                    Ty::Class(ci) | Ty::ClassRef(ci, _) => {
-                        if let Some(name) = externs.get(*ci) {
-                            refs.push((name.clone(), span));
-                        }
-                    }
-                    Ty::Record(ri) | Ty::RawRecord(ri) | Ty::OptionRaw(ri) => {
-                        if let Some(name) = record_externs.get(*ri) {
-                            refs.push((name.clone(), span));
-                        }
-                    }
-                    Ty::Res(crate::ast::ResKind::PointsToRecord(ri))
-                    | Ty::Res(crate::ast::ResKind::ResourceMapPointsToRecord(ri))
-                    | Ty::ResRef(crate::ast::ResKind::PointsToRecord(ri), _)
-                    | Ty::ResRef(crate::ast::ResKind::ResourceMapPointsToRecord(ri), _) => {
-                        if let Some(name) = record_externs.get(*ri) {
-                            refs.push((name.clone(), span));
-                        }
-                    }
-                    _ => {}
-                }
+                walk_ty(ty, span, externs, record_externs, refs);
             }
             for b in f.type_bounds.iter().flatten() {
-                refs.push((b.clone(), f.name_span));
+                refs.push((ItemNamespace::Trait, b.clone(), f.name_span));
             }
         };
 
@@ -480,72 +731,69 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 walk_fn(&m.f, &mut refs);
             }
             if let Some(d) = &c.deinit {
-                walk_stmts(d, &mut refs, &consts);
+                walk_stmts(d, &mut refs, &consts, externs, record_externs);
             }
             for fi in &c.fields {
-                if let Ty::Class(ci) | Ty::ClassRef(ci, _) = fi.ty {
-                    if let Some(name) = externs.get(ci) {
-                        refs.push((name.clone(), fi.span));
-                    }
-                }
+                walk_ty(&fi.ty, fi.span, externs, record_externs, &mut refs);
             }
             for b in c.type_bounds.iter().flatten() {
-                refs.push((b.clone(), c.name_span));
+                refs.push((ItemNamespace::Trait, b.clone(), c.name_span));
             }
         }
         for r in &p.records {
             for fi in &r.fields {
-                match fi.ty {
-                    Ty::RawRecord(ri) | Ty::OptionRaw(ri) | Ty::Record(ri) => {
-                        if let Some(name) = record_externs.get(ri) {
-                            refs.push((name.clone(), fi.span));
-                        }
-                    }
-                    _ => {}
-                }
+                walk_ty(&fi.ty, fi.span, externs, record_externs, &mut refs);
+            }
+        }
+        for trait_ in &p.traits {
+            for method in &trait_.methods {
+                walk_fn(method, &mut refs);
             }
         }
         for im in &p.impls {
-            refs.push((im.trait_name.clone(), im.trait_span));
+            refs.push((ItemNamespace::Trait, im.trait_name.clone(), im.trait_span));
             for f in &im.fns {
                 walk_fn(f, &mut refs);
             }
         }
         for ob in &p.operators {
-            refs.push((ob.fn_name.clone(), ob.span));
+            refs.push((ItemNamespace::Runtime, ob.fn_name.clone(), ob.span));
         }
         // A listed `use` may only name exports.
         for (from, u, dep) in &loading.imports {
             if from == idx {
                 if let Some(list) = &u.names {
                     for n in list {
-                        if let Some(&(owner, is_pub)) = items.get(n.as_str()) {
-                            if owner == *dep && !is_pub {
-                                return Err(Diagnostic {
-                                    name: "module.private".into(),
-                                    title: format!(
-                                        "`{n}` is private to module `{}`",
-                                        module_name(*dep)
+                        let (_, dep_program) = loading
+                            .programs
+                            .iter()
+                            .find(|(candidate, _)| candidate == dep)
+                            .expect("import target is loaded");
+                        if named_item_visibility(dep_program, n) == Some(false) {
+                            return Err(Diagnostic {
+                                name: "module.private".into(),
+                                title: format!(
+                                    "`{n}` is private to module `{}`",
+                                    module_name(*dep)
+                                ),
+                                span: u.span,
+                                label: "listed, but not exported".into(),
+                                notes: vec![(
+                                    "note".into(),
+                                    format!(
+                                        "mark it `pub` in {} to export it",
+                                        loading.set.modules[*dep].display
                                     ),
-                                    span: u.span,
-                                    label: "listed, but not exported".into(),
-                                    notes: vec![(
-                                        "note".into(),
-                                        format!(
-                                            "mark it `pub` in {} to export it",
-                                            loading.set.modules[*dep].display
-                                        ),
-                                    )],
-                                });
-                            }
+                                )],
+                            });
                         }
                     }
                 }
             }
         }
 
-        for (name, span) in refs {
-            check(*idx, &name, span)?;
+        for (namespace, name, span) in refs {
+            check(*idx, namespace, &name, span)?;
         }
     }
     Ok(())
@@ -669,13 +917,7 @@ fn load_file(
                 .find(|(i, _)| *i == dep_idx)
                 .expect("loaded");
             for n in names {
-                let known = dep.fns.iter().any(|f| f.name == *n)
-                    || dep.fn_templates.iter().any(|f| f.name == *n)
-                    || dep.classes.iter().any(|c| c.name == *n)
-                    || dep.class_templates.iter().any(|c| c.name == *n)
-                    || dep.records.iter().any(|r| r.name == *n)
-                    || dep.traits.iter().any(|t| t.name == *n);
-                if !known {
+                if named_item_visibility(dep, n).is_none() {
                     return Err(Diagnostic {
                         name: "module.unknown_name".into(),
                         title: format!("module `{}` has no `{n}`", u.module),
@@ -688,15 +930,32 @@ fn load_file(
         }
     }
 
-    // Dependencies are parsed; their classes (in merge order) seed this
-    // module's class-index space.
+    // Dependencies are parsed; their non-generic classes (in merge order)
+    // seed this module's checked class-index space. Generic templates travel
+    // in the separate name/arity table below and acquire no checked index.
     // Finish order, not load order: a module always finishes after its
     // dependencies, so concatenating classes in finish order puts every
     // module's own classes exactly where its parse assumed they were.
     let extern_classes: Vec<String> = loading
         .programs
         .iter()
-        .flat_map(|(_, p)| p.classes.iter().map(|c| c.name.clone()))
+        .flat_map(|(_, p)| {
+            p.classes
+                .iter()
+                .filter(|c| c.type_params.is_empty())
+                .map(|c| c.name.clone())
+        })
+        .collect();
+    let extern_generic_classes: Vec<(String, usize)> = loading
+        .programs
+        .iter()
+        .flat_map(|(_, p)| {
+            p.classes
+                .iter()
+                .filter(|c| !c.type_params.is_empty())
+                .chain(p.class_templates.iter())
+                .map(|c| (c.name.clone(), c.type_params.len()))
+        })
         .collect();
     let extern_records: Vec<String> = loading
         .programs
@@ -721,6 +980,7 @@ fn load_file(
         &combined_lines,
         &combined_program,
         &extern_classes,
+        &extern_generic_classes,
         &extern_records,
     )?;
     loading.programs.push((idx, program));
@@ -783,6 +1043,41 @@ fn shift(s: Span, base: usize) -> Span {
     Span::new(s.start + base, s.end + base)
 }
 
+/// Report the first cross-module collision within any legal item namespace.
+/// This runs before visibility so first-wins owner lookup cannot turn a link
+/// error into `module.private`/`module.not_imported`. Module finish order is
+/// the merge order; declaration spans restore source order within each module.
+fn first_name_collision(loading: &Loading) -> Option<Diagnostic> {
+    let mut runtime_owners: HashMap<&str, (usize, &'static str)> = HashMap::new();
+    let mut trait_owners: HashMap<&str, (usize, &'static str)> = HashMap::new();
+    let mut const_owners: HashMap<&str, (usize, &'static str)> = HashMap::new();
+    for (module, program) in &loading.programs {
+        for declaration in item_declarations(program) {
+            let owners = match declaration.namespace {
+                ItemNamespace::Runtime => &mut runtime_owners,
+                ItemNamespace::Trait => &mut trait_owners,
+                ItemNamespace::Const => &mut const_owners,
+            };
+            match owners.get(declaration.name) {
+                Some(&(owner, first_kind)) if owner != *module => {
+                    return Some(collision(
+                        declaration.namespace,
+                        first_kind,
+                        declaration.kind,
+                        declaration.name,
+                        declaration.span,
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    owners.insert(declaration.name, (*module, declaration.kind));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Flat merge, in **finish order**. Class-index consistency requires the
 /// same order each parse saw as `extern_classes`: the classes of every
 /// module that had already finished, concatenated in finish order, with
@@ -797,17 +1092,44 @@ fn merge(loading: Loading) -> Result<(Program, ModuleSet), (Diagnostic, ModuleSe
     for (_, p) in it {
         for f in &p.fns {
             if merged.fns.iter().any(|g| g.name == f.name) {
-                return Err((collision("function", &f.name, f.name_span), loading.set));
+                return Err((
+                    collision(
+                        ItemNamespace::Runtime,
+                        "function",
+                        "function",
+                        &f.name,
+                        f.name_span,
+                    ),
+                    loading.set,
+                ));
             }
         }
         for c in &p.classes {
             if merged.classes.iter().any(|d| d.name == c.name) {
-                return Err((collision("class", &c.name, c.name_span), loading.set));
+                return Err((
+                    collision(
+                        ItemNamespace::Runtime,
+                        "class",
+                        "class",
+                        &c.name,
+                        c.name_span,
+                    ),
+                    loading.set,
+                ));
             }
         }
         for r in &p.records {
             if merged.records.iter().any(|d| d.name == r.name) {
-                return Err((collision("record", &r.name, r.name_span), loading.set));
+                return Err((
+                    collision(
+                        ItemNamespace::Runtime,
+                        "record",
+                        "record",
+                        &r.name,
+                        r.name_span,
+                    ),
+                    loading.set,
+                ));
             }
         }
         merged.fns.extend(p.fns);
@@ -827,15 +1149,393 @@ fn merge(loading: Loading) -> Result<(Program, ModuleSet), (Diagnostic, ModuleSe
     Ok((merged, loading.set))
 }
 
-fn collision(what: &str, name: &str, span: Span) -> Diagnostic {
+fn collision(
+    namespace: ItemNamespace,
+    first_kind: &str,
+    second_kind: &str,
+    name: &str,
+    span: Span,
+) -> Diagnostic {
+    let title = if first_kind == second_kind {
+        format!("{second_kind} `{name}` is declared in two modules")
+    } else {
+        format!("`{name}` is declared as a {first_kind} and a {second_kind} in two modules")
+    };
+    let note = match namespace {
+        ItemNamespace::Runtime => {
+            "functions, classes, and records share one flat runtime namespace in v1; \
+             rename one of them"
+        }
+        ItemNamespace::Trait => {
+            "a trait name has one owner in the linked program; rename one declaration"
+        }
+        ItemNamespace::Const => {
+            "a constant name has one owner in the linked program; rename one declaration"
+        }
+    };
     Diagnostic {
         name: "module.name_collision".into(),
-        title: format!("{what} `{name}` is declared in two modules"),
+        title,
         span,
         label: "second declaration here".into(),
-        notes: vec![(
-            "note".into(),
-            "imports are a flat namespace in v1; rename one of them".into(),
-        )],
+        notes: vec![("note".into(), note.into())],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    struct FixtureDir {
+        path: PathBuf,
+    }
+
+    impl FixtureDir {
+        fn new(files: &[(&str, &str)]) -> FixtureDir {
+            let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sable-module-namespace-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("create module fixture directory");
+            for (name, source) in files {
+                fs::write(path.join(name), source).expect("write module fixture");
+            }
+            FixtureDir { path }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.path.join("root.sable")
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn load_error(fixture: &FixtureDir) -> Diagnostic {
+        match load(&fixture.root(), &[]) {
+            Err((diagnostic, _)) => diagnostic,
+            Ok(_) => panic!("module fixture unexpectedly loaded"),
+        }
+    }
+
+    #[test]
+    fn runtime_traits_and_consts_use_separate_visibility_namespaces() {
+        let fixture = FixtureDir::new(&[
+            (
+                "runtime_names.sable",
+                "fn shared(u64 value) -> u64 { return value; }\n",
+            ),
+            ("trait_names.sable", "pub trait shared {}\n"),
+            ("const_names.sable", "pub const u64 shared = 7;\n"),
+            (
+                "root.sable",
+                r#"use runtime_names;
+use trait_names::{shared};
+use const_names::{shared};
+
+fn identity<T: shared>(T value) -> T {
+    return value;
+}
+
+fn read_shared() -> u64 {
+    return shared;
+}
+"#,
+            ),
+        ]);
+
+        let (program, _) = load(&fixture.root(), &[]).unwrap_or_else(|(diagnostic, modules)| {
+            panic!(
+                "module fixture should load:\n{}",
+                modules.render(&diagnostic)
+            )
+        });
+        assert!(program.fns.iter().any(|function| function.name == "shared"));
+        assert!(program.traits.iter().any(|trait_| trait_.name == "shared"));
+        assert!(
+            program
+                .consts
+                .iter()
+                .any(|constant| constant.name == "shared")
+        );
+    }
+
+    #[test]
+    fn restrictive_imports_recognize_private_consts_before_visibility() {
+        let fixture = FixtureDir::new(&[
+            ("values.sable", "const u64 hidden = 7;\n"),
+            (
+                "root.sable",
+                "use values::{hidden};\nfn read_hidden() -> u64 { return hidden; }\n",
+            ),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.private");
+        assert!(diagnostic.title.contains("hidden"));
+    }
+
+    #[test]
+    fn recursive_type_arguments_obey_private_visibility() {
+        let fixture = FixtureDir::new(&[
+            (
+                "types.sable",
+                "record Hidden #[layout(size := 1, align := 1)] {}\n",
+            ),
+            (
+                "root.sable",
+                r#"use types;
+
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn read() -> u64 {
+    return identity<option<[Hidden]>>(7);
+}
+"#,
+            ),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.private");
+        assert!(diagnostic.title.contains("Hidden"));
+    }
+
+    #[test]
+    fn recursive_type_arguments_require_a_direct_import() {
+        let fixture = FixtureDir::new(&[
+            (
+                "types.sable",
+                "pub record Shared #[layout(size := 1, align := 1)] {}\n",
+            ),
+            ("middle.sable", "use types;\n"),
+            (
+                "root.sable",
+                r#"use middle;
+
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn read() -> u64 {
+    return identity<option<[Shared]>>(7);
+}
+"#,
+            ),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.not_imported");
+        assert!(diagnostic.title.contains("Shared"));
+    }
+
+    #[test]
+    fn explicit_local_types_obey_private_visibility() {
+        let fixture = FixtureDir::new(&[
+            (
+                "types.sable",
+                "record Hidden #[layout(size := 1, align := 1)] {}\n",
+            ),
+            (
+                "root.sable",
+                r#"use types;
+
+fn declare_hidden() {
+    raw<Hidden> pointer;
+}
+"#,
+            ),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.private");
+        assert!(diagnostic.title.contains("Hidden"));
+    }
+
+    #[test]
+    fn explicit_local_types_require_a_direct_import() {
+        let fixture = FixtureDir::new(&[
+            (
+                "types.sable",
+                "pub record Shared #[layout(size := 1, align := 1)] {}\n",
+            ),
+            ("middle.sable", "use types;\n"),
+            (
+                "root.sable",
+                r#"use middle;
+
+fn declare_shared() {
+    raw<Shared> pointer;
+}
+"#,
+            ),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.not_imported");
+        assert!(diagnostic.title.contains("Shared"));
+    }
+
+    #[test]
+    fn typed_raw_operations_obey_private_visibility() {
+        let fixture = FixtureDir::new(&[
+            (
+                "types.sable",
+                "record Hidden #[layout(size := 1, align := 1)] {}\n",
+            ),
+            (
+                "root.sable",
+                r#"use types;
+
+fn cast_hidden(raw<u8> pointer) -> u64 {
+    unsafe {
+        raw_cast<Hidden>(pointer);
+    }
+    return 0;
+}
+"#,
+            ),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.private");
+        assert!(diagnostic.title.contains("Hidden"));
+    }
+
+    #[test]
+    fn typed_raw_operations_require_a_direct_import() {
+        let fixture = FixtureDir::new(&[
+            (
+                "types.sable",
+                "pub record Shared #[layout(size := 1, align := 1)] {}\n",
+            ),
+            ("middle.sable", "use types;\n"),
+            (
+                "root.sable",
+                r#"use middle;
+
+fn cast_shared(raw<u8> pointer) -> u64 {
+    unsafe {
+        raw_cast<Shared>(pointer);
+    }
+    return 0;
+}
+"#,
+            ),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.not_imported");
+        assert!(diagnostic.title.contains("Shared"));
+    }
+
+    #[test]
+    fn every_cross_category_runtime_collision_is_a_module_collision() {
+        let cases = [
+            (
+                "fn clash() -> u64 { return 0; }\n",
+                "class clash {}\n",
+                "function",
+                "class",
+            ),
+            (
+                "class clash {}\n",
+                "record clash #[layout(size := 1, align := 1)] {}\n",
+                "class",
+                "record",
+            ),
+            (
+                "record clash #[layout(size := 1, align := 1)] {}\n",
+                "fn clash() -> u64 { return 0; }\n",
+                "record",
+                "function",
+            ),
+        ];
+
+        for (dependency, root_declaration, first_kind, second_kind) in cases {
+            let root = format!("use dependency;\n{root_declaration}");
+            let fixture =
+                FixtureDir::new(&[("dependency.sable", dependency), ("root.sable", &root)]);
+            let diagnostic = load_error(&fixture);
+            assert_eq!(diagnostic.name, "module.name_collision");
+            assert!(diagnostic.title.contains(first_kind));
+            assert!(diagnostic.title.contains(second_kind));
+            assert!(diagnostic.title.contains("clash"));
+        }
+    }
+
+    #[test]
+    fn duplicate_traits_and_consts_collide_within_their_own_namespaces() {
+        let cases = [
+            ("trait duplicate {}\n", "trait duplicate {}\n", "trait"),
+            (
+                "const u64 duplicate = 1;\n",
+                "const u64 duplicate = 2;\n",
+                "constant",
+            ),
+        ];
+
+        for (dependency, root_declaration, kind) in cases {
+            let root = format!("use dependency;\n{root_declaration}");
+            let fixture =
+                FixtureDir::new(&[("dependency.sable", dependency), ("root.sable", &root)]);
+            let diagnostic = load_error(&fixture);
+            assert_eq!(diagnostic.name, "module.name_collision");
+            assert!(diagnostic.title.contains(kind));
+            assert!(diagnostic.title.contains("duplicate"));
+        }
+    }
+
+    #[test]
+    fn collision_selection_is_source_ordered_across_item_namespaces() {
+        let root = r#"use dependency;
+
+const u64 constant_first = 2;
+trait trait_second {}
+"#;
+        let fixture = FixtureDir::new(&[
+            (
+                "dependency.sable",
+                "trait trait_second {}\nconst u64 constant_first = 1;\n",
+            ),
+            ("root.sable", root),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.name_collision");
+        assert!(diagnostic.title.contains("constant_first"));
+        assert!(!diagnostic.title.contains("trait_second"));
+        assert_eq!(diagnostic.span.start, root.find("constant_first").unwrap());
+    }
+
+    #[test]
+    fn runtime_collision_selection_follows_source_order_within_a_module() {
+        let root = r#"use dependency;
+
+record beta #[layout(size := 1, align := 1)] {}
+class alpha {}
+"#;
+        let fixture = FixtureDir::new(&[
+            (
+                "dependency.sable",
+                "fn alpha() -> u64 { return 0; }\nfn beta() -> u64 { return 0; }\n",
+            ),
+            ("root.sable", root),
+        ]);
+
+        let diagnostic = load_error(&fixture);
+        assert_eq!(diagnostic.name, "module.name_collision");
+        assert!(diagnostic.title.contains("beta"));
+        assert!(!diagnostic.title.contains("alpha"));
+        assert_eq!(diagnostic.span.start, root.find("beta").unwrap());
     }
 }
