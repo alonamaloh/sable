@@ -1868,6 +1868,19 @@ typing, updating, and clearing a header cannot change allocator identity,
 block key, or the remaining payload extent. Then implement one linked free-map
 walk vertically before adding allocation policy or randomized testing.
 
+**The U8e header authority shape is proved (2026-08-12, ADR 0041).** A real
+in-band node needs two aligned `u64` cells: whole-block size and next key. The
+first one-word probe was rejected because ghost `SpanView.len` erases and
+cannot drive runtime splitting. The corrected `FreeHeaderView` retains
+allocator identity and block key beside distinct size/link cells and the raw
+payload; its 16-byte minimum, disjointness, field updates, `u64` bounds,
+clearing, and whole-block round trip are kernel-checked.
+
+Next implement only this mandatory header role and its sealed transitions.
+Then probe one traversal step and choose a sentinel/link-order policy from the
+proof and runtime needs; do not bury that decision inside the eventual search
+loop.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;
