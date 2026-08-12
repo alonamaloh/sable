@@ -134,6 +134,10 @@ structure Allocation where
   size : Int
   live : Bool
   bytes : Seq RawByte
+  /-- Starts of abstract typed `u64` extents. Outer `none` means raw
+  bytes; `some none` is an uninitialized cell; `some (some v)` is an
+  initialized one (ADR 0031). -/
+  cellsU64 : Int → Option (Option Int)
 
 /-- The raw heap: a fresh-provenance counter and a partial map from
 allocation ids. Ids at or above `next` are unallocated, which is what
@@ -151,13 +155,19 @@ construction: the machine must be able to *compute* this, since it is
 the difference between a store and `undef`. -/
 def RawHeap.inBounds (μ : RawHeap) (a k : Int) : Bool :=
   match μ.allocs a with
-  | some al => al.live && decide (0 ≤ k) && decide (k < al.size)
+  | some al =>
+      let base := k - k.emod 8
+      al.live && decide (0 ≤ k) && decide (k < al.size) && decide (al.cellsU64 base = none)
   | none => false
 
 /-- The byte at `(a, k)`, if that address is in a live allocation. -/
 def RawHeap.byteAt (μ : RawHeap) (a k : Int) : Option RawByte :=
   match μ.allocs a with
-  | some al => if al.live ∧ 0 ≤ k ∧ k < al.size then some (al.bytes.get k) else none
+  | some al =>
+      let base := k - k.emod 8
+      if al.live ∧ 0 ≤ k ∧ k < al.size ∧ al.cellsU64 base = none then
+        some (al.bytes.get k)
+      else none
   | none => none
 
 /-- The initialized byte at `(a, k)`, if there is one. `none` covers all
@@ -181,6 +191,36 @@ def RawHeap.store (μ : RawHeap) (a k : Int) (b : RawByte) : RawHeap :=
       if i = a then (μ.allocs i).map (fun al => { al with bytes := al.bytes.set k b })
       else μ.allocs i }
 
+/-- Whether eight aligned raw bytes may change role into one typed cell. -/
+def RawHeap.cellConvertibleU64 (μ : RawHeap) (a k : Int) : Bool :=
+  match μ.allocs a with
+  | some al =>
+      al.live && decide (0 ≤ k) && decide (k % 8 = 0) &&
+        decide (k + 8 ≤ al.size) && decide (al.cellsU64 k = none)
+  | none => false
+
+def RawHeap.cellAtU64 (μ : RawHeap) (a k : Int) : Option (Option Int) :=
+  match μ.allocs a with
+  | some al => if al.live then al.cellsU64 k else none
+  | none => none
+
+def RawHeap.putCellU64 (μ : RawHeap) (a k : Int) (s : Option Int) : RawHeap :=
+  { μ with allocs := fun i =>
+      if i = a then (μ.allocs i).map (fun al =>
+        { al with cellsU64 := fun j => if j = k then some s else al.cellsU64 j })
+      else μ.allocs i }
+
+/-- Remove an uninitialized typed tag and explicitly zero the raw extent.
+The zero fill is cleanup, not a byte representation of a typed value. -/
+def RawHeap.removeCellU64 (μ : RawHeap) (a k : Int) : RawHeap :=
+  { μ with allocs := fun i =>
+      if i = a then (μ.allocs i).map (fun al =>
+        { al with
+          cellsU64 := fun j => if j = k then none else al.cellsU64 j
+          bytes := ⟨al.bytes.len, fun j =>
+            if k ≤ j ∧ j < k + 8 then .init 0 else al.bytes.get j⟩ })
+      else μ.allocs i }
+
 /-- Mark an allocation dead. The entry stays, so its id is never reused
 and a pointer into it stays distinguishable from a fresh one. -/
 def RawHeap.release (μ : RawHeap) (a : Int) : RawHeap :=
@@ -192,7 +232,9 @@ def RawHeap.release (μ : RawHeap) (a : Int) : RawHeap :=
 def RawHeap.fresh (μ : RawHeap) (size : Int) : RawHeap :=
   { next := μ.next + 1,
     allocs := fun i =>
-      if i = μ.next then some ⟨size, true, ⟨size, fun _ => .uninit⟩⟩ else μ.allocs i }
+      if i = μ.next then
+        some ⟨size, true, ⟨size, fun _ => .uninit⟩, fun _ => none⟩
+      else μ.allocs i }
 
 /-- Terminal trap outcomes, distinct from normal termination. These are
 *structural* (they carry the operation and the offending data); the
@@ -311,6 +353,15 @@ inductive Stmt where
   storage uninitialized. Reading it again is `undef` until it is written
   back, which is what makes a move out of raw memory expressible. -/
   | rawTake8  (dst : String) (p : Expr)
+  /-- Change an aligned eight-byte raw extent into an uninitialized
+  abstract typed `u64` cell, discarding the former byte contents. -/
+  | rawIntoCellU64 (p : Expr)
+  /-- Remove an uninitialized typed tag and zero the eight raw bytes. -/
+  | rawFromCellU64 (p : Expr)
+  | rawCellInitU64 (p v : Expr)
+  | rawCellReadU64 (dst : String) (p : Expr)
+  | rawCellTakeU64 (dst : String) (p : Expr)
+  | rawCellDropU64 (p : Expr)
 
 /-! ## Environments
 
@@ -960,6 +1011,121 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort ab)) :
       Step P cap (.run (.rawTake8 dst e :: k) ρ σ μ) ab.toConfig
+  -- typed u64 cells (ADR 0031): role conversion is explicit, and byte
+  -- operations cannot observe an extent while its typed tag is present.
+  | intoCellU64_ok {ρ : Env} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : μ.cellConvertibleU64 a k' = true) :
+      Step P cap (.run (.rawIntoCellU64 e :: k) ρ σ μ)
+        (.run k ρ σ (μ.putCellU64 a k' none))
+  | intoCellU64_bad {ρ : Env} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : μ.cellConvertibleU64 a k' = false) :
+      Step P cap (.run (.rawIntoCellU64 e :: k) ρ σ μ) .undef
+  | intoCellU64_undef_ptr {ρ : Env} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawIntoCellU64 e :: k) ρ σ μ) .undef
+  | intoCellU64_abort {ρ : Env} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawIntoCellU64 e :: k) ρ σ μ) ab.toConfig
+  | fromCellU64_ok {ρ : Env} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : μ.cellAtU64 a k' = some none) :
+      Step P cap (.run (.rawFromCellU64 e :: k) ρ σ μ)
+        (.run k ρ σ (μ.removeCellU64 a k'))
+  | fromCellU64_bad {ρ : Env} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : μ.cellAtU64 a k' ≠ some none) :
+      Step P cap (.run (.rawFromCellU64 e :: k) ρ σ μ) .undef
+  | fromCellU64_undef_ptr {ρ : Env} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawFromCellU64 e :: k) ρ σ μ) .undef
+  | fromCellU64_abort {ρ : Env} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawFromCellU64 e :: k) ρ σ μ) ab.toConfig
+  | cellInitU64_ok {ρ : Env} {ep ev : Expr} {a k' w : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok (.int w)))
+      (hr : IntTy.u64.inRange w) (hc : μ.cellAtU64 a k' = some none) :
+      Step P cap (.run (.rawCellInitU64 ep ev :: k) ρ σ μ)
+        (.run k ρ σ (μ.putCellU64 a k' (some w)))
+  | cellInitU64_bad {ρ : Env} {ep ev : Expr} {a k' w : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok (.int w)))
+      (hbad : ¬ IntTy.u64.inRange w ∨ μ.cellAtU64 a k' ≠ some none) :
+      Step P cap (.run (.rawCellInitU64 ep ev :: k) ρ σ μ) .undef
+  | cellInitU64_undef_val {ρ : Env} {ep ev : Expr} {a k' : Int} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.ok v))
+      (hw : ∀ w, v ≠ .int w) :
+      Step P cap (.run (.rawCellInitU64 ep ev :: k) ρ σ μ) .undef
+  | cellInitU64_abort_val {ρ : Env} {ep ev : Expr} {a k' : Int} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok (.ptr a k'))) (hv : Eval cap ρ ev (.abort ab)) :
+      Step P cap (.run (.rawCellInitU64 ep ev :: k) ρ σ μ) ab.toConfig
+  | cellInitU64_undef_ptr {ρ : Env} {ep ev : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawCellInitU64 ep ev :: k) ρ σ μ) .undef
+  | cellInitU64_abort_ptr {ρ : Env} {ep ev : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hp : Eval cap ρ ep (.abort ab)) :
+      Step P cap (.run (.rawCellInitU64 ep ev :: k) ρ σ μ) ab.toConfig
+  | cellReadU64_ok {ρ : Env} {dst : String} {e : Expr} {a k' w : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : μ.cellAtU64 a k' = some (some w)) :
+      Step P cap (.run (.rawCellReadU64 dst e :: k) ρ σ μ)
+        (.run k (ρ.update dst (.int w)) σ μ)
+  | cellReadU64_bad {ρ : Env} {dst : String} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : ∀ w, μ.cellAtU64 a k' ≠ some (some w)) :
+      Step P cap (.run (.rawCellReadU64 dst e :: k) ρ σ μ) .undef
+  | cellReadU64_undef_ptr {ρ : Env} {dst : String} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawCellReadU64 dst e :: k) ρ σ μ) .undef
+  | cellReadU64_abort {ρ : Env} {dst : String} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawCellReadU64 dst e :: k) ρ σ μ) ab.toConfig
+  | cellTakeU64_ok {ρ : Env} {dst : String} {e : Expr} {a k' w : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : μ.cellAtU64 a k' = some (some w)) :
+      Step P cap (.run (.rawCellTakeU64 dst e :: k) ρ σ μ)
+        (.run k (ρ.update dst (.int w)) σ (μ.putCellU64 a k' none))
+  | cellTakeU64_bad {ρ : Env} {dst : String} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : ∀ w, μ.cellAtU64 a k' ≠ some (some w)) :
+      Step P cap (.run (.rawCellTakeU64 dst e :: k) ρ σ μ) .undef
+  | cellTakeU64_undef_ptr {ρ : Env} {dst : String} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawCellTakeU64 dst e :: k) ρ σ μ) .undef
+  | cellTakeU64_abort {ρ : Env} {dst : String} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawCellTakeU64 dst e :: k) ρ σ μ) ab.toConfig
+  | cellDropU64_ok {ρ : Env} {e : Expr} {a k' w : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : μ.cellAtU64 a k' = some (some w)) :
+      Step P cap (.run (.rawCellDropU64 e :: k) ρ σ μ)
+        (.run k ρ σ (μ.putCellU64 a k' none))
+  | cellDropU64_bad {ρ : Env} {e : Expr} {a k' : Int}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok (.ptr a k'))) (hc : ∀ w, μ.cellAtU64 a k' ≠ some (some w)) :
+      Step P cap (.run (.rawCellDropU64 e :: k) ρ σ μ) .undef
+  | cellDropU64_undef_ptr {ρ : Env} {e : Expr} {v : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k', v ≠ .ptr a k') :
+      Step P cap (.run (.rawCellDropU64 e :: k) ρ σ μ) .undef
+  | cellDropU64_abort {ρ : Env} {e : Expr} {ab : Abort}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (h : Eval cap ρ e (.abort ab)) :
+      Step P cap (.run (.rawCellDropU64 e :: k) ρ σ μ) ab.toConfig
   -- fall off the end of a body: return unit
   | nil_ret {ρ : Env} {μ : RawHeap} :
       Step P cap (.run [] ρ [] μ) (.done .unit)

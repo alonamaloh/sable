@@ -121,6 +121,10 @@ pub enum Ty {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResKind {
     RawSpan,
+    /// One abstract `u64` typed extent. The source spelling is
+    /// `PointsTo<u64>`; wider generic layout follows only after this
+    /// complete vertical slice (ADR 0031).
+    PointsToU64,
     /// One open file description: the authority to use a descriptor, and
     /// the position that description is at (ADR 0028).
     OpenFile,
@@ -190,6 +194,16 @@ pub enum RawOp {
     /// resource &mut RawSpan d)` — the affine tokens are what supply
     /// separation, so there is no nonoverlap premise to discharge.
     Copy,
+    /// Convert exactly eight aligned raw bytes into an uninitialized typed
+    /// `u64` extent, discarding their former contents.
+    IntoCellU64,
+    /// Return an uninitialized typed `u64` extent to raw byte authority.
+    FromCellU64,
+    /// Initialize, copy-read, take, or drop a typed `u64` extent.
+    CellInitU64,
+    CellReadU64,
+    CellTakeU64,
+    CellDropU64,
 }
 
 impl RawOp {
@@ -199,6 +213,12 @@ impl RawOp {
             "raw_load8" => Some(RawOp::Load8),
             "raw_store8" => Some(RawOp::Store8),
             "raw_copy_nonoverlapping" => Some(RawOp::Copy),
+            "raw_into_cell_u64" => Some(RawOp::IntoCellU64),
+            "raw_from_cell_u64" => Some(RawOp::FromCellU64),
+            "raw_cell_init_u64" => Some(RawOp::CellInitU64),
+            "raw_cell_read_u64" => Some(RawOp::CellReadU64),
+            "raw_cell_take_u64" => Some(RawOp::CellTakeU64),
+            "raw_cell_drop_u64" => Some(RawOp::CellDropU64),
             _ => None,
         }
     }
@@ -209,6 +229,12 @@ impl RawOp {
             RawOp::Load8 => "raw_load8",
             RawOp::Store8 => "raw_store8",
             RawOp::Copy => "raw_copy_nonoverlapping",
+            RawOp::IntoCellU64 => "raw_into_cell_u64",
+            RawOp::FromCellU64 => "raw_from_cell_u64",
+            RawOp::CellInitU64 => "raw_cell_init_u64",
+            RawOp::CellReadU64 => "raw_cell_read_u64",
+            RawOp::CellTakeU64 => "raw_cell_take_u64",
+            RawOp::CellDropU64 => "raw_cell_drop_u64",
         }
     }
 
@@ -224,6 +250,9 @@ impl RawOp {
             RawOp::Load8 => 2,
             RawOp::Store8 => 3,
             RawOp::Copy => 5,
+            RawOp::IntoCellU64 | RawOp::FromCellU64 | RawOp::CellReadU64
+            | RawOp::CellTakeU64 | RawOp::CellDropU64 => 2,
+            RawOp::CellInitU64 => 3,
         }
     }
 }
@@ -241,6 +270,7 @@ impl ResKind {
     pub fn name(self) -> &'static str {
         match self {
             ResKind::RawSpan => "RawSpan",
+            ResKind::PointsToU64 => "PointsTo<u64>",
             ResKind::OpenFile => "OpenFile",
             ResKind::PosixWorld => "PosixWorld",
         }
@@ -250,6 +280,7 @@ impl ResKind {
     pub fn view_ty(self) -> &'static str {
         match self {
             ResKind::RawSpan => "Sable.SpanView",
+            ResKind::PointsToU64 => "Sable.PointsToView Int",
             ResKind::OpenFile => "Sable.OpenFileView",
             ResKind::PosixWorld => "Sable.PosixWorldView",
         }

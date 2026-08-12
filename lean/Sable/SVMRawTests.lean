@@ -2,11 +2,9 @@
 Direct SVM subjects for the raw heap.
 
 These are programs written in the machine's own syntax rather than
-lowered from Sable, because the raw operations have no source surface
-yet (that is lexical byte exposure, a later rung). They are `#guard`s, so
-`lake build` fails if an outcome moves — the same standing-regression
-role the agreement proofs play for the rule system, aimed at the
-*outcomes* instead.
+lowered from Sable. They are `#guard`s, so `lake build` fails if an
+outcome moves — the same standing-regression role the agreement proofs
+play for the rule system, aimed at the *outcomes* instead.
 
 What they pin: the valid path through alloc/store/load/take/free, and
 each way an invalid one reaches `undef` — out of bounds, uninitialized,
@@ -191,6 +189,74 @@ a store asks. -/
     .rawLoad8 "b" (.var "q"),
     .ret (.var "b") ]
   = "done int 7"
+
+/-! ## Abstract typed u64 cells (ADR 0031) -/
+
+#guard outcome
+  [ .rawAlloc "p" (u64 8),
+    .rawIntoCellU64 (.var "p"),
+    .rawCellInitU64 (.var "p") (u64 42),
+    .rawCellReadU64 "a" (.var "p"),
+    .rawCellTakeU64 "b" (.var "p"),
+    .rawFromCellU64 (.var "p"),
+    .ret (.var "b") ]
+  = "done int 42"
+
+/- Returning an empty cell zero-fills the raw extent. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 8),
+    .rawIntoCellU64 (.var "p"),
+    .rawCellInitU64 (.var "p") (u64 9),
+    .rawCellDropU64 (.var "p"),
+    .rawFromCellU64 (.var "p"),
+    .rawLoad8 "b" (.var "p"),
+    .ret (.var "b") ]
+  = "done int 0"
+
+/- Typed access before initialization is undefined. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 8),
+    .rawIntoCellU64 (.var "p"),
+    .rawCellReadU64 "b" (.var "p") ]
+  = "undef"
+
+/- Byte access cannot pierce an active typed extent. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 8),
+    .rawIntoCellU64 (.var "p"),
+    .rawStore8 (.ptrAdd (.var "p") (u64 3)) (u8 1) ]
+  = "undef"
+
+/- Runtime conversion requires an aligned address with eight live bytes.
+Exact resource extent is additionally a verifier obligation. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 9),
+    .rawIntoCellU64 (.ptrAdd (.var "p") (u64 1)) ]
+  = "undef"
+
+/- Initialization is a transition, not an overwrite operation. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 8),
+    .rawIntoCellU64 (.var "p"),
+    .rawCellInitU64 (.var "p") (u64 5),
+    .rawCellInitU64 (.var "p") (u64 6) ]
+  = "undef"
+
+/- Typed tags do not resurrect when their allocation is released. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 8),
+    .rawIntoCellU64 (.var "p"),
+    .rawFree (.var "p"),
+    .rawCellInitU64 (.var "p") (u64 1) ]
+  = "undef"
+
+/- An initialized cell cannot return to raw storage until taken/dropped. -/
+#guard outcome
+  [ .rawAlloc "p" (u64 8),
+    .rawIntoCellU64 (.var "p"),
+    .rawCellInitU64 (.var "p") (u64 5),
+    .rawFromCellU64 (.var "p") ]
+  = "undef"
 
 end SVM
 end Sable

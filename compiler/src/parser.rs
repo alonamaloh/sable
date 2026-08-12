@@ -655,26 +655,48 @@ impl<'a> Parser<'a> {
             None
         };
         let (name, name_span) = self.ident()?;
-        let Some(kind) = ResKind::from_name(&name) else {
-            return Err(Diagnostic {
-                name: "resource.unknown_type".into(),
-                title: format!("unknown resource type `{name}`"),
-                span: name_span,
-                label: "expected `RawSpan`".into(),
-                notes: vec![(
-                    "note".into(),
-                    "resource types are compiler-defined; a program may not declare \
-                     one, because it must not be able to fabricate authority by \
-                     constructing a view-shaped value"
-                        .into(),
-                )],
-            });
+        let (kind, end_span) = if name == "PointsTo" {
+            self.expect(Tok::Lt)?;
+            let (elem, elem_span) = self.int_ty()?;
+            let end = self.expect(Tok::Gt)?.span;
+            if elem != IntTy::U64 {
+                return Err(Diagnostic {
+                    name: "resource.points_to_type".into(),
+                    title: format!("`PointsTo<{}>` is not supported yet", elem.name()),
+                    span: elem_span,
+                    label: "the first typed-storage slice supports `PointsTo<u64>`".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "general `Layout<T>` follows after the fixed-width vertical slice \
+                         works through the checker, logic, interpreter, and machine"
+                            .into(),
+                    )],
+                });
+            }
+            (ResKind::PointsToU64, end)
+        } else {
+            let Some(kind) = ResKind::from_name(&name) else {
+                return Err(Diagnostic {
+                    name: "resource.unknown_type".into(),
+                    title: format!("unknown resource type `{name}`"),
+                    span: name_span,
+                    label: "expected `RawSpan`, `PointsTo<u64>`, or a built-in resource".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "resource types are compiler-defined; a program may not declare \
+                         one, because it must not be able to fabricate authority by \
+                         constructing a view-shaped value"
+                            .into(),
+                    )],
+                });
+            };
+            (kind, name_span)
         };
         let ty = match mutability {
             Some(m) => Ty::ResRef(kind, m),
             None => Ty::Res(kind),
         };
-        Ok((ty, start.join(name_span)))
+        Ok((ty, start.join(end_span)))
     }
 
     fn scalar_ty(&mut self) -> PResult<(Ty, Span)> {

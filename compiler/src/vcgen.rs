@@ -2151,6 +2151,185 @@ impl<'a> Generator<'a> {
                         self.env.insert(dname.clone(), Val::View(d2));
                         Val::Unit
                     }
+                    RawOp::IntoCellU64 => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(m) = self.eval(&args[1]) else {
+                            unreachable!("checked: span value")
+                        };
+                        let goal = format!(
+                            "({p}).alloc = ({m}).alloc ∧ ({p}).off = ({m}).off \
+                             ∧ ({m}).len = 8 ∧ ({m}).off % 8 = 0"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.cell_u64.from_raw", self.fname),
+                            "`raw_into_cell_u64` needs an aligned eight-byte raw extent".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let c = self.hinted_sym("_cell", hint);
+                        self.binders
+                            .push((c.clone(), ResKind::PointsToU64.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_cell", c.trim_start_matches('_')),
+                            format!("{c} = Sable.SpanView.toCellU64 ({m})"),
+                        );
+                        Val::View(c)
+                    }
+                    RawOp::FromCellU64 => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(c) = self.eval(&args[1]) else {
+                            unreachable!("checked: cell value")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({c}) ({p}) \
+                             ∧ ({c}).state = Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.cell_u64.to_raw", self.fname),
+                            "`raw_from_cell_u64` needs an uninitialized cell at this pointer"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let m = self.hinted_sym("_view", hint);
+                        self.binders
+                            .push((m.clone(), ResKind::RawSpan.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_span", m.trim_start_matches('_')),
+                            format!("{m} = Sable.PointsToView.toSpanU64 ({c})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_recon", m.trim_start_matches('_')),
+                            format!("Sable.SpanView.reconstructible {m}"),
+                        );
+                        Val::View(m)
+                    }
+                    RawOp::CellInitU64 => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::Int(w) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64")
+                        };
+                        let Val::View(c) = self.eval(&args[2]) else {
+                            unreachable!("checked: cell borrow")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({c}) ({p}) \
+                             ∧ ({c}).state = Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.cell_u64.init", self.fname),
+                            "`raw_cell_init_u64` needs an uninitialized cell at this pointer"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array: name, .. } = &args[2].kind else {
+                            unreachable!("checked: borrow arg")
+                        };
+                        let c2 = self.hinted_sym("_cell", Some(name.clone()));
+                        self.binders
+                            .push((c2.clone(), ResKind::PointsToU64.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{name}_init"),
+                            format!("{c2} = Sable.PointsToView.put ({c}) {w}"),
+                        );
+                        self.env.insert(name.clone(), Val::View(c2));
+                        Val::Unit
+                    }
+                    RawOp::CellReadU64 | RawOp::CellTakeU64 => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(c) = self.eval(&args[1]) else {
+                            unreachable!("checked: cell borrow")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({c}) ({p}) \
+                             ∧ ({c}).state ≠ Sable.CellState.uninit"
+                        );
+                        let opname = if matches!(op, RawOp::CellReadU64) {
+                            "read"
+                        } else {
+                            "take"
+                        };
+                        let ob = self.obligation(
+                            &format!("{}.cell_u64.{opname}", self.fname),
+                            format!("`raw_cell_{opname}_u64` needs an initialized cell at this pointer"),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let value = self.hinted_sym("_value", hint);
+                        self.binders.push((value.clone(), "Int".into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_cell_value", value.trim_start_matches('_')),
+                            format!("({c}).state = Sable.CellState.init {value}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_range", value.trim_start_matches('_')),
+                            range_prop(&value, IntTy::U64),
+                        );
+                        if matches!(op, RawOp::CellTakeU64) {
+                            let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
+                                unreachable!("checked: borrow arg")
+                            };
+                            let c2 = self.hinted_sym("_cell", Some(name.clone()));
+                            self.binders
+                                .push((c2.clone(), ResKind::PointsToU64.view_ty().into()));
+                            self.push_hyp_unique(
+                                format!("h_{name}_take"),
+                                format!("{c2} = Sable.PointsToView.clear ({c})"),
+                            );
+                            self.env.insert(name.clone(), Val::View(c2));
+                        }
+                        Val::Int(value)
+                    }
+                    RawOp::CellDropU64 => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        let Val::View(c) = self.eval(&args[1]) else {
+                            unreachable!("checked: cell borrow")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({c}) ({p}) \
+                             ∧ ({c}).state ≠ Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.cell_u64.drop", self.fname),
+                            "`raw_cell_drop_u64` needs an initialized cell at this pointer"
+                                .into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
+                            unreachable!("checked: borrow arg")
+                        };
+                        let c2 = self.hinted_sym("_cell", Some(name.clone()));
+                        self.binders
+                            .push((c2.clone(), ResKind::PointsToU64.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{name}_drop"),
+                            format!("{c2} = Sable.PointsToView.clear ({c})"),
+                        );
+                        self.env.insert(name.clone(), Val::View(c2));
+                        Val::Unit
+                    }
                 }
             }
             // The sealed resource transformations. Their contracts are
@@ -3646,6 +3825,10 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         ResKind::RawSpan => vec![(
             format!("h_{name}_wf"),
             format!("0 ≤ {binder}.len ∧ {binder}.len ≤ {binder}.bytes.len"),
+        )],
+        ResKind::PointsToU64 => vec![(
+            format!("h_{name}_wf"),
+            format!("Sable.PointsToView.wfU64 {binder}"),
         )],
         // A descriptor is nonnegative and a position never goes backwards
         // past the start of the file. Nothing about *which* file, and

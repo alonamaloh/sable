@@ -1,0 +1,14 @@
+// State-invalid but type-correct: both executable semantics must classify
+// reading an uninitialized typed cell as undefined.
+
+fn subj() -> u64 {
+    mut [u8] a = alloc_array<u8>(8, 0);
+    mut u64 out = 0;
+    unsafe expose &mut a as (p, resource mem) {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        out = raw_cell_read_u64(p, &cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+        mem = bytes;
+    }
+    return out;
+}

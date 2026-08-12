@@ -667,6 +667,38 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
         match μ.loadByte a k' with
         | some b => .run k (ρ.update dst (.int b)) σ (μ.store a k' .uninit)
         | none => .undef)
+  | .run (.rawIntoCellU64 e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        if μ.cellConvertibleU64 a k' then
+          .run k ρ σ (μ.putCellU64 a k' none)
+        else .undef)
+  | .run (.rawFromCellU64 e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        if μ.cellAtU64 a k' = some none then
+          .run k ρ σ (μ.removeCellU64 a k')
+        else .undef)
+  | .run (.rawCellInitU64 ep ev :: k) ρ σ μ =>
+      some ((evalE cap ρ ep).stepPtr fun a k' =>
+        (evalE cap ρ ev).stepInt fun w =>
+          if IntTy.u64.inRange w ∧ μ.cellAtU64 a k' = some none then
+            .run k ρ σ (μ.putCellU64 a k' (some w))
+          else .undef)
+  | .run (.rawCellReadU64 dst e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.cellAtU64 a k' with
+        | some (some w) => .run k (ρ.update dst (.int w)) σ μ
+        | _ => .undef)
+  | .run (.rawCellTakeU64 dst e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.cellAtU64 a k' with
+        | some (some w) =>
+            .run k (ρ.update dst (.int w)) σ (μ.putCellU64 a k' none)
+        | _ => .undef)
+  | .run (.rawCellDropU64 e :: k) ρ σ μ =>
+      some ((evalE cap ρ e).stepPtr fun a k' =>
+        match μ.cellAtU64 a k' with
+        | some (some _) => .run k ρ σ (μ.putCellU64 a k' none)
+        | _ => .undef)
   | .done _ => none
   | .trapped _ => none
   | .undef => none
@@ -749,6 +781,37 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   | take8_undef_byte h hb => simp [stepF, h.evalE_eq, hb]
   | take8_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
   | take8_abort h => simp [stepF, h.evalE_eq]
+  | intoCellU64_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | intoCellU64_bad h hc => simp [stepF, h.evalE_eq, hc]
+  | intoCellU64_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | intoCellU64_abort h => simp [stepF, h.evalE_eq]
+  | fromCellU64_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | fromCellU64_bad h hc => simp [stepF, h.evalE_eq, hc]
+  | fromCellU64_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | fromCellU64_abort h => simp [stepF, h.evalE_eq]
+  | cellInitU64_ok hp hv hr hc => simp [stepF, hp.evalE_eq, hv.evalE_eq, hr, hc]
+  | cellInitU64_bad hp hv hbad =>
+      simp only [stepF, hp.evalE_eq, hv.evalE_eq, EOut.stepPtr_ptr, EOut.stepInt_int]
+      rcases hbad with hr | hc
+      · rw [if_neg (by simp [hr])]
+      · rw [if_neg (by simp [hc])]
+  | cellInitU64_undef_val hp hv hw =>
+      simp [stepF, hp.evalE_eq, hv.evalE_eq, EOut.stepInt_ok_of_ne _ hw]
+  | cellInitU64_abort_val hp hv => simp [stepF, hp.evalE_eq, hv.evalE_eq]
+  | cellInitU64_undef_ptr hp hv => simp [stepF, hp.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellInitU64_abort_ptr hp => simp [stepF, hp.evalE_eq]
+  | cellReadU64_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | cellReadU64_bad h hc => simp [stepF, h.evalE_eq]
+  | cellReadU64_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellReadU64_abort h => simp [stepF, h.evalE_eq]
+  | cellTakeU64_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | cellTakeU64_bad h hc => simp [stepF, h.evalE_eq]
+  | cellTakeU64_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellTakeU64_abort h => simp [stepF, h.evalE_eq]
+  | cellDropU64_ok h hc => simp [stepF, h.evalE_eq, hc]
+  | cellDropU64_bad h hc => simp [stepF, h.evalE_eq]
+  | cellDropU64_undef_ptr h hv => simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
+  | cellDropU64_abort h => simp [stepF, h.evalE_eq]
 
 private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Int → Config}
@@ -944,6 +1007,69 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           cases hb : μ.loadByte a k' with
           | some b => simpa [hb] using Step.take8_ok he hb
           | none => simpa [hb] using Step.take8_undef_byte he hb
+      | rawIntoCellU64 e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .intoCellU64_abort he)
+            (fun v he hv => .intoCellU64_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.cellConvertibleU64 a k' with
+          | true => rw [if_pos (by simp [hc])]; exact .intoCellU64_ok he hc
+          | false => rw [if_neg (by simp [hc])]; exact .intoCellU64_bad he hc
+      | rawFromCellU64 e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .fromCellU64_abort he)
+            (fun v he hv => .fromCellU64_undef_ptr he hv) fun a k' he => ?_
+          by_cases hc : μ.cellAtU64 a k' = some none
+          · rw [if_pos hc]; exact .fromCellU64_ok he hc
+          · rw [if_neg hc]; exact .fromCellU64_bad he hc
+      | rawCellInitU64 ep ev =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab hp => .cellInitU64_abort_ptr hp)
+            (fun v hp hv => .cellInitU64_undef_ptr hp hv) fun a k' hp => ?_
+          refine step_stepInt (fun ab hv => .cellInitU64_abort_val hp hv)
+            (fun v hv hw => .cellInitU64_undef_val hp hv hw) fun w hv => ?_
+          by_cases hok : IntTy.u64.inRange w ∧ μ.cellAtU64 a k' = some none
+          · rw [if_pos hok]; exact .cellInitU64_ok hp hv hok.1 hok.2
+          · rw [if_neg hok]
+            refine .cellInitU64_bad hp hv ?_
+            by_cases hr : IntTy.u64.inRange w
+            · exact Or.inr (by simpa [hr] using hok)
+            · exact Or.inl hr
+      | rawCellReadU64 dst e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .cellReadU64_abort he)
+            (fun v he hv => .cellReadU64_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.cellAtU64 a k' with
+          | none => simpa [hc] using Step.cellReadU64_bad (dst := dst) he (by simp [hc])
+          | some s =>
+              cases s with
+              | none => simpa [hc] using Step.cellReadU64_bad (dst := dst) he (by simp [hc])
+              | some w => simpa [hc] using Step.cellReadU64_ok (dst := dst) he hc
+      | rawCellTakeU64 dst e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .cellTakeU64_abort he)
+            (fun v he hv => .cellTakeU64_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.cellAtU64 a k' with
+          | none => simpa [hc] using Step.cellTakeU64_bad (dst := dst) he (by simp [hc])
+          | some s =>
+              cases s with
+              | none => simpa [hc] using Step.cellTakeU64_bad (dst := dst) he (by simp [hc])
+              | some w => simpa [hc] using Step.cellTakeU64_ok (dst := dst) he hc
+      | rawCellDropU64 e =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          refine step_stepPtr (fun ab he => .cellDropU64_abort he)
+            (fun v he hv => .cellDropU64_undef_ptr he hv) fun a k' he => ?_
+          cases hc : μ.cellAtU64 a k' with
+          | none => simpa [hc] using Step.cellDropU64_bad he (by simp [hc])
+          | some s =>
+              cases s with
+              | none => simpa [hc] using Step.cellDropU64_bad he (by simp [hc])
+              | some w => simpa [hc] using Step.cellDropU64_ok he hc
 
 /-- The two presentations of the machine step agree. -/
 theorem step_iff_stepF {P : Prog} {cap : Int} {c c' : Config} :

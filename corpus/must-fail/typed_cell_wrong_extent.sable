@@ -1,0 +1,10 @@
+// expect-error: cell_u64.from_raw
+// A typed u64 cell needs exactly eight aligned bytes.
+/// pre a.len = 7
+fn wrong_extent(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource mem) {
+        resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+        mem = bytes;
+    }
+}

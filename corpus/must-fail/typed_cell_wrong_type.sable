@@ -1,0 +1,4 @@
+// expect-error: resource.points_to_type
+fn wrong_cell_type() {
+    resource PointsTo<u32> cell;
+}

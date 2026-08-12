@@ -65,16 +65,36 @@ fn next_loan() -> usize {
 }
 
 fn lower_block(stmts: &[Stmt]) -> Result<String, String> {
+    lower_block_erasing(stmts, &[])
+}
+
+fn lower_block_erasing(stmts: &[Stmt], erased_resources: &[&str]) -> Result<String, String> {
+    let mut block_resources = erased_resources.to_vec();
+    for stmt in stmts {
+        match stmt {
+            Stmt::Decl { ty, name, .. } if ty.is_resource() => {
+                block_resources.push(name.as_str());
+            }
+            Stmt::VarDecl {
+                name,
+                ty: Some(ty),
+                ..
+            } if ty.is_resource() => {
+                block_resources.push(name.as_str());
+            }
+            _ => {}
+        }
+    }
     let mut out = Vec::new();
     for s in stmts {
-        if let Some(t) = lower_stmt(s)? {
+        if let Some(t) = lower_stmt_erasing(s, &block_resources)? {
             out.push(t);
         }
     }
     Ok(format!("[{}]", out.join(", ")))
 }
 
-fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
+fn lower_stmt_erasing(s: &Stmt, erased_resources: &[&str]) -> Result<Option<String>, String> {
     Ok(match s {
         // A ⊥ slot: the machine conflates "undeclared" with ⊥, and
         // definite initialization guarantees assignment-before-read.
@@ -87,7 +107,7 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
         Stmt::VarDecl { name, init, .. } => Some(lower_bind(name, init)?),
         // `unsafe { ... }` is a marker with no machine step of its own.
         Stmt::Unsafe { body, .. } => {
-            let inner = lower_block(body)?;
+            let inner = lower_block_erasing(body, erased_resources)?;
             // Splice the body in place: the block does not scope.
             Some(
                 inner
@@ -116,7 +136,9 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             let t = format!("_lb{id}");
             let n = format!("(.len \"{array}\")");
             let at = format!("(.ptrAdd (.var \"{loan}\") (.var \"{i}\"))");
-            let inner = lower_block(body)?;
+            let mut inner_erased = erased_resources.to_vec();
+            inner_erased.push(res);
+            let inner = lower_block_erasing(body, &inner_erased)?;
             let inner = inner.trim_start_matches('[').trim_end_matches(']');
             let mut parts: Vec<String> = Vec::new();
             parts.push(format!("(.rawAlloc \"{loan}\" {n})"));
@@ -131,7 +153,6 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             parts.push(format!(
                 "(.assign \"{ptr}\" (.var \"{loan}\"))"
             ));
-            let _ = res;
             if !inner.is_empty() {
                 parts.push(inner.to_string());
             }
@@ -146,6 +167,10 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             }
             parts.push(format!("(.rawFree (.var \"{loan}\"))"));
             Some(parts.join(", "))
+        }
+        Stmt::Assign { name, .. } if erased_resources.contains(&name.as_str()) => {
+            // Resource authority has no runtime representation.
+            None
         }
         Stmt::Assign { name, value, .. } => Some(lower_bind(name, value)?),
         Stmt::Store {
@@ -164,13 +189,13 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             else_block,
         } => {
             let els = match else_block {
-                Some(b) => lower_block(b)?,
+                Some(b) => lower_block_erasing(b, erased_resources)?,
                 None => "[]".into(),
             };
             Some(format!(
                 "(.ite {} {} {})",
                 lower_expr(cond)?,
-                lower_block(then_block)?,
+                lower_block_erasing(then_block, erased_resources)?,
                 els
             ))
         }
@@ -190,7 +215,7 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
             Some(format!(
                 "(.while {} {})",
                 lower_expr(cond)?,
-                lower_block(body)?
+                lower_block_erasing(body, erased_resources)?
             ))
         }
         Stmt::Return { value: Some(e), .. } => Some(format!("(.ret {})", lower_expr(e)?)),
@@ -209,6 +234,14 @@ fn lower_stmt(s: &Stmt) -> Result<Option<String>, String> {
                     lower_expr(&args[0])?,
                     lower_expr(&args[1])?
                 ),
+                RawOp::CellInitU64 => format!(
+                    "(.rawCellInitU64 {} {})",
+                    lower_expr(&args[0])?,
+                    lower_expr(&args[1])?
+                ),
+                RawOp::CellDropU64 => {
+                    format!("(.rawCellDropU64 {})", lower_expr(&args[0])?)
+                }
                 RawOp::Copy => {
                     return Err("`raw_copy_nonoverlapping` has no single machine step: \
                                 the machine copies a byte at a time, and lowering it \
@@ -245,6 +278,25 @@ fn lower_bind(name: &str, e: &Expr) -> Result<String, String> {
             "(.rawLoad8 \"{name}\" {})",
             lower_expr(&args[0])?
         )),
+        ExprKind::RawOp { op, args, .. } => match op {
+            // Resource destinations are erased; the role-changing machine
+            // instruction is nevertheless observable in the heap.
+            RawOp::IntoCellU64 => {
+                Ok(format!("(.rawIntoCellU64 {})", lower_expr(&args[0])?))
+            }
+            RawOp::FromCellU64 => {
+                Ok(format!("(.rawFromCellU64 {})", lower_expr(&args[0])?))
+            }
+            RawOp::CellReadU64 => Ok(format!(
+                "(.rawCellReadU64 \"{name}\" {})",
+                lower_expr(&args[0])?
+            )),
+            RawOp::CellTakeU64 => Ok(format!(
+                "(.rawCellTakeU64 \"{name}\" {})",
+                lower_expr(&args[0])?
+            )),
+            _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(e)?)),
+        },
         _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(e)?)),
     }
 }

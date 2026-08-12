@@ -2306,15 +2306,27 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let u64t = Ty::Int(IntTy::U64);
             let shared = Ty::ResRef(ResKind::RawSpan, Mutability::Shared);
             let unique = Ty::ResRef(ResKind::RawSpan, Mutability::Mut);
+            let span = Ty::Res(ResKind::RawSpan);
+            let cell = Ty::Res(ResKind::PointsToU64);
+            let cell_shared = Ty::ResRef(ResKind::PointsToU64, Mutability::Shared);
+            let cell_unique = Ty::ResRef(ResKind::PointsToU64, Mutability::Mut);
             let want: &[Ty] = match op {
                 RawOp::Offset => &[raw, u64t],
                 RawOp::Load8 => &[raw, shared],
                 RawOp::Store8 => &[raw, u8t, unique],
                 RawOp::Copy => &[raw, raw, u64t, shared, unique],
+                RawOp::IntoCellU64 => &[raw, span],
+                RawOp::FromCellU64 => &[raw, cell],
+                RawOp::CellInitU64 => &[raw, u64t, cell_unique],
+                RawOp::CellReadU64 => &[raw, cell_shared],
+                RawOp::CellTakeU64 | RawOp::CellDropU64 => &[raw, cell_unique],
             };
             for (arg, w) in args.iter_mut().zip(want) {
                 require_explicit_borrow(ctx, arg, *w)?;
                 check_expr(ctx, arg, Some(*w))?;
+                if matches!(w, Ty::Res(_)) {
+                    transfer(ctx, arg, None)?;
+                }
             }
             check_borrow_conflicts(ctx, args, None)?;
             match op {
@@ -2324,6 +2336,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::Offset => raw,
                 RawOp::Load8 => u8t,
                 RawOp::Store8 | RawOp::Copy => Ty::Unit,
+                RawOp::IntoCellU64 => cell,
+                RawOp::FromCellU64 => span,
+                RawOp::CellInitU64 | RawOp::CellDropU64 => Ty::Unit,
+                RawOp::CellReadU64 | RawOp::CellTakeU64 => u64t,
             }
         }
         ExprKind::ResOp { op, op_span, args } => {

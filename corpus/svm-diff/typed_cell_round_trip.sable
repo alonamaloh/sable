@@ -1,0 +1,16 @@
+// The first abstract typed-storage path. The typed value is never decoded
+// from or encoded into bytes: returning the empty cell to raw storage
+// explicitly zero-fills the extent.
+
+fn subj() -> u64 {
+    mut [u8] a = alloc_array<u8>(8, 7);
+    mut u64 out = 0;
+    unsafe expose &mut a as (p, resource mem) {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        raw_cell_init_u64(p, 42, &mut cell);
+        out = raw_cell_take_u64(p, &mut cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+        mem = bytes;
+    }
+    return out + widen<u64>(a[0]);
+}

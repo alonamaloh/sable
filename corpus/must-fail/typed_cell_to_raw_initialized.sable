@@ -1,0 +1,10 @@
+// expect-error: cell_u64.to_raw
+/// pre a.len = 8
+fn initialized_to_raw(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource mem) {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        raw_cell_init_u64(p, 1, &mut cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+        mem = bytes;
+    }
+}

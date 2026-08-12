@@ -1,0 +1,32 @@
+// The first typed-storage vertical slice (ADR 0031): eight raw bytes
+// become one abstract `u64` cell without decoding a byte representation.
+// Taking the value returns the cell to uninitialized state; converting it
+// back explicitly zero-fills the raw extent before exposure closes.
+
+/// pre  a.len = 8
+/// post result = 42
+/// post ∀ i, 0 ≤ i → i < a.len → a.get i = 0
+pub fn typed_u64_round_trip(&mut [u8] a) -> u64 {
+    mut u64 out = 0;
+    unsafe expose &mut a as (p, resource mem) {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        raw_cell_init_u64(p, 42, &mut cell);
+        out = raw_cell_read_u64(p, &cell);
+        u64 taken = raw_cell_take_u64(p, &mut cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+        mem = bytes;
+    }
+    return out;
+}
+
+/// pre  a.len = 8
+/// post ∀ i, 0 ≤ i → i < a.len → a.get i = 0
+pub fn typed_u64_drop(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource mem) {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        raw_cell_init_u64(p, 99, &mut cell);
+        raw_cell_drop_u64(p, &mut cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+        mem = bytes;
+    }
+}

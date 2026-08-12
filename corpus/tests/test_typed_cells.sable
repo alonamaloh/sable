@@ -1,0 +1,29 @@
+use typed_cells;
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+/// pre x = y
+fn expect_eq_u8(u8 x, u8 y) {
+}
+
+fn test_typed_u64_round_trip() {
+    mut [u8] a = [1, 2, 3, 4, 5, 6, 7, 8];
+    expect_eq_u64(typed_u64_round_trip(&mut a), 42);
+    expect_eq_u8(a[0], 0);
+    expect_eq_u8(a[1], 0);
+    expect_eq_u8(a[2], 0);
+    expect_eq_u8(a[3], 0);
+    expect_eq_u8(a[4], 0);
+    expect_eq_u8(a[5], 0);
+    expect_eq_u8(a[6], 0);
+    expect_eq_u8(a[7], 0);
+}
+
+fn test_typed_u64_drop() {
+    mut [u8] a = [8, 7, 6, 5, 4, 3, 2, 1];
+    typed_u64_drop(&mut a);
+    expect_eq_u8(a[0], 0);
+    expect_eq_u8(a[7], 0);
+}

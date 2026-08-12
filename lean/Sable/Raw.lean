@@ -26,6 +26,55 @@ inductive ByteState where
   | init : Int → ByteState
   deriving DecidableEq, Repr
 
+/-- Initialization state of an abstract typed extent. This is not
+`Option α`: an initialized `Option β` holding `none` must remain distinct
+from storage that contains no value (ADR 0031). -/
+inductive CellState (α : Type) where
+  | uninit : CellState α
+  | init : α → CellState α
+  deriving DecidableEq, Repr
+
+/-- Pure view of one typed extent. Size and alignment come from the
+layout capability; the first slice fixes both to eight for `u64`. -/
+structure PointsToView (α : Type) where
+  alloc : Int
+  off : Int
+  state : CellState α
+
+/-- Shape facts carried by every `PointsTo<u64>` binding. -/
+def PointsToView.wfU64 (v : PointsToView Int) : Prop :=
+  0 ≤ v.off ∧ v.off % 8 = 0 ∧
+    match v.state with
+    | .uninit => True
+    | .init x => 0 ≤ x ∧ x ≤ 18446744073709551615
+
+@[simp] theorem PointsToView.wfU64_iff (v : PointsToView Int) :
+    v.wfU64 ↔ (0 ≤ v.off ∧ v.off % 8 = 0 ∧
+      match v.state with
+      | .uninit => True
+      | .init x => 0 ≤ x ∧ x ≤ 18446744073709551615) := Iff.rfl
+
+/-- Put a value into an uninitialized typed extent. -/
+def PointsToView.put (v : PointsToView α) (x : α) : PointsToView α :=
+  { v with state := .init x }
+
+/-- Remove or destroy the value while retaining typed authority. -/
+def PointsToView.clear (v : PointsToView α) : PointsToView α :=
+  { v with state := .uninit }
+
+@[simp] theorem PointsToView.put_alloc (v : PointsToView α) (x : α) :
+    (v.put x).alloc = v.alloc := rfl
+@[simp] theorem PointsToView.put_off (v : PointsToView α) (x : α) :
+    (v.put x).off = v.off := rfl
+@[simp] theorem PointsToView.put_state (v : PointsToView α) (x : α) :
+    (v.put x).state = .init x := rfl
+@[simp] theorem PointsToView.clear_alloc (v : PointsToView α) :
+    v.clear.alloc = v.alloc := rfl
+@[simp] theorem PointsToView.clear_off (v : PointsToView α) :
+    v.clear.off = v.off := rfl
+@[simp] theorem PointsToView.clear_state (v : PointsToView α) :
+    v.clear.state = .uninit := rfl
+
 /-- The byte, if this state has one. Junk-free: `none` is the honest
 answer for uninitialized storage, and the initialization VC is what keeps
 verified programs away from it. -/
@@ -197,6 +246,38 @@ an allocation equality, which is what `omega` wants to see. -/
 @[simp] theorem SpanView.namesByte_iff (v : SpanView) (p : RawPtr) (k : Int) :
     v.namesByte p k ↔ (p.alloc = v.alloc ∧ p.off = v.off + k ∧ 0 ≤ k ∧ k < v.len) :=
   Iff.rfl
+
+/-- A pointer names this typed extent. -/
+def PointsToView.names (v : PointsToView α) (p : RawPtr) : Prop :=
+  p.alloc = v.alloc ∧ p.off = v.off
+
+@[simp] theorem PointsToView.names_iff (v : PointsToView α) (p : RawPtr) :
+    v.names p ↔ (p.alloc = v.alloc ∧ p.off = v.off) := Iff.rfl
+
+/-- Reinterpret one checked raw extent as an uninitialized `u64` cell. -/
+def SpanView.toCellU64 (v : SpanView) : PointsToView Int :=
+  { alloc := v.alloc, off := v.off, state := .uninit }
+
+/-- Return an uninitialized typed cell to eight initialized zero bytes.
+This is explicit cleanup; no typed value is serialized by the operation. -/
+def PointsToView.toSpanU64 (v : PointsToView Int) : SpanView :=
+  { alloc := v.alloc, off := v.off, len := 8,
+    bytes := ⟨8, fun _ => .init 0⟩ }
+
+@[simp] theorem SpanView.toCellU64_alloc (v : SpanView) :
+    v.toCellU64.alloc = v.alloc := rfl
+@[simp] theorem SpanView.toCellU64_off (v : SpanView) :
+    v.toCellU64.off = v.off := rfl
+@[simp] theorem SpanView.toCellU64_state (v : SpanView) :
+    v.toCellU64.state = .uninit := rfl
+@[simp] theorem PointsToView.toSpanU64_alloc (v : PointsToView Int) :
+    v.toSpanU64.alloc = v.alloc := rfl
+@[simp] theorem PointsToView.toSpanU64_off (v : PointsToView Int) :
+    v.toSpanU64.off = v.off := rfl
+@[simp] theorem PointsToView.toSpanU64_len (v : PointsToView Int) :
+    v.toSpanU64.len = 8 := rfl
+@[simp] theorem PointsToView.toSpanU64_get (v : PointsToView Int) (k : Int) :
+    v.toSpanU64.bytes.get k = .init 0 := rfl
 
 /-! ## The bridge between safe arrays and raw bytes
 

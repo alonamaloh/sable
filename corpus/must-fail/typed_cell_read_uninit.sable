@@ -1,0 +1,12 @@
+// expect-error: cell_u64.read
+/// pre a.len = 8
+fn read_before_init(&mut [u8] a) -> u64 {
+    mut u64 out = 0;
+    unsafe expose &mut a as (p, resource mem) {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        out = raw_cell_read_u64(p, &cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+        mem = bytes;
+    }
+    return out;
+}

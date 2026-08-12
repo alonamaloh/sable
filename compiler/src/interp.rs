@@ -151,19 +151,35 @@ struct RawAlloc {
     live: bool,
     /// `None` is uninitialized: distinct from any byte value.
     bytes: Vec<Option<i128>>,
+    /// Starts of abstract typed `u64` extents. `None` is a typed but
+    /// uninitialized cell; `Some(v)` is initialized. Bytes covered by a
+    /// cell are inaccessible until the uninitialized cell is converted
+    /// back (ADR 0031).
+    cells_u64: HashMap<i128, Option<i128>>,
 }
 
 impl RawHeap {
     fn fresh(&mut self, bytes: Vec<Option<i128>>) -> i128 {
         let id = self.next;
         self.next += 1;
-        self.allocs.insert(id, RawAlloc { live: true, bytes });
+        self.allocs.insert(
+            id,
+            RawAlloc {
+                live: true,
+                bytes,
+                cells_u64: HashMap::new(),
+            },
+        );
         id
     }
 
     fn live_at(&self, alloc: i128, off: i128) -> Option<&RawAlloc> {
         let al = self.allocs.get(&alloc)?;
-        if al.live && off >= 0 && (off as usize) < al.bytes.len() {
+        let covered = al
+            .cells_u64
+            .keys()
+            .any(|start| *start <= off && off < *start + 8);
+        if al.live && off >= 0 && (off as usize) < al.bytes.len() && !covered {
             Some(al)
         } else {
             None
@@ -1381,6 +1397,127 @@ impl<'a> Interp<'a> {
                                 .bytes[(do_ + i) as usize] = Some(b);
                         }
                         Ok(RtVal::Unit)
+                    }
+                    RawOp::IntoCellU64 => {
+                        let (a, o) = ptr_at(0);
+                        if o % 8 != 0 {
+                            return Err(bad(format!(
+                                "raw_into_cell_u64 needs 8-byte alignment: {a}+{o}"
+                            )));
+                        }
+                        for i in 0..8 {
+                            if self.raw.live_at(a, o + i).is_none() {
+                                return Err(bad(format!(
+                                    "raw_into_cell_u64 needs eight raw bytes at {a}+{o}"
+                                )));
+                            }
+                        }
+                        self.raw
+                            .allocs
+                            .get_mut(&a)
+                            .expect("live_at checked")
+                            .cells_u64
+                            .insert(o, None);
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::FromCellU64 => {
+                        let (a, o) = ptr_at(0);
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_from_cell_u64 names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!(
+                                "raw_from_cell_u64 names dead allocation {a}"
+                            )));
+                        }
+                        match al.cells_u64.get(&o) {
+                            Some(None) => {
+                                al.cells_u64.remove(&o);
+                                for i in 0..8 {
+                                    al.bytes[(o + i) as usize] = Some(0);
+                                }
+                                Ok(RtVal::Unit)
+                            }
+                            _ => Err(bad(format!(
+                                "raw_from_cell_u64 needs an uninitialized cell at {a}+{o}"
+                            ))),
+                        }
+                    }
+                    RawOp::CellInitU64 => {
+                        let (a, o) = ptr_at(0);
+                        let w = int_at(1);
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_cell_init_u64 names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!(
+                                "raw_cell_init_u64 names dead allocation {a}"
+                            )));
+                        }
+                        match al.cells_u64.get_mut(&o) {
+                            Some(state @ None) => {
+                                *state = Some(w);
+                                Ok(RtVal::Unit)
+                            }
+                            _ => Err(bad(format!(
+                                "raw_cell_init_u64 needs an uninitialized cell at {a}+{o}"
+                            ))),
+                        }
+                    }
+                    RawOp::CellReadU64 => {
+                        let (a, o) = ptr_at(0);
+                        match self
+                            .raw
+                            .allocs
+                            .get(&a)
+                            .filter(|al| al.live)
+                            .and_then(|al| al.cells_u64.get(&o))
+                        {
+                            Some(Some(w)) => Ok(RtVal::Int(*w)),
+                            _ => Err(bad(format!(
+                                "raw_cell_read_u64 needs an initialized cell at {a}+{o}"
+                            ))),
+                        }
+                    }
+                    RawOp::CellTakeU64 => {
+                        let (a, o) = ptr_at(0);
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_cell_take_u64 names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!(
+                                "raw_cell_take_u64 names dead allocation {a}"
+                            )));
+                        }
+                        match al.cells_u64.get_mut(&o) {
+                            Some(state @ Some(_)) => {
+                                let w = state.take().expect("matched initialized cell");
+                                Ok(RtVal::Int(w))
+                            }
+                            _ => Err(bad(format!(
+                                "raw_cell_take_u64 needs an initialized cell at {a}+{o}"
+                            ))),
+                        }
+                    }
+                    RawOp::CellDropU64 => {
+                        let (a, o) = ptr_at(0);
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_cell_drop_u64 names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!(
+                                "raw_cell_drop_u64 names dead allocation {a}"
+                            )));
+                        }
+                        match al.cells_u64.get_mut(&o) {
+                            Some(state @ Some(_)) => {
+                                *state = None;
+                                Ok(RtVal::Unit)
+                            }
+                            _ => Err(bad(format!(
+                                "raw_cell_drop_u64 needs an initialized cell at {a}+{o}"
+                            ))),
+                        }
                     }
                 }
             }

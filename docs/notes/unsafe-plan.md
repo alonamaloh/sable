@@ -1725,12 +1725,19 @@ do-nothing by-value sink must not satisfy `SystemDealloc`.
 
 ### U7b — typed cells, layout, and static bump arena
 
-Add:
+**Slice U7b1 is complete (2026-08-12, ADR 0031):** `PointsTo<u64>` and
+`CellState<u64>` now make one complete raw-span → typed-cell → raw-span
+round trip. The checker transfers affine authority at both conversions; VCs
+track provenance, alignment, and state; the interpreter and SVM keep an
+abstract typed tag that excludes byte access; and the relational SVM still
+agrees with its executable evaluator. Returning an empty cell to raw storage
+zero-fills eight bytes as cleanup, without choosing a representation for an
+initialized `u64`. Positive, negative, dynamic, direct-SVM, and differential
+subjects cover the slice.
+
+Remaining U7b work:
 
 - `Layout<T>`;
-- abstract typed extents;
-- `PointsTo<T>` with `CellState<T>`;
-- init/read-copy/take/drop-in-place operations;
 - root/static allocation sources;
 - a program-lifetime static bump arena.
 
@@ -1738,8 +1745,9 @@ Do not introduce `SystemDealloc` on this rung. The static root is deliberately
 non-deallocating; that keeps typed-storage state and layout separate from the
 interprocedural mandatory-consumption rule that U8 will need.
 
-Use fixed-width integers first. Add one explicitly laid-out record only after the
-integer path works.
+Generalize the now-working fixed-width integer path through `Layout<T>`. Add one
+explicitly laid-out record only after the layout generalization works; do not
+introduce byte serialization while doing so.
 
 Exit criteria:
 
