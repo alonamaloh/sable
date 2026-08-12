@@ -1915,6 +1915,159 @@ theorem AllocatorView.InsertionLocation.replacePredecessor
           hkPrevious, hkReplacement]
       exact priorPath.splice location.1 agree rebuilt
 
+/-- Remove the stored successor at a non-head insertion location, replace it
+with a merged header beginning at the returned key, and relink the exact
+predecessor to that header. The caller supplies the byte-level merge facts;
+this theorem preserves the untouched suffix and prefix. -/
+theorem AllocatorView.InsertionLocation.coalesceSuccessorAfter
+    {v : AllocatorView}
+    {limit start key gapSize previous current previousSize
+      successorSize next mergedSize : Int}
+    (location : v.InsertionLocation
+      limit start key gapSize previous current)
+    (notHead : current ≠ start)
+    (currentNotEnd : current ≠ limit)
+    {predecessor successor merged relinked : FreeHeaderView}
+    (predecessorStored : v.storesHeader previous predecessor)
+    (predecessorFields : predecessor.hasFields previousSize current)
+    (successorStored : v.storesHeader current successor)
+    (successorFields : successor.hasFields successorSize next)
+    (mergedKey : merged.key = key)
+    (mergedFields : merged.hasFields mergedSize next)
+    (mergedExtent : merged.toFree.span.len = mergedSize)
+    (mergedClear :
+      ((v.takeHeader current).takeHeader previous).clearInterior
+        merged.key mergedSize)
+    (mergedRoot : merged.sizeCell.alloc =
+      ((v.takeHeader current).takeHeader previous).root.alloc)
+    (canPutMerged :
+      ((v.takeHeader current).takeHeader previous).canPutHeader merged)
+    (relinkedEq : relinked =
+      predecessor.clearFields.putFields previousSize key)
+    (canPutRelinked :
+      (((v.takeHeader current).takeHeader previous).putHeader merged
+        ).canPutHeader relinked)
+    (mergedNonneg : 0 ≤ merged.key)
+    (mergedMin : freeHeaderBytes ≤ mergedSize)
+    (mergedOrder : merged.key + mergedSize ≤ next) :
+    ((((v.takeHeader current).takeHeader previous).putHeader merged
+      ).putHeader relinked).StoredChain limit start := by
+  obtain ⟨locationHeader, locationSize, locationStored, locationFields,
+      afterPrevious⟩ := location.predecessor notHead
+  have sameHeader : locationHeader = predecessor :=
+    AllocatorView.storesHeader_unique locationStored predecessorStored
+  subst locationHeader
+  unfold FreeHeaderView.hasFields at locationFields predecessorFields
+  have sameSize : locationSize = previousSize :=
+    CellState.init.inj (locationFields.1.symm.trans predecessorFields.1)
+  simp only [sameSize] at afterPrevious
+  have currentChain : v.StoredChain limit current := location.currentChain
+  have currentMatch := currentChain.takeMatchingHead currentNotEnd
+    successorStored successorFields
+  cases pathEq : location.2.1 with
+  | nil => exact (notHead rfl).elim
+  | step priorPath predecessorNotEnd pathStored pathFields beforeKey =>
+      have previousChain : v.StoredChain limit previous := by
+        simpa using priorPath.tail location.1
+      have previousMatch := previousChain.takeMatchingHead
+        predecessorNotEnd predecessorStored predecessorFields
+      have previousCurrent : previous < current := by
+        have hfit := previousMatch.2.2.1
+        have horder := previousMatch.2.2.2.1
+        simp [freeHeaderBytes, u64.layout] at hfit
+        omega
+      have currentNext : current < next := by
+        have hfit := currentMatch.2.2.1
+        have horder := currentMatch.2.2.2.1
+        simp [freeHeaderBytes, u64.layout] at hfit
+        omega
+      have bareTail :
+          ((v.takeHeader current).takeHeader previous).StoredChain
+            limit next := by
+        apply currentMatch.2.2.2.2.2.takeHeaderBefore
+        omega
+      have mergedChainAtKey :
+          (((v.takeHeader current).takeHeader previous).putHeader merged
+            ).StoredChain limit merged.key := by
+        apply AllocatorView.StoredChain.prependAfterPut
+          bareTail canPutMerged mergedFields mergedExtent mergedClear
+          mergedRoot mergedNonneg mergedMin mergedOrder
+        exact currentMatch.2.2.2.2.1
+      have mergedChain :
+          (((v.takeHeader current).takeHeader previous).putHeader merged
+            ).StoredChain limit key := by
+        rw [mergedKey] at mergedChainAtKey
+        exact mergedChainAtKey
+      have relinkedKey : relinked.key = previous := by
+        rw [relinkedEq]
+        exact predecessorStored.2.2.1
+      have relinkedFields : relinked.hasFields previousSize key := by
+        simp [relinkedEq, FreeHeaderView.hasFields,
+          FreeHeaderView.clearFields, FreeHeaderView.putFields]
+      have relinkedExtent : relinked.toFree.span.len = previousSize := by
+        rw [relinkedEq]
+        simpa using previousMatch.1
+      have relinkedClear :
+          (((v.takeHeader current).takeHeader previous).putHeader merged
+            ).clearInterior relinked.key previousSize := by
+        rw [relinkedKey]
+        intro k hlo hhi
+        have hkPrevious : k ≠ previous := by omega
+        have hkCurrent : k ≠ current := by
+          have horder := previousMatch.2.2.2.1
+          omega
+        have hkMerged : k ≠ merged.key := by
+          rw [mergedKey]
+          omega
+        simpa [AllocatorView.takeHeader, AllocatorView.putHeader,
+          hkPrevious, hkCurrent, hkMerged] using
+          previousMatch.2.1 k hlo hhi
+      have relinkedRoot : relinked.sizeCell.alloc =
+          (((v.takeHeader current).takeHeader previous).putHeader merged
+            ).root.alloc := by
+        rw [relinkedEq]
+        exact predecessorStored.2.2.2.2.2
+      have previousNonneg : 0 ≤ previous := by
+        have hwf := predecessorStored.2.2.2.1
+        unfold FreeHeaderView.wf at hwf
+        calc
+          0 ≤ predecessor.sizeCell.off := hwf.1.2.1
+          _ = predecessor.key := hwf.2.2.1.symm
+          _ = previous := predecessorStored.2.2.1
+      have rebuiltAtKey :
+          ((((v.takeHeader current).takeHeader previous).putHeader merged
+            ).putHeader relinked).StoredChain limit relinked.key := by
+        apply AllocatorView.StoredChain.prependAfterPut
+          mergedChain canPutRelinked relinkedFields relinkedExtent
+          relinkedClear relinkedRoot
+        · rw [relinkedKey]
+          exact previousNonneg
+        · exact previousMatch.2.2.1
+        · rw [relinkedKey]
+          exact afterPrevious
+        · exact mergedChain.head_le_limit
+      have rebuilt :
+          ((((v.takeHeader current).takeHeader previous).putHeader merged
+            ).putHeader relinked).StoredChain limit previous := by
+        rw [relinkedKey] at rebuiltAtKey
+        exact rebuiltAtKey
+      have agree : v.AgreesBelow
+          ((((v.takeHeader current).takeHeader previous).putHeader merged
+            ).putHeader relinked) previous := by
+        refine ⟨rfl, rfl, ?_⟩
+        intro k hk
+        have hkPrevious : k ≠ previous := by omega
+        have hkCurrent : k ≠ current := by omega
+        have hkMerged : k ≠ merged.key := by
+          rw [mergedKey]
+          omega
+        have hkRelinked : k ≠ relinked.key := by
+          rw [relinkedKey]
+          omega
+        simp [AllocatorView.takeHeader, AllocatorView.putHeader,
+          hkPrevious, hkCurrent, hkMerged, hkRelinked]
+      exact priorPath.splice location.1 agree rebuilt
+
 /-- First-fit together with the runtime predecessor needed by a later unlink.
 The location is still read-only: the represented allocator view is exactly the
 entry view. -/
