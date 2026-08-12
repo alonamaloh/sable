@@ -1,0 +1,14 @@
+use intrusive_list;
+
+// The recursive abstract-sequence invariant is deliberately beyond the
+// dynamic monitor's scalar fragment; Lean checks both source assertions.
+// expect-skip: IntrusiveList nodes base.alloc head tail [0, 24]
+// expect-skip: IntrusiveList nodes base.alloc head tail [24]
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+fn test_intrusive_list_two_nodes() {
+    expect_eq_u64(intrusive_list_two_nodes(), 50);
+}

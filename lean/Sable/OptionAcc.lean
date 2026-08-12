@@ -10,20 +10,20 @@ clause text, so specs can be written accessor-style too
 
 namespace Option
 
-@[simp] def is_some (o : Option Int) : Prop := o ≠ none
+@[simp] def is_some {α : Type} (o : Option α) : Prop := o ≠ none
 
-@[simp] def value (o : Option Int) : Int := o.getD 0
+@[simp] def value {α : Type} [Inhabited α] (o : Option α) : α := o.getD default
 
-@[simp] theorem value_some (x : Int) : (some x).value = x := rfl
+@[simp] theorem value_some {α : Type} [Inhabited α] (x : α) : (some x).value = x := rfl
 
-@[simp] theorem is_some_some (x : Int) : (some x).is_some := by
+@[simp] theorem is_some_some {α : Type} (x : α) : (some x).is_some := by
   simp [is_some]
 
-@[simp] theorem not_is_some_none : ¬ (none : Option Int).is_some := by
+@[simp] theorem not_is_some_none {α : Type} : ¬ (none : Option α).is_some := by
   intro h
   exact h rfl
 
-theorem eq_some_of_is_some {o : Option Int} (h : o.is_some) :
+theorem eq_some_of_is_some {α : Type} [Inhabited α] {o : Option α} (h : o.is_some) :
     o = some o.value := by
   cases o with
   | none => exact absurd rfl h

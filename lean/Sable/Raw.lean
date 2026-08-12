@@ -3117,6 +3117,7 @@ operation names. -/
 structure RawPtr where
   alloc : Int
   off : Int
+  deriving Inhabited
 
 /-- The pointer at the start of a span. -/
 def SpanView.start (v : SpanView) : RawPtr :=

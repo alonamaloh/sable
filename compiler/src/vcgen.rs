@@ -2813,6 +2813,10 @@ impl<'a> Generator<'a> {
                             format!("h_{name}_wf"),
                             format!("{record}.cellWf {next}"),
                         );
+                        self.push_hyp_unique(
+                            format!("h_{name}_names"),
+                            format!("Sable.PointsToView.names ({next}) ({p})"),
+                        );
                         self.env.insert(name.clone(), Val::View(next));
                         Val::Unit
                     }
@@ -2868,6 +2872,10 @@ impl<'a> Generator<'a> {
                                 format!("h_{name}_wf"),
                                 format!("{record}.cellWf {next}"),
                             );
+                            self.push_hyp_unique(
+                                format!("h_{name}_names"),
+                                format!("Sable.PointsToView.names ({next}) ({p})"),
+                            );
                             self.env.insert(name.clone(), Val::View(next));
                         }
                         Val::Record(value)
@@ -2910,6 +2918,10 @@ impl<'a> Generator<'a> {
                         self.push_hyp_unique(
                             format!("h_{name}_wf"),
                             format!("{record}.cellWf {next}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{name}_names"),
+                            format!("Sable.PointsToView.names ({next}) ({p})"),
                         );
                         self.env.insert(name.clone(), Val::View(next));
                         Val::Unit
@@ -4336,7 +4348,7 @@ impl<'a> Generator<'a> {
                 let values: Vec<String> = args
                     .iter()
                     .map(|arg| match self.eval(arg) {
-                        Val::Int(v) | Val::Opt(v) | Val::Ptr(v) => v,
+                        Val::Int(v) | Val::Opt(v) | Val::Ptr(v) => format!("({v})"),
                         _ => unreachable!("checked: raw-storable record field"),
                     })
                     .collect();
@@ -4945,7 +4957,13 @@ impl<'a> Generator<'a> {
             .env
             .iter()
             .filter_map(|(name, val)| match val {
-                Val::Int(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s) | Val::Ptr(s)
+                Val::Int(s)
+                | Val::Opt(s)
+                | Val::Arr(s)
+                | Val::Obj(s)
+                | Val::Record(s)
+                | Val::View(s)
+                | Val::Ptr(s)
                     if s != name =>
                 {
                     Some((name.clone(), s.clone()))

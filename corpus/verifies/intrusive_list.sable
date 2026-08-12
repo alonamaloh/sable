@@ -1,0 +1,146 @@
+// U9 acceptance subject: a doubly linked list whose runtime links are real
+// nullable raw pointers and whose erased ownership is one generic ResourceMap.
+// Both nodes live in one allocation, so keys are arena-relative offsets.
+
+record IntrusiveNode #[layout(size := 24, align := 8)] {
+    #[offset(0)] option<raw<IntrusiveNode>> previous;
+    #[offset(8)] option<raw<IntrusiveNode>> next;
+    #[offset(16)] u64 payload;
+}
+
+// The visible invariant is deliberately ordinary functional mathematics:
+// a partial map, an abstract key sequence, and the links stored in each node.
+// Hidden ownership separation remains the ResourceMap token's interpretation.
+
+/// def nodePointer (arena key : Int) : Sable.RawPtr := ⟨arena, key⟩
+///
+/// def Linked
+///     (nodes : Sable.ResourceMapView Int
+///       (Sable.PointsToView SableR_IntrusiveNode))
+///     (arena : Int) : Option Sable.RawPtr → List Int → Prop
+///   | _, [] => True
+///   | previous, key :: rest =>
+///       ∃ node cell,
+///         nodes.entries key = some cell ∧
+///         cell.state = Sable.CellState.init node ∧
+///         cell.alloc = arena ∧ cell.off = key ∧
+///         node.previous = previous ∧
+///         node.next = rest.head?.map (nodePointer arena) ∧
+///         Linked nodes arena (some (nodePointer arena key)) rest
+///
+/// def IntrusiveList
+///     (nodes : Sable.ResourceMapView Int
+///       (Sable.PointsToView SableR_IntrusiveNode))
+///     (arena : Int) (head tail : Option Sable.RawPtr)
+///     (sequence : List Int) : Prop :=
+///   head = sequence.head?.map (nodePointer arena) ∧
+///   tail = sequence.getLast?.map (nodePointer arena) ∧
+///   sequence.Nodup ∧ Linked nodes arena none sequence
+
+/// post result = 50
+pub fn intrusive_list_two_nodes() -> u64 {
+    unsafe system_alloc(48) as (base, resource root, resource release);
+    mut resource RawSpan bytes0 = root;
+    resource RawSpan bytes1 = split_off(&mut bytes0, 24);
+    raw<u8> byte1 = raw_offset(base, 24);
+
+    unsafe {
+        raw<IntrusiveNode> p0 = raw_cast<IntrusiveNode>(base);
+        raw<IntrusiveNode> p1 = raw_cast<IntrusiveNode>(byte1);
+        mut resource PointsTo<IntrusiveNode> cell0 =
+            raw_into_cell<IntrusiveNode>(p0, bytes0);
+        mut resource PointsTo<IntrusiveNode> cell1 =
+            raw_into_cell<IntrusiveNode>(p1, bytes1);
+        IntrusiveNode node0 = IntrusiveNode(none, some(p1), 10);
+        IntrusiveNode node1 = IntrusiveNode(some(p0), none, 20);
+        raw_cell_init<IntrusiveNode>(p0, node0, &mut cell0);
+        raw_cell_init<IntrusiveNode>(p1, node1, &mut cell1);
+    }
+
+    mut resource ResourceMap<u64, PointsTo<IntrusiveNode>> nodes =
+        resource_map_empty();
+    resource_map_put(&mut nodes, 0, cell0);
+    resource_map_put(&mut nodes, 24, cell1);
+    mut option<raw<IntrusiveNode>> head = some(p0);
+    option<raw<IntrusiveNode>> tail = some(p1);
+
+    // Traverse through the stored forward link, extracting exactly one node
+    // permission at a time and restoring the aggregate after each read.
+    /// assert #[label(two_node_shape)]
+    ///   IntrusiveList nodes base.alloc head tail [0, 24]
+    raw<IntrusiveNode> cursor0 = head.value;
+    unsafe {
+        u64 key0 = raw_pointer_offset<IntrusiveNode>(cursor0);
+    }
+    mut resource PointsTo<IntrusiveNode> first_cell =
+        resource_map_take(&mut nodes, key0);
+    unsafe {
+        IntrusiveNode first = raw_cell_read<IntrusiveNode>(cursor0, &first_cell);
+    }
+    resource_map_put(&mut nodes, key0, first_cell);
+
+    raw<IntrusiveNode> cursor1 = first.next.value;
+    unsafe {
+        u64 key1 = raw_pointer_offset<IntrusiveNode>(cursor1);
+    }
+    mut resource PointsTo<IntrusiveNode> second_cell =
+        resource_map_take(&mut nodes, key1);
+    unsafe {
+        IntrusiveNode second = raw_cell_read<IntrusiveNode>(cursor1, &second_cell);
+    }
+    resource_map_put(&mut nodes, key1, second_cell);
+
+    // Unlink the head. Its cleared permission leaves the aggregate; the new
+    // head is rewritten with a null back-link and reinserted at the same key.
+    mut resource PointsTo<IntrusiveNode> removed =
+        resource_map_take(&mut nodes, 0);
+    unsafe {
+        IntrusiveNode removed_value = raw_cell_take<IntrusiveNode>(p0, &mut removed);
+    }
+    mut resource PointsTo<IntrusiveNode> remaining =
+        resource_map_take(&mut nodes, 24);
+    unsafe {
+        IntrusiveNode remaining_value =
+            raw_cell_take<IntrusiveNode>(p1, &mut remaining);
+    }
+    IntrusiveNode relinked =
+        IntrusiveNode(none, none, remaining_value.payload);
+    unsafe {
+        raw_cell_init<IntrusiveNode>(p1, relinked, &mut remaining);
+    }
+    resource_map_put(&mut nodes, 24, remaining);
+    head = some(p1);
+
+    // Tear down the remaining list and reconstruct the exact root allocation.
+    /// assert #[label(one_node_shape)]
+    ///   IntrusiveList nodes base.alloc head tail [24]
+    mut resource PointsTo<IntrusiveNode> last =
+        resource_map_take(&mut nodes, 24);
+    unsafe {
+        IntrusiveNode last_value = raw_cell_take<IntrusiveNode>(p1, &mut last);
+        resource RawSpan raw0 = raw_from_cell<IntrusiveNode>(p0, removed);
+        resource RawSpan raw1 = raw_from_cell<IntrusiveNode>(p1, last);
+    }
+    resource RawSpan whole = join(raw0, raw1);
+    unsafe system_dealloc(base, whole, release);
+    return first.payload + second.payload + last_value.payload;
+}
+
+/// discharge intrusive_list_two_nodes.assert.two_node_shape by
+///   subst_vars
+///   simp [IntrusiveList, Linked, nodePointer, Sable.RawPtr.add,
+///     Sable.SpanView.start, Sable.SpanView.uninit,
+///     SableR_IntrusiveNode.fromSpan, Sable.PointsToView.put,
+///     Sable.ResourceMapView.insert] at *
+///
+/// discharge intrusive_list_two_nodes.assert.one_node_shape by
+///   subst_vars
+///   simp [IntrusiveList, Linked, nodePointer, Sable.RawPtr.add,
+///     Sable.SpanView.start, Sable.SpanView.uninit,
+///     SableR_IntrusiveNode.fromSpan, Sable.PointsToView.put,
+///     Sable.PointsToView.clear, Sable.ResourceMapView.insert,
+///     Sable.ResourceMapView.erase]
+///   simpa [Sable.PointsToView.names, Sable.PointsToView.clear,
+///     Sable.PointsToView.put, Sable.SpanView.start,
+///     Sable.SpanView.uninit, Sable.RawPtr.add, eq_comm]
+///     using h_remaining_names_2
