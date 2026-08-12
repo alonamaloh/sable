@@ -533,6 +533,7 @@ pub fn canonical_outcome(res: Result<RtVal, String>) -> String {
             RtVal::Opt(None) => "done opt none".into(),
             RtVal::Opt(Some(n)) => format!("done opt some {n}"),
             RtVal::Obj { .. } => "unclassified: class value".into(),
+            RtVal::ResMap(..) => "unclassified: erased resource map".into(),
         },
         Err(msg) => classify_trap(&msg),
     }

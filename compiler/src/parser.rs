@@ -655,7 +655,52 @@ impl<'a> Parser<'a> {
             None
         };
         let (name, name_span) = self.ident()?;
-        let (kind, end_span) = if name == "PointsTo" || name == "LeasedPointsTo" {
+        let (kind, end_span) = if name == "ResourceMap" {
+            self.expect(Tok::Lt)?;
+            let (key, key_span) = self.int_ty()?;
+            self.expect(Tok::Comma)?;
+            let (value_name, value_span) = self.ident()?;
+            if value_name != "PointsTo" {
+                return Err(Diagnostic {
+                    name: "resource.map_type".into(),
+                    title: "this `ResourceMap` value type is not supported yet".into(),
+                    span: value_span,
+                    label: "the first aggregate slice requires `PointsTo<u64>`".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "the surface is parameterized so later resource kinds reuse the same \
+                         aggregate abstraction; for now only \
+                         `ResourceMap<u64, PointsTo<u64>>` has sealed operations"
+                            .into(),
+                    )],
+                });
+            }
+            self.expect(Tok::Lt)?;
+            let (value_elem, value_elem_span) = self.int_ty()?;
+            self.expect(Tok::Gt)?;
+            let end = self.expect(Tok::Gt)?.span;
+            if key != IntTy::U64 || value_elem != IntTy::U64 {
+                return Err(Diagnostic {
+                    name: "resource.map_type".into(),
+                    title: "this `ResourceMap` instantiation is not supported yet".into(),
+                    span: if key != IntTy::U64 {
+                        key_span
+                    } else {
+                        value_elem_span
+                    },
+                    label: "the first aggregate slice supports \
+                            `ResourceMap<u64, PointsTo<u64>>`"
+                        .into(),
+                    notes: vec![(
+                        "note".into(),
+                        "typed records and their layout must be established before maps of \
+                         node permissions can be admitted honestly"
+                            .into(),
+                    )],
+                });
+            }
+            (ResKind::ResourceMapPointsToU64, end)
+        } else if name == "PointsTo" || name == "LeasedPointsTo" {
             self.expect(Tok::Lt)?;
             let (elem, elem_span) = self.int_ty()?;
             let end = self.expect(Tok::Gt)?.span;
@@ -3148,6 +3193,9 @@ fn is_reserved_name(name: &str) -> bool {
         "allocator_take_header",
         "allocator_put_header",
         "allocator_step_header",
+        "resource_map_empty",
+        "resource_map_take",
+        "resource_map_put",
         "static_alloc",
         "system_alloc",
         "system_dealloc",

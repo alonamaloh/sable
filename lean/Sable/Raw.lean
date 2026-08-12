@@ -89,6 +89,145 @@ def PointsToView.clear (v : PointsToView α) : PointsToView α :=
 @[simp] theorem PointsToView.clear_state (v : PointsToView α) :
     v.clear.state = .uninit := rfl
 
+/-! ## Generic aggregate authority views
+
+`ResourceMapView` is deliberately only a pure partial map. The affine
+checker token owns all entries, and the hidden valid-composition
+interpretation proves that taking one entry preserves separation from the
+residual map (ADR 0053). Generated VCs therefore mention membership and
+well-formedness, never a user-facing heap or separating conjunction.
+-/
+
+structure ResourceMapView (K : Type) (V : Type) where
+  entries : K → Option V
+
+namespace ResourceMapView
+
+variable {K V : Type} [DecidableEq K]
+
+def empty : ResourceMapView K V :=
+  ⟨fun _ => none⟩
+
+def erase (m : ResourceMapView K V) (key : K) : ResourceMapView K V :=
+  ⟨fun other => if other = key then none else m.entries other⟩
+
+def insert (m : ResourceMapView K V) (key : K) (value : V) :
+    ResourceMapView K V :=
+  ⟨fun other => if other = key then some value else m.entries other⟩
+
+omit [DecidableEq K] in
+@[simp] theorem empty_entries (key : K) :
+    (empty : ResourceMapView K V).entries key = none := rfl
+
+@[simp] theorem erase_eq (m : ResourceMapView K V) (key : K) :
+    (m.erase key).entries key = none := by
+  simp [erase]
+
+@[simp] theorem erase_ne (m : ResourceMapView K V) {key other : K}
+    (hne : other ≠ key) :
+    (m.erase key).entries other = m.entries other := by
+  simp [erase, hne]
+
+@[simp] theorem insert_eq (m : ResourceMapView K V) (key : K) (value : V) :
+    (m.insert key value).entries key = some value := by
+  simp [insert]
+
+@[simp] theorem insert_ne (m : ResourceMapView K V) {key other : K}
+    (value : V) (hne : other ≠ key) :
+    (m.insert key value).entries other = m.entries other := by
+  simp [insert, hne]
+
+/-- Taking and returning the same entry restores the exact map view. -/
+theorem erase_insert_roundTrip
+    {m : ResourceMapView K V} {key : K} {value : V}
+    (hentry : m.entries key = some value) :
+    (m.erase key).insert key value = m := by
+  cases m with
+  | mk entries =>
+      simp only [erase, insert]
+      congr 1
+      funext other
+      by_cases h : other = key
+      · subst other
+        simpa using hentry.symm
+      · simp [h]
+
+/-- Inserting into an absent slot and taking it back restores the map. -/
+theorem insert_erase_roundTrip
+    {m : ResourceMapView K V} {key : K} {value : V}
+    (hempty : m.entries key = none) :
+    (m.insert key value).erase key = m := by
+  cases m with
+  | mk entries =>
+      simp only [erase, insert]
+      congr 1
+      funext other
+      by_cases h : other = key
+      · subst other
+        simpa using hempty.symm
+      · simp [h]
+
+/-! The first source-language instance: `u64` keys and `PointsTo<u64>`
+entries. A total selector keeps generated terms first-order; its fallback is
+unobservable because every use carries `canTakeU64`. -/
+
+@[simp] def canTakeU64
+    (m : ResourceMapView Int (PointsToView Int)) (key : Int) : Prop :=
+  ∃ cell, m.entries key = some cell
+
+def fallbackCellU64 : PointsToView Int :=
+  { alloc := 0, off := 0, layout := u64.layout, state := .uninit }
+
+def cellAtU64
+    (m : ResourceMapView Int (PointsToView Int)) (key : Int) :
+    PointsToView Int :=
+  match m.entries key with
+  | some cell => cell
+  | none => fallbackCellU64
+
+def wfU64 (m : ResourceMapView Int (PointsToView Int)) : Prop :=
+  ∀ key cell, m.entries key = some cell → cell.wfU64
+
+theorem canTakeU64_entry {m : ResourceMapView Int (PointsToView Int)}
+    {key : Int} (h : m.canTakeU64 key) :
+    m.entries key = some (m.cellAtU64 key) := by
+  obtain ⟨cell, hcell⟩ := h
+  simp [cellAtU64, hcell]
+
+theorem wfU64_cellAt {m : ResourceMapView Int (PointsToView Int)}
+    {key : Int} (hwf : m.wfU64) (htake : m.canTakeU64 key) :
+    (m.cellAtU64 key).wfU64 :=
+  hwf key _ (canTakeU64_entry htake)
+
+@[simp] theorem wfU64_empty :
+    (empty : ResourceMapView Int (PointsToView Int)).wfU64 := by
+  intro key cell hentry
+  simp at hentry
+
+theorem wfU64_erase {m : ResourceMapView Int (PointsToView Int)}
+    (hwf : m.wfU64) (key : Int) : (m.erase key).wfU64 := by
+  intro other cell hentry
+  have hne : other ≠ key := by
+    intro heq
+    subst other
+    simp at hentry
+  apply hwf other cell
+  simpa [erase, hne] using hentry
+
+theorem wfU64_insert {m : ResourceMapView Int (PointsToView Int)}
+    (hwf : m.wfU64) (key : Int) {cell : PointsToView Int}
+    (hcell : cell.wfU64) : (m.insert key cell).wfU64 := by
+  intro other stored hentry
+  by_cases heq : other = key
+  · subst other
+    simp only [insert_eq] at hentry
+    cases hentry
+    exact hcell
+  · apply hwf other stored
+    simpa [insert, heq] using hentry
+
+end ResourceMapView
+
 /-- The byte, if this state has one. Junk-free: `none` is the honest
 answer for uninitialized storage, and the initialization VC is what keeps
 verified programs away from it. -/

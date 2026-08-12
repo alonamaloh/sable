@@ -1,0 +1,11 @@
+// expect-test-failure: resource_map_take: key 0 is absent
+
+fn shadow_take(resource &mut ResourceMap<u64, PointsTo<u64>> cells,
+               u64 key) -> resource PointsTo<u64> {
+    return resource_map_take(&mut cells, key);
+}
+
+fn test_resource_map_take_missing() {
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    resource PointsTo<u64> cell = shadow_take(&mut cells, 0);
+}

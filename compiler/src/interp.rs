@@ -26,6 +26,10 @@ pub enum RtVal {
     },
     /// A raw pointer: allocation id plus byte offset (ADR 0025/0026).
     Ptr(i128, i128),
+    /// Sanitizer-only shadow state for an erased resource map. The machine
+    /// still carries no authority value; this set independently catches an
+    /// absent take or duplicate put in unverified `test_` code.
+    ResMap(Rc<RefCell<HashSet<i128>>>),
     Unit,
 }
 
@@ -50,6 +54,18 @@ struct Trap {
 type IResult<T> = Result<T, Trap>;
 
 const FUEL: u64 = 50_000_000;
+
+/// Most resources are wholly erased even in the interpreter. A resource map
+/// alone carries sanitizer shadow metadata so invalid test code can be caught
+/// independently of Lean; that metadata must follow ordinary Sable calls even
+/// though no backend ABI receives it.
+fn has_resource_shadow(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Res(ResKind::ResourceMapPointsToU64)
+            | Ty::ResRef(ResKind::ResourceMapPointsToU64, _)
+    )
+}
 
 pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<TestReport> {
     let source = mods.combined_source.as_str();
@@ -446,7 +462,12 @@ impl<'a> Interp<'a> {
             olds: HashMap::new(),
             self_ctx: None,
         };
-        for (p, v) in f.params.iter().filter(|p| !p.ty.is_resource()).zip(args) {
+        for (p, v) in f
+            .params
+            .iter()
+            .filter(|p| !p.ty.is_resource() || has_resource_shadow(p.ty))
+            .zip(args)
+        {
             match (&v, p.ty) {
                 (RtVal::Arr(a), Ty::Array(_, Mutability::Mut)) => {
                     frame
@@ -740,7 +761,7 @@ impl<'a> Interp<'a> {
     /// erased (ADR 0024), and integers are copied.
     fn eval_moved(&mut self, e: &Expr, frame: &mut Frame) -> IResult<RtVal> {
         let v = self.eval(e, frame)?;
-        if matches!(v, RtVal::Obj { .. }) {
+        if matches!(v, RtVal::Obj { .. } | RtVal::ResMap(_)) {
             if let Some(place) = Self::source_place(e) {
                 self.take_place(&place, frame);
             }
@@ -1342,6 +1363,41 @@ impl<'a> Interp<'a> {
                                     span: e.span,
                                 });
                             }
+                        }
+                    }
+                    ResOp::ResourceMapEmpty => {
+                        return Ok(RtVal::ResMap(Rc::new(RefCell::new(HashSet::new()))));
+                    }
+                    ResOp::ResourceMapTake => {
+                        let RtVal::ResMap(entries) = self.eval(&args[0], frame)? else {
+                            unreachable!("checked: resource map borrow")
+                        };
+                        let key = self.eval_int(&args[1], frame)?;
+                        if !entries.borrow_mut().remove(&key) {
+                            return Err(Trap {
+                                undef: false,
+                                message: format!(
+                                    "resource_map_take: key {key} is absent"
+                                ),
+                                span: e.span,
+                            });
+                        }
+                    }
+                    ResOp::ResourceMapPut => {
+                        let RtVal::ResMap(entries) = self.eval(&args[0], frame)? else {
+                            unreachable!("checked: resource map borrow")
+                        };
+                        let key = self.eval_int(&args[1], frame)?;
+                        // The consumed cell is ordinary erased authority; only the
+                        // aggregate's key set has sanitizer shadow state.
+                        if !entries.borrow_mut().insert(key) {
+                            return Err(Trap {
+                                undef: false,
+                                message: format!(
+                                    "resource_map_put: key {key} is already occupied"
+                                ),
+                                span: e.span,
+                            });
                         }
                     }
                     _ => {}
@@ -1979,14 +2035,17 @@ impl<'a> Interp<'a> {
                 // Resource arguments are erased: authority is a static
                 // notion, so it has no runtime representation to pass and
                 // the callee's runtime signature does not have the
-                // parameter at all (ADR 0024). Both sides drop the same
-                // positions, so the remaining ones still line up.
+                // parameter at all (ADR 0024). Resource-map shadow metadata
+                // is the sole interpreter-only exception, and it follows
+                // verified Sable calls but never crosses an extern ABI.
                 // A by-value class argument is a *move*, and moves clear
                 // their source place — `eval_moved` is the same operation
                 // the other transfers use.
                 let mut vals = Vec::with_capacity(args.len());
                 for (a, p) in args.iter().zip(&f.params) {
-                    if p.ty.is_resource() {
+                    if p.ty.is_resource()
+                        && (f.extern_info.is_some() || !has_resource_shadow(p.ty))
+                    {
                         continue;
                     }
                     vals.push(self.eval_moved(a, frame)?);
@@ -2062,6 +2121,7 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
         // A pointer has no specification value: contracts speak about
         // views, and a view is not something the monitor can see.
         RtVal::Ptr(..) => return None,
+        RtVal::ResMap(..) => return None,
         RtVal::Unit => return None,
     })
 }

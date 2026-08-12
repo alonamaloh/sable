@@ -169,6 +169,10 @@ pub enum ResKind {
     FreeBlock,
     /// An internal free block while its two-word size/link header is typed.
     FreeHeader,
+    /// An affine aggregate of independently owned typed cells, indexed by a
+    /// stable integer key. The parameterized source surface initially admits
+    /// only `ResourceMap<u64, PointsTo<u64>>` (ADR 0053).
+    ResourceMapPointsToU64,
 }
 
 /// The sealed transformations of resource authority. These are not
@@ -212,6 +216,9 @@ pub enum ResOp {
     FreeBlockJoin,
     FreeBlockLease,
     BlockLeaseFree,
+    ResourceMapEmpty,
+    ResourceMapTake,
+    ResourceMapPut,
 }
 
 impl ResOp {
@@ -234,6 +241,9 @@ impl ResOp {
             "free_block_join" => Some(ResOp::FreeBlockJoin),
             "free_block_lease" => Some(ResOp::FreeBlockLease),
             "block_lease_free" => Some(ResOp::BlockLeaseFree),
+            "resource_map_empty" => Some(ResOp::ResourceMapEmpty),
+            "resource_map_take" => Some(ResOp::ResourceMapTake),
+            "resource_map_put" => Some(ResOp::ResourceMapPut),
             _ => None,
         }
     }
@@ -257,6 +267,9 @@ impl ResOp {
             ResOp::FreeBlockJoin => "free_block_join",
             ResOp::FreeBlockLease => "free_block_lease",
             ResOp::BlockLeaseFree => "block_lease_free",
+            ResOp::ResourceMapEmpty => "resource_map_empty",
+            ResOp::ResourceMapTake => "resource_map_take",
+            ResOp::ResourceMapPut => "resource_map_put",
         }
     }
 }
@@ -390,6 +403,7 @@ impl ResKind {
             ResKind::LeasedPointsToU64 => "LeasedPointsTo<u64>",
             ResKind::FreeBlock => "FreeBlock",
             ResKind::FreeHeader => "FreeHeader",
+            ResKind::ResourceMapPointsToU64 => "ResourceMap<u64, PointsTo<u64>>",
         }
     }
 
@@ -424,6 +438,8 @@ impl ResKind {
             ResKind::LeasedPointsToU64 => "Sable.LeasedPointsToU64View",
             ResKind::FreeBlock => "Sable.FreeBlockView",
             ResKind::FreeHeader => "Sable.FreeHeaderView",
+            ResKind::ResourceMapPointsToU64 =>
+                "Sable.ResourceMapView Int (Sable.PointsToView Int)",
         }
     }
 

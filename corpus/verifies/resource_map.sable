@@ -1,0 +1,58 @@
+// The first generic aggregate-authority slice (ADR 0053). Two independently
+// owned typed cells enter one affine map, leave in the opposite order, and
+// still reconstruct the exact system allocation required for release.
+
+/// pre  #[label(absent)] cells.entries key = none
+/// post #[label(inserted)]
+///        cells = Sable.ResourceMapView.insert (old cells) key cell
+pub fn resource_map_put_cell(
+    resource &mut ResourceMap<u64, PointsTo<u64>> cells,
+    u64 key,
+    resource PointsTo<u64> cell
+) {
+    resource_map_put(&mut cells, key, cell);
+}
+
+/// pre  #[label(present)] ∃ stored, cells.entries key = some stored
+/// post #[label(removed)]
+///        cells = Sable.ResourceMapView.erase (old cells) key
+/// post #[label(returned)] (old cells).entries key = some result
+pub fn resource_map_take_cell(
+    resource &mut ResourceMap<u64, PointsTo<u64>> cells,
+    u64 key
+) -> resource PointsTo<u64> {
+    return resource_map_take(&mut cells, key);
+}
+
+/// post result = 42
+pub fn resource_map_round_trip() -> u64 {
+    unsafe system_alloc(16) as (base, resource mem, resource release);
+    mut resource RawSpan bytes0 = mem;
+    resource RawSpan bytes1 = split_off(&mut bytes0, 8);
+    raw<u8> p1 = raw_offset(base, 8);
+
+    unsafe {
+        mut resource PointsTo<u64> cell0 = raw_into_cell_u64(base, bytes0);
+        mut resource PointsTo<u64> cell1 = raw_into_cell_u64(p1, bytes1);
+        raw_cell_init_u64(base, 11, &mut cell0);
+        raw_cell_init_u64(p1, 31, &mut cell1);
+    }
+
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    resource_map_put_cell(&mut cells, 0, cell0);
+    resource_map_put_cell(&mut cells, 1, cell1);
+
+    mut resource PointsTo<u64> back1 = resource_map_take_cell(&mut cells, 1);
+    mut resource PointsTo<u64> back0 = resource_map_take_cell(&mut cells, 0);
+    mut u64 right = 0;
+    mut u64 left = 0;
+    unsafe {
+        right = raw_cell_take_u64(p1, &mut back1);
+        left = raw_cell_take_u64(base, &mut back0);
+        resource RawSpan raw1 = raw_from_cell_u64(p1, back1);
+        resource RawSpan raw0 = raw_from_cell_u64(base, back0);
+    }
+    resource RawSpan whole = join(raw0, raw1);
+    unsafe system_dealloc(base, whole, release);
+    return left + right;
+}

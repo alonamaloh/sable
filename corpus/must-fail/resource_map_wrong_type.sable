@@ -1,0 +1,4 @@
+// expect-error: resource.map_type
+
+pub fn resource_map_wrong_type(resource ResourceMap<u32, PointsTo<u64>> cells) {
+}

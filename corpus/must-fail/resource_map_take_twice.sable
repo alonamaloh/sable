@@ -1,0 +1,12 @@
+// expect-error: resource_map_take_twice.resource_map_take.0.2
+
+pub fn resource_map_take_twice() {
+    unsafe static_alloc(8) as (base, resource bytes);
+    unsafe {
+        resource PointsTo<u64> cell = raw_into_cell_u64(base, bytes);
+    }
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    resource_map_put(&mut cells, 0, cell);
+    resource PointsTo<u64> first = resource_map_take(&mut cells, 0);
+    resource PointsTo<u64> second = resource_map_take(&mut cells, 0);
+}

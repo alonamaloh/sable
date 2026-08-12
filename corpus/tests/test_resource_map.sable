@@ -1,0 +1,44 @@
+// Resource views are proof-only; the sanitizer shadows just key membership.
+// These imported wrapper contracts are therefore deliberately outside the
+// dynamic monitor's scalar/array fragment.
+// expect-skip: cells.entries key = none
+// expect-skip: cells = Sable.ResourceMapView.insert
+// expect-skip: ∃ stored, cells.entries key = some stored
+// expect-skip: cells = Sable.ResourceMapView.erase
+// expect-skip: (old cells).entries key = some result
+
+use resource_map;
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+fn shadow_put(resource &mut ResourceMap<u64, PointsTo<u64>> cells,
+              u64 key, resource PointsTo<u64> cell) {
+    resource_map_put(&mut cells, key, cell);
+}
+
+fn shadow_take(resource &mut ResourceMap<u64, PointsTo<u64>> cells,
+               u64 key) -> resource PointsTo<u64> {
+    return resource_map_take(&mut cells, key);
+}
+
+fn test_resource_map_round_trip() {
+    expect_eq_u64(resource_map_round_trip(), 42);
+}
+
+fn test_resource_map_shadow_across_calls() {
+    unsafe static_alloc(8) as (base, resource bytes);
+    unsafe {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(base, bytes);
+        raw_cell_init_u64(base, 9, &mut cell);
+    }
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    shadow_put(&mut cells, 7, cell);
+    mut resource PointsTo<u64> back = shadow_take(&mut cells, 7);
+    unsafe {
+        u64 value = raw_cell_take_u64(base, &mut back);
+        resource RawSpan raw_bytes = raw_from_cell_u64(base, back);
+    }
+    expect_eq_u64(value, 9);
+}

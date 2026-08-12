@@ -2650,14 +2650,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let op = *op;
             let op_span = *op_span;
             let arity = match op {
-                ResOp::AllocatorStepHeader => 3,
+                ResOp::AllocatorStepHeader | ResOp::ResourceMapPut => 3,
                 ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf
                 | ResOp::AllocatorTake | ResOp::AllocatorPut
                 | ResOp::AllocatorTakeFree | ResOp::AllocatorPutFree
                 | ResOp::AllocatorTakeHeader | ResOp::AllocatorPutHeader
-                | ResOp::FreeBlockSplit | ResOp::FreeBlockJoin => 2,
+                | ResOp::FreeBlockSplit | ResOp::FreeBlockJoin
+                | ResOp::ResourceMapTake => 2,
                 ResOp::TestWorld | ResOp::AllocatorCreate | ResOp::AllocatorDestroy
                 | ResOp::FreeBlockLease | ResOp::BlockLeaseFree => 1,
+                ResOp::ResourceMapEmpty => 0,
             };
             if args.len() != arity {
                 return Err(Diagnostic {
@@ -2845,6 +2847,34 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     check_expr(ctx, &mut args[0], Some(lease))?;
                     transfer(ctx, &args[0], None)?;
                     Ty::Res(ResKind::FreeBlock)
+                }
+                ResOp::ResourceMapEmpty => {
+                    Ty::Res(ResKind::ResourceMapPointsToU64)
+                }
+                ResOp::ResourceMapTake => {
+                    let map = Ty::ResRef(
+                        ResKind::ResourceMapPointsToU64,
+                        Mutability::Mut,
+                    );
+                    require_explicit_borrow(ctx, &args[0], map)?;
+                    check_expr(ctx, &mut args[0], Some(map))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Res(ResKind::PointsToU64)
+                }
+                ResOp::ResourceMapPut => {
+                    let map = Ty::ResRef(
+                        ResKind::ResourceMapPointsToU64,
+                        Mutability::Mut,
+                    );
+                    require_explicit_borrow(ctx, &args[0], map)?;
+                    check_expr(ctx, &mut args[0], Some(map))?;
+                    check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+                    let cell = Ty::Res(ResKind::PointsToU64);
+                    check_expr(ctx, &mut args[2], Some(cell))?;
+                    transfer(ctx, &args[2], None)?;
+                    check_borrow_conflicts(ctx, args, None)?;
+                    Ty::Unit
                 }
             }
         }

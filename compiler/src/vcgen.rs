@@ -2908,6 +2908,137 @@ impl<'a> Generator<'a> {
                         );
                         Val::View(w)
                     }
+                    ResOp::ResourceMapEmpty => {
+                        let map = self.hinted_sym("_resource_map", hint);
+                        self.binders.push((
+                            map.clone(),
+                            ResKind::ResourceMapPointsToU64.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{}_empty", map.trim_start_matches('_')),
+                            format!("{map} = Sable.ResourceMapView.empty"),
+                        );
+                        for (h, prop) in view_wf_hyps(
+                            ResKind::ResourceMapPointsToU64,
+                            map.trim_start_matches('_'),
+                            &map,
+                        ) {
+                            self.push_hyp_unique(h, prop);
+                        }
+                        Val::View(map)
+                    }
+                    ResOp::ResourceMapTake => {
+                        let Val::View(map) = self.eval(&args[0]) else {
+                            unreachable!("checked: resource map borrow")
+                        };
+                        let Val::Int(key) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 key")
+                        };
+                        let goal = format!(
+                            "Sable.ResourceMapView.canTakeU64 ({map}) {key}"
+                        );
+                        let ob = self.obligation(
+                            &format!(
+                                "{}.resource_map_take.{}",
+                                self.fname,
+                                slug(&key)
+                            ),
+                            "`resource_map_take` needs a stored entry at this key".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: resource map borrow")
+                        };
+                        let residual =
+                            self.hinted_sym("_resource_map", Some(array.clone()));
+                        self.binders.push((
+                            residual.clone(),
+                            ResKind::ResourceMapPointsToU64.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_take"),
+                            format!(
+                                "{residual} = Sable.ResourceMapView.erase ({map}) {key}"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_wf"),
+                            format!("Sable.ResourceMapView.wfU64 {residual}"),
+                        );
+                        self.env
+                            .insert(array.clone(), Val::View(residual.clone()));
+                        let cell = self.hinted_sym("_cell", hint);
+                        self.binders
+                            .push((cell.clone(), ResKind::PointsToU64.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_take", cell.trim_start_matches('_')),
+                            format!(
+                                "{cell} = Sable.ResourceMapView.cellAtU64 ({map}) {key}"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_entry", cell.trim_start_matches('_')),
+                            format!("({map}).entries {key} = some {cell}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", cell.trim_start_matches('_')),
+                            format!("Sable.PointsToView.wfU64 {cell}"),
+                        );
+                        Val::View(cell)
+                    }
+                    ResOp::ResourceMapPut => {
+                        let Val::View(map) = self.eval(&args[0]) else {
+                            unreachable!("checked: resource map borrow")
+                        };
+                        let Val::Int(key) = self.eval(&args[1]) else {
+                            unreachable!("checked: u64 key")
+                        };
+                        let Val::View(cell) = self.eval(&args[2]) else {
+                            unreachable!("checked: points-to value")
+                        };
+                        let goal = format!("({map}).entries {key} = none");
+                        let ob = self.obligation(
+                            &format!(
+                                "{}.resource_map_put.{}",
+                                self.fname,
+                                slug(&key)
+                            ),
+                            "`resource_map_put` needs an absent key".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
+                            unreachable!("checked: resource map borrow")
+                        };
+                        let restored =
+                            self.hinted_sym("_resource_map", Some(array.clone()));
+                        self.binders.push((
+                            restored.clone(),
+                            ResKind::ResourceMapPointsToU64.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{array}_put"),
+                            format!(
+                                "{restored} = Sable.ResourceMapView.insert \
+                                 ({map}) {key} ({cell})"
+                            ),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_entry"),
+                            format!("({restored}).entries {key} = some {cell}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_wf"),
+                            format!("Sable.ResourceMapView.wfU64 {restored}"),
+                        );
+                        self.env.insert(array.clone(), Val::View(restored));
+                        Val::Unit
+                    }
                     ResOp::AllocatorCreate => {
                         let Val::View(root) = self.eval(&args[0]) else {
                             unreachable!("checked: raw span value")
@@ -4865,6 +4996,10 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         ResKind::FreeHeader => vec![(
             format!("h_{name}_wf"),
             format!("Sable.FreeHeaderView.wf {binder}"),
+        )],
+        ResKind::ResourceMapPointsToU64 => vec![(
+            format!("h_{name}_wf"),
+            format!("Sable.ResourceMapView.wfU64 {binder}"),
         )],
     }
 }

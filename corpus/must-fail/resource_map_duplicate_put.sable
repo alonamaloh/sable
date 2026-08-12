@@ -1,0 +1,15 @@
+// expect-error: resource_map_duplicate_put.resource_map_put.0.2
+
+pub fn resource_map_duplicate_put() {
+    unsafe static_alloc(16) as (base, resource mem);
+    mut resource RawSpan bytes0 = mem;
+    resource RawSpan bytes1 = split_off(&mut bytes0, 8);
+    raw<u8> p1 = raw_offset(base, 8);
+    unsafe {
+        resource PointsTo<u64> cell0 = raw_into_cell_u64(base, bytes0);
+        resource PointsTo<u64> cell1 = raw_into_cell_u64(p1, bytes1);
+    }
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    resource_map_put(&mut cells, 0, cell0);
+    resource_map_put(&mut cells, 0, cell1);
+}

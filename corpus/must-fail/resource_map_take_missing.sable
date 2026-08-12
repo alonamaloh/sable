@@ -1,0 +1,6 @@
+// expect-error: resource_map_take_missing.resource_map_take.0
+
+pub fn resource_map_take_missing() {
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    resource PointsTo<u64> cell = resource_map_take(&mut cells, 0);
+}

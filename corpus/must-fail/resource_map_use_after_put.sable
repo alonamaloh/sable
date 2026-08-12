@@ -1,0 +1,14 @@
+// expect-error: resource.use_after_move
+
+pub fn resource_map_use_after_put() -> u64 {
+    unsafe static_alloc(8) as (base, resource bytes);
+    unsafe {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(base, bytes);
+        raw_cell_init_u64(base, 7, &mut cell);
+    }
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    resource_map_put(&mut cells, 0, cell);
+    unsafe {
+        return raw_cell_read_u64(base, &cell);
+    }
+}
