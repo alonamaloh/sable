@@ -4,7 +4,7 @@
 use crate::scan::Clause;
 use crate::span::Span;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntTy {
     U8,
     U16,
@@ -104,6 +104,314 @@ impl IntTy {
             _ => return None,
         })
     }
+}
+
+/// The legacy AST stores a generic parameter in `IntTy::TParam(u8)`, so G0
+/// keeps the same 256-parameter ceiling explicitly instead of silently
+/// truncating a parser index with `as u8`.
+pub const MAX_TYPE_PARAMS: usize = u8::MAX as usize + 1;
+
+/// Stable index of a parameter in its enclosing generic declaration.
+///
+/// This is deliberately distinct from `IntTy::TParam`: the recursive generic
+/// type tree is not intrinsically integer-typed. Construction is checked
+/// against the legacy G0 ceiling while existing AST type positions still use
+/// the `u8` representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeParamId(u32);
+
+impl TypeParamId {
+    pub fn new(index: usize) -> Option<TypeParamId> {
+        (index < MAX_TYPE_PARAMS).then_some(TypeParamId(index as u32))
+    }
+
+    pub const fn from_legacy(index: u8) -> TypeParamId {
+        TypeParamId(index as u32)
+    }
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    fn legacy_index(self) -> u8 {
+        u8::try_from(self.0).expect("TypeParamId construction enforces the G0 u8 ceiling")
+    }
+}
+
+/// A nominal value type referenced by a recursive generic type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NominalKind {
+    Record,
+    Class,
+}
+
+/// A source-level value-type shape carried through generic parsing and
+/// monomorphization.
+///
+/// G0 does not yet store this in the existing AST type-argument fields and
+/// does not accept any new syntax. It is an owned structural representation
+/// for the migration away from integer-only `Vec<IntTy>` arguments. Nominal
+/// types are name-based because module-local class indices are not stable
+/// until merging and monomorphization have finished.
+///
+/// `GenericTy::Int(IntTy::TParam(_))` is non-canonical. Use
+/// `GenericTy::from_legacy_int`, which normalizes it to `GenericTy::Param`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GenericTy {
+    Int(IntTy),
+    Param(TypeParamId),
+    Bool,
+    Record(String),
+    Array(Box<GenericTy>),
+    Option(Box<GenericTy>),
+    Class {
+        name: String,
+        args: Box<[GenericTy]>,
+    },
+}
+
+/// A recursive generic type together with the source range that named it.
+/// Spans deliberately do not participate in structural instance identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeArg {
+    pub ty: GenericTy,
+    pub span: Span,
+}
+
+impl TypeArg {
+    pub fn from_legacy_int(ty: IntTy, span: Span) -> TypeArg {
+        TypeArg {
+            ty: GenericTy::from_legacy_int(ty),
+            span,
+        }
+    }
+}
+
+/// Failures from checked generic-type conversion, substitution, and keying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenericTyError {
+    /// The shape cannot be represented by the integer-only v1 AST surface.
+    NotV1Integer,
+    /// A parameter survived where a concrete monomorphization key or integer
+    /// was required.
+    UnsubstitutedTypeParameter(TypeParamId),
+    /// A substitution referred outside the declaration's argument list.
+    TypeParameterOutOfBounds {
+        parameter: TypeParamId,
+        arity: usize,
+    },
+    /// A caller constructed `Int(TParam(_))` instead of the normalized
+    /// `Param(_)` form.
+    NonCanonicalLegacyParameter(TypeParamId),
+}
+
+/// Opaque, injective encoding of one concrete recursive generic type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CanonicalTypeKey(String);
+
+impl CanonicalTypeKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CanonicalTypeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for CanonicalTypeKey {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl GenericTy {
+    /// Lift an existing integer type into the recursive representation,
+    /// normalizing the legacy embedded parameter variant.
+    pub fn from_legacy_int(ty: IntTy) -> GenericTy {
+        match ty {
+            IntTy::TParam(index) => GenericTy::Param(TypeParamId::from_legacy(index)),
+            concrete => GenericTy::Int(concrete),
+        }
+    }
+
+    /// Convert back to the current integer-only AST representation. This
+    /// admits a parameter because templates still encode one as
+    /// `IntTy::TParam`; aggregate and nominal shapes are rejected.
+    pub fn try_to_v1_int(&self) -> Result<IntTy, GenericTyError> {
+        match self {
+            GenericTy::Int(IntTy::TParam(index)) => Err(
+                GenericTyError::NonCanonicalLegacyParameter(TypeParamId::from_legacy(*index)),
+            ),
+            GenericTy::Int(concrete) => Ok(*concrete),
+            GenericTy::Param(parameter) => Ok(IntTy::TParam(parameter.legacy_index())),
+            _ => Err(GenericTyError::NotV1Integer),
+        }
+    }
+
+    /// Convert a fully instantiated G0 argument to an integer type.
+    pub fn try_to_concrete_v1_int(&self) -> Result<IntTy, GenericTyError> {
+        match self {
+            GenericTy::Param(parameter) => {
+                Err(GenericTyError::UnsubstitutedTypeParameter(*parameter))
+            }
+            _ => self.try_to_v1_int(),
+        }
+    }
+
+    /// Substitute type parameters recursively. The returned tree is owned so
+    /// callers cannot accidentally share and mutate an instance key.
+    pub fn substitute(&self, args: &[GenericTy]) -> Result<GenericTy, GenericTyError> {
+        match self {
+            GenericTy::Int(IntTy::TParam(index)) => {
+                let parameter = TypeParamId::from_legacy(*index);
+                args.get(parameter.index()).cloned().ok_or(
+                    GenericTyError::TypeParameterOutOfBounds {
+                        parameter,
+                        arity: args.len(),
+                    },
+                )
+            }
+            GenericTy::Param(parameter) => args.get(parameter.index()).cloned().ok_or(
+                GenericTyError::TypeParameterOutOfBounds {
+                    parameter: *parameter,
+                    arity: args.len(),
+                },
+            ),
+            GenericTy::Int(concrete) => Ok(GenericTy::Int(*concrete)),
+            GenericTy::Bool => Ok(GenericTy::Bool),
+            GenericTy::Record(name) => Ok(GenericTy::Record(name.clone())),
+            GenericTy::Array(element) => Ok(GenericTy::Array(Box::new(element.substitute(args)?))),
+            GenericTy::Option(element) => {
+                Ok(GenericTy::Option(Box::new(element.substitute(args)?)))
+            }
+            GenericTy::Class {
+                name,
+                args: type_args,
+            } => Ok(GenericTy::Class {
+                name: name.clone(),
+                args: type_args
+                    .iter()
+                    .map(|arg| arg.substitute(args))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice(),
+            }),
+        }
+    }
+
+    /// Whether this tree contains no type parameter, including the legacy
+    /// non-canonical `Int(TParam(_))` spelling.
+    pub fn is_concrete(&self) -> bool {
+        match self {
+            GenericTy::Int(IntTy::TParam(_)) | GenericTy::Param(_) => false,
+            GenericTy::Int(_) | GenericTy::Bool | GenericTy::Record(_) => true,
+            GenericTy::Array(element) | GenericTy::Option(element) => element.is_concrete(),
+            GenericTy::Class { args, .. } => args.iter().all(GenericTy::is_concrete),
+        }
+    }
+
+    /// Structural tree depth, counting an atom as one node. A zero-argument
+    /// class also has depth one.
+    pub fn structural_depth(&self) -> usize {
+        match self {
+            GenericTy::Int(_) | GenericTy::Param(_) | GenericTy::Bool | GenericTy::Record(_) => 1,
+            GenericTy::Array(element) | GenericTy::Option(element) => {
+                1 + element.structural_depth()
+            }
+            GenericTy::Class { args, .. } => {
+                1 + args
+                    .iter()
+                    .map(GenericTy::structural_depth)
+                    .max()
+                    .unwrap_or(0)
+            }
+        }
+    }
+
+    /// Visit every nominal reference in deterministic preorder.
+    pub fn visit_nominals(&self, mut visit: impl FnMut(NominalKind, &str)) {
+        self.visit_nominals_with(&mut visit);
+    }
+
+    fn visit_nominals_with(&self, visit: &mut impl FnMut(NominalKind, &str)) {
+        match self {
+            GenericTy::Record(name) => visit(NominalKind::Record, name),
+            GenericTy::Array(element) | GenericTy::Option(element) => {
+                element.visit_nominals_with(visit)
+            }
+            GenericTy::Class { name, args } => {
+                visit(NominalKind::Class, name);
+                for arg in args.iter() {
+                    arg.visit_nominals_with(visit);
+                }
+            }
+            GenericTy::Int(_) | GenericTy::Param(_) | GenericTy::Bool => {}
+        }
+    }
+
+    /// Produce an injective, length-prefixed key for a concrete type. Source
+    /// identifiers are ASCII today, but lengths are byte lengths so the
+    /// encoding remains unambiguous for any UTF-8 string.
+    pub fn concrete_key(&self) -> Result<CanonicalTypeKey, GenericTyError> {
+        let mut encoded = String::new();
+        self.encode_concrete_key(&mut encoded)?;
+        Ok(CanonicalTypeKey(encoded))
+    }
+
+    fn encode_concrete_key(&self, out: &mut String) -> Result<(), GenericTyError> {
+        match self {
+            GenericTy::Int(IntTy::TParam(index)) => {
+                return Err(GenericTyError::NonCanonicalLegacyParameter(
+                    TypeParamId::from_legacy(*index),
+                ));
+            }
+            GenericTy::Int(concrete) => {
+                out.push('I');
+                push_length_prefixed(out, concrete.name());
+            }
+            GenericTy::Param(parameter) => {
+                return Err(GenericTyError::UnsubstitutedTypeParameter(*parameter));
+            }
+            GenericTy::Bool => out.push('B'),
+            GenericTy::Record(name) => {
+                out.push('R');
+                push_length_prefixed(out, name);
+            }
+            GenericTy::Array(element) => {
+                let child = element.concrete_key()?;
+                out.push('A');
+                push_length_prefixed(out, child.as_str());
+            }
+            GenericTy::Option(element) => {
+                let child = element.concrete_key()?;
+                out.push('O');
+                push_length_prefixed(out, child.as_str());
+            }
+            GenericTy::Class { name, args } => {
+                out.push('C');
+                push_length_prefixed(out, name);
+                out.push_str(&args.len().to_string());
+                out.push('_');
+                for arg in args.iter() {
+                    let key = arg.concrete_key()?;
+                    push_length_prefixed(out, key.as_str());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn push_length_prefixed(out: &mut String, value: &str) {
+    out.push_str(&value.len().to_string());
+    out.push('_');
+    out.push_str(value);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1264,4 +1572,260 @@ pub struct Program {
     pub uses: Vec<UseDecl>,
     /// Named constants (ADR 0016), consumed by the const pass.
     pub consts: Vec<ConstDecl>,
+}
+
+#[cfg(test)]
+mod generic_ty_tests {
+    use super::*;
+
+    fn parameter(index: usize) -> GenericTy {
+        GenericTy::Param(TypeParamId::new(index).expect("test parameter is in range"))
+    }
+
+    #[test]
+    fn type_parameter_ids_enforce_the_legacy_g0_ceiling() {
+        assert_eq!(MAX_TYPE_PARAMS, 256);
+        assert_eq!(TypeParamId::new(0).unwrap().index(), 0);
+        assert_eq!(
+            TypeParamId::new(MAX_TYPE_PARAMS - 1).unwrap().index(),
+            MAX_TYPE_PARAMS - 1
+        );
+        assert_eq!(TypeParamId::new(MAX_TYPE_PARAMS), None);
+    }
+
+    #[test]
+    fn legacy_integer_parameters_normalize_and_round_trip() {
+        let concrete = [
+            IntTy::U8,
+            IntTy::U16,
+            IntTy::U32,
+            IntTy::U64,
+            IntTy::I8,
+            IntTy::I16,
+            IntTy::I32,
+            IntTy::I64,
+        ];
+        for integer in concrete {
+            let ty = GenericTy::from_legacy_int(integer);
+            assert_eq!(ty, GenericTy::Int(integer));
+            assert_eq!(ty.try_to_v1_int(), Ok(integer));
+            assert_eq!(ty.try_to_concrete_v1_int(), Ok(integer));
+        }
+
+        let parameter = GenericTy::from_legacy_int(IntTy::TParam(7));
+        assert_eq!(parameter, GenericTy::Param(TypeParamId::from_legacy(7)));
+        assert_eq!(parameter.try_to_v1_int(), Ok(IntTy::TParam(7)));
+        assert_eq!(
+            parameter.try_to_concrete_v1_int(),
+            Err(GenericTyError::UnsubstitutedTypeParameter(
+                TypeParamId::from_legacy(7)
+            ))
+        );
+
+        let malformed = GenericTy::Int(IntTy::TParam(7));
+        assert_eq!(
+            malformed.try_to_v1_int(),
+            Err(GenericTyError::NonCanonicalLegacyParameter(
+                TypeParamId::from_legacy(7)
+            ))
+        );
+        assert!(!malformed.is_concrete());
+    }
+
+    #[test]
+    fn v1_integer_conversion_rejects_new_shapes() {
+        for ty in [
+            GenericTy::Bool,
+            GenericTy::Record("Node".into()),
+            GenericTy::Array(Box::new(GenericTy::Int(IntTy::I32))),
+            GenericTy::Option(Box::new(GenericTy::Int(IntTy::I32))),
+            GenericTy::Class {
+                name: "Box".into(),
+                args: vec![GenericTy::Int(IntTy::I32)].into_boxed_slice(),
+            },
+        ] {
+            assert_eq!(ty.try_to_v1_int(), Err(GenericTyError::NotV1Integer));
+            assert_eq!(
+                ty.try_to_concrete_v1_int(),
+                Err(GenericTyError::NotV1Integer)
+            );
+        }
+    }
+
+    #[test]
+    fn substitution_recurses_through_every_container_shape() {
+        let template = GenericTy::Class {
+            name: "Pair".into(),
+            args: vec![
+                GenericTy::Option(Box::new(parameter(0))),
+                GenericTy::Array(Box::new(GenericTy::Class {
+                    name: "Box".into(),
+                    args: vec![parameter(1)].into_boxed_slice(),
+                })),
+            ]
+            .into_boxed_slice(),
+        };
+        let got = template
+            .substitute(&[GenericTy::Bool, GenericTy::Record("Node".into())])
+            .unwrap();
+        let expected = GenericTy::Class {
+            name: "Pair".into(),
+            args: vec![
+                GenericTy::Option(Box::new(GenericTy::Bool)),
+                GenericTy::Array(Box::new(GenericTy::Class {
+                    name: "Box".into(),
+                    args: vec![GenericTy::Record("Node".into())].into_boxed_slice(),
+                })),
+            ]
+            .into_boxed_slice(),
+        };
+        assert_eq!(got, expected);
+        assert!(got.is_concrete());
+
+        assert_eq!(
+            GenericTy::Int(IntTy::TParam(0))
+                .substitute(&[GenericTy::Bool])
+                .unwrap(),
+            GenericTy::Bool
+        );
+    }
+
+    #[test]
+    fn substitution_reports_an_out_of_bounds_parameter() {
+        let parameter = TypeParamId::new(2).unwrap();
+        assert_eq!(
+            GenericTy::Param(parameter).substitute(&[GenericTy::Bool]),
+            Err(GenericTyError::TypeParameterOutOfBounds {
+                parameter,
+                arity: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn concreteness_and_depth_are_recursive() {
+        let concrete = GenericTy::Class {
+            name: "Outer".into(),
+            args: vec![GenericTy::Option(Box::new(GenericTy::Array(Box::new(
+                GenericTy::Int(IntTy::I32),
+            ))))]
+            .into_boxed_slice(),
+        };
+        assert!(concrete.is_concrete());
+        assert_eq!(concrete.structural_depth(), 4);
+
+        let abstract_ty = GenericTy::Option(Box::new(GenericTy::Class {
+            name: "Box".into(),
+            args: vec![parameter(0)].into_boxed_slice(),
+        }));
+        assert!(!abstract_ty.is_concrete());
+        assert_eq!(abstract_ty.structural_depth(), 3);
+        assert_eq!(
+            GenericTy::Class {
+                name: "UnitLike".into(),
+                args: Box::new([]),
+            }
+            .structural_depth(),
+            1
+        );
+    }
+
+    #[test]
+    fn nominal_visitation_is_deterministic_preorder() {
+        let ty = GenericTy::Class {
+            name: "Outer".into(),
+            args: vec![
+                GenericTy::Record("Header".into()),
+                GenericTy::Option(Box::new(GenericTy::Class {
+                    name: "Inner".into(),
+                    args: vec![GenericTy::Record("Payload".into())].into_boxed_slice(),
+                })),
+            ]
+            .into_boxed_slice(),
+        };
+        let mut seen = Vec::new();
+        ty.visit_nominals(|kind, name| seen.push((kind, name.to_string())));
+        assert_eq!(
+            seen,
+            vec![
+                (NominalKind::Class, "Outer".into()),
+                (NominalKind::Record, "Header".into()),
+                (NominalKind::Class, "Inner".into()),
+                (NominalKind::Record, "Payload".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_keys_are_length_prefixed_and_injective() {
+        let integer = GenericTy::Int(IntTy::I32);
+        let array = GenericTy::Array(Box::new(integer.clone()));
+        let record = GenericTy::Record("Node".into());
+        let option_record = GenericTy::Option(Box::new(record.clone()));
+        let class = GenericTy::Class {
+            name: "Vec".into(),
+            args: vec![option_record.clone()].into_boxed_slice(),
+        };
+
+        assert_eq!(integer.concrete_key().unwrap().as_str(), "I3_i32");
+        assert_eq!(array.concrete_key().unwrap().as_str(), "A6_I3_i32");
+        assert_eq!(record.concrete_key().unwrap().as_str(), "R4_Node");
+        assert_eq!(option_record.concrete_key().unwrap().as_str(), "O7_R4_Node");
+        assert_eq!(
+            class.concrete_key().unwrap().as_str(),
+            "C3_Vec1_10_O7_R4_Node"
+        );
+
+        let array_of_option =
+            GenericTy::Array(Box::new(GenericTy::Option(Box::new(integer.clone()))));
+        let option_of_array = GenericTy::Option(Box::new(array));
+        assert_ne!(
+            array_of_option.concrete_key().unwrap(),
+            option_of_array.concrete_key().unwrap()
+        );
+        assert_ne!(
+            GenericTy::Record("X".into()).concrete_key().unwrap(),
+            GenericTy::Class {
+                name: "X".into(),
+                args: Box::new([]),
+            }
+            .concrete_key()
+            .unwrap()
+        );
+
+        let left = GenericTy::Class {
+            name: "A_i32".into(),
+            args: vec![GenericTy::Int(IntTy::U8)].into_boxed_slice(),
+        };
+        let right = GenericTy::Class {
+            name: "A".into(),
+            args: vec![GenericTy::Int(IntTy::I32), GenericTy::Int(IntTy::U8)].into_boxed_slice(),
+        };
+        assert_ne!(left.concrete_key().unwrap(), right.concrete_key().unwrap());
+    }
+
+    #[test]
+    fn concrete_keys_reject_parameters_and_noncanonical_legacy_parameters() {
+        let parameter = TypeParamId::new(3).unwrap();
+        assert_eq!(
+            GenericTy::Param(parameter).concrete_key(),
+            Err(GenericTyError::UnsubstitutedTypeParameter(parameter))
+        );
+        assert_eq!(
+            GenericTy::Int(IntTy::TParam(3)).concrete_key(),
+            Err(GenericTyError::NonCanonicalLegacyParameter(parameter))
+        );
+    }
+
+    #[test]
+    fn type_arg_preserves_span_while_normalizing_legacy_parameters() {
+        let span = Span::new(10, 14);
+        assert_eq!(
+            TypeArg::from_legacy_int(IntTy::TParam(2), span),
+            TypeArg {
+                ty: parameter(2),
+                span,
+            }
+        );
+    }
 }
