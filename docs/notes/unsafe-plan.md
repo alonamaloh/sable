@@ -1983,16 +1983,16 @@ after that search proof is stable should allocation remove the chosen node and
 choose between whole-block leasing and a header-sized remainder split.
 
 **The U8f4 first-fit search is complete (2026-08-12, ADR 0048).**
-`free_list_first_fit` remains ordinary verified Sable policy: it extracts and
-reads each real header, restores the allocator view before branching, records
-every too-small node in a structural rejected-prefix witness, and returns the
-first fitting key or the root-length sentinel. Prefix steps explicitly exclude
-the sentinel, and a kernel-checked theorem proves that every prefix endpoint
-is a suffix of the original stored chain; this closes a pure-model loophole in
-which an unrelated sentinel entry could otherwise extend the trace. All 15
-obligations are proved with zero assumptions or deferrals. A dynamic two-node
-fixture checks both a head hit and a complete miss before restoring and
-releasing the exact root extent.
+`free_list_locate_first_fit` remains ordinary verified Sable policy: it
+extracts and reads each real header, restores the allocator view before
+branching, records every too-small node in a structural rejected-path witness,
+and returns the predecessor, selected key, actual size, and actual successor;
+the key-only `free_list_first_fit` wrapper remains available. Path steps
+explicitly exclude the sentinel, and kernel-checked tail lemmas prove that
+every endpoint is a suffix of the original stored chain. All 22 obligations
+across both functions are proved with zero assumptions or deferrals. A dynamic
+two-node fixture checks both a head hit and a complete miss before restoring
+and releasing the exact root extent.
 
 Next separate selection from authority change. Define the smallest
 predecessor/head witness needed to unlink the selected header, and prove a
@@ -2000,6 +2000,28 @@ sealed removal transition that preserves the residual chain. Then choose the
 whole-block versus split-remainder policy from explicit size arithmetic; do
 not let the search function manufacture a client lease or silently mutate
 links.
+
+**The U8f5 first-fit authority-change slice is complete (2026-08-12,
+ADR 0049).** `free_list_allocate_found` uses a proved read-only location and
+covers all four found-node cases: head/non-head crossed with whole/split.
+Whole allocation removes exactly one stored header and returns its complete
+extent as a mandatory nonsplittable `BlockLease`. Split allocation returns
+exactly the requested prefix only when the suffix can hold a complete 16-byte
+header, stores that exact suffix, and points either the runtime head or the
+rebuilt predecessor at it. A strengthened `StoredChain` carries exact header
+extent plus an empty-interior frame, while `RejectedPrefix.splice`,
+`unlinkAfter`, and the combined `splitAfter` theorem restore an arbitrary
+untouched rejected prefix over the rebuilt tail. Head and non-head dynamic
+fixtures exercise whole and split behavior and rejoin the precise original
+system root. Every new obligation is proved with zero assumptions or
+deferrals, and the complete corpus passes with one worker.
+
+Next implement client `free` as sorted insertion of the exact matching lease,
+then coalesce with the predecessor and successor through proved adjacency and
+`FreeBlock` joins. Keep insertion and coalescing ordinary verified policy over
+sealed role transitions; add local wrong-owner/double-return/subregion guards
+and randomized dynamic comparison only after the structural insert proof is
+stable.
 
 Exit criteria:
 

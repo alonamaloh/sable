@@ -1,0 +1,40 @@
+// U8f5 whole-block allocation: once policy has selected the runtime head,
+// authority change removes that exact header and gives clients only the
+// nonsplittable BlockLease role.
+
+use free_list_remove_head;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] list.limit = state.root.len
+/// pre  #[label(chain)]
+///        Sable.AllocatorView.StoredChain state list.limit list.head
+/// pre  #[label(nonempty)] list.head != list.limit
+/// pre  #[label(node)] ∃ header,
+///        state.storesHeader list.head header ∧
+///        header.hasFields size next
+/// post #[label(limit_frame)] list.limit = (old list).limit
+/// post #[label(head)] list.head = next
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state list.limit list.head
+/// post #[label(lease)] result.key = (old list).head ∧
+///        result.span.len = size
+/// post #[label(owner)] result.allocator = state.allocator
+/// post #[label(root)] result.span.alloc = state.root.alloc
+pub fn free_list_lease_head(raw<u8> base,
+                            &mut FreeListState list,
+                            resource &mut AllocatorState state,
+                            u64 size, u64 next)
+                            -> resource BlockLease {
+    resource FreeBlock block = free_list_remove_head(
+        base, &mut list, &mut state, size, next);
+    resource BlockLease lease = free_block_lease(block);
+    return lease;
+}
+
+/// discharge free_list_lease_head.post.lease by
+///   rw [h_result, h_lease4_lease]
+///   exact h_free_list_remove_head_post_removed
+
+/// discharge free_list_lease_head.post.root by
+///   rw [h_result, h_lease4_lease]
+///   exact h_free_list_remove_head_post_root

@@ -1,0 +1,95 @@
+// U8f5 authority-change dispatcher. Search remains read-only and supplies a
+// proved first-fit location; this function alone chooses head/non-head and
+// whole/split mutation policy for that found node.
+
+use free_list_allocate_head;
+use free_list_allocate_after;
+use free_list_lease_after;
+use free_list_remove_head;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] list.limit = state.root.len
+/// pre  #[label(request)] Sable.freeHeaderBytes ≤ need ∧
+///        need % u64.layout.align = 0
+/// pre  #[label(location)] Sable.AllocatorView.FirstFitLocation
+///        state list.limit list.head need previous current size next
+/// pre  #[label(found)] current != list.limit
+/// post #[label(limit_frame)] list.limit = (old list).limit
+/// post #[label(head)] list.head =
+///        (if current = (old list).head
+///         then if need + Sable.freeHeaderBytes ≤ size
+///              then current + need else next
+///         else (old list).head)
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state list.limit list.head
+/// post #[label(lease)] result.key = current ∧
+///        result.span.len =
+///          (if need + Sable.freeHeaderBytes ≤ size then need else size)
+/// post #[label(owner)] result.allocator = state.allocator
+/// post #[label(root)] result.span.alloc = state.root.alloc
+pub fn free_list_allocate_found(raw<u8> base,
+                                &mut FreeListState list,
+                                resource &mut AllocatorState state,
+                                u64 need, u64 previous, u64 current,
+                                u64 size, u64 next)
+                                -> resource BlockLease {
+    if (current == list.head) {
+        resource BlockLease head_lease = free_list_allocate_head(
+            base, &mut list, &mut state, need, size, next);
+        return head_lease;
+    }
+    if (need <= size - 16) {
+        resource BlockLease split_lease = free_list_allocate_after(
+            base, &mut state, list.limit, list.head, need,
+            previous, current, size, next);
+        return split_lease;
+    }
+    resource BlockLease whole_lease = free_list_lease_after(
+        base, &mut state, list.limit, list.head, need,
+        previous, current, size, next);
+    return whole_lease;
+}
+
+/// discharge free_list_allocate_found.call_pre.free_list_allocate_head.chain by
+///   exact h_pre_location.1
+
+/// discharge free_list_allocate_found.call_pre.free_list_allocate_head.node by
+///   obtain ⟨header, hstored, hfields, hfit⟩ :=
+///     h_pre_location.foundData (by simpa using h_pre_found)
+///   refine ⟨header, ?_, hfields⟩
+///   rw [← h_path_current_old_list_head]
+///   exact hstored
+
+/// discharge free_list_allocate_found.call_pre.free_list_allocate_head.fit by
+///   obtain ⟨header, hstored, hfields, hfit⟩ :=
+///     h_pre_location.foundData (by simpa using h_pre_found)
+///   exact hfit
+
+/// discharge free_list_allocate_found.overflow.size_16 by
+///   obtain ⟨header, hstored, hfields, hfit⟩ :=
+///     h_pre_location.foundData (by simpa using h_pre_found)
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     at h_pre_request
+///   constructor <;> omega
+
+/// discharge free_list_allocate_found.call_pre.free_list_allocate_after.split by
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     at h_path_need_size_16 ⊢
+///   omega
+
+/// discharge free_list_allocate_found.post.lease.2 by
+///   have hsplit : need + Sable.freeHeaderBytes ≤ size := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///       at h_path_need_size_16 ⊢
+///     omega
+///   rw [h_result, if_pos hsplit]
+///   exact h_free_list_allocate_after_post_lease
+
+/// discharge free_list_allocate_found.post.lease.3 by
+///   have hwhole : ¬ need + Sable.freeHeaderBytes ≤ size := by
+///     intro hsplit
+///     apply h_path_not_need_size_16
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout] at hsplit ⊢
+///     omega
+///   rw [h_result, if_neg hwhole]
+///   exact h_free_list_lease_after_post_lease

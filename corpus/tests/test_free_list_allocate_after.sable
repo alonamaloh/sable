@@ -1,0 +1,77 @@
+// expect-skip: base.alloc = state.root.alloc ∧ base.off = 0
+// expect-skip: limit = state.root.len
+// expect-skip: Sable.freeHeaderBytes ≤ need
+// expect-skip: Sable.AllocatorView.StoredChain state
+// expect-skip: state = old state
+// expect-skip: Sable.AllocatorView.RejectedPath
+// expect-skip: Sable.AllocatorView.FirstFitLocation
+// expect-skip: need + Sable.freeHeaderBytes ≤ size
+// expect-skip: result.key = current
+// expect-skip: result.allocator = state.allocator
+// expect-skip: result.span.alloc = state.root.alloc
+
+use free_list_first_fit;
+use free_list_allocate_found;
+use free_list_remove_head;
+
+/// pre actual = expected
+fn expect_eq_u64(u64 actual, u64 expected) {
+}
+
+fn test_free_list_allocate_after_split() {
+    unsafe system_alloc(88) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    mut resource FreeBlock left = allocator_take_free(&mut state, 0);
+    resource FreeBlock selected = free_block_split(&mut left, 24);
+
+    unsafe {
+        raw<u8> selected_ptr = raw_offset(base, 24);
+        mut resource FreeHeader selected_header =
+            raw_into_free_header(selected_ptr, selected);
+        raw_header_init(selected_ptr, 64, 88, &mut selected_header);
+    }
+    allocator_put_header(&mut state, selected_header);
+
+    unsafe {
+        mut resource FreeHeader left_header = raw_into_free_header(base, left);
+        raw_header_init(base, 24, 24, &mut left_header);
+    }
+    allocator_put_header(&mut state, left_header);
+
+    var mut list = FreeListState::make(0, 88);
+    var location = free_list_locate_first_fit(
+        base, &mut state, list.limit, list.head, 32);
+    expect_eq_u64(location.previous, 0);
+    expect_eq_u64(location.current, 24);
+    expect_eq_u64(location.size, 64);
+    expect_eq_u64(location.next, 88);
+
+    resource BlockLease lease = free_list_allocate_found(
+        base, &mut list, &mut state, 32,
+        location.previous, location.current, location.size, location.next);
+    expect_eq_u64(list.head, 0);
+    resource FreeBlock allocated = block_lease_free(lease);
+
+    mut resource FreeHeader left_cleanup =
+        allocator_take_header(&mut state, 0);
+    unsafe {
+        raw_header_clear(base, &mut left_cleanup);
+        resource FreeBlock left_block =
+            raw_from_free_header(base, left_cleanup);
+    }
+
+    mut resource FreeHeader remainder_cleanup =
+        allocator_take_header(&mut state, 56);
+    unsafe {
+        raw<u8> remainder_ptr = raw_offset(base, 56);
+        raw_header_clear(remainder_ptr, &mut remainder_cleanup);
+        resource FreeBlock remainder_block =
+            raw_from_free_header(remainder_ptr, remainder_cleanup);
+    }
+
+    resource FreeBlock prefix = free_block_join(left_block, allocated);
+    resource FreeBlock whole_free = free_block_join(prefix, remainder_block);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}

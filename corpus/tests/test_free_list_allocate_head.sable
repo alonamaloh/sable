@@ -1,0 +1,70 @@
+// expect-skip: base.alloc = state.root.alloc ∧ base.off = 0
+// expect-skip: list.limit = state.root.len
+// expect-skip: Sable.AllocatorView.StoredChain state list.limit list.head
+// expect-skip: Sable.freeHeaderBytes ≤ need
+// expect-skip: ∃ header
+// expect-skip: takeHeader (old list).head
+// expect-skip: list.head =
+// expect-skip: result.key = (old list).head
+// expect-skip: result.allocator = state.allocator
+// expect-skip: result.span.alloc = state.root.alloc
+
+use free_list_allocate_head;
+use free_list_remove_head;
+
+/// pre actual = expected
+fn expect_eq_u64(u64 actual, u64 expected) {
+}
+
+fn test_free_list_allocate_head_split() {
+    unsafe system_alloc(64) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+
+    unsafe {
+        mut resource FreeHeader header = raw_into_free_header(base, block);
+        raw_header_init(base, 64, 64, &mut header);
+    }
+    allocator_put_header(&mut state, header);
+
+    var mut list = FreeListState::make(0, 64);
+    resource BlockLease lease = free_list_allocate_head(
+        base, &mut list, &mut state, 32, 64, 64);
+    resource FreeBlock left = block_lease_free(lease);
+    expect_eq_u64(list.head, 32);
+
+    mut resource FreeHeader remainder =
+        allocator_take_header(&mut state, 32);
+    unsafe {
+        raw<u8> remainder_ptr = raw_offset(base, 32);
+        raw_header_clear(remainder_ptr, &mut remainder);
+        resource FreeBlock right =
+            raw_from_free_header(remainder_ptr, remainder);
+    }
+    resource FreeBlock whole_free = free_block_join(left, right);
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}
+
+fn test_free_list_allocate_head_whole() {
+    unsafe system_alloc(32) as (base, resource mem, resource release);
+    mut resource AllocatorState state = allocator_create(mem);
+    resource FreeBlock block = allocator_take_free(&mut state, 0);
+
+    unsafe {
+        mut resource FreeHeader header = raw_into_free_header(base, block);
+        raw_header_init(base, 32, 32, &mut header);
+    }
+    allocator_put_header(&mut state, header);
+
+    var mut list = FreeListState::make(0, 32);
+    resource BlockLease lease = free_list_allocate_head(
+        base, &mut list, &mut state, 24, 32, 32);
+    resource FreeBlock whole_free = block_lease_free(lease);
+    expect_eq_u64(list.head, 32);
+
+    allocator_put_free(&mut state, whole_free);
+    resource RawSpan whole = allocator_destroy(state);
+    unsafe system_dealloc(base, whole, release);
+}

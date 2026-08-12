@@ -81,6 +81,16 @@ pub fn free_list_one_step() -> u64 {
 ///       · rw [h_header_init]
 ///         simp [Sable.FreeHeaderView.hasFields,
 ///           Sable.FreeHeaderView.putFields]
+///       · have htotal :=
+///           h_fact_sable_pointstoview_names.2.2.2.2.2
+///         rw [h_header_init]
+///         simp [Sable.FreeHeaderView.toFree,
+///           Sable.FreeHeaderView.rawCell,
+///           Sable.FreeHeaderView.putFields, Sable.SpanView.cat]
+///         omega
+///       · intro k hlo hhi
+///         simp [h_state_take_free, h_allocator_view6_create,
+///           Sable.AllocatorView.take, Sable.AllocatorView.initial]
 ///       · rw [h_header_init, h_header9_header, h_free8_take,
 ///           h_state_take_free, h_allocator_view6_create]
 ///         rfl
@@ -121,7 +131,7 @@ pub fn free_list_one_step() -> u64 {
 
 /// discharge free_list_one_step.assert.header by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
-///       hfit, horder, hbound, tail⟩ :=
+///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
 ///     Sable.AllocatorView.StoredChain.step
 ///       h_fact_0_32_sable_allocatorview.2 (by omega)
 ///   have hnode : _header13 = node := by
@@ -135,7 +145,7 @@ pub fn free_list_one_step() -> u64 {
 
 /// discharge free_list_one_step.assert.order by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
-///       hfit, horder, hbound, tail⟩ :=
+///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
 ///     Sable.AllocatorView.StoredChain.step
 ///       h_fact_0_32_sable_allocatorview.2 (by omega)
 ///   have hnode : _header13 = node := by
@@ -150,7 +160,7 @@ pub fn free_list_one_step() -> u64 {
 
 /// discharge free_list_one_step.assert.bound by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
-///       hfit, horder, hbound, tail⟩ :=
+///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
 ///     Sable.AllocatorView.StoredChain.step
 ///       h_fact_0_32_sable_allocatorview.2 (by omega)
 ///   have hnode : _header13 = node := by

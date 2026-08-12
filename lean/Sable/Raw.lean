@@ -561,6 +561,24 @@ def FreeHeaderView.toFree (v : FreeHeaderView) : FreeBlockView :=
     key := v.key
     span := (rawCell v.sizeCell).cat ((rawCell v.nextCell).cat v.payload) }
 
+@[simp] theorem FreeHeaderView.clearFields_toFree_allocator
+    (v : FreeHeaderView) : v.clearFields.toFree.allocator = v.allocator := rfl
+
+@[simp] theorem FreeHeaderView.clearFields_toFree_key
+    (v : FreeHeaderView) : v.clearFields.toFree.key = v.key := rfl
+
+@[simp] theorem FreeHeaderView.clearFields_toFree_span_alloc
+    (v : FreeHeaderView) : v.clearFields.toFree.span.alloc = v.sizeCell.alloc := rfl
+
+@[simp] theorem FreeHeaderView.clearFields_toFree_span_len
+    (v : FreeHeaderView) :
+    v.clearFields.toFree.span.len = v.toFree.span.len := rfl
+
+@[simp] theorem FreeHeaderView.clearFields_putFields_toFree_span_len
+    (v : FreeHeaderView) (size next : Int) :
+    (v.clearFields.putFields size next).toFree.span.len =
+      v.toFree.span.len := rfl
+
 def AllocatorView.headerAt (v : AllocatorView) (key : Int) : FreeHeaderView :=
   (v.headers key).getD (v.takeFree key).toHeader
 
@@ -696,12 +714,31 @@ def AllocatorView.storesHeader
   header.allocator = v.allocator ∧
   header.sizeCell.alloc = v.root.alloc
 
+/-- No allocator role is hidden strictly inside a stored block. This is the
+spatial vacancy needed to split the block and park a remainder header without
+overlapping an unrelated map entry. -/
+def AllocatorView.clearInterior
+    (v : AllocatorView) (key size : Int) : Prop :=
+  ∀ k, key < k → k < key + size →
+    v.free k = none ∧ v.headers k = none
+
+theorem AllocatorView.clearInterior_takeHeader
+    {v : AllocatorView} {key size : Int}
+    (hclear : v.clearInterior key size) :
+    (v.takeHeader key).clearInterior key size := by
+  intro k hlo hhi
+  have hne : k ≠ key := by omega
+  obtain ⟨hfree, hheaders⟩ := hclear k hlo hhi
+  exact ⟨hfree, by simpa [AllocatorView.takeHeader, hne] using hheaders⟩
+
 inductive AllocatorView.StoredChain
     (v : AllocatorView) (limit : Int) : Int → Prop where
   | nil : StoredChain v limit limit
   | cons (key size next : Int) (header : FreeHeaderView)
       (stored : v.storesHeader key header)
       (fields : header.hasFields size next)
+      (extent : header.toFree.span.len = size)
+      (interior_clear : v.clearInterior key size)
       (key_nonneg : 0 ≤ key)
       (header_fits : freeHeaderBytes ≤ size)
       (ordered_disjoint : key + size ≤ next)
@@ -728,14 +765,17 @@ theorem AllocatorView.StoredChain.step
     ∃ header size next,
       v.storesHeader head header ∧
       header.hasFields size next ∧
+      header.toFree.span.len = size ∧
+      v.clearInterior head size ∧
       freeHeaderBytes ≤ size ∧
       head + size ≤ next ∧
       next ≤ limit ∧
       v.StoredChain limit next := by
   cases chain with
   | nil => exact (hne rfl).elim
-  | cons key size next header stored fields hkey hheader horder hbound tail =>
-      exact ⟨header, size, next, stored, fields, hheader, horder, hbound, tail⟩
+  | cons key size next header stored fields extent hclear hkey hheader horder hbound tail =>
+      exact ⟨header, size, next, stored, fields, extent, hclear,
+        hheader, horder, hbound, tail⟩
 
 theorem AllocatorView.StoredChain.takeable
     {v : AllocatorView} {limit head : Int}
@@ -749,7 +789,7 @@ theorem AllocatorView.StoredChain.step_variant
     (chain : v.StoredChain limit head) (hne : head ≠ limit) :
     ∃ next, 0 ≤ limit - next ∧ limit - next < limit - head ∧
       v.StoredChain limit next := by
-  obtain ⟨_, size, next, _, _, hheader, horder, hbound, tail⟩ :=
+  obtain ⟨_, size, next, _, _, _, _, hheader, horder, hbound, tail⟩ :=
     chain.step hne
   refine ⟨next, by omega, ?_, tail⟩
   simp [freeHeaderBytes, u64.layout] at hheader
@@ -765,6 +805,8 @@ theorem AllocatorView.StoredChain.singleAfterPut
     {v : AllocatorView} {header : FreeHeaderView} {size limit : Int}
     (hput : v.canPutHeader header)
     (hfields : header.hasFields size limit)
+    (hextent : header.toFree.span.len = size)
+    (hclear : v.clearInterior header.key size)
     (hroot : header.sizeCell.alloc = v.root.alloc)
     (hkey : 0 ≤ header.key)
     (hsize : freeHeaderBytes ≤ size)
@@ -777,6 +819,12 @@ theorem AllocatorView.StoredChain.singleAfterPut
       by change header.allocator = v.allocator; exact hput.1,
       by simpa [AllocatorView.putHeader] using hroot⟩
   · exact hfields
+  · exact hextent
+  · intro k hlo hhi
+    have hne : k ≠ header.key := by omega
+    obtain ⟨hfree, hheaders⟩ := hclear k hlo hhi
+    exact ⟨by simpa [AllocatorView.putHeader] using hfree,
+      by simpa [AllocatorView.putHeader, hne] using hheaders⟩
   · exact hkey
   · exact hsize
   · exact hbound
@@ -789,7 +837,7 @@ theorem AllocatorView.StoredChain.putHeaderBefore
     (v.putHeader header).StoredChain limit head := by
   induction chain with
   | nil => exact AllocatorView.StoredChain.nil
-  | cons key size next node stored fields hkey hsize horder hbound tail ih =>
+  | cons key size next node stored fields extent hclear hkey hsize horder hbound tail ih =>
       apply AllocatorView.StoredChain.cons key size next node
       · refine ⟨?_, stored.2.1, stored.2.2.1, stored.2.2.2.1,
           ?_, ?_⟩
@@ -799,6 +847,12 @@ theorem AllocatorView.StoredChain.putHeaderBefore
           exact stored.2.2.2.2.1
         · simpa [AllocatorView.putHeader] using stored.2.2.2.2.2
       · exact fields
+      · exact extent
+      · intro k hlo hhi
+        have hne : k ≠ header.key := by omega
+        obtain ⟨hfree, hheaders⟩ := hclear k hlo hhi
+        exact ⟨by simpa [AllocatorView.putHeader] using hfree,
+          by simpa [AllocatorView.putHeader, hne] using hheaders⟩
       · exact hkey
       · exact hsize
       · exact horder
@@ -807,12 +861,95 @@ theorem AllocatorView.StoredChain.putHeaderBefore
         simp [freeHeaderBytes, u64.layout] at hsize
         omega
 
+theorem AllocatorView.StoredChain.takeHeaderBefore
+    {v : AllocatorView} {limit head removed : Int}
+    (chain : v.StoredChain limit head) (hbefore : removed < head) :
+    (v.takeHeader removed).StoredChain limit head := by
+  induction chain with
+  | nil => exact AllocatorView.StoredChain.nil
+  | cons key size next node stored fields extent hclear hkey hsize horder hbound tail ih =>
+      apply AllocatorView.StoredChain.cons key size next node
+      · have hne : key ≠ removed := by omega
+        refine ⟨?_, stored.2.1, stored.2.2.1, stored.2.2.2.1,
+          ?_, ?_⟩
+        · simpa [AllocatorView.takeHeader, hne] using stored.1
+        · change node.allocator = v.allocator
+          exact stored.2.2.2.2.1
+        · simpa [AllocatorView.takeHeader] using stored.2.2.2.2.2
+      · exact fields
+      · exact extent
+      · intro k hlo hhi
+        have hne : k ≠ removed := by omega
+        obtain ⟨hfree, hheaders⟩ := hclear k hlo hhi
+        exact ⟨hfree,
+          by simpa [AllocatorView.takeHeader, hne] using hheaders⟩
+      · exact hkey
+      · exact hsize
+      · exact horder
+      · exact hbound
+      · apply ih
+        simp [freeHeaderBytes, u64.layout] at hsize
+        omega
+
+/-- Extracting the first header removes only that node. The chain beginning at
+its runtime successor remains valid in the residual allocator view. -/
+theorem AllocatorView.StoredChain.takeHead
+    {v : AllocatorView} {limit head : Int}
+    (chain : v.StoredChain limit head) (notEnd : head ≠ limit) :
+    ∃ header size next,
+      v.storesHeader head header ∧
+      header.hasFields size next ∧
+      header.toFree.span.len = size ∧
+      (v.takeHeader head).clearInterior head size ∧
+      freeHeaderBytes ≤ size ∧
+      head + size ≤ next ∧
+      next ≤ limit ∧
+      (v.takeHeader head).StoredChain limit next := by
+  obtain ⟨header, size, next, stored, fields, extent, hclear, hsize,
+      horder, hbound, tail⟩ := chain.step notEnd
+  refine ⟨header, size, next, stored, fields, extent,
+    AllocatorView.clearInterior_takeHeader hclear, hsize,
+    horder, hbound, ?_⟩
+  apply tail.takeHeaderBefore
+  simp [freeHeaderBytes, u64.layout] at hsize
+  omega
+
+/-- Match caller-supplied runtime fields against the unique stored head and
+return both the exact byte extent and the residual chain after extraction. -/
+theorem AllocatorView.StoredChain.takeMatchingHead
+    {v : AllocatorView} {limit head size next : Int}
+    {header : FreeHeaderView}
+    (chain : v.StoredChain limit head) (notEnd : head ≠ limit)
+    (stored : v.storesHeader head header)
+    (fields : header.hasFields size next) :
+    header.toFree.span.len = size ∧
+    (v.takeHeader head).clearInterior head size ∧
+    freeHeaderBytes ≤ size ∧
+    head + size ≤ next ∧
+    next ≤ limit ∧
+    (v.takeHeader head).StoredChain limit next := by
+  obtain ⟨chainHeader, chainSize, chainNext, chainStored, chainFields,
+      extent, hclear, hsize, horder, hbound, tail⟩ := chain.takeHead notEnd
+  have hheader : chainHeader = header :=
+    Option.some.inj (chainStored.1.symm.trans stored.1)
+  subst chainHeader
+  unfold FreeHeaderView.hasFields at chainFields fields
+  have hsameSize : chainSize = size :=
+    CellState.init.inj (chainFields.1.symm.trans fields.1)
+  have hsameNext : chainNext = next :=
+    CellState.init.inj (chainFields.2.symm.trans fields.2)
+  simp only [hsameSize] at extent hclear hsize horder
+  simp only [hsameNext] at horder hbound tail
+  exact ⟨extent, hclear, hsize, horder, hbound, tail⟩
+
 theorem AllocatorView.StoredChain.prependAfterPut
     {v : AllocatorView} {header : FreeHeaderView}
     {size next limit : Int}
     (tail : v.StoredChain limit next)
     (hput : v.canPutHeader header)
     (hfields : header.hasFields size next)
+    (hextent : header.toFree.span.len = size)
+    (hclear : v.clearInterior header.key size)
     (hroot : header.sizeCell.alloc = v.root.alloc)
     (hkey : 0 ≤ header.key)
     (hsize : freeHeaderBytes ≤ size)
@@ -826,6 +963,12 @@ theorem AllocatorView.StoredChain.prependAfterPut
       by change header.allocator = v.allocator; exact hput.1,
       by simpa [AllocatorView.putHeader] using hroot⟩
   · exact hfields
+  · exact hextent
+  · intro k hlo hhi
+    have hne : k ≠ header.key := by omega
+    obtain ⟨hfree, hheaders⟩ := hclear k hlo hhi
+    exact ⟨by simpa [AllocatorView.putHeader] using hfree,
+      by simpa [AllocatorView.putHeader, hne] using hheaders⟩
   · exact hkey
   · exact hsize
   · exact horder
@@ -866,7 +1009,7 @@ theorem AllocatorView.RejectedPrefix.tail
   | nil => exact chain
   | @step previous size next header trace notEnd stored fields rejected ih =>
       obtain ⟨chainHeader, chainSize, chainNext, chainStored, chainFields,
-          hfit, horder, hbound, tail⟩ := ih.step notEnd
+          extent, hclear, hfit, horder, hbound, tail⟩ := ih.step notEnd
       have hheader : chainHeader = header :=
         AllocatorView.storesHeader_unique chainStored stored
       subst chainHeader
@@ -875,6 +1018,80 @@ theorem AllocatorView.RejectedPrefix.tail
           (chainFields.2.symm.trans fields.2)
       rw [← hnext]
       exact tail
+
+/-- Two allocator views agree on all authority-map observations strictly
+below a boundary, and retain the same allocator/root identity. This is the
+frame needed to splice an unchanged rejected prefix onto a rebuilt tail. -/
+def AllocatorView.AgreesBelow
+    (v w : AllocatorView) (boundary : Int) : Prop :=
+  v.allocator = w.allocator ∧ v.root = w.root ∧
+  ∀ k, k < boundary →
+    w.free k = v.free k ∧ w.headers k = v.headers k
+
+/-- Replace the suffix at the endpoint of a genuine rejected prefix. If the
+new allocator view agrees below that endpoint, every earlier stored node and
+its clear interior frame across unchanged, so the rebuilt tail can be spliced
+back into a chain from the original start. -/
+theorem AllocatorView.RejectedPrefix.splice
+    {v w : AllocatorView} {limit need start current : Int}
+    (chain : v.StoredChain limit start)
+    (trace : v.RejectedPrefix limit need start current)
+    (agree : v.AgreesBelow w current)
+    (tail : w.StoredChain limit current) :
+    w.StoredChain limit start := by
+  induction trace generalizing w with
+  | nil => exact tail
+  | @step previous size next header trace notEnd stored fields rejected ih =>
+      have previousChain : v.StoredChain limit previous :=
+        trace.tail chain
+      obtain ⟨chainHeader, chainSize, chainNext, chainStored, chainFields,
+          extent, hclear, hfit, horder, hbound, originalTail⟩ :=
+        previousChain.step notEnd
+      have hheader : chainHeader = header :=
+        AllocatorView.storesHeader_unique chainStored stored
+      subst chainHeader
+      unfold FreeHeaderView.hasFields at chainFields fields
+      have hsameSize : chainSize = size :=
+        CellState.init.inj (chainFields.1.symm.trans fields.1)
+      have hsameNext : chainNext = next :=
+        CellState.init.inj (chainFields.2.symm.trans fields.2)
+      simp only [hsameSize] at extent hclear hfit horder
+      simp only [hsameNext] at horder hbound originalTail
+      have hpreviousNext : previous < next := by
+        simp [freeHeaderBytes, u64.layout] at hfit
+        omega
+      have atPrevious := agree.2.2 previous hpreviousNext
+      have stored' : w.storesHeader previous header := by
+        refine ⟨?_, ?_, stored.2.2.1, stored.2.2.2.1, ?_, ?_⟩
+        · rw [atPrevious.2]
+          exact stored.1
+        · rw [atPrevious.1]
+          exact stored.2.1
+        · exact stored.2.2.2.2.1.trans agree.1
+        · simpa [agree.2.1] using stored.2.2.2.2.2
+      have clear' : w.clearInterior previous size := by
+        intro k hlo hhi
+        have hk : k < next := by omega
+        have atK := agree.2.2 k hk
+        obtain ⟨hfree, hheaders⟩ := hclear k hlo hhi
+        exact ⟨by simpa [atK.1] using hfree,
+          by simpa [atK.2] using hheaders⟩
+      have hkey : 0 ≤ previous := by
+        have hwf := chainStored.2.2.2.1
+        unfold FreeHeaderView.wf at hwf
+        calc
+          0 ≤ header.sizeCell.off := hwf.1.2.1
+          _ = header.key := hwf.2.2.1.symm
+          _ = previous := chainStored.2.2.1
+      have rebuilt : w.StoredChain limit previous :=
+        AllocatorView.StoredChain.cons previous size next header
+          stored' fields extent clear' hkey
+          hfit horder hbound tail
+      have agreePrevious : v.AgreesBelow w previous := by
+        refine ⟨agree.1, agree.2.1, ?_⟩
+        intro k hk
+        exact agree.2.2 k (by omega)
+      exact ih agreePrevious rebuilt
 
 /-- `result` is the first fitting node, or the sentinel after every reachable
 node was rejected. The original chain is retained explicitly so this remains
@@ -913,6 +1130,452 @@ theorem AllocatorView.FirstFit.resultChain
     (first : v.FirstFit limit start need result) :
     v.StoredChain limit result := by
   exact first.2.1.tail first.1
+
+/-- The executable search cursor remembers both the node most recently
+rejected and the node reached from it. `limit` is the distinguished
+"no predecessor" value at the initial cursor. -/
+inductive AllocatorView.RejectedPath
+    (v : AllocatorView) (limit need start : Int) : Int → Int → Prop where
+  | nil : RejectedPath v limit need start limit start
+  | step {previous current size next : Int} {header : FreeHeaderView}
+      (path : RejectedPath v limit need start previous current)
+      (notEnd : current ≠ limit)
+      (stored : v.storesHeader current header)
+      (fields : header.hasFields size next)
+      (rejected : size < need) :
+      RejectedPath v limit need start current next
+
+theorem AllocatorView.RejectedPath.toPrefix
+    {v : AllocatorView} {limit need start previous current : Int}
+    (path : v.RejectedPath limit need start previous current) :
+    v.RejectedPrefix limit need start current := by
+  induction path with
+  | nil => exact AllocatorView.RejectedPrefix.nil
+  | step path notEnd stored fields rejected ih =>
+      exact AllocatorView.RejectedPrefix.step
+        ih notEnd stored fields rejected
+
+theorem AllocatorView.RejectedPath.tail
+    {v : AllocatorView} {limit need start previous current : Int}
+    (chain : v.StoredChain limit start)
+    (path : v.RejectedPath limit need start previous current) :
+    v.StoredChain limit current := by
+  exact path.toPrefix.tail chain
+
+theorem AllocatorView.RejectedPath.predecessor
+    {v : AllocatorView} {limit need start previous current : Int}
+    (path : v.RejectedPath limit need start previous current)
+    (notHead : current ≠ start) :
+    ∃ header size,
+      v.storesHeader previous header ∧
+      header.hasFields size current ∧
+      size < need := by
+  cases path with
+  | nil => exact (notHead rfl).elim
+  | step path notEnd stored fields rejected =>
+      exact ⟨_, _, stored, fields, rejected⟩
+
+/-- First-fit together with the runtime predecessor needed by a later unlink.
+The location is still read-only: the represented allocator view is exactly the
+entry view. -/
+def AllocatorView.FirstFitLocation
+    (v : AllocatorView)
+    (limit start need previous result size next : Int) : Prop :=
+  v.StoredChain limit start ∧
+  v.RejectedPath limit need start previous result ∧
+  ((result = limit ∧ size = 0 ∧ next = limit) ∨
+    ∃ header,
+      v.storesHeader result header ∧
+      header.hasFields size next ∧
+      need ≤ size)
+
+theorem AllocatorView.FirstFitLocation.found
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    {header : FreeHeaderView}
+    (chain : v.StoredChain limit start)
+    (path : v.RejectedPath limit need start previous result)
+    (stored : v.storesHeader result header)
+    (fields : header.hasFields size next)
+    (fits : need ≤ size) :
+    v.FirstFitLocation limit start need previous result size next := by
+  exact ⟨chain, path, Or.inr ⟨header, stored, fields, fits⟩⟩
+
+theorem AllocatorView.FirstFitLocation.notFound
+    {v : AllocatorView} {limit start need previous : Int}
+    (chain : v.StoredChain limit start)
+    (path : v.RejectedPath limit need start previous limit) :
+    v.FirstFitLocation limit start need previous limit 0 limit := by
+  exact ⟨chain, path, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+theorem AllocatorView.FirstFitLocation.toFirstFit
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    (location : v.FirstFitLocation
+      limit start need previous result size next) :
+    v.FirstFit limit start need result := by
+  refine ⟨location.1, location.2.1.toPrefix, ?_⟩
+  cases location.2.2 with
+  | inl missing => exact Or.inl missing.1
+  | inr found =>
+      exact Or.inr ⟨found.choose, size, next,
+        found.choose_spec.1, found.choose_spec.2.1,
+        found.choose_spec.2.2⟩
+
+theorem AllocatorView.FirstFitLocation.resultChain
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    (location : v.FirstFitLocation
+      limit start need previous result size next) :
+    v.StoredChain limit result := by
+  exact location.2.1.tail location.1
+
+theorem AllocatorView.FirstFitLocation.foundData
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    (location : v.FirstFitLocation
+      limit start need previous result size next)
+    (notEnd : result ≠ limit) :
+    ∃ header,
+      v.storesHeader result header ∧
+      header.hasFields size next ∧ need ≤ size := by
+  cases location.2.2 with
+  | inl missing => exact (notEnd missing.1).elim
+  | inr found => exact found
+
+theorem AllocatorView.FirstFitLocation.predecessor
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    (location : v.FirstFitLocation
+      limit start need previous result size next)
+    (notHead : result ≠ start) :
+    ∃ header size,
+      v.storesHeader previous header ∧
+      header.hasFields size result ∧
+      size < need := by
+  exact location.2.1.predecessor notHead
+
+theorem AllocatorView.FirstFitLocation.predecessorChain
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    (location : v.FirstFitLocation
+      limit start need previous result size next)
+    (notHead : result ≠ start) :
+    v.StoredChain limit previous := by
+  cases location.2.1 with
+  | nil => exact (notHead rfl).elim
+  | step priorPath notEnd stored fields rejected =>
+      exact priorPath.tail location.1
+
+theorem AllocatorView.FirstFitLocation.predecessorNotEnd
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    (location : v.FirstFitLocation
+      limit start need previous result size next)
+    (notHead : result ≠ start) : previous ≠ limit := by
+  cases location.2.1 with
+  | nil => exact (notHead rfl).elim
+  | step priorPath notEnd stored fields rejected => exact notEnd
+
+theorem AllocatorView.FirstFitLocation.predecessorBefore
+    {v : AllocatorView}
+    {limit start need previous result size next : Int}
+    (location : v.FirstFitLocation
+      limit start need previous result size next)
+    (notHead : result ≠ start) : previous < result := by
+  obtain ⟨header, previousSize, stored, fields, rejected⟩ :=
+    location.predecessor notHead
+  have matched := location.predecessorChain notHead |>.takeMatchingHead
+    (location.predecessorNotEnd notHead) stored fields
+  have hfit := matched.2.2.1
+  have horder := matched.2.2.2.1
+  simp [freeHeaderBytes, u64.layout] at hfit
+  omega
+
+/-- Unlink a non-head first-fit result after its exact header has been taken.
+The predecessor is rebuilt with the same extent and a link to the selected
+node's successor. The untouched rejected prefix is then spliced onto that
+rebuilt tail, yielding a chain from the original head. -/
+theorem AllocatorView.FirstFitLocation.unlinkAfter
+    {v : AllocatorView}
+    {limit start need previous current size next previousSize : Int}
+    (location : v.FirstFitLocation
+      limit start need previous current size next)
+    (currentNotEnd : current ≠ limit)
+    (notHead : current ≠ start)
+    {selected predecessor relinked : FreeHeaderView}
+    (selectedStored : v.storesHeader current selected)
+    (selectedFields : selected.hasFields size next)
+    (predecessorStored : v.storesHeader previous predecessor)
+    (predecessorFields : predecessor.hasFields previousSize current)
+    (relinkedEq : relinked =
+      predecessor.clearFields.putFields previousSize next)
+    (canPut : ((v.takeHeader current).takeHeader previous).canPutHeader
+      relinked) :
+    (((v.takeHeader current).takeHeader previous).putHeader relinked).StoredChain
+      limit start := by
+  have currentChain : v.StoredChain limit current :=
+    location.resultChain
+  have currentMatch := currentChain.takeMatchingHead currentNotEnd
+    selectedStored selectedFields
+  cases pathEq : location.2.1 with
+  | nil => exact (notHead rfl).elim
+  | step priorPath predecessorNotEnd pathStored pathFields rejected =>
+      have previousChain : v.StoredChain limit previous := by
+        simpa using priorPath.tail location.1
+      have previousMatch := previousChain.takeMatchingHead
+        predecessorNotEnd predecessorStored predecessorFields
+      have previousCurrent : previous < current := by
+        have hfit := previousMatch.2.2.1
+        have horder := previousMatch.2.2.2.1
+        simp [freeHeaderBytes, u64.layout] at hfit
+        omega
+      have currentNext : current < next := by
+        have hfit := currentMatch.2.2.1
+        have horder := currentMatch.2.2.2.1
+        simp [freeHeaderBytes, u64.layout] at hfit
+        omega
+      have tailBase :
+          ((v.takeHeader current).takeHeader previous).StoredChain
+            limit next := by
+        apply currentMatch.2.2.2.2.2.takeHeaderBefore
+        omega
+      have relinkedKey : relinked.key = previous := by
+        rw [relinkedEq]
+        exact predecessorStored.2.2.1
+      have relinkedFields : relinked.hasFields previousSize next := by
+        simp [relinkedEq, FreeHeaderView.hasFields,
+          FreeHeaderView.clearFields, FreeHeaderView.putFields]
+      have relinkedExtent : relinked.toFree.span.len = previousSize := by
+        rw [relinkedEq]
+        simpa using previousMatch.1
+      have relinkedClear :
+          ((v.takeHeader current).takeHeader previous).clearInterior
+            relinked.key previousSize := by
+        rw [relinkedKey]
+        intro k hlo hhi
+        have hkPrevious : k ≠ previous := by omega
+        have hkCurrent : k ≠ current := by
+          have horder := previousMatch.2.2.2.1
+          omega
+        simpa [AllocatorView.takeHeader, hkPrevious, hkCurrent] using
+          previousMatch.2.1 k hlo hhi
+      have relinkedRoot :
+          relinked.sizeCell.alloc =
+            ((v.takeHeader current).takeHeader previous).root.alloc := by
+        rw [relinkedEq]
+        exact predecessorStored.2.2.2.2.2
+      have previousNonneg : 0 ≤ previous := by
+        have hwf := predecessorStored.2.2.2.1
+        unfold FreeHeaderView.wf at hwf
+        calc
+          0 ≤ predecessor.sizeCell.off := hwf.1.2.1
+          _ = predecessor.key := hwf.2.2.1.symm
+          _ = previous := predecessorStored.2.2.1
+      have rebuilt :
+          (((v.takeHeader current).takeHeader previous).putHeader relinked).StoredChain
+            limit previous := by
+        have rebuiltAtKey :
+            (((v.takeHeader current).takeHeader previous).putHeader relinked).StoredChain
+              limit relinked.key := by
+          apply AllocatorView.StoredChain.prependAfterPut
+            tailBase canPut relinkedFields relinkedExtent relinkedClear
+            relinkedRoot
+          · rw [relinkedKey]
+            exact previousNonneg
+          · exact previousMatch.2.2.1
+          · have hprevOrder := previousMatch.2.2.2.1
+            rw [relinkedKey]
+            omega
+          · exact currentMatch.2.2.2.2.1
+        rw [relinkedKey] at rebuiltAtKey
+        exact rebuiltAtKey
+      have agree : v.AgreesBelow
+          (((v.takeHeader current).takeHeader previous).putHeader relinked)
+          previous := by
+        refine ⟨rfl, rfl, ?_⟩
+        intro k hk
+        have hkPrevious : k ≠ previous := by omega
+        have hkCurrent : k ≠ current := by omega
+        simp [AllocatorView.takeHeader, AllocatorView.putHeader,
+          relinkedKey, hkPrevious, hkCurrent]
+      exact priorPath.toPrefix.splice location.1 agree rebuilt
+
+/-- Replace a non-head first-fit result by its split remainder. Both the
+selected header and its predecessor have been taken; the suffix header is
+parked at `current + need`, then the predecessor is rebuilt to point at it.
+The untouched rejected prefix is spliced back onto the two rebuilt nodes. -/
+theorem AllocatorView.FirstFitLocation.splitAfter
+    {v : AllocatorView}
+    {limit start need previous current size next previousSize : Int}
+    (location : v.FirstFitLocation
+      limit start need previous current size next)
+    (currentNotEnd : current ≠ limit)
+    (notHead : current ≠ start)
+    {selected predecessor remainder relinked : FreeHeaderView}
+    (selectedStored : v.storesHeader current selected)
+    (selectedFields : selected.hasFields size next)
+    (predecessorStored : v.storesHeader previous predecessor)
+    (predecessorFields : predecessor.hasFields previousSize current)
+    (remainderKey : remainder.key = current + need)
+    (remainderFields : remainder.hasFields (size - need) next)
+    (remainderExtent : remainder.toFree.span.len = size - need)
+    (remainderRoot : remainder.sizeCell.alloc =
+      ((v.takeHeader current).takeHeader previous).root.alloc)
+    (canPutRemainder :
+      ((v.takeHeader current).takeHeader previous).canPutHeader remainder)
+    (relinkedEq : relinked =
+      predecessor.clearFields.putFields previousSize (current + need))
+    (canPutRelinked :
+      (((v.takeHeader current).takeHeader previous).putHeader remainder
+        ).canPutHeader relinked)
+    (requestMin : freeHeaderBytes ≤ need)
+    (remainderMin : freeHeaderBytes ≤ size - need) :
+    ((((v.takeHeader current).takeHeader previous).putHeader remainder
+      ).putHeader relinked).StoredChain limit start := by
+  have currentChain : v.StoredChain limit current :=
+    location.resultChain
+  have currentMatch := currentChain.takeMatchingHead currentNotEnd
+    selectedStored selectedFields
+  cases pathEq : location.2.1 with
+  | nil => exact (notHead rfl).elim
+  | step priorPath predecessorNotEnd pathStored pathFields rejected =>
+      have previousChain : v.StoredChain limit previous := by
+        simpa using priorPath.tail location.1
+      have previousMatch := previousChain.takeMatchingHead
+        predecessorNotEnd predecessorStored predecessorFields
+      have previousCurrent : previous < current := by
+        have hfit := previousMatch.2.2.1
+        have horder := previousMatch.2.2.2.1
+        simp [freeHeaderBytes, u64.layout] at hfit
+        omega
+      have currentNext : current < next := by
+        have hfit := currentMatch.2.2.1
+        have horder := currentMatch.2.2.2.1
+        simp [freeHeaderBytes, u64.layout] at hfit
+        omega
+      have bareTail :
+          ((v.takeHeader current).takeHeader previous).StoredChain
+            limit next := by
+        apply currentMatch.2.2.2.2.2.takeHeaderBefore
+        omega
+      have bareSelectedClear :
+          ((v.takeHeader current).takeHeader previous).clearInterior
+            current size := by
+        intro k hlo hhi
+        have hkPrevious : k ≠ previous := by omega
+        simpa [AllocatorView.takeHeader, hkPrevious] using
+          currentMatch.2.1 k hlo hhi
+      have needPositive : 0 < need := by
+        simp [freeHeaderBytes, u64.layout] at requestMin
+        omega
+      have needAtMostSize : need ≤ size := by
+        simp [freeHeaderBytes, u64.layout] at remainderMin
+        omega
+      have remainderClear :
+          ((v.takeHeader current).takeHeader previous).clearInterior
+            remainder.key (size - need) := by
+        rw [remainderKey]
+        intro k hlo hhi
+        apply bareSelectedClear k
+        · omega
+        · omega
+      have currentNonneg : 0 ≤ current := by
+        have hwf := selectedStored.2.2.2.1
+        unfold FreeHeaderView.wf at hwf
+        calc
+          0 ≤ selected.sizeCell.off := hwf.1.2.1
+          _ = selected.key := hwf.2.2.1.symm
+          _ = current := selectedStored.2.2.1
+      have rebuiltRemainder :
+          (((v.takeHeader current).takeHeader previous).putHeader remainder
+            ).StoredChain limit remainder.key := by
+        apply AllocatorView.StoredChain.prependAfterPut
+          bareTail canPutRemainder remainderFields remainderExtent
+          remainderClear remainderRoot
+        · rw [remainderKey]
+          omega
+        · exact remainderMin
+        · rw [remainderKey]
+          have horder := currentMatch.2.2.2.1
+          omega
+        · exact currentMatch.2.2.2.2.1
+      have relinkedKey : relinked.key = previous := by
+        rw [relinkedEq]
+        exact predecessorStored.2.2.1
+      have relinkedFields :
+          relinked.hasFields previousSize remainder.key := by
+        rw [remainderKey, relinkedEq]
+        simp [FreeHeaderView.hasFields, FreeHeaderView.clearFields,
+          FreeHeaderView.putFields]
+      have relinkedExtent : relinked.toFree.span.len = previousSize := by
+        rw [relinkedEq]
+        simpa using previousMatch.1
+      have relinkedClear :
+          (((v.takeHeader current).takeHeader previous).putHeader remainder
+            ).clearInterior relinked.key previousSize := by
+        rw [relinkedKey]
+        intro k hlo hhi
+        have hkPrevious : k ≠ previous := by omega
+        have hkCurrent : k ≠ current := by
+          have horder := previousMatch.2.2.2.1
+          omega
+        have hkRemainder : k ≠ remainder.key := by
+          rw [remainderKey]
+          omega
+        simpa [AllocatorView.takeHeader, AllocatorView.putHeader,
+          hkPrevious, hkCurrent, hkRemainder] using
+          previousMatch.2.1 k hlo hhi
+      have relinkedRoot :
+          relinked.sizeCell.alloc =
+            (((v.takeHeader current).takeHeader previous).putHeader remainder
+              ).root.alloc := by
+        rw [relinkedEq]
+        exact predecessorStored.2.2.2.2.2
+      have previousNonneg : 0 ≤ previous := by
+        have hwf := predecessorStored.2.2.2.1
+        unfold FreeHeaderView.wf at hwf
+        calc
+          0 ≤ predecessor.sizeCell.off := hwf.1.2.1
+          _ = predecessor.key := hwf.2.2.1.symm
+          _ = previous := predecessorStored.2.2.1
+      have rebuiltAtKey :
+          ((((v.takeHeader current).takeHeader previous).putHeader remainder
+            ).putHeader relinked).StoredChain limit relinked.key := by
+        apply AllocatorView.StoredChain.prependAfterPut
+          rebuiltRemainder canPutRelinked relinkedFields relinkedExtent
+          relinkedClear relinkedRoot
+        · rw [relinkedKey]
+          exact previousNonneg
+        · exact previousMatch.2.2.1
+        · rw [relinkedKey, remainderKey]
+          have horder := previousMatch.2.2.2.1
+          omega
+        · rw [remainderKey]
+          have horder := currentMatch.2.2.2.1
+          have hbound := currentMatch.2.2.2.2.1
+          omega
+      have rebuilt :
+          ((((v.takeHeader current).takeHeader previous).putHeader remainder
+            ).putHeader relinked).StoredChain limit previous := by
+        rw [relinkedKey] at rebuiltAtKey
+        exact rebuiltAtKey
+      have agree : v.AgreesBelow
+          ((((v.takeHeader current).takeHeader previous).putHeader remainder
+            ).putHeader relinked) previous := by
+        refine ⟨rfl, rfl, ?_⟩
+        intro k hk
+        have hkPrevious : k ≠ previous := by omega
+        have hkCurrent : k ≠ current := by omega
+        have hkRemainder : k ≠ remainder.key := by
+          rw [remainderKey]
+          omega
+        have hkRelinked : k ≠ relinked.key := by
+          rw [relinkedKey]
+          omega
+        simp [AllocatorView.takeHeader, AllocatorView.putHeader,
+          hkPrevious, hkCurrent, hkRemainder, hkRelinked]
+      exact priorPath.toPrefix.splice location.1 agree rebuilt
 
 @[simp] theorem FreeBlockView.split_joinable (v : FreeBlockView) (n : Int) :
     (v.prefix n).joinable (v.suffix n) := by
@@ -985,6 +1648,14 @@ theorem FreeHeaderView.toFree_wf {v : FreeHeaderView} (hv : v.wf) :
   · simp [FreeHeaderView.toFree, FreeHeaderView.rawCell,
       hsizeLayout, hnextLayout, u64.layout]
     omega
+
+@[simp] theorem FreeBlockView.toHeader_putFields_toFree_span_len
+    (v : FreeBlockView) (size next : Int) :
+    (v.toHeader.putFields size next).toFree.span.len = v.span.len := by
+  simp [FreeBlockView.toHeader, FreeHeaderView.putFields,
+    FreeHeaderView.toFree, FreeHeaderView.rawCell,
+    SpanView.cat, SpanView.drop, freeHeaderBytes, u64.layout]
+  omega
 
 theorem FreeHeaderView.roundTrip_identity (v : FreeBlockView)
     (size next : Int) :

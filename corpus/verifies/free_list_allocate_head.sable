@@ -1,0 +1,268 @@
+// U8f5 head allocation policy. Remove the selected stored header exactly
+// once, split only when the suffix can hold another two-word header, rebuild
+// that suffix as the new head, and expose only a nonsplittable client lease.
+
+use free_list_remove_head;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] list.limit = state.root.len
+/// pre  #[label(chain)]
+///        Sable.AllocatorView.StoredChain state list.limit list.head
+/// pre  #[label(nonempty)] list.head != list.limit
+/// pre  #[label(request)] Sable.freeHeaderBytes ≤ need ∧
+///        need % u64.layout.align = 0
+/// pre  #[label(node)] ∃ header,
+///        state.storesHeader list.head header ∧
+///        header.hasFields size next
+/// pre  #[label(fit)] need ≤ size
+/// post #[label(limit_frame)] list.limit = (old list).limit
+/// post #[label(head)] list.head =
+///        (if need + Sable.freeHeaderBytes ≤ size
+///         then (old list).head + need else next)
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state list.limit list.head
+/// post #[label(lease)] result.key = (old list).head ∧
+///        result.span.len =
+///          (if need + Sable.freeHeaderBytes ≤ size then need else size)
+/// post #[label(owner)] result.allocator = state.allocator
+/// post #[label(root)] result.span.alloc = state.root.alloc
+pub fn free_list_allocate_head(raw<u8> base,
+                               &mut FreeListState list,
+                               resource &mut AllocatorState state,
+                               u64 need, u64 size, u64 next)
+                               -> resource BlockLease {
+    u64 current = list.head;
+    mut resource FreeBlock block = free_list_remove_head(
+        base, &mut list, &mut state, size, next);
+    if (need <= size - 16) {
+        resource FreeBlock remainder = free_block_split(&mut block, need);
+        u64 remainder_key = current + need;
+        u64 remainder_size = size - need;
+        unsafe {
+            raw<u8> remainder_ptr = raw_offset(base, remainder_key);
+            mut resource FreeHeader remainder_header =
+                raw_into_free_header(remainder_ptr, remainder);
+            raw_header_init(
+                remainder_ptr, remainder_size, next, &mut remainder_header);
+        }
+        allocator_put_header(&mut state, remainder_header);
+        list.advance(remainder_key);
+    }
+    resource BlockLease lease = free_block_lease(block);
+    return lease;
+}
+
+/// discharge free_list_allocate_head.overflow.size_16 by
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout] at h_pre_request
+///   omega
+
+/// discharge free_list_allocate_head.free_block_split.need by
+///   rw [h_free_list_remove_head_post_removed.2]
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout] at h_pre_request
+///   omega
+
+/// discharge free_list_allocate_head.overflow.current_need by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hmatch := Sable.AllocatorView.StoredChain.takeMatchingHead
+///     h_pre_chain (by simpa using h_pre_nonempty) hstored hfields
+///   constructor
+///   · omega
+///   · calc
+///       _old_list.head + need ≤ _old_list.head + size := by omega
+///       _ ≤ next := hmatch.2.2.2.1
+///       _ ≤ Sable.u64.max := h_next_range.2
+
+/// discharge free_list_allocate_head.free_header.from_block by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hwf := hstored.2.2.2.1
+///   unfold Sable.FreeHeaderView.wf at hwf
+///   obtain ⟨hsizewf, _, hkeyoff, _, _, _, _, _⟩ := hwf
+///   have hheadalign :
+///       _old_list.head % Sable.u64.layout.align = 0 := by
+///     rw [← hstored.2.2.1, hkeyoff]
+///     simpa [hsizewf.1] using hsizewf.2.2.1
+///   rw [h_free5_split.2.2.1,
+///     h_free5_split.2.2.2.1, h_free5_split.2.2.2.2]
+///   constructor
+///   · calc
+///       (Sable.RawPtr.add base (_old_list.head + need)).alloc =
+///           base.alloc := rfl
+///       _ = _old_state.root.alloc := h_pre_base.1
+///       _ = state.root.alloc := by
+///         rw [h_free_list_remove_head_post_transition]
+///         rfl
+///       _ = block.span.alloc :=
+///         h_free_list_remove_head_post_root.symm
+///   constructor
+///   · calc
+///       (Sable.RawPtr.add base (_old_list.head + need)).off =
+///           base.off + (_old_list.head + need) := rfl
+///       _ = _old_list.head + need := by rw [h_pre_base.2]; omega
+///       _ = block.key + need := by
+///         rw [h_free_list_remove_head_post_removed.1]
+///       _ = block.span.off + need := by rw [h_block_wf.1]
+///   constructor
+///   · rw [Sable.RawPtr.add_off, h_pre_base.2]
+///     omega
+///   constructor
+///   · rw [Sable.RawPtr.add_off, h_pre_base.2]
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///       at h_pre_request hheadalign ⊢
+///     omega
+///   · rw [h_free_list_remove_head_post_removed.2]
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     omega
+
+/// discharge free_list_allocate_head.free_header.init by
+///   rw [h_header6_header]
+///   simp [Sable.FreeBlockView.toHeader, Sable.PointsToView.names,
+///     h_fact_sable_rawptr_add_base_ol, Sable.freeHeaderBytes,
+///     Sable.u64.layout]
+///   refine ⟨⟨h_fact_sable_rawptr_add_base_ol.1,
+///       h_fact_sable_rawptr_add_base_ol.2.1⟩,
+///     h_fact_sable_rawptr_add_base_ol.1.symm,
+///     h_fact_sable_rawptr_add_base_ol.2.1.symm, ?_⟩
+///   rw [h_free5_split.2.2.2.2,
+///     h_free_list_remove_head_post_removed.2]
+///   simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     at h_fact_sable_rawptr_add_base_ol
+///   omega
+
+/// discharge free_list_allocate_head.allocator_put_header by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hmatch := Sable.AllocatorView.StoredChain.takeMatchingHead
+///     h_pre_chain (by simpa using h_pre_nonempty) hstored hfields
+///   have hkey : remainder_header.key = _old_list.head + need := by
+///     simp [h_remainder_header_init, h_header6_header, h_free5_suffix,
+///       Sable.FreeHeaderView.putFields, Sable.FreeBlockView.toHeader,
+///       Sable.FreeBlockView.suffix,
+///       h_free_list_remove_head_post_removed.1]
+///   have hslot :
+///       state.free (_old_list.head + need) = none ∧
+///       state.headers (_old_list.head + need) = none := by
+///     rw [h_free_list_remove_head_post_transition]
+///     have hneedpos : 0 < need := by
+///       simp [Sable.freeHeaderBytes, Sable.u64.layout] at h_pre_request
+///       omega
+///     have hproper : need < size := by omega
+///     exact hmatch.2.1 (_old_list.head + need)
+///       (by omega) (by omega)
+///   unfold Sable.AllocatorView.canPutHeader
+///   refine ⟨?_, h_remainder_header_wf, ?_, ?_⟩
+///   · rw [h_remainder_header_init, h_header6_header, h_free5_suffix]
+///     exact h_free_list_remove_head_post_owner
+///   · rw [hkey]
+///     exact hslot.1
+///   · rw [hkey]
+///     exact hslot.2
+
+/// discharge free_list_allocate_head.call_pre.FreeListState_advance.next_self_limit by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hmatch := Sable.AllocatorView.StoredChain.takeMatchingHead
+///     h_pre_chain (by simpa using h_pre_nonempty) hstored hfields
+///   calc
+///     _old_list.head + need ≤ _old_list.head + size := by omega
+///     _ ≤ next := hmatch.2.2.2.1
+///     _ ≤ _old_list.limit := hmatch.2.2.2.2.1
+///     _ = list.limit := h_free_list_remove_head_post_limit_frame.symm
+
+/// discharge free_list_allocate_head.post.chain by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hmatch := Sable.AllocatorView.StoredChain.takeMatchingHead
+///     h_pre_chain (by simpa using h_pre_nonempty) hstored hfields
+///   have hkey : remainder_header.key = _old_list.head + need := by
+///     simp [h_remainder_header_init, h_header6_header, h_free5_suffix,
+///       Sable.FreeHeaderView.putFields, Sable.FreeBlockView.toHeader,
+///       Sable.FreeBlockView.suffix,
+///       h_free_list_remove_head_post_removed.1]
+///   have hnewFields :
+///       remainder_header.hasFields (size - need) next := by
+///     simp [h_remainder_header_init, h_header6_header,
+///       Sable.FreeHeaderView.hasFields,
+///       Sable.FreeHeaderView.putFields]
+///   have hnewExtent :
+///       remainder_header.toFree.span.len = size - need := by
+///     rw [h_remainder_header_init, h_header6_header,
+///       Sable.FreeBlockView.toHeader_putFields_toFree_span_len,
+///       h_free5_split.2.2.2.2,
+///       h_free_list_remove_head_post_removed.2]
+///   have hnewClear :
+///       state.clearInterior remainder_header.key (size - need) := by
+///     intro k hlo hhi
+///     rw [hkey] at hlo hhi
+///     rw [h_free_list_remove_head_post_transition]
+///     apply hmatch.2.1 k
+///     · omega
+///     · omega
+///   have hnewRoot :
+///       remainder_header.sizeCell.alloc = state.root.alloc := by
+///     rw [h_remainder_header_init, h_header6_header, h_free5_suffix]
+///     exact h_free_list_remove_head_post_root
+///   rw [h_state_put_header,
+///     h_FreeListState_advance_post_self_head_next_self_limi.1,
+///     h_FreeListState_advance_post_self_head_next_self_limi.2,
+///     ← hkey]
+///   apply Sable.AllocatorView.StoredChain.prependAfterPut
+///   · rw [h_free_list_remove_head_post_head]
+///       at h_free_list_remove_head_post_chain
+///     exact h_free_list_remove_head_post_chain
+///   · exact h_fact_sable_allocatorview_canp
+///   · exact hnewFields
+///   · exact hnewExtent
+///   · exact hnewClear
+///   · exact hnewRoot
+///   · rw [hkey]
+///     omega
+///   · simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     omega
+///   · rw [hkey]
+///     have horder := hmatch.2.2.2.1
+///     omega
+///   · rw [h_free_list_remove_head_post_limit_frame]
+///     exact hmatch.2.2.2.2.1
+
+/// discharge free_list_allocate_head.post.lease by
+///   have hsplit : need + Sable.freeHeaderBytes ≤ size := by
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout]
+///     omega
+///   rw [h_result, h_lease11_lease, h_block_prefix, if_pos hsplit]
+///   simp [Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix,
+///     h_free_list_remove_head_post_removed]
+
+/// discharge free_list_allocate_head.post.owner by
+///   rw [h_result, h_lease11_lease, h_block_prefix,
+///     h_state_put_header]
+///   simpa [Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix,
+///     Sable.AllocatorView.putHeader] using
+///     h_free_list_remove_head_post_owner
+
+/// discharge free_list_allocate_head.post.root by
+///   rw [h_result, h_lease11_lease, h_block_prefix,
+///     h_state_put_header]
+///   simpa [Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix,
+///     Sable.AllocatorView.putHeader] using
+///     h_free_list_remove_head_post_root
+
+/// discharge free_list_allocate_head.post.head.2 by
+///   have hwhole : ¬ need + Sable.freeHeaderBytes ≤ size := by
+///     intro hsplit
+///     apply h_path_not_need_size_16
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout] at hsplit ⊢
+///     omega
+///   rw [if_neg hwhole]
+///   exact h_free_list_remove_head_post_head
+
+/// discharge free_list_allocate_head.post.lease.2 by
+///   have hwhole : ¬ need + Sable.freeHeaderBytes ≤ size := by
+///     intro hsplit
+///     apply h_path_not_need_size_16
+///     simp [Sable.freeHeaderBytes, Sable.u64.layout] at hsplit ⊢
+///     omega
+///   rw [h_result, h_lease12_lease, if_neg hwhole]
+///   simpa [Sable.FreeBlockView.toLease] using
+///     h_free_list_remove_head_post_removed
+
+/// discharge free_list_allocate_head.post.root.2 by
+///   rw [h_result, h_lease12_lease]
+///   simpa [Sable.FreeBlockView.toLease] using
+///     h_free_list_remove_head_post_root

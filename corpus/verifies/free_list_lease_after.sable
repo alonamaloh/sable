@@ -1,0 +1,36 @@
+// U8f5 whole-block allocation after a rejected prefix. The predecessor is
+// relinked around the selected node, while clients receive only BlockLease.
+
+use free_list_remove_after;
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(limit)] limit = state.root.len
+/// pre  #[label(location)] Sable.AllocatorView.FirstFitLocation
+///        state limit head need previous current size next
+/// pre  #[label(found)] current != limit
+/// pre  #[label(interior)] current != head
+/// post #[label(chain)]
+///        Sable.AllocatorView.StoredChain state limit head
+/// post #[label(lease)] result.key = current ∧ result.span.len = size
+/// post #[label(owner)] result.allocator = state.allocator
+/// post #[label(root)] result.span.alloc = state.root.alloc
+pub fn free_list_lease_after(raw<u8> base,
+                             resource &mut AllocatorState state,
+                             u64 limit, u64 head, u64 need,
+                             u64 previous, u64 current,
+                             u64 size, u64 next)
+                             -> resource BlockLease {
+    resource FreeBlock block = free_list_remove_after(
+        base, &mut state, limit, head, need,
+        previous, current, size, next);
+    resource BlockLease lease = free_block_lease(block);
+    return lease;
+}
+
+/// discharge free_list_lease_after.post.lease by
+///   rw [h_result, h_lease3_lease]
+///   exact h_free_list_remove_after_post_removed
+
+/// discharge free_list_lease_after.post.root by
+///   rw [h_result, h_lease3_lease]
+///   exact h_free_list_remove_after_post_root

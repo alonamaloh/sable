@@ -1,22 +1,20 @@
-// The search specification and its structural loop witnesses are deliberately
-// outside the dynamic monitor's first-order fragment; the static subject is
-// still kernel-checked in full.
-// expect-skip: Sable.AllocatorView.StoredChain state limit head
-// expect-skip: Sable.AllocatorView.StoredChain state limit current
-// expect-skip: Sable.AllocatorView.RejectedPath
-// expect-skip: Sable.AllocatorView.FirstFit
 // expect-skip: base.alloc = state.root.alloc ∧ base.off = 0
-// expect-skip: limit = state.root.len
-// expect-skip: Sable.freeHeaderBytes ≤ need
-// expect-skip: state = old state
+// expect-skip: list.limit = state.root.len
+// expect-skip: Sable.AllocatorView.StoredChain state list.limit list.head
+// expect-skip: ∃ header
+// expect-skip: takeHeader (old list).head
+// expect-skip: result.key = (old list).head
+// expect-skip: result.allocator = state.allocator
+// expect-skip: result.span.alloc = state.root.alloc
 
-use free_list_first_fit;
+use free_list_lease_head;
+use free_list_remove_head;
 
 /// pre actual = expected
 fn expect_eq_u64(u64 actual, u64 expected) {
 }
 
-fn test_free_list_first_fit_found_and_missing() {
+fn test_free_list_remove_head_two_nodes() {
     unsafe system_alloc(64) as (base, resource mem, resource release);
     mut resource AllocatorState state = allocator_create(mem);
     mut resource FreeBlock left = allocator_take_free(&mut state, 0);
@@ -36,25 +34,21 @@ fn test_free_list_first_fit_found_and_missing() {
     }
     allocator_put_header(&mut state, left_header);
 
-    u64 first = free_list_first_fit(base, &mut state, 64, 0, 16);
-    expect_eq_u64(first, 0);
+    var mut list = FreeListState::make(0, 64);
+    resource BlockLease lease =
+        free_list_lease_head(base, &mut list, &mut state, 32, 32);
+    resource FreeBlock removed = block_lease_free(lease);
+    expect_eq_u64(list.head, 32);
 
-    u64 missing = free_list_first_fit(base, &mut state, 64, 0, 40);
-    expect_eq_u64(missing, 64);
-
-    mut resource FreeHeader left_cleanup = allocator_take_header(&mut state, 0);
-    unsafe {
-        raw_header_clear(base, &mut left_cleanup);
-        resource FreeBlock left_block = raw_from_free_header(base, left_cleanup);
-    }
-    mut resource FreeHeader right_cleanup = allocator_take_header(&mut state, 32);
+    mut resource FreeHeader right_cleanup =
+        allocator_take_header(&mut state, 32);
     unsafe {
         raw<u8> cleanup_ptr = raw_offset(base, 32);
         raw_header_clear(cleanup_ptr, &mut right_cleanup);
         resource FreeBlock right_block =
             raw_from_free_header(cleanup_ptr, right_cleanup);
     }
-    resource FreeBlock whole_free = free_block_join(left_block, right_block);
+    resource FreeBlock whole_free = free_block_join(removed, right_block);
     allocator_put_free(&mut state, whole_free);
     resource RawSpan whole = allocator_destroy(state);
     unsafe system_dealloc(base, whole, release);
