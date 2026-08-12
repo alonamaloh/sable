@@ -1,0 +1,17 @@
+// expect-error: extern.returns_storage
+// The case the old rule missed. Forbidding raw and resource returns named
+// the storage *types*; a class holding a resource field is the same power
+// through a container, and it is exactly what a foreign function would use
+// to retain the storage it was lent (ADR 0029/0030).
+
+class Holder {
+    resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(resource RawSpan s) {
+        self.span = s;
+    }
+}
+
+extern "C" #[audit(id := "test.holder.v1", reason := "probe")]
+fn c_make_holder() -> Holder;

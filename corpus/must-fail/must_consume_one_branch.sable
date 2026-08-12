@@ -1,0 +1,25 @@
+// expect-error: resource.abandoned
+// A `#[must_consume]` obligation is a state of the *place*, and it joins
+// path-sensitively: outstanding after a branch iff some reaching path left
+// it outstanding. Consuming the token on one path says nothing about the
+// other, and the union of moved places would have called this consumed.
+
+fn eat(resource RawSpan s) {
+}
+
+class Guard {
+    u64 n;
+    #[must_consume] resource RawSpan span;
+
+    /// pre  s.len ≥ 0
+    init hold(u64 k, resource RawSpan s) {
+        self.n = k;
+        self.span = s;
+    }
+
+    deinit {
+        if (self.n > 0) {
+            eat(self.span);
+        }
+    }
+}

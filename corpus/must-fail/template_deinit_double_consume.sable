@@ -1,0 +1,25 @@
+// expect-error: resource.use_after_move
+// A generic class's destructor is checked like any other. Verifying a
+// generic once at the template (ADR 0009) is only a saving if what it
+// verifies is the same thing — and the destructor is the one member where
+// fields may be moved out, so it is where a template that skipped the
+// check would be most wrong.
+
+fn eat_span(resource RawSpan s) {
+}
+
+pub class Wrap<T> {
+    T v;
+    resource RawSpan span;
+
+    /// pre s.len ≥ 0
+    init of(T x, resource RawSpan s) {
+        self.v = x;
+        self.span = s;
+    }
+
+    deinit {
+        eat_span(self.span);
+        eat_span(self.span);
+    }
+}

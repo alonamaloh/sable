@@ -48,12 +48,14 @@ struct VarInfo {
     /// return, no assignment to an outer place, and no passing to a
     /// user function that could launder them out.
     branded: bool,
-    /// Holds the authority of a `#[must_consume]` field (ADR 0029). The
-    /// obligation travels with the token: moving it into a local moves
-    /// the obligation too, so abandoning that local is the same
-    /// diagnostic as abandoning the field. Passing it by value discharges
-    /// it — the authority is somebody else's problem then.
-    must_consume: bool,
+    /// An undischarged `#[must_consume]` obligation is sitting *here*
+    /// (ADR 0029/0030). It travels with the token: moving the value into
+    /// another place moves the obligation, and moving it out of this
+    /// frame discharges it. Being a state of the place rather than a
+    /// property of the declaration is what lets it join path-sensitively
+    /// — outstanding after a branch iff outstanding on some reaching
+    /// path.
+    obligation: bool,
 }
 
 struct Ctx<'a> {
@@ -90,6 +92,11 @@ struct Ctx<'a> {
     /// nowhere else (ADR 0029).
     in_deinit: bool,
     class_metas: &'a [ClassMeta],
+    /// Name and declaration span of the enclosing class's
+    /// `#[must_consume]` fields; empty outside a class member. A field
+    /// keeps its marker when it is given a new value, so the sink needs
+    /// to know which fields carry one.
+    marked_fields: &'a [(String, Span)],
     /// Template context (ADR 0009): bounded type parameter →
     /// (trait name, parameter index).
     tbounds: HashMap<String, (String, u8)>,
@@ -134,17 +141,28 @@ fn class_tbounds(c: &ClassDecl) -> HashMap<String, (String, u8)> {
 /// foreign code are out of scope for v1, so the *signature* forbids them
 /// rather than a rule about what the foreign code does (ADR 0027).
 fn check_extern_signature(f: &Fn) -> CResult<()> {
-    if matches!(f.ret, Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..)) {
+    // A whitelist, not a blacklist. Forbidding raw and resource returns
+    // named the *storage* cases and missed the container: a class may hold
+    // resource fields (ADR 0029), so returning one is returning storage by
+    // another route. Every other type — options, arrays, classes — would
+    // need a layout and an ownership-transfer meaning at the ABI that
+    // Sable has not specified, so they wait until it does.
+    if !matches!(f.ret, Ty::Unit | Ty::Int(_)) {
+        let what = match f.ret {
+            Ty::Class(_) => "a class value".to_string(),
+            other => format!("`{}`", other.name()),
+        };
         return Err(Diagnostic {
             name: "extern.returns_storage".into(),
-            title: format!("`{}` may not return `{}`", f.name, f.ret.name()),
+            title: format!("`{}` may not return {what}", f.name),
             span: f.name_span,
-            label: "an extern cannot hand storage back".into(),
+            label: "an extern returns an integer or nothing".into(),
             notes: vec![(
                 "note".into(),
                 "retained pointers and ownership transfer to foreign code are out of \
-                 scope; forbidding them in the signature is what lets a caller pass \
-                 borrowed storage to an extern at all"
+                 scope; a signature that cannot hand storage back is what lets a \
+                 caller pass borrowed storage to an extern at all — and a class \
+                 counts, because it may have resource fields"
                     .into(),
             )],
         });
@@ -406,6 +424,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             vars: HashMap::new(),
             declared: HashSet::new(),
             moved: HashSet::new(),
+            marked_fields: MARKED_NONE,
             in_unsafe: false,
             unsafe_blocks: 0,
             calls: Vec::new(),
@@ -443,7 +462,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     initialized: true,
                     mutable: false,
                         branded: false,
-                        must_consume: false,
+                        obligation: false,
                     },
             );
         }
@@ -474,6 +493,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             vars: HashMap::new(),
             declared: HashSet::new(),
             moved: HashSet::new(),
+            marked_fields: MARKED_NONE,
             in_unsafe: false,
             unsafe_blocks: 0,
             calls: Vec::new(),
@@ -502,7 +522,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     initialized: true,
                     mutable: false,
                         branded: false,
-                        must_consume: false,
+                        obligation: false,
                     },
             );
         }
@@ -541,6 +561,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 vars: HashMap::new(),
                 declared: HashSet::new(),
             moved: HashSet::new(),
+            marked_fields: &marked,
             in_unsafe: false,
             unsafe_blocks: 0,
                 calls: Vec::new(),
@@ -561,7 +582,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: false,
                         branded: false,
-                        must_consume: false,
+                        obligation: false,
                     },
                 );
             }
@@ -573,10 +594,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: false,
                         mutable: true,
                         branded: false,
-                        // The marker is the field's, in every member: it is
-                        // what makes overwriting a live one a diagnostic
-                        // rather than a silent leak.
-                        must_consume: marked_field(&marked, fname),
+                        // A field holds nothing yet, so it owes nothing
+                        // yet: the first assignment is what puts the
+                        // authority there, and what makes the marker bite.
+                        obligation: false,
                     },
                 );
             }
@@ -609,6 +630,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 vars: HashMap::new(),
                 declared: HashSet::new(),
             moved: HashSet::new(),
+            marked_fields: &marked,
             in_unsafe: false,
             unsafe_blocks: 0,
                 calls: Vec::new(),
@@ -629,7 +651,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: false,
                         branded: false,
-                        must_consume: false,
+                        obligation: false,
                     },
                 );
             }
@@ -641,7 +663,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: true,
                         branded: false,
-                        must_consume: marked_field(&marked, fname),
+                        obligation: marked_field(&marked, fname),
                     },
                 );
             }
@@ -681,6 +703,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 vars: HashMap::new(),
                 declared: HashSet::new(),
                 moved: HashSet::new(),
+                marked_fields: &marked,
                 in_unsafe: false,
                 unsafe_blocks: 0,
                 calls: Vec::new(),
@@ -701,7 +724,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         initialized: true,
                         mutable: true,
                         branded: false,
-                        must_consume: marked_field(&marked, fname),
+                        obligation: marked_field(&marked, fname),
                     },
                 );
             }
@@ -775,6 +798,17 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         for (ci, class) in ctemplates.iter_mut().enumerate() {
             let meta = &tmetas[ci];
             let ctb = class_tbounds(class);
+            // A template's members answer to the same ownership rules as a
+            // monomorphic class's. Verifying a generic once at the template
+            // (ADR 0009) is only a saving if what it verifies is the same
+            // thing.
+            let marked: Vec<(String, Span)> = class
+                .fields
+                .iter()
+                .filter(|f| f.must_consume)
+                .map(|f| (f.name.clone(), f.span))
+                .collect();
+            let class_span = class.name_span;
             for init in &mut class.inits {
                 let mut ctx = Ctx {
                     sigs: &sigs,
@@ -784,6 +818,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     vars: HashMap::new(),
                     declared: HashSet::new(),
             moved: HashSet::new(),
+            marked_fields: &marked,
             in_unsafe: false,
             unsafe_blocks: 0,
                     calls: Vec::new(),
@@ -804,7 +839,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: true,
                             mutable: false,
                         branded: false,
-                        must_consume: false,
+                        obligation: false,
                     },
                     );
                 }
@@ -816,13 +851,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: false,
                             mutable: true,
                         branded: false,
-                        must_consume: false,
+                        obligation: false,
                     },
                     );
                 }
                 check_block(&mut ctx, &mut init.body, Ty::Unit)?;
                 unsafe_regions += ctx.unsafe_blocks;
-            unsafe_regions += ctx.unsafe_blocks;
+                reject_field_holes(&ctx, &meta.name, &init.name, init.name_span)?;
+                reject_outstanding_obligations(&ctx, &marked, class_span, &init.name, false)?;
                 for (fname, _) in &meta.fields {
                     if !ctx.vars[&format!("self.{fname}")].initialized {
                         return Err(Diagnostic {
@@ -847,6 +883,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     vars: HashMap::new(),
                     declared: HashSet::new(),
             moved: HashSet::new(),
+            marked_fields: &marked,
             in_unsafe: false,
             unsafe_blocks: 0,
                     calls: Vec::new(),
@@ -867,7 +904,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: true,
                             mutable: false,
                         branded: false,
-                        must_consume: false,
+                        obligation: false,
                     },
                     );
                 }
@@ -879,13 +916,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             initialized: true,
                             mutable: true,
                         branded: false,
-                        must_consume: false,
+                        obligation: marked_field(&marked, fname),
                     },
                     );
                 }
                 let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
                 unsafe_regions += ctx.unsafe_blocks;
-            unsafe_regions += ctx.unsafe_blocks;
+                reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
+                reject_outstanding_obligations(&ctx, &marked, class_span, &m.f.name, false)?;
                 if !returns && m.f.ret != Ty::Unit {
                     return Err(Diagnostic {
                         name: "type.missing_return".into(),
@@ -898,6 +936,59 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         notes: vec![],
                     });
                 }
+            }
+            // A template's destructor is checked exactly as a monomorphic
+            // one is. Skipping it would leave the one member where fields
+            // may be moved out unchecked, and generic resource-owning
+            // classes are the ones that need it most.
+            if let Some(body) = &mut class.deinit {
+                let mut ctx = Ctx {
+                    sigs: &sigs,
+                    current_fn: format!("{}::deinit", meta.name),
+                    current_has_variant: false,
+                    in_test: false,
+                    vars: HashMap::new(),
+                    declared: HashSet::new(),
+                    moved: HashSet::new(),
+                    marked_fields: &marked,
+                    in_unsafe: false,
+                    unsafe_blocks: 0,
+                    calls: Vec::new(),
+                    in_class: Some((ci, true)),
+                    in_init: false,
+                    in_deinit: true,
+                    class_metas: &tmetas,
+                    tbounds: ctb.clone(),
+                    operators: &operators,
+                    traits: &traits_c,
+                };
+                for (fname, fty) in &meta.fields {
+                    ctx.vars.insert(
+                        format!("self.{fname}"),
+                        VarInfo {
+                            ty: *fty,
+                            initialized: true,
+                            mutable: true,
+                            branded: false,
+                            obligation: marked_field(&marked, fname),
+                        },
+                    );
+                }
+                let returns = check_block(&mut ctx, body, Ty::Unit)?;
+                unsafe_regions += ctx.unsafe_blocks;
+                if returns {
+                    return Err(Diagnostic {
+                        name: "type.return_in_deinit".into(),
+                        title: "`return` is not allowed inside `deinit`".into(),
+                        span: class_span,
+                        label: "a destructor runs to the end of its body".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "leaving early would skip the drops that follow the body".into(),
+                        )],
+                    });
+                }
+                reject_outstanding_obligations(&ctx, &marked, class_span, "deinit", true)?;
             }
         }
     }
@@ -993,7 +1084,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         initialized: init.is_some(),
                         mutable: *mutable,
                         branded,
-                        must_consume,
+                        obligation: must_consume,
                     },
                 );
             }
@@ -1050,7 +1141,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     v.initialized = true;
                     // The local now holds whatever obligation the value
                     // brought, and no longer the previous one.
-                    v.must_consume = carries;
+                    v.obligation = carries;
                 } else {
                     if matches!(ty, Ty::Array(..)) {
                         return Err(Diagnostic {
@@ -1073,26 +1164,23 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 else_block,
             } => {
                 check_expr(ctx, cond, Some(Ty::Bool))?;
-                // Both flow facts are per-path: a name is initialized
-                // after the `if` iff every falling-through branch
-                // initialized it, and moved-out iff any of them moved
-                // it. A branch that returns contributes neither.
-                let snapshot = |ctx: &Ctx| -> HashMap<String, bool> {
-                    ctx.vars
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.initialized))
-                        .collect()
-                };
+                // Every flow fact is per-path. A name is initialized after
+                // the `if` iff every falling-through branch initialized it;
+                // it is moved-out iff any of them moved it; and it is
+                // branded, or still owes a `#[must_consume]` obligation,
+                // iff some reaching branch left it that way. A branch that
+                // returns contributes none of them.
+                //
+                // The whole per-place state travels together: a fact
+                // carried by `VarInfo` and *not* snapshotted here would
+                // leak out of whichever branch the checker happened to
+                // walk last, which is traversal order deciding a rule.
                 let before = snapshot(ctx);
                 let before_moved = ctx.moved.clone();
                 let then_ret = check_block(ctx, then_block, ret_ty)?;
                 let after_then = snapshot(ctx);
                 let after_then_moved = ctx.moved.clone();
-                for (name, init) in &before {
-                    if let Some(v) = ctx.vars.get_mut(name.as_str()) {
-                        v.initialized = *init;
-                    }
-                }
+                restore(ctx, &before);
                 ctx.moved = before_moved.clone();
                 let else_ret = match else_block {
                     Some(b) => check_block(ctx, b, ret_ty)?,
@@ -1102,7 +1190,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let after_else_moved = ctx.moved.clone();
                 // Reaching branches only: a branch that returns
                 // contributes nothing to the fall-through state.
-                let mut reaching_init: Vec<&HashMap<String, bool>> = Vec::new();
+                let mut reaching_init: Vec<&HashMap<String, PlaceState>> = Vec::new();
                 let mut reaching_moved: Vec<&HashSet<Place>> = Vec::new();
                 if !then_ret {
                     reaching_init.push(&after_then);
@@ -1121,14 +1209,24 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     }
                 }
                 for (name, v) in ctx.vars.iter_mut() {
-                    let was = before.get(name).copied().unwrap_or(false);
-                    v.initialized = if reaching_init.is_empty() {
-                        was
-                    } else {
-                        reaching_init
-                            .iter()
-                            .all(|m| m.get(name).copied().unwrap_or(was))
-                    };
+                    let was = before.get(name).cloned().unwrap_or(PlaceState {
+                        initialized: v.initialized,
+                        branded: v.branded,
+                        obligation: v.obligation,
+                    });
+                    if reaching_init.is_empty() {
+                        v.initialized = was.initialized;
+                        v.branded = was.branded;
+                        v.obligation = was.obligation;
+                        continue;
+                    }
+                    let states = || reaching_init.iter().map(|m| m.get(name).unwrap_or(&was));
+                    v.initialized = states().all(|st| st.initialized);
+                    v.branded = states().any(|st| st.branded);
+                    // Outstanding after the branch iff some reaching path
+                    // left it outstanding: a token consumed on one path and
+                    // abandoned on the other is abandoned.
+                    v.obligation = states().any(|st| st.obligation);
                 }
                 // Resource shape must agree across reaching branches
                 // (ADR 0024): a token moved on one path and not the other
@@ -1196,11 +1294,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // The body may run zero times: check it against the entry
                 // state, then restore the entry state (body-declared locals
                 // become uninitialized after the loop).
-                let before: HashMap<String, bool> = ctx
-                    .vars
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.initialized))
-                    .collect();
+                let before = snapshot(ctx);
                 let before_moved = ctx.moved.clone();
                 let _body_ret = check_block(ctx, body, ret_ty)?;
                 // Affine shape must be preserved at the backedge
@@ -1229,10 +1323,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         )],
                     });
                 }
+                // The body may run zero times, so the state after the loop
+                // is the state before it. A body that consumed something
+                // live at the head was already rejected above, which is
+                // what makes restoring an obligation here correct rather
+                // than merely conservative.
                 ctx.moved = before_moved;
-                for (name, v) in ctx.vars.iter_mut() {
-                    v.initialized = before.get(name).copied().unwrap_or(false);
-                }
+                restore(ctx, &before);
             }
             Stmt::Return { value, span } => {
                 if ctx.in_init {
@@ -1342,7 +1439,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         initialized: true,
                         mutable: *mutable,
                         branded,
-                        must_consume,
+                        obligation: must_consume,
                     },
                 );
             }
@@ -1425,6 +1522,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 }
+                // Everything in scope before the loan opens. What the
+                // exposure adds — its two bindings, and whatever the body
+                // declares — goes away with it.
+                let declared_before: HashSet<String> = ctx.vars.keys().cloned().collect();
                 // The two bindings carry the loan brand. They name storage
                 // that exists only for this body, so nothing derived from
                 // them may outlive it.
@@ -1453,7 +1554,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             // proved.
                             mutable: *mutable,
                             branded: true,
-                            must_consume: false,
+                            obligation: false,
                         },
                     );
                 }
@@ -1497,9 +1598,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         )],
                     });
                 }
-                ctx.vars.remove(ptr.as_str());
-                ctx.vars.remove(res.as_str());
-                ctx.moved.retain(|p| p.root != *ptr && p.root != *res);
+                // An exposure body *is* a scope, and this is the one place
+                // in the language where that matters: the loan ends here.
+                // Its own bindings go, and so does everything declared
+                // inside — a local derived from `p` or `m` names storage
+                // the safe world owns again, and letting it keep a name
+                // would leave a value the brand rule has to chase forever
+                // (ADR 0030). `unsafe { ... }` is the opposite case: it
+                // grants vocabulary, has no lifetime, and is not a scope.
+                //
+                // Names stay reserved in `ctx.declared`, so nothing later
+                // reuses one and reads as a reference to what is gone.
+                ctx.vars.retain(|name, _| declared_before.contains(name));
+                ctx.moved.retain(|p| declared_before.contains(&p.root));
             }
             Stmt::Assert(_) => {
                 // Proof language: elaborated by Lean (well-formedness def)
@@ -1565,8 +1676,9 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // A field keeps its declared obligation and picks up one
                 // that travelled into it; storing a token in a field is
                 // not a way to lose its marker.
+                let marked = marked_field(ctx.marked_fields, field);
                 if let Some(v) = ctx.vars.get_mut(&format!("self.{field}")) {
-                    v.must_consume |= carries;
+                    v.obligation = marked || carries;
                 }
                 if ctx.in_init {
                     ctx.vars
@@ -3353,14 +3465,71 @@ fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<b
     if let Some((how, span)) = escapes {
         reject_brand_escape(ctx, e, how, span)?;
     }
-    let carries = match &e.kind {
-        ExprKind::Var(n) => ctx.vars.get(n.as_str()),
-        ExprKind::SelfField { field } => ctx.vars.get(format!("self.{field}").as_str()),
+    let source = match &e.kind {
+        ExprKind::Var(n) => Some(n.clone()),
+        ExprKind::SelfField { field } => Some(format!("self.{field}")),
         _ => None,
+    };
+    let mut carries = false;
+    if let Some(name) = source {
+        if let Some(v) = ctx.vars.get_mut(name.as_str()) {
+            carries = v.obligation;
+            // The obligation goes with the token. Whether it is discharged
+            // or merely relocated is the *sink's* answer, and the source
+            // no longer owes it either way.
+            v.obligation = false;
+        }
     }
-    .is_some_and(|v| v.must_consume);
     mark_moved(ctx, e)?;
     Ok(carries)
+}
+
+/// No `#[must_consume]` fields: the marker list outside a class member.
+const MARKED_NONE: &[(String, Span)] = &[];
+
+/// Everything the checker knows about a place, as one value.
+///
+/// Branch and loop joins are defined over this rather than over a chosen
+/// subset, so a fact added later joins with the rest instead of leaking
+/// out of whichever path was walked last (ADR 0030). Move state is the
+/// exception and lives in `Ctx::moved`, because it is keyed by `Place`
+/// rather than by name — a field is a place its object's name cannot
+/// describe.
+#[derive(Clone)]
+struct PlaceState {
+    initialized: bool,
+    branded: bool,
+    obligation: bool,
+}
+
+fn snapshot(ctx: &Ctx) -> HashMap<String, PlaceState> {
+    ctx.vars
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                PlaceState {
+                    initialized: v.initialized,
+                    branded: v.branded,
+                    obligation: v.obligation,
+                },
+            )
+        })
+        .collect()
+}
+
+fn restore(ctx: &mut Ctx, snap: &HashMap<String, PlaceState>) {
+    for (name, v) in ctx.vars.iter_mut() {
+        if let Some(st) = snap.get(name) {
+            v.initialized = st.initialized;
+            v.branded = st.branded;
+            v.obligation = st.obligation;
+        } else {
+            // Declared inside the block that is being unwound: it exists
+            // only where it was declared.
+            v.initialized = false;
+        }
+    }
 }
 
 /// Whether a field carries the `#[must_consume]` marker.
@@ -3375,8 +3544,8 @@ fn marked_field(marked: &[(String, Span)], field: &str) -> bool {
 /// that holds one and not only about the field: moving it into a local
 /// and dropping the local abandons the authority exactly as leaving it in
 /// the field does. What discharges one is passing the value *by value* to
-/// something that takes it, which is why the question is "still live
-/// here", not "was moved at some point".
+/// something that takes it, which is why the state lives on the place —
+/// "is one sitting here", not "was this ever moved".
 ///
 /// `fields` says whether a marked field still holding its authority is an
 /// abandonment. In a `deinit` it is — the object is ending, and nothing
@@ -3393,23 +3562,13 @@ fn reject_outstanding_obligations(
     let mut outstanding: Vec<&String> = ctx
         .vars
         .iter()
-        .filter(|(_, v)| v.must_consume)
+        .filter(|(_, v)| v.obligation)
         .map(|(name, _)| name)
         .collect();
     outstanding.sort();
     for name in outstanding {
         let field = name.strip_prefix("self.");
         if field.is_some() && !fields {
-            continue;
-        }
-        let place = match field {
-            Some(f) => Place {
-                root: "self".to_string(),
-                fields: vec![f.to_string()],
-            },
-            None => Place::local(name),
-        };
-        if ctx.is_moved(&place) {
             continue;
         }
         let (span, label) = match field {
@@ -3447,11 +3606,8 @@ fn reject_outstanding_obligations(
 /// empty, and an empty place may be given a new value.
 fn reject_overwrite_of_obligation(ctx: &Ctx, place: &Place, span: Span) -> CResult<()> {
     let name = place.render();
-    let holds = ctx
-        .vars
-        .get(name.as_str())
-        .is_some_and(|v| v.must_consume && v.initialized);
-    if !holds || ctx.is_moved(place) {
+    let holds = ctx.vars.get(name.as_str()).is_some_and(|v| v.obligation);
+    if !holds {
         return Ok(());
     }
     Err(Diagnostic {

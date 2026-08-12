@@ -1,0 +1,19 @@
+// expect-error: type.unknown_variable
+// An exposure body is a scope, and the loan is why: the storage stops
+// being borrowed at the closing brace, so a local derived from `p` or `m`
+// would keep a name for storage the safe world owns again. Nonescape
+// stops such a value crossing a sink; scoping is what stops it having a
+// name at all.
+//
+// `unsafe { ... }` is the other case — vocabulary, no lifetime, no scope —
+// and `ownership.sable` carries the positive subject for it.
+
+fn dangle(&[u8] a) -> u64 {
+    unsafe expose &a as (p, resource m) {
+        var q = raw_offset(p, 0);
+    }
+    unsafe {
+        u8 b = raw_load8(q, &m);
+    }
+    return 0;
+}

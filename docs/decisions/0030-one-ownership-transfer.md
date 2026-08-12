@@ -187,6 +187,54 @@ for a foreign one, since nothing stops C stashing it in a foreign global.
 The rule and the code are unchanged; which side of the audited boundary
 the reasoning sits on is not. ADR 0027 carries the amendment.
 
+## Third pass: the joins, the ABI, the loan, and the templates
+
+A third review pass found four more, and the first two are the same defect
+as everything above: a rule that existed in one place and not in the
+places that shared its subject.
+
+**Branch and loop joins carried only part of the state.** `VarInfo` grew
+`branded` and then the must-consume obligation, while the `if` and `while`
+handlers went on snapshotting `initialized` and the move set. Whichever
+branch the checker walked last decided the rest, which is traversal order
+deciding a rule. The joins are now defined over a `PlaceState`
+(`initialized`, `branded`, obligation) that travels as one value:
+initialized joins by AND over reaching paths, the other two by OR.
+
+That fix is what makes the obligation mean anything across control flow,
+and it needed the obligation to become a **state of the place** rather
+than a flag on a declaration consulted against the move set. Moving a
+token out of a place clears it; landing in a place sets it; a marked field
+gets it back whenever it is assigned. The old formulation asked
+`must_consume && !is_moved`, and since the move set is a *union* over
+reaching branches, consuming on one path read as consuming on all of them
+— a destructor that closed a handle only inside an `if` was accepted.
+
+**The extern return rule was a blacklist.** Forbidding raw and resource
+returns named the storage types and missed the container: a class may hold
+resource fields, so returning one returns storage. It is a whitelist now —
+an integer, or nothing — and ADR 0027's decision 5 is amended to match.
+
+**An exposure body is a scope; an `unsafe` block is not.** The second pass
+made both non-scoping to match the checker, which fixed the premature
+destruction but left a derived local (`var q = raw_offset(p, 0);`)
+holding a name for storage the safe world owns again once the loan closes.
+The asymmetry is the honest resolution: `unsafe { ... }` grants vocabulary
+and has no lifetime, while an exposure *is* a lifetime, and its body ends
+where the loan does. Nonescape stops such a value crossing a sink; scoping
+stops it having a name at all, which is a smaller rule than giving loans
+identities and invalidating derived locals — the alternative worth
+revisiting only if nested exposures need to tell two loans apart.
+
+**Generic class templates had not caught up.** A template's members were
+checked without the marker list, without the field-hole rule, and — the
+sharp one — its `deinit` was not checked *at all*: a destructor that
+consumed the same field twice passed at the template. Verifying a generic
+once at the template (ADR 0009) is only a saving if what it verifies is
+the same thing, and the destructor is the one member where fields may
+legally move out. Templates now run the same three checks, and a doubled
+`unsafe_regions` increment in that path is gone.
+
 ## Consequences
 
 - `Ctx::place_ty` replaces the per-category place queries; `affine_kind`
@@ -224,7 +272,15 @@ the reasoning sits on is not. ADR 0027 carries the amendment.
   name. Marker blocks are the case where the two really did differ, and
   that is now fixed; a genuine scope construct is still not needed.
 - **A callee inheriting a `#[must_consume]` obligation.** The marker is on
-  a field, so passing the token by value discharges it. Making it mean
-  "reaches a consuming primitive" needs the marker on a *type*, which is
-  the same prerequisite ADR 0029 recorded and which `SystemDealloc` will
-  force.
+  a field, so passing the token by value discharges it: the guarantee is
+  *must leave this frame*, and a do-nothing sink function satisfies it.
+  Making it mean "reaches a consuming primitive" needs the marker on a
+  *type* and an interprocedural obligation, which is the prerequisite ADR
+  0029 recorded and which `SystemDealloc` forces. **The decision to take
+  then is between two honest options** — rename it `#[must_move]` and keep
+  the affine meaning, or propagate the obligation — and it should be taken
+  before an allocator's release authority depends on the answer, not after.
+- **Loan identities.** A single `branded` bit cannot tell two nested
+  exposures apart. Scoping the body removes the need today, because
+  nothing derived survives to be confused; a second loan open at the same
+  time would bring the question back.

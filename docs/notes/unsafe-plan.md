@@ -1681,6 +1681,17 @@ that falsifies its own invariant, so a second drop traps, and
 each path destroys at all. The second cannot live in `corpus/verifies` — a
 verifying file may not contain a deliberately failing call.
 
+**A third pass** closed the last four: branch and loop joins carried only part of
+the per-place state, so traversal order decided the rest (and because the move set
+is a *union* over reaching branches, "consumed on one path" read as consumed — a
+destructor that closed a handle only inside an `if` was accepted); the extern
+return rule was a blacklist that named the storage types and missed the container;
+an exposure body was left non-scoping by the second pass, so a derived local could
+keep a name for storage the loan had given back; and generic class templates were
+checked without the marker list, without the field-hole rule, and with **no
+destructor checking at all**. `unsafe { }` is a marker and an exposure body is a
+scope — the block grants vocabulary and has no lifetime, the exposure *is* one.
+
 **A second review pass found four more of the same shape**, each the rule missing
 from one more spot, and all four are now closed: `unsafe { }` and an exposure
 body were scopes in the *interpreter* while the checker keeps their locals in the

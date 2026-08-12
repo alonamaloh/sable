@@ -1,0 +1,18 @@
+// expect-error: extern.returns_storage
+// An extern's ABI return type is a whitelist: an integer, or nothing.
+// A class is not on it even when its fields are ordinary — its layout and
+// the meaning of handing one across the boundary are not specified yet,
+// and blacklisting the storage types by name would only catch the cases
+// somebody thought of.
+
+class Plain {
+    u64 v;
+
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+extern "C" #[audit(id := "test.plain.v1", reason := "probe")]
+fn c_make_plain() -> Plain;

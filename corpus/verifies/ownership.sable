@@ -147,10 +147,16 @@ pub fn two_descriptors(resource &mut PosixWorld w) {
 
 // ---------------------------- markers, not scopes --------------------------
 //
-// `unsafe { ... }` and an exposure body license operations; they do not
-// open a scope. A value declared inside one is still live at the closing
-// brace, and the interpreter has to destroy it where the checker says it
-// dies — at the end of the function — rather than at the brace.
+// `unsafe { ... }` licenses operations and has no lifetime, so it is a
+// marker rather than a scope: a value declared inside one is still live
+// at the closing brace, and the interpreter destroys it where the checker
+// says it dies — at the end of the function.
+//
+// An exposure is the other case, and the difference is the loan. Its body
+// *is* a scope, because the storage it lends stops being borrowed at the
+// closing brace: a local derived from `p` or `m` would otherwise keep a
+// name for storage the safe world owns again
+// (`corpus/must-fail/expose_local_outlives_loan.sable`).
 
 pub fn unsafe_block_local() -> u64 {
     unsafe {
@@ -159,10 +165,39 @@ pub fn unsafe_block_local() -> u64 {
     return swallow(t);
 }
 
-/// pre a.len ≥ 1
-pub fn exposure_body_local(&mut [u8] a) -> u64 {
-    unsafe expose &mut a as (p, resource m) {
-        var t = Token::make();
+/// pre  a.len ≥ 1
+/// post result = a.get 0
+pub fn exposure_keeps_its_result(&[u8] a) -> u8 {
+    mut u8 first = 0;
+    unsafe expose &a as (p, resource m) {
+        first = raw_load8(p, &m);
     }
-    return swallow(t);
+    return first;
+}
+
+// ------------------------- consuming on every path -------------------------
+//
+// The obligation joins path-sensitively, so a destructor that consumes on
+// one branch has to consume on the other too. This is what the rule looks
+// like when it is satisfied — the guard below hands the authority on
+// whichever way the branch goes.
+
+pub class Guard {
+    u64 n;
+    #[must_consume] resource RawSpan span;
+
+    /// pre  #[label(len)] s.len ≥ 0
+    init hold(u64 k, resource RawSpan s) {
+        self.n = k;
+        self.span = s;
+    }
+
+    deinit {
+        if (self.n > 0) {
+            eat_span(self.span);
+        } else {
+            resource RawSpan late = self.span;
+            eat_span(late);
+        }
+    }
 }

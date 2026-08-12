@@ -866,7 +866,11 @@ impl<'a> Interp<'a> {
                 // The resource has no runtime representation (ADR 0024);
                 // the binding exists so the body's names resolve.
                 frame.vars.insert(res.clone(), RtVal::Unit);
-                let flow = self.exec_open_block(body, frame, locals)?;
+                // An exposure body is a scope on both sides: the loan ends
+                // at the closing brace, so anything the body declared ends
+                // with it (ADR 0030). `unsafe { ... }` is the other case —
+                // vocabulary, no lifetime, no scope.
+                let flow = self.exec_block(body, frame)?;
                 let final_bytes = self
                     .raw
                     .allocs

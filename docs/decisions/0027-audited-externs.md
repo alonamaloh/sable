@@ -36,12 +36,22 @@ convention, it is the honesty of the output.
    pointer, the length, and the byte. Authority is a static notion
    (ADR 0024), so there is nothing to pass.
 
-5. **An extern may not return raw or resource storage**
-   (`extern.returns_storage`), and may not be generic (`extern.generic`).
-   Retained pointers, callbacks, and ownership transfer to foreign code are
-   out of scope for v1 — and forbidding them *in the signature* is what
-   makes passing borrowed storage to an extern safe at all, rather than a
-   promise about what the foreign code does.
+5. **An extern's return type is an ABI whitelist** — an integer, or
+   nothing (`extern.returns_storage`) — and it may not be generic
+   (`extern.generic`). Retained pointers, callbacks, and ownership transfer
+   to foreign code are out of scope for v1, and a signature that cannot
+   hand storage back is what makes passing borrowed storage to an extern
+   *reasonable* at all.
+
+   **Amended (ADR 0030), twice.** As first written this rule blacklisted
+   raw and resource returns, which named the storage *types* and missed the
+   container: a class may hold resource fields (ADR 0029), so returning one
+   returns storage by another route. It is a whitelist now, and everything
+   else — classes, options, arrays — waits until its ABI and its
+   ownership-transfer meaning are deliberately specified. And the sentence
+   this decision originally ended on ("rather than a promise about what the
+   foreign code does") claimed too much: see the amendment under
+   *Consequences*.
 
 6. **The manifest goes inside the hashed content, not beside it.** ADR
    0018's artifact hash is over the generated Lean bytes, and an artifact's
@@ -91,6 +101,11 @@ convention, it is the honesty of the output.
   is unchanged and so is the code; what changes is which side of the
   audited boundary the reasoning sits on. (Resource fields also made the
   premise "no storage-typed fields" false outright; see ADR 0029.)
+
+  Read decision 5 with this amendment: for a verified callee, "it cannot
+  hand storage back" is a fact about the language; for a foreign one it is
+  the audited contract's promise, and the whitelist is what keeps the
+  promise small enough to audit.
 - **`extern.generic` had to move from the checker to the parser.**
   Monomorphization drops an uninstantiated template before the checker sees
   it, and substitutes the parameters away on an instantiated one — leaving
