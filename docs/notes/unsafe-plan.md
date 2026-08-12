@@ -1982,6 +1982,25 @@ minimality comes from the invariant rather than from the concrete test. Only
 after that search proof is stable should allocation remove the chosen node and
 choose between whole-block leasing and a header-sized remainder split.
 
+**The U8f4 first-fit search is complete (2026-08-12, ADR 0048).**
+`free_list_first_fit` remains ordinary verified Sable policy: it extracts and
+reads each real header, restores the allocator view before branching, records
+every too-small node in a structural rejected-prefix witness, and returns the
+first fitting key or the root-length sentinel. Prefix steps explicitly exclude
+the sentinel, and a kernel-checked theorem proves that every prefix endpoint
+is a suffix of the original stored chain; this closes a pure-model loophole in
+which an unrelated sentinel entry could otherwise extend the trace. All 15
+obligations are proved with zero assumptions or deferrals. A dynamic two-node
+fixture checks both a head hit and a complete miss before restoring and
+releasing the exact root extent.
+
+Next separate selection from authority change. Define the smallest
+predecessor/head witness needed to unlink the selected header, and prove a
+sealed removal transition that preserves the residual chain. Then choose the
+whole-block versus split-remainder policy from explicit size arithmetic; do
+not let the search function manufacture a client lease or silently mutate
+links.
+
 Exit criteria:
 
 - allocation transfers exactly one disjoint region;

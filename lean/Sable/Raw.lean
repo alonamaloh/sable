@@ -834,6 +834,86 @@ theorem AllocatorView.StoredChain.prependAfterPut
     simp [freeHeaderBytes, u64.layout] at hsize
     omega
 
+/-- A runtime search has followed exactly these rejected header links from
+`start` to `current`. Each recorded node is stored at the key reached by the
+previous link and its actual size is smaller than the normalized request. -/
+inductive AllocatorView.RejectedPrefix
+    (v : AllocatorView) (limit need start : Int) : Int → Prop where
+  | nil : RejectedPrefix v limit need start start
+  | step {current size next : Int} {header : FreeHeaderView}
+      (trace : RejectedPrefix v limit need start current)
+      (notEnd : current ≠ limit)
+      (stored : v.storesHeader current header)
+      (fields : header.hasFields size next)
+      (rejected : size < need) :
+      RejectedPrefix v limit need start next
+
+theorem AllocatorView.storesHeader_unique
+    {v : AllocatorView} {key : Int} {left right : FreeHeaderView}
+    (hleft : v.storesHeader key left)
+    (hright : v.storesHeader key right) : left = right := by
+  exact Option.some.inj (hleft.1.symm.trans hright.1)
+
+/-- A rejected trace cannot leave the original sorted chain or step through
+its sentinel. This is the semantic link that makes the witness a genuine
+prefix rather than merely a sequence of entries from the same header map. -/
+theorem AllocatorView.RejectedPrefix.tail
+    {v : AllocatorView} {limit need start current : Int}
+    (chain : v.StoredChain limit start)
+    (trace : v.RejectedPrefix limit need start current) :
+    v.StoredChain limit current := by
+  induction trace with
+  | nil => exact chain
+  | @step previous size next header trace notEnd stored fields rejected ih =>
+      obtain ⟨chainHeader, chainSize, chainNext, chainStored, chainFields,
+          hfit, horder, hbound, tail⟩ := ih.step notEnd
+      have hheader : chainHeader = header :=
+        AllocatorView.storesHeader_unique chainStored stored
+      subst chainHeader
+      have hnext : chainNext = next := by
+        exact CellState.init.inj
+          (chainFields.2.symm.trans fields.2)
+      rw [← hnext]
+      exact tail
+
+/-- `result` is the first fitting node, or the sentinel after every reachable
+node was rejected. The original chain is retained explicitly so this remains
+a complete search specification rather than a trace through unrelated map
+entries. -/
+def AllocatorView.FirstFit
+    (v : AllocatorView) (limit start need result : Int) : Prop :=
+  v.StoredChain limit start ∧
+  v.RejectedPrefix limit need start result ∧
+  (result = limit ∨
+    ∃ header size next,
+      v.storesHeader result header ∧
+      header.hasFields size next ∧
+      need ≤ size)
+
+theorem AllocatorView.FirstFit.found
+    {v : AllocatorView} {limit start need result size next : Int}
+    {header : FreeHeaderView}
+    (chain : v.StoredChain limit start)
+    (trace : v.RejectedPrefix limit need start result)
+    (stored : v.storesHeader result header)
+    (fields : header.hasFields size next)
+    (fits : need ≤ size) :
+    v.FirstFit limit start need result := by
+  exact ⟨chain, trace, Or.inr ⟨header, size, next, stored, fields, fits⟩⟩
+
+theorem AllocatorView.FirstFit.notFound
+    {v : AllocatorView} {limit start need : Int}
+    (chain : v.StoredChain limit start)
+    (trace : v.RejectedPrefix limit need start limit) :
+    v.FirstFit limit start need limit := by
+  exact ⟨chain, trace, Or.inl rfl⟩
+
+theorem AllocatorView.FirstFit.resultChain
+    {v : AllocatorView} {limit start need result : Int}
+    (first : v.FirstFit limit start need result) :
+    v.StoredChain limit result := by
+  exact first.2.1.tail first.1
+
 @[simp] theorem FreeBlockView.split_joinable (v : FreeBlockView) (n : Int) :
     (v.prefix n).joinable (v.suffix n) := by
   simp [FreeBlockView.joinable, FreeBlockView.prefix, FreeBlockView.suffix]
