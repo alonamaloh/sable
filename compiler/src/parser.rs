@@ -1119,11 +1119,11 @@ impl<'a> Parser<'a> {
             })
     }
 
-    /// The currently admitted array/option payload grammar: concrete integer
-    /// types plus an in-scope declaration parameter. Unlike `int_ty`, this
-    /// preserves a parameter as `ValueTy::Param`, so later stages cannot infer
-    /// integer semantics from its representation. Bool and record payloads
-    /// remain a later G1 semantic slice.
+    /// The currently admitted array payload grammar: concrete integer types
+    /// plus an in-scope declaration parameter. Unlike `int_ty`, this preserves
+    /// a parameter as `ValueTy::Param`, so later stages cannot infer integer
+    /// semantics from its representation. Boolean and record arrays remain a
+    /// later G1 semantic slice.
     fn value_ty(&mut self) -> PResult<(ValueTy, Span)> {
         let (name, span) = self.ident()?;
         if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
@@ -1140,6 +1140,42 @@ impl<'a> Parser<'a> {
                 label: "expected `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter".into(),
                 notes: vec![],
             })
+    }
+
+    /// The first non-integer aggregate slice is deliberately option-specific:
+    /// integers and declaration parameters retain their existing behavior,
+    /// while `bool` gains a payload identity without also admitting `[bool]`
+    /// or `alloc_array<bool>`. Visible POD records are represented honestly so
+    /// the checker can reject them at its semantic boundary with a stable
+    /// diagnostic; classes and nested aggregates are not value payloads here.
+    fn option_value_ty(&mut self) -> PResult<(ValueTy, Span)> {
+        let (name, span) = self.ident()?;
+        if name == "bool" {
+            return Ok((ValueTy::Bool, span));
+        }
+        if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
+            let parameter = TypeParamId::new(index)
+                .expect("type_param_list enforces the type-parameter ceiling");
+            return Ok((ValueTy::Param(parameter), span));
+        }
+        if let Some(ty) = IntTy::from_name(&name) {
+            return Ok((ValueTy::Int(ty), span));
+        }
+        if let Some(record) = self
+            .record_names
+            .iter()
+            .position(|candidate| *candidate == name)
+        {
+            return Ok((ValueTy::Record(record), span));
+        }
+        Err(Diagnostic {
+            name: "parse.unknown_type".into(),
+            title: format!("unknown option payload type `{name}`"),
+            span,
+            label: "expected `bool`, `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter"
+                .into(),
+            notes: vec![],
+        })
     }
 
     /// `<T, U>` / `<K: Hashable, V>` after a declaration name.
@@ -1295,8 +1331,10 @@ impl<'a> Parser<'a> {
         Ok((Ty::Raw(elem), start.join(end)))
     }
 
-    /// The two option families currently admitted by the language:
-    /// integer options and nullable pointers to explicit records.
+    /// The option families currently admitted by the parser: integer/Boolean
+    /// value options (plus retained declaration parameters), and nullable
+    /// pointers to explicit records. POD record values reach the checker only
+    /// to receive the G1 semantic-boundary diagnostic.
     fn option_ty(&mut self) -> PResult<(Ty, Span)> {
         let (name, start) = self.ident()?;
         debug_assert_eq!(name, "option");
@@ -1320,7 +1358,7 @@ impl<'a> Parser<'a> {
                 }),
             };
         }
-        let (elem, _) = self.value_ty()?;
+        let (elem, _) = self.option_value_ty()?;
         let end = self.expect(Tok::Gt)?.span;
         Ok((Ty::Option(elem), start.join(end)))
     }
@@ -1689,14 +1727,20 @@ impl<'a> Parser<'a> {
                     });
                 }
                 Tok::Ident(n) => {
-                    // A class-typed field: the class owns the value
-                    // (dropped with it, in reverse declaration order).
-                    let ty = match self.class_names.iter().position(|c| *c == n) {
-                        Some(ci) => {
-                            self.bump();
-                            Ty::Class(ci)
+                    // Parse value-option fields honestly so the checker can
+                    // keep their storage boundary closed with a dedicated
+                    // diagnostic. A class-typed field owns its value (and is
+                    // dropped with it, in reverse declaration order).
+                    let ty = if n == "option" && self.peek2() == &Tok::Lt {
+                        self.option_ty()?.0
+                    } else {
+                        match self.class_names.iter().position(|c| *c == n) {
+                            Some(ci) => {
+                                self.bump();
+                                Ty::Class(ci)
+                            }
+                            None => self.scalar_ty()?.0,
                         }
-                        None => self.scalar_ty()?.0,
                     };
                     let (fname, fspan) = self.ident()?;
                     self.expect(Tok::Semi)?;
@@ -4734,6 +4778,68 @@ fn plumbing<T>(&[T] input, T value) -> option<T> {
             panic!("expected alloc_array initializer");
         };
         assert_eq!(*elem, ValueTy::Param(parameter));
+    }
+
+    #[test]
+    fn bool_options_parse_without_widening_array_payload_syntax() {
+        let source = r#"
+fn choose(i32 value) -> option<bool> {
+    mut option<bool> r = none;
+    r = some(value > 0);
+    return r;
+}
+"#;
+        let program = parse_source(source).unwrap();
+        let function = &program.fns[0];
+        assert_eq!(function.ret, Ty::Option(ValueTy::Bool));
+
+        let Stmt::Decl {
+            ty,
+            init: Some(initializer),
+            mutable,
+            ..
+        } = &function.body[0]
+        else {
+            panic!("expected the explicit option local");
+        };
+        assert_eq!(*ty, Ty::Option(ValueTy::Bool));
+        assert!(*mutable);
+        assert!(matches!(&initializer.kind, ExprKind::NoneE));
+
+        let Stmt::Assign { value, .. } = &function.body[1] else {
+            panic!("expected the contextual option assignment");
+        };
+        let ExprKind::SomeE(payload) = &value.kind else {
+            panic!("expected some(Boolean expression)");
+        };
+        assert!(matches!(
+            &payload.kind,
+            ExprKind::Binary { op: BinOp::Gt, .. }
+        ));
+
+        let array_error = parse_source("fn bad(&[bool] values) {}\n").unwrap_err();
+        assert_eq!(array_error.name, "parse.unknown_type");
+        assert!(array_error.title.contains("bool"));
+
+        let allocation_error =
+            parse_source("fn bad() { var values = alloc_array<bool>(1, false); }\n").unwrap_err();
+        assert_eq!(allocation_error.name, "parse.unknown_type");
+        assert!(allocation_error.title.contains("bool"));
+    }
+
+    #[test]
+    fn visible_record_option_payload_reaches_the_checker_boundary() {
+        let source = r#"
+record Pair #[layout(size := 1, align := 1)] {
+    #[offset(0)] u8 value;
+}
+
+fn unsupported() -> option<Pair> {
+    return none;
+}
+"#;
+        let program = parse_source(source).unwrap();
+        assert_eq!(program.fns[0].ret, Ty::Option(ValueTy::Record(0)));
     }
 
     #[test]

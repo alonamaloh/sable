@@ -134,7 +134,7 @@ G1.0 therefore makes both facts explicit:
 
 This amendment narrows the authorization described in decision 4; it does not
 widen ADR 0009's proof domain. Existing integer instances retain their behavior.
-The next semantic slice is `option<bool>`.
+G1.0 is closed; G1.1 is the first semantic widening built on this boundary.
 
 G1.0 is closed by
 `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
@@ -144,3 +144,37 @@ must-fail, 44 dynamic, 17 dynamic-fail) in 382.78s; LLVM CLI 6/6; the exact
 `VerifiedProgram` interpreter↔Clang differential at `-O0` and `-O2` 1/1; and
 SVM differential 69/69. The randomized allocator, grind-budget, LSP, and
 documentation gates were green.
+
+## G1.1 amendment: Boolean options do not widen concepts (2026-08-12)
+
+G1.1 implements a monomorphic `option<bool>` return-and-local slice while
+preserving ADR 0009's integer-only proof-reuse authorization. Ordinary
+functions and inherent class methods may return the type; explicit and inferred
+locals support contextual `some(bool-expression)`/`none`, assignment, calls
+returning the type, `.is_some`, and guarded `.value`. No Boolean type argument
+can acquire `ProofReuse::Adr0009IntModel`, and Boolean generic arguments remain
+rejected.
+
+VC generation models these values as Lean `Option Bool`. Because Sable's
+symbolic program booleans are propositions, `some(p)` crosses the boundary via
+an explicit `@decide p (Classical.propDecidable p)` term and Boolean `.value`
+crosses back as `o.value = true`. The interpreter and dynamic monitor retain a
+payload tag on absent values, so `Option.getD default` means `false` for a
+Boolean absence and `0` for an integer absence without changing the executable
+trap on absent access.
+
+This addition does not admit Boolean arrays or `alloc_array<bool>`, any
+option-typed parameter, option-valued class or record fields, trait or impl
+method option returns, record or nested option payloads, or generic Boolean
+instances. The formal SVM and LLVM emitter continue to reject `option<bool>`
+independently.
+
+G1.1's complete low-concurrency closure command was
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. It passed
+116/116 library tests; all 374 corpus subjects (80 verifies, 231 must-fail, 45
+dynamic, 18 dynamic-fail) in 409.31s; the focused `option_bool` verification at
+21/21 obligations across six functions and its dynamic subject at 1/1; LLVM CLI
+6/6; the exact `VerifiedProgram` interpreter↔Clang differential at `-O0` and
+`-O2` 1/1; and SVM differential 69/69. The randomized allocator,
+grind-budget, LSP, and documentation gates were green. G1.1 is closed.

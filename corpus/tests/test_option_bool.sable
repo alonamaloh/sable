@@ -1,0 +1,33 @@
+// Dynamic G1.1 checks pin `some(true)`, `some(false)`, typed `none`,
+// option equality, and Bool-valued `.value` in the contract monitor.
+
+use option_bool;
+
+/// post result = some(true)
+fn expect_true() -> option<bool> {
+    return sign_bit(7);
+}
+
+/// post result = some(false)
+fn expect_false() -> option<bool> {
+    return sign_bit(0);
+}
+
+/// post result = none
+fn expect_none() -> option<bool> {
+    return sign_bit(-1);
+}
+
+fn test_option_bool_values() {
+    expect_true();
+    expect_false();
+    expect_none();
+    positive_via_option(0);
+    positive_via_option(9);
+    inferred_positive_via_option(0);
+    inferred_positive_via_option(9);
+    assigned_sign_bit(-4);
+    assigned_sign_bit(4);
+    contextual_none_is_absent();
+    option_from_bool_field();
+}

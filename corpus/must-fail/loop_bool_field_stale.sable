@@ -1,0 +1,19 @@
+// expect-error: FlagLoop::make.post
+// A loop mutation of a Bool field must havoc the pre-loop symbolic value.
+// Retaining `false` here would prove this deliberately false constructor post.
+
+class FlagLoop {
+    bool flag;
+
+    /// post self.flag = false
+    init make(u64 n) {
+        self.flag = false;
+        mut u64 i = 0;
+        /// invariant i ≤ n
+        /// variant   n - i
+        while (i < n) {
+            self.flag = true;
+            i = i + 1;
+        }
+    }
+}

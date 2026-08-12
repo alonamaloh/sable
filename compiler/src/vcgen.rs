@@ -283,18 +283,17 @@ fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
 }
 
 /// Recover the abstract/concrete integer model used by the retained ADR 0009
-/// proof domain. G1.0 represents array/option payloads honestly, but the proof
-/// generator still only has semantics for integer payloads. Keep that boundary
-/// fail-closed so a future bool or POD-record value cannot silently be emitted
-/// as Lean `Int`.
+/// proof domain. Arrays still have integer-only proof semantics; options add a
+/// concrete Bool model in G1.1. Keep the integer boundary fail-closed so a POD
+/// record (or a future value kind) cannot silently be emitted as Lean `Int`.
 fn adr0009_int_model(ty: ValueTy) -> IntTy {
     ty.int_model().unwrap_or_else(|| match ty {
         ValueTy::Int(IntTy::TParam(_)) => {
             unreachable!("non-canonical legacy type parameter in a value type")
         }
-        ValueTy::Bool => unreachable!("G1.0 VC generation does not support bool payloads"),
+        ValueTy::Bool => unreachable!("bool is not an ADR 0009 integer model"),
         ValueTy::Record(_) => {
-            unreachable!("G1.0 VC generation does not support POD-record payloads")
+            unreachable!("G1.1 VC generation does not support POD-record payloads")
         }
         ValueTy::Int(_) | ValueTy::Param(_) => {
             unreachable!("ValueTy::int_model rejected an ADR 0009 integer model")
@@ -322,25 +321,53 @@ fn lean_array_ty(element: ValueTy) -> String {
 }
 
 fn lean_option_ty(element: ValueTy) -> String {
-    let _ = adr0009_int_model(element);
-    "Option Int".into()
+    match element {
+        ValueTy::Bool => "Option Bool".into(),
+        ValueTy::Int(_) | ValueTy::Param(_) => {
+            let _ = adr0009_int_model(element);
+            "Option Int".into()
+        }
+        ValueTy::Record(_) => {
+            unreachable!("VC preflight rejects POD-record option payloads")
+        }
+    }
 }
 
-fn validate_vc_value_ty(ty: ValueTy, allow_param: bool, context: &str) -> Result<(), String> {
+/// The symbolic evaluator carries source booleans as propositions. Whenever
+/// one crosses back into a source `Bool` position, use an explicit local
+/// decidability witness and parenthesize the complete application so it stays
+/// one argument inside constructors, structure updates, and substitutions.
+fn lean_bool_value(prop: &str) -> String {
+    format!("(@decide ({prop}) (Classical.propDecidable ({prop})))")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VcAggregateKind {
+    Array,
+    Option,
+}
+
+fn validate_vc_value_ty(
+    ty: ValueTy,
+    allow_param: bool,
+    aggregate: VcAggregateKind,
+    context: &str,
+) -> Result<(), String> {
     match ty {
         ValueTy::Int(IntTy::TParam(_)) => Err(format!(
-            "internal G1.0 VC type error: non-canonical legacy parameter in {context}"
+            "internal G1.1 VC type error: non-canonical legacy parameter in {context}"
         )),
         ValueTy::Int(_) => Ok(()),
         ValueTy::Param(_) if allow_param => Ok(()),
         ValueTy::Param(_) => Err(format!(
-            "internal G1.0 VC type error: type parameter escaped monomorphization in {context}"
+            "internal G1.1 VC type error: type parameter escaped monomorphization in {context}"
         )),
+        ValueTy::Bool if aggregate == VcAggregateKind::Option => Ok(()),
         ValueTy::Bool => Err(format!(
-            "internal G1.0 VC type error: bool payload reached {context} before bool proof semantics"
+            "internal G1.1 VC type error: bool array payload reached {context} before bool array proof semantics"
         )),
         ValueTy::Record(_) => Err(format!(
-            "internal G1.0 VC type error: POD-record payload reached {context} before record proof semantics"
+            "internal G1.1 VC type error: POD-record payload reached {context} before record proof semantics"
         )),
     }
 }
@@ -348,13 +375,16 @@ fn validate_vc_value_ty(ty: ValueTy, allow_param: bool, context: &str) -> Result
 fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
     match ty {
         Ty::Param(_) if !allow_param => Err(format!(
-            "internal G1.0 VC type error: type parameter escaped monomorphization in {context}"
+            "internal G1.1 VC type error: type parameter escaped monomorphization in {context}"
         )),
         Ty::Int(IntTy::TParam(_)) => Err(format!(
-            "internal G1.0 VC type error: non-canonical legacy scalar parameter in {context}"
+            "internal G1.1 VC type error: non-canonical legacy scalar parameter in {context}"
         )),
-        Ty::Array(element, _) | Ty::Option(element) => {
-            validate_vc_value_ty(element, allow_param, context)
+        Ty::Array(element, _) => {
+            validate_vc_value_ty(element, allow_param, VcAggregateKind::Array, context)
+        }
+        Ty::Option(element) => {
+            validate_vc_value_ty(element, allow_param, VcAggregateKind::Option, context)
         }
         Ty::Int(_)
         | Ty::Bool
@@ -404,7 +434,7 @@ fn validate_vc_expr(expr: &Expr, allow_param: bool, context: &str) -> Result<(),
         | ExprKind::SelfFieldIndex { index, .. }
         | ExprKind::ClassFieldIndex { index, .. } => validate_vc_expr(index, allow_param, context),
         ExprKind::AllocArray { elem, len, init } => {
-            validate_vc_value_ty(*elem, allow_param, context)?;
+            validate_vc_value_ty(*elem, allow_param, VcAggregateKind::Array, context)?;
             validate_vc_expr(len, allow_param, context)?;
             validate_vc_expr(init, allow_param, context)
         }
@@ -483,24 +513,77 @@ fn validate_vc_block(block: &[Stmt], allow_param: bool, context: &str) -> Result
     Ok(())
 }
 
-fn validate_vc_fn(function: &Fn, allow_param: bool, context: &str) -> Result<(), String> {
-    for parameter in &function.params {
-        validate_vc_ty(parameter.ty, allow_param, context)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VcTypePosition {
+    General,
+    Parameter,
+    TraitReturn,
+    ClassField,
+    RecordField,
+}
+
+fn validate_vc_type_position(
+    ty: Ty,
+    allow_param: bool,
+    position: VcTypePosition,
+    context: &str,
+) -> Result<(), String> {
+    // Validate the payload first. This keeps the unsupported POD-record model
+    // an independent fail-closed boundary even if the surrounding option is
+    // also in a position that the checked language currently forbids.
+    validate_vc_ty(ty, allow_param, context)?;
+    if !matches!(ty, Ty::Option(_)) {
+        return Ok(());
     }
-    validate_vc_ty(function.ret, allow_param, context)?;
+    let position = match position {
+        VcTypePosition::General => return Ok(()),
+        VcTypePosition::Parameter => "option parameters",
+        VcTypePosition::TraitReturn => "trait option returns",
+        VcTypePosition::ClassField => "option-valued class fields",
+        VcTypePosition::RecordField => "option-valued record fields",
+    };
+    Err(format!(
+        "internal G1.1 VC type error: {position} are not supported in {context}"
+    ))
+}
+
+fn validate_vc_fn(
+    function: &Fn,
+    allow_param: bool,
+    trait_signature: bool,
+    context: &str,
+) -> Result<(), String> {
+    for parameter in &function.params {
+        validate_vc_type_position(
+            parameter.ty,
+            allow_param,
+            VcTypePosition::Parameter,
+            context,
+        )?;
+    }
+    validate_vc_type_position(
+        function.ret,
+        allow_param,
+        if trait_signature {
+            VcTypePosition::TraitReturn
+        } else {
+            VcTypePosition::General
+        },
+        context,
+    )?;
     validate_vc_block(&function.body, allow_param, context)
 }
 
 fn validate_vc_class(class: &ClassDecl, allow_param: bool) -> Result<(), String> {
     let context = format!("class `{}`", class.name);
     for field in &class.fields {
-        validate_vc_ty(field.ty, allow_param, &context)?;
+        validate_vc_type_position(field.ty, allow_param, VcTypePosition::ClassField, &context)?;
     }
     for init in &class.inits {
-        validate_vc_fn(init, allow_param, &context)?;
+        validate_vc_fn(init, allow_param, false, &context)?;
     }
     for method in &class.methods {
-        validate_vc_fn(&method.f, allow_param, &context)?;
+        validate_vc_fn(&method.f, allow_param, false, &context)?;
     }
     if let Some(deinit) = &class.deinit {
         validate_vc_block(deinit, allow_param, &context)?;
@@ -510,10 +593,20 @@ fn validate_vc_class(class: &ClassDecl, allow_param: bool) -> Result<(), String>
 
 fn validate_vc_type_domain(program: &Program) -> Result<(), String> {
     for function in &program.fns {
-        validate_vc_fn(function, false, &format!("function `{}`", function.name))?;
+        validate_vc_fn(
+            function,
+            false,
+            false,
+            &format!("function `{}`", function.name),
+        )?;
     }
     for function in &program.fn_templates {
-        validate_vc_fn(function, true, &format!("template `{}`", function.name))?;
+        validate_vc_fn(
+            function,
+            true,
+            false,
+            &format!("template `{}`", function.name),
+        )?;
     }
     for class in &program.classes {
         validate_vc_class(class, false)?;
@@ -523,12 +616,17 @@ fn validate_vc_type_domain(program: &Program) -> Result<(), String> {
     }
     for record in &program.records {
         for field in &record.fields {
-            validate_vc_ty(field.ty, false, &format!("record `{}`", record.name))?;
+            validate_vc_type_position(
+                field.ty,
+                false,
+                VcTypePosition::RecordField,
+                &format!("record `{}`", record.name),
+            )?;
         }
     }
     for trait_decl in &program.traits {
         for method in &trait_decl.methods {
-            validate_vc_fn(method, true, &format!("trait `{}`", trait_decl.name))?;
+            validate_vc_fn(method, true, true, &format!("trait `{}`", trait_decl.name))?;
         }
     }
     for implementation in &program.impls {
@@ -536,6 +634,7 @@ fn validate_vc_type_domain(program: &Program) -> Result<(), String> {
             validate_vc_fn(
                 function,
                 false,
+                true,
                 &format!("impl `{}`", implementation.trait_name),
             )?;
         }
@@ -628,9 +727,7 @@ fn emit_extern_clause_wfs(
                 binders.push((p.name.clone(), lean_record_name(&program.records[ri].name)))
             }
             Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
-            Ty::Option(element) => {
-                let _ = adr0009_int_model(element);
-            }
+            Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
             Ty::Unit => {}
         }
     }
@@ -1191,9 +1288,7 @@ impl<'a> Generator<'a> {
                     match self.env.get(&format!("self.{}", fld.name)) {
                         Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s))
                         | Some(Val::View(s)) | Some(Val::Ptr(s)) => format!("{s}"),
-                        Some(Val::Prop(p)) => {
-                            format!("@decide ({p}) (Classical.propDecidable ({p}))")
-                        }
+                        Some(Val::Prop(p)) => lean_bool_value(p),
                         _ => "0".to_string(), // unreachable: checked init
                     }
                 })
@@ -1203,10 +1298,15 @@ impl<'a> Generator<'a> {
         let mut map = HashMap::new();
         map.insert("self".to_string(), literal.clone());
         for fld in &class.fields {
-            if let Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) | Some(Val::View(s))
-            | Some(Val::Ptr(s)) = self.env.get(&format!("self.{}", fld.name))
-            {
-                map.insert(fld.name.clone(), s.clone());
+            match self.env.get(&format!("self.{}", fld.name)) {
+                Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) | Some(Val::View(s))
+                | Some(Val::Ptr(s)) => {
+                    map.insert(fld.name.clone(), s.clone());
+                }
+                Some(Val::Prop(p)) => {
+                    map.insert(fld.name.clone(), lean_bool_value(p));
+                }
+                _ => {}
             }
         }
         (literal, map)
@@ -1262,10 +1362,7 @@ impl<'a> Generator<'a> {
                 }
                 Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
-                Ty::Option(element) => {
-                    let _ = adr0009_int_model(*element);
-                    None
-                }
+                Ty::Option(element) => Some((name.clone(), lean_option_ty(*element))),
                 Ty::Unit => None,
             })
             .collect();
@@ -1622,10 +1719,7 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
-                Ty::Option(element) => {
-                    let _ = adr0009_int_model(element);
-                    unreachable!("checked: no option parameters")
-                }
+                Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
                 Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
@@ -2119,9 +2213,7 @@ impl<'a> Generator<'a> {
                             | Val::Obj(s)
                             | Val::View(s)
                             | Val::Ptr(s) => s,
-                            Val::Prop(p) => {
-                                format!("@decide ({p}) (Classical.propDecidable ({p}))")
-                            }
+                            Val::Prop(p) => lean_bool_value(&p),
                             _ => unreachable!("checked: field value"),
                         };
                         let chain = self.self_chain();
@@ -2566,6 +2658,12 @@ impl<'a> Generator<'a> {
                                 );
                                 self.env.insert(key, Val::Int(b));
                             }
+                            (Ty::Bool, Some(Val::Prop(_))) => {
+                                self.fresh += 1;
+                                let b = format!("_self{}_{}", self.fresh, fld.name);
+                                self.binders.push((b.clone(), "Bool".into()));
+                                self.env.insert(key, Val::Prop(format!("({b} = true)")));
+                            }
                             _ => {}
                         }
                     }
@@ -2739,6 +2837,7 @@ impl<'a> Generator<'a> {
                 let value = format!("(({o}).value)");
                 match e.ty {
                     Some(Ty::RawRecord(_)) => Val::Ptr(value),
+                    Some(Ty::Bool) => Val::Prop(format!("({value} = true)")),
                     _ => Val::Int(value),
                 }
             }
@@ -2765,11 +2864,19 @@ impl<'a> Generator<'a> {
             ExprKind::SomeE(inner) => {
                 let value = match self.eval(inner) {
                     Val::Int(v) | Val::Ptr(v) => v,
+                    Val::Prop(p) => lean_bool_value(&p),
                     _ => unreachable!("checked: option payload"),
                 };
                 Val::Opt(format!("some ({value})"))
             }
-            ExprKind::NoneE => Val::Opt("none".into()),
+            ExprKind::NoneE => {
+                let ty = match e.ty {
+                    Some(Ty::Option(element)) => lean_option_ty(element),
+                    Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".into(),
+                    _ => unreachable!("checked: contextual none has an option type"),
+                };
+                Val::Opt(format!("(none : {ty})"))
+            }
             // The raw operations. Every one carries a *pointer-names-byte*
             // premise instead of a global provenance predicate: same
             // allocation, offset lands inside the span. The resource
@@ -4672,7 +4779,11 @@ impl<'a> Generator<'a> {
                 let Val::Obj(chain) = self.env[obj.as_str()].clone() else {
                     unreachable!("checked: class-typed receiver")
                 };
-                Val::Int(project_field(&chain, field))
+                let projected = project_field(&chain, field);
+                match e.ty {
+                    Some(Ty::Bool) => Val::Prop(format!("({projected} = true)")),
+                    _ => Val::Int(projected),
+                }
             }
             ExprKind::RecordField { obj, field, .. } => {
                 let Val::Record(record) = self.env[obj.as_str()].clone() else {
@@ -4733,6 +4844,7 @@ impl<'a> Generator<'a> {
                         Some(Ty::Class(_)) | Some(Ty::ClassRef(..)) => Val::Obj(projected),
                         Some(Ty::Raw(_)) => Val::Ptr(projected),
                         Some(Ty::Array(..)) => Val::Arr(projected),
+                        Some(Ty::Bool) => Val::Prop(format!("({projected} = true)")),
                         _ => Val::Int(projected),
                     }
                 }
@@ -4775,9 +4887,7 @@ impl<'a> Generator<'a> {
                         // Class args (by value or borrowed) substitute
                         // as their symbolic structure value (ADR 0020).
                         Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
-                        Val::Prop(p) => {
-                            format!("@decide ({p}) (Classical.propDecidable ({p}))")
-                        }
+                        Val::Prop(p) => lean_bool_value(&p),
                         _ => unreachable!("checked: ctor args"),
                     })
                     .collect();
@@ -5493,10 +5603,9 @@ impl<'a> Generator<'a> {
                 // must all remain well-typed). A parameter or havocked bool's
                 // canonical self mapping is already represented by its source
                 // binder and must stay untouched.
-                Val::Prop(p) if p != name && p != &format!("({name} = true)") => Some((
-                    name.clone(),
-                    format!("@decide ({p}) (Classical.propDecidable ({p}))"),
-                )),
+                Val::Prop(p) if p != name && p != &format!("({name} = true)") => {
+                    Some((name.clone(), lean_bool_value(p)))
+                }
                 _ => None,
             })
             .collect();
@@ -5630,9 +5739,7 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), lean_res_view_ty(k, self.records)));
                     }
                 }
-                Ty::Option(element) => {
-                    let _ = adr0009_int_model(element);
-                }
+                Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
                 Ty::Unit => {}
             }
         }
@@ -6381,18 +6488,47 @@ mod g1_type_domain_tests {
     }
 
     #[test]
-    fn g1_aggregate_payloads_fail_closed_before_semantics() {
-        let bool_error =
-            validate_vc_ty(Ty::Option(ValueTy::Bool), false, "unused ordinary function")
-                .expect_err("bool options are represented but not proved in G1.0");
-        assert!(bool_error.contains("bool payload"));
+    fn g1_1_bool_options_have_a_distinct_proof_model() {
+        assert_eq!(lean_option_ty(ValueTy::Bool), "Option Bool");
+        assert!(
+            validate_vc_ty(Ty::Option(ValueTy::Bool), false, "unused ordinary function").is_ok()
+        );
 
-        let record_error = validate_vc_ty(
-            Ty::Array(ValueTy::Record(0), Mutability::Shared),
+        let bool_array_error = validate_vc_ty(
+            Ty::Array(ValueTy::Bool, Mutability::Shared),
             false,
             "unused ordinary function",
         )
-        .expect_err("record arrays are represented but not proved in G1.0");
+        .expect_err("bool arrays do not acquire proof semantics with bool options");
+        assert!(bool_array_error.contains("bool array payload"));
+    }
+
+    #[test]
+    fn pod_record_payloads_still_fail_closed_independently() {
+        let record_error = validate_vc_ty(
+            Ty::Option(ValueTy::Record(0)),
+            false,
+            "unused ordinary function",
+        )
+        .expect_err("POD-record options are represented but not proved in G1.1");
         assert!(record_error.contains("POD-record payload"));
+    }
+
+    #[test]
+    fn unsupported_option_positions_fail_in_vc_preflight() {
+        for (position, expected) in [
+            (VcTypePosition::Parameter, "option parameters"),
+            (VcTypePosition::TraitReturn, "trait option returns"),
+            (VcTypePosition::ClassField, "option-valued class fields"),
+        ] {
+            let error = validate_vc_type_position(
+                Ty::Option(ValueTy::Bool),
+                false,
+                position,
+                "synthetic declaration",
+            )
+            .expect_err("unsupported option position must fail before VC generation");
+            assert!(error.contains(expected));
+        }
     }
 }

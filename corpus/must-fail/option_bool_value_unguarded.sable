@@ -1,0 +1,14 @@
+// expect-error: careless_bool.option
+
+fn maybe_bool(i32 x) -> option<bool> {
+    if (x > 0) {
+        return some(true);
+    }
+    return none;
+}
+
+/// post result
+fn careless_bool(i32 x) -> bool {
+    option<bool> r = maybe_bool(x);
+    return r.value;
+}

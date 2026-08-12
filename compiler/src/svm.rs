@@ -1041,8 +1041,15 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
                 .join(", ")
         ),
         RtVal::Ptr(a, o) => format!("ptr {a}+{o}"),
-        RtVal::Opt(None) => "opt none".into(),
-        RtVal::Opt(Some(n)) => format!("opt some {n}"),
+        RtVal::Opt { value: None, .. } => "opt none".into(),
+        RtVal::Opt {
+            value: Some(value), ..
+        } => match value.as_ref() {
+            // Preserve the established integer-option wire spelling while
+            // the formal machine remains integer-only in G1.1.
+            RtVal::Int(n) => format!("opt some {n}"),
+            value => format!("opt some {}", render_rt_val(program, value)),
+        },
         RtVal::PtrOpt(None) => "ptrOpt none".into(),
         RtVal::PtrOpt(Some((a, o))) => format!("ptrOpt some {a}+{o}"),
         RtVal::Record { record, fields } => {

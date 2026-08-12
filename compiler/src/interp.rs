@@ -19,7 +19,14 @@ pub enum RtVal {
     Int(i128),
     Bool(bool),
     Arr(Rc<RefCell<Vec<i128>>>),
-    Opt(Option<i128>),
+    /// An ordinary option. The checked payload type is retained even for
+    /// `none`, because the dynamic proof monitor must implement the typed
+    /// `Option.value = getD default` model (`0` for integers, `false` for
+    /// booleans) after a function returns.
+    Opt {
+        payload: ValueTy,
+        value: Option<Box<RtVal>>,
+    },
     PtrOpt(Option<(i128, i128)>),
     /// A POD record is a plain copyable value, distinct from an affine
     /// class object and its destructor-bearing field storage (ADR 0054).
@@ -86,11 +93,11 @@ type IResult<T> = Result<T, Trap>;
 
 const FUEL: u64 = 50_000_000;
 
-/// The interpreter still stores ordinary arrays and options as `i128`
-/// payloads.  G1 makes other payload kinds representable in the checked AST,
-/// so raw `Program` callers need the same explicit domain boundary as normal
-/// checked callers: a newly representable payload must not silently inherit
-/// the old integer runtime semantics.
+/// The interpreter still stores ordinary arrays as `i128` payloads; G1.1 adds
+/// typed recursive ordinary options for concrete integers and booleans. Raw
+/// `Program` callers need the same explicit domain boundary as normal checked
+/// callers: a newly representable payload must not silently inherit runtime
+/// semantics it has not implemented.
 fn validate_interp_program(program: &Program) -> Result<(), String> {
     // Retained generic templates are proof artifacts and are never executed by
     // the interpreter.  They intentionally contain `ValueTy::Param`; validate
@@ -101,7 +108,10 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 
     for class in &program.classes {
         for field in &class.fields {
-            validate_interp_ty(field.ty, &format!("field `{}.{}`", class.name, field.name))?;
+            validate_interp_nonlocal_option_position(
+                field.ty,
+                &format!("field `{}.{}`", class.name, field.name),
+            )?;
         }
         for init in &class.inits {
             validate_interp_fn(init)?;
@@ -116,7 +126,10 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 
     for record in &program.records {
         for field in &record.fields {
-            validate_interp_ty(field.ty, &format!("field `{}.{}`", record.name, field.name))?;
+            validate_interp_nonlocal_option_position(
+                field.ty,
+                &format!("field `{}.{}`", record.name, field.name),
+            )?;
         }
     }
 
@@ -125,16 +138,30 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 
 fn validate_interp_fn(function: &Fn) -> Result<(), String> {
     for param in &function.params {
-        validate_interp_ty(param.ty, &format!("parameter `{}`", param.name))?;
+        validate_interp_nonlocal_option_position(param.ty, &format!("parameter `{}`", param.name))?;
     }
     validate_interp_ty(function.ret, &format!("return type of `{}`", function.name))?;
     validate_interp_stmts(&function.body)
 }
 
+/// G1.1 gives ordinary value options local/return semantics only. Keep raw
+/// `Program` callers behind the same boundary as the checker: a parameter or
+/// stored class/record field must not acquire an accidental Option ABI merely
+/// because the interpreter knows how to execute a local `option<bool>`.
+fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(), String> {
+    if matches!(ty, Ty::Option(_)) {
+        return Err(format!(
+            "interp.option_position_unsupported: {context} is option-valued; \
+             G1.1 supports ordinary options only as returns and locals"
+        ));
+    }
+    validate_interp_ty(ty, context)
+}
+
 fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
-        Ty::Array(payload, _) => validate_interp_payload(payload, context, "array"),
-        Ty::Option(payload) => validate_interp_payload(payload, context, "option"),
+        Ty::Array(payload, _) => validate_interp_array_payload(payload, context),
+        Ty::Option(payload) => validate_interp_option_payload(payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "interp.type_parameter_unsupported: {context} contains an unresolved type parameter"
         )),
@@ -142,12 +169,24 @@ fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
     }
 }
 
-fn validate_interp_payload(payload: ValueTy, context: &str, aggregate: &str) -> Result<(), String> {
+fn validate_interp_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
     match payload {
         ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         _ => Err(format!(
-            "interp.aggregate_payload_unsupported: {context} has {aggregate} payload `{}`; \
+            "interp.aggregate_payload_unsupported: {context} has array payload `{}`; \
              the interpreter currently executes only concrete integer payloads",
+            payload.name()
+        )),
+    }
+}
+
+fn validate_interp_option_payload(payload: ValueTy, context: &str) -> Result<(), String> {
+    match payload {
+        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        ValueTy::Bool => Ok(()),
+        _ => Err(format!(
+            "interp.aggregate_payload_unsupported: {context} has option payload `{}`; \
+             the interpreter currently executes only concrete integer and Boolean option payloads",
             payload.name()
         )),
     }
@@ -241,7 +280,7 @@ fn validate_interp_expr(expr: &Expr) -> Result<(), String> {
             validate_interp_expr(index)?;
         }
         ExprKind::AllocArray { elem, len, init } => {
-            validate_interp_payload(*elem, "alloc_array", "array")?;
+            validate_interp_array_payload(*elem, "alloc_array")?;
             validate_interp_expr(len)?;
             validate_interp_expr(init)?;
         }
@@ -2374,14 +2413,16 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Int(arr[idx as usize]))
             }
             ExprKind::IsSome { operand } => match self.eval(operand, frame)? {
-                RtVal::Opt(o) => Ok(RtVal::Bool(o.is_some())),
+                RtVal::Opt { value, .. } => Ok(RtVal::Bool(value.is_some())),
                 RtVal::PtrOpt(o) => Ok(RtVal::Bool(o.is_some())),
                 _ => unreachable!("checked: option operand"),
             },
             ExprKind::OptValue { operand } => match self.eval(operand, frame)? {
-                RtVal::Opt(Some(v)) => Ok(RtVal::Int(v)),
+                RtVal::Opt {
+                    value: Some(value), ..
+                } => Ok(*value),
                 RtVal::PtrOpt(Some((a, o))) => Ok(RtVal::Ptr(a, o)),
-                RtVal::Opt(None) | RtVal::PtrOpt(None) => Err(Trap {
+                RtVal::Opt { value: None, .. } | RtVal::PtrOpt(None) => Err(Trap {
                     undef: false,
                     message: "`.value` of an empty option".into(),
                     span: e.span,
@@ -2450,9 +2491,12 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Int(v))
             }
             ExprKind::SomeE(inner) => match e.ty {
-                Some(Ty::Option(_)) => {
-                    let v = self.eval_int(inner, frame)?;
-                    Ok(RtVal::Opt(Some(v)))
+                Some(Ty::Option(payload)) => {
+                    let value = self.eval(inner, frame)?;
+                    Ok(RtVal::Opt {
+                        payload,
+                        value: Some(Box::new(value)),
+                    })
                 }
                 Some(Ty::OptionRaw(_)) => {
                     let RtVal::Ptr(a, o) = self.eval(inner, frame)? else {
@@ -2463,7 +2507,10 @@ impl<'a> Interp<'a> {
                 _ => unreachable!("checked: option construction"),
             },
             ExprKind::NoneE => match e.ty {
-                Some(Ty::Option(_)) => Ok(RtVal::Opt(None)),
+                Some(Ty::Option(payload)) => Ok(RtVal::Opt {
+                    payload,
+                    value: None,
+                }),
                 Some(Ty::OptionRaw(_)) => Ok(RtVal::PtrOpt(None)),
                 _ => unreachable!("checked: option construction"),
             },
@@ -2726,6 +2773,10 @@ impl<'a> Interp<'a> {
 fn deep_copy(v: &RtVal) -> RtVal {
     match v {
         RtVal::Arr(a) => RtVal::Arr(Rc::new(RefCell::new(a.borrow().clone()))),
+        RtVal::Opt { payload, value } => RtVal::Opt {
+            payload: *payload,
+            value: value.as_deref().map(deep_copy).map(Box::new),
+        },
         RtVal::Obj { class, fields } => RtVal::Obj {
             class: *class,
             fields: Rc::new(RefCell::new(
@@ -2752,7 +2803,13 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
         RtVal::Int(n) => SpecVal::Int(*n),
         RtVal::Bool(b) => SpecVal::Bool(*b),
         RtVal::Arr(a) => SpecVal::Arr(a.borrow().clone()),
-        RtVal::Opt(o) => SpecVal::Opt(*o),
+        RtVal::Opt { payload, value } => SpecVal::Opt {
+            payload: Some(*payload),
+            value: match value {
+                Some(value) => Some(Box::new(spec_of(value)?)),
+                None => None,
+            },
+        },
         RtVal::PtrOpt(_) => return None,
         RtVal::Obj { fields, .. } => SpecVal::Obj(
             fields
@@ -2852,10 +2909,37 @@ mod g1_payload_guard_tests {
         expr(ExprKind::IntLit(value), Some(Ty::Int(IntTy::U64)))
     }
 
+    fn eval_with_empty_runtime(expression: &Expr) -> Result<RtVal, String> {
+        let fns: HashMap<&str, &Fn> = HashMap::new();
+        let classes: Vec<ClassDecl> = Vec::new();
+        let records: Vec<RecordDecl> = Vec::new();
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut interpreter = Interp {
+            fns: &fns,
+            classes: &classes,
+            records: &records,
+            ghosts: &ghosts,
+            source: "",
+            fuel: FUEL,
+            skipped: Vec::new(),
+            raw: RawHeap::default(),
+            world: None,
+            uart: None,
+        };
+        let mut frame = Frame {
+            vars: HashMap::new(),
+            entry_scalars: HashMap::new(),
+            olds: HashMap::new(),
+            self_ctx: None,
+        };
+        interpreter
+            .eval(expression, &mut frame)
+            .map_err(|trap| trap.message)
+    }
+
     #[test]
-    fn rejects_every_non_integer_option_payload() {
+    fn rejects_option_payloads_without_g1_runtime_semantics() {
         let unsupported = [
-            ValueTy::Bool,
             ValueTy::Record(0),
             ValueTy::Param(TypeParamId::from_legacy(0)),
             ValueTy::Int(IntTy::TParam(0)),
@@ -2867,12 +2951,110 @@ mod g1_payload_guard_tests {
                 .fns
                 .push(function("subject", Ty::Option(payload), Vec::new()));
             let error = validate_interp_program(&program)
-                .expect_err("a non-integer option must not inherit i128 execution");
+                .expect_err("an unsupported option payload must fail closed");
             assert!(
                 error.starts_with("interp.aggregate_payload_unsupported:"),
                 "{payload:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn permits_boolean_options_but_not_boolean_arrays() {
+        let mut program = empty_program();
+        program.fns.push(function(
+            "subject",
+            Ty::Option(ValueTy::Bool),
+            vec![Stmt::Return {
+                value: Some(expr(
+                    ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool)))),
+                    Some(Ty::Option(ValueTy::Bool)),
+                )),
+                span: Span::new(0, 0),
+            }],
+        ));
+
+        validate_interp_program(&program).expect("Boolean options have G1.1 runtime semantics");
+        assert!(
+            validate_interp_ty(Ty::Array(ValueTy::Bool, Mutability::Owned), "Boolean array")
+                .unwrap_err()
+                .contains("only concrete integer payloads")
+        );
+    }
+
+    #[test]
+    fn option_parameters_and_stored_fields_remain_outside_g1_1() {
+        for context in ["parameter `value`", "field `Box.value`"] {
+            let error =
+                validate_interp_nonlocal_option_position(Ty::Option(ValueTy::Bool), context)
+                    .expect_err("G1.1 must not introduce an option parameter/field ABI");
+            assert!(error.starts_with("interp.option_position_unsupported:"));
+        }
+    }
+
+    #[test]
+    fn boolean_option_construction_access_and_empty_trap_are_typed() {
+        let some_false = expr(
+            ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool)))),
+            Some(Ty::Option(ValueTy::Bool)),
+        );
+        let is_some = expr(
+            ExprKind::IsSome {
+                operand: Box::new(some_false.clone()),
+            },
+            Some(Ty::Bool),
+        );
+        let value = expr(
+            ExprKind::OptValue {
+                operand: Box::new(some_false),
+            },
+            Some(Ty::Bool),
+        );
+
+        assert!(matches!(
+            eval_with_empty_runtime(&is_some),
+            Ok(RtVal::Bool(true))
+        ));
+        assert!(matches!(
+            eval_with_empty_runtime(&value),
+            Ok(RtVal::Bool(false))
+        ));
+
+        let none = expr(ExprKind::NoneE, Some(Ty::Option(ValueTy::Bool)));
+        let runtime_none = eval_with_empty_runtime(&none).unwrap();
+        assert_eq!(
+            spec_of(&runtime_none),
+            Some(SpecVal::Opt {
+                payload: Some(ValueTy::Bool),
+                value: None,
+            })
+        );
+        let empty_value = expr(
+            ExprKind::OptValue {
+                operand: Box::new(none),
+            },
+            Some(Ty::Bool),
+        );
+        assert_eq!(
+            eval_with_empty_runtime(&empty_value).unwrap_err(),
+            "`.value` of an empty option"
+        );
+    }
+
+    #[test]
+    fn deep_copy_recurses_through_present_options() {
+        let original = RtVal::Opt {
+            payload: ValueTy::Bool,
+            value: Some(Box::new(RtVal::Bool(false))),
+        };
+        let copied = deep_copy(&original);
+        assert!(matches!(
+            copied,
+            RtVal::Opt {
+                payload: ValueTy::Bool,
+                value: Some(value),
+            } if matches!(*value, RtVal::Bool(false))
+        ));
     }
 
     #[test]

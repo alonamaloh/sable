@@ -1,0 +1,75 @@
+// G1.1: Bool is the first non-integer option payload.  The surface is
+// deliberately narrow: returns, locals, contextual construction,
+// assignment, and guarded accessor-style consumption.
+
+/// post result.is_some ↔ x ≥ 0
+/// post result.is_some → (result.value = true ↔ x > 0)
+pub fn sign_bit(i32 x) -> option<bool> {
+    if (x < 0) {
+        return none;
+    }
+    if (x == 0) {
+        return some(false);
+    }
+    return some(true);
+}
+
+/// pre  x ≥ 0
+/// post result ↔ x > 0
+pub fn positive_via_option(i32 x) -> bool {
+    option<bool> r = sign_bit(x);
+    if (r.is_some) {
+        return r.value;
+    }
+    return false;
+}
+
+/// pre  x ≥ 0
+/// post result ↔ x > 0
+pub fn inferred_positive_via_option(i32 x) -> bool {
+    var r = sign_bit(x);
+    if (r.is_some) {
+        return r.value;
+    }
+    return false;
+}
+
+/// post result.is_some
+/// post result.value = true ↔ x > 0
+pub fn assigned_sign_bit(i32 x) -> option<bool> {
+    mut option<bool> r = none;
+    if (x > 0) {
+        r = some(true);
+    } else {
+        r = some(false);
+    }
+    return r;
+}
+
+/// post ¬result
+pub fn contextual_none_is_absent() -> bool {
+    option<bool> r = none;
+    return r.is_some;
+}
+
+pub class BoolOptionBox {
+    bool flag;
+
+    /// invariant flag = true
+
+    /// post self.flag = true
+    init yes() {
+        self.flag = true;
+    }
+
+    /// post result = some false
+    fn negated(&self) -> option<bool> {
+        return some(!self.flag);
+    }
+}
+
+/// post result = some false
+pub fn option_from_bool_field() -> option<bool> {
+    var box = BoolOptionBox::yes();
+    return box.negated();
+}

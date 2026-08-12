@@ -12,7 +12,7 @@
 //! `match result with | some i => .. | none => ..` idiom, and
 //! `Sable.Seq.perm` (checked as multiset equality).
 
-use crate::ast::{GhostItem, IntTy};
+use crate::ast::{GhostItem, IntTy, ValueTy};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,7 +20,15 @@ pub enum SpecVal {
     Int(i128),
     Bool(bool),
     Arr(Vec<i128>),
-    Opt(Option<i128>),
+    /// An ordinary option's proof value. Program-derived options retain their
+    /// checked payload type even when absent, because `Option.value` is
+    /// `getD default` in Lean: the junk value is `0` for integers and `false`
+    /// for booleans. Clause literals are polymorphic and therefore carry no
+    /// payload metadata until a surrounding program value supplies it.
+    Opt {
+        payload: Option<ValueTy>,
+        value: Option<Box<SpecVal>>,
+    },
     /// A class value: field name → value.
     Obj(HashMap<String, SpecVal>),
 }
@@ -495,6 +503,13 @@ impl P {
             T::Ident(name) => match name.as_str() {
                 "True" => S::True,
                 "False" => S::False,
+                // Lean's proposition literals are capitalized, while values
+                // of program type `bool` use the lowercase constructors.
+                // Both are represented by `SpecVal::Bool`; their surrounding
+                // expression determines whether a proposition or Bool value
+                // was intended.
+                "true" => S::True,
+                "false" => S::False,
                 "none" => S::NoneLit,
                 "match" => return self.match_opt(),
                 "if" => return self.ite(),
@@ -769,12 +784,20 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             ))
         }
         S::IsSomeE(x) => match eval(x, env, depth + 1)? {
-            SpecVal::Opt(o) => Ok(SpecVal::Bool(o.is_some())),
+            SpecVal::Opt { value, .. } => Ok(SpecVal::Bool(value.is_some())),
             _ => Err(Unmonitorable("`.is_some` on a non-option".into())),
         },
         S::OptValE(x) => match eval(x, env, depth + 1)? {
-            // Junk-on-none matches the model (Option.getD 0).
-            SpecVal::Opt(o) => Ok(SpecVal::Int(o.unwrap_or(0))),
+            SpecVal::Opt {
+                value: Some(value), ..
+            } => Ok(*value),
+            // Junk-on-none matches the typed Lean model (`Option.getD
+            // default`). Keeping the payload type on an absent program value
+            // is what distinguishes integer zero from Boolean false here.
+            SpecVal::Opt {
+                payload,
+                value: None,
+            } => option_default(payload),
             _ => Err(Unmonitorable("`.value` on a non-option".into())),
         },
         S::Ite(c, a, b) => {
@@ -836,10 +859,23 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             })
         }
         S::Quant { forall, vars, body } => eval_quant(*forall, vars, body, env, depth),
-        S::NoneLit => Ok(SpecVal::Opt(None)),
+        S::NoneLit => Ok(SpecVal::Opt {
+            payload: None,
+            value: None,
+        }),
         S::SomeLit(inner) => {
-            let v = int(eval(inner, env, depth + 1)?)?;
-            Ok(SpecVal::Opt(Some(v)))
+            let value = eval(inner, env, depth + 1)?;
+            let payload = match &value {
+                SpecVal::Bool(_) => Some(ValueTy::Bool),
+                // The proof language erases fixed integer widths to `Int`, so
+                // a standalone `some(1)` has no honest `IntTy` metadata. It
+                // does not need one while present; `.value` returns the value.
+                _ => None,
+            };
+            Ok(SpecVal::Opt {
+                payload,
+                value: Some(Box::new(value)),
+            })
         }
         S::App(name, args) => {
             let base = name.rsplit('.').next().unwrap_or(name);
@@ -919,9 +955,11 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             some_body,
             none_body,
         } => match eval(scrutinee, env, depth + 1)? {
-            SpecVal::Opt(Some(v)) => {
+            SpecVal::Opt {
+                value: Some(value), ..
+            } => {
                 let mut inner_vars = env.vars.clone();
-                inner_vars.insert(some_var.clone(), SpecVal::Int(v));
+                inner_vars.insert(some_var.clone(), *value);
                 let inner = SpecEnv {
                     vars: inner_vars,
                     olds: env.olds.clone(),
@@ -929,7 +967,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                 };
                 eval(some_body, &inner, depth + 1)
             }
-            SpecVal::Opt(None) => eval(none_body, env, depth + 1),
+            SpecVal::Opt { value: None, .. } => eval(none_body, env, depth + 1),
             _ => Err(Unmonitorable("`match` scrutinee is not an option".into())),
         },
     }
@@ -1064,11 +1102,32 @@ fn closed_int(s: &S, env: &SpecEnv, depth: u32) -> EResult<i128> {
     int(eval(s, env, depth + 1)?)
 }
 
+fn option_default(payload: Option<ValueTy>) -> EResult<SpecVal> {
+    match payload {
+        Some(ValueTy::Int(_)) => Ok(SpecVal::Int(0)),
+        Some(ValueTy::Bool) => Ok(SpecVal::Bool(false)),
+        Some(ValueTy::Record(_)) => Err(Unmonitorable(
+            "the monitor has no default value for a POD-record option".into(),
+        )),
+        Some(ValueTy::Param(_)) => Err(Unmonitorable(
+            "an unresolved option payload reached the dynamic monitor".into(),
+        )),
+        None => Err(Unmonitorable(
+            "cannot determine the payload type of `none.value`".into(),
+        )),
+    }
+}
+
 fn spec_eq(a: &SpecVal, b: &SpecVal) -> Option<bool> {
     match (a, b) {
-        (SpecVal::Opt(x), SpecVal::Opt(y)) => Some(x == y),
-        (SpecVal::Arr(x), SpecVal::Arr(y)) => Some(x == y),
+        (SpecVal::Int(x), SpecVal::Int(y)) => Some(x == y),
         (SpecVal::Bool(x), SpecVal::Bool(y)) => Some(x == y),
+        (SpecVal::Arr(x), SpecVal::Arr(y)) => Some(x == y),
+        (SpecVal::Opt { value: x, .. }, SpecVal::Opt { value: y, .. }) => match (x, y) {
+            (None, None) => Some(true),
+            (Some(_), None) | (None, Some(_)) => Some(false),
+            (Some(x), Some(y)) => spec_eq(x, y),
+        },
         (SpecVal::Obj(x), SpecVal::Obj(y)) => Some(x == y),
         _ => None,
     }
@@ -1111,5 +1170,74 @@ fn array(v: SpecVal) -> EResult<Vec<i128>> {
     match v {
         SpecVal::Arr(a) => Ok(a),
         _ => Err(Unmonitorable("expected a sequence value".into())),
+    }
+}
+
+#[cfg(test)]
+mod g1_option_monitor_tests {
+    use super::*;
+
+    fn option(payload: ValueTy, value: Option<SpecVal>) -> SpecVal {
+        SpecVal::Opt {
+            payload: Some(payload),
+            value: value.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn typed_none_uses_the_lean_default_for_its_payload() {
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut vars = HashMap::new();
+        vars.insert("integer".into(), option(ValueTy::Int(IntTy::I32), None));
+        vars.insert(
+            "integer_some".into(),
+            option(ValueTy::Int(IntTy::I32), Some(SpecVal::Int(7))),
+        );
+        vars.insert("boolean".into(), option(ValueTy::Bool, None));
+        let env = SpecEnv {
+            vars,
+            olds: HashMap::new(),
+            ghosts: &ghosts,
+        };
+
+        assert!(eval_clause("integer.value = 0", &env).unwrap());
+        assert!(eval_clause("integer_some = some(7)", &env).unwrap());
+        assert!(eval_clause("boolean.value = false", &env).unwrap());
+        assert!(eval_clause("boolean = none", &env).unwrap());
+        assert!(!eval_clause("boolean.is_some", &env).unwrap());
+    }
+
+    #[test]
+    fn boolean_some_literals_access_and_match_without_integer_coercion() {
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut vars = HashMap::new();
+        vars.insert(
+            "o".into(),
+            option(ValueTy::Bool, Some(SpecVal::Bool(false))),
+        );
+        let env = SpecEnv {
+            vars,
+            olds: HashMap::new(),
+            ghosts: &ghosts,
+        };
+
+        assert!(eval_clause("o = some(false)", &env).unwrap());
+        assert!(eval_clause("o.value = false", &env).unwrap());
+        assert!(eval_clause("match o with | some b => b = false | none => False", &env).unwrap());
+    }
+
+    #[test]
+    fn unsupported_absent_payload_defaults_fail_closed() {
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut vars = HashMap::new();
+        vars.insert("record_option".into(), option(ValueTy::Record(0), None));
+        let env = SpecEnv {
+            vars,
+            olds: HashMap::new(),
+            ghosts: &ghosts,
+        };
+
+        let error = eval_clause("record_option.value = 0", &env).unwrap_err();
+        assert!(error.0.contains("no default value for a POD-record option"));
     }
 }

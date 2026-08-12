@@ -783,15 +783,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     notes: vec![],
                 });
             }
-            if matches!(p.ty, Ty::Option(_)) {
-                return Err(Diagnostic {
-                    name: "type.option_param".into(),
-                    title: "option-typed parameters are not supported yet".into(),
-                    span: p.span,
-                    label: "`option<T>` is a return type for now".into(),
-                    notes: vec![],
-                });
-            }
             ctx.vars.insert(
                 p.name.clone(),
                 VarInfo {
@@ -2074,7 +2065,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
-                let elem_ty = aggregate_payload_ty(elem, *array_span)?;
+                let elem_ty = array_payload_ty(elem, *array_span)?;
                 if elem_ty != Ty::Int(IntTy::U8) {
                     return Err(Diagnostic {
                         name: "expose.element_type".into(),
@@ -2294,7 +2285,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 };
                 ctx.require_field_init(field, *field_span)?;
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(aggregate_payload_ty(elem, *field_span)?))?;
+                check_expr(ctx, value, Some(array_payload_ty(elem, *field_span)?))?;
             }
             Stmt::Store {
                 array,
@@ -2354,7 +2345,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     return Err(moved_out(ctx, &place, *array_span, "store"));
                 }
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(aggregate_payload_ty(elem, *array_span)?))?;
+                check_expr(ctx, value, Some(array_payload_ty(elem, *array_span)?))?;
             }
         }
     }
@@ -2405,36 +2396,63 @@ fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
     }
 }
 
-/// The checked value type represented by an aggregate payload.
-///
-/// G1.0 gives bool and POD-record payloads an honest AST representation
-/// before their runtime and proof models exist. Any operation that reads,
-/// writes, or constructs such a payload therefore fails closed at this one
-/// boundary. A retained template parameter remains an abstract integer value
-/// for ADR 0009 without being encoded as `IntTy`.
-fn aggregate_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
+fn noncanonical_aggregate_payload(span: Span) -> Diagnostic {
+    Diagnostic {
+        name: "type.aggregate_payload_noncanonical".into(),
+        title: "legacy integer type-parameter storage is not valid in an aggregate".into(),
+        span,
+        label: "aggregate parameters must use the explicit declaration-parameter form".into(),
+        notes: vec![],
+    }
+}
+
+/// Arrays retain the ADR 0009 integer domain. G1.1 must not gain Boolean
+/// arrays merely because options now have a Boolean payload model.
+fn array_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
     match payload {
-        ValueTy::Int(IntTy::TParam(_)) => Err(Diagnostic {
-            name: "type.aggregate_payload_noncanonical".into(),
-            title: "legacy integer type-parameter storage is not valid in an aggregate".into(),
-            span,
-            label: "aggregate parameters must use the explicit declaration-parameter form".into(),
-            notes: vec![],
-        }),
+        ValueTy::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
         ValueTy::Int(integer) => Ok(Ty::Int(integer)),
         ValueTy::Param(parameter) => Ok(Ty::Param(parameter)),
         ValueTy::Bool | ValueTy::Record(_) => Err(Diagnostic {
-            name: "type.aggregate_payload_unsupported".into(),
+            name: "type.array_payload_unsupported".into(),
             title: format!(
-                "aggregate payload type `{}` is not supported yet",
+                "array payload type `{}` is not supported yet",
                 payload.name()
             ),
             span,
-            label: "array and option operations currently require an integer payload".into(),
+            label: "array operations currently require an integer payload".into(),
             notes: vec![(
                 "note".into(),
                 "the AST records this type without granting runtime or proof semantics; \
-                 enable those layers together before accepting the operation"
+                 enable array checking, proof, and execution together before accepting it"
+                    .into(),
+            )],
+        }),
+    }
+}
+
+/// G1.1's first concrete non-integer aggregate: options may contain Boolean
+/// values, while POD records remain behind their later representation,
+/// ownership, proof, and runtime slice. Retained declaration parameters keep
+/// the existing ADR 0009 abstract-integer semantics.
+fn option_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
+    match payload {
+        ValueTy::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
+        ValueTy::Int(integer) => Ok(Ty::Int(integer)),
+        ValueTy::Param(parameter) => Ok(Ty::Param(parameter)),
+        ValueTy::Bool => Ok(Ty::Bool),
+        ValueTy::Record(_) => Err(Diagnostic {
+            name: "type.option_payload_unsupported".into(),
+            title: format!(
+                "option payload type `{}` is not supported yet",
+                payload.name()
+            ),
+            span,
+            label: "value options currently hold integers or `bool`".into(),
+            notes: vec![(
+                "note".into(),
+                "POD record options need their representation, proof, and runtime semantics \
+                 enabled together"
                     .into(),
             )],
         }),
@@ -2443,9 +2461,8 @@ fn aggregate_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
 
 fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
     match ty {
-        Ty::Array(payload, _) | Ty::Option(payload) => {
-            aggregate_payload_ty(payload, span).map(|_| ())
-        }
+        Ty::Array(payload, _) => array_payload_ty(payload, span).map(|_| ()),
+        Ty::Option(payload) => option_payload_ty(payload, span).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -2454,8 +2471,53 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     fn function(function: &Fn) -> CResult<()> {
         for parameter in &function.params {
             validate_aggregate_ty(parameter.ty, parameter.span)?;
+            if matches!(parameter.ty, Ty::Option(_)) {
+                return Err(Diagnostic {
+                    name: "type.option_param".into(),
+                    title: "option-typed parameters are not supported yet".into(),
+                    span: parameter.span,
+                    label: "`option<T>` is a return type or local for now".into(),
+                    notes: vec![],
+                });
+            }
         }
         validate_aggregate_ty(function.ret, function.name_span)
+    }
+
+    fn class_field(field: &Field) -> CResult<()> {
+        validate_aggregate_ty(field.ty, field.span)?;
+        if matches!(field.ty, Ty::Option(_)) {
+            return Err(Diagnostic {
+                name: "type.option_field".into(),
+                title: "option-valued class fields are not supported yet".into(),
+                span: field.span,
+                label: "G1.1 keeps `option<T>` in returns and locals".into(),
+                notes: vec![(
+                    "note".into(),
+                    "field storage must land together with aggregate ownership and lowering".into(),
+                )],
+            });
+        }
+        Ok(())
+    }
+
+    fn trait_method(method: &Fn) -> CResult<()> {
+        function(method)?;
+        if matches!(method.ret, Ty::Option(_)) {
+            return Err(Diagnostic {
+                name: "type.trait_option_return".into(),
+                title: "trait methods may not return value options yet".into(),
+                span: method.name_span,
+                label: "trait calls retain the ADR 0009 integer proof domain".into(),
+                notes: vec![(
+                    "note".into(),
+                    "ordinary functions and class methods may return `option<bool>`; trait \
+                     proof reuse needs a separate widening decision"
+                        .into(),
+                )],
+            });
+        }
+        Ok(())
     }
 
     for function_ in program.fns.iter().chain(&program.fn_templates) {
@@ -2463,7 +2525,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     }
     for class in program.classes.iter().chain(&program.class_templates) {
         for field in &class.fields {
-            validate_aggregate_ty(field.ty, field.span)?;
+            class_field(field)?;
         }
         for initializer in &class.inits {
             function(initializer)?;
@@ -2479,7 +2541,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     }
     for trait_ in &program.traits {
         for method in &trait_.methods {
-            function(method)?;
+            trait_method(method)?;
         }
     }
     for implementation in &program.impls {
@@ -2689,7 +2751,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         } => {
             let elem = array_elem_ty(ctx, array, *array_span)?;
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            aggregate_payload_ty(elem, *array_span)?
+            array_payload_ty(elem, *array_span)?
         }
         ExprKind::Len { array } => {
             // `a.len` on a class receiver is the FIELD named `len`
@@ -2810,7 +2872,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             Ty::Bool
         }
         ExprKind::OptValue { operand } => match check_expr(ctx, operand, None)? {
-            Ty::Option(payload) => aggregate_payload_ty(payload, span)?,
+            Ty::Option(payload) => option_payload_ty(payload, span)?,
             Ty::OptionRaw(ri) => Ty::RawRecord(ri),
             other => {
                 return Err(Diagnostic {
@@ -2957,7 +3019,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
             };
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            aggregate_payload_ty(elem, span)?
+            array_payload_ty(elem, span)?
         }
         ExprKind::TraitCall {
             param,
@@ -3534,7 +3596,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::AllocArray { elem, len, init } => {
             let elem = *elem;
             check_expr(ctx, len, Some(Ty::Int(IntTy::U64)))?;
-            check_expr(ctx, init, Some(aggregate_payload_ty(elem, span)?))?;
+            check_expr(ctx, init, Some(array_payload_ty(elem, span)?))?;
             Ty::Array(elem, Mutability::Owned)
         }
         ExprKind::SelfField { field } => {
@@ -3584,7 +3646,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ctx.require_field_init(field, span)?;
             }
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            aggregate_payload_ty(elem, span)?
+            array_payload_ty(elem, span)?
         }
         ExprKind::CtorCall {
             class,
@@ -3803,7 +3865,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::ArrayLit(elems) => match expected {
             Some(Ty::Array(t, Mutability::Owned)) => {
-                let element_ty = aggregate_payload_ty(t, span)?;
+                let element_ty = array_payload_ty(t, span)?;
                 for el in elems {
                     check_expr(ctx, el, Some(element_ty))?;
                 }
@@ -4059,7 +4121,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::SomeE(inner) => match expected {
             Some(Ty::Option(t)) => {
-                check_expr(ctx, inner, Some(aggregate_payload_ty(t, span)?))?;
+                check_expr(ctx, inner, Some(option_payload_ty(t, span)?))?;
                 Ty::Option(t)
             }
             Some(Ty::OptionRaw(ri)) => {
@@ -5269,7 +5331,7 @@ fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<ValueTy> {
             ty: Ty::Array(t, _),
             ..
         }) => {
-            aggregate_payload_ty(*t, span)?;
+            array_payload_ty(*t, span)?;
             Ok(*t)
         }
         Some(v) => Err(Diagnostic {
@@ -5383,4 +5445,145 @@ fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod g1_bool_option_tests {
+    use super::*;
+    use crate::span::LineMap;
+
+    fn parse_program(source: &str) -> Program {
+        let scanned = crate::scan::scan(source);
+        let tokens = crate::lexer::lex(&scanned.program_text).expect("test source should lex");
+        crate::parser::parse(
+            &tokens,
+            &scanned.blocks,
+            &LineMap::new(source),
+            &scanned.program_text,
+        )
+        .expect("test source should parse")
+    }
+
+    fn monomorphized_program(source: &str) -> Program {
+        let mut program = parse_program(source);
+        crate::mono::monomorphize(&mut program).expect("test source should monomorphize");
+        program
+    }
+
+    #[test]
+    fn bool_options_work_in_the_narrow_return_local_and_accessor_surface() {
+        let mut program = monomorphized_program(
+            r#"
+fn choose(i32 value) -> option<bool> {
+    if (value > 0) {
+        return some(true);
+    }
+    return none;
+}
+
+fn forward(i32 value) -> option<bool> {
+    option<bool> r = choose(value);
+    return r;
+}
+
+fn consume(i32 value) -> bool {
+    mut option<bool> r = choose(value);
+    r = none;
+    r = some(value > 0);
+    if (r.is_some) {
+        return r.value;
+    }
+    return false;
+}
+"#,
+        );
+
+        check(&mut program).expect("the complete narrow option<bool> surface should typecheck");
+        assert_eq!(program.fns[0].ret, Ty::Option(ValueTy::Bool));
+        assert_eq!(program.fns[1].ret, Ty::Option(ValueTy::Bool));
+
+        let Stmt::If { then_block, .. } = &program.fns[2].body[3] else {
+            panic!("expected the accessor guard");
+        };
+        let Stmt::Return {
+            value: Some(value), ..
+        } = &then_block[0]
+        else {
+            panic!("expected the guarded payload return");
+        };
+        assert_eq!(value.ty, Some(Ty::Bool));
+    }
+
+    #[test]
+    fn array_and_record_payloads_remain_outside_the_bool_option_slice() {
+        assert_eq!(
+            option_payload_ty(ValueTy::Bool, Span::new(0, 1)).unwrap(),
+            Ty::Bool
+        );
+        let array = array_payload_ty(ValueTy::Bool, Span::new(0, 1)).unwrap_err();
+        assert_eq!(array.name, "type.array_payload_unsupported");
+
+        let record = option_payload_ty(ValueTy::Record(0), Span::new(0, 1)).unwrap_err();
+        assert_eq!(record.name, "type.option_payload_unsupported");
+    }
+
+    #[test]
+    fn option_parameters_fields_and_trait_returns_stay_closed() {
+        let mut parameter = monomorphized_program("fn bad(option<bool> value) {}\n");
+        let error = match check(&mut parameter) {
+            Err(error) => error,
+            Ok(_) => panic!("option parameters remain unsupported"),
+        };
+        assert_eq!(error.name, "type.option_param");
+
+        let mut field = monomorphized_program(
+            r#"
+class Holder {
+    option<bool> value;
+
+    init new() {
+        self.value = none;
+    }
+}
+"#,
+        );
+        let error = match check(&mut field) {
+            Err(error) => error,
+            Ok(_) => panic!("option class fields remain unsupported"),
+        };
+        assert_eq!(error.name, "type.option_field");
+
+        let mut trait_program = parse_program(
+            r#"
+trait Flag {
+    fn flag(Self value) -> option<bool>;
+}
+"#,
+        );
+        let error = match check(&mut trait_program) {
+            Err(error) => error,
+            Ok(_) => panic!("trait option returns remain unsupported"),
+        };
+        assert_eq!(error.name, "type.trait_option_return");
+    }
+
+    #[test]
+    fn visible_record_option_is_rejected_at_the_checker_boundary() {
+        let mut program = monomorphized_program(
+            r#"
+record Pair #[layout(size := 1, align := 1)] {
+    #[offset(0)] u8 value;
+}
+
+fn unsupported() -> option<Pair> {
+    return none;
+}
+"#,
+        );
+        let error = match check(&mut program) {
+            Err(error) => error,
+            Ok(_) => panic!("POD option values remain unsupported"),
+        };
+        assert_eq!(error.name, "type.option_payload_unsupported");
+    }
 }

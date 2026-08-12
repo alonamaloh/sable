@@ -1,10 +1,10 @@
 /-
 Sable prelude: option accessors (ADR 0008). The program language
 consumes options C++-style — `r.is_some` / `r.value` — never by pattern
-matching. `value` is junk-on-none (getD 0), mirroring `Seq.get`'s
-junk-off-range convention: a someness VC keeps verified code away from
-the junk, and `sable test` traps there. The same dot-notation works in
-clause text, so specs can be written accessor-style too
+matching. `value` is junk-on-none (`getD default`, hence `false` for Bool),
+mirroring `Seq.get`'s junk-off-range convention: a someness VC keeps
+verified code away from the junk, and `sable test` traps there. The same
+dot-notation works in clause text, so specs can be written accessor-style too
 (`result.is_some → result.value = 7`).
 -/
 

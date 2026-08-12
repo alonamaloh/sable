@@ -78,7 +78,11 @@ typecheck (compiler/src/check.rs)     types, call graph, and one flow-sensitive
   │                                   contracted call)
   ▼
 vcgen (compiler/src/vcgen.rs)         forward symbolic execution over the AST;
-  │                                   values are Lean `Int` expression strings;
+  │                                   integer values are Lean `Int` strings and
+  │                                   program booleans are symbolic propositions;
+  │                                   G1.1 stores Boolean options as `Option Bool`,
+  │                                   using explicit Prop↔Bool bridges at packing
+  │                                   and extraction rather than conflating models;
   │                                   path-splitting at `if`; per-operation VCs;
   │                                   call sites: callee pres become obligations,
   │                                   callee posts become hypotheses on a fresh symbol;
@@ -203,13 +207,13 @@ this completed scalar boundary and are future M46+ work.
   cannot route a hand-built program around that check. VCgen skips instance
   obligations only when the exact variant is present. This prevents a later
   Boolean or record instance from silently inheriting a theorem proved over
-  `Sable.IntModel`. The checker and VCgen independently reject non-integer
-  aggregate payloads; the interpreter and SVM repeat the fail-closed guard at
-  their own execution/lowering boundaries. Module visibility also descends
-  through `ValueTy::Record`, so a nominal payload cannot bypass a restrictive
-  import. G1.0 therefore changes representation and invariants, not the
-  accepted language: Boolean/POD arrays and options remain unusable, and
-  existing integer behavior is preserved.
+  `Sable.IntModel`. At this checkpoint the checker and VCgen independently
+  rejected non-integer aggregate payloads; the interpreter and SVM repeated the
+  fail-closed guard at their own execution/lowering boundaries. Module
+  visibility also descended through `ValueTy::Record`, so a nominal payload
+  could not bypass a restrictive import. G1.0 therefore changed representation
+  and invariants, not the accepted language: Boolean/POD arrays and options
+  remained unusable, and existing integer behavior was preserved.
 
   G1.0 is closed by the complete low-concurrency command
   `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
@@ -218,7 +222,39 @@ this completed scalar boundary and are future M46+ work.
   must-fail, 44 dynamic, 17 dynamic-fail) in 382.78s; LLVM CLI 6/6; the exact
   verified-program interpreter↔Clang differential at `-O0` and `-O2` 1/1;
   and SVM differential 69/69. Randomized allocator, grind-budget, LSP, and
-  documentation gates were green. The next semantic slice is `option<bool>`.
+  documentation gates were green. G1.0 is closed.
+- **The first Boolean aggregate slice is deliberately local and
+  independently fenced.** G1.1 admits `option<bool>` returns on ordinary
+  functions and inherent class methods, plus explicit and inferred locals,
+  contextual `some(bool-expression)` and `none`, assignment, calls returning
+  the type, `.is_some`, and `.value` on a path that proves someness. It does not
+  admit option-typed parameters, option-valued class or record fields, trait or
+  impl method option returns, Boolean arrays or `alloc_array<bool>`, record or
+  nested option payloads, or Boolean generic arguments. These position fences
+  are checked before execution as well as at the individual checker/VC
+  boundaries.
+
+  VCgen gives the feature its real Lean type, `Option Bool`. Sable program
+  booleans are represented symbolically as propositions, so constructing
+  `some(p)` uses an explicit `@decide p (Classical.propDecidable p)` term;
+  extracting an option payload returns the proposition `o.value = true`.
+  Neither direction silently treats a `Prop` as a `Bool`. The Rust interpreter
+  and dynamic specification monitor carry the checked payload type inside an
+  option value even when it is absent. Consequently the logical junk value is
+  Lean's payload-specific `default` (`0` for integers and `false` for `Bool`),
+  while executable unguarded access still traps.
+
+  The formal SVM and LLVM emitter remain separate fail-closed consumers and
+  reject Boolean options; carrying this exact feature through those boundaries
+  is G1.2 and G1.3. G1.1's complete low-concurrency closure command was
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+  SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. It
+  passed 116/116 library tests; all 374 corpus subjects (80 verifies, 231
+  must-fail, 45 dynamic, 18 dynamic-fail) in 409.31s; the focused `option_bool`
+  verification at 21/21 obligations across six functions and its dynamic
+  subject at 1/1; LLVM CLI 6/6; the exact `VerifiedProgram` interpreter↔Clang
+  differential at `-O0` and `-O2` 1/1; and SVM differential 69/69. Randomized
+  allocator, grind-budget, LSP, and documentation gates were green. G1.1 is closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

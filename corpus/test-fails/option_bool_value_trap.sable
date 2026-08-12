@@ -1,0 +1,10 @@
+// expect-test-failure: `.value` of an empty option
+
+fn no_bool() -> option<bool> {
+    return none;
+}
+
+fn test_bool_value_of_none() {
+    option<bool> r = no_bool();
+    bool v = r.value;
+}

@@ -702,11 +702,11 @@ working hypothesis, not a promise that evidence cannot reorder it:
 
      **G1.0 — representation and proof provenance (complete):** declaration
      parameters now use `Ty::Param(TypeParamId)`, and
-     aggregate payloads use `ValueTy::{Int, Bool, Record, Param}`. This is an
+     aggregate payloads use `ValueTy::{Int, Bool, Record, Param}`. This was an
      internal separation of concerns, not a usable Boolean/POD feature: parser
-     and checker acceptance is not widened, and concrete Boolean/record arrays
-     and options remain fail-closed. Mono validates every declaration parameter
-     id before direct-index substitution, rejects noncanonical legacy parameter
+     and checker acceptance was not widened, and concrete Boolean/record arrays
+     and options remained fail-closed. Mono validates every declaration
+     parameter id before direct-index substitution, rejects noncanonical legacy parameter
      forms, and exhaustively checks afterward that ordinary declarations contain
      no parameter. Retained ADR 0009 templates intentionally remain abstract.
 
@@ -716,10 +716,11 @@ working hypothesis, not a promise that evidence cannot reorder it:
      can inspect but cannot forge it. Mono rejects a caller-supplied marker and
      authors it only for instances licensed by the existing concrete-integer
      domain; VCgen recognizes only that exact variant. The preparation and
-     VC-generation entry points are crate-private as well. Checker and VCgen
-     reject Boolean/POD aggregate semantics independently, the interpreter and
-     SVM repeat the fail-closed guard, and module visibility follows nominal
-     records carried inside aggregate payloads. Existing integer programs keep
+     VC-generation entry points are crate-private as well. At that checkpoint,
+     checker and VCgen rejected Boolean/POD aggregate semantics independently,
+     the interpreter and SVM repeated the fail-closed guard, and module
+     visibility followed nominal records carried inside aggregate payloads.
+     Existing integer programs keep
      their previous semantics.
 
      The complete low-concurrency closure command was
@@ -732,8 +733,42 @@ working hypothesis, not a promise that evidence cannot reorder it:
      Randomized allocator, grind-budget, LSP, and documentation gates were
      green. G1.0 is closed.
 
-     **Next slice — `option<bool>`:** add one complete non-integer vertical path
-     without weakening any of G1.0's independent rejection boundaries.
+     **G1.1 — verified/interpreted `option<bool>` (complete):** ordinary
+     functions and inherent class methods may
+     return `option<bool>`. Explicit and inferred locals support contextual
+     `some(bool-expression)` and `none`, assignment, calls returning the type,
+     `.is_some`, and `.value` where the path proves someness. VC generation uses
+     Lean `Option Bool`; because Sable's symbolic program booleans are
+     propositions, packing uses an explicit decidable Prop-to-`Bool` term and
+     extraction produces `o.value = true`. The interpreter and dynamic monitor
+     retain the payload type on present and absent values, preserving Lean's
+     typed `default` (`0` for integer options, `false` for Boolean options)
+     without weakening the executable trap on absent `.value`.
+
+     This slice does not admit Boolean arrays or `alloc_array<bool>`, any
+     option-typed parameter, option-valued class or record fields, trait or impl
+     method option returns, record or nested option payloads, or Boolean generic
+     type arguments. The formal SVM and LLVM emitter independently reject the
+     new type.
+
+     The complete low-concurrency closure command was
+     `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. It passed 116/116 library tests; all 374
+     corpus subjects (80 verifies, 231 must-fail, 45 dynamic, 18 dynamic-fail)
+     in 409.31s; the focused `option_bool` verification at 21/21 obligations
+     across six functions and its dynamic subject at 1/1; LLVM CLI 6/6; the
+     exact `VerifiedProgram` interpreter↔Clang differential at `-O0` and `-O2`
+     1/1; and SVM differential 69/69. Randomized allocator, grind-budget, LSP,
+     and documentation gates were green. G1.1 is closed.
+
+     **G1.2 — formal SVM Boolean options (next):** extend the relational and
+     executable machine models together, prove their agreement, and add the
+     interpreter/SVM differential before removing the lowering rejection.
+
+     **G1.3 — LLVM Boolean options:** lower the same checked value as a tagged
+     option with an explicit absent-value trap path, then close native `-O0` and
+     `-O2` differentials before broadening aggregate payloads.
    - **G2 — affine options:** carry ownership and destruction correctly through
      present/absent aggregate values.
    - **G3 — slots and `Vec`:** make generic element storage and movement real
