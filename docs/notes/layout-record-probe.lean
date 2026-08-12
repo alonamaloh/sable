@@ -50,6 +50,72 @@ theorem fields_disjoint :
 
 end Pair64
 
+/-! ## The U9 node instance
+
+`Option RawPtr` is an abstract nullable pointer value here. Giving it the
+target pointer layout does not give it a byte encoding: in particular, this
+probe does not identify `none` with any sequence of bytes or permit a raw byte
+load from an occupied node extent.
+-/
+
+structure IntrusiveNode where
+  previous : Option RawPtr
+  next : Option RawPtr
+  payload : Int
+
+namespace IntrusiveNode
+
+def rawPointerLayout : Layout := ⟨8, 8⟩
+def nullableRawPointerLayout : Layout := rawPointerLayout
+def layout : Layout := ⟨24, 8⟩
+
+def previousOffset : Int := 0
+def nextOffset : Int := 8
+def payloadOffset : Int := 16
+
+theorem rawPointerLayout_wf : rawPointerLayout.wf := by
+  refine ⟨by decide, by decide, ⟨3, rfl⟩⟩
+
+theorem nullableRawPointerLayout_wf : nullableRawPointerLayout.wf := by
+  exact rawPointerLayout_wf
+
+theorem layout_wf : layout.wf := by
+  refine ⟨by decide, by decide, ⟨3, rfl⟩⟩
+
+theorem previous_fits :
+    Pair64.fieldFits layout nullableRawPointerLayout previousOffset := by
+  simp [Pair64.fieldFits, layout, nullableRawPointerLayout, rawPointerLayout,
+    previousOffset]
+
+theorem next_fits :
+    Pair64.fieldFits layout nullableRawPointerLayout nextOffset := by
+  simp [Pair64.fieldFits, layout, nullableRawPointerLayout, rawPointerLayout,
+    nextOffset]
+
+theorem payload_fits :
+    Pair64.fieldFits layout u64.layout payloadOffset := by
+  simp [Pair64.fieldFits, layout, payloadOffset, Sable.u64.layout]
+
+theorem previous_next_disjoint :
+    Pair64.fieldsDisjoint nullableRawPointerLayout previousOffset
+      nullableRawPointerLayout nextOffset := by
+  simp [Pair64.fieldsDisjoint, nullableRawPointerLayout, rawPointerLayout,
+    previousOffset, nextOffset]
+
+theorem previous_payload_disjoint :
+    Pair64.fieldsDisjoint nullableRawPointerLayout previousOffset
+      u64.layout payloadOffset := by
+  simp [Pair64.fieldsDisjoint, nullableRawPointerLayout, rawPointerLayout,
+    previousOffset, payloadOffset, Sable.u64.layout]
+
+theorem next_payload_disjoint :
+    Pair64.fieldsDisjoint nullableRawPointerLayout nextOffset
+      u64.layout payloadOffset := by
+  simp [Pair64.fieldsDisjoint, nullableRawPointerLayout, rawPointerLayout,
+    nextOffset, payloadOffset, Sable.u64.layout]
+
+end IntrusiveNode
+
 /-- Candidate pure view invariant for `PointsTo<Pair64>`. The value ranges are
 type facts, not representation facts. -/
 def wfPair64 (v : PointsToView Pair64) : Prop :=
@@ -79,6 +145,35 @@ theorem init_preserves_layout (v : PointsToView Pair64) (x : Pair64) :
     (v.put x).layout = v.layout := rfl
 
 theorem take_preserves_layout (v : PointsToView Pair64) :
+    v.clear.layout = v.layout := rfl
+
+def wfIntrusiveNode (v : PointsToView IntrusiveNode) : Prop :=
+  v.layout = IntrusiveNode.layout ∧
+  0 ≤ v.off ∧ v.off % v.layout.align = 0 ∧
+  match v.state with
+  | .uninit => True
+  | .init node => 0 ≤ node.payload ∧ node.payload ≤ u64.max
+
+def toIntrusiveNode (v : SpanView) : PointsToView IntrusiveNode :=
+  { alloc := v.alloc, off := v.off, layout := IntrusiveNode.layout,
+    state := .uninit }
+
+def intrusiveNodeToSpan (v : PointsToView IntrusiveNode) : SpanView :=
+  { alloc := v.alloc, off := v.off, len := v.layout.size,
+    bytes := ⟨v.layout.size, fun _ => .init 0⟩ }
+
+@[simp] theorem toIntrusiveNode_layout (v : SpanView) :
+    (toIntrusiveNode v).layout = IntrusiveNode.layout := rfl
+
+@[simp] theorem intrusiveNodeToSpan_len (v : PointsToView IntrusiveNode) :
+    (intrusiveNodeToSpan v).len = v.layout.size := rfl
+
+theorem intrusiveNode_init_preserves_layout
+    (v : PointsToView IntrusiveNode) (node : IntrusiveNode) :
+    (v.put node).layout = v.layout := rfl
+
+theorem intrusiveNode_take_preserves_layout
+    (v : PointsToView IntrusiveNode) :
     v.clear.layout = v.layout := rfl
 
 example (raw : SpanView)
