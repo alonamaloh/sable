@@ -111,7 +111,9 @@ fn subst_stmts(
             | Stmt::StaticAlloc { size: e, .. }
             | Stmt::SystemAlloc { size: e, .. }
             | Stmt::Return { value: Some(e), .. } => subst_expr(e, values),
-            Stmt::SystemDealloc { ptr, res, release, .. } => {
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
                 subst_expr(ptr, values);
                 subst_expr(res, values);
                 subst_expr(release, values);
@@ -163,7 +165,9 @@ fn subst_expr(e: &mut Expr, values: &HashMap<String, i128>) {
                 e.kind = ExprKind::IntLit(*v);
             }
         }
-        ExprKind::ResOp { args, .. } | ExprKind::RawOp { args, .. } => {
+        ExprKind::ResOp { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. } => {
             for a in args {
                 subst_expr(a, values);
             }

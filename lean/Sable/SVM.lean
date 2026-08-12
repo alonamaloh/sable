@@ -497,6 +497,16 @@ inductive Stmt where
   | rawCellReadRecord (tag : Int) (dst : String) (p : Expr)
   | rawCellTakeRecord (tag : Int) (dst : String) (p : Expr)
   | rawCellDropRecord (tag : Int) (p : Expr)
+  /-- Test-only selection of the scripted UART profile. The unprofiled
+  core gives this statement `undef`; `Sable.SVMUart` supplies its
+  profile-specific meaning without changing `Config`. -/
+  | testUartProfile (script : Expr)
+  /-- Read the selected UART status register into `dst`. As with every
+  machine-profile operation, the unprofiled core meaning is `undef`. -/
+  | uartStatus (dst : String)
+  /-- Write one byte to the selected UART transmitter. The unprofiled
+  core meaning is `undef`. -/
+  | uartWrite (value : Expr)
 
 /-! ## Environments
 
@@ -1451,6 +1461,17 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort ab)) :
       Step P cap (.run (.rawCellDropRecord tag e :: k) ρ σ μ) ab.toConfig
+  -- Machine-profile operations have no meaning in the unprofiled core.
+  -- A selected profile must intercept them before delegating to `Step`.
+  | testUartProfile_undef {ρ : Env} {script : Expr}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap} :
+      Step P cap (.run (.testUartProfile script :: k) ρ σ μ) .undef
+  | uartStatus_undef {ρ : Env} {dst : String}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap} :
+      Step P cap (.run (.uartStatus dst :: k) ρ σ μ) .undef
+  | uartWrite_undef {ρ : Env} {value : Expr}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap} :
+      Step P cap (.run (.uartWrite value :: k) ρ σ μ) .undef
   -- fall off the end of a body: return unit
   | nil_ret {ρ : Env} {μ : RawHeap} :
       Step P cap (.run [] ρ [] μ) (.done .unit)

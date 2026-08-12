@@ -1,0 +1,12 @@
+// expect-error: borrow.conflict
+// A trait call obeys the same no-alias rule as an ordinary call: its
+// abstract contract cannot frame two arguments as distinct when one is a
+// mutable borrow of the very same resource view.
+
+trait SpanOps {
+    fn both(resource &mut RawSpan a, resource &RawSpan b) -> u64;
+}
+
+fn generic_both<K: SpanOps>(resource &mut RawSpan span) -> u64 {
+    return K::both(&mut span, &span);
+}

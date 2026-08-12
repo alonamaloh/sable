@@ -1,4 +1,6 @@
-// expect-skip: Sable.AllocatorView.StoredChain state limit 0
+// expect-skip: base.alloc = state.root.alloc ∧ base.off = 0
+// expect-skip: Sable.AllocatorView.StoredChain state limit head
+// expect-skip: state = old state
 // expect-skip: Sable.AllocatorView.StoredChain state limit current
 
 use free_list_walk;

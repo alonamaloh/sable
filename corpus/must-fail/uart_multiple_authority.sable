@@ -1,0 +1,4 @@
+// expect-error: uart.multiple_authority
+
+fn two_uarts(resource &mut Uart first, resource &mut Uart second) {
+}

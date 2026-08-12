@@ -12,3 +12,6 @@ import Sable.Specs
 import Sable.SVM
 import Sable.SVMEval
 import Sable.SVMRawTests
+import Sable.MMIO
+import Sable.SVMUart
+import Sable.SVMUartTests

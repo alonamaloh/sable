@@ -1,0 +1,33 @@
+// expect-test-failure: loop variant did not decrease (0 → 0)
+// The measure is a loop-head expression. The condition temporarily sets it
+// to 3, 2, then 1, while the body restores it to 0 at every backedge. A
+// post-condition sampler sees a decreasing sequence and accepts; the actual
+// head-to-head transition is 0 → 0 and must fail immediately.
+
+class DynamicVariantState {
+    u64 step;
+    u64 measure;
+
+    init zero() {
+        self.step = 0;
+        self.measure = 0;
+    }
+
+    fn prepare(&mut self) -> bool {
+        self.measure = 3 - self.step;
+        return self.step < 3;
+    }
+
+    fn finish(&mut self) {
+        self.measure = 0;
+        self.step = self.step + 1;
+    }
+}
+
+fn test_variant_uses_pre_condition_head() {
+    var mut state = DynamicVariantState::zero();
+    /// variant state.measure
+    while (state.prepare()) {
+        state.finish();
+    }
+}

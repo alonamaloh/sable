@@ -2,6 +2,15 @@
 
 Original north star for v0.1 — **verify `binary_search` and insertion sort end-to-end, with no hand-waving** — was reached 2026-08-08/09; the corpus now also carries fully-specified quicksort, the merge kernel, and round-trip codecs. Current state: **Tier 1 complete** (`Vec`/generics M7, traits/hash map M8) and **the Tier 2 spine landed** — UTF-8 codec + buffer validation (M9), JSON tokenizer (M10), option accessors (M11, ADR 0008), and the JSON parser against the full recursive grammar (M12 layer 1, 270 obligations). The scaling work landed (concepts M13, class values M14, `#[label]`), and the **bignum arithmetic pillar is complete through division and gcd**: `Nat` cmp/add/sub, schoolbook multiplication, `div`/`rem`, and Euclid's `gcd` (proven against Lean's own `Int.gcd`) all verified against one-line `natVal` specs (M15–M16) — the first benchmark where the mathematics itself was the test, and it stayed pleasant. **The roadmap's boss fight is won (M24): `div` is Knuth's Algorithm D with the `qhat_bound` lemma discharged and load-bearing**, and `Integer` (M27) is the first type built on top of a verified class — signed arithmetic whose `/` and `%` are literally Lean's, which is what ADR 0004 bought. The SVM semantic-oracle track landed on the core subset: determinism, totality, and rule/evaluator agreement are kernel-checked theorems, and the differential harness (`interp.rs` vs the Lean evaluator) runs in `cargo test` (ADR 0017). Verification is separate per module (M23, ADR 0018): imports verify once into content-addressed artifacts instead of being re-proven per importer. Ownership is now keyed by places rather than by names (M28, ADR 0023), which brought local-to-local class moves and `&mut C` — and, on the way, three soundness bugs in the borrow and loop-havoc rules. On that engine, **resources are a real category in the compiler** (M29, ADR 0024): affine authority the checker tracks, a pure view the logic reads, and nothing at all at runtime. The raw-memory direction has passed its first go/no-go (M30, ADR 0026): a safe `copy_prefix` over raw pointers verifies from a three-line value-level contract, with no user-visible heap logic anywhere. Foreign contracts are audited rather than proved (M31, ADR 0027), and the build status says `verified relative to audited boundary` instead of pretending otherwise. Non-memory resources and an explicit `PosixWorld` follow (M32, ADR 0028): a foreign function that can reach outside has to say so in its signature. Destructors then run bodies and classes own authority (M33, ADR 0029), which invalidated two earlier arguments and closed the hole the second one left. Ownership transfer is then one operation used by every sink (M34, ADR 0030) — a move kills its source place and destroys what the destination held, wherever it is written — which is what made the remaining duplicate-authority and double-drop paths one fix instead of six.
 
+The unsafe ladder is complete through M44, and **unsafe Sable v1 has reached a
+defensible stopping point**. Typed POD records and an arena-backed intrusive
+list sit on generic aggregate authority; the core SVM is triangulated against
+the Rust interpreter; and the formal `uart-poll-v1` profile adds an affine UART
+capability, checked device intrinsics, observable trace semantics, and a bounded
+verified transmit driver. Broader U10 work—generic MMIO, production
+provisioning, richer UART/ISA models, concurrency, DMA, and atomics—is
+deliberately deferred rather than required before the usability roadmap.
+
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
 ## Milestones
@@ -201,7 +210,7 @@ Driven by the authoring-experience review after the bignum pillar (LLM-reported 
 
 ### M23 — separate verification (modules slice 2) *(2026-08-10, ADR 0018)*
 
-One content-addressed Lean artifact per module (`.sable-out/modules/<stem>_<hash>.{lean,olean,ok}`): an imported module's obligations verify once and importers consume them through Lean's own `import` — `sable check string.sable` dropped 27.6s → 2.0s (utf8's 205 obligations imported, not re-proven); cold full corpus 164s → 130s. The hash covers generated content plus the prelude, and import lines name dep artifacts by hash, so an artifact transitively pins everything its verification depended on — validity is mere existence (`.ok` only after a kernel-checked success), and the same header change that marks a stale dep is the warm daemon's own reload signal. Emission is name subtraction (a file declares only what no imported artifact declares; generic instances demanded by an importer land in the importer's file), which forced byte-stable generation — vcgen's scope binders are now name-sorted. Flat-namespace guards with must-fail programs: `module.foreign_escape`, ghost `module.name_collision`, `module.duplicate_decl`. Dep diagnostics still point at the dep's own file from any importer. Roots always re-verify their own file; root-check caching noted in the ADR as a future knob.
+One content-addressed Lean artifact per module (`.sable-out/modules/<stem>_<hash>.{lean,olean,ok}`): an imported module's obligations verify once and importers consume them through Lean's own `import` — `sable check string.sable` dropped 27.6s → 2.0s (utf8's 205 obligations imported, not re-proven); cold full corpus 164s → 130s. Import lines name dependency artifacts by hash, so an artifact transitively pins generated dependencies. M44 later made reuse fail-closed: `.ok` is necessary but not sufficient; exact generated bytes, the immutable proof environment, and the exact canonical Sable source graph must also agree. Emission is name subtraction (a file declares only what no imported artifact declares; generic instances demanded by an importer land in the importer's file), which forced byte-stable generation — vcgen's scope binders are now name-sorted. Flat-namespace guards with must-fail programs: `module.foreign_escape`, ghost `module.name_collision`, `module.duplicate_decl`. Dep diagnostics still point at the dep's own file from any importer. Roots still verify their own obligations on every check, while their generated documents are immutable and content-addressed.
 
 ### M24 — Algorithm D: fast long division *(2026-08-10)*
 
@@ -235,11 +244,11 @@ U2b's first slice, and the point where `docs/notes/unsafe-sketch.md`'s central b
 
 The unsafe ladder's first go/no-go checkpoint, and **the verdict is go**: `copy_prefix` copies bytes through raw pointers inside `unsafe` and verifies from a three-line value-level contract — no heap predicate, frame clause, separating conjunction, provenance lemma, disjointness proof, or discharge script. Four other subjects in `corpus/verifies/unsafe_copy.sable` do the same, including one that splits a span inside the exposure and rejoins it; 29 obligations, zero hand proofs. The checkpoint's other half — that the checker explains failures locally — is carried by eight negative subjects each landing on a named diagnostic at the right span. Two decisions do the work. **Exposure is a construct, not a proof**: `unsafe expose &a as (p, resource m) { ... }` lends the array's bytes for the body and takes them back, so the bridge between the safe world's `[u8]` and the raw world's bytes is syntax with generated obligations (the whole extent came back; every byte is present and in `u8` range) rather than something a user reasons about. And **affinity supplies separation**: `raw_copy_nonoverlapping` has *no nonoverlap premise at all*, because the two spans are distinct affine tokens and that is what being distinct means — the design test the plan set for whether a caller holding two exclusive resources must prove they do not alias. Nonescape is done by hidden **loan brands** with no lifetime syntax: branded values cannot be returned, assigned to a local outside the body, or passed to a user function that could launder them, and the brand follows *provenance* through `raw_offset`/`split_off`/`join` — but not onto loaded bytes, since a byte read out of memory is an ordinary number, which branding it broke until a corpus subject caught `return b`. A shared exposure cannot mutate *structurally* (its resource binding is not `mut`, so unique access never exists) rather than by frame condition, which is the better answer.
 
-The three findings that decided the rung are all about the shape of what the **compiler** emits, not the user's proof burden. Automation needs the vocabulary *visible*: `abbrev` is not, because `simp` does not see through a reducible definition, so every spec-level notion in `lean/Sable/Raw.lean` carries an explicit unfolding lemma. `reconstructible` had to lose its existential — `∃ b, get k = .init b ∧ ...` reads better and defeats `grind`, which then invents a witness at every index. And a store's effect has to be **functional**, not axiomatic: stated as "index k is now this, every other index unchanged" it left grind in case analysis and timing out at every exposure exit, while `m₂ = write m k (.init w)` lets the composition lemmas fire on the shape. Reconstructibility is then tracked as a hypothesis established by each operation — the same by-construction treatment array length and element ranges already get across a store, with the theorem named at each site — and one lemma per operation (`ofSeq`, `write`, `take`, `drop`, `cat`) is the entire cost of keeping the exit automatic, which is why carving inside an exposure is not proof-noisy. `unsafe regions: N` now appears in build output: the count of places resting on a proof rather than the type system is a fact about the program. This rung also cleared **U3's two inherited criteria**, since the raw operations finally have a surface to lower — `svm.rs` expands exposure into the machine's own loan-allocation model, `corpus/svm-diff` gained a valid and an invalid raw subject, and an injected wrong lowering diverges. Recorded rather than hidden: the exit obligation is currently *unfalsifiable* (every operation in this surface preserves reconstructibility; `take8` is what will make it bite, and it is in the machine but not the surface), and a stale warm `sable daemon` serves the old prelude after a `lake build`.
+The three findings that decided the rung are all about the shape of what the **compiler** emits, not the user's proof burden. Automation needs the vocabulary *visible*: every spec-level notion in `lean/Sable/Raw.lean` carries an explicit unfolding lemma. `reconstructible` had to lose its existential, and a store's effect had to be functional (`m₂ = write m k (.init w)`) so composition lemmas fire without case analysis. One preservation lemma per operation keeps exposure exit automatic. `unsafe regions: N` records how many regions rest on proof rather than the type system. This rung also cleared U3's inherited differential criteria. Its then-current warm daemon could retain old prelude oleans after `lake build`; M44 closes that path by selecting an immutable proof environment per request and replacing the daemon server when its id changes.
 
 ### M31 — audited externs and the trust manifest *(2026-08-11, ADR 0027)*
 
-Sable can now call code it cannot verify, and — the part that mattered — the build stops claiming it verified everything. `extern "C" #[audit(id := "...", reason := "...")] fn c_fill(raw<u8> p, u64 n, u8 value, resource &mut RawSpan mem);` declares a foreign function whose contract is *audited*: no body, so no obligations, but the clauses still get well-formedness defs, because a trusted contract that does not elaborate is not a contract. The metadata is mandatory — a trusted contract with no recorded reason is an unsourced axiom, and the manifest exists so a reader can find every one. **Effects are structural, through the resource parameters**: only a passed `resource &mut R` may change, a `resource &R` frames itself, and so "undeclared mutation is impossible at the call boundary" is enforced rather than promised — `checksum_all` proves its array comes back byte for byte across a foreign call, and there is no `modifies` clause in the language to get wrong. Resources are erased from the ABI, so the shim receives the pointer, the length, and the byte; an extern may not return raw or resource storage and may not be generic, since forbidding retention *in the signature* is what makes handing borrowed storage to a foreign function safe at all. The trust manifest is emitted **into** the hashed Lean content rather than beside it, because an artifact's validity is mere existence of its `.ok` file and it must not survive a change to what it trusted — checked, `test.fill.v1` and `test.fill.v2` hash differently — and importers inherit it with no union step, since the flat merge already puts a dependency's externs in the importer's program. Build status now reads `status: verified relative to audited boundary` with the assumptions listed, and reserves `fully verified` for a module that trusts nothing.
+Sable can now call code it cannot verify, and — the part that mattered — the build stops claiming it verified everything. `extern "C" #[audit(id := "...", reason := "...")] fn c_fill(raw<u8> p, u64 n, u8 value, resource &mut RawSpan mem);` declares an audited foreign contract: no body and therefore no obligations, but its clauses must elaborate and its audit metadata is mandatory. **Effects are structural, through resource parameters**: only a passed `resource &mut R` may change, while `resource &R` frames itself; there is no `modifies` clause to get wrong. Resources erase at the ABI, and extern returns/generics are restricted to prevent retained storage. The trust manifest is emitted into generated Lean, so `test.fill.v1` and `test.fill.v2` name different artifacts. M44 later made `.ok` only one reuse condition: exact generated bytes, exact Sable graph, and the immutable proof environment must also match. Build status reads `verified relative to audited boundary` when assumptions remain and reserves `fully verified` for modules that trust none.
 
 Three findings. **M30's brand rule was too blunt** and this milestone found it: it forbade passing branded storage to any function, which blocked the extern call outright. The right rule follows from a property of the language — with no globals and no raw- or resource-typed fields, a callee that cannot *return* storage cannot retain it either, so only a signature returning raw or resource can launder a brand. **`extern.generic` had to move from the checker to the parser**, because monomorphization drops an uninstantiated template before the checker sees it and substitutes the parameters away on an instantiated one, leaving nothing to reject. And **M30's unfalsifiable exposure obligation is now falsifiable**: every operation in that surface preserved reconstructibility so `expose.<a>.bytes` always closed, and an extern whose post says the bytes become `uninit` fails it — trusting a boundary is different from trusting the compiler, and this is where the difference shows. Test shims are keyed on the audit id, not the name, and an unknown id traps rather than running the empty body: a contract that appears to hold because nothing happened is the one outcome a monitor must never produce.
 
@@ -459,12 +468,123 @@ functional evaluator. Per-byte record ownership excludes both byte access and
 overlapping `u64` cells throughout the extent. The 47 direct machine guards and
 59-subject Rust/Lean differential corpus cover successful record and pointer-
 option outcomes plus the important `undef` state and tag failures. Agreement,
-determinism, totality, and progress remain kernel-checked. M44/U10 is now the
-next unsafe-Sable architecture probe.
+determinism, totality, and progress remain kernel-checked. That bare core is now
+the compatibility base for M44/U10's first profile-specific wrapper.
+
+### M44 — first formal UART machine profile *(complete, 2026-08-12, ADR 0057)*
+
+The first U10 slice keeps device state out of both the raw heap and the audited
+extern boundary. Source programs carry an affine `resource Uart`; ordinary
+code cannot construct it, derive it from an integer, copy it, or pass it through
+an extern. The ABI rule is now an explicit resource whitelist—`RawSpan`,
+`OpenFile`, and `PosixWorld`—and `Uart` is deliberately absent. The signature
+authority budget is one: a function, method, initializer, or template may
+declare zero or one explicit UART parameter, never two. A second would give
+VCgen two apparently independent views of the singleton UART0 used by both
+executable semantics. Owned or borrowed `Uart` resource fields are rejected in
+monomorphic and generic classes for the same reason; device identities and
+functional field write-back are deferred. Tests alone may choose a deterministic
+profile script with the compiler-sealed `test_uart` constructor.
+
+Two device intrinsics live behind `unsafe` without becoming trust escapes.
+`uart_status(&mut uart) -> u8` consumes the next oracle value, advances an
+explicit cursor, appends an ordered status-read event, and establishes whether
+the transmitter is ready. `uart_write(byte, &mut uart)` has a generated
+readiness obligation, appends a transmit event, and clears readiness, so two
+writes require two successful polls. The proof-facing `UartView` exposes a
+transmit projection for contracts while the machine retains every read and
+write in chronological order.
+
+The formal machine extension is a wrapper in `lean/Sable/SVMUart.lean`, not
+device fields threaded through every core rule. It delegates non-device steps
+to the existing SVM and preserves the exact bare-core rendering when no profile
+is selected; selected runs add profile identity, cursor, readiness, oracle, and
+trace. The wrapper's relational and executable presentations agree in both
+directions, with determinism and progress proved. Generated verification
+content records `uart-poll-v1`, the intrinsics used, and a stable content hash
+of the recursive local Lean import closure rooted at `MMIO.lean` and
+`SVMUart.lean`, together with `lean-toolchain` and `lakefile.toml`. That is a
+kernel-checked machine dependency, so it does not downgrade status to
+“verified relative to audited boundary” as an extern assumption would.
+
+The cache boundary was hardened with the profile. Each request captures an
+immutable `proof-env-v2` byte map before profile generation or dependency work:
+every local Lean source plus `lean-toolchain`, `lakefile.toml`, and
+`lake-manifest.json`. Its source snapshot and single-job Lake build live under a
+content-addressed id; batch Lean and the daemon consume the same exact snapshot
+and generated text. Module artifacts additionally bind the canonical Sable
+paths, source bytes, resolved import edges, and order. Generated root/module
+documents are immutable and compared byte-for-byte on reuse; the FNV hashes are
+only compact names, so a collision fails closed. The in-process cache retains
+only identical builds currently in flight.
+
+The first acceptance subject, `corpus/verifies/uart.sable`, is a bounded
+poll/transmit driver: it either emits exactly the requested byte after observing
+readiness or exhausts its budget without changing the transmit projection. It
+assumes neither fairness nor eventual readiness, and 16/16 obligations verify.
+Four dynamic tests (4/4) cover an immediately-ready script, readiness on the third
+poll, a permanently-not-ready script, and `test_uart(0)` evaluated directly as
+an erased resource argument. The single-job Lean package build is green. The
+Rust/Lean differential gate agrees on 69/69 subjects, including profile traces,
+cursor movement, readiness clearing, invalid writes, profile reselection before
+replacement-script evaluation, and selection through assignment, discard, and
+an inferred declaration.
+
+The audit also closed general checker/VCgen/monitor soundness omissions. Loop
+mutation discovery now exhaustively follows conditions, bodies, nested
+`unsafe`/`expose` statements, and every ordinary, trait, raw, resource, and
+device operand. Affine shape and the variant are snapshotted before the
+condition; a false condition retains its post-condition state; and both VCgen
+and the interpreter compare the pre-condition head measure with the post-body
+measure on every taken iteration, including the last. Trait calls now use the
+ordinary overlapping-borrow check, while UART-bearing trait signatures remain
+rejected until abstract trait contracts can carry resource state.
+
+Erasure likewise preserves effects: the interpreter evaluates resource-valued
+arguments and transformation operands left-to-right before discarding their
+proof-only value. SVM lowering preserves `test_uart` selection in declarations,
+assignments, inferred declarations, and discarded expression statements;
+authority-only resource operations erase only when their operands are
+syntactically runtime-inert, otherwise lowering rejects the subject.
+
+The sound havoc rule exposed free-list proofs that had relied on stale state.
+`free_list_walk_unchanged` now carries a `state = old state` frame and restored
+chain, while insert-location and first-fit transport their current facts through
+the same invariant. Targeted checks are green for 33/33, 13/13, and 22/22
+obligations across those three function pairs. The focused Rust library suite is
+green at 9/9, and the complete single-worker serial corpus is green in 297.65s.
+The full serial Rust suite is green: units, corpus, randomized allocator,
+grind-budget, LSP, SVM differential, and doc tests.
+
+M44 is complete and this is the **unsafe-Sable v1 stopping point**. Production
+capability provisioning and native fixed-address lowering, a general
+MMIO/device-description abstraction, UART receive/interrupt/error/timing models,
+page tables, privileged instructions, any Sail/ISA connection, concurrency,
+DMA, and atomics remain deliberately deferred and require their own decisions.
+
+## Post-U10 usability sequence
+
+With that stopping point reached, LLVM IR lowering is the active next milestone.
+The rest remains a working order, not a promise that evidence cannot reorder it:
+
+1. Add an LLVM IR backend, preserving the checked language semantics and using
+   differential/end-to-end tests to keep lowering honest.
+2. Generalize aggregate values: class type parameters, then arrays and options
+   whose elements are not restricted to the current integer-oriented surface.
+3. Add printing and formatting together with the smallest practical `String`
+   standard-library layer.
+4. Introduce `Result`-shaped explicit error handling; keep general surface
+   pattern matching deferred until a benchmark demonstrates that accessors or
+   combinators are insufficient.
+5. Replace flat source merging with real module namespaces and stable backend
+   name mangling.
+6. Add floating-point types only when a target domain forces their semantics;
+   they remain last because rounding modes, NaNs, and proof vocabulary deserve
+   a benchmark rather than speculative surface area.
 
 ## Parallel track (low intensity)
 
-The SVM semantic oracle — **checkpoint reached**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers checked Sable through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator. Calls/frames, byte raw memory, abstract `u64` cells, and now abstract POD record cells all live in both presentations. ADR 0056 adds nullable pointers, record construction/projection, tag-checked record storage, and per-byte extent exclusion without adding a byte representation. Forty-seven direct guards pin the outcomes independently of agreement; 59 differential subjects cover scalar, call, byte, `u64`, record, and pointer-option paths with zero divergences. The older ghost-transition erasure theorem and class track remain separate future work; neither is a blocker for beginning U10's profile-specific machine extension.
+The SVM semantic oracle — **checkpoint reached, with the first profile composition complete**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers checked Sable through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator. Calls/frames, byte raw memory, abstract `u64` cells, and abstract POD record cells all live in both core presentations. ADR 0056 adds nullable pointers, record construction/projection, tag-checked record storage, and per-byte extent exclusion without adding a byte representation. Forty-seven direct guards pin those outcomes independently of agreement. ADR 0057 composes `SVMUart` around the core: bare executions remain byte-for-byte compatible, while selected executions add an oracle cursor and ordered MMIO observation. The differential set is now green at 69/69 subjects, including profile reselection precedence and profile selection through assignment, discard, and inferred declaration. The older ghost-transition erasure theorem and class track remain separate future work.
 
 ## Testing strategy
 

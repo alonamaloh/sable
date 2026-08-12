@@ -12,7 +12,7 @@
 //! by the interpreter, so a diff program's variants must hold.
 
 use crate::ast::*;
-use crate::interp::RtVal;
+use crate::interp::{MmioEvent, ObservedRun, RtVal};
 
 /// Program metadata needed while lowering checked, index-bearing AST nodes.
 /// Keeping this context explicit ensures record tags and layouts come from
@@ -130,24 +130,22 @@ fn lower_stmt_erasing(
         // definite initialization guarantees assignment-before-read.
         Stmt::Decl { init: None, .. } => None,
         Stmt::Decl {
+            name,
             ty,
-            init:
-                Some(Expr {
-                    kind: ExprKind::ResOp { .. },
-                    ..
-                }),
+            init: Some(e),
             ..
-        } if ty.is_resource() => {
-            // Static authority bookkeeping may surround observable raw
-            // operations. Erase it in statement position; `lower_expr`
-            // still rejects a resource operation used as runtime data.
-            None
-        }
+        } if ty.is_resource() => lower_erased_resource_bind(ctx, name, e)?,
         Stmt::Decl {
             name,
             init: Some(e),
             ..
         } => Some(lower_bind(ctx, name, e)?),
+        Stmt::VarDecl {
+            name,
+            init,
+            ty: Some(ty),
+            ..
+        } if ty.is_resource() => lower_erased_resource_bind(ctx, name, init)?,
         Stmt::VarDecl { name, init, .. } => Some(lower_bind(ctx, name, init)?),
         // `unsafe { ... }` is a marker with no machine step of its own.
         Stmt::Unsafe { body, .. } => {
@@ -217,9 +215,8 @@ fn lower_stmt_erasing(
             parts.push(format!("(.rawFree (.var \"{loan}\"))"));
             Some(parts.join(", "))
         }
-        Stmt::Assign { name, .. } if erased_resources.contains(&name.as_str()) => {
-            // Resource authority has no runtime representation.
-            None
+        Stmt::Assign { name, value, .. } if erased_resources.contains(&name.as_str()) => {
+            lower_erased_resource_bind(ctx, name, value)?
         }
         Stmt::Assign { name, value, .. } => Some(lower_bind(ctx, name, value)?),
         Stmt::Store {
@@ -325,8 +322,16 @@ fn lower_stmt_erasing(
                 }
                 _ => return Err(format!("`{}` produces a value", op.name())),
             }),
+            ExprKind::DeviceOp { op, args, .. } => Some(match op {
+                DeviceOp::UartWrite => {
+                    format!("(.uartWrite {})", lower_expr(ctx, &args[0])?)
+                }
+                DeviceOp::UartStatus => {
+                    return Err("`uart_status` produces a value".into());
+                }
+            }),
             ExprKind::Call { callee, args, .. } => Some(lower_call(ctx, &None, callee, args)?),
-            ExprKind::ResOp { .. } => None,
+            ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args)?,
             _ => {
                 return Err("expression statements are outside the SVM core subset".into());
             }
@@ -340,6 +345,119 @@ fn lower_stmt_erasing(
     })
 }
 
+/// Lower the runtime part of a resource-producing expression. Most sealed
+/// resource operations only redistribute static authority and therefore have
+/// no machine step. The exceptions below have interpreter-visible state: a
+/// differential subject must either use the matching profile statement or be
+/// rejected until the SVM models that state too.
+fn lower_resource_op_stmt(
+    ctx: &LowerCtx<'_>,
+    op: ResOp,
+    args: &[Expr],
+) -> Result<Option<String>, String> {
+    match op {
+        ResOp::TestUart => Ok(Some(format!(
+            "(.testUartProfile {})",
+            lower_expr(ctx, &args[0])?
+        ))),
+        ResOp::TestWorld
+        | ResOp::OpenFileOf
+        | ResOp::ResourceMapEmpty
+        | ResOp::ResourceMapTake
+        | ResOp::ResourceMapPut => Err(format!(
+            "`{}` has interpreter-visible runtime state but no SVM statement",
+            op.name()
+        )),
+        _ => {
+            ensure_erased_resource_operands_inert(op, args)?;
+            Ok(None)
+        }
+    }
+}
+
+/// An authority-only operation has no SVM statement, but source operands are
+/// still evaluated before its erased result is produced. Erase the operation
+/// only when each operand is syntactically known to have no runtime effect and
+/// no trap. Anything richer must either gain an explicit discard/effect
+/// lowering or remain outside the differential subset; silently dropping it
+/// would make the harness compare a different program.
+fn ensure_erased_resource_operands_inert(op: ResOp, args: &[Expr]) -> Result<(), String> {
+    for (index, arg) in args.iter().enumerate() {
+        let inert = match &arg.kind {
+            // Checked literals are in range and cannot trap.
+            ExprKind::IntLit(_) | ExprKind::BoolLit(_) => true,
+            // Reading or borrowing an erased authority place performs no
+            // runtime access. Resource variables deliberately have no cached
+            // `Expr::ty`: the checker returns as soon as it validates their
+            // expected affine type. The sealed primitive's operand position is
+            // therefore the authority for erasedness when that annotation is
+            // absent; a present annotation must still agree. This positional
+            // guard also keeps an ordinary machine value from being discarded.
+            ExprKind::Var(_) | ExprKind::SelfField { .. } | ExprKind::Borrow { .. } => {
+                resource_operand_position(op, index) && arg.ty.map_or(true, Ty::is_resource)
+            }
+            // Calls, arithmetic (including division), raw/device operations,
+            // and nested resource transformations may trap or mutate runtime
+            // state. Reject them instead of trying to infer purity here.
+            _ => false,
+        };
+        if !inert {
+            return Err(format!(
+                "`{}` operand {} is not provably runtime-inert; the SVM lowerer \
+                 will not erase its evaluation",
+                op.name(),
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The resource-typed operands of each compiler-sealed primitive. Unlike an
+/// ordinary call, these positions cannot be changed by user declarations and
+/// exactly mirror the type rules in `check::infer_expr`.
+fn resource_operand_position(op: ResOp, index: usize) -> bool {
+    match op {
+        ResOp::Join
+        | ResOp::AllocatorPut
+        | ResOp::AllocatorPutFree
+        | ResOp::AllocatorPutHeader
+        | ResOp::FreeBlockJoin => index < 2,
+        ResOp::ResourceMapPut => index == 0 || index == 2,
+        ResOp::SplitOff
+        | ResOp::OpenFileOf
+        | ResOp::AllocatorCreate
+        | ResOp::AllocatorDestroy
+        | ResOp::AllocatorTake
+        | ResOp::AllocatorTakeFree
+        | ResOp::AllocatorTakeHeader
+        | ResOp::AllocatorStepHeader
+        | ResOp::FreeBlockSplit
+        | ResOp::FreeBlockLease
+        | ResOp::BlockLeaseFree
+        | ResOp::ResourceMapTake => index == 0,
+        ResOp::TestWorld | ResOp::TestUart | ResOp::ResourceMapEmpty => false,
+    }
+}
+
+/// Resource locals themselves are erased, but evaluating their initializer or
+/// assignment may still perform a machine transition. Pure moves and sealed
+/// authority-only transformations disappear; raw role changes, calls, and the
+/// UART profile selector keep their runtime effect.
+fn lower_erased_resource_bind(
+    ctx: &LowerCtx<'_>,
+    name: &str,
+    e: &Expr,
+) -> Result<Option<String>, String> {
+    match &e.kind {
+        ExprKind::Var(_) => Ok(None),
+        ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args),
+        ExprKind::RawOp { .. } => Ok(Some(lower_bind(ctx, name, e)?)),
+        ExprKind::Call { callee, args, .. } => Ok(Some(lower_call(ctx, &None, callee, args)?)),
+        _ => Err("resource-valued expression is outside the SVM core subset".into()),
+    }
+}
+
 /// `x = e;` — an assign, or (A-normalized, ADR 0005) a call when `e`
 /// is exactly a call; calls nested deeper stay outside the subset.
 fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String> {
@@ -347,6 +465,14 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
         ExprKind::Call { callee, args, .. } => {
             lower_call(ctx, &Some(name.to_string()), callee, args)
         }
+        ExprKind::DeviceOp {
+            op: DeviceOp::UartStatus,
+            ..
+        } => Ok(format!("(.uartStatus \"{name}\")")),
+        ExprKind::DeviceOp {
+            op: DeviceOp::UartWrite,
+            ..
+        } => Err("`uart_write` produces no value".into()),
         ExprKind::RecordLit { record, args, .. } => {
             let ri = match e.ty {
                 Some(Ty::Record(ri)) => ri,
@@ -488,6 +614,12 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
         }
         ExprKind::BoolLit(b) => format!("(.boolLit {b})"),
         ExprKind::Var(x) => format!("(.var \"{x}\")"),
+        ExprKind::DeviceOp { op, .. } => {
+            return Err(format!(
+                "`{}` is a statement in the profile machine, not an expression",
+                op.name()
+            ));
+        }
         ExprKind::ResOp { op, .. } => {
             // Resource transformations are static: they redistribute
             // authority and there is nothing for the machine to do. A
@@ -667,6 +799,44 @@ pub fn canonical_outcome(program: &Program, res: Result<RtVal, String>) -> Strin
     }
 }
 
+/// Canonicalize the outcome and every machine-profile observation. Bare
+/// executions deliberately retain the core wire format byte-for-byte; once
+/// the UART profile is selected, the suffix must match `SVMUart.Config.render`
+/// exactly so the differential oracle also detects dropped, duplicated, or
+/// reordered device accesses.
+pub fn canonical_observed(program: &Program, observed: ObservedRun) -> String {
+    let ObservedRun {
+        outcome,
+        mmio,
+        uart_profile,
+        uart_cursor,
+    } = observed;
+    let core = canonical_outcome(program, outcome);
+    if uart_profile.is_none() {
+        return core;
+    }
+    let trace = mmio
+        .iter()
+        .map(|event| match event {
+            MmioEvent::Read {
+                address,
+                width,
+                value,
+            } => format!("read(uart0,status,{address},{width},{value})"),
+            MmioEvent::Write {
+                address,
+                width,
+                value,
+            } => format!("write(uart0,tx,{address},{width},{value})"),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{core} | profile={} cursor={uart_cursor} trace=[{trace}]",
+        crate::profile::UART_POLL_V1_ID
+    )
+}
+
 fn render_rt_val(program: &Program, value: &RtVal) -> String {
     match value {
         RtVal::Unit => "unit".into(),
@@ -751,4 +921,78 @@ fn classify_trap(msg: &str) -> String {
         }
     }
     format!("unclassified: {msg}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::span::Span;
+
+    fn expr(kind: ExprKind, ty: Ty) -> Expr {
+        Expr {
+            kind,
+            span: Span::new(0, 0),
+            ty: Some(ty),
+        }
+    }
+
+    #[test]
+    fn erased_resource_op_accepts_unannotated_resource_place() {
+        let mem = Expr {
+            kind: ExprKind::Var("mem".into()),
+            span: Span::new(0, 0),
+            // Resource variables take the checker's early-return path, so a
+            // successfully checked operand intentionally has no cached type.
+            ty: None,
+        };
+        ensure_erased_resource_operands_inert(ResOp::AllocatorCreate, &[mem])
+            .expect("allocator_create(resource_place) is runtime-inert");
+    }
+
+    #[test]
+    fn erased_resource_op_rejects_effectful_operand() {
+        let span = expr(
+            ExprKind::Borrow {
+                array: "mem".into(),
+                field: None,
+                mutable: true,
+            },
+            Ty::ResRef(ResKind::RawSpan, Mutability::Mut),
+        );
+        let one = expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64));
+        let zero = expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64));
+        let division = expr(
+            ExprKind::Binary {
+                op: BinOp::Div,
+                op_span: Span::new(0, 0),
+                lhs: Box::new(one),
+                rhs: Box::new(zero),
+            },
+            Ty::Int(IntTy::U64),
+        );
+
+        let program = Program {
+            fns: Vec::new(),
+            fn_templates: Vec::new(),
+            class_templates: Vec::new(),
+            classes: Vec::new(),
+            records: Vec::new(),
+            traits: Vec::new(),
+            impls: Vec::new(),
+            discharges: Vec::new(),
+            ghosts: Vec::new(),
+            defers: Vec::new(),
+            assumes: Vec::new(),
+            operators: Vec::new(),
+            uses: Vec::new(),
+            consts: Vec::new(),
+        };
+        let error = lower_resource_op_stmt(
+            &LowerCtx { program: &program },
+            ResOp::SplitOff,
+            &[span, division],
+        )
+        .expect_err("split_off(&mut mem, 1 / 0) must not disappear");
+        assert!(error.contains("`split_off` operand 2"), "{error}");
+    }
 }

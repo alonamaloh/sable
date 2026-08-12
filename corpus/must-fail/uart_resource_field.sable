@@ -1,0 +1,5 @@
+// expect-error: uart.field_unsupported
+
+class DeviceHolder {
+    resource Uart uart;
+}

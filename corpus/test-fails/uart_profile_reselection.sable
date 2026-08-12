@@ -1,0 +1,6 @@
+// expect-test-failure: test_uart: a UART profile is already selected
+
+fn test_uart_profile_reselection() {
+    mut resource Uart first = test_uart(0);
+    mut resource Uart second = test_uart(1);
+}

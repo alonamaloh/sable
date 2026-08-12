@@ -48,6 +48,30 @@ pub struct TestReport {
     pub skipped: Vec<(String, String)>,
 }
 
+/// One ordered profile-mediated MMIO observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MmioEvent {
+    Read {
+        address: i128,
+        width: u8,
+        value: i128,
+    },
+    Write {
+        address: i128,
+        width: u8,
+        value: i128,
+    },
+}
+
+/// Interpreter outcome plus the externally observable device trace.
+pub struct ObservedRun {
+    pub outcome: Result<RtVal, String>,
+    pub mmio: Vec<MmioEvent>,
+    /// Selected test profile and number of status-oracle observations.
+    pub uart_profile: Option<i128>,
+    pub uart_cursor: usize,
+}
+
 struct Trap {
     message: String,
     span: crate::span::Span,
@@ -97,6 +121,7 @@ pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<Tes
                 skipped: Vec::new(),
                 raw: RawHeap::default(),
                 world: None,
+                uart: None,
             };
             let outcome = interp.call(test, Vec::new()).map(|_| ()).map_err(|trap| {
                 let (file, line, col) = mods.locate(trap.span.start);
@@ -119,6 +144,16 @@ pub fn run_fn(
     mods: &crate::modules::ModuleSet,
     name: &str,
 ) -> Result<RtVal, String> {
+    run_fn_observed(program, mods, name).outcome
+}
+
+/// Run one zero-argument function while retaining its ordered MMIO trace.
+/// Existing callers that observe only the return/trap keep using `run_fn`.
+pub fn run_fn_observed(
+    program: &Program,
+    mods: &crate::modules::ModuleSet,
+    name: &str,
+) -> ObservedRun {
     let ghosts = GhostDefs::from_items(&program.ghosts);
     let fns: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let f = fns[name];
@@ -132,14 +167,27 @@ pub fn run_fn(
         skipped: Vec::new(),
         raw: RawHeap::default(),
         world: None,
+        uart: None,
     };
-    interp.call(f, Vec::new()).map_err(|trap| {
+    let outcome = interp.call(f, Vec::new()).map_err(|trap| {
         if trap.undef {
             format!("undef: {}", trap.message)
         } else {
             trap.message
         }
-    })
+    });
+    let mmio = interp
+        .uart
+        .as_ref()
+        .map_or_else(Vec::new, |uart| uart.events.clone());
+    let uart_profile = interp.uart.as_ref().map(|uart| uart.script);
+    let uart_cursor = interp.uart.as_ref().map_or(0, |uart| uart.cursor);
+    ObservedRun {
+        outcome,
+        mmio,
+        uart_profile,
+        uart_cursor,
+    }
 }
 
 enum Flow {
@@ -159,6 +207,8 @@ struct Interp<'a> {
     /// `None` until a test asks for one. A program cannot conjure the
     /// world; only `posix_world` can, and only in a test.
     world: Option<PosixWorld>,
+    /// `None` until a test selects a scripted UART profile.
+    uart: Option<ScriptedUart>,
 }
 
 /// The interpreter's raw heap. It mirrors the SVM's: a fresh-provenance
@@ -217,15 +267,11 @@ impl RawHeap {
             .cells_u64
             .keys()
             .any(|start| *start <= off && off < *start + IntTy::U64.layout().size);
-        let record_covered = al.cells_record.iter().any(|(start, cell)| {
-            *start <= off && off < *start + cell.layout.size
-        });
-        if al.live
-            && off >= 0
-            && (off as usize) < al.bytes.len()
-            && !covered
-            && !record_covered
-        {
+        let record_covered = al
+            .cells_record
+            .iter()
+            .any(|(start, cell)| *start <= off && off < *start + cell.layout.size);
+        if al.live && off >= 0 && (off as usize) < al.bytes.len() && !covered && !record_covered {
             Some(al)
         } else {
             None
@@ -306,6 +352,50 @@ impl PosixWorld {
     }
 }
 
+struct ScriptedUart {
+    script: i128,
+    cursor: usize,
+    ready: bool,
+    events: Vec<MmioEvent>,
+}
+
+impl ScriptedUart {
+    fn new(script: i128) -> ScriptedUart {
+        ScriptedUart {
+            script,
+            cursor: 0,
+            ready: false,
+            events: Vec::new(),
+        }
+    }
+
+    fn status(&mut self) -> i128 {
+        let value = match self.script {
+            0 => 1,
+            1 if self.cursor < 2 => 0,
+            1 => 1,
+            _ => 0,
+        };
+        self.cursor += 1;
+        self.ready = value != 0;
+        self.events.push(MmioEvent::Read {
+            address: 4096,
+            width: 8,
+            value,
+        });
+        value
+    }
+
+    fn write(&mut self, byte: i128) {
+        self.events.push(MmioEvent::Write {
+            address: 4097,
+            width: 8,
+            value: byte,
+        });
+        self.ready = false;
+    }
+}
+
 /// A place a value can be moved out of or dropped: a local, or a field of
 /// the enclosing `self`. These are the roots of the checker's `Place`, at
 /// the depth the program language can name.
@@ -344,8 +434,12 @@ impl<'a> Interp<'a> {
     /// An unknown id traps. Running the body as a no-op would let a
     /// contract appear to hold because nothing happened, which is the one
     /// outcome a monitor must never produce.
-    fn call_extern(&mut self, f: &'a Fn, args: Vec<RtVal>, span: crate::span::Span)
-        -> IResult<RtVal> {
+    fn call_extern(
+        &mut self,
+        f: &'a Fn,
+        args: Vec<RtVal>,
+        span: crate::span::Span,
+    ) -> IResult<RtVal> {
         let info = f.extern_info.as_ref().expect("checked: extern");
         match info.audit_id.as_str() {
             "test.fill.v1" => {
@@ -358,30 +452,26 @@ impl<'a> Interp<'a> {
                     if self.raw.live_at(a, off + i).is_none() {
                         return Err(Trap {
                             undef: true,
-                            message: format!(
-                                "`{}` writes out of bounds: {a}+{}",
-                                f.name,
-                                off + i
-                            ),
+                            message: format!("`{}` writes out of bounds: {a}+{}", f.name, off + i),
                             span,
                         });
                     }
-                    self.raw
-                        .allocs
-                        .get_mut(&a)
-                        .expect("live_at checked")
-                        .bytes[(off + i) as usize] = Some(v);
+                    self.raw.allocs.get_mut(&a).expect("live_at checked").bytes
+                        [(off + i) as usize] = Some(v);
                 }
                 Ok(RtVal::Unit)
             }
             "test.checksum.v1" => {
-                let (RtVal::Ptr(a, off), RtVal::Int(n)) = (args[0].clone(), args[1].clone())
-                else {
+                let (RtVal::Ptr(a, off), RtVal::Int(n)) = (args[0].clone(), args[1].clone()) else {
                     unreachable!("checked: (raw<u8>, u64)")
                 };
                 let mut sum: i128 = 0;
                 for i in 0..n {
-                    match self.raw.live_at(a, off + i).map(|al| al.bytes[(off + i) as usize]) {
+                    match self
+                        .raw
+                        .live_at(a, off + i)
+                        .map(|al| al.bytes[(off + i) as usize])
+                    {
                         Some(Some(b)) => sum += b,
                         _ => {
                             return Err(Trap {
@@ -430,9 +520,7 @@ impl<'a> Interp<'a> {
                 let pos = w.pos[fd as usize];
                 let avail = (w.data.len() as i128 - pos).max(0);
                 let got = want.min(avail);
-                let bytes: Vec<i128> = (0..got)
-                    .map(|i| w.data[(pos + i) as usize])
-                    .collect();
+                let bytes: Vec<i128> = (0..got).map(|i| w.data[(pos + i) as usize]).collect();
                 w.pos[fd as usize] = pos + got;
                 for (i, b) in bytes.iter().enumerate() {
                     let at = off + i as i128;
@@ -443,11 +531,8 @@ impl<'a> Interp<'a> {
                             span,
                         });
                     }
-                    self.raw
-                        .allocs
-                        .get_mut(&a)
-                        .expect("live_at checked")
-                        .bytes[at as usize] = Some(*b);
+                    self.raw.allocs.get_mut(&a).expect("live_at checked").bytes[at as usize] =
+                        Some(*b);
                 }
                 Ok(RtVal::Int(got))
             }
@@ -518,6 +603,17 @@ impl<'a> Interp<'a> {
                 }
             }
             frame.vars.insert(p.name.clone(), v);
+        }
+        // Erased parameters are absent from the runtime argument vector, but
+        // their source-level places still exist inside the callee. A unit
+        // placeholder lets an owned parameter be moved into a mutable local
+        // (and then borrowed by an intrinsic) without pretending that an ABI
+        // value was passed. Resource-map parameters keep their real sanitizer
+        // shadow value from the loop above.
+        for p in &f.params {
+            if p.ty.is_resource() && !has_resource_shadow(p.ty) {
+                frame.vars.insert(p.name.clone(), RtVal::Unit);
+            }
         }
 
         for pre in &f.pres {
@@ -797,6 +893,39 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(v)
+    }
+
+    /// Evaluate an expression passed to an erased resource parameter for its
+    /// runtime effects, then discard its proof-only value. A resource place
+    /// itself has no runtime read to perform; constructors, transformations,
+    /// and ordinary calls still execute, preserving source call-by-value
+    /// order even though no value crosses the callee's runtime signature.
+    fn eval_erased_resource_arg(&mut self, e: &Expr, frame: &mut Frame) -> IResult<()> {
+        // The checked formal parameter or sealed primitive operand is the
+        // authority for erasedness here. Resource variables and borrows may
+        // have no cached `Expr::ty`: their checker arms return as soon as the
+        // expected resource type has been validated. A present annotation
+        // must still agree with the caller's contract.
+        debug_assert!(e.ty.map_or(true, Ty::is_resource));
+        match &e.kind {
+            ExprKind::Var(_) | ExprKind::Borrow { .. } | ExprKind::SelfField { .. } => Ok(()),
+            _ => {
+                self.eval_moved(e, frame)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Operand evaluation for a resource transformation whose result is
+    /// erased. Nested resource expressions recurse through the same effect
+    /// boundary; ordinary operands use their normal runtime evaluator.
+    fn eval_erased_resource_operand(&mut self, e: &Expr, frame: &mut Frame) -> IResult<()> {
+        if e.ty.is_some_and(Ty::is_resource) {
+            self.eval_erased_resource_arg(e, frame)
+        } else {
+            self.eval_moved(e, frame)?;
+            Ok(())
+        }
     }
 
     /// Drop one class value: invariant, body, then the remaining fields in
@@ -1128,45 +1257,65 @@ impl<'a> Interp<'a> {
                 kw_span,
                 body,
             } => {
-                let mut prev_variant: Option<i128> = None;
                 loop {
                     self.burn(*kw_span)?;
                     for inv in invariants {
                         self.check_loop_clause(frame, inv, "loop invariant")?;
                     }
+
+                    // VCgen's measure is the loop-head value, before an
+                    // effectful condition runs. Save it now, but report an
+                    // unmonitorable measure only if the condition is true:
+                    // the verifier owes descent only on a body path.
+                    let head_variant = variant.as_ref().map(|v| (v, self.variant_value(frame, v)));
                     if !self.eval_bool(cond, frame)? {
                         break;
                     }
-                    if let Some(v) = variant {
-                        if let Some(val) = self.variant_value(frame, v) {
-                            if val < 0 {
+
+                    let monitored_head = match head_variant {
+                        Some((v, Ok(v0))) => {
+                            if v0 < 0 {
+                                return Err(Trap {
+                                    undef: false,
+                                    message: format!("loop variant is negative ({v0}): {}", v.text),
+                                    span: v.span,
+                                });
+                            }
+                            Some((v, v0))
+                        }
+                        Some((v, Err(um))) => {
+                            self.skipped.push((v.text.replace('\n', " "), um.0));
+                            None
+                        }
+                        None => None,
+                    };
+
+                    match self.exec_block(body, frame)? {
+                        Flow::Normal => {}
+                        ret => return Ok(ret),
+                    }
+
+                    // Check the same transition as the preservation VC:
+                    // head measure v0, then condition + body, then v1. Doing
+                    // this immediately also covers the final body iteration,
+                    // whose following condition may be false.
+                    if let Some((v, v0)) = monitored_head {
+                        match self.variant_value(frame, v) {
+                            Ok(v1) if v1 >= v0 => {
                                 return Err(Trap {
                                     undef: false,
                                     message: format!(
-                                        "loop variant is negative ({val}): {}",
+                                        "loop variant did not decrease ({v0} → {v1}): {}",
                                         v.text
                                     ),
                                     span: v.span,
                                 });
                             }
-                            if let Some(prev) = prev_variant {
-                                if val >= prev {
-                                    return Err(Trap {
-                                        undef: false,
-                                        message: format!(
-                                            "loop variant did not decrease ({prev} → {val}): {}",
-                                            v.text
-                                        ),
-                                        span: v.span,
-                                    });
-                                }
+                            Ok(_) => {}
+                            Err(um) => {
+                                self.skipped.push((v.text.replace('\n', " "), um.0));
                             }
-                            prev_variant = Some(val);
                         }
-                    }
-                    match self.exec_block(body, frame)? {
-                        Flow::Normal => {}
-                        ret => return Ok(ret),
                     }
                 }
                 Ok(Flow::Normal)
@@ -1176,7 +1325,11 @@ impl<'a> Interp<'a> {
 
     /// Evaluate a variant measure numerically by evaluating the program
     /// expression through the spec evaluator (variants are Int-valued).
-    fn variant_value(&mut self, frame: &Frame, clause: &crate::scan::Clause) -> Option<i128> {
+    fn variant_value(
+        &self,
+        frame: &Frame,
+        clause: &crate::scan::Clause,
+    ) -> Result<i128, speceval::Unmonitorable> {
         let mut vars: HashMap<String, SpecVal> = HashMap::new();
         for (name, v) in &frame.vars {
             if let Some(sv) = spec_of(v) {
@@ -1188,13 +1341,7 @@ impl<'a> Interp<'a> {
             olds: frame.olds.clone(),
             ghosts: self.ghosts,
         };
-        match speceval::eval_int_expr(&clause.text, &env) {
-            Ok(n) => Some(n),
-            Err(um) => {
-                self.skipped.push((clause.text.replace('\n', " "), um.0));
-                None
-            }
-        }
+        speceval::eval_int_expr(&clause.text, &env)
     }
 
     fn construct(
@@ -1367,11 +1514,23 @@ impl<'a> Interp<'a> {
                         let script = self.eval_int(&args[0], frame)?;
                         self.world = Some(PosixWorld::scripted(script));
                     }
+                    ResOp::TestUart => {
+                        if self.uart.is_some() {
+                            return Err(Trap {
+                                undef: true,
+                                message: "test_uart: a UART profile is already selected".into(),
+                                span: e.span,
+                            });
+                        }
+                        let script = self.eval_int(&args[0], frame)?;
+                        self.uart = Some(ScriptedUart::new(script));
+                    }
                     // Adoption spends the world's claim on a descriptor.
                     // The VC is what makes a second adoption unreachable;
                     // this is the monitor saying so independently, the
                     // same two layers the raw operations have.
                     ResOp::OpenFileOf => {
+                        self.eval_erased_resource_arg(&args[0], frame)?;
                         let fd = self.eval_int(&args[1], frame)?;
                         if let Some(w) = &mut self.world {
                             if fd < 0 || fd >= w.fds {
@@ -1406,9 +1565,7 @@ impl<'a> Interp<'a> {
                         if !entries.borrow_mut().remove(&key) {
                             return Err(Trap {
                                 undef: false,
-                                message: format!(
-                                    "resource_map_take: key {key} is absent"
-                                ),
+                                message: format!("resource_map_take: key {key} is absent"),
                                 span: e.span,
                             });
                         }
@@ -1418,22 +1575,62 @@ impl<'a> Interp<'a> {
                             unreachable!("checked: resource map borrow")
                         };
                         let key = self.eval_int(&args[1], frame)?;
+                        self.eval_erased_resource_arg(&args[2], frame)?;
                         // The consumed cell is ordinary erased authority; only the
                         // aggregate's key set has sanitizer shadow state.
                         if !entries.borrow_mut().insert(key) {
                             return Err(Trap {
                                 undef: false,
-                                message: format!(
-                                    "resource_map_put: key {key} is already occupied"
-                                ),
+                                message: format!("resource_map_put: key {key} is already occupied"),
                                 span: e.span,
                             });
                         }
                     }
-                    _ => {}
+                    // The remaining transformations are proof-state
+                    // transitions. Their result is erased, but evaluating
+                    // their operands may run ordinary calls or a nested
+                    // profile/resource constructor, so visit every operand
+                    // in source order before discarding the result.
+                    _ => {
+                        for arg in args {
+                            self.eval_erased_resource_operand(arg, frame)?;
+                        }
+                    }
                 }
                 Ok(RtVal::Unit)
             }
+            ExprKind::DeviceOp { op, args, .. } => match op {
+                DeviceOp::UartStatus => {
+                    let Some(uart) = &mut self.uart else {
+                        return Err(Trap {
+                            undef: true,
+                            message: "uart_status: no UART profile selected".into(),
+                            span: e.span,
+                        });
+                    };
+                    Ok(RtVal::Int(uart.status()))
+                }
+                DeviceOp::UartWrite => {
+                    if self.uart.is_none() {
+                        return Err(Trap {
+                            undef: true,
+                            message: "uart_write: no UART profile selected".into(),
+                            span: e.span,
+                        });
+                    }
+                    let byte = self.eval_int(&args[0], frame)?;
+                    let uart = self.uart.as_mut().expect("checked above");
+                    if !uart.ready {
+                        return Err(Trap {
+                            undef: true,
+                            message: "uart_write: transmitter is not ready".into(),
+                            span: e.span,
+                        });
+                    }
+                    uart.write(byte);
+                    Ok(RtVal::Unit)
+                }
+            },
             // The raw operations. Each classification here must match the
             // machine's: a trap is a trap, and everything the SVM calls
             // `undef` is a trap with a precise message — the reference
@@ -1497,11 +1694,8 @@ impl<'a> Interp<'a> {
                                 "raw_store8 out of bounds or after free: {a}+{o}"
                             )));
                         }
-                        self.raw
-                            .allocs
-                            .get_mut(&a)
-                            .expect("live_at checked")
-                            .bytes[o as usize] = Some(w);
+                        self.raw.allocs.get_mut(&a).expect("live_at checked").bytes[o as usize] =
+                            Some(w);
                         Ok(RtVal::Unit)
                     }
                     RawOp::Copy => {
@@ -1537,11 +1731,8 @@ impl<'a> Interp<'a> {
                                     do_ + i
                                 )));
                             }
-                            self.raw
-                                .allocs
-                                .get_mut(&da)
-                                .expect("live_at checked")
-                                .bytes[(do_ + i) as usize] = Some(b);
+                            self.raw.allocs.get_mut(&da).expect("live_at checked").bytes
+                                [(do_ + i) as usize] = Some(b);
                         }
                         Ok(RtVal::Unit)
                     }
@@ -1647,9 +1838,7 @@ impl<'a> Interp<'a> {
                             bad(format!("raw_header_init names absent allocation {a}"))
                         })?;
                         if !al.live {
-                            return Err(bad(format!(
-                                "raw_header_init names dead allocation {a}"
-                            )));
+                            return Err(bad(format!("raw_header_init names dead allocation {a}")));
                         }
                         if !matches!(al.cells_u64.get(&o), Some(None))
                             || !matches!(al.cells_u64.get(&(o + layout.size)), Some(None))
@@ -1690,15 +1879,10 @@ impl<'a> Interp<'a> {
                             bad(format!("raw_header_clear names absent allocation {a}"))
                         })?;
                         if !al.live {
-                            return Err(bad(format!(
-                                "raw_header_clear names dead allocation {a}"
-                            )));
+                            return Err(bad(format!("raw_header_clear names dead allocation {a}")));
                         }
                         if !matches!(al.cells_u64.get(&o), Some(Some(_)))
-                            || !matches!(
-                                al.cells_u64.get(&(o + layout.size)),
-                                Some(Some(_))
-                            )
+                            || !matches!(al.cells_u64.get(&(o + layout.size)), Some(Some(_)))
                         {
                             return Err(bad(format!(
                                 "raw_header_clear needs two initialized cells at {a}+{o}"
@@ -1946,25 +2130,21 @@ impl<'a> Interp<'a> {
                 }
                 Ok(RtVal::Int(arr[idx as usize]))
             }
-            ExprKind::IsSome { operand } => {
-                match self.eval(operand, frame)? {
-                    RtVal::Opt(o) => Ok(RtVal::Bool(o.is_some())),
-                    RtVal::PtrOpt(o) => Ok(RtVal::Bool(o.is_some())),
-                    _ => unreachable!("checked: option operand"),
-                }
-            }
-            ExprKind::OptValue { operand } => {
-                match self.eval(operand, frame)? {
-                    RtVal::Opt(Some(v)) => Ok(RtVal::Int(v)),
-                    RtVal::PtrOpt(Some((a, o))) => Ok(RtVal::Ptr(a, o)),
-                    RtVal::Opt(None) | RtVal::PtrOpt(None) => Err(Trap {
-                            undef: false,
-                            message: "`.value` of an empty option".into(),
-                            span: e.span,
-                        }),
-                    _ => unreachable!("checked: option operand"),
-                }
-            }
+            ExprKind::IsSome { operand } => match self.eval(operand, frame)? {
+                RtVal::Opt(o) => Ok(RtVal::Bool(o.is_some())),
+                RtVal::PtrOpt(o) => Ok(RtVal::Bool(o.is_some())),
+                _ => unreachable!("checked: option operand"),
+            },
+            ExprKind::OptValue { operand } => match self.eval(operand, frame)? {
+                RtVal::Opt(Some(v)) => Ok(RtVal::Int(v)),
+                RtVal::PtrOpt(Some((a, o))) => Ok(RtVal::Ptr(a, o)),
+                RtVal::Opt(None) | RtVal::PtrOpt(None) => Err(Trap {
+                    undef: false,
+                    message: "`.value` of an empty option".into(),
+                    span: e.span,
+                }),
+                _ => unreachable!("checked: option operand"),
+            },
             ExprKind::TraitCall { .. } => {
                 unreachable!("trait calls exist only in templates, never executed")
             }
@@ -2026,21 +2206,19 @@ impl<'a> Interp<'a> {
                 }
                 Ok(RtVal::Int(v))
             }
-            ExprKind::SomeE(inner) => {
-                match e.ty {
-                    Some(Ty::Option(_)) => {
-                        let v = self.eval_int(inner, frame)?;
-                        Ok(RtVal::Opt(Some(v)))
-                    }
-                    Some(Ty::OptionRaw(_)) => {
-                        let RtVal::Ptr(a, o) = self.eval(inner, frame)? else {
-                            unreachable!("checked: raw pointer option")
-                        };
-                        Ok(RtVal::PtrOpt(Some((a, o))))
-                    }
-                    _ => unreachable!("checked: option construction"),
+            ExprKind::SomeE(inner) => match e.ty {
+                Some(Ty::Option(_)) => {
+                    let v = self.eval_int(inner, frame)?;
+                    Ok(RtVal::Opt(Some(v)))
                 }
-            }
+                Some(Ty::OptionRaw(_)) => {
+                    let RtVal::Ptr(a, o) = self.eval(inner, frame)? else {
+                        unreachable!("checked: raw pointer option")
+                    };
+                    Ok(RtVal::PtrOpt(Some((a, o))))
+                }
+                _ => unreachable!("checked: option construction"),
+            },
             ExprKind::NoneE => match e.ty {
                 Some(Ty::Option(_)) => Ok(RtVal::Opt(None)),
                 Some(Ty::OptionRaw(_)) => Ok(RtVal::PtrOpt(None)),
@@ -2257,9 +2435,9 @@ impl<'a> Interp<'a> {
                 // the other transfers use.
                 let mut vals = Vec::with_capacity(args.len());
                 for (a, p) in args.iter().zip(&f.params) {
-                    if p.ty.is_resource()
-                        && (f.extern_info.is_some() || !has_resource_shadow(p.ty))
+                    if p.ty.is_resource() && (f.extern_info.is_some() || !has_resource_shadow(p.ty))
                     {
+                        self.eval_erased_resource_arg(a, frame)?;
                         continue;
                     }
                     vals.push(self.eval_moved(a, frame)?);

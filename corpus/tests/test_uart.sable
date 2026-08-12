@@ -1,0 +1,57 @@
+// Script 0 is immediately ready; script 1 becomes ready on its third status
+// read; every other script remains not-ready. Resource-view clauses are proof
+// state and therefore deliberately unavailable to the dynamic monitor.
+// expect-skip: uart.writes
+
+use uart;
+
+fn fail() {
+    u8 zero = 0;
+    u8 impossible = 1 / zero;
+}
+
+fn consume_immediate_uart(resource Uart uart) -> bool {
+    // Owned parameters are immutable source places. Move the erased token to
+    // a mutable local before handing unique access to the device intrinsic.
+    mut resource Uart device = uart;
+    mut bool ready = false;
+    unsafe {
+        u8 status = uart_status(&mut device);
+        ready = status != 0;
+    }
+    return ready;
+}
+
+fn test_uart_direct_resource_argument() {
+    // The resource value is erased from `consume_immediate_uart`'s runtime
+    // signature, but selecting the scripted profile is an ordered runtime
+    // effect and must happen before the callee starts polling.
+    bool ready = consume_immediate_uart(test_uart(0));
+    if (!ready) {
+        fail();
+    }
+}
+
+fn test_uart_immediate_ready() {
+    mut resource Uart uart = test_uart(0);
+    bool sent = uart_try_write(65, 1, &mut uart);
+    if (!sent) {
+        fail();
+    }
+}
+
+fn test_uart_delayed_ready() {
+    mut resource Uart uart = test_uart(1);
+    bool sent = uart_try_write(66, 3, &mut uart);
+    if (!sent) {
+        fail();
+    }
+}
+
+fn test_uart_poll_budget_exhausted() {
+    mut resource Uart uart = test_uart(2);
+    bool sent = uart_try_write(67, 4, &mut uart);
+    if (sent) {
+        fail();
+    }
+}

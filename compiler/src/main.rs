@@ -134,6 +134,8 @@ fn main() -> ExitCode {
             obligations,
             unsafe_regions,
             externs,
+            machine_profiles,
+            machine_intrinsics,
             deferred,
             assumed,
             warnings,
@@ -171,6 +173,12 @@ fn main() -> ExitCode {
                     for (id, reason, name) in &externs {
                         println!("    - {id} ({name}): {reason}");
                     }
+                }
+                for (id, hash) in &machine_profiles {
+                    println!("  machine profile: {id} ({hash})");
+                }
+                if !machine_intrinsics.is_empty() {
+                    println!("  machine intrinsics: {}", machine_intrinsics.join(", "));
                 }
                 if !deferred.is_empty() || !assumed.is_empty() {
                     println!(

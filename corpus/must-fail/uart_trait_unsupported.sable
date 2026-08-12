@@ -1,0 +1,12 @@
+// expect-error: uart.trait_unsupported
+// Template-level trait calls are modeled through pure abstract contracts.
+// Until those contracts carry resource state, a UART borrow in the trait
+// interface would bypass the singleton signature gate and crash VCgen.
+
+trait DevicePoll {
+    fn status(resource &mut Uart uart) -> u8;
+}
+
+fn generic_status<K: DevicePoll>(resource &mut Uart uart) -> u8 {
+    return K::status(&mut uart);
+}

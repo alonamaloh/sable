@@ -1,5 +1,33 @@
 // U8f3: walk an unchanged two-node sorted free list. Every inspected header
-// is reinserted before the ordinary runtime head advances.
+// is reinserted before the ordinary runtime head advances. The helper's
+// frame contract makes that restoration explicit at the Sable boundary;
+// callers never rely on a stale pre-loop allocator view.
+
+/// pre  #[label(base)] base.alloc = state.root.alloc ∧ base.off = 0
+/// pre  #[label(chain)] Sable.AllocatorView.StoredChain state limit head
+/// post #[label(frame)] state = old state
+/// post #[label(chain)] Sable.AllocatorView.StoredChain state limit head
+/// post #[label(end)] result = limit
+fn free_list_walk_unchanged(raw<u8> base,
+                            resource &mut AllocatorState state,
+                            u64 limit, u64 head) -> u64 {
+    mut u64 current = head;
+    /// invariant state = old state
+    /// invariant Sable.AllocatorView.StoredChain state limit current
+    /// variant limit - current
+    while (current != limit) {
+        resource FreeHeader node =
+            allocator_step_header(&mut state, limit, current);
+        mut u64 next = 0;
+        unsafe {
+            raw<u8> node_ptr = raw_offset(base, current);
+            next = raw_header_next(node_ptr, &node);
+        }
+        allocator_put_header(&mut state, node);
+        current = next;
+    }
+    return current;
+}
 
 /// post result = 64
 pub fn free_list_walk_two() -> u64 {
@@ -22,23 +50,7 @@ pub fn free_list_walk_two() -> u64 {
     }
     allocator_put_header(&mut state, left_header);
 
-    u64 limit = 64;
-    mut u64 current = 0;
-    /// invariant current <= limit
-    /// invariant Sable.AllocatorView.StoredChain state limit 0
-    /// invariant Sable.AllocatorView.StoredChain state limit current
-    /// variant limit - current
-    while (current != limit) {
-        resource FreeHeader node =
-            allocator_step_header(&mut state, limit, current);
-        mut u64 next = 0;
-        unsafe {
-            raw<u8> node_ptr = raw_offset(base, current);
-            next = raw_header_next(node_ptr, &node);
-        }
-        allocator_put_header(&mut state, node);
-        current = next;
-    }
+    u64 current = free_list_walk_unchanged(base, &mut state, 64, 0);
 
     mut resource FreeHeader left_cleanup = allocator_take_header(&mut state, 0);
     unsafe {
@@ -142,7 +154,7 @@ pub fn free_list_walk_two() -> u64 {
 ///       Sable.AllocatorView.leaseAt, Sable.AllocatorView.initial,
 ///       Sable.BlockLeaseView.toFree]
 
-/// discharge free_list_walk_two.inv_init.sable_allocatorview_storedchain_state_li by
+/// discharge free_list_walk_two.call_pre.free_list_walk_unchanged.chain by
 ///   have hrightkey : right_header.key = 32 := by
 ///     rw [h_right_header_init, h_header11_header, h_free10_suffix,
 ///       h_free8_take, h_allocator_view6_create]
@@ -229,123 +241,41 @@ pub fn free_list_walk_two() -> u64 {
 ///     omega
 ///   · omega
 
-/// discharge free_list_walk_two.inv_init.sable_allocatorview_storedchain_state_li.2 by
-///   have hrightkey : right_header.key = 32 := by
-///     rw [h_right_header_init, h_header11_header, h_free10_suffix,
-///       h_free8_take, h_allocator_view6_create]
+/// discharge free_list_walk_two.call_pre.free_list_walk_unchanged.base by
+///   constructor
+///   · rw [h_state_put_header_2, h_state_put_header,
+///       h_state_take_free, h_allocator_view6_create,
+///       h_base_system, h_mem_system]
 ///     rfl
-///   have hrightput : state.canPutHeader right_header := by
-///     unfold Sable.AllocatorView.canPutHeader
-///     refine ⟨?_, h_right_header_wf, ?_, ?_⟩
-///     · rw [h_right_header_init, h_header11_header,
-///         h_free10_suffix]
-///       change _free8.allocator = state.allocator
-///       exact h_free8_owner
-///     · simp [h_right_header_init, h_header11_header,
-///         h_free10_suffix, h_free8_take, h_state_take_free,
-///         h_allocator_view6_create, Sable.FreeHeaderView.putFields,
-///         Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix,
-///         Sable.AllocatorView.take, Sable.AllocatorView.takeFree,
-///         Sable.AllocatorView.leaseAt, Sable.AllocatorView.initial,
-///         Sable.BlockLeaseView.toFree]
-///     · simp [h_right_header_init, h_header11_header,
-///         h_free10_suffix, h_free8_take, h_state_take_free,
-///         h_allocator_view6_create, Sable.FreeHeaderView.putFields,
-///         Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix,
-///         Sable.AllocatorView.take, Sable.AllocatorView.takeFree,
-///         Sable.AllocatorView.leaseAt, Sable.AllocatorView.initial,
-///         Sable.BlockLeaseView.toFree]
-///   have hright : state_2.StoredChain 64 32 := by
-///     rw [h_state_put_header, ← hrightkey]
-///     apply Sable.AllocatorView.StoredChain.singleAfterPut
-///       (size := 32) (limit := 64) hrightput
-///     · rw [h_right_header_init]
-///       simp [Sable.FreeHeaderView.hasFields,
-///         Sable.FreeHeaderView.putFields]
-///     · rw [h_right_header_init, h_header11_header,
-///         Sable.FreeBlockView.toHeader_putFields_toFree_span_len,
-///         h_free10_split.2.2.2.2, h_free8_take,
-///         h_allocator_view6_create, h_mem_system]
-///       simp [Sable.AllocatorView.takeFree,
-///         Sable.AllocatorView.leaseAt, Sable.AllocatorView.initial,
-///         Sable.BlockLeaseView.toFree, Sable.SpanView.uninit]
-///     · intro k hlo hhi
-///       simp [h_state_take_free, h_allocator_view6_create,
-///         Sable.AllocatorView.take, Sable.AllocatorView.initial]
-///     · rw [h_right_header_init, h_header11_header,
-///         h_free10_suffix, h_free8_take, h_state_take_free,
-///         h_allocator_view6_create]
-///       rfl
-///     · rw [hrightkey]
-///       omega
-///     · simp [Sable.freeHeaderBytes, Sable.u64.layout]
-///     · rw [hrightkey]
-///       omega
-///   have hleftkey : left_header.key = 0 := by
-///     rw [h_left_header_init, h_header14_header, h_left_prefix,
-///       h_free8_take, h_allocator_view6_create]
-///     rfl
-///   rw [h_state_put_header_2, ← hleftkey]
-///   apply Sable.AllocatorView.StoredChain.prependAfterPut
-///     (size := 32) (next := 32) (limit := 64) hright
-///     h_fact_sable_allocatorview_canp
-///   · rw [h_left_header_init]
-///     simp [Sable.FreeHeaderView.hasFields,
-///       Sable.FreeHeaderView.putFields]
-///   · rw [h_left_header_init, h_header14_header,
-///       Sable.FreeBlockView.toHeader_putFields_toFree_span_len,
-///       h_left_prefix]
-///     rfl
-///   · intro k hlo hhi
-///     have hkright : k ≠ right_header.key := by
-///       rw [hleftkey] at hlo hhi
-///       rw [hrightkey]
-///       omega
-///     simp [h_state_put_header, h_state_take_free,
-///       h_allocator_view6_create, Sable.AllocatorView.putHeader,
-///       Sable.AllocatorView.take, Sable.AllocatorView.initial,
-///       hkright]
-///   · rw [h_left_header_init, h_header14_header, h_left_prefix,
-///       h_free8_take, h_state_put_header, h_state_take_free,
-///       h_allocator_view6_create]
-///     rfl
-///   · rw [hleftkey]
-///     omega
-///   · simp [Sable.freeHeaderBytes, Sable.u64.layout]
-///   · rw [hleftkey]
-///     omega
-///   · omega
+///   · rw [h_base_system]
+///     exact h_fact_mem_off_0_0_mem_len.1
 
-/// discharge free_list_walk_two.allocator_step_header.current by
-///   exact ⟨h_path_current_64,
-///     h_inv_sable_allocatorview_stor_2⟩
+/// discharge free_list_walk_unchanged.allocator_step_header.current by
+///   exact ⟨h_path_current_limit,
+///     h_inv_sable_allocatorview_stor⟩
 
-/// discharge free_list_walk_two.free_header.next by
+/// discharge free_list_walk_unchanged.free_header.next by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
 ///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
 ///     Sable.AllocatorView.StoredChain.step
-///       h_inv_sable_allocatorview_stor_2 h_path_current_64
-///   have hnode : _header23 = node := by
-///     rw [h_header23_step,
+///       h_inv_sable_allocatorview_stor h_path_current_limit
+///   have hnode : _header6 = node := by
+///     rw [h_header6_step,
 ///       Sable.AllocatorView.storesHeader_headerAt hstored]
 ///   have hwf := hstored.2.2.2.1
 ///   unfold Sable.FreeHeaderView.wf at hwf
 ///   obtain ⟨hsizewf, _, hkeyoff, halloc, _, hoff, _, _⟩ := hwf
 ///   have hlayout : node.sizeCell.layout = Sable.u64.layout :=
 ///     hsizewf.1
-///   have hroot : state_3.root = mem := by
-///     rw [h_state_put_header_2, h_state_put_header,
-///       h_state_take_free, h_allocator_view6_create]
-///     rfl
 ///   rw [hnode]
 ///   constructor
 ///   · constructor
 ///     · calc
 ///         node.nextCell.alloc = node.sizeCell.alloc := halloc.symm
-///         _ = state_3.root.alloc := hstored.2.2.2.2.2
-///         _ = mem.alloc := by rw [hroot]
-///         _ = (Sable.RawPtr.add base_2 current).alloc := by
-///           simp [h_base_system, Sable.SpanView.start]
+///         _ = state.root.alloc := hstored.2.2.2.2.2
+///         _ = _old_state.root.alloc := by rw [h_inv_state_old_state]
+///         _ = base.alloc := h_pre_base.1.symm
+///         _ = (Sable.RawPtr.add base current).alloc := rfl
 ///     · calc
 ///         node.nextCell.off =
 ///             node.sizeCell.off + node.sizeCell.layout.size := hoff.symm
@@ -353,80 +283,78 @@ pub fn free_list_walk_two() -> u64 {
 ///           rw [← hkeyoff, hlayout]
 ///         _ = current + Sable.u64.layout.size := by
 ///           rw [hstored.2.2.1]
-///         _ = (Sable.RawPtr.add base_2 current).off +
+///         _ = (Sable.RawPtr.add base current).off +
 ///             Sable.u64.layout.size := by
-///           simp [h_base_system, h_mem_system,
-///             Sable.SpanView.start, Sable.SpanView.uninit,
-///             Sable.RawPtr.add]
+///           rw [Sable.RawPtr.add_off, h_pre_base.2]
+///           omega
 ///   · rw [hfields.2]
 ///     simp
 
-/// discharge free_list_walk_two.allocator_put_header.3 by
-///   have htake : Sable.AllocatorView.canTakeHeader state_3 current :=
+/// discharge free_list_walk_unchanged.allocator_put_header by
+///   have hchain : _old_state.StoredChain limit current := by
+///     simpa [h_inv_state_old_state] using
+///       h_inv_sable_allocatorview_stor
+///   have htake : Sable.AllocatorView.canTakeHeader _old_state current :=
 ///     Sable.AllocatorView.StoredChain.takeable
-///       h_inv_sable_allocatorview_stor_2 h_path_current_64
-///   rw [h_state_step_header, h_header23_step]
+///       hchain h_path_current_limit
+///   rw [h_state_step_header, h_header6_step, h_inv_state_old_state]
 ///   exact Sable.AllocatorView.takeHeader_canPutHeader
-///     state_3 current htake
+///     _old_state current htake
 
-/// discharge free_list_walk_two.inv_preserved.current_limit by
+/// discharge free_list_walk_unchanged.inv_preserved.state_old_state by
+///   rw [h_state_put_header, h_state_step_header, h_header6_step]
+///   exact (Sable.AllocatorView.StoredChain.extract_restore
+///     h_inv_sable_allocatorview_stor h_path_current_limit).trans
+///     h_inv_state_old_state
+
+/// discharge free_list_walk_unchanged.inv_preserved.sable_allocatorview_storedchain_state_li by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
 ///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
 ///     Sable.AllocatorView.StoredChain.step
-///       h_inv_sable_allocatorview_stor_2 h_path_current_64
-///   have hnode : _header23 = node := by
-///     rw [h_header23_step,
+///       h_inv_sable_allocatorview_stor h_path_current_limit
+///   have hnode : _header6 = node := by
+///     rw [h_header6_step,
 ///       Sable.AllocatorView.storesHeader_headerAt hstored]
 ///   unfold Sable.FreeHeaderView.hasFields at hfields
-///   rw [hnode, hfields.2] at h_value24_header_next
-///   injection h_value24_header_next
-///   omega
-
-/// discharge free_list_walk_two.inv_preserved.sable_allocatorview_storedchain_state_li by
-///   have hrestore : state_5 = state_3 := by
-///     rw [h_state_put_header_3, h_state_step_header, h_header23_step]
-///     exact Sable.AllocatorView.StoredChain.extract_restore
-///       h_inv_sable_allocatorview_stor_2 h_path_current_64
-///   rw [hrestore]
-///   exact h_inv_sable_allocatorview_stor
-
-/// discharge free_list_walk_two.inv_preserved.sable_allocatorview_storedchain_state_li.2 by
-///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
-///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
-///     Sable.AllocatorView.StoredChain.step
-///       h_inv_sable_allocatorview_stor_2 h_path_current_64
-///   have hnode : _header23 = node := by
-///     rw [h_header23_step,
-///       Sable.AllocatorView.storesHeader_headerAt hstored]
-///   unfold Sable.FreeHeaderView.hasFields at hfields
-///   rw [hnode, hfields.2] at h_value24_header_next
-///   have hnext : storedNext = _value24 := by
-///     injection h_value24_header_next
-///   have hrestore : state_5 = state_3 := by
-///     rw [h_state_put_header_3, h_state_step_header, h_header23_step]
-///     exact Sable.AllocatorView.StoredChain.extract_restore
-///       h_inv_sable_allocatorview_stor_2 h_path_current_64
+///   rw [hnode, hfields.2] at h_value7_header_next
+///   have hnext : storedNext = _value7 := by
+///     injection h_value7_header_next
+///   have hrestore : state_3 = _old_state := by
+///     rw [h_state_put_header, h_state_step_header, h_header6_step]
+///     exact (Sable.AllocatorView.StoredChain.extract_restore
+///       h_inv_sable_allocatorview_stor h_path_current_limit).trans
+///       h_inv_state_old_state
 ///   rw [hrestore, ← hnext]
-///   exact tail
+///   simpa [h_inv_state_old_state] using tail
 
-/// discharge free_list_walk_two.variant_decreases.limit_current by
+/// discharge free_list_walk_unchanged.variant_decreases.limit_current by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
 ///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
 ///     Sable.AllocatorView.StoredChain.step
-///       h_inv_sable_allocatorview_stor_2 h_path_current_64
-///   have hnode : _header23 = node := by
-///     rw [h_header23_step,
+///       h_inv_sable_allocatorview_stor h_path_current_limit
+///   have hnode : _header6 = node := by
+///     rw [h_header6_step,
 ///       Sable.AllocatorView.storesHeader_headerAt hstored]
 ///   unfold Sable.FreeHeaderView.hasFields at hfields
-///   rw [hnode, hfields.2] at h_value24_header_next
-///   injection h_value24_header_next
+///   rw [hnode, hfields.2] at h_value7_header_next
+///   injection h_value7_header_next
 ///   simp [Sable.freeHeaderBytes, Sable.u64.layout] at hfit
 ///   rw [h_variant_limit_current]
 ///   omega
 
+/// discharge free_list_walk_unchanged.post.frame by
+///   exact h_inv_state_old_state
+
+/// discharge free_list_walk_unchanged.post.chain by
+///   rw [h_inv_state_old_state]
+///   exact h_pre_chain
+
+/// discharge free_list_walk_unchanged.post.end by
+///   omega
+
 /// discharge free_list_walk_two.allocator_take_header.0 by
 ///   exact Sable.AllocatorView.StoredChain.takeable
-///     h_inv_sable_allocatorview_stor (by omega)
+///     h_free_list_walk_unchanged_post_chain (by omega)
 
 /// discharge free_list_walk_two.free_header.clear by
 ///   have hleftkey : left_header.key = 0 := by
@@ -436,8 +364,8 @@ pub fn free_list_walk_two() -> u64 {
 ///   have hentry : state_3.headerAt 0 = left_header := by
 ///     rw [← hleftkey]
 ///     exact h_state_entry_header_2
-///   have hsame : _header27 = left_header := by
-///     rw [h_header27_take, hentry]
+///   have hsame : _header20 = left_header := by
+///     rw [h_header20_take, h_free_list_walk_unchanged_post_frame, hentry]
 ///   rw [hsame, h_left_header_init, h_header14_header, h_base_system,
 ///       h_left_prefix, h_free8_take, h_allocator_view6_create,
 ///       h_mem_system]
@@ -457,8 +385,8 @@ pub fn free_list_walk_two() -> u64 {
 ///   have hentry : state_3.headerAt 0 = left_header := by
 ///     rw [← hleftkey]
 ///     exact h_state_entry_header_2
-///   have hsame : _header27 = left_header := by
-///     rw [h_header27_take, hentry]
+///   have hsame : _header20 = left_header := by
+///     rw [h_header20_take, h_free_list_walk_unchanged_post_frame, hentry]
 ///   rw [h_left_cleanup_clear, hsame, h_left_header_init,
 ///       h_header14_header, h_base_system, h_left_prefix, h_free8_take,
 ///       h_allocator_view6_create, h_mem_system]
@@ -485,7 +413,7 @@ pub fn free_list_walk_two() -> u64 {
 ///     rw [h_state_put_header_2]
 ///     exact Sable.AllocatorView.putHeader_canTakeHeader_ne
 ///       state_2 left_header htake2 (by omega)
-///   rw [h_state_take_header]
+///   rw [h_state_take_header, h_free_list_walk_unchanged_post_frame]
 ///   exact Sable.AllocatorView.takeHeader_canTakeHeader_ne
 ///     state_3 htake3 (by omega)
 
@@ -506,12 +434,12 @@ pub fn free_list_walk_two() -> u64 {
 ///       Sable.AllocatorView.putHeader_headerAt_ne state_2 left_header
 ///         (by omega)]
 ///     exact hentry2
-///   have hentry6 : state_6.headerAt 32 = right_header := by
-///     rw [h_state_take_header,
+///   have hentry5 : state_5.headerAt 32 = right_header := by
+///     rw [h_state_take_header, h_free_list_walk_unchanged_post_frame,
 ///       Sable.AllocatorView.takeHeader_headerAt_ne state_3 (by omega)]
 ///     exact hentry3
-///   have hsame : _header31 = right_header := by
-///     rw [h_header31_take, hentry6]
+///   have hsame : _header24 = right_header := by
+///     rw [h_header24_take, hentry5]
 ///   rw [hsame, h_right_header_init, h_header11_header, h_base_system,
 ///       h_free10_suffix, h_free8_take, h_allocator_view6_create,
 ///       h_mem_system]
@@ -540,12 +468,12 @@ pub fn free_list_walk_two() -> u64 {
 ///       Sable.AllocatorView.putHeader_headerAt_ne state_2 left_header
 ///         (by omega)]
 ///     exact hentry2
-///   have hentry6 : state_6.headerAt 32 = right_header := by
-///     rw [h_state_take_header,
+///   have hentry5 : state_5.headerAt 32 = right_header := by
+///     rw [h_state_take_header, h_free_list_walk_unchanged_post_frame,
 ///       Sable.AllocatorView.takeHeader_headerAt_ne state_3 (by omega)]
 ///     exact hentry3
-///   have hsame : _header31 = right_header := by
-///     rw [h_header31_take, hentry6]
+///   have hsame : _header24 = right_header := by
+///     rw [h_header24_take, hentry5]
 ///   rw [h_right_cleanup_clear, hsame, h_right_header_init,
 ///       h_header11_header, h_base_system, h_free10_suffix,
 ///       h_free8_take, h_allocator_view6_create, h_mem_system]
@@ -565,8 +493,9 @@ pub fn free_list_walk_two() -> u64 {
 ///   have hleftentry : state_3.headerAt 0 = left_header := by
 ///     rw [← hleftkey]
 ///     exact h_state_entry_header_2
-///   have hleftsame : _header27 = left_header := by
-///     rw [h_header27_take, hleftentry]
+///   have hleftsame : _header20 = left_header := by
+///     rw [h_header20_take, h_free_list_walk_unchanged_post_frame,
+///       hleftentry]
 ///   have hrightkey : right_header.key = 32 := by
 ///     rw [h_right_header_init, h_header11_header, h_free10_suffix,
 ///       h_free8_take, h_allocator_view6_create]
@@ -579,24 +508,24 @@ pub fn free_list_walk_two() -> u64 {
 ///       Sable.AllocatorView.putHeader_headerAt_ne state_2 left_header
 ///         (by omega)]
 ///     exact hrightentry2
-///   have hrightentry6 : state_6.headerAt 32 = right_header := by
-///     rw [h_state_take_header,
+///   have hrightentry5 : state_5.headerAt 32 = right_header := by
+///     rw [h_state_take_header, h_free_list_walk_unchanged_post_frame,
 ///       Sable.AllocatorView.takeHeader_headerAt_ne state_3 (by omega)]
 ///     exact hrightentry3
-///   have hrightsame : _header31 = right_header := by
-///     rw [h_header31_take, hrightentry6]
+///   have hrightsame : _header24 = right_header := by
+///     rw [h_header24_take, hrightentry5]
 ///   have hleftRound :
-///       _free29.allocator = left.allocator ∧
-///       _free29.key = left.key ∧
-///       _free29.span.sameExtent left.span := by
-///     rw [h_free29_block, h_left_cleanup_clear, hleftsame,
+///       _free22.allocator = left.allocator ∧
+///       _free22.key = left.key ∧
+///       _free22.span.sameExtent left.span := by
+///     rw [h_free22_block, h_left_cleanup_clear, hleftsame,
 ///       h_left_header_init, h_header14_header]
 ///     exact Sable.FreeHeaderView.roundTrip_identity left 32 32
 ///   have hrightRound :
-///       _free33.allocator = _free10.allocator ∧
-///       _free33.key = _free10.key ∧
-///       _free33.span.sameExtent _free10.span := by
-///     rw [h_free33_block, h_right_cleanup_clear, hrightsame,
+///       _free26.allocator = _free10.allocator ∧
+///       _free26.key = _free10.key ∧
+///       _free26.span.sameExtent _free10.span := by
+///     rw [h_free26_block, h_right_cleanup_clear, hrightsame,
 ///       h_right_header_init, h_header11_header]
 ///     exact Sable.FreeHeaderView.roundTrip_identity _free10 32 64
 ///   have horiginal : left.joinable _free10 := by
@@ -616,20 +545,22 @@ pub fn free_list_walk_two() -> u64 {
 ///   have hleftentry : state_3.headerAt 0 = left_header := by
 ///     rw [← hleftkey]
 ///     exact h_state_entry_header_2
-///   have hleftsame : _header27 = left_header := by
-///     rw [h_header27_take, hleftentry]
+///   have hleftsame : _header20 = left_header := by
+///     rw [h_header20_take, h_free_list_walk_unchanged_post_frame,
+///       hleftentry]
 ///   unfold Sable.AllocatorView.canPutFree
-///   refine ⟨?_, h_free34_wf, ?_⟩
-///   · rw [h_free34_owner, h_free29_block, h_left_cleanup_clear]
-///     change _header27.allocator = state_7.allocator
+///   refine ⟨?_, h_free27_wf, ?_⟩
+///   · rw [h_free27_owner, h_free22_block, h_left_cleanup_clear]
+///     change _header20.allocator = state_6.allocator
 ///     rw [h_state_take_header_2]
-///     exact h_header27_owner
-///   · have hkey : _free34.key = 0 := by
-///       rw [h_free34_join, h_free29_block, h_left_cleanup_clear,
+///     exact h_header20_owner
+///   · have hkey : _free27.key = 0 := by
+///       rw [h_free27_join, h_free22_block, h_left_cleanup_clear,
 ///         hleftsame]
 ///       simpa [Sable.FreeBlockView.join, Sable.FreeHeaderView.toFree,
 ///         Sable.FreeHeaderView.clearFields] using hleftkey
-///     rw [hkey, h_state_take_header_2, h_state_take_header]
+///     rw [hkey, h_state_take_header_2, h_state_take_header,
+///       h_free_list_walk_unchanged_post_frame]
 ///     simp [Sable.AllocatorView.takeHeader]
 
 /// discharge free_list_walk_two.allocator_destroy by
@@ -643,31 +574,33 @@ pub fn free_list_walk_two() -> u64 {
 ///   subst state_2
 ///   subst _header14
 ///   subst left_header
+///   subst state_4
 ///   subst state_3
-///   subst state_6
-///   subst _header27
+///   subst state_5
+///   subst _header20
 ///   subst left_cleanup
-///   subst _free29
-///   subst state_7
-///   subst _header31
+///   subst _free22
+///   subst state_6
+///   subst _header24
 ///   subst right_cleanup
-///   subst _free33
-///   subst _free34
-///   subst state_8
+///   subst _free26
+///   subst _free27
+///   subst state_7
 ///   exact
 ///     Sable.AllocatorView.initialSplitStoredHeadersRoundTrip_complete
 ///       _allocator5 mem 32 32 32 32 64 (by omega)
 
 /// discharge free_list_walk_two.system_dealloc by
-///   have hroot : state_8.root = mem := by
+///   have hroot : state_7.root = mem := by
 ///     rw [h_state_put_free, h_state_take_header_2,
-///       h_state_take_header, h_state_put_header_2,
+///       h_state_take_header, h_free_list_walk_unchanged_post_frame,
+///       h_state_put_header_2,
 ///       h_state_put_header, h_state_take_free,
 ///       h_allocator_view6_create]
 ///     rfl
 ///   simp [h_base_system, h_release_system, h_mem_system, hroot,
-///     h_view36_extent.1, h_view36_extent.2.1,
-///     h_view36_extent.2.2]
+///     h_view29_extent.1, h_view29_extent.2.1,
+///     h_view29_extent.2.2]
 
 /// discharge free_list_walk_two.post.result_64 by
 ///   omega

@@ -1,0 +1,9 @@
+// expect-error: resource.use_after_move
+
+fn consume_uart(resource Uart uart) {
+}
+
+fn reuse(resource Uart uart) {
+    consume_uart(uart);
+    consume_uart(uart);
+}

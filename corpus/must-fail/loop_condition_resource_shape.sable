@@ -1,0 +1,20 @@
+// expect-error: resource.loop_shape
+// Regression guard: an effectful condition is part of every iteration.
+// The first condition evaluation moves `span`; after the body decreases the
+// integer measure, the backedge would evaluate the condition again without
+// owning `span`. Snapshotting ownership only after the condition hid that
+// recurrence and incorrectly accepted the loop.
+
+/// post result ↔ n > 0
+fn consume_if_positive(resource RawSpan span, u64 n) -> bool {
+    return n > 0;
+}
+
+fn condition_consumes_span(resource RawSpan span) {
+    mut u64 n = 1;
+    /// invariant n <= 1
+    /// variant n
+    while (consume_if_positive(span, n)) {
+        n = n - 1;
+    }
+}

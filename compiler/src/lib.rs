@@ -14,6 +14,7 @@ pub mod lsp;
 pub mod modules;
 pub mod mono;
 pub mod parser;
+pub mod profile;
 pub mod scan;
 pub mod span;
 pub mod speceval;
@@ -36,6 +37,8 @@ pub enum Outcome {
         obligations: usize,
         unsafe_regions: usize,
         externs: Vec<(String, String, String)>,
+        machine_profiles: Vec<(String, String)>,
+        machine_intrinsics: Vec<String>,
         /// Obligations compiled to runtime traps (sound escape).
         deferred: Vec<String>,
         /// Obligations taken as audited axioms (unsound escape): (name, reason).
@@ -63,6 +66,10 @@ pub struct VerifiedInfo {
     /// verified *relative to* a boundary, and the status must say so
     /// (ADR 0027).
     pub externs: Vec<(String, String, String)>,
+    /// Formal machine profiles and their semantic content hashes. These are
+    /// dependencies, not audited assumptions.
+    pub machine_profiles: Vec<(String, String)>,
+    pub machine_intrinsics: Vec<String>,
     pub deferred: Vec<String>,
     pub assumed: Vec<(String, String)>,
     /// Automation-budget warnings (non-fatal), as diagnostics.
@@ -150,6 +157,8 @@ pub fn check_file(path: &Path, opts: &Options) -> Outcome {
             obligations: info.obligations,
             unsafe_regions: info.unsafe_regions,
             externs: info.externs,
+            machine_profiles: info.machine_profiles,
+            machine_intrinsics: info.machine_intrinsics,
             deferred: info.deferred,
             assumed: info.assumed,
             warnings: info
@@ -221,6 +230,8 @@ pub fn check_file_structured(
     let obligations = prep.emitted.names.thms.len();
     let unsafe_regions = prep.unsafe_regions;
     let externs = prep.vc.trust.externs.clone();
+    let machine_profiles = prep.vc.machine.profiles.clone();
+    let machine_intrinsics = prep.vc.machine.intrinsics.clone();
 
     if opts.emit_lean_only {
         print!("{}", prep.emitted.lean_source);
@@ -231,6 +242,8 @@ pub fn check_file_structured(
                 obligations,
                 unsafe_regions,
                 externs,
+                machine_profiles,
+                machine_intrinsics,
                 deferred,
                 assumed,
                 warnings: Vec::new(),
@@ -238,45 +251,35 @@ pub fn check_file_structured(
         );
     }
 
-    // The root's file is checked at a *stable* path so the daemon's
-    // warm document reuse keeps working across edits (its header still
-    // changes whenever a dep artifact does, which is exactly when the
-    // worker must reload imports).
-    let out_dir = repo_root.join(".sable-out");
-    if let Err(err) = std::fs::create_dir_all(&out_dir) {
-        return (
-            mods,
-            Err(vec![io_diag(
-                "io.out_dir",
-                format!("cannot create {}: {err}", out_dir.display()),
-            )]),
-        );
-    }
-    let stem = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "module".into());
-    let lean_file = out_dir.join(format!("{stem}.lean"));
-    if let Err(err) = std::fs::write(&lean_file, &prep.emitted.lean_source) {
-        return (
-            mods,
-            Err(vec![io_diag(
-                "io.write",
-                format!("cannot write {}: {err}", lean_file.display()),
-            )]),
-        );
-    }
+    // Root documents are immutable and content-addressed. Concurrent checks
+    // of the same basename or different source versions cannot overwrite the
+    // exact bytes this verification is about to send to Lean.
+    let lean_file = match artifacts::write_root_generated(&repo_root, opts, &prep) {
+        Ok(path) => path,
+        Err(message) => return (mods, Err(vec![io_diag("io.write", message)])),
+    };
 
     // Warm path: a running `sable daemon` keeps a Lean server alive and
     // skips the per-check cold start. Any daemon problem falls back to
     // the batch invocation, unchanged — including a daemon started
     // before the generated-artifact directory was on its search path
     // (its messages then report unknown modules).
-    let daemon_messages = daemon::try_check(&repo_root, &lean_file)
-        .filter(|ms| !ms.iter().any(|m| m.data.contains("unknown module")));
+    let daemon_messages = daemon::try_check(
+        &repo_root,
+        &lean_file,
+        &prep.proof_environment,
+        &prep.emitted.lean_source,
+    )
+    .filter(|ms| !ms.iter().any(|m| m.data.contains("unknown module")));
     let messages = match daemon_messages {
         Some(m) => m,
-        None => match lean::run_lean(&repo_root, &lean_file, None) {
+        None => match lean::run_lean(
+            &repo_root,
+            &prep.proof_environment,
+            &lean_file,
+            None,
+            &prep.emitted.lean_source,
+        ) {
             Ok(m) => m,
             Err(msg) => return (mods, Err(vec![io_diag("internal.lean_invocation", msg)])),
         },
@@ -286,7 +289,7 @@ pub fn check_file_structured(
     if diags.is_empty() {
         // Record the verification so importers reuse it (ADR 0013
         // slice 2): same content, same artifact, proven once.
-        if let Err(msg) = artifacts::stamp_verified(&repo_root, &prep) {
+        if let Err(msg) = artifacts::stamp_verified(&repo_root, opts, &prep) {
             return (mods, Err(vec![io_diag("io.write", msg)]));
         }
         let mut warnings =
@@ -299,6 +302,8 @@ pub fn check_file_structured(
                 obligations,
                 unsafe_regions,
                 externs,
+                machine_profiles,
+                machine_intrinsics,
                 deferred,
                 assumed,
                 warnings,

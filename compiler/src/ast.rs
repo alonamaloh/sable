@@ -164,6 +164,9 @@ pub enum ResKind {
     /// must receive this explicitly, which is what replaces a free-form
     /// `modifies` clause over the outside.
     PosixWorld,
+    /// Authority for one UART device profile. Device operations mutate its
+    /// logical view; the interpreter separately records concrete MMIO events.
+    Uart,
     /// The unique authority to release one system allocation. Mandatory:
     /// it must reach the compiler-sealed deallocation operation (ADR 0036).
     SystemDealloc,
@@ -211,6 +214,9 @@ pub enum ResOp {
     /// tests only. This is the one place authority appears from nothing,
     /// and the checker confines it to `test_` functions.
     TestWorld,
+    /// `test_uart(script) -> resource Uart` — a scripted device profile,
+    /// confined to dynamic tests just like `posix_world`.
+    TestUart,
     /// Fold one complete raw extent into a fresh allocator aggregate.
     AllocatorCreate,
     /// Unfold a complete allocator aggregate back to its raw root.
@@ -243,6 +249,7 @@ impl ResOp {
             "join" => Some(ResOp::Join),
             "open_file" => Some(ResOp::OpenFileOf),
             "posix_world" => Some(ResOp::TestWorld),
+            "test_uart" => Some(ResOp::TestUart),
             "allocator_create" => Some(ResOp::AllocatorCreate),
             "allocator_destroy" => Some(ResOp::AllocatorDestroy),
             "allocator_take" => Some(ResOp::AllocatorTake),
@@ -269,6 +276,7 @@ impl ResOp {
             ResOp::Join => "join",
             ResOp::OpenFileOf => "open_file",
             ResOp::TestWorld => "posix_world",
+            ResOp::TestUart => "test_uart",
             ResOp::AllocatorCreate => "allocator_create",
             ResOp::AllocatorDestroy => "allocator_destroy",
             ResOp::AllocatorTake => "allocator_take",
@@ -285,6 +293,39 @@ impl ResOp {
             ResOp::ResourceMapEmpty => "resource_map_empty",
             ResOp::ResourceMapTake => "resource_map_take",
             ResOp::ResourceMapPut => "resource_map_put",
+        }
+    }
+}
+
+/// Profile-mediated device operations. These are neither authority
+/// transformations nor ordinary raw-memory operations: they produce ordered
+/// MMIO observations against a concrete platform profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceOp {
+    UartStatus,
+    UartWrite,
+}
+
+impl DeviceOp {
+    pub fn from_name(name: &str) -> Option<DeviceOp> {
+        match name {
+            "uart_status" => Some(DeviceOp::UartStatus),
+            "uart_write" => Some(DeviceOp::UartWrite),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DeviceOp::UartStatus => "uart_status",
+            DeviceOp::UartWrite => "uart_write",
+        }
+    }
+
+    pub fn arity(self) -> usize {
+        match self {
+            DeviceOp::UartStatus => 1,
+            DeviceOp::UartWrite => 2,
         }
     }
 }
@@ -404,13 +445,21 @@ impl RawOp {
             RawOp::Load8 => 2,
             RawOp::Store8 => 3,
             RawOp::Copy => 5,
-            RawOp::IntoCellU64 | RawOp::FromCellU64 | RawOp::CellReadU64
-            | RawOp::CellTakeU64 | RawOp::CellDropU64
-            | RawOp::IntoCellRecord(_) | RawOp::FromCellRecord(_)
-            | RawOp::CellReadRecord(_) | RawOp::CellTakeRecord(_)
+            RawOp::IntoCellU64
+            | RawOp::FromCellU64
+            | RawOp::CellReadU64
+            | RawOp::CellTakeU64
+            | RawOp::CellDropU64
+            | RawOp::IntoCellRecord(_)
+            | RawOp::FromCellRecord(_)
+            | RawOp::CellReadRecord(_)
+            | RawOp::CellTakeRecord(_)
             | RawOp::CellDropRecord(_)
-            | RawOp::IntoFreeHeader | RawOp::FromFreeHeader
-            | RawOp::HeaderSize | RawOp::HeaderNext | RawOp::HeaderClear => 2,
+            | RawOp::IntoFreeHeader
+            | RawOp::FromFreeHeader
+            | RawOp::HeaderSize
+            | RawOp::HeaderNext
+            | RawOp::HeaderClear => 2,
             RawOp::CellInitU64 | RawOp::CellInitRecord(_) => 3,
             RawOp::CastRecord(_) | RawOp::PointerOffsetRecord(_) => 1,
             RawOp::HeaderInit => 4,
@@ -424,6 +473,7 @@ impl ResKind {
             "RawSpan" => Some(ResKind::RawSpan),
             "OpenFile" => Some(ResKind::OpenFile),
             "PosixWorld" => Some(ResKind::PosixWorld),
+            "Uart" => Some(ResKind::Uart),
             "SystemDealloc" => Some(ResKind::SystemDealloc),
             "AllocatorState" => Some(ResKind::AllocatorState),
             "BlockLease" => Some(ResKind::BlockLease),
@@ -440,6 +490,7 @@ impl ResKind {
             ResKind::PointsToRecord(_) => "PointsTo<record>",
             ResKind::OpenFile => "OpenFile",
             ResKind::PosixWorld => "PosixWorld",
+            ResKind::Uart => "Uart",
             ResKind::SystemDealloc => "SystemDealloc",
             ResKind::AllocatorState => "AllocatorState",
             ResKind::BlockLease => "BlockLease",
@@ -447,8 +498,7 @@ impl ResKind {
             ResKind::FreeBlock => "FreeBlock",
             ResKind::FreeHeader => "FreeHeader",
             ResKind::ResourceMapPointsToU64 => "ResourceMap<u64, PointsTo<u64>>",
-            ResKind::ResourceMapPointsToRecord(_) =>
-                "ResourceMap<u64, PointsTo<record>>",
+            ResKind::ResourceMapPointsToRecord(_) => "ResourceMap<u64, PointsTo<record>>",
         }
     }
 
@@ -475,20 +525,22 @@ impl ResKind {
         match self {
             ResKind::RawSpan => "Sable.SpanView",
             ResKind::PointsToU64 => "Sable.PointsToView Int",
-            ResKind::PointsToRecord(_) =>
-                unreachable!("record resource views need the program record table"),
+            ResKind::PointsToRecord(_) => {
+                unreachable!("record resource views need the program record table")
+            }
             ResKind::OpenFile => "Sable.OpenFileView",
             ResKind::PosixWorld => "Sable.PosixWorldView",
+            ResKind::Uart => "Sable.UartView",
             ResKind::SystemDealloc => "Sable.SystemDeallocView",
             ResKind::AllocatorState => "Sable.AllocatorView",
             ResKind::BlockLease => "Sable.BlockLeaseView",
             ResKind::LeasedPointsToU64 => "Sable.LeasedPointsToU64View",
             ResKind::FreeBlock => "Sable.FreeBlockView",
             ResKind::FreeHeader => "Sable.FreeHeaderView",
-            ResKind::ResourceMapPointsToU64 =>
-                "Sable.ResourceMapView Int (Sable.PointsToView Int)",
-            ResKind::ResourceMapPointsToRecord(_) =>
-                unreachable!("record resource-map views need the program record table"),
+            ResKind::ResourceMapPointsToU64 => "Sable.ResourceMapView Int (Sable.PointsToView Int)",
+            ResKind::ResourceMapPointsToRecord(_) => {
+                unreachable!("record resource-map views need the program record table")
+            }
         }
     }
 
@@ -503,6 +555,16 @@ impl ResKind {
                 | ResKind::LeasedPointsToU64
                 | ResKind::FreeBlock
                 | ResKind::FreeHeader
+        )
+    }
+
+    /// Resource views whose erased authority may cross the audited extern
+    /// boundary. This is deliberately a whitelist: adding a resource kind
+    /// does not silently grant it foreign-call semantics.
+    pub fn extern_abi_allowed(self) -> bool {
+        matches!(
+            self,
+            ResKind::RawSpan | ResKind::OpenFile | ResKind::PosixWorld
         )
     }
 }
@@ -635,6 +697,14 @@ pub enum ExprKind {
     /// A raw machine operation. Its contract is generated (ADR 0026).
     RawOp {
         op: RawOp,
+        op_span: Span,
+        args: Vec<Expr>,
+    },
+    /// A profile-mediated device access. It requires explicit affine
+    /// authority and an `unsafe` audit boundary, but never exposes a raw
+    /// address to source code.
+    DeviceOp {
+        op: DeviceOp,
         op_span: Span,
         args: Vec<Expr>,
     },
@@ -846,10 +916,7 @@ pub enum Stmt {
     /// `unsafe { ... }` — the block raw operations may be called in. It
     /// is a marker, not a scope: locals declared inside still belong to
     /// the enclosing function (ADR 0026).
-    Unsafe {
-        kw_span: Span,
-        body: Vec<Stmt>,
-    },
+    Unsafe { kw_span: Span, body: Vec<Stmt> },
     /// `unsafe static_alloc(N) as (p, resource m);` — acquire one fresh,
     /// program-lifetime raw root. There is deliberately no deallocation
     /// authority on this rung (ADR 0033).

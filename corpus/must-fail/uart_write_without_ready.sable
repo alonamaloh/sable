@@ -1,0 +1,7 @@
+// expect-error: uart.write_ready
+
+fn write_without_poll(u8 byte, resource &mut Uart uart) {
+    unsafe {
+        uart_write(byte, &mut uart);
+    }
+}

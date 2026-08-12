@@ -6,7 +6,7 @@
 //!
 //!   1. prove each invariant at loop entry (goal = invariant text with
 //!      variables substituted by their current symbolic values);
-//!   2. havoc every variable the body assigns (fresh binders under their
+//!   2. havoc every variable the condition or body may mutate (fresh binders under their
 //!      *source names*, so invariant/variant clauses splice verbatim as
 //!      hypotheses), dropping hypotheses that mention havocked names;
 //!   3. body path: assume invariants + condition, execute the body, and at
@@ -24,6 +24,7 @@ use crate::check::FnSig;
 use crate::scan::Clause;
 use crate::span::Span;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct Obligation {
@@ -63,6 +64,9 @@ pub struct VcResult {
     /// artifact must not survive a change to what it trusted, and the
     /// hash is over bytes, so a comment is enough.
     pub trust: TrustManifest,
+    /// Formal machine semantics this module uses. Unlike `trust`, these
+    /// entries are kernel-checked dependencies rather than audited axioms.
+    pub machine: MachineManifest,
 }
 
 /// Everything a reader must take on faith to believe this module.
@@ -70,6 +74,17 @@ pub struct VcResult {
 pub struct TrustManifest {
     /// Audited extern contracts, as `(audit id, reason, name)`, sorted.
     pub externs: Vec<(String, String, String)>,
+}
+
+/// Profile identity and the exact compiler-sealed intrinsics a module uses.
+/// Both land in the generated artifact so semantic changes invalidate cached
+/// evidence and build output can name the machine being verified against.
+#[derive(Debug, Clone, Default)]
+pub struct MachineManifest {
+    /// `(stable profile id, content hash of its formal semantics)`.
+    pub profiles: Vec<(String, String)>,
+    /// Sorted source spellings of used profile operations.
+    pub intrinsics: Vec<String>,
 }
 
 /// A class as the Lean emitter needs it: `structure name where fields`.
@@ -95,6 +110,181 @@ pub struct RecordFieldEmit {
     pub layout: String,
     pub offset: i128,
     pub wf: Option<String>,
+}
+
+fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
+    fn is_uart_ty(ty: Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
+        )
+    }
+
+    fn signature_uses_uart(function: &Fn) -> bool {
+        is_uart_ty(function.ret) || function.params.iter().any(|param| is_uart_ty(param.ty))
+    }
+
+    fn visit_expr(expr: &Expr, uses_uart: &mut bool, used: &mut HashSet<String>) {
+        *uses_uart |= expr.ty.is_some_and(is_uart_ty);
+        match &expr.kind {
+            ExprKind::DeviceOp { op, args, .. } => {
+                used.insert(op.name().into());
+                for arg in args {
+                    visit_expr(arg, uses_uart, used);
+                }
+            }
+            ExprKind::ResOp { op, args, .. } => {
+                if *op == ResOp::TestUart {
+                    used.insert(op.name().into());
+                }
+                for arg in args {
+                    visit_expr(arg, uses_uart, used);
+                }
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Widen { arg: operand, .. }
+            | ExprKind::Narrow { arg: operand, .. }
+            | ExprKind::IsSome { operand }
+            | ExprKind::OptValue { operand }
+            | ExprKind::SomeE(operand) => visit_expr(operand, uses_uart, used),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                visit_expr(lhs, uses_uart, used);
+                visit_expr(rhs, uses_uart, used);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::RawOp { args, .. }
+            | ExprKind::CtorCall { args, .. }
+            | ExprKind::RecordLit { args, .. }
+            | ExprKind::TraitCall { args, .. }
+            | ExprKind::MethodCall { args, .. }
+            | ExprKind::ArrayLit(args) => {
+                for arg in args {
+                    visit_expr(arg, uses_uart, used);
+                }
+            }
+            ExprKind::Index { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. } => {
+                visit_expr(index, uses_uart, used)
+            }
+            ExprKind::AllocArray { len, init, .. } => {
+                visit_expr(len, uses_uart, used);
+                visit_expr(init, uses_uart, used);
+            }
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Var(_)
+            | ExprKind::Len { .. }
+            | ExprKind::NoneE
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::Borrow { .. } => {}
+        }
+    }
+
+    fn visit_block(block: &[Stmt], uses_uart: &mut bool, used: &mut HashSet<String>) {
+        for stmt in block {
+            match stmt {
+                Stmt::Decl { ty, init, .. } => {
+                    *uses_uart |= is_uart_ty(*ty);
+                    if let Some(expr) = init {
+                        visit_expr(expr, uses_uart, used);
+                    }
+                }
+                Stmt::Assign { value, .. }
+                | Stmt::VarDecl { init: value, .. }
+                | Stmt::FieldAssign { value, .. }
+                | Stmt::ExprStmt(value) => visit_expr(value, uses_uart, used),
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    visit_expr(cond, uses_uart, used);
+                    visit_block(then_block, uses_uart, used);
+                    if let Some(block) = else_block {
+                        visit_block(block, uses_uart, used);
+                    }
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(expr) = value {
+                        visit_expr(expr, uses_uart, used);
+                    }
+                }
+                Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                    visit_expr(index, uses_uart, used);
+                    visit_expr(value, uses_uart, used);
+                }
+                Stmt::While { cond, body, .. } => {
+                    visit_expr(cond, uses_uart, used);
+                    visit_block(body, uses_uart, used);
+                }
+                Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                    visit_block(body, uses_uart, used);
+                }
+                Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                    visit_expr(size, uses_uart, used);
+                }
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
+                    visit_expr(ptr, uses_uart, used);
+                    visit_expr(res, uses_uart, used);
+                    visit_expr(release, uses_uart, used);
+                }
+                Stmt::Assert(_) => {}
+            }
+        }
+    }
+
+    fn visit_fn(function: &Fn, uses_uart: &mut bool, used: &mut HashSet<String>) {
+        *uses_uart |= signature_uses_uart(function);
+        visit_block(&function.body, uses_uart, used);
+    }
+
+    let mut uses_uart = false;
+    let mut used = HashSet::new();
+    for function in &program.fns {
+        if function.name.starts_with("test_") {
+            // Tests are dynamic-only and generate neither definitions nor
+            // obligations. Their bodies (including `test_uart`) therefore do
+            // not belong in a verification manifest. The checker also enforces
+            // that test signatures are parameterless procedures.
+            continue;
+        }
+        visit_fn(function, &mut uses_uart, &mut used);
+    }
+    for function in &program.fn_templates {
+        visit_fn(function, &mut uses_uart, &mut used);
+    }
+    for class in program.classes.iter().chain(&program.class_templates) {
+        uses_uart |= class.fields.iter().any(|field| is_uart_ty(field.ty));
+        for init in &class.inits {
+            visit_fn(init, &mut uses_uart, &mut used);
+        }
+        for method in &class.methods {
+            visit_fn(&method.f, &mut uses_uart, &mut used);
+        }
+        if let Some(body) = &class.deinit {
+            visit_block(body, &mut uses_uart, &mut used);
+        }
+    }
+    for implementation in &program.impls {
+        for function in &implementation.fns {
+            visit_fn(function, &mut uses_uart, &mut used);
+        }
+    }
+    for trait_decl in &program.traits {
+        for method in &trait_decl.methods {
+            uses_uart |= signature_uses_uart(method);
+        }
+    }
+    let mut used: Vec<String> = used.into_iter().collect();
+    used.sort();
+    (uses_uart || !used.is_empty(), used)
 }
 
 fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> String {
@@ -126,10 +316,9 @@ fn lean_record_field_layout(ty: Ty) -> String {
 
 fn lean_res_view_ty(kind: ResKind, records: &[RecordDecl]) -> String {
     match kind {
-        ResKind::PointsToRecord(ri) => format!(
-            "Sable.PointsToView {}",
-            lean_record_name(&records[ri].name)
-        ),
+        ResKind::PointsToRecord(ri) => {
+            format!("Sable.PointsToView {}", lean_record_name(&records[ri].name))
+        }
         ResKind::ResourceMapPointsToRecord(ri) => format!(
             "Sable.ResourceMapView Int (Sable.PointsToView {})",
             lean_record_name(&records[ri].name)
@@ -165,8 +354,7 @@ fn emit_extern_clause_wfs(
         match p.ty {
             Ty::Int(_) => binders.push((p.name.clone(), "Int".into())),
             Ty::Bool => binders.push((p.name.clone(), "Bool".into())),
-            Ty::Raw(_) | Ty::RawRecord(_) =>
-                binders.push((p.name.clone(), "Sable.RawPtr".into())),
+            Ty::Raw(_) | Ty::RawRecord(_) => binders.push((p.name.clone(), "Sable.RawPtr".into())),
             Ty::Res(k) | Ty::ResRef(k, _) => {
                 binders.push((p.name.clone(), lean_res_view_ty(k, &program.records)));
                 if matches!(p.ty, Ty::ResRef(_, Mutability::Mut)) {
@@ -180,10 +368,10 @@ fn emit_extern_clause_wfs(
             Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                 binders.push((p.name.clone(), lean_class_name(&program.classes[ci].name)))
             }
-            Ty::Record(ri) =>
-                binders.push((p.name.clone(), lean_record_name(&program.records[ri].name))),
-            Ty::OptionRaw(_) =>
-                binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
+            Ty::Record(ri) => {
+                binders.push((p.name.clone(), lean_record_name(&program.records[ri].name)))
+            }
+            Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
             Ty::Option(_) | Ty::Unit => {}
         }
     }
@@ -213,7 +401,12 @@ fn emit_extern_clause_wfs(
     }
 }
 
-pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) -> VcResult {
+pub fn generate(
+    program: &Program,
+    sigs: &HashMap<String, FnSig>,
+    source: &str,
+    repo_root: &Path,
+) -> Result<VcResult, String> {
     let fn_map: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let trait_map: HashMap<&str, &TraitDecl> = program
         .traits
@@ -225,6 +418,14 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         .iter()
         .map(|c| (c.name.as_str(), c))
         .collect();
+    let (uses_uart_profile, uart_intrinsics) = collect_uart_dependencies(program);
+    let uart_profile = uses_uart_profile
+        .then(|| {
+            crate::profile::uart_poll_v1_hash(repo_root).map(|hash| {
+                vec![(crate::profile::UART_POLL_V1_ID.into(), hash)]
+            })
+        })
+        .transpose()?;
     let mut result = VcResult {
         ghosts: program.ghosts.clone(),
         classes: program
@@ -235,7 +436,12 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 fields: c
                     .fields
                     .iter()
-                    .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes, &program.records)))
+                    .map(|f| {
+                        (
+                            f.name.clone(),
+                            lean_field_ty(f.ty, &program.classes, &program.records),
+                        )
+                    })
                     .collect(),
                 span: c.name_span,
             })
@@ -248,24 +454,21 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 fields: r
                     .fields
                     .iter()
-                    .map(|f| {
-                        RecordFieldEmit {
-                            name: f.name.clone(),
-                            lean_ty: lean_field_ty(
-                                f.ty,
-                                &program.classes,
-                                &program.records,
-                            ),
-                            layout: lean_record_field_layout(f.ty),
-                            offset: f.offset,
-                            wf: match f.ty {
-                                Ty::Int(it) => Some(format!(
-                                    "{} ≤ value.{} ∧ value.{} ≤ {}",
-                                    it.lean_min(), f.name, f.name, it.lean_max()
-                                )),
-                                _ => None,
-                            },
-                        }
+                    .map(|f| RecordFieldEmit {
+                        name: f.name.clone(),
+                        lean_ty: lean_field_ty(f.ty, &program.classes, &program.records),
+                        layout: lean_record_field_layout(f.ty),
+                        offset: f.offset,
+                        wf: match f.ty {
+                            Ty::Int(it) => Some(format!(
+                                "{} ≤ value.{} ∧ value.{} ≤ {}",
+                                it.lean_min(),
+                                f.name,
+                                f.name,
+                                it.lean_max()
+                            )),
+                            _ => None,
+                        },
                     })
                     .collect(),
                 layout: r.layout,
@@ -285,15 +488,19 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                     .fns
                     .iter()
                     .filter_map(|f| {
-                        f.extern_info.as_ref().map(|x| {
-                            (x.audit_id.clone(), x.reason.clone(), f.name.clone())
-                        })
+                        f.extern_info
+                            .as_ref()
+                            .map(|x| (x.audit_id.clone(), x.reason.clone(), f.name.clone()))
                     })
                     .collect();
                 v.sort();
                 v.dedup();
                 v
             },
+        },
+        machine: MachineManifest {
+            profiles: uart_profile.unwrap_or_default(),
+            intrinsics: uart_intrinsics,
         },
     };
 
@@ -303,7 +510,12 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             fields: c
                 .fields
                 .iter()
-                .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes, &program.records)))
+                .map(|f| {
+                    (
+                        f.name.clone(),
+                        lean_field_ty(f.ty, &program.classes, &program.records),
+                    )
+                })
                 .collect(),
             span: c.name_span,
         });
@@ -314,7 +526,12 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         let binders: Vec<(String, String)> = c
             .fields
             .iter()
-            .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes, &program.records)))
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    lean_field_ty(f.ty, &program.classes, &program.records),
+                )
+            })
             .collect();
         for (i, inv) in c.invariants.iter().enumerate() {
             let mut wf_binders: Vec<(String, String)> = Vec::new();
@@ -585,7 +802,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             &mut result,
         );
     }
-    result
+    Ok(result)
 }
 
 #[derive(Debug, Clone)]
@@ -691,12 +908,11 @@ impl<'a> Generator<'a> {
                 .iter()
                 .map(|fld| {
                     match self.env.get(&format!("self.{}", fld.name)) {
-                        Some(Val::Int(s))
-                        | Some(Val::Arr(s))
-                        | Some(Val::Obj(s))
-                        | Some(Val::View(s))
-                        | Some(Val::Ptr(s)) => format!("{s}"),
-                        Some(Val::Prop(p)) => format!("(decide {p})"),
+                        Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s))
+                        | Some(Val::View(s)) | Some(Val::Ptr(s)) => format!("{s}"),
+                        Some(Val::Prop(p)) => {
+                            format!("@decide ({p}) (Classical.propDecidable ({p}))")
+                        }
                         _ => "0".to_string(), // unreachable: checked init
                     }
                 })
@@ -706,10 +922,7 @@ impl<'a> Generator<'a> {
         let mut map = HashMap::new();
         map.insert("self".to_string(), literal.clone());
         for fld in &class.fields {
-            if let Some(Val::Int(s))
-            | Some(Val::Arr(s))
-            | Some(Val::Obj(s))
-            | Some(Val::View(s))
+            if let Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) | Some(Val::View(s))
             | Some(Val::Ptr(s)) = self.env.get(&format!("self.{}", fld.name))
             {
                 map.insert(fld.name.clone(), s.clone());
@@ -725,8 +938,7 @@ impl<'a> Generator<'a> {
                 lean_class_name(&self.classes[*ci].name)
             }
             Some(Ty::Record(ri)) => lean_record_name(&self.records[*ri].name),
-            Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) =>
-                lean_res_view_ty(*k, self.records),
+            Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) => lean_res_view_ty(*k, self.records),
             Some(Ty::Raw(_)) | Some(Ty::RawRecord(_)) => "Sable.RawPtr".to_string(),
             Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".to_string(),
             Some(Ty::Option(_)) => "Option Int".to_string(),
@@ -760,18 +972,14 @@ impl<'a> Generator<'a> {
                 Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                     Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
                 }
-                Ty::Record(ri) => {
-                    Some((name.clone(), lean_record_name(&self.records[*ri].name)))
-                }
+                Ty::Record(ri) => Some((name.clone(), lean_record_name(&self.records[*ri].name))),
                 // A resource binds its *view*; the authority it names is
                 // a checker property and appears nowhere in Lean.
                 Ty::Res(k) | Ty::ResRef(k, _) => {
                     Some((name.clone(), lean_res_view_ty(*k, self.records)))
                 }
-                Ty::Raw(_) | Ty::RawRecord(_) =>
-                    Some((name.clone(), "Sable.RawPtr".to_string())),
-                Ty::OptionRaw(_) =>
-                    Some((name.clone(), "Option Sable.RawPtr".to_string())),
+                Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
+                Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
                 Ty::Option(_) | Ty::Unit => None,
             })
             .collect();
@@ -791,9 +999,7 @@ impl<'a> Generator<'a> {
                 scope_binders.push(("self".to_string(), lean_class_name(&c.name)));
                 scope_binders.push(("_old_self".to_string(), lean_class_name(&c.name)));
             }
-            Cctx::Deinit(c) => {
-                scope_binders.push(("self".to_string(), lean_class_name(&c.name)))
-            }
+            Cctx::Deinit(c) => scope_binders.push(("self".to_string(), lean_class_name(&c.name))),
             Cctx::None => {}
         }
         scope_binders
@@ -977,10 +1183,8 @@ impl<'a> Generator<'a> {
                         Some(Val::Obj(chain)) => chain.clone(),
                         _ => array.clone(),
                     };
-                    self.env.insert(
-                        array,
-                        Val::Obj(format!("{{ {base} with {f} := {b} }}")),
-                    );
+                    self.env
+                        .insert(array, Val::Obj(format!("{{ {base} with {f} := {b} }}")));
                 }
             }
             out.push((pname, b));
@@ -1044,16 +1248,12 @@ impl<'a> Generator<'a> {
                 }
                 Ty::Record(ri) => {
                     let lean_record = lean_record_name(&self.records[ri].name);
-                    self.binders.push((
-                        p.name.clone(),
-                        lean_record.clone(),
-                    ));
+                    self.binders.push((p.name.clone(), lean_record.clone()));
                     self.hyps.push((
                         format!("h_{}_wf", p.name),
                         format!("{lean_record}.wf {}", p.name),
                     ));
-                    self.env
-                        .insert(p.name.clone(), Val::Record(p.name.clone()));
+                    self.env.insert(p.name.clone(), Val::Record(p.name.clone()));
                 }
                 // A resource parameter binds its *view* and nothing
                 // else: the authority it carries is a checker property,
@@ -1261,9 +1461,7 @@ impl<'a> Generator<'a> {
                 self.push_obligation(ob);
                 let ob = self.obligation(
                     &format!("{}.expose.{array}.bytes", self.fname),
-                    format!(
-                        "every byte of `{array}` must be present and in `u8` range here"
-                    ),
+                    format!("every byte of `{array}` must be present and in `u8` range here"),
                     *kw_span,
                     format!("Sable.SpanView.reconstructible ({view})"),
                 );
@@ -1288,9 +1486,7 @@ impl<'a> Generator<'a> {
                     );
                     self.push_hyp_unique(
                         format!("h_{array}_elems"),
-                        format!(
-                            "∀ k, 0 ≤ k → k < {a2}.len → 0 ≤ {a2}.get k ∧ {a2}.get k ≤ u8.max"
-                        ),
+                        format!("∀ k, 0 ≤ k → k < {a2}.len → 0 ≤ {a2}.get k ∧ {a2}.get k ≤ u8.max"),
                     );
                     self.env.insert((*array).to_string(), Val::Arr(a2));
                 }
@@ -1316,6 +1512,7 @@ impl<'a> Generator<'a> {
                             | ExprKind::MethodCall { .. }
                             | ExprKind::CtorCall { .. }
                             | ExprKind::TraitCall { .. }
+                            | ExprKind::DeviceOp { .. }
                             | ExprKind::AllocArray { .. }
                             | ExprKind::ArrayLit(_)
                     ) {
@@ -1336,6 +1533,7 @@ impl<'a> Generator<'a> {
                         | ExprKind::MethodCall { .. }
                         | ExprKind::CtorCall { .. }
                         | ExprKind::TraitCall { .. }
+                        | ExprKind::DeviceOp { .. }
                         | ExprKind::AllocArray { .. }
                         | ExprKind::ArrayLit(_)
                 ) {
@@ -1413,8 +1611,7 @@ impl<'a> Generator<'a> {
                     format!("0 ≤ {view}.len ∧ {view}.len ≤ {view}.bytes.len"),
                 );
                 self.env.insert(res.clone(), Val::View(view.clone()));
-                self.var_tys
-                    .insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                self.var_tys.insert(res.clone(), Ty::Res(ResKind::RawSpan));
                 let p = self.hinted_sym("_ptr", Some(ptr.clone()));
                 self.binders.push((p.clone(), "Sable.RawPtr".into()));
                 self.push_hyp_unique(
@@ -1449,14 +1646,11 @@ impl<'a> Generator<'a> {
                     format!("0 ≤ {view}.len ∧ {view}.len ≤ {view}.bytes.len"),
                 );
                 self.env.insert(res.clone(), Val::View(view.clone()));
-                self.var_tys
-                    .insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                self.var_tys.insert(res.clone(), Ty::Res(ResKind::RawSpan));
 
                 let rel = self.hinted_sym("_release", Some(release.clone()));
-                self.binders.push((
-                    rel.clone(),
-                    ResKind::SystemDealloc.view_ty().into(),
-                ));
+                self.binders
+                    .push((rel.clone(), ResKind::SystemDealloc.view_ty().into()));
                 self.push_hyp_unique(
                     format!("h_{release}_system"),
                     format!("{rel} = {{ alloc := {alloc}, len := {n} }}"),
@@ -1466,10 +1660,8 @@ impl<'a> Generator<'a> {
                     format!("Sable.SystemDeallocView.wf {rel}"),
                 );
                 self.env.insert(release.clone(), Val::View(rel));
-                self.var_tys.insert(
-                    release.clone(),
-                    Ty::Res(ResKind::SystemDealloc),
-                );
+                self.var_tys
+                    .insert(release.clone(), Ty::Res(ResKind::SystemDealloc));
 
                 let p = self.hinted_sym("_ptr", Some(ptr.clone()));
                 self.binders.push((p.clone(), "Sable.RawPtr".into()));
@@ -1548,8 +1740,7 @@ impl<'a> Generator<'a> {
                     format!("Sable.SpanView.reconstructible {view}"),
                 );
                 self.env.insert(res.clone(), Val::View(view.clone()));
-                self.var_tys
-                    .insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                self.var_tys.insert(res.clone(), Ty::Res(ResKind::RawSpan));
                 let p = self.hinted_sym("_ptr", Some(ptr.clone()));
                 self.binders.push((p.clone(), "Sable.RawPtr".into()));
                 self.push_hyp_unique(
@@ -1616,9 +1807,14 @@ impl<'a> Generator<'a> {
                             // field a pointer: both are ordinary values in
                             // the structure, and the authority that came
                             // with the resource is nowhere here (ADR 0024).
-                            Val::Int(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s)
+                            Val::Int(s)
+                            | Val::Arr(s)
+                            | Val::Obj(s)
+                            | Val::View(s)
                             | Val::Ptr(s) => s,
-                            Val::Prop(p) => format!("(decide {p})"),
+                            Val::Prop(p) => {
+                                format!("@decide ({p}) (Classical.propDecidable ({p}))")
+                            }
                             _ => unreachable!("checked: field value"),
                         };
                         let chain = self.self_chain();
@@ -1807,7 +2003,7 @@ impl<'a> Generator<'a> {
                 }
 
                 // 2. Havoc assigned state (fresh source-named binders).
-                self.havoc(body);
+                self.havoc(cond, body);
 
                 // 3. Assume invariants; evaluate the condition once in the
                 // havocked context (its VCs must follow from invariants).
@@ -1818,6 +2014,17 @@ impl<'a> Generator<'a> {
                     self.context
                         .push((format!("invariant {}", inv.text), inv.line_span));
                 }
+
+                // The measure belongs to the loop head, before evaluating
+                // the condition. A condition may mutate through `&mut` (or
+                // an `&mut self` receiver), and those effects are part of
+                // the iteration transition. Capturing the measure after the
+                // condition would let a condition raise it and the body
+                // restore it forever while still proving a false decrease.
+                // Save only the substituted expression here; keep the fresh
+                // binder below so existing numbering and branch contexts do
+                // not change.
+                let vtext = self.subst_env(&self.preprocess(&variant.text));
                 let p = self.eval_prop(cond);
 
                 // Full clones — see the If arm.
@@ -1829,7 +2036,6 @@ impl<'a> Generator<'a> {
                 self.fresh += 1;
                 let v0 = format!("_v{}", self.fresh);
                 self.binders.push((v0.clone(), "Int".into()));
-                let vtext = self.subst_env(&self.preprocess(&variant.text));
                 self.hyps.push((
                     format!("h_variant_{}", chslug(variant)),
                     format!("{v0} = ({vtext})"),
@@ -1862,7 +2068,7 @@ impl<'a> Generator<'a> {
     /// Fresh source-named binders for everything the loop body assigns
     /// (plus locals whose symbolic value mentions a havocked variable,
     /// transitively). Hypotheses mentioning havocked names are dropped.
-    fn havoc(&mut self, body: &[Stmt]) {
+    fn havoc(&mut self, cond: &Expr, body: &[Stmt]) {
         let mut havoc_set: HashSet<String> = HashSet::new();
         {
             // `c.m()` havocs `c` only when `m` takes `&mut self`; a
@@ -1886,6 +2092,10 @@ impl<'a> Generator<'a> {
                     None => true,
                 }
             };
+            // The condition is executed once per iteration and may call a
+            // mutating method or pass an explicit `&mut` argument. It belongs
+            // to the loop transition just as much as the lexical body does.
+            collect_mut_borrows(cond, &mut havoc_set, &resolver);
             collect_assigned(body, &mut havoc_set, &resolver);
         }
         // Cascade: symbolic values referring to havocked names die too.
@@ -2456,8 +2666,7 @@ impl<'a> Generator<'a> {
                         } else {
                             ResKind::PointsToU64
                         };
-                        self.binders
-                            .push((c.clone(), result_kind.view_ty().into()));
+                        self.binders.push((c.clone(), result_kind.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_cell", c.trim_start_matches('_')),
                             if leased {
@@ -2503,8 +2712,7 @@ impl<'a> Generator<'a> {
                         } else {
                             ResKind::RawSpan
                         };
-                        self.binders
-                            .push((m.clone(), result_kind.view_ty().into()));
+                        self.binders.push((m.clone(), result_kind.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_span", m.trim_start_matches('_')),
                             if leased {
@@ -2601,7 +2809,9 @@ impl<'a> Generator<'a> {
                         };
                         let ob = self.obligation(
                             &format!("{}.cell_u64.{opname}", self.fname),
-                            format!("`raw_cell_{opname}_u64` needs an initialized cell at this pointer"),
+                            format!(
+                                "`raw_cell_{opname}_u64` needs an initialized cell at this pointer"
+                            ),
                             e.span,
                             goal.clone(),
                         );
@@ -2631,9 +2841,7 @@ impl<'a> Generator<'a> {
                             self.push_hyp_unique(
                                 format!("h_{name}_take"),
                                 if leased {
-                                    format!(
-                                        "{c2} = Sable.LeasedPointsToU64View.clear ({c})"
-                                    )
+                                    format!("{c2} = Sable.LeasedPointsToU64View.clear ({c})")
                                 } else {
                                     format!("{c2} = Sable.PointsToView.clear ({c})")
                                 },
@@ -2664,8 +2872,7 @@ impl<'a> Generator<'a> {
                         );
                         let ob = self.obligation(
                             &format!("{}.cell_u64.drop", self.fname),
-                            "`raw_cell_drop_u64` needs an initialized cell at this pointer"
-                                .into(),
+                            "`raw_cell_drop_u64` needs an initialized cell at this pointer".into(),
                             e.span,
                             goal.clone(),
                         );
@@ -2719,10 +2926,8 @@ impl<'a> Generator<'a> {
                         self.assume_fact(&goal);
                         let cell = self.hinted_sym("_cell", hint);
                         let kind = ResKind::PointsToRecord(*ri);
-                        self.binders.push((
-                            cell.clone(),
-                            lean_res_view_ty(kind, self.records),
-                        ));
+                        self.binders
+                            .push((cell.clone(), lean_res_view_ty(kind, self.records)));
                         self.push_hyp_unique(
                             format!("h_{}_cell", cell.trim_start_matches('_')),
                             format!("{cell} = {record}.fromSpan ({bytes})"),
@@ -2757,10 +2962,8 @@ impl<'a> Generator<'a> {
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
                         let bytes = self.hinted_sym("_view", hint);
-                        self.binders.push((
-                            bytes.clone(),
-                            ResKind::RawSpan.view_ty().into(),
-                        ));
+                        self.binders
+                            .push((bytes.clone(), ResKind::RawSpan.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_span", bytes.trim_start_matches('_')),
                             format!("{bytes} = {record}.toSpan ({cell})"),
@@ -2941,8 +3144,7 @@ impl<'a> Generator<'a> {
                         );
                         let ob = self.obligation(
                             &format!("{}.free_header.from_block", self.fname),
-                            "`raw_into_free_header` needs an aligned two-word block header"
-                                .into(),
+                            "`raw_into_free_header` needs an aligned two-word block header".into(),
                             e.span,
                             goal.clone(),
                         );
@@ -3079,9 +3281,7 @@ impl<'a> Generator<'a> {
                         self.binders.push((value.clone(), "Int".into()));
                         self.push_hyp_unique(
                             format!("h_{}_header_{label}", value.trim_start_matches('_')),
-                            format!(
-                                "({header}).{field}.state = Sable.CellState.init {value}"
-                            ),
+                            format!("({header}).{field}.state = Sable.CellState.init {value}"),
                         );
                         self.push_hyp_unique(
                             format!("h_{}_range", value.trim_start_matches('_')),
@@ -3126,6 +3326,75 @@ impl<'a> Generator<'a> {
                             format!("Sable.FreeHeaderView.wf {h2}"),
                         );
                         self.env.insert(name.clone(), Val::View(h2));
+                        Val::Unit
+                    }
+                }
+            }
+            ExprKind::DeviceOp { op, args, .. } => {
+                let hint = self.name_hint.take();
+                match op {
+                    DeviceOp::UartStatus => {
+                        let Val::View(old) = self.eval(&args[0]) else {
+                            unreachable!("checked: UART borrow")
+                        };
+                        let ExprKind::Borrow { array: name, .. } = &args[0].kind else {
+                            unreachable!("checked: explicit mutable UART borrow")
+                        };
+                        let status = self.hinted_sym("_uart_status", hint);
+                        self.binders.push((status.clone(), "Int".into()));
+                        self.push_hyp_unique(
+                            format!("h_{}_status", status.trim_start_matches('_')),
+                            format!("{status} = ({old}).status"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_range", status.trim_start_matches('_')),
+                            range_prop(&status, IntTy::U8),
+                        );
+                        let next = self.hinted_sym("_uart", Some(name.clone()));
+                        self.binders
+                            .push((next.clone(), ResKind::Uart.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{name}_status_transition"),
+                            format!("{next} = ({old}).afterStatus {status}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{name}_wf"),
+                            format!("Sable.UartView.wf {next}"),
+                        );
+                        self.env.insert(name.clone(), Val::View(next));
+                        Val::Int(status)
+                    }
+                    DeviceOp::UartWrite => {
+                        let Val::Int(byte) = self.eval(&args[0]) else {
+                            unreachable!("checked: UART byte")
+                        };
+                        let Val::View(old) = self.eval(&args[1]) else {
+                            unreachable!("checked: UART borrow")
+                        };
+                        let ready = format!("({old}).ready = true");
+                        let ob = self.obligation(
+                            &format!("{}.uart.write_ready", self.fname),
+                            "`uart_write` requires a ready transmitter".into(),
+                            e.span,
+                            ready.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&ready);
+                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
+                            unreachable!("checked: explicit mutable UART borrow")
+                        };
+                        let next = self.hinted_sym("_uart", Some(name.clone()));
+                        self.binders
+                            .push((next.clone(), ResKind::Uart.view_ty().into()));
+                        self.push_hyp_unique(
+                            format!("h_{name}_write_transition"),
+                            format!("{next} = ({old}).afterWrite {byte}"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{name}_wf"),
+                            format!("Sable.UartView.wf {next}"),
+                        );
+                        self.env.insert(name.clone(), Val::View(next));
                         Val::Unit
                     }
                 }
@@ -3203,8 +3472,9 @@ impl<'a> Generator<'a> {
                         let Val::View(b) = self.eval(&args[1]) else {
                             unreachable!("checked: span value")
                         };
-                        let goal =
-                            format!("({a}).alloc = ({b}).alloc ∧ ({a}).off + ({a}).len = ({b}).off");
+                        let goal = format!(
+                            "({a}).alloc = ({b}).alloc ∧ ({a}).off + ({a}).len = ({b}).off"
+                        );
                         let ob = self.obligation(
                             &format!("{}.join.{}", self.fname, slug(&format!("{a}_{b}"))),
                             "`join` needs two adjacent spans of one allocation".into(),
@@ -3284,9 +3554,7 @@ impl<'a> Generator<'a> {
                         let w = self.hinted_sym("_world", hint);
                         self.binders
                             .push((w.clone(), ResKind::PosixWorld.view_ty().into()));
-                        for (h, prop) in
-                            view_wf_hyps(ResKind::PosixWorld, &w, &w, self.records)
-                        {
+                        for (h, prop) in view_wf_hyps(ResKind::PosixWorld, &w, &w, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                         // A fresh world has handed out no authority yet.
@@ -3299,9 +3567,23 @@ impl<'a> Generator<'a> {
                         );
                         Val::View(w)
                     }
+                    ResOp::TestUart => {
+                        let Val::Int(_script) = self.eval(&args[0]) else {
+                            unreachable!("checked: u64 script")
+                        };
+                        let uart = self.hinted_sym("_uart", hint);
+                        self.binders
+                            .push((uart.clone(), ResKind::Uart.view_ty().into()));
+                        for (h, prop) in view_wf_hyps(ResKind::Uart, &uart, &uart, self.records) {
+                            self.push_hyp_unique(h, prop);
+                        }
+                        Val::View(uart)
+                    }
                     ResOp::ResourceMapEmpty => {
-                        let Some(Ty::Res(map_kind @ (ResKind::ResourceMapPointsToU64
-                            | ResKind::ResourceMapPointsToRecord(_)))) = e.ty
+                        let Some(Ty::Res(
+                            map_kind @ (ResKind::ResourceMapPointsToU64
+                            | ResKind::ResourceMapPointsToRecord(_)),
+                        )) = e.ty
                         else {
                             unreachable!("checked: resource-map result type")
                         };
@@ -3312,28 +3594,24 @@ impl<'a> Generator<'a> {
                             format!("h_{}_empty", map.trim_start_matches('_')),
                             format!("{map} = Sable.ResourceMapView.empty"),
                         );
-                        for (h, prop) in view_wf_hyps(
-                            map_kind,
-                            map.trim_start_matches('_'),
-                            &map,
-                            self.records,
-                        ) {
+                        for (h, prop) in
+                            view_wf_hyps(map_kind, map.trim_start_matches('_'), &map, self.records)
+                        {
                             self.push_hyp_unique(h, prop);
                         }
                         Val::View(map)
                     }
                     ResOp::ResourceMapTake => {
-                        let Some(map_kind @ (ResKind::ResourceMapPointsToU64
-                            | ResKind::ResourceMapPointsToRecord(_))) =
-                            vc_resource_kind(&self.var_tys, &args[0])
+                        let Some(
+                            map_kind @ (ResKind::ResourceMapPointsToU64
+                            | ResKind::ResourceMapPointsToRecord(_)),
+                        ) = vc_resource_kind(&self.var_tys, &args[0])
                         else {
                             unreachable!("checked: resource-map borrow")
                         };
                         let cell_kind = match map_kind {
                             ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
-                            ResKind::ResourceMapPointsToRecord(ri) => {
-                                ResKind::PointsToRecord(ri)
-                            }
+                            ResKind::ResourceMapPointsToRecord(ri) => ResKind::PointsToRecord(ri),
                             _ => unreachable!(),
                         };
                         let Val::View(map) = self.eval(&args[0]) else {
@@ -3352,11 +3630,7 @@ impl<'a> Generator<'a> {
                             _ => unreachable!(),
                         };
                         let ob = self.obligation(
-                            &format!(
-                                "{}.resource_map_take.{}",
-                                self.fname,
-                                slug(&key)
-                            ),
+                            &format!("{}.resource_map_take.{}", self.fname, slug(&key)),
                             "`resource_map_take` needs a stored entry at this key".into(),
                             e.span,
                             goal.clone(),
@@ -3366,36 +3640,24 @@ impl<'a> Generator<'a> {
                         let ExprKind::Borrow { array, .. } = &args[0].kind else {
                             unreachable!("checked: resource map borrow")
                         };
-                        let residual =
-                            self.hinted_sym("_resource_map", Some(array.clone()));
-                        self.binders.push((
-                            residual.clone(),
-                            lean_res_view_ty(map_kind, self.records),
-                        ));
+                        let residual = self.hinted_sym("_resource_map", Some(array.clone()));
+                        self.binders
+                            .push((residual.clone(), lean_res_view_ty(map_kind, self.records)));
                         self.push_hyp_unique(
                             format!("h_{array}_take"),
-                            format!(
-                                "{residual} = Sable.ResourceMapView.erase ({map}) {key}"
-                            ),
+                            format!("{residual} = Sable.ResourceMapView.erase ({map}) {key}"),
                         );
-                        for (h, prop) in
-                            view_wf_hyps(map_kind, array, &residual, self.records)
-                        {
+                        for (h, prop) in view_wf_hyps(map_kind, array, &residual, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
-                        self.env
-                            .insert(array.clone(), Val::View(residual.clone()));
+                        self.env.insert(array.clone(), Val::View(residual.clone()));
                         let cell = self.hinted_sym("_cell", hint);
-                        self.binders.push((
-                            cell.clone(),
-                            lean_res_view_ty(cell_kind, self.records),
-                        ));
+                        self.binders
+                            .push((cell.clone(), lean_res_view_ty(cell_kind, self.records)));
                         if map_kind == ResKind::ResourceMapPointsToU64 {
                             self.push_hyp_unique(
                                 format!("h_{}_take", cell.trim_start_matches('_')),
-                                format!(
-                                    "{cell} = Sable.ResourceMapView.cellAtU64 ({map}) {key}"
-                                ),
+                                format!("{cell} = Sable.ResourceMapView.cellAtU64 ({map}) {key}"),
                             );
                         }
                         self.push_hyp_unique(
@@ -3413,9 +3675,10 @@ impl<'a> Generator<'a> {
                         Val::View(cell)
                     }
                     ResOp::ResourceMapPut => {
-                        let Some(map_kind @ (ResKind::ResourceMapPointsToU64
-                            | ResKind::ResourceMapPointsToRecord(_))) =
-                            vc_resource_kind(&self.var_tys, &args[0])
+                        let Some(
+                            map_kind @ (ResKind::ResourceMapPointsToU64
+                            | ResKind::ResourceMapPointsToRecord(_)),
+                        ) = vc_resource_kind(&self.var_tys, &args[0])
                         else {
                             unreachable!("checked: resource-map borrow")
                         };
@@ -3430,11 +3693,7 @@ impl<'a> Generator<'a> {
                         };
                         let goal = format!("({map}).entries {key} = none");
                         let ob = self.obligation(
-                            &format!(
-                                "{}.resource_map_put.{}",
-                                self.fname,
-                                slug(&key)
-                            ),
+                            &format!("{}.resource_map_put.{}", self.fname, slug(&key)),
                             "`resource_map_put` needs an absent key".into(),
                             e.span,
                             goal.clone(),
@@ -3444,12 +3703,9 @@ impl<'a> Generator<'a> {
                         let ExprKind::Borrow { array, .. } = &args[0].kind else {
                             unreachable!("checked: resource map borrow")
                         };
-                        let restored =
-                            self.hinted_sym("_resource_map", Some(array.clone()));
-                        self.binders.push((
-                            restored.clone(),
-                            lean_res_view_ty(map_kind, self.records),
-                        ));
+                        let restored = self.hinted_sym("_resource_map", Some(array.clone()));
+                        self.binders
+                            .push((restored.clone(), lean_res_view_ty(map_kind, self.records)));
                         self.push_hyp_unique(
                             format!("h_{array}_put"),
                             format!(
@@ -3461,9 +3717,7 @@ impl<'a> Generator<'a> {
                             format!("h_{array}_entry"),
                             format!("({restored}).entries {key} = some {cell}"),
                         );
-                        for (h, prop) in
-                            view_wf_hyps(map_kind, array, &restored, self.records)
-                        {
+                        for (h, prop) in view_wf_hyps(map_kind, array, &restored, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                         self.env.insert(array.clone(), Val::View(restored));
@@ -3476,8 +3730,7 @@ impl<'a> Generator<'a> {
                         let goal = format!("({root}).off = 0 ∧ 0 < ({root}).len");
                         let ob = self.obligation(
                             &format!("{}.allocator_create", self.fname),
-                            "`allocator_create` needs a positive root span at offset zero"
-                                .into(),
+                            "`allocator_create` needs a positive root span at offset zero".into(),
                             e.span,
                             goal.clone(),
                         );
@@ -3487,15 +3740,11 @@ impl<'a> Generator<'a> {
                         let identity = format!("_allocator{}", self.fresh);
                         self.binders.push((identity.clone(), "Int".into()));
                         let state = self.hinted_sym("_allocator_view", hint);
-                        self.binders.push((
-                            state.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        self.binders
+                            .push((state.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_create", state.trim_start_matches('_')),
-                            format!(
-                                "{state} = Sable.AllocatorView.initial {identity} ({root})"
-                            ),
+                            format!("{state} = Sable.AllocatorView.initial {identity} ({root})"),
                         );
                         self.push_hyp_unique(
                             format!("h_{}_complete", state.trim_start_matches('_')),
@@ -3570,16 +3819,13 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: allocator borrow")
                         };
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
-                        self.binders.push((
-                            residual.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        self.binders
+                            .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{array}_take"),
                             format!("{residual} = Sable.AllocatorView.take ({state}) {key}"),
                         );
-                        self.env
-                            .insert(array.clone(), Val::View(residual.clone()));
+                        self.env.insert(array.clone(), Val::View(residual.clone()));
                         let lease = self.hinted_sym("_lease", hint);
                         self.binders
                             .push((lease.clone(), ResKind::BlockLease.view_ty().into()));
@@ -3589,9 +3835,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_hyp_unique(
                             format!("h_{}_returnable", lease.trim_start_matches('_')),
-                            format!(
-                                "Sable.AllocatorView.canPut ({residual}) ({lease})"
-                            ),
+                            format!("Sable.AllocatorView.canPut ({residual}) ({lease})"),
                         );
                         Val::View(lease)
                     }
@@ -3602,9 +3846,7 @@ impl<'a> Generator<'a> {
                         let Val::View(lease) = self.eval(&args[1]) else {
                             unreachable!("checked: block lease value")
                         };
-                        let goal = format!(
-                            "Sable.AllocatorView.canPut ({state}) ({lease})"
-                        );
+                        let goal = format!("Sable.AllocatorView.canPut ({state}) ({lease})");
                         let ob = self.obligation(
                             &format!("{}.allocator_put", self.fname),
                             "`allocator_put` needs a lease from this allocator and an absent key"
@@ -3618,15 +3860,11 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: allocator borrow")
                         };
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
-                        self.binders.push((
-                            restored.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        self.binders
+                            .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{array}_put"),
-                            format!(
-                                "{restored} = Sable.AllocatorView.put ({state}) ({lease})"
-                            ),
+                            format!("{restored} = Sable.AllocatorView.put ({state}) ({lease})"),
                         );
                         self.env.insert(array.clone(), Val::View(restored));
                         Val::Unit
@@ -3651,10 +3889,8 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: allocator borrow")
                         };
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
-                        self.binders.push((
-                            residual.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        self.binders
+                            .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{array}_take_free"),
                             format!("{residual} = Sable.AllocatorView.take ({state}) {key}"),
@@ -3663,8 +3899,7 @@ impl<'a> Generator<'a> {
                             format!("h_{array}_owner_free"),
                             format!("({residual}).allocator = ({state}).allocator"),
                         );
-                        self.env
-                            .insert(array.clone(), Val::View(residual.clone()));
+                        self.env.insert(array.clone(), Val::View(residual.clone()));
                         let block = self.hinted_sym("_free", hint);
                         self.binders
                             .push((block.clone(), ResKind::FreeBlock.view_ty().into()));
@@ -3689,9 +3924,7 @@ impl<'a> Generator<'a> {
                         let Val::View(block) = self.eval(&args[1]) else {
                             unreachable!("checked: free block value")
                         };
-                        let goal = format!(
-                            "Sable.AllocatorView.canPutFree ({state}) ({block})"
-                        );
+                        let goal = format!("Sable.AllocatorView.canPutFree ({state}) ({block})");
                         let ob = self.obligation(
                             &format!("{}.allocator_put_free", self.fname),
                             "`allocator_put_free` needs a matching well-formed internal block"
@@ -3705,15 +3938,11 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: allocator borrow")
                         };
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
-                        self.binders.push((
-                            restored.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        self.binders
+                            .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{array}_put_free"),
-                            format!(
-                                "{restored} = Sable.AllocatorView.putFree ({state}) ({block})"
-                            ),
+                            format!("{restored} = Sable.AllocatorView.putFree ({state}) ({block})"),
                         );
                         self.push_hyp_unique(
                             format!("h_{array}_owner_free"),
@@ -3721,9 +3950,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_hyp_unique(
                             format!("h_{array}_takeable_free"),
-                            format!(
-                                "Sable.AllocatorView.canTakeFree ({restored}) ({block}).key"
-                            ),
+                            format!("Sable.AllocatorView.canTakeFree ({restored}) ({block}).key"),
                         );
                         self.push_hyp_unique(
                             format!("h_{array}_entry_free"),
@@ -3741,9 +3968,7 @@ impl<'a> Generator<'a> {
                         let Val::Int(key) = self.eval(&args[1]) else {
                             unreachable!("checked: u64 key")
                         };
-                        let goal = format!(
-                            "Sable.AllocatorView.canTakeHeader ({state}) {key}"
-                        );
+                        let goal = format!("Sable.AllocatorView.canTakeHeader ({state}) {key}");
                         let ob = self.obligation(
                             &format!("{}.allocator_take_header.{}", self.fname, slug(&key)),
                             "`allocator_take_header` needs a stored header at this key".into(),
@@ -3755,17 +3980,12 @@ impl<'a> Generator<'a> {
                         let ExprKind::Borrow { array, .. } = &args[0].kind else {
                             unreachable!("checked: allocator borrow")
                         };
-                        let residual =
-                            self.hinted_sym("_allocator_view", Some(array.clone()));
-                        self.binders.push((
-                            residual.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders
+                            .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{array}_take_header"),
-                            format!(
-                                "{residual} = Sable.AllocatorView.takeHeader ({state}) {key}"
-                            ),
+                            format!("{residual} = Sable.AllocatorView.takeHeader ({state}) {key}"),
                         );
                         self.env.insert(array.clone(), Val::View(residual.clone()));
                         let header = self.hinted_sym("_header", hint);
@@ -3773,9 +3993,7 @@ impl<'a> Generator<'a> {
                             .push((header.clone(), ResKind::FreeHeader.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_take", header.trim_start_matches('_')),
-                            format!(
-                                "{header} = Sable.AllocatorView.headerAt ({state}) {key}"
-                            ),
+                            format!("{header} = Sable.AllocatorView.headerAt ({state}) {key}"),
                         );
                         self.push_hyp_unique(
                             format!("h_{}_wf", header.trim_start_matches('_')),
@@ -3813,17 +4031,12 @@ impl<'a> Generator<'a> {
                         let ExprKind::Borrow { array, .. } = &args[0].kind else {
                             unreachable!("checked: allocator borrow")
                         };
-                        let residual =
-                            self.hinted_sym("_allocator_view", Some(array.clone()));
-                        self.binders.push((
-                            residual.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders
+                            .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{array}_step_header"),
-                            format!(
-                                "{residual} = Sable.AllocatorView.takeHeader ({state}) {key}"
-                            ),
+                            format!("{residual} = Sable.AllocatorView.takeHeader ({state}) {key}"),
                         );
                         self.env.insert(array.clone(), Val::View(residual.clone()));
                         let header = self.hinted_sym("_header", hint);
@@ -3831,9 +4044,7 @@ impl<'a> Generator<'a> {
                             .push((header.clone(), ResKind::FreeHeader.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_step", header.trim_start_matches('_')),
-                            format!(
-                                "{header} = Sable.AllocatorView.headerAt ({state}) {key}"
-                            ),
+                            format!("{header} = Sable.AllocatorView.headerAt ({state}) {key}"),
                         );
                         self.push_hyp_unique(
                             format!("h_{}_wf", header.trim_start_matches('_')),
@@ -3852,9 +4063,7 @@ impl<'a> Generator<'a> {
                         let Val::View(header) = self.eval(&args[1]) else {
                             unreachable!("checked: free header value")
                         };
-                        let goal = format!(
-                            "Sable.AllocatorView.canPutHeader ({state}) ({header})"
-                        );
+                        let goal = format!("Sable.AllocatorView.canPutHeader ({state}) ({header})");
                         let ob = self.obligation(
                             &format!("{}.allocator_put_header", self.fname),
                             "`allocator_put_header` needs a matching well-formed header slot"
@@ -3867,12 +4076,9 @@ impl<'a> Generator<'a> {
                         let ExprKind::Borrow { array, .. } = &args[0].kind else {
                             unreachable!("checked: allocator borrow")
                         };
-                        let restored =
-                            self.hinted_sym("_allocator_view", Some(array.clone()));
-                        self.binders.push((
-                            restored.clone(),
-                            ResKind::AllocatorState.view_ty().into(),
-                        ));
+                        let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
+                        self.binders
+                            .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{array}_put_header"),
                             format!(
@@ -3961,13 +4167,10 @@ impl<'a> Generator<'a> {
                         let Val::View(right) = self.eval(&args[1]) else {
                             unreachable!("checked: free block value")
                         };
-                        let goal = format!(
-                            "Sable.FreeBlockView.joinable ({left}) ({right})"
-                        );
+                        let goal = format!("Sable.FreeBlockView.joinable ({left}) ({right})");
                         let ob = self.obligation(
                             &format!("{}.free_block_join", self.fname),
-                            "`free_block_join` needs adjacent blocks from one allocator"
-                                .into(),
+                            "`free_block_join` needs adjacent blocks from one allocator".into(),
                             e.span,
                             goal.clone(),
                         );
@@ -3978,9 +4181,7 @@ impl<'a> Generator<'a> {
                             .push((joined.clone(), ResKind::FreeBlock.view_ty().into()));
                         self.push_hyp_unique(
                             format!("h_{}_join", joined.trim_start_matches('_')),
-                            format!(
-                                "{joined} = Sable.FreeBlockView.join ({left}) ({right})"
-                            ),
+                            format!("{joined} = Sable.FreeBlockView.join ({left}) ({right})"),
                         );
                         self.push_hyp_unique(
                             format!("h_{}_wf", joined.trim_start_matches('_')),
@@ -4020,9 +4221,8 @@ impl<'a> Generator<'a> {
                         let Val::View(lease) = self.eval(&args[0]) else {
                             unreachable!("checked: block lease value")
                         };
-                        let goal = format!(
-                            "({lease}).key = ({lease}).span.off ∧ 0 < ({lease}).span.len"
-                        );
+                        let goal =
+                            format!("({lease}).key = ({lease}).span.off ∧ 0 < ({lease}).span.len");
                         let ob = self.obligation(
                             &format!("{}.block_lease_free", self.fname),
                             "`block_lease_free` needs a positive whole-block lease".into(),
@@ -4258,7 +4458,9 @@ impl<'a> Generator<'a> {
                         // Class args (by value or borrowed) substitute
                         // as their symbolic structure value (ADR 0020).
                         Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
-                        Val::Prop(p) => format!("(decide {p})"),
+                        Val::Prop(p) => {
+                            format!("@decide ({p}) (Classical.propDecidable ({p}))")
+                        }
                         _ => unreachable!("checked: ctor args"),
                     })
                     .collect();
@@ -4534,9 +4736,7 @@ impl<'a> Generator<'a> {
                     Ty::Res(k) | Ty::ResRef(k, _) => {
                         self.binders
                             .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
-                        for (h, prop) in
-                            view_wf_hyps(k, &ret_sym, &ret_sym, self.records)
-                        {
+                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                     }
@@ -4568,8 +4768,7 @@ impl<'a> Generator<'a> {
                 // pre-call state.
                 post_map.insert("_old_self".to_string(), cur.clone());
                 for post in m.f.posts.iter() {
-                    let text =
-                        preprocess_old_params(&preprocess_old_self(&post.text), &m.f.params);
+                    let text = preprocess_old_params(&preprocess_old_self(&post.text), &m.f.params);
                     let ret_ref = if m.f.ret == Ty::Unit {
                         None
                     } else {
@@ -4845,9 +5044,7 @@ impl<'a> Generator<'a> {
                     Ty::Res(k) | Ty::ResRef(k, _) => {
                         self.binders
                             .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
-                        for (h, prop) in
-                            view_wf_hyps(k, &ret_sym, &ret_sym, self.records)
-                        {
+                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                     }
@@ -4968,6 +5165,17 @@ impl<'a> Generator<'a> {
                 {
                     Some((name.clone(), s.clone()))
                 }
+                // Source booleans are `Bool`, while the symbolic evaluator
+                // carries their meaning as a Lean `Prop`. Reify a changed
+                // proposition back to `Bool` before splicing it into an
+                // arbitrary source clause (`b`, `b = true`, and `b ↔ p`
+                // must all remain well-typed). A parameter or havocked bool's
+                // canonical self mapping is already represented by its source
+                // binder and must stay untouched.
+                Val::Prop(p) if p != name && p != &format!("({name} = true)") => Some((
+                    name.clone(),
+                    format!("@decide ({p}) (Classical.propDecidable ({p}))"),
+                )),
                 _ => None,
             })
             .collect();
@@ -5083,20 +5291,17 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), lean));
                     }
                 }
-                Ty::Record(ri) => out.push((
-                    p.name.clone(),
-                    lean_record_name(&self.records[ri].name),
-                )),
+                Ty::Record(ri) => {
+                    out.push((p.name.clone(), lean_record_name(&self.records[ri].name)))
+                }
                 Ty::Array(..) => {
                     out.push((p.name.clone(), "Sable.Seq Int".into()));
                     if let Some(entry) = self.entry_states.get(&p.name) {
                         out.push((entry.clone(), "Sable.Seq Int".into()));
                     }
                 }
-                Ty::Raw(_) | Ty::RawRecord(_) =>
-                    out.push((p.name.clone(), "Sable.RawPtr".into())),
-                Ty::OptionRaw(_) =>
-                    out.push((p.name.clone(), "Option Sable.RawPtr".into())),
+                Ty::Raw(_) | Ty::RawRecord(_) => out.push((p.name.clone(), "Sable.RawPtr".into())),
+                Ty::OptionRaw(_) => out.push((p.name.clone(), "Option Sable.RawPtr".into())),
                 Ty::Res(k) | Ty::ResRef(k, _) => {
                     out.push((p.name.clone(), lean_res_view_ty(k, self.records)));
                     if let Some(entry) = self.entry_states.get(&p.name) {
@@ -5323,11 +5528,24 @@ pub fn collect_assigned(
                 out.insert(name.clone());
                 collect_mut_borrows(value, out, mut_recv);
             }
-            Stmt::Store { array, .. } => {
+            Stmt::Store {
+                array,
+                index,
+                value,
+                ..
+            } => {
                 out.insert(array.clone());
+                collect_mut_borrows(index, out, mut_recv);
+                collect_mut_borrows(value, out, mut_recv);
             }
-            Stmt::FieldAssign { .. } | Stmt::FieldStore { .. } => {
+            Stmt::FieldAssign { value, .. } => {
                 out.insert("self".to_string());
+                collect_mut_borrows(value, out, mut_recv);
+            }
+            Stmt::FieldStore { index, value, .. } => {
+                out.insert("self".to_string());
+                collect_mut_borrows(index, out, mut_recv);
+                collect_mut_borrows(value, out, mut_recv);
             }
             Stmt::Assert(_) => {}
             Stmt::ExprStmt(e) => {
@@ -5345,17 +5563,47 @@ pub fn collect_assigned(
                 collect_mut_borrows(e, out, mut_recv);
             }
             Stmt::If {
+                cond,
                 then_block,
                 else_block,
-                ..
             } => {
+                collect_mut_borrows(cond, out, mut_recv);
                 collect_assigned(then_block, out, mut_recv);
                 if let Some(eb) = else_block {
                     collect_assigned(eb, out, mut_recv);
                 }
             }
-            Stmt::While { body, .. } => collect_assigned(body, out, mut_recv),
-            _ => {}
+            Stmt::While { cond, body, .. } => {
+                collect_mut_borrows(cond, out, mut_recv);
+                collect_assigned(body, out, mut_recv);
+            }
+            // `unsafe` is a vocabulary marker, not an effect barrier. An
+            // exposure is a nested scope, but writes through its mutable raw
+            // view change the exposed safe array at exit, and its body may
+            // also mutate unrelated outer state.
+            Stmt::Unsafe { body, .. } => collect_assigned(body, out, mut_recv),
+            Stmt::Expose {
+                array,
+                mutable,
+                body,
+                ..
+            } => {
+                if *mutable {
+                    out.insert(array.clone());
+                }
+                collect_assigned(body, out, mut_recv);
+            }
+            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                collect_mut_borrows(size, out, mut_recv);
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                collect_mut_borrows(ptr, out, mut_recv);
+                collect_mut_borrows(res, out, mut_recv);
+                collect_mut_borrows(release, out, mut_recv);
+            }
+            Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
         }
     }
 }
@@ -5380,7 +5628,6 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mu
                 collect_mut_borrows(a, out, mut_recv);
             }
         }
-        ExprKind::ClassField { .. } | ExprKind::ClassFieldLen { .. } => {}
         ExprKind::ClassFieldIndex { index, .. } => collect_mut_borrows(index, out, mut_recv),
         ExprKind::SomeE(inner) => collect_mut_borrows(inner, out, mut_recv),
         ExprKind::Binary { lhs, rhs, .. } => {
@@ -5397,7 +5644,12 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mu
                 collect_mut_borrows(a, out, mut_recv);
             }
         }
-        ExprKind::Call { args, .. } | ExprKind::CtorCall { args, .. } => {
+        ExprKind::Call { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::DeviceOp { args, .. } => {
             for a in args {
                 collect_mut_borrows(a, out, mut_recv);
             }
@@ -5414,7 +5666,19 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mu
                 collect_mut_borrows(el, out, mut_recv);
             }
         }
-        _ => {}
+        // Deliberately exhaustive: a new expression form must decide whether
+        // it contains an effectful subexpression instead of silently falling
+        // through and reopening loop-havoc unsoundness.
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Len { .. }
+        | ExprKind::NoneE
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. } => {}
     }
 }
 
@@ -5471,6 +5735,10 @@ fn view_wf_hyps(
         ResKind::PosixWorld => vec![(
             format!("h_{name}_wf"),
             format!("Sable.PosixWorldView.wf {binder}"),
+        )],
+        ResKind::Uart => vec![(
+            format!("h_{name}_wf"),
+            format!("Sable.UartView.wf {binder}"),
         )],
         ResKind::SystemDealloc => vec![(
             format!("h_{name}_wf"),
@@ -5769,5 +6037,9 @@ pub fn slug(text: &str) -> String {
         }
     }
     let out = out.trim_matches('_').to_string();
-    if out.is_empty() { "e".to_string() } else { out }
+    if out.is_empty() {
+        "e".to_string()
+    } else {
+        out
+    }
 }

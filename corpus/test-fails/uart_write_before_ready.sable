@@ -1,0 +1,8 @@
+// expect-test-failure: uart_write: transmitter is not ready
+
+fn test_write_before_ready() {
+    mut resource Uart uart = test_uart(1);
+    unsafe {
+        uart_write(65, &mut uart);
+    }
+}

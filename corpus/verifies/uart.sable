@@ -1,0 +1,29 @@
+// A bounded polling/transmit driver for the formal `uart-poll-v1` profile
+// (ADR 0057). The caller supplies the capability; ordinary code cannot mint
+// one or derive it from an integer address.
+//
+// Status reads are observable MMIO events too, but most driver contracts care
+// about transmitted bytes. `writes` is the trace projection that hides those
+// polling details without hiding their order from the machine semantics.
+
+/// post #[label(sent)] result → uart.writes = (old uart).writes ++ [byte]
+/// post #[label(exhausted)] ¬result → uart.writes = (old uart).writes
+pub fn uart_try_write(u8 byte, u64 polls, resource &mut Uart uart) -> bool {
+    mut u64 i = 0;
+    mut bool sent = false;
+    /// invariant i ≤ polls
+    /// invariant sent = false → uart.writes = (old uart).writes
+    /// invariant sent = true → uart.writes = (old uart).writes ++ [byte]
+    /// variant polls - i
+    while (i < polls && !sent) {
+        unsafe {
+            u8 status = uart_status(&mut uart);
+            if (status != 0) {
+                uart_write(byte, &mut uart);
+                sent = true;
+            }
+        }
+        i = i + 1;
+    }
+    return sent;
+}

@@ -1,0 +1,38 @@
+// expect-error: condition_variant_cycle.variant_decreases.c_n
+// Regression guard: the variant is measured at the loop head, before an
+// effectful condition runs. This condition raises the measure from zero to
+// one and always enters the body; the body restores it to zero. Measuring
+// after the condition would "prove" 0 < 1 on every iteration even though
+// the program diverges. The real head-to-head comparison is 0 < 0.
+
+class ConditionVariantState {
+    u64 n;
+
+    /// invariant n <= 1
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// post self.n = 1
+    /// post result
+    fn rise(&mut self) -> bool {
+        self.n = 1;
+        return true;
+    }
+
+    /// post self.n = 0
+    fn fall(&mut self) {
+        self.n = 0;
+    }
+}
+
+fn condition_variant_cycle() {
+    var mut c = ConditionVariantState::zero();
+    /// invariant c.n = 0
+    /// variant c.n
+    while (c.rise()) {
+        c.fall();
+    }
+}

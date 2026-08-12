@@ -1,0 +1,5 @@
+// expect-error: uart.profile_outside_test
+
+fn conjure_profile() {
+    mut resource Uart uart = test_uart(0);
+}

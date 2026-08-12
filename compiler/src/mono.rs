@@ -381,7 +381,9 @@ fn prepare_stmts(
             | Stmt::StaticAlloc { size: e, .. }
             | Stmt::SystemAlloc { size: e, .. }
             | Stmt::Return { value: Some(e), .. } => prepare_expr(e, bound_params),
-            Stmt::SystemDealloc { ptr, res, release, .. } => {
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
                 prepare_expr(ptr, bound_params);
                 prepare_expr(res, bound_params);
                 prepare_expr(release, bound_params);
@@ -451,6 +453,9 @@ fn prepare_expr(e: &mut Expr, bound_params: &HashSet<String>) {
         | ExprKind::CtorCall { args, .. }
         | ExprKind::MethodCall { args, .. }
         | ExprKind::TraitCall { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::DeviceOp { args, .. }
         | ExprKind::ArrayLit(args) => {
             for a in args.iter_mut() {
                 prepare_expr(a, bound_params);
@@ -687,7 +692,9 @@ impl Mono {
                 | Stmt::StaticAlloc { size: e, .. }
                 | Stmt::SystemAlloc { size: e, .. }
                 | Stmt::Return { value: Some(e), .. } => self.rewrite_expr(e, depth)?,
-                Stmt::SystemDealloc { ptr, res, release, .. } => {
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
                     self.rewrite_expr(ptr, depth)?;
                     self.rewrite_expr(res, depth)?;
                     self.rewrite_expr(release, depth)?;
@@ -796,6 +803,13 @@ impl Mono {
                     self.rewrite_expr(a, depth)?;
                 }
             }
+            ExprKind::RawOp { args, .. }
+            | ExprKind::ResOp { args, .. }
+            | ExprKind::DeviceOp { args, .. } => {
+                for a in args.iter_mut() {
+                    self.rewrite_expr(a, depth)?;
+                }
+            }
             ExprKind::Unary { operand, .. }
             | ExprKind::IsSome { operand }
             | ExprKind::OptValue { operand } => self.rewrite_expr(operand, depth)?,
@@ -861,7 +875,9 @@ fn subst_stmts(
             | Stmt::FieldAssign { value, .. }
             | Stmt::StaticAlloc { size: value, .. }
             | Stmt::SystemAlloc { size: value, .. } => subst_expr(value, args, bound_calls)?,
-            Stmt::SystemDealloc { ptr, res, release, .. } => {
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
                 subst_expr(ptr, args, bound_calls)?;
                 subst_expr(res, args, bound_calls)?;
                 subst_expr(release, args, bound_calls)?;
@@ -972,7 +988,10 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
                 subst_expr(x, args, bound_calls)?;
             }
         }
-        ExprKind::MethodCall { args: a, .. } => {
+        ExprKind::MethodCall { args: a, .. }
+        | ExprKind::RawOp { args: a, .. }
+        | ExprKind::ResOp { args: a, .. }
+        | ExprKind::DeviceOp { args: a, .. } => {
             for x in a.iter_mut() {
                 subst_expr(x, args, bound_calls)?;
             }

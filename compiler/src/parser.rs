@@ -711,8 +711,13 @@ impl<'a> Parser<'a> {
             None
         };
         match self.bump() {
-            Token { tok: Tok::Int(n), span } => Ok((if neg.is_some() { -n } else { n },
-                neg.map_or(span, |s| s.join(span)))),
+            Token {
+                tok: Tok::Int(n),
+                span,
+            } => Ok((
+                if neg.is_some() { -n } else { n },
+                neg.map_or(span, |s| s.join(span)),
+            )),
             t => Err(Diagnostic {
                 name: "parse.expected".into(),
                 title: "expected an integer literal".into(),
@@ -1149,8 +1154,7 @@ impl<'a> Parser<'a> {
                 label: "expected `layout(size := ..., align := ...)`".into(),
                 notes: vec![(
                     "note".into(),
-                    "raw-storable records do not inherit class layout or an implicit ABI"
-                        .into(),
+                    "raw-storable records do not inherit class layout or an implicit ABI".into(),
                 )],
             });
         }
@@ -1772,8 +1776,8 @@ impl<'a> Parser<'a> {
             };
             let end = self.expect(Tok::Semi)?.span;
             let mut f = Fn {
-            is_pub: false,
-            extern_info: None,
+                is_pub: false,
+                extern_info: None,
                 name: mname,
                 name_span: mspan,
                 type_params: Vec::new(),
@@ -2214,7 +2218,9 @@ impl<'a> Parser<'a> {
         let size = self.expr()?;
         self.expect(Tok::RParen)?;
         match self.peek() {
-            Tok::Ident(kw) if kw == "as" => { self.bump(); }
+            Tok::Ident(kw) if kw == "as" => {
+                self.bump();
+            }
             _ => return Err(self.error_expected("`as`")),
         }
         self.expect(Tok::LParen)?;
@@ -2230,7 +2236,14 @@ impl<'a> Parser<'a> {
         }
         self.expect(Tok::RParen)?;
         self.expect(Tok::Semi)?;
-        Ok(Stmt::StaticAlloc { kw_span, size, ptr, ptr_span, res, res_span })
+        Ok(Stmt::StaticAlloc {
+            kw_span,
+            size,
+            ptr,
+            ptr_span,
+            res,
+            res_span,
+        })
     }
 
     /// `system_alloc(N) as (p, resource m, resource release);`, after
@@ -2243,7 +2256,9 @@ impl<'a> Parser<'a> {
         let size = self.expr()?;
         self.expect(Tok::RParen)?;
         match self.peek() {
-            Tok::Ident(kw) if kw == "as" => { self.bump(); }
+            Tok::Ident(kw) if kw == "as" => {
+                self.bump();
+            }
             _ => return Err(self.error_expected("`as`")),
         }
         self.expect(Tok::LParen)?;
@@ -2262,7 +2277,14 @@ impl<'a> Parser<'a> {
         self.expect(Tok::RParen)?;
         self.expect(Tok::Semi)?;
         Ok(Stmt::SystemAlloc {
-            kw_span, size, ptr, ptr_span, res, res_span, release, release_span,
+            kw_span,
+            size,
+            ptr,
+            ptr_span,
+            res,
+            res_span,
+            release,
+            release_span,
         })
     }
 
@@ -2278,7 +2300,12 @@ impl<'a> Parser<'a> {
         let release = self.expr()?;
         self.expect(Tok::RParen)?;
         self.expect(Tok::Semi)?;
-        Ok(Stmt::SystemDealloc { kw_span, ptr, res, release })
+        Ok(Stmt::SystemDealloc {
+            kw_span,
+            ptr,
+            res,
+            release,
+        })
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
@@ -3154,6 +3181,30 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::Ident(name) if DeviceOp::from_name(&name).is_some() => {
+                let op = DeviceOp::from_name(&name).expect("checked");
+                self.bump();
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                while !self.at(&Tok::RParen) {
+                    args.push(self.expr()?);
+                    if self.at(&Tok::Comma) {
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::DeviceOp {
+                        op,
+                        op_span: span,
+                        args,
+                    },
+                    span: span.join(close),
+                    ty: None,
+                })
+            }
             Tok::Ident(name) if ResOp::from_name(&name).is_some() => {
                 let op = ResOp::from_name(&name).expect("checked");
                 self.bump();
@@ -3521,6 +3572,9 @@ fn is_reserved_name(name: &str) -> bool {
         "join",
         "open_file",
         "posix_world",
+        "test_uart",
+        "uart_status",
+        "uart_write",
         "raw_offset",
         "raw_load8",
         "raw_store8",
@@ -3574,7 +3628,9 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
         ExprKind::Var(n) => {
             out.insert(n.clone());
         }
-        ExprKind::ResOp { args, .. } | ExprKind::RawOp { args, .. } => {
+        ExprKind::ResOp { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. } => {
             for a in args {
                 expr_vars(a, out);
             }

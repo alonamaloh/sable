@@ -143,6 +143,88 @@ fn class_tbounds(c: &ClassDecl) -> HashMap<String, (String, u8)> {
     tbounds_of(&c.type_params, &c.type_bounds)
 }
 
+/// `uart-poll-v1` has one physical UART0 and one corresponding root
+/// authority. Until a later profile gives capabilities device identities,
+/// accepting two UART parameters would let VCgen reason about independent
+/// views while both executable semantics operate on the singleton device.
+fn check_uart_params(params: &[Param]) -> CResult<()> {
+    let mut first: Option<&Param> = None;
+    for param in params.iter().filter(|param| {
+        matches!(
+            param.ty,
+            Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
+        )
+    }) {
+        if let Some(first) = first {
+            return Err(Diagnostic {
+                name: "uart.multiple_authority".into(),
+                title: "`uart-poll-v1` provides one UART authority".into(),
+                span: param.span,
+                label: "second UART parameter".into(),
+                notes: vec![(
+                    "first UART parameter".into(),
+                    format!(
+                        "`{}` is the singleton profile capability; pass or return that token instead of accepting another",
+                        first.name
+                    ),
+                )],
+            });
+        }
+        first = Some(param);
+    }
+    Ok(())
+}
+
+/// Trait calls are currently modeled as pure integer operations in template
+/// verification. In particular, they have no resource-view transition with
+/// which to model a UART borrow or owned UART result. Keep the singleton
+/// profile capability out of trait interfaces until that contract machinery
+/// is resource-aware instead of accepting a signature that later VCgen cannot
+/// represent.
+fn check_uart_trait_methods(traits: &[TraitDecl]) -> CResult<()> {
+    for tr in traits {
+        for method in &tr.methods {
+            if let Some(param) = method.params.iter().find(|param| {
+                matches!(
+                    param.ty,
+                    Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
+                )
+            }) {
+                return Err(Diagnostic {
+                    name: "uart.trait_unsupported".into(),
+                    title: "UART authority is not supported in trait methods".into(),
+                    span: param.span,
+                    label: "keep `resource Uart` out of trait method signatures".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "trait calls are verified through abstract integer contracts; they do \
+                         not yet model a UART state transition"
+                            .into(),
+                    )],
+                });
+            }
+            if matches!(
+                method.ret,
+                Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
+            ) {
+                return Err(Diagnostic {
+                    name: "uart.trait_unsupported".into(),
+                    title: "UART authority is not supported in trait methods".into(),
+                    span: method.name_span,
+                    label: "a trait method may not return `resource Uart`".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "the `uart-poll-v1` capability is a singleton passed explicitly through \
+                         ordinary functions; trait contracts do not yet model its state transition"
+                            .into(),
+                    )],
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// An extern's signature must be ABI-representable and must not be able
 /// to hand storage back: retained pointers and ownership transfer to
 /// foreign code are out of scope for v1. For a verified Sable callee the
@@ -177,25 +259,6 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
         });
     }
     for p in &f.params {
-        let ok = matches!(
-            p.ty,
-            Ty::Int(_) | Ty::Raw(_) | Ty::RawRecord(_) | Ty::ResRef(..) | Ty::Res(_)
-        );
-        if !ok {
-            return Err(Diagnostic {
-                name: "extern.param_abi".into(),
-                title: format!("`{}` is not an ABI type", p.ty.name()),
-                span: p.span,
-                label: "extern parameters are integers, raw pointers, and resources".into(),
-                notes: vec![(
-                    "note".into(),
-                    "resources are erased from the ABI, so the foreign function receives \
-                     the pointer and the length and nothing else; a safe array or class \
-                     would need a layout guarantee Sable does not make yet"
-                        .into(),
-                )],
-            });
-        }
         if matches!(p.ty, Ty::Res(kind) | Ty::ResRef(kind, _) if kind.sealed_terminal()) {
             let kind = match p.ty {
                 Ty::Res(kind) | Ty::ResRef(kind, _) => kind,
@@ -203,10 +266,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
             };
             return Err(Diagnostic {
                 name: "resource.release_sealed".into(),
-                title: format!(
-                    "{} authority may not cross an extern boundary",
-                    kind.name()
-                ),
+                title: format!("{} authority may not cross an extern boundary", kind.name()),
                 span: p.span,
                 label: "compiler-sealed authority is not an extern ABI capability".into(),
                 notes: vec![(
@@ -214,6 +274,30 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
                     "resource authority erases at the ABI, so a foreign parameter could \
                      only promise the token away; it could not perform the checked \
                      authority transition"
+                        .into(),
+                )],
+            });
+        }
+        // Explicit resource whitelist: a new resource kind must make a
+        // deliberate ABI decision. In particular, device-profile authority
+        // is meaningful only to compiler intrinsics and may not cross FFI.
+        let ok = match p.ty {
+            Ty::Int(_) | Ty::Raw(_) | Ty::RawRecord(_) => true,
+            Ty::Res(kind) | Ty::ResRef(kind, _) => kind.extern_abi_allowed(),
+            _ => false,
+        };
+        if !ok {
+            return Err(Diagnostic {
+                name: "extern.param_abi".into(),
+                title: format!("`{}` is not an ABI type", p.ty.name()),
+                span: p.span,
+                label: "not in the explicit extern ABI whitelist".into(),
+                notes: vec![(
+                    "note".into(),
+                    "extern parameters are integers, raw pointers, or the explicitly \
+                     supported RawSpan, OpenFile, and PosixWorld resources; a safe array, \
+                     class, or machine-profile capability needs semantics this ABI does \
+                     not provide"
                         .into(),
                 )],
             });
@@ -250,6 +334,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
     let mut unsafe_regions = 0usize;
     let traits_c: Vec<TraitDecl> = program.traits.clone();
+    check_uart_trait_methods(&traits_c)?;
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for f in &program.fns {
         if sigs.contains_key(&f.name) {
@@ -269,6 +354,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 label: "arrays are parameters only for now".into(),
                 notes: vec![],
             });
+        }
+        if f.extern_info.is_none() {
+            check_uart_params(&f.params)?;
         }
         sigs.insert(
             f.name.clone(),
@@ -349,20 +437,25 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         });
                     }
                 };
-                let end = field.offset.checked_add(field_layout.size).ok_or_else(|| Diagnostic {
-                    name: "record.field_out_of_bounds".into(),
-                    title: format!("field `{}` extent overflows", field.name),
-                    span: field.offset_span,
-                    label: "offset plus field size is not representable".into(),
-                    notes: vec![],
-                })?;
-                if field.offset < 0
-                    || field.offset % field_layout.align != 0
-                    || end > r.layout.size
+                let end =
+                    field
+                        .offset
+                        .checked_add(field_layout.size)
+                        .ok_or_else(|| Diagnostic {
+                            name: "record.field_out_of_bounds".into(),
+                            title: format!("field `{}` extent overflows", field.name),
+                            span: field.offset_span,
+                            label: "offset plus field size is not representable".into(),
+                            notes: vec![],
+                        })?;
+                if field.offset < 0 || field.offset % field_layout.align != 0 || end > r.layout.size
                 {
                     return Err(Diagnostic {
                         name: "record.field_out_of_bounds".into(),
-                        title: format!("field `{}` does not fit its declared record layout", field.name),
+                        title: format!(
+                            "field `{}` does not fit its declared record layout",
+                            field.name
+                        ),
                         span: field.offset_span,
                         label: format!(
                             "offset {} must be {}-aligned and the {}-byte field must end by {}",
@@ -382,7 +475,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         label: "record fields must occupy disjoint half-open extents".into(),
                         notes: vec![(
                             "note".into(),
-                            format!("the earlier field's offset is declared at byte {}", other_span.start),
+                            format!(
+                                "the earlier field's offset is declared at byte {}",
+                                other_span.start
+                            ),
                         )],
                     });
                 }
@@ -426,9 +522,28 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         notes: vec![],
                     });
                 }
+                if matches!(
+                    fld.ty,
+                    Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
+                ) {
+                    return Err(Diagnostic {
+                        name: "uart.field_unsupported".into(),
+                        title: "the singleton UART capability may not be stored in a class".into(),
+                        span: fld.span,
+                        label: "keep `resource Uart` as an explicit parameter or local".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "device-identified profile capabilities and functional field \
+                             write-back are deferred; accepting this field would make the \
+                             proof and executable machine models disagree"
+                                .into(),
+                        )],
+                    });
+                }
                 fields.push((fld.name.clone(), fld.ty));
             }
             let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
+                check_uart_params(params)?;
                 for p in params {
                     // Class parameters: by value (moved in) or borrowed
                     // (ADR 0020, ADR 0023), and resources — a class that
@@ -437,9 +552,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     let ok = matches!(
                         p.ty,
                         Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(..) | Ty::Res(_) | Ty::ResRef(..)
-                    )
-                        || (allow_shared_arrays
-                            && matches!(p.ty, Ty::Array(_, Mutability::Shared)));
+                    ) || (allow_shared_arrays
+                        && matches!(p.ty, Ty::Array(_, Mutability::Shared)));
                     if !ok {
                         return Err(Diagnostic {
                             name: "type.member_param".into(),
@@ -538,11 +652,10 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             sig.params.first().map(|p| p.ty),
             sig.params.get(1).map(|p| p.ty),
         ) {
-            (Some(Ty::ClassRef(a, Mutability::Shared)), Some(Ty::ClassRef(b, Mutability::Shared)))
-                if sig.params.len() == 2 =>
-            {
-                (a, b)
-            }
+            (
+                Some(Ty::ClassRef(a, Mutability::Shared)),
+                Some(Ty::ClassRef(b, Mutability::Shared)),
+            ) if sig.params.len() == 2 => (a, b),
             _ => return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`")),
         };
         if ci_a != ci_b {
@@ -674,13 +787,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             });
         }
         if !returns {
-            reject_outstanding_obligations(
-                &ctx,
-                MARKED_NONE,
-                f.name_span,
-                &f.name,
-                true,
-            )?;
+            reject_outstanding_obligations(&ctx, MARKED_NONE, f.name_span, &f.name, true)?;
         }
         call_graph.insert(f.name.clone(), ctx.calls);
     }
@@ -690,6 +797,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
     // gates (literals, conversions, division) fire on the way.
     let mut templates = std::mem::take(&mut program.fn_templates);
     for f in &mut templates {
+        check_uart_params(&f.params)?;
         let mut ctx = Ctx {
             sigs: &sigs,
             current_fn: f.name.clone(),
@@ -727,9 +835,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ty: p.ty,
                     initialized: true,
                     mutable: false,
-                        branded: false,
-                        obligation: mandatory_ty(p.ty),
-                    },
+                    branded: false,
+                    obligation: mandatory_ty(p.ty),
+                },
             );
         }
         let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
@@ -744,13 +852,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             });
         }
         if !returns {
-            reject_outstanding_obligations(
-                &ctx,
-                MARKED_NONE,
-                f.name_span,
-                &f.name,
-                true,
-            )?;
+            reject_outstanding_obligations(&ctx, MARKED_NONE, f.name_span, &f.name, true)?;
         }
     }
     program.fn_templates = templates;
@@ -775,14 +877,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_test: false,
                 vars: HashMap::new(),
                 declared: HashSet::new(),
-            moved: HashSet::new(),
-            marked_fields: &marked,
-            in_unsafe: false,
-            unsafe_blocks: 0,
+                moved: HashSet::new(),
+                marked_fields: &marked,
+                in_unsafe: false,
+                unsafe_blocks: 0,
                 calls: Vec::new(),
                 in_class: Some((ci, true)),
                 in_init: true,
-            in_deinit: false,
+                in_deinit: false,
                 class_metas: &class_metas,
                 record_metas: &record_metas,
                 tbounds: HashMap::new(),
@@ -845,14 +947,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_test: false,
                 vars: HashMap::new(),
                 declared: HashSet::new(),
-            moved: HashSet::new(),
-            marked_fields: &marked,
-            in_unsafe: false,
-            unsafe_blocks: 0,
+                moved: HashSet::new(),
+                marked_fields: &marked,
+                in_unsafe: false,
+                unsafe_blocks: 0,
                 calls: Vec::new(),
                 in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                 in_init: false,
-            in_deinit: false,
+                in_deinit: false,
                 class_metas: &class_metas,
                 record_metas: &record_metas,
                 tbounds: HashMap::new(),
@@ -998,6 +1100,23 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         notes: vec![],
                     });
                 }
+                if matches!(
+                    fld.ty,
+                    Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
+                ) {
+                    return Err(Diagnostic {
+                        name: "uart.field_unsupported".into(),
+                        title: "the singleton UART capability may not be stored in a class".into(),
+                        span: fld.span,
+                        label: "keep `resource Uart` as an explicit parameter or local".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "device-identified profile capabilities and functional field \
+                             write-back are deferred"
+                                .into(),
+                        )],
+                    });
+                }
                 fields.push((fld.name.clone(), fld.ty));
             }
             tmetas.push(ClassMeta {
@@ -1030,6 +1149,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 .collect();
             let class_span = class.name_span;
             for init in &mut class.inits {
+                check_uart_params(&init.params)?;
                 let mut ctx = Ctx {
                     sigs: &sigs,
                     current_fn: format!("{}::{}", meta.name, init.name),
@@ -1037,14 +1157,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_test: false,
                     vars: HashMap::new(),
                     declared: HashSet::new(),
-            moved: HashSet::new(),
-            marked_fields: &marked,
-            in_unsafe: false,
-            unsafe_blocks: 0,
+                    moved: HashSet::new(),
+                    marked_fields: &marked,
+                    in_unsafe: false,
+                    unsafe_blocks: 0,
                     calls: Vec::new(),
                     in_class: Some((ci, true)),
                     in_init: true,
-            in_deinit: false,
+                    in_deinit: false,
                     class_metas: &tmetas,
                     record_metas: &record_metas,
                     tbounds: ctb.clone(),
@@ -1061,7 +1181,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             mutable: false,
                             branded: false,
                             obligation: mandatory_ty(p.ty),
-                    },
+                        },
                     );
                 }
                 for (fname, fty) in &meta.fields {
@@ -1073,7 +1193,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             mutable: true,
                             branded: false,
                             obligation: false,
-                    },
+                        },
                     );
                 }
                 check_block(&mut ctx, &mut init.body, Ty::Unit)?;
@@ -1096,6 +1216,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 }
             }
             for m in &mut class.methods {
+                check_uart_params(&m.f.params)?;
                 let mut ctx = Ctx {
                     sigs: &sigs,
                     current_fn: format!("{}::{}", meta.name, m.f.name),
@@ -1103,14 +1224,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_test: false,
                     vars: HashMap::new(),
                     declared: HashSet::new(),
-            moved: HashSet::new(),
-            marked_fields: &marked,
-            in_unsafe: false,
-            unsafe_blocks: 0,
+                    moved: HashSet::new(),
+                    marked_fields: &marked,
+                    in_unsafe: false,
+                    unsafe_blocks: 0,
                     calls: Vec::new(),
                     in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                     in_init: false,
-            in_deinit: false,
+                    in_deinit: false,
                     class_metas: &tmetas,
                     record_metas: &record_metas,
                     tbounds: ctb.clone(),
@@ -1125,9 +1246,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: p.ty,
                             initialized: true,
                             mutable: false,
-                        branded: false,
-                        obligation: mandatory_ty(p.ty),
-                    },
+                            branded: false,
+                            obligation: mandatory_ty(p.ty),
+                        },
                     );
                 }
                 for (fname, fty) in &meta.fields {
@@ -1137,22 +1258,16 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             ty: *fty,
                             initialized: true,
                             mutable: true,
-                        branded: false,
-                        obligation: marked_field(&marked, fname),
-                    },
+                            branded: false,
+                            obligation: marked_field(&marked, fname),
+                        },
                     );
                 }
                 let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
                 unsafe_regions += ctx.unsafe_blocks;
                 reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
                 if !returns {
-                    reject_outstanding_obligations(
-                        &ctx,
-                        &marked,
-                        class_span,
-                        &m.f.name,
-                        false,
-                    )?;
+                    reject_outstanding_obligations(&ctx, &marked, class_span, &m.f.name, false)?;
                 }
                 if !returns && m.f.ret != Ty::Unit {
                     return Err(Diagnostic {
@@ -1343,10 +1458,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
-                let dest_branded = ctx
-                    .vars
-                    .get(name.as_str())
-                    .is_some_and(|v| v.branded);
+                let dest_branded = ctx.vars.get(name.as_str()).is_some_and(|v| v.branded);
                 if !was_mutable {
                     return Err(Diagnostic {
                         name: "mut.assign_immutable".into(),
@@ -1504,7 +1616,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 ctx.moved = if reaching_moved.is_empty() {
                     before_moved
                 } else {
-                    reaching_moved.iter().flat_map(|s| s.iter().cloned()).collect()
+                    reaching_moved
+                        .iter()
+                        .flat_map(|s| s.iter().cloned())
+                        .collect()
                 };
                 returned = then_ret && else_ret;
             }
@@ -1528,35 +1643,43 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         )],
                     });
                 }
+                // Snapshot the actual loop head before evaluating the
+                // condition. Conditions are expressions, but they may still
+                // move affine arguments or mutate ownership state through a
+                // call. Those effects recur on every trip around the loop and
+                // therefore belong to the backedge comparison.
+                let head = snapshot(ctx);
+                let head_moved = ctx.moved.clone();
                 check_expr(ctx, cond, Some(Ty::Bool))?;
-                // The body may run zero times: check it against the entry
-                // state, then restore the entry state (body-declared locals
-                // become uninitialized after the loop).
-                let before = snapshot(ctx);
-                let before_moved = ctx.moved.clone();
+
+                // The body may run zero times, but the condition always runs
+                // once. Preserve its flow state for the false/exit path while
+                // checking condition + body against the pre-condition head.
+                let after_cond = snapshot(ctx);
+                let after_cond_moved = ctx.moved.clone();
                 let _body_ret = check_block(ctx, body, ret_ty)?;
                 // Affine shape must be preserved at the backedge
-                // (ADR 0024): a value consumed by the body is not there
-                // for the second iteration, and a resource created per
-                // iteration and never consumed leaks one per turn. Views
-                // may change freely — that is what the loop invariant is
-                // for; the *shape* is what must come back.
+                // (ADR 0024): a value consumed by the condition or body is
+                // not there for the next condition evaluation, and a
+                // resource created per iteration and never consumed leaks
+                // one per turn. Views may change freely — that is what the
+                // loop invariant is for; the *shape* is what must come back.
                 // Only values live at the loop head are part of the
                 // shape. One declared and consumed inside the body is
                 // per-iteration scratch, not something the backedge owes.
-                if let Some(p) = ctx.moved.symmetric_difference(&before_moved).find(|p| {
-                    ctx.place_ty(p).is_some_and(is_affine) && snapshot_has_place(&before, p)
+                if let Some(p) = ctx.moved.symmetric_difference(&head_moved).find(|p| {
+                    ctx.place_ty(p).is_some_and(is_affine) && snapshot_has_place(&head, p)
                 }) {
                     return Err(Diagnostic {
                         name: format!("{}.loop_shape", ctx.affine_kind(p)),
-                        title: format!("the loop body consumes `{}`", p.render()),
+                        title: format!("the loop iteration consumes `{}`", p.render()),
                         span: *kw_span,
-                        label: "the second iteration would not have it".into(),
+                        label: "the next condition evaluation would not have it".into(),
                         notes: vec![(
                             "note".into(),
-                            "a loop must leave the same values live at the backedge as at \
-                             the head; an invariant carries what they are, not whether \
-                             they are still there"
+                            "the condition and body together must leave the same values live at \
+                             the backedge as at the head; an invariant carries what they are, \
+                             not whether they are still there"
                                 .into(),
                         )],
                     });
@@ -1569,7 +1692,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // may run zero times) and resource views (loop invariants
                 // describe how those change).
                 let after = snapshot(ctx);
-                for (name, was) in &before {
+                for (name, was) in &head {
                     let Some(now) = after.get(name) else {
                         continue;
                     };
@@ -1591,9 +1714,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     if was.obligation != now.obligation {
                         return Err(Diagnostic {
                             name: "resource.loop_shape".into(),
-                            title: format!(
-                                "the loop changes the must-consume state of `{name}`"
-                            ),
+                            title: format!("the loop changes the must-consume state of `{name}`"),
                             span: *kw_span,
                             label: "the backedge leaves the obligation on a different place".into(),
                             notes: vec![(
@@ -1606,13 +1727,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 }
-                // The body may run zero times, so the state after the loop
-                // is the state before it. A body that consumed something
-                // live at the head was already rejected above, which is
-                // what makes restoring an obligation here correct rather
-                // than merely conservative.
-                ctx.moved = before_moved;
-                restore(ctx, &before);
+                // The body may run zero times, but the condition does not:
+                // continuation is its false path. Restore the post-condition
+                // flow state, not the pre-condition head. Any condition/body
+                // path that reaches a backedge with a different affine shape
+                // was already rejected above.
+                ctx.moved = after_cond_moved;
+                restore(ctx, &after_cond);
             }
             Stmt::Return { value, span } => {
                 if ctx.in_init {
@@ -1731,11 +1852,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // declaration computes it.
                 let branded = matches!(
                     t,
-                    Ty::Raw(_)
-                        | Ty::RawRecord(_)
-                        | Ty::OptionRaw(_)
-                        | Ty::Record(_)
-                        | Ty::Res(_)
+                    Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Record(_) | Ty::Res(_)
                 ) && brand_of(ctx, init);
                 let must_consume = transfer(ctx, init, None)?;
                 if t == Ty::Unit {
@@ -1810,9 +1927,16 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             notes: vec![],
                         });
                     }
-                    ctx.vars.insert(name.to_string(), VarInfo {
-                        ty, initialized: true, mutable, branded: false, obligation: false,
-                    });
+                    ctx.vars.insert(
+                        name.to_string(),
+                        VarInfo {
+                            ty,
+                            initialized: true,
+                            mutable,
+                            branded: false,
+                            obligation: false,
+                        },
+                    );
                 }
                 ctx.unsafe_blocks += 1;
             }
@@ -1878,10 +2002,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 ctx.unsafe_blocks += 1;
             }
             Stmt::SystemDealloc {
-                ptr,
-                res,
-                release,
-                ..
+                ptr, res, release, ..
             } => {
                 check_expr(ctx, ptr, Some(Ty::Raw(IntTy::U8)))?;
                 check_expr(ctx, res, Some(Ty::Res(ResKind::RawSpan)))?;
@@ -2237,10 +2358,9 @@ fn stmt_span(stmt: &Stmt) -> Span {
 fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
     let ty = match &e.kind {
         ExprKind::Var(name) => ctx.vars.get(name.as_str()).map(|v| v.ty),
-        ExprKind::SelfField { field } => ctx
-            .vars
-            .get(format!("self.{field}").as_str())
-            .map(|v| v.ty),
+        ExprKind::SelfField { field } => {
+            ctx.vars.get(format!("self.{field}").as_str()).map(|v| v.ty)
+        }
         ExprKind::Borrow { array, field, .. } => {
             let key = field
                 .as_ref()
@@ -2560,7 +2680,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             obj_span,
             field,
         } => {
-            if matches!(ctx.vars.get(obj.as_str()).map(|v| v.ty), Some(Ty::Record(_))) {
+            if matches!(
+                ctx.vars.get(obj.as_str()).map(|v| v.ty),
+                Some(Ty::Record(_))
+            ) {
                 let record_obj = obj.clone();
                 let record_obj_span = *obj_span;
                 let record_field = field.clone();
@@ -2742,6 +2865,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             for (a, w) in args.iter_mut().zip(&want) {
                 check_expr(ctx, a, Some(*w))?;
             }
+            check_borrow_conflicts(ctx, args, None)?;
             remap(m.ret)
         }
         ExprKind::RawOp { op, op_span, args } => {
@@ -2799,19 +2923,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::IntoCellRecord(_) => arg_kind(1),
                 RawOp::FromCellRecord(_) => arg_kind(1),
                 RawOp::CellInitRecord(_) => arg_kind(2),
-                RawOp::CellReadRecord(_)
-                | RawOp::CellTakeRecord(_)
-                | RawOp::CellDropRecord(_) => arg_kind(1),
+                RawOp::CellReadRecord(_) | RawOp::CellTakeRecord(_) | RawOp::CellDropRecord(_) => {
+                    arg_kind(1)
+                }
                 _ => None,
             };
             let leased_role = matches!(
                 cell_kind,
                 Some(ResKind::BlockLease | ResKind::LeasedPointsToU64)
             );
-            let leased_cell_shared =
-                Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Shared);
-            let leased_cell_unique =
-                Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Mut);
+            let leased_cell_shared = Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Shared);
+            let leased_cell_unique = Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Mut);
             let want: Vec<Ty> = match op {
                 RawOp::Offset => vec![raw, u64t],
                 RawOp::Load8 => vec![raw, shared],
@@ -2822,24 +2944,32 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::CellInitU64 => vec![
                     raw,
                     u64t,
-                    if leased_role { leased_cell_unique } else { cell_unique },
+                    if leased_role {
+                        leased_cell_unique
+                    } else {
+                        cell_unique
+                    },
                 ],
                 RawOp::CellReadU64 => vec![
                     raw,
-                    if leased_role { leased_cell_shared } else { cell_shared },
+                    if leased_role {
+                        leased_cell_shared
+                    } else {
+                        cell_shared
+                    },
                 ],
                 RawOp::CellTakeU64 | RawOp::CellDropU64 => vec![
                     raw,
-                    if leased_role { leased_cell_unique } else { cell_unique },
+                    if leased_role {
+                        leased_cell_unique
+                    } else {
+                        cell_unique
+                    },
                 ],
-                RawOp::IntoCellRecord(ri) => vec![
-                    Ty::RawRecord(ri),
-                    Ty::Res(ResKind::RawSpan),
-                ],
-                RawOp::FromCellRecord(ri) => vec![
-                    Ty::RawRecord(ri),
-                    Ty::Res(ResKind::PointsToRecord(ri)),
-                ],
+                RawOp::IntoCellRecord(ri) => vec![Ty::RawRecord(ri), Ty::Res(ResKind::RawSpan)],
+                RawOp::FromCellRecord(ri) => {
+                    vec![Ty::RawRecord(ri), Ty::Res(ResKind::PointsToRecord(ri))]
+                }
                 RawOp::CellInitRecord(ri) => vec![
                     Ty::RawRecord(ri),
                     Ty::Record(ri),
@@ -2876,8 +3006,20 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::Offset => raw,
                 RawOp::Load8 => u8t,
                 RawOp::Store8 | RawOp::Copy => Ty::Unit,
-                RawOp::IntoCellU64 => if leased_role { leased_cell } else { cell },
-                RawOp::FromCellU64 => if leased_role { leased } else { span },
+                RawOp::IntoCellU64 => {
+                    if leased_role {
+                        leased_cell
+                    } else {
+                        cell
+                    }
+                }
+                RawOp::FromCellU64 => {
+                    if leased_role {
+                        leased
+                    } else {
+                        span
+                    }
+                }
                 RawOp::CellInitU64 | RawOp::CellDropU64 => Ty::Unit,
                 RawOp::CellReadU64 | RawOp::CellTakeU64 => u64t,
                 RawOp::IntoCellRecord(ri) => Ty::Res(ResKind::PointsToRecord(ri)),
@@ -2892,19 +3034,74 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::HeaderSize | RawOp::HeaderNext => u64t,
             }
         }
+        ExprKind::DeviceOp { op, op_span, args } => {
+            let op = *op;
+            let op_span = *op_span;
+            if !ctx.in_unsafe {
+                return Err(Diagnostic {
+                    name: "device.outside_unsafe".into(),
+                    title: format!("`{}` may only be called inside `unsafe`", op.name()),
+                    span: op_span,
+                    label: "profile-mediated device access".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "the block is the audit boundary for externally observable device effects"
+                            .into(),
+                    )],
+                });
+            }
+            if args.len() != op.arity() {
+                return Err(Diagnostic {
+                    name: "type.arity".into(),
+                    title: format!(
+                        "`{}` takes {} argument(s), {} given",
+                        op.name(),
+                        op.arity(),
+                        args.len()
+                    ),
+                    span: op_span,
+                    label: "wrong number of arguments".into(),
+                    notes: vec![],
+                });
+            }
+            let uart = Ty::ResRef(ResKind::Uart, Mutability::Mut);
+            let want = match op {
+                DeviceOp::UartStatus => vec![uart],
+                DeviceOp::UartWrite => vec![Ty::Int(IntTy::U8), uart],
+            };
+            for (arg, expected) in args.iter_mut().zip(want) {
+                require_explicit_borrow(ctx, arg, expected)?;
+                check_expr(ctx, arg, Some(expected))?;
+            }
+            check_borrow_conflicts(ctx, args, None)?;
+            match op {
+                DeviceOp::UartStatus => Ty::Int(IntTy::U8),
+                DeviceOp::UartWrite => Ty::Unit,
+            }
+        }
         ExprKind::ResOp { op, op_span, args } => {
             let op = *op;
             let op_span = *op_span;
             let arity = match op {
                 ResOp::AllocatorStepHeader | ResOp::ResourceMapPut => 3,
-                ResOp::SplitOff | ResOp::Join | ResOp::OpenFileOf
-                | ResOp::AllocatorTake | ResOp::AllocatorPut
-                | ResOp::AllocatorTakeFree | ResOp::AllocatorPutFree
-                | ResOp::AllocatorTakeHeader | ResOp::AllocatorPutHeader
-                | ResOp::FreeBlockSplit | ResOp::FreeBlockJoin
+                ResOp::SplitOff
+                | ResOp::Join
+                | ResOp::OpenFileOf
+                | ResOp::AllocatorTake
+                | ResOp::AllocatorPut
+                | ResOp::AllocatorTakeFree
+                | ResOp::AllocatorPutFree
+                | ResOp::AllocatorTakeHeader
+                | ResOp::AllocatorPutHeader
+                | ResOp::FreeBlockSplit
+                | ResOp::FreeBlockJoin
                 | ResOp::ResourceMapTake => 2,
-                ResOp::TestWorld | ResOp::AllocatorCreate | ResOp::AllocatorDestroy
-                | ResOp::FreeBlockLease | ResOp::BlockLeaseFree => 1,
+                ResOp::TestWorld
+                | ResOp::TestUart
+                | ResOp::AllocatorCreate
+                | ResOp::AllocatorDestroy
+                | ResOp::FreeBlockLease
+                | ResOp::BlockLeaseFree => 1,
                 ResOp::ResourceMapEmpty => 0,
             };
             if args.len() != arity {
@@ -2987,6 +3184,23 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     }
                     check_expr(ctx, &mut args[0], Some(Ty::Int(IntTy::U64)))?;
                     Ty::Res(ResKind::PosixWorld)
+                }
+                ResOp::TestUart => {
+                    if !ctx.in_test {
+                        return Err(Diagnostic {
+                            name: "uart.profile_outside_test".into(),
+                            title: "`test_uart` exists only in tests".into(),
+                            span: op_span,
+                            label: "a program cannot select a scripted device profile".into(),
+                            notes: vec![(
+                                "note".into(),
+                                "outside a test, UART authority arrives from the platform profile"
+                                    .into(),
+                            )],
+                        });
+                    }
+                    check_expr(ctx, &mut args[0], Some(Ty::Int(IntTy::U64)))?;
+                    Ty::Res(ResKind::Uart)
                 }
                 // Fold a complete raw extent into a fresh affine aggregate.
                 ResOp::AllocatorCreate => {
@@ -3094,19 +3308,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     transfer(ctx, &args[0], None)?;
                     Ty::Res(ResKind::FreeBlock)
                 }
-                ResOp::ResourceMapEmpty => {
-                    match expected {
-                        Some(Ty::Res(kind @ ResKind::ResourceMapPointsToU64))
-                        | Some(Ty::Res(kind @ ResKind::ResourceMapPointsToRecord(_))) => {
-                            Ty::Res(kind)
-                        }
-                        _ => Ty::Res(ResKind::ResourceMapPointsToU64),
-                    }
-                }
+                ResOp::ResourceMapEmpty => match expected {
+                    Some(Ty::Res(kind @ ResKind::ResourceMapPointsToU64))
+                    | Some(Ty::Res(kind @ ResKind::ResourceMapPointsToRecord(_))) => Ty::Res(kind),
+                    _ => Ty::Res(ResKind::ResourceMapPointsToU64),
+                },
                 ResOp::ResourceMapTake => {
-                    let Some(map_kind @ (ResKind::ResourceMapPointsToU64
-                        | ResKind::ResourceMapPointsToRecord(_))) =
-                        resource_arg_kind(ctx, &args[0])
+                    let Some(
+                        map_kind @ (ResKind::ResourceMapPointsToU64
+                        | ResKind::ResourceMapPointsToRecord(_)),
+                    ) = resource_arg_kind(ctx, &args[0])
                     else {
                         return Err(Diagnostic {
                             name: "resource.map_type".into(),
@@ -3128,9 +3339,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     })
                 }
                 ResOp::ResourceMapPut => {
-                    let Some(map_kind @ (ResKind::ResourceMapPointsToU64
-                        | ResKind::ResourceMapPointsToRecord(_))) =
-                        resource_arg_kind(ctx, &args[0])
+                    let Some(
+                        map_kind @ (ResKind::ResourceMapPointsToU64
+                        | ResKind::ResourceMapPointsToRecord(_)),
+                    ) = resource_arg_kind(ctx, &args[0])
                     else {
                         return Err(Diagnostic {
                             name: "resource.map_type".into(),
@@ -3402,27 +3614,25 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // A method is a callee like any other: it can launder a brand
             // only if its signature can give storage back.
             let launders = match ret {
-                Ty::Raw(_)
-                | Ty::RawRecord(_)
-                | Ty::OptionRaw(_)
-                | Ty::Res(_)
-                | Ty::ResRef(..) => true,
+                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Res(_) | Ty::ResRef(..) => {
+                    true
+                }
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
                 _ => false,
             };
             for (arg, p) in args.iter_mut().zip(&params) {
                 check_expr(ctx, arg, Some(p.ty))?;
-                transfer(ctx, arg, launders.then(|| ("be passed to a method", arg.span)))?;
+                transfer(
+                    ctx,
+                    arg,
+                    launders.then(|| ("be passed to a method", arg.span)),
+                )?;
             }
             check_borrow_conflicts(
                 ctx,
                 args,
-                Some((
-                    Place::local(recv),
-                    self_kind == SelfKind::Mut,
-                    *recv_span,
-                )),
+                Some((Place::local(recv), self_kind == SelfKind::Mut, *recv_span)),
             )?;
             ctx.calls
                 .push(format!("{}::{method}", ctx.class_metas[ci].name));
@@ -3619,8 +3829,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         if src_mut != Mutability::Mut {
                             return Err(Diagnostic {
                                 name: "type.mut_borrow_shared".into(),
-                                title: format!("cannot mutably borrow `{array}` through `&{}`",
-                                    ctx.class_metas[ci].name),
+                                title: format!(
+                                    "cannot mutably borrow `{array}` through `&{}`",
+                                    ctx.class_metas[ci].name
+                                ),
                                 span,
                                 label: "this parameter is a shared borrow".into(),
                                 notes: vec![],
@@ -3955,11 +4167,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // stops C stashing the pointer in a foreign global — and it is
             // part of what the contract's audit id covers.
             let launders = match ret {
-                Ty::Raw(_)
-                | Ty::RawRecord(_)
-                | Ty::OptionRaw(_)
-                | Ty::Res(_)
-                | Ty::ResRef(..) => true,
+                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Res(_) | Ty::ResRef(..) => {
+                    true
+                }
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
                 _ => false,
@@ -4246,11 +4456,7 @@ fn flip(m: Mutability) -> Mutability {
 fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
     match &arg.kind {
         ExprKind::Var(name) => {
-            if ctx
-                .vars
-                .get(name.as_str())
-                .is_some_and(|v| is_affine(v.ty))
-            {
+            if ctx.vars.get(name.as_str()).is_some_and(|v| is_affine(v.ty)) {
                 ctx.moved.insert(Place::local(name));
             }
         }
@@ -4505,19 +4711,22 @@ fn reject_outstanding_obligations(
             title: format!("`{member}` abandons `{name}`"),
             span,
             label: label.into(),
-            notes: vec![("note".into(), if sealed_release {
-                "return the full allocation to raw authority and pass it with the base \
+            notes: vec![(
+                "note".into(),
+                if sealed_release {
+                    "return the full allocation to raw authority and pass it with the base \
                  pointer to `unsafe system_dealloc`"
-                    .into()
-            } else if mandatory {
-                "hand the authority through verified owned parameters until it reaches \
+                        .into()
+                } else if mandatory {
+                    "hand the authority through verified owned parameters until it reaches \
                  an audited `#[consumes]` operation"
-                    .into()
-            } else {
-                "hand the authority on — pass it by value to something that consumes it \
+                        .into()
+                } else {
+                    "hand the authority on — pass it by value to something that consumes it \
                  — or drop the field marker and accept the leak"
-                    .into()
-            })],
+                        .into()
+                },
+            )],
         });
     }
     Ok(())
@@ -4742,14 +4951,14 @@ fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
         ExprKind::Var(n) | ExprKind::Borrow { array: n, .. } => {
             ctx.vars.get(n.as_str()).is_some_and(|v| v.branded)
         }
-        ExprKind::RawOp { args, .. } | ExprKind::ResOp { args, .. } => {
-            args.iter().any(|a| brand_of(ctx, a))
-        }
-        ExprKind::SomeE(inner) | ExprKind::OptValue { operand: inner }
+        ExprKind::RawOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::DeviceOp { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
+        ExprKind::SomeE(inner)
+        | ExprKind::OptValue { operand: inner }
         | ExprKind::IsSome { operand: inner } => brand_of(ctx, inner),
         ExprKind::RecordLit { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
-        ExprKind::RecordField { obj, .. } =>
-            ctx.vars.get(obj.as_str()).is_some_and(|v| v.branded),
+        ExprKind::RecordField { obj, .. } => ctx.vars.get(obj.as_str()).is_some_and(|v| v.branded),
         _ => false,
     }
 }

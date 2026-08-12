@@ -99,6 +99,7 @@ pub fn free_list_first_fit(raw<u8> base,
 ///     · calc
 ///         (Sable.RawPtr.add base current).alloc = base.alloc := rfl
 ///         _ = _old_state.root.alloc := h_pre_base.1
+///         _ = state.root.alloc := by rw [h_inv_state_old_state]
 ///         _ = node.sizeCell.alloc := hstored.2.2.2.2.2.symm
 ///     · calc
 ///         (Sable.RawPtr.add base current).off = base.off + current := rfl
@@ -126,7 +127,8 @@ pub fn free_list_first_fit(raw<u8> base,
 ///   · constructor
 ///     · calc
 ///         node.nextCell.alloc = node.sizeCell.alloc := halloc.symm
-///         _ = _old_state.root.alloc := hstored.2.2.2.2.2
+///         _ = state.root.alloc := hstored.2.2.2.2.2
+///         _ = _old_state.root.alloc := by rw [h_inv_state_old_state]
 ///         _ = base.alloc := h_pre_base.1.symm
 ///         _ = (Sable.RawPtr.add base current).alloc := rfl
 ///     · calc
@@ -144,17 +146,21 @@ pub fn free_list_first_fit(raw<u8> base,
 ///     simp
 
 /// discharge free_list_locate_first_fit.allocator_put_header by
+///   have hchain : _old_state.StoredChain limit current := by
+///     simpa [h_inv_state_old_state] using
+///       h_inv_sable_allocatorview_stor
 ///   have htake : Sable.AllocatorView.canTakeHeader _old_state current :=
 ///     Sable.AllocatorView.StoredChain.takeable
-///       h_inv_sable_allocatorview_stor h_path_current_limit
-///   rw [h_state_step_header, h_header7_step]
+///       hchain h_path_current_limit
+///   rw [h_state_step_header, h_header7_step, h_inv_state_old_state]
 ///   exact Sable.AllocatorView.takeHeader_canPutHeader
 ///     _old_state current htake
 
 /// discharge free_list_locate_first_fit.post.frame by
 ///   rw [h_state_put_header, h_state_step_header, h_header7_step]
-///   exact Sable.AllocatorView.StoredChain.extract_restore
-///     h_inv_sable_allocatorview_stor h_path_current_limit
+///   exact (Sable.AllocatorView.StoredChain.extract_restore
+///     h_inv_sable_allocatorview_stor h_path_current_limit).trans
+///     h_inv_state_old_state
 
 /// discharge free_list_locate_first_fit.post.location by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
@@ -171,6 +177,8 @@ pub fn free_list_first_fit(raw<u8> base,
 ///     injection h_value8_header_size
 ///   have hnext : storedNext = _value9 := by
 ///     injection h_value9_header_next
+///   have hstoredOld : _old_state.storesHeader current node := by
+///     simpa [h_inv_state_old_state] using hstored
 ///   rw [h_result,
 ///     h_FreeListLocation_make_post_self_previous_previous_s.1,
 ///     h_FreeListLocation_make_post_self_previous_previous_s.2.1,
@@ -178,13 +186,14 @@ pub fn free_list_first_fit(raw<u8> base,
 ///     h_FreeListLocation_make_post_self_previous_previous_s.2.2.2,
 ///     ← hsize, ← hnext]
 ///   exact Sable.AllocatorView.FirstFitLocation.found
-///     h_pre_chain h_inv_sable_allocatorview_reje hstored hfields
+///     h_pre_chain h_inv_sable_allocatorview_reje hstoredOld hfields
 ///       (by omega)
 
 /// discharge free_list_locate_first_fit.inv_preserved.state_old_state by
 ///   rw [h_state_put_header, h_state_step_header, h_header7_step]
-///   exact Sable.AllocatorView.StoredChain.extract_restore
-///     h_inv_sable_allocatorview_stor h_path_current_limit
+///   exact (Sable.AllocatorView.StoredChain.extract_restore
+///     h_inv_sable_allocatorview_stor h_path_current_limit).trans
+///     h_inv_state_old_state
 
 /// discharge free_list_locate_first_fit.inv_preserved.sable_allocatorview_storedchain_state_li by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
@@ -198,12 +207,13 @@ pub fn free_list_first_fit(raw<u8> base,
 ///   rw [hnode, hfields.2] at h_value9_header_next
 ///   have hnext : storedNext = _value9 := by
 ///     injection h_value9_header_next
-///   have hrestore : state_2 = _old_state := by
+///   have hrestore : state_3 = _old_state := by
 ///     rw [h_state_put_header, h_state_step_header, h_header7_step]
-///     exact Sable.AllocatorView.StoredChain.extract_restore
-///       h_inv_sable_allocatorview_stor h_path_current_limit
+///     exact (Sable.AllocatorView.StoredChain.extract_restore
+///       h_inv_sable_allocatorview_stor h_path_current_limit).trans
+///       h_inv_state_old_state
 ///   rw [hrestore, ← hnext]
-///   exact tail
+///   simpa [h_inv_state_old_state] using tail
 
 /// discharge free_list_locate_first_fit.inv_preserved.sable_allocatorview_rejectedpath_old_sta by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
@@ -220,10 +230,12 @@ pub fn free_list_first_fit(raw<u8> base,
 ///     injection h_value8_header_size
 ///   have hnext : storedNext = _value9 := by
 ///     injection h_value9_header_next
+///   have hstoredOld : _old_state.storesHeader current node := by
+///     simpa [h_inv_state_old_state] using hstored
 ///   rw [← hnext]
 ///   exact Sable.AllocatorView.RejectedPath.step
 ///     h_inv_sable_allocatorview_reje h_path_current_limit
-///       hstored hfields (by omega)
+///       hstoredOld hfields (by omega)
 
 /// discharge free_list_locate_first_fit.variant_decreases.limit_current by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,

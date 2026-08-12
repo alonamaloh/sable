@@ -1,0 +1,39 @@
+// expect-error: loop_condition_mutation_stale.post.result_one
+// Regression guard: an effectful loop condition belongs to the transition.
+// If mutation discovery scans only the lexical body, the condition below is
+// evaluated from the pre-loop zero state on every symbolic path; its false
+// branch is then contradictory and the false postcondition appears to verify.
+
+class LoopConditionCounter {
+    u64 n;
+
+    /// invariant n <= 3
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre self.n < 3
+    /// post self.n = old self.n + 1
+    /// post result ↔ self.n < 3
+    fn tick(&mut self) -> bool {
+        self.n = self.n + 1;
+        return self.n < 3;
+    }
+
+    /// post result = self.n
+    fn get(&self) -> u64 {
+        return self.n;
+    }
+}
+
+/// post #[label(result_one)] result = 1
+fn loop_condition_mutation_stale() -> u64 {
+    var mut c = LoopConditionCounter::zero();
+    /// invariant c.n <= 2
+    /// variant 3 - c.n
+    while (c.tick()) {
+    }
+    return c.get();
+}

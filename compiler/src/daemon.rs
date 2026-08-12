@@ -3,7 +3,8 @@
 //!
 //! Protocol (deliberately trivial — newline-delimited JSON over a unix socket
 //! at `.sable-out/daemon.sock`):
-//!   client → daemon: `{"file": "/abs/path/to/generated.lean"}\n`
+//!   client → daemon: `{"file": "/abs/path/to/generated.lean",
+//!                       "fingerprint": "fnv64:...", "text": "..."}\n`
 //!   daemon → client: `{"ok": true, "messages": [{"severity", "line", "data"}…]}\n`
 //!                or  `{"ok": false, "error": "…"}\n`
 //! `messages` uses the same shape as `lean::LeanMessage` from the batch
@@ -18,12 +19,11 @@
 //! If `waitForDiagnostics` fails we fall back to watching
 //! `$/lean/fileProgress` for an empty `processing` array.
 //!
-//! Documents stay open between checks on purpose: Lean's server runs one
-//! worker process per open document, and that worker re-imports the prelude
-//! only when the file *header* changes. Generated files always start with
-//! `import Sable`, so a re-check of an open document skips import loading —
-//! that is where the cold-start time goes. Each open document costs a
-//! resident worker process, so we cap them with a small LRU.
+//! Documents stay open only within one exact immutable proof build. A request
+//! for another captured environment replaces the whole server; a generated
+//! import-header edit triggers didClose/didOpen. We never didChange a document
+//! whose worker may hold stale imports. Each open document costs a resident
+//! worker process, so we cap them with an LRU.
 //!
 //! The client side (`try_check`) treats *any* problem — no socket, stale
 //! socket, daemon error — as "no daemon": the caller falls back to the batch
@@ -52,15 +52,29 @@ pub fn socket_path(repo_root: &Path) -> PathBuf {
 // Client side (used by `sable check`)
 // ---------------------------------------------------------------------------
 
-/// Ask a running daemon to check `lean_file`. Returns `None` when there is no
-/// usable daemon (socket missing, connection refused, daemon reported an
-/// error, malformed reply) — the caller then uses the batch path.
-pub fn try_check(repo_root: &Path, lean_file: &Path) -> Option<Vec<LeanMessage>> {
+/// Check a generated document against the exact proof environment captured
+/// while it was prepared. The caller must not substitute a fresh fingerprint:
+/// doing so could pair old generated text with newly edited profile/prelude
+/// semantics. Returns `None` when no usable daemon answers, so the caller can
+/// use the batch path with the same expected fingerprint.
+pub fn try_check(
+    repo_root: &Path,
+    lean_file: &Path,
+    proof_environment: &crate::lean::ProofEnvironment,
+    expected_source: &str,
+) -> Option<Vec<LeanMessage>> {
+    // Ensure the daemon can recover these exact bytes even if the live
+    // checkout changes before it reads the request.
+    proof_environment.materialize_source(repo_root).ok()?;
     let mut stream = UnixStream::connect(socket_path(repo_root)).ok()?;
     // A generous ceiling so a wedged daemon cannot hang `sable check`
     // forever; real checks finish in well under this.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(300)));
-    let request = serde_json::json!({ "file": lean_file.to_string_lossy() });
+    let request = serde_json::json!({
+        "file": lean_file.to_string_lossy(),
+        "fingerprint": proof_environment.id(),
+        "text": expected_source,
+    });
     writeln!(stream, "{request}").ok()?;
     stream.flush().ok()?;
 
@@ -87,28 +101,10 @@ pub fn try_check(repo_root: &Path, lean_file: &Path) -> Option<Vec<LeanMessage>>
 // Daemon side (`sable daemon`)
 // ---------------------------------------------------------------------------
 
-/// Run the daemon until killed. Builds the prelude once, spawns the Lean
-/// server, then services check requests sequentially over the unix socket.
+/// Run the daemon until killed. Proof builds are request-selected immutable
+/// snapshots, so startup never guesses which mutable checkout state to build.
 pub fn run(repo_root: &Path) -> Result<(), String> {
-    let lean_dir = repo_root.join("lean");
-
-    // Same staleness guard as the batch path, paid once at daemon startup.
-    let build = Command::new("lake")
-        .arg("build")
-        .current_dir(&lean_dir)
-        .output()
-        .map_err(|err| format!("failed to run `lake build`: {err}"))?;
-    if !build.status.success() {
-        return Err(format!(
-            "`lake build` failed in {}:\n{}{}",
-            lean_dir.display(),
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr),
-        ));
-    }
-
-    let mut server = LeanServer::spawn(&lean_dir)?;
-    eprintln!("sable daemon: lean server ready ({})", lean_dir.display());
+    let mut server: Option<LeanServer> = None;
 
     let sock = socket_path(repo_root);
     if let Some(dir) = sock.parent() {
@@ -131,7 +127,7 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
                 continue;
             }
         };
-        let reply = handle_request(&mut server, &mut stream, &lean_dir);
+        let reply = handle_request(&mut server, &mut stream, repo_root);
         let _ = writeln!(stream, "{reply}");
         let _ = stream.flush();
     }
@@ -139,9 +135,9 @@ pub fn run(repo_root: &Path) -> Result<(), String> {
 }
 
 fn handle_request(
-    server: &mut LeanServer,
+    server: &mut Option<LeanServer>,
     stream: &mut UnixStream,
-    lean_dir: &Path,
+    repo_root: &Path,
 ) -> serde_json::Value {
     let mut line = String::new();
     if BufReader::new(&mut *stream).read_line(&mut line).is_err() {
@@ -153,18 +149,54 @@ fn handle_request(
     let Some(file) = request["file"].as_str() else {
         return error_reply("request missing \"file\"");
     };
+    let Some(request_fingerprint) = request["fingerprint"].as_str() else {
+        return error_reply("request missing \"fingerprint\"");
+    };
+    let Some(expected_source) = request["text"].as_str() else {
+        return error_reply("request missing \"text\"");
+    };
 
-    // If the Lean server died since the last request, respawn it once.
-    if !server.alive() {
+    let proof_environment = match crate::lean::ProofEnvironment::load_published(
+        repo_root,
+        request_fingerprint,
+    ) {
+        Ok(environment) => environment,
+        Err(error) => return error_reply(&error),
+    };
+    let built = match proof_environment.ensure_built(repo_root) {
+        Ok(built) => built,
+        Err(error) => return error_reply(&error),
+    };
+    let replace = server.as_ref().is_none_or(|server| {
+        server.environment_fingerprint != proof_environment.id() || server.built_root != built
+    });
+    if replace {
+        eprintln!(
+            "sable daemon: selecting proof environment {}",
+            proof_environment.id()
+        );
+        match LeanServer::spawn(repo_root, &proof_environment, &built) {
+            Ok(fresh) => *server = Some(fresh),
+            Err(error) => return error_reply(&format!("lean server spawn failed: {error}")),
+        }
+    }
+    if server.as_mut().is_none_or(|server| !server.alive()) {
         eprintln!("sable daemon: lean server exited; respawning");
-        match LeanServer::spawn(lean_dir) {
-            Ok(fresh) => *server = fresh,
-            Err(err) => return error_reply(&format!("lean server respawn failed: {err}")),
+        match LeanServer::spawn(repo_root, &proof_environment, &built) {
+            Ok(fresh) => *server = Some(fresh),
+            Err(error) => return error_reply(&format!("lean server respawn failed: {error}")),
         }
     }
 
-    match server.check(Path::new(file), stream) {
+    match server
+        .as_mut()
+        .expect("server was spawned above")
+        .check(Path::new(file), expected_source, stream)
+    {
         Ok(messages) => {
+            if let Err(error) = proof_environment.validate_built(&built) {
+                return error_reply(&error);
+            }
             let messages: Vec<serde_json::Value> = messages
                 .iter()
                 .map(|m| {
@@ -179,6 +211,21 @@ fn handle_request(
         }
         Err(err) => {
             eprintln!("sable daemon: check failed: {err}");
+            // A failed notify/request can leave our open-document bookkeeping
+            // out of sync with Lean. Replace the whole server before another
+            // client can use it; the next request will still perform the
+            // normal environment-fingerprint comparison first.
+            if let Some(mut failed) = server.take() {
+                failed.stop();
+            }
+            match LeanServer::spawn(repo_root, &proof_environment, &built) {
+                Ok(fresh) => *server = Some(fresh),
+                Err(respawn_error) => {
+                    eprintln!(
+                        "sable daemon: cleanup respawn after failed check also failed: {respawn_error}"
+                    );
+                }
+            }
             error_reply(&err)
         }
     }
@@ -196,7 +243,32 @@ fn error_reply(message: &str) -> serde_json::Value {
 /// resident Lean worker process holding the imported prelude).
 const MAX_OPEN_DOCS: usize = 4;
 
+struct OpenDocument {
+    uri: String,
+    /// Exact leading `import ...` lines. Lean workers retain imported oleans,
+    /// so changing this requires didClose/didOpen, never didChange.
+    import_header: String,
+    /// Exact last text, so cached diagnostics are reused only for an
+    /// identical document, never merely for one with the same imports.
+    text: String,
+}
+
+fn import_header(text: &str) -> String {
+    // Generated files put their complete import list first. Preserve exact
+    // lines and their order: changing even one dependency identity is enough
+    // to require a fresh worker.
+    text.lines()
+        .take_while(|line| line.trim_start().starts_with("import "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 struct LeanServer {
+    /// Snapshot this process was spawned against. Any change replaces the
+    /// entire server, clearing workers, open documents, and cached oleans.
+    environment_fingerprint: String,
+    /// Final stable repo-shaped build path whose oleans this process imports.
+    built_root: PathBuf,
     child: Child,
     stdin: ChildStdin,
     /// Messages parsed off the server's stdout by a dedicated reader
@@ -207,8 +279,8 @@ struct LeanServer {
     next_id: i64,
     /// Monotonic didOpen/didChange version, shared across documents.
     next_version: i64,
-    /// Currently-open document uris, most recently used last.
-    open_docs: Vec<String>,
+    /// Currently-open documents, most recently used last.
+    open_docs: Vec<OpenDocument>,
     /// Last published diagnostics per open uri. Lean may elide re-publishing
     /// when a re-check reuses cached snapshots (identical content), so a
     /// round with no publishDiagnostics falls back to these.
@@ -216,17 +288,25 @@ struct LeanServer {
 }
 
 impl LeanServer {
-    fn spawn(lean_dir: &Path) -> Result<LeanServer, String> {
+    fn spawn(
+        repo_root: &Path,
+        proof_environment: &crate::lean::ProofEnvironment,
+        built_root: &Path,
+    ) -> Result<LeanServer, String> {
         // Direct `lean` with the explicit search path (workspace +
         // generated-artifact dir): generated files import per-module
         // artifacts (ADR 0013 slice 2), and their content-addressed
         // names change with content, so a header re-import always sees
         // the current artifact.
-        let repo_root = lean_dir.parent().ok_or("lean dir has no parent")?;
+        proof_environment.validate_built(built_root)?;
+        let lean_dir = built_root.join("lean");
         let mut child = Command::new("lean")
             .arg("--server")
-            .env("LEAN_PATH", crate::lean::lean_search_path(repo_root)?)
-            .current_dir(lean_dir)
+            .env(
+                "LEAN_PATH",
+                crate::lean::lean_search_path(repo_root, proof_environment)?,
+            )
+            .current_dir(&lean_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -251,6 +331,8 @@ impl LeanServer {
             }
         });
         let mut server = LeanServer {
+            environment_fingerprint: proof_environment.id().to_string(),
+            built_root: built_root.to_path_buf(),
             child,
             stdin,
             incoming,
@@ -260,7 +342,7 @@ impl LeanServer {
             last_diags: std::collections::HashMap::new(),
         };
 
-        let root_uri = file_uri(lean_dir);
+        let root_uri = file_uri(&lean_dir);
         server.request(
             "initialize",
             serde_json::json!({
@@ -277,54 +359,74 @@ impl LeanServer {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     /// Check one generated .lean file; returns messages in batch-path shape.
     /// Watches `client` while waiting: a disconnect cancels the check by
     /// closing the document (terminating its worker).
     fn check(
         &mut self,
         lean_file: &Path,
+        expected_source: &str,
         client: &mut UnixStream,
     ) -> Result<Vec<LeanMessage>, String> {
-        let text = std::fs::read_to_string(lean_file)
-            .map_err(|err| format!("cannot read {}: {err}", lean_file.display()))?;
+        // The exact prepared text travels with the request. The file path is
+        // only the stable LSP identity; re-reading it here would reintroduce a
+        // race with another checker materializing a different root version.
+        let text = expected_source.to_string();
         let uri = file_uri(lean_file);
+        let import_header = import_header(&text);
         self.next_version += 1;
         let version = self.next_version;
 
-        if let Some(pos) = self.open_docs.iter().position(|u| *u == uri) {
-            // Already open: full-text didChange. The header (`import Sable`)
-            // is unchanged, so the worker keeps its loaded imports — this is
-            // the warm path that makes the daemon worthwhile.
-            self.open_docs.remove(pos);
-            self.open_docs.push(uri.clone());
-            self.notify(
-                "textDocument/didChange",
-                serde_json::json!({
-                    "textDocument": { "uri": uri, "version": version },
-                    "contentChanges": [ { "text": text } ],
-                }),
-            )?;
-        } else {
-            if self.open_docs.len() >= MAX_OPEN_DOCS {
-                let evicted = self.open_docs.remove(0);
-                self.last_diags.remove(&evicted);
+        if let Some(pos) = self.open_docs.iter().position(|doc| doc.uri == uri) {
+            let previous = &self.open_docs[pos];
+            if previous.import_header != import_header {
+                // A worker does not necessarily reload imported oleans on a
+                // full-text change. Close it before opening the replacement,
+                // so the new import graph is elaborated from a clean state.
                 self.notify(
                     "textDocument/didClose",
-                    serde_json::json!({ "textDocument": { "uri": evicted } }),
+                    serde_json::json!({ "textDocument": { "uri": uri } }),
                 )?;
+                self.open_docs.remove(pos);
+                self.last_diags.remove(&uri);
+                self.open_document(uri.clone(), import_header, version, text)?;
+            } else {
+                // Import environment is unchanged: full-text didChange is the
+                // safe warm path.
+                let identical_text = previous.text == text;
+                self.notify(
+                    "textDocument/didChange",
+                    serde_json::json!({
+                        "textDocument": { "uri": uri, "version": version },
+                        "contentChanges": [ { "text": text } ],
+                    }),
+                )?;
+                self.open_docs.remove(pos);
+                if !identical_text {
+                    self.last_diags.remove(&uri);
+                }
+                self.open_docs.push(OpenDocument {
+                    uri: uri.clone(),
+                    import_header,
+                    text,
+                });
             }
-            self.open_docs.push(uri.clone());
-            self.notify(
-                "textDocument/didOpen",
-                serde_json::json!({
-                    "textDocument": {
-                        "uri": uri,
-                        "languageId": "lean",
-                        "version": version,
-                        "text": text,
-                    }
-                }),
-            )?;
+        } else {
+            if self.open_docs.len() >= MAX_OPEN_DOCS {
+                let evicted_uri = self.open_docs[0].uri.clone();
+                self.notify(
+                    "textDocument/didClose",
+                    serde_json::json!({ "textDocument": { "uri": evicted_uri } }),
+                )?;
+                self.open_docs.remove(0);
+                self.last_diags.remove(&evicted_uri);
+            }
+            self.open_document(uri.clone(), import_header, version, text)?;
         }
 
         // Quiescence: Lean's own extension request answers once diagnostics
@@ -415,7 +517,7 @@ impl LeanServer {
             // Leave the document out of the warm set; a fresh didOpen next
             // time is the safest way back to a known state. (On cancel the
             // didClose already happened.)
-            self.open_docs.retain(|u| *u != uri);
+            self.open_docs.retain(|doc| doc.uri != uri);
             self.last_diags.remove(&uri);
             if !canceled {
                 let _ = self.notify(
@@ -451,6 +553,32 @@ impl LeanServer {
             }
         }
         Ok(messages)
+    }
+
+    fn open_document(
+        &mut self,
+        uri: String,
+        import_header: String,
+        version: i64,
+        text: String,
+    ) -> Result<(), String> {
+        self.notify(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri.clone(),
+                    "languageId": "lean",
+                    "version": version,
+                    "text": text.clone(),
+                }
+            }),
+        )?;
+        self.open_docs.push(OpenDocument {
+            uri,
+            import_header,
+            text,
+        });
+        Ok(())
     }
 
     // -- JSON-RPC plumbing --------------------------------------------------
@@ -577,8 +705,7 @@ fn client_disconnected(stream: &mut UnixStream) -> bool {
 
 impl Drop for LeanServer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 

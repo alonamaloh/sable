@@ -1,0 +1,20 @@
+// expect-error: loop_nested_unsafe_stale.post.result_false
+// Regression guard: `unsafe` is a vocabulary marker, not an effect barrier.
+// If loop mutation discovery skips its body, `changed` keeps the pre-loop
+// value at the exit and the false postcondition below appears to verify.
+
+/// post #[label(result_false)] result = false
+fn loop_nested_unsafe_stale() -> bool {
+    mut u64 i = 0;
+    mut bool changed = false;
+    /// invariant i <= 1
+    /// invariant changed = false ∨ changed = true
+    /// variant 1 - i
+    while (i < 1) {
+        unsafe {
+            changed = true;
+        }
+        i = i + 1;
+    }
+    return changed;
+}

@@ -9,8 +9,14 @@
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use crate::vcgen::{Obligation, VcResult};
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 enum MapTarget {
     Clause {
@@ -123,6 +129,18 @@ pub fn emit(
             e.push(&format!("--   {id} ({name}): {reason}"));
         }
     }
+    if !vc.machine.profiles.is_empty() {
+        e.push("-- formal machine profiles (kernel-checked, not trusted axioms)");
+        for (id, hash) in &vc.machine.profiles {
+            e.push(&format!("--   {id} {hash}"));
+        }
+        if !vc.machine.intrinsics.is_empty() {
+            e.push(&format!(
+                "--   intrinsics: {}",
+                vc.machine.intrinsics.join(", ")
+            ));
+        }
+    }
     e.push("");
 
     for r in &vc.records {
@@ -151,7 +169,10 @@ pub fn emit(
             r.layout.align
         ));
         for field in &r.fields {
-            e.push(&format!("def {}Offset : Int := {}", field.name, field.offset));
+            e.push(&format!(
+                "def {}Offset : Int := {}",
+                field.name, field.offset
+            ));
         }
         let mut exponent = 0u32;
         let mut align = r.layout.align;
@@ -423,64 +444,555 @@ pub fn modules_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".sable-out").join("modules")
 }
 
-/// The full `LEAN_PATH` for checking generated files: the lake
-/// workspace's own path (prelude + toolchain; queried once per process)
-/// extended with the generated-artifact directory.
-pub fn lean_search_path(repo_root: &Path) -> Result<String, String> {
-    use std::sync::OnceLock;
-    static LAKE_PATH: OnceLock<Result<String, String>> = OnceLock::new();
-    let base = LAKE_PATH
-        .get_or_init(|| {
-            let out = Command::new("lake")
-                .args(["env", "printenv", "LEAN_PATH"])
-                .current_dir(repo_root.join("lean"))
-                .output()
-                .map_err(|err| format!("failed to run `lake env`: {err}"))?;
-            if !out.status.success() {
-                return Err(format!(
-                    "`lake env printenv LEAN_PATH` failed:\n{}",
-                    String::from_utf8_lossy(&out.stderr)
-                ));
-            }
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-        })
-        .clone()?;
-    Ok(format!("{base}:{}", modules_dir(repo_root).display()))
+/// Exact repository-local inputs that can affect a generated proof. The FNV
+/// identifier is only a compact directory/name tag; every reuse also compares
+/// this complete map, so a hash collision fails closed.
+#[derive(Clone)]
+pub struct ProofEnvironment {
+    id: String,
+    files: Arc<BTreeMap<String, Vec<u8>>>,
 }
 
-/// Build the prelude if needed and check the generated file. With
-/// `olean_out`, additionally compile it into an importable artifact
-/// (the file must live in the modules dir, which becomes `--root` so
-/// the Lean module name matches the file stem).
-pub fn run_lean(
-    repo_root: &Path,
-    lean_file: &Path,
-    olean_out: Option<&Path>,
-) -> Result<Vec<LeanMessage>, String> {
-    let lean_dir = repo_root.join("lean");
+impl ProofEnvironment {
+    /// Capture one immutable view before profile generation or dependency work.
+    pub fn capture(repo_root: &Path) -> Result<Self, String> {
+        Self::from_files(capture_proof_files(repo_root)?)
+    }
 
-    // `lake build` is a fast no-op when the prelude is current, and keeps
-    // agents who edit the prelude from checking against stale oleans.
-    let build = Command::new("lake")
-        .arg("build")
-        .current_dir(&lean_dir)
-        .output()
-        .map_err(|err| format!("failed to run `lake build`: {err}"))?;
-    if !build.status.success() {
+    fn from_files(files: BTreeMap<String, Vec<u8>>) -> Result<Self, String> {
+        if files.is_empty() {
+            return Err("proof environment contains no inputs".into());
+        }
+        let mut hash = 0xcbf29ce484222325u64;
+        for (label, bytes) in &files {
+            hash = fingerprint_bytes(hash, &(label.len() as u64).to_le_bytes());
+            hash = fingerprint_bytes(hash, label.as_bytes());
+            hash = fingerprint_bytes(hash, &(bytes.len() as u64).to_le_bytes());
+            hash = fingerprint_bytes(hash, bytes);
+        }
+        Ok(Self {
+            // Version the identity domain so evidence produced by the old
+            // mutable-checkout builder can never be mistaken for v2 evidence.
+            id: format!("proof-env-v2-fnv64:{hash:016x}"),
+            files: Arc::new(files),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Load a client-selected published snapshot without consulting the live
+    /// checkout. This is how a long-lived daemon recovers the exact bytes named
+    /// in a request after those checkout files have changed.
+    pub fn load_published(repo_root: &Path, id: &str) -> Result<Self, String> {
+        validate_environment_id(id)?;
+        validate_proof_environment_dir(repo_root, id)?;
+        let source = proof_environment_dir(repo_root, id).join("source");
+        let environment = Self::capture(&source)?;
+        if environment.id != id {
+            return Err(format!(
+                "published proof environment {} contains bytes for {}",
+                source.display(),
+                environment.id
+            ));
+        }
+        Ok(environment)
+    }
+
+    /// Atomically publish a repo-shaped source snapshot. A racing process may
+    /// win the rename, but it is accepted only after an exact byte-map match.
+    pub fn materialize_source(&self, repo_root: &Path) -> Result<PathBuf, String> {
+        let environment_dir = ensure_proof_environment_dir(repo_root, &self.id)?;
+        let source = environment_dir.join("source");
+        if std::fs::symlink_metadata(&source).is_ok() {
+            self.validate_snapshot(&source, "published source snapshot")?;
+            return Ok(source);
+        }
+
+        let temporary = unique_directory(&environment_dir, "source.tmp")?;
+        let result = (|| {
+            write_proof_files(&temporary, &self.files)?;
+            self.validate_snapshot(&temporary, "temporary source snapshot")?;
+            match std::fs::rename(&temporary, &source) {
+                Ok(()) => {}
+                Err(_error) if std::fs::symlink_metadata(&source).is_ok() => {
+                    self.validate_snapshot(&source, "racing published source snapshot")?;
+                    let _ = std::fs::remove_dir_all(&temporary);
+                    return Ok(source.clone());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot publish proof source snapshot {}: {error}",
+                        source.display()
+                    ));
+                }
+            }
+            self.validate_snapshot(&source, "published source snapshot")?;
+            Ok(source.clone())
+        })();
+        if result.is_err() && temporary.is_dir() {
+            // The name is unique to this process/attempt; never clean a path a
+            // different builder could own.
+            let _ = std::fs::remove_dir_all(&temporary);
+        }
+        result
+    }
+
+    /// Build at the final stable path. Lake and Lean can embed absolute paths,
+    /// so building elsewhere and renaming would not produce an immutable,
+    /// reproducible workspace. A per-id advisory lock serializes processes;
+    /// READY is written last and a READY workspace is never rebuilt.
+    pub fn ensure_built(&self, repo_root: &Path) -> Result<PathBuf, String> {
+        self.materialize_source(repo_root)?;
+        let environment_dir = proof_environment_dir(repo_root, &self.id);
+        let _lock = ProofBuildLock::acquire(&environment_dir.join("build.lock"))?;
+        self.validate_snapshot(
+            &environment_dir.join("source"),
+            "published source snapshot",
+        )?;
+
+        let built = environment_dir.join("built");
+        let ready = built.join("READY");
+        if std::fs::symlink_metadata(&ready).is_ok() {
+            match self.validate_built(&built) {
+                Ok(()) => return Ok(built),
+                Err(_) => {
+                    // READY is published atomically below, but older/crashed
+                    // writers may have left a partial marker. Under this id's
+                    // lock, an invalid marker is incomplete state, not a
+                    // permanent poisoned cache entry.
+                    remove_unready_built(&environment_dir, &built)?;
+                }
+            }
+        }
+        // The invalid-READY branch above has already removed `built`.
+        if std::fs::symlink_metadata(&built).is_ok() {
+            remove_unready_built(&environment_dir, &built)?;
+        }
+
+        std::fs::create_dir(&built)
+            .map_err(|error| format!("cannot create proof build {}: {error}", built.display()))?;
+        write_proof_files(&built, &self.files)?;
+        self.validate_snapshot(&built, "unbuilt proof workspace")?;
+
+        let lean_dir = built.join("lean");
+        let build = Command::new("lake")
+            .args(["-Kjobs=1", "build"])
+            .current_dir(&lean_dir)
+            .output()
+            .map_err(|error| format!("failed to run `lake -Kjobs=1 build`: {error}"))?;
+        if !build.status.success() {
+            return Err(format!(
+                "`lake -Kjobs=1 build` failed in {}:\n{}{}",
+                lean_dir.display(),
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr),
+            ));
+        }
+        self.validate_snapshot(&built, "completed proof build")?;
+        require_sable_olean(&built)?;
+        publish_ready(&built, &ready, &self.id)?;
+        self.validate_built(&built)?;
+        Ok(built)
+    }
+
+    pub fn validate_built(&self, built: &Path) -> Result<(), String> {
+        self.validate_snapshot(built, "immutable proof build")?;
+        let ready = built.join("READY");
+        let metadata = std::fs::symlink_metadata(&ready)
+            .map_err(|error| format!("cannot inspect proof readiness {}: {error}", ready.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!("proof readiness {} is not a regular file", ready.display()));
+        }
+        let actual = std::fs::read_to_string(&ready)
+            .map_err(|error| format!("cannot read proof readiness {}: {error}", ready.display()))?;
+        if actual != format!("{}\n", self.id) {
+            return Err(format!(
+                "proof readiness {} does not match environment {}",
+                ready.display(),
+                self.id
+            ));
+        }
+        require_sable_olean(built)
+    }
+
+    fn validate_snapshot(&self, root: &Path, description: &str) -> Result<(), String> {
+        let actual = capture_proof_files(root)?;
+        if actual == *self.files {
+            Ok(())
+        } else {
+            Err(format!(
+                "{description} {} does not exactly match proof environment {} (possible content-address collision)",
+                root.display(),
+                self.id
+            ))
+        }
+    }
+}
+
+fn publish_ready(built: &Path, ready: &Path, id: &str) -> Result<(), String> {
+    let temporary = built.join(format!(
+        ".READY.tmp.{}.{}",
+        std::process::id(),
+        NEXT_PROOF_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .and_then(|mut file| {
+            writeln!(file, "{id}")?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temporary, ready));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error| {
+        format!(
+            "cannot publish proof-build readiness {}: {error}",
+            ready.display()
+        )
+    })
+}
+
+/// Compatibility helper for callers that only need a fresh tag. Verification
+/// paths carry `ProofEnvironment` itself and never rely on before/after hashes.
+pub fn proof_environment_fingerprint(repo_root: &Path) -> Result<String, String> {
+    ProofEnvironment::capture(repo_root).map(|environment| environment.id)
+}
+
+fn proof_environment_dir(repo_root: &Path, id: &str) -> PathBuf {
+    repo_root
+        .join(".sable-out")
+        .join("proof-envs")
+        .join(id.replace(':', "_"))
+}
+
+fn validate_environment_id(id: &str) -> Result<(), String> {
+    let Some(hex) = id.strip_prefix("proof-env-v2-fnv64:") else {
+        return Err(format!("invalid proof-environment id `{id}`"));
+    };
+    if hex.len() == 16 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(format!("invalid proof-environment id `{id}`"))
+    }
+}
+
+fn ensure_proof_environment_dir(repo_root: &Path, id: &str) -> Result<PathBuf, String> {
+    validate_environment_id(id)?;
+    let output = repo_root.join(".sable-out");
+    ensure_local_directory(&output)?;
+    let environments = output.join("proof-envs");
+    ensure_local_directory(&environments)?;
+    let environment = proof_environment_dir(repo_root, id);
+    ensure_local_directory(&environment)?;
+    Ok(environment)
+}
+
+fn validate_proof_environment_dir(repo_root: &Path, id: &str) -> Result<(), String> {
+    validate_environment_id(id)?;
+    validate_local_directory(&repo_root.join(".sable-out"))?;
+    validate_local_directory(&repo_root.join(".sable-out/proof-envs"))?;
+    validate_local_directory(&proof_environment_dir(repo_root, id))
+}
+
+fn validate_local_directory(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect managed directory {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        Err(format!(
+            "managed proof-environment path {} must be a local directory",
+            path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_local_directory(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => validate_local_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    validate_local_directory(path)
+                }
+                Err(error) => Err(format!(
+                    "cannot create managed directory {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+        Err(error) => Err(format!("cannot inspect managed directory {}: {error}", path.display())),
+    }
+}
+
+fn capture_proof_files(repo_root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
+    let root_metadata = std::fs::symlink_metadata(repo_root).map_err(|error| {
+        format!("cannot inspect proof snapshot root {}: {error}", repo_root.display())
+    })?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
         return Err(format!(
-            "`lake build` failed in {}:\n{}{}",
-            lean_dir.display(),
-            String::from_utf8_lossy(&build.stdout),
-            String::from_utf8_lossy(&build.stderr),
+            "proof snapshot root {} must be a local directory",
+            repo_root.display()
+        ));
+    }
+    let lean_relative = Path::new("lean");
+    let lean_dir = repo_root.join(lean_relative);
+    let lean_metadata = std::fs::symlink_metadata(&lean_dir)
+        .map_err(|error| format!("cannot inspect proof workspace {}: {error}", lean_dir.display()))?;
+    if lean_metadata.file_type().is_symlink() || !lean_metadata.is_dir() {
+        return Err(format!(
+            "proof workspace {} must be a repository-local directory",
+            lean_dir.display()
         ));
     }
 
-    // Direct `lean` (the elan shim resolves the pinned toolchain from
-    // `lean/`): `lake env lean` rebuilds LEAN_PATH from scratch and
-    // drops ambient additions, so the search path is passed explicitly.
+    let mut files = BTreeMap::new();
+    for relative in [
+        "lean/lean-toolchain",
+        "lean/lakefile.toml",
+        "lean/lake-manifest.json",
+        "lean/Sable.lean",
+    ] {
+        capture_proof_file(repo_root, Path::new(relative), &mut files)?;
+    }
+    capture_lean_tree(repo_root, lean_relative, &mut files)?;
+    Ok(files)
+}
+
+fn capture_lean_tree(
+    root: &Path,
+    relative: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    let directory = root.join(relative);
+    let directory_metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
+        format!(
+            "cannot inspect proof source directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(format!(
+            "proof source directory {} must be a local directory",
+            directory.display()
+        ));
+    }
+    let entries = std::fs::read_dir(&directory).map_err(|error| {
+        format!("cannot read proof source directory {}: {error}", directory.display())
+    })?;
+    let mut children = entries
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read an entry in {}: {error}", directory.display()))?;
+    children.sort_by_key(std::fs::DirEntry::file_name);
+    for child in children {
+        if child.file_name().to_str() == Some(".lake") {
+            continue;
+        }
+        let child_relative = relative.join(child.file_name());
+        let path = child.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect proof source {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "proof source {} is a symlink; proof snapshots require local regular files",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            capture_lean_tree(root, &child_relative, files)?;
+        } else if child_relative.extension().is_some_and(|extension| extension == "lean") {
+            capture_proof_file(root, &child_relative, files)?;
+        }
+    }
+    Ok(())
+}
+
+fn capture_proof_file(
+    root: &Path,
+    relative: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), String> {
+    let label = relative
+        .to_str()
+        .ok_or_else(|| format!("proof input path {} is not UTF-8", relative.display()))?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("cannot inspect proof input {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "proof input {} must be a repository-local regular file",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("cannot read proof input {}: {error}", path.display()))?;
+    files.insert(label, bytes);
+    Ok(())
+}
+
+fn write_proof_files(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+    for (label, bytes) in files {
+        let path = root.join(label);
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("proof input `{label}` has no parent"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(bytes))
+            .map_err(|error| format!("cannot write proof input {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn unique_directory(parent: &Path, prefix: &str) -> Result<PathBuf, String> {
+    for _ in 0..100 {
+        let nonce = NEXT_PROOF_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(".{prefix}.{}.{}", std::process::id(), nonce));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("cannot create {}: {error}", path.display())),
+        }
+    }
+    Err(format!(
+        "cannot allocate a unique proof snapshot directory in {}",
+        parent.display()
+    ))
+}
+
+static NEXT_PROOF_TEMP: AtomicU64 = AtomicU64::new(0);
+
+fn remove_unready_built(environment_dir: &Path, built: &Path) -> Result<(), String> {
+    if built.parent() != Some(environment_dir) || built.file_name().and_then(|name| name.to_str()) != Some("built") {
+        return Err(format!("refusing to replace out-of-scope proof build {}", built.display()));
+    }
+    let metadata = std::fs::symlink_metadata(built)
+        .map_err(|error| format!("cannot inspect incomplete proof build {}: {error}", built.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "incomplete proof build {} is not an owned directory",
+            built.display()
+        ));
+    }
+    std::fs::remove_dir_all(built)
+        .map_err(|error| format!("cannot replace incomplete proof build {}: {error}", built.display()))
+}
+
+fn require_sable_olean(built: &Path) -> Result<(), String> {
+    let olean = built.join("lean/.lake/build/lib/lean/Sable.olean");
+    let metadata = std::fs::symlink_metadata(&olean)
+        .map_err(|error| format!("proof build is missing {}: {error}", olean.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        Err(format!("proof build output {} is not a regular file", olean.display()))
+    } else {
+        Ok(())
+    }
+}
+
+fn fingerprint_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+struct ProofBuildLock(File);
+
+impl ProofBuildLock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        if let Ok(metadata) = std::fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(format!(
+                    "proof-build lock {} must be a local regular file",
+                    path.display()
+                ));
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|error| format!("cannot open proof-build lock {}: {error}", path.display()))?;
+        // This crate's daemon already requires Unix sockets. `flock` keeps a
+        // crashed process from leaving a permanent lock-directory tombstone.
+        let result = unsafe { process_flock(file.as_raw_fd(), LOCK_EXCLUSIVE) };
+        if result != 0 {
+            return Err(format!(
+                "cannot lock proof-build lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for ProofBuildLock {
+    fn drop(&mut self) {
+        let _ = unsafe { process_flock(self.0.as_raw_fd(), LOCK_UNLOCK) };
+    }
+}
+
+const LOCK_EXCLUSIVE: std::os::raw::c_int = 2;
+const LOCK_UNLOCK: std::os::raw::c_int = 8;
+
+unsafe extern "C" {
+    #[link_name = "flock"]
+    fn process_flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+/// The full search path is derived from the exact READY build and extended
+/// only with this checkout's generated artifact directory.
+pub fn lean_search_path(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+) -> Result<String, String> {
+    let built = environment.ensure_built(repo_root)?;
+    let out = Command::new("lake")
+        .args(["env", "printenv", "LEAN_PATH"])
+        .current_dir(built.join("lean"))
+        .output()
+        .map_err(|err| format!("failed to run `lake env`: {err}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`lake env printenv LEAN_PATH` failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    environment.validate_built(&built)?;
+    let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok(format!("{base}:{}", modules_dir(repo_root).display()))
+}
+
+/// Check a generated file against an immutable proof build. With `olean_out`,
+/// additionally compile it into an importable generated-module artifact.
+pub fn run_lean(
+    repo_root: &Path,
+    environment: &ProofEnvironment,
+    lean_file: &Path,
+    olean_out: Option<&Path>,
+    expected_source: &str,
+) -> Result<Vec<LeanMessage>, String> {
+    let built = environment.ensure_built(repo_root)?;
+    let lean_dir = built.join("lean");
+    require_generated_source(lean_file, expected_source, "before Lean checking")?;
+
     let mut cmd = Command::new("lean");
     cmd.arg("--json")
-        .env("LEAN_PATH", lean_search_path(repo_root)?)
+        .env("LEAN_PATH", lean_search_path(repo_root, environment)?)
         .current_dir(&lean_dir);
     if let Some(olean) = olean_out {
         cmd.arg("--root")
@@ -492,6 +1004,8 @@ pub fn run_lean(
         .arg(lean_file)
         .output()
         .map_err(|err| format!("failed to run `lean`: {err}"))?;
+    environment.validate_built(&built)?;
+    require_generated_source(lean_file, expected_source, "while Lean was checking")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut messages = Vec::new();
@@ -527,6 +1041,23 @@ pub fn run_lean(
     }
 
     Ok(messages)
+}
+
+fn require_generated_source(path: &Path, expected: &str, phase: &str) -> Result<(), String> {
+    let actual = std::fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read generated Lean file {}: {error}",
+            path.display()
+        )
+    })?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "generated Lean file {} changed {phase}; retry the check",
+            path.display()
+        ))
+    }
 }
 
 /// Map lean error messages back to .sable diagnostics.

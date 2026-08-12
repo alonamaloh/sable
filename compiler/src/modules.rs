@@ -42,6 +42,11 @@ pub struct ModuleSet {
     pub modules: Vec<ModuleInfo>,
     /// All sources concatenated (spans in the merged AST index this).
     pub combined_source: String,
+    /// Resolved direct import edges `(importer, dependency)`, preserving each
+    /// importer's source order. Snapshot consumers use these canonical
+    /// identities to distinguish equal source sets wired into different
+    /// module graphs.
+    pub import_edges: Vec<(usize, usize)>,
 }
 
 impl ModuleSet {
@@ -58,6 +63,7 @@ impl ModuleSet {
                 source,
                 lines,
             }],
+            import_edges: Vec::new(),
         }
     }
 
@@ -128,6 +134,7 @@ pub fn load(
         set: ModuleSet {
             modules: Vec::new(),
             combined_source: String::new(),
+            import_edges: Vec::new(),
         },
         programs: Vec::new(),
         seen: Vec::new(),
@@ -266,7 +273,9 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
         const_names: &HashMap<&str, (usize, bool)>,
     ) {
         match &e.kind {
-            ExprKind::ResOp { args, .. } | ExprKind::RawOp { args, .. } => {
+            ExprKind::ResOp { args, .. }
+            | ExprKind::RawOp { args, .. }
+            | ExprKind::DeviceOp { args, .. } => {
                 for a in args {
                     walk_expr(a, refs, const_names);
                 }
@@ -370,7 +379,9 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
                     walk_expr(size, refs, const_names)
                 }
-                Stmt::SystemDealloc { ptr, res, release, .. } => {
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
                     walk_expr(ptr, refs, const_names);
                     walk_expr(res, refs, const_names);
                     walk_expr(release, refs, const_names);
@@ -649,6 +660,7 @@ fn load_file(
         };
         let dep_idx = load_file(loading, found, Some(u.span))?;
         loading.imports.push((idx, u.clone(), dep_idx));
+        loading.set.import_edges.push((idx, dep_idx));
         // Listed imports validate the names exist in the target module.
         if let Some(names) = &u.names {
             let (_, dep) = loading

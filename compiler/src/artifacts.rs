@@ -26,7 +26,8 @@ use crate::vcgen::{self, VcResult};
 use crate::{check, consts, mono};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// A verified (or cache-hit) module artifact, as importers need it.
 pub struct ModuleArtifact {
@@ -38,9 +39,78 @@ pub struct ModuleArtifact {
     pub display: String,
     /// Canonical source path.
     pub path: PathBuf,
+    /// Exact source bytes whose contracts this artifact exports. Importers
+    /// compare this to their already-loaded closure before using `names`.
+    pub source: Arc<str>,
+    /// Exact proof environment used to verify this dependency.
+    proof_fingerprint: String,
+    /// Exact transitive module graph used to prove this artifact. A parent
+    /// requires equality with the dependency subgraph from its already-loaded
+    /// closure, including resolved edges and order.
+    inputs: SourceSnapshot,
     /// Warnings from a fresh verification (empty on cache hits),
     /// including those bubbled up from its own dependencies.
     pub warnings: Vec<PortableDiag>,
+}
+
+#[derive(Clone)]
+struct SourceSnapshot {
+    modules: Vec<(PathBuf, Arc<str>)>,
+    edges: Vec<(usize, usize)>,
+}
+
+impl SourceSnapshot {
+    fn exact_eq(&self, other: &SourceSnapshot) -> bool {
+        self.edges == other.edges
+            && self.modules.len() == other.modules.len()
+            && self.modules.iter().zip(&other.modules).all(
+                |((left_path, left_source), (right_path, right_source))| {
+                    left_path == right_path && left_source == right_source
+                },
+            )
+    }
+
+    fn rooted_at(&self, root_path: &Path) -> Option<SourceSnapshot> {
+        let root = self
+            .modules
+            .iter()
+            .position(|(path, _)| path == root_path)?;
+        fn visit(snapshot: &SourceSnapshot, module: usize, ordered: &mut Vec<usize>) {
+            if ordered.contains(&module) {
+                return;
+            }
+            ordered.push(module);
+            for &(_, dependency) in snapshot
+                .edges
+                .iter()
+                .filter(|(importer, _)| *importer == module)
+            {
+                visit(snapshot, dependency, ordered);
+            }
+        }
+        let mut ordered = Vec::new();
+        visit(self, root, &mut ordered);
+        let remap: HashMap<usize, usize> = ordered
+            .iter()
+            .enumerate()
+            .map(|(new, old)| (*old, new))
+            .collect();
+        let mut edges = Vec::new();
+        for importer in &ordered {
+            for &(_, dependency) in self.edges.iter().filter(|(from, _)| from == importer) {
+                if let (Some(&from), Some(&to)) = (remap.get(importer), remap.get(&dependency)) {
+                    edges.push((from, to));
+                }
+            }
+        }
+        Some(SourceSnapshot {
+            modules: ordered
+                .iter()
+                .map(|&index| self.modules[index].clone())
+                .collect(),
+            edges,
+        })
+    }
 }
 
 /// A diagnostic pinned to (module file, module-local span) so it can be
@@ -80,6 +150,20 @@ pub struct Prepared {
     pub emitted: Emitted,
     /// Content-addressed artifact name for this module.
     pub lean_name: String,
+    /// Exact proof environment used to derive `lean_name` and emit this
+    /// artifact. Verification and stamping must compare against this value;
+    /// recomputing a request fingerprint would hide an intervening edit.
+    pub proof_fingerprint: String,
+    /// Exact captured bytes behind `proof_fingerprint`. Profile generation,
+    /// dependency verification, batch Lean, and the daemon all use this same
+    /// immutable handle rather than re-reading the mutable checkout.
+    pub(crate) proof_environment: lean::ProofEnvironment,
+    /// Exact Sable source/module-resolution snapshot loaded for this VC. It is
+    /// rechecked after dependency ensuring, before Lean, and before stamping,
+    /// so a root cannot combine contracts from closure A with artifacts from
+    /// concurrently edited closure B.
+    input_snapshot: SourceSnapshot,
+    root_path: PathBuf,
     /// Warnings from freshly verified dependencies, in this module's
     /// combined coordinates.
     pub dep_warnings: Vec<Diagnostic>,
@@ -92,10 +176,37 @@ pub fn prepare(
     opts: &Options,
     repo_root: &Path,
 ) -> (ModuleSet, Result<Prepared, Vec<Diagnostic>>) {
+    // Capture this before any profile or dependency work. The resulting bytes,
+    // not a later same-valued hash of the checkout, are the proof environment.
+    let proof_environment = lean::ProofEnvironment::capture(repo_root);
+    let proof_environment = match proof_environment {
+        Ok(environment) => environment,
+        Err(message) => {
+            let mods = modules::load(path, &opts.module_paths)
+                .map(|(_, modules)| modules)
+                .unwrap_or_else(|(_, partial)| partial);
+            return (mods, Err(vec![proof_fingerprint_diag(message)]));
+        }
+    };
+    prepare_with_environment(path, opts, repo_root, &proof_environment)
+}
+
+fn prepare_with_environment(
+    path: &Path,
+    opts: &Options,
+    repo_root: &Path,
+    proof_environment: &lean::ProofEnvironment,
+) -> (ModuleSet, Result<Prepared, Vec<Diagnostic>>) {
     let (mut program, mods) = match modules::load(path, &opts.module_paths) {
         Ok(ok) => ok,
         Err((d, partial)) => return (partial, Err(vec![d])),
     };
+    let snapshot_repo_root = match proof_environment.materialize_source(repo_root) {
+        Ok(root) => root,
+        Err(message) => return (mods, Err(vec![proof_fingerprint_diag(message)])),
+    };
+    let proof_fingerprint = proof_environment.id().to_string();
+    let input_snapshot = module_snapshot(&mods);
     if let Err(d) = consts::apply(&mut program) {
         return (mods, Err(vec![d]));
     }
@@ -106,7 +217,15 @@ pub fn prepare(
         Ok(c) => c,
         Err(d) => return (mods, Err(vec![d])),
     };
-    let vc = vcgen::generate(&program, &checked.sigs, &mods.combined_source);
+    let vc = match vcgen::generate(
+        &program,
+        &checked.sigs,
+        &mods.combined_source,
+        &snapshot_repo_root,
+    ) {
+        Ok(vc) => vc,
+        Err(message) => return (mods, Err(vec![proof_fingerprint_diag(message)])),
+    };
 
     if let Err(d) = validate_escapes(&program, &vc) {
         return (mods, Err(vec![d]));
@@ -116,9 +235,40 @@ pub fn prepare(
     // artifact; a dep failure surfaces here in this load's coordinates.
     let mut dep_arts: Vec<Arc<ModuleArtifact>> = Vec::new();
     let mut dep_warnings: Vec<Diagnostic> = Vec::new();
-    for m in &mods.modules[1..] {
-        match ensure_artifact(&m.path, opts, repo_root) {
+    for module_index in 1..mods.modules.len() {
+        let module_path = mods.modules[module_index].path.clone();
+        let module_display = mods.modules[module_index].display.clone();
+        let module_source = mods.modules[module_index].source.clone();
+        let Some(expected_dependency) = input_snapshot.rooted_at(&module_path) else {
+            return (
+                mods,
+                Err(vec![proof_fingerprint_diag(format!(
+                    "module `{}` is missing from its loaded import graph",
+                    module_display
+                ))]),
+            );
+        };
+        match ensure_artifact_snapshot(
+            &module_path,
+            opts,
+            repo_root,
+            Some(&expected_dependency),
+            proof_environment,
+        ) {
             Ok(a) => {
+                if a.path != module_path
+                    || a.source.as_ref() != module_source
+                    || !a.inputs.exact_eq(&expected_dependency)
+                    || a.proof_fingerprint.as_str() != proof_fingerprint
+                {
+                    return (
+                        mods,
+                        Err(vec![proof_fingerprint_diag(format!(
+                            "module `{}` changed while its artifact was being prepared; retry the check",
+                            module_display
+                        ))]),
+                    );
+                }
                 dep_warnings.extend(a.warnings.iter().map(|w| from_portable(&mods, w)));
                 dep_arts.push(a);
             }
@@ -127,6 +277,9 @@ pub fn prepare(
                 return (mods, Err(diags));
             }
         }
+    }
+    if let Err(message) = require_module_snapshot(path, opts, &input_snapshot) {
+        return (mods, Err(vec![proof_fingerprint_diag(message)]));
     }
 
     // One declaration, one owner: a name two imported artifacts both
@@ -168,7 +321,9 @@ pub fn prepare(
         exclude.ghosts.extend(a.names.ghosts.iter().cloned());
         exclude.wfs.extend(a.names.wfs.iter().cloned());
         exclude.thms.extend(a.names.thms.iter().cloned());
-        exclude.obligations.extend(a.names.obligations.iter().cloned());
+        exclude
+            .obligations
+            .extend(a.names.obligations.iter().cloned());
     }
 
     // A ghost defined here under a name an import already declares
@@ -245,7 +400,8 @@ pub fn prepare(
         .collect();
     let imports: Vec<String> = dep_arts.iter().map(|a| a.lean_name.clone()).collect();
     let emitted = lean::emit(&vc, &program.discharges, &skip, &imports, &exclude);
-    let lean_name = artifact_name(path, &emitted.lean_source, repo_root);
+    let lean_name = artifact_name(path, &emitted.lean_source, &proof_fingerprint);
+    let root_path = mods.modules[0].path.clone();
 
     (
         mods,
@@ -254,10 +410,61 @@ pub fn prepare(
             vc,
             emitted,
             lean_name,
+            proof_fingerprint,
+            proof_environment: proof_environment.clone(),
+            input_snapshot,
+            root_path,
             dep_warnings,
             unsafe_regions: checked.unsafe_regions,
         }),
     )
+}
+
+fn require_prepared_inputs(
+    path: &Path,
+    opts: &Options,
+    prep: &Prepared,
+    phase: &str,
+) -> Result<(), String> {
+    require_module_snapshot(path, opts, &prep.input_snapshot)
+        .map_err(|_| format!("the Sable module closure changed {phase}; retry the check"))
+}
+
+fn module_snapshot(modules: &ModuleSet) -> SourceSnapshot {
+    let raw = SourceSnapshot {
+        modules: modules
+            .modules
+            .iter()
+            .map(|module| (module.path.clone(), Arc::from(module.source.as_str())))
+            .collect(),
+        edges: modules.import_edges.clone(),
+    };
+    let root = raw.modules.first().map(|(path, _)| path.clone());
+    root.and_then(|path| raw.rooted_at(&path)).unwrap_or(raw)
+}
+
+fn require_module_snapshot(
+    path: &Path,
+    opts: &Options,
+    expected: &SourceSnapshot,
+) -> Result<(), String> {
+    let (_, current) = modules::load(path, &opts.module_paths)
+        .map_err(|(diagnostic, _)| format!("{}: {}", diagnostic.name, diagnostic.title))?;
+    if module_snapshot(&current).exact_eq(expected) {
+        Ok(())
+    } else {
+        Err("the Sable module closure changed while preparing artifacts; retry the check".into())
+    }
+}
+
+fn proof_fingerprint_diag(message: String) -> Diagnostic {
+    Diagnostic {
+        name: "internal.proof_fingerprint".into(),
+        title: message,
+        span: Span::new(0, 0),
+        label: "cannot identify a stable current proof environment".into(),
+        notes: vec![],
+    }
 }
 
 /// Escape-hatch validation: every defer/assume/discharge must name a
@@ -362,11 +569,72 @@ fn validate_escapes(program: &crate::ast::Program, vc: &VcResult) -> Result<(), 
 
 type ArtifactResult = Result<Arc<ModuleArtifact>, Arc<Vec<PortableDiag>>>;
 
-/// In-process artifact cache: one build per module per process, however
-/// many importers race for it (corpus threads share dependencies).
-fn cache() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<Option<ArtifactResult>>>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<Option<ArtifactResult>>>>>> =
-        OnceLock::new();
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ArtifactBuildKey {
+    path: PathBuf,
+    inputs: u64,
+}
+
+struct ArtifactFlight {
+    result: Mutex<Option<ArtifactResult>>,
+    ready: Condvar,
+}
+
+struct ArtifactLeader {
+    key: ArtifactBuildKey,
+    flight: Arc<ArtifactFlight>,
+    path: PathBuf,
+    published: bool,
+}
+
+impl ArtifactLeader {
+    fn publish(mut self, result: ArtifactResult) -> ArtifactResult {
+        complete_flight(&self.key, &self.flight, result.clone());
+        self.published = true;
+        result
+    }
+}
+
+impl Drop for ArtifactLeader {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        // A compiler panic must not strand every importer waiting forever.
+        // Preserve the leader's unwind, but wake followers with a portable
+        // internal diagnostic and remove the failed flight for future retries.
+        complete_flight(
+            &self.key,
+            &self.flight,
+            Err(io_portable(
+                &self.path,
+                "internal.artifact_build_panicked",
+                "the concurrent artifact build panicked; retry the check".into(),
+            )),
+        );
+    }
+}
+
+fn complete_flight(key: &ArtifactBuildKey, flight: &Arc<ArtifactFlight>, result: ArtifactResult) {
+    let mut map = cache().lock().unwrap_or_else(|poison| poison.into_inner());
+    *flight
+        .result
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = Some(result);
+    if map.get(key).is_some_and(|entry| Arc::ptr_eq(entry, flight)) {
+        map.remove(key);
+    }
+    drop(map);
+    flight.ready.notify_all();
+}
+
+/// In-process artifact coordinator: callers racing on the same module and
+/// the same current inputs share one build. Completed results are removed
+/// immediately. Long-lived processes must re-snapshot source, options, and
+/// the Lean proof environment on their next request rather than returning a
+/// result retained under a path that may since have changed.
+fn cache() -> &'static Mutex<HashMap<ArtifactBuildKey, Arc<ArtifactFlight>>> {
+    static CACHE: OnceLock<Mutex<HashMap<ArtifactBuildKey, Arc<ArtifactFlight>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -374,18 +642,187 @@ fn cache() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<Option<ArtifactResult>>>
 /// own dependencies, recursively) if the content-addressed stamp is
 /// absent. Lock order follows the import DAG, so no deadlock.
 pub fn ensure_artifact(path: &Path, opts: &Options, repo_root: &Path) -> ArtifactResult {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let cell = {
-        let mut map = cache().lock().unwrap();
-        map.entry(canonical.clone()).or_default().clone()
+    let environment = match lean::ProofEnvironment::capture(repo_root) {
+        Ok(environment) => environment,
+        Err(message) => {
+            return Err(io_portable(
+                path,
+                "internal.proof_fingerprint",
+                message,
+            ));
+        }
     };
-    let mut slot = cell.lock().unwrap();
-    if let Some(r) = &*slot {
-        return r.clone();
+    ensure_artifact_snapshot(path, opts, repo_root, None, &environment)
+}
+
+fn ensure_artifact_snapshot(
+    path: &Path,
+    opts: &Options,
+    repo_root: &Path,
+    expected: Option<&SourceSnapshot>,
+    proof_environment: &lean::ProofEnvironment,
+) -> ArtifactResult {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if let Err(message) = proof_environment.materialize_source(repo_root) {
+        return Err(io_portable(
+            &canonical,
+            "internal.proof_fingerprint",
+            message,
+        ));
     }
-    let result = build_artifact(&canonical, opts, repo_root);
-    *slot = Some(result.clone());
-    result
+    if let Some(expected) = expected {
+        match load_snapshot(&canonical, opts) {
+            Ok(current) if current.exact_eq(expected) => {}
+            Ok(_) => {
+                return Err(io_portable(
+                    &canonical,
+                    "internal.artifact_inputs_changed",
+                    "the dependency import graph changed before its artifact build; retry the check"
+                        .into(),
+                ));
+            }
+            Err(message) => {
+                return Err(io_portable(
+                    &canonical,
+                    "internal.artifact_inputs_changed",
+                    message,
+                ));
+            }
+        }
+    }
+    let inputs = match artifact_input_fingerprint(&canonical, opts, repo_root, proof_environment) {
+        Ok(inputs) => inputs,
+        Err(message) => {
+            return Err(io_portable(
+                &canonical,
+                "internal.proof_fingerprint",
+                message,
+            ));
+        }
+    };
+    let key = ArtifactBuildKey {
+        path: canonical.clone(),
+        inputs,
+    };
+    let (flight, leader) = {
+        let mut map = cache().lock().unwrap_or_else(|poison| poison.into_inner());
+        match map.get(&key) {
+            Some(flight) => (flight.clone(), false),
+            None => {
+                let flight = Arc::new(ArtifactFlight {
+                    result: Mutex::new(None),
+                    ready: Condvar::new(),
+                });
+                map.insert(key.clone(), flight.clone());
+                (flight, true)
+            }
+        }
+    };
+
+    if !leader {
+        let mut slot = flight
+            .result
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        while slot.is_none() {
+            slot = flight
+                .ready
+                .wait(slot)
+                .unwrap_or_else(|poison| poison.into_inner());
+        }
+        let result = slot.as_ref().unwrap().clone();
+        return result;
+    }
+
+    let leader = ArtifactLeader {
+        key: key.clone(),
+        flight,
+        path: canonical.clone(),
+        published: false,
+    };
+    let result = build_artifact(
+        &canonical,
+        opts,
+        repo_root,
+        key.inputs,
+        expected,
+        proof_environment,
+    );
+    leader.publish(result)
+}
+
+fn load_snapshot(path: &Path, opts: &Options) -> Result<SourceSnapshot, String> {
+    let (_, modules) = modules::load(path, &opts.module_paths)
+        .map_err(|(diagnostic, _)| format!("{}: {}", diagnostic.name, diagnostic.title))?;
+    Ok(module_snapshot(&modules))
+}
+
+/// Fingerprint all inputs that can affect a per-module result before joining
+/// an in-flight build. `modules::load` gives us the current resolved import
+/// closure, so an unchanged root cannot reuse a flight after one of its
+/// dependencies (or module-path resolution) changes.
+fn artifact_input_fingerprint(
+    path: &Path,
+    opts: &Options,
+    repo_root: &Path,
+    proof_environment: &lean::ProofEnvironment,
+) -> Result<u64, String> {
+    let (load_error, modules) = match modules::load(path, &opts.module_paths) {
+        Ok((_, modules)) => (None, modules),
+        Err((diagnostic, modules)) => (Some(diagnostic), modules),
+    };
+    let mut hash = module_set_fingerprint(&modules, opts, repo_root, proof_environment.id());
+    if let Some(diagnostic) = load_error {
+        hash = fnv64(hash, b"load-error\0");
+        hash = fnv64(hash, diagnostic.name.as_bytes());
+        hash = fnv64(hash, &[0]);
+        hash = fnv64(hash, diagnostic.title.as_bytes());
+        hash = fnv64(hash, &[0]);
+        hash = fnv64(hash, &diagnostic.span.start.to_le_bytes());
+        hash = fnv64(hash, &diagnostic.span.end.to_le_bytes());
+    }
+    Ok(hash)
+}
+
+fn module_set_fingerprint(
+    modules: &ModuleSet,
+    opts: &Options,
+    repo_root: &Path,
+    proof_fingerprint: &str,
+) -> u64 {
+    let mut hash = fnv64(0, proof_fingerprint.as_bytes());
+    hash = fnv64(hash, &[u8::from(opts.emit_lean_only)]);
+    if let Ok(heartbeats) = std::env::var("SABLE_GRIND_HEARTBEATS") {
+        hash = fnv64(hash, heartbeats.as_bytes());
+    }
+
+    hash = fnv64(hash, b"module-paths\0");
+    for module_path in &opts.module_paths {
+        hash = hash_relative_path(hash, repo_root, module_path);
+        hash = fnv64(hash, &[0]);
+    }
+
+    for module in &modules.modules {
+        hash = hash_relative_path(hash, repo_root, &module.path);
+        hash = fnv64(hash, &[0]);
+        hash = fnv64(hash, module.source.as_bytes());
+        hash = fnv64(hash, &[0]);
+    }
+    hash = fnv64(hash, b"resolved-import-edges\0");
+    for (importer, dependency) in &modules.import_edges {
+        hash = fnv64(hash, &importer.to_le_bytes());
+        hash = fnv64(hash, &dependency.to_le_bytes());
+    }
+    hash
+}
+
+fn hash_relative_path(seed: u64, repo_root: &Path, path: &Path) -> u64 {
+    let root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let label = resolved.strip_prefix(&root).unwrap_or(&resolved);
+    fnv64(seed, label.to_string_lossy().as_bytes())
 }
 
 fn io_portable(path: &Path, name: &str, message: String) -> Arc<Vec<PortableDiag>> {
@@ -403,8 +840,15 @@ fn io_portable(path: &Path, name: &str, message: String) -> Arc<Vec<PortableDiag
     }])
 }
 
-fn build_artifact(path: &Path, opts: &Options, repo_root: &Path) -> ArtifactResult {
-    let (mods, prep) = prepare(path, opts, repo_root);
+fn build_artifact(
+    path: &Path,
+    opts: &Options,
+    repo_root: &Path,
+    expected_inputs: u64,
+    expected_snapshot: Option<&SourceSnapshot>,
+    proof_environment: &lean::ProofEnvironment,
+) -> ArtifactResult {
+    let (mods, prep) = prepare_with_environment(path, opts, repo_root, proof_environment);
     let prep = match prep {
         Ok(p) => p,
         Err(diags) => {
@@ -413,7 +857,23 @@ fn build_artifact(path: &Path, opts: &Options, repo_root: &Path) -> ArtifactResu
             ));
         }
     };
+    if expected_snapshot.is_some_and(|expected| !prep.input_snapshot.exact_eq(expected)) {
+        return Err(io_portable(
+            path,
+            "internal.artifact_inputs_changed",
+            "the dependency import graph changed while its artifact was being prepared; retry the check"
+                .into(),
+        ));
+    }
+    if prep.proof_fingerprint != proof_environment.id() {
+        return Err(io_portable(
+            path,
+            "internal.proof_fingerprint",
+            "dependency preparation substituted a different immutable proof environment".into(),
+        ));
+    }
     let display = mods.modules[0].display.clone();
+    let source: Arc<str> = Arc::from(mods.modules[0].source.as_str());
     let dir = lean::modules_dir(repo_root);
     if let Err(err) = std::fs::create_dir_all(&dir) {
         return Err(io_portable(
@@ -430,20 +890,68 @@ fn build_artifact(path: &Path, opts: &Options, repo_root: &Path) -> ArtifactResu
     // after a successful kernel-checked run that also produced the
     // importable olean.
     if ok_path.is_file() && olean_path.is_file() {
+        if let Some(expected) = expected_snapshot {
+            match load_snapshot(path, opts) {
+                Ok(current) if current.exact_eq(expected) => {}
+                _ => {
+                    return Err(io_portable(
+                        path,
+                        "internal.artifact_inputs_changed",
+                        "the dependency import graph changed before artifact reuse; retry the check"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        if artifact_input_fingerprint(path, opts, repo_root, proof_environment).as_ref()
+            != Ok(&expected_inputs)
+        {
+            return Err(io_portable(
+                path,
+                "internal.artifact_inputs_changed",
+                "module inputs changed while locating its verified artifact; retry the check"
+                    .into(),
+            ));
+        }
+        if let Err(message) = require_file_content(&lean_path, &prep.emitted.lean_source) {
+            return Err(io_portable(
+                path,
+                "internal.artifact_content_collision",
+                message,
+            ));
+        }
         return Ok(Arc::new(ModuleArtifact {
             lean_name: prep.lean_name,
             names: prep.emitted.names.clone(),
             display,
             path: path.to_path_buf(),
+            source,
+            proof_fingerprint: prep.proof_fingerprint.clone(),
+            inputs: prep.input_snapshot.clone(),
             warnings: Vec::new(),
         }));
     }
 
-    if let Err(err) = write_atomic(&lean_path, &prep.emitted.lean_source) {
-        return Err(io_portable(path, "io.write", err));
+    if let Err(err) = write_immutable(&lean_path, &prep.emitted.lean_source) {
+        return Err(io_portable(
+            path,
+            "internal.artifact_content_collision",
+            err,
+        ));
     }
-    let tmp_olean = dir.join(format!("{}.olean.tmp{}", prep.lean_name, std::process::id()));
-    let messages = match lean::run_lean(repo_root, &lean_path, Some(&tmp_olean)) {
+    let tmp_olean = dir.join(format!(
+        "{}.olean.tmp{}.{}",
+        prep.lean_name,
+        std::process::id(),
+        temp_nonce(),
+    ));
+    let messages = match lean::run_lean(
+        repo_root,
+        proof_environment,
+        &lean_path,
+        Some(&tmp_olean),
+        &prep.emitted.lean_source,
+    ) {
         Ok(m) => m,
         Err(msg) => {
             let _ = std::fs::remove_file(&tmp_olean);
@@ -457,6 +965,43 @@ fn build_artifact(path: &Path, opts: &Options, repo_root: &Path) -> ArtifactResu
             errors.iter().map(|d| to_portable(&mods, d)).collect(),
         ));
     }
+    if artifact_input_fingerprint(path, opts, repo_root, proof_environment).as_ref()
+        != Ok(&expected_inputs)
+    {
+        let _ = std::fs::remove_file(&tmp_olean);
+        return Err(io_portable(
+            path,
+            "internal.artifact_inputs_changed",
+            "module inputs changed while Lean was checking; retry the check".into(),
+        ));
+    }
+    if let Err(message) = require_prepared_inputs(
+        &prep.root_path,
+        opts,
+        &prep,
+        "while Lean was checking the dependency artifact",
+    ) {
+        let _ = std::fs::remove_file(&tmp_olean);
+        return Err(io_portable(
+            path,
+            "internal.artifact_inputs_changed",
+            message,
+        ));
+    }
+    if let Some(expected) = expected_snapshot {
+        match load_snapshot(path, opts) {
+            Ok(current) if current.exact_eq(expected) => {}
+            _ => {
+                let _ = std::fs::remove_file(&tmp_olean);
+                return Err(io_portable(
+                    path,
+                    "internal.artifact_inputs_changed",
+                    "the dependency import graph changed while Lean was checking; retry the check"
+                        .into(),
+                ));
+            }
+        }
+    }
     if let Err(err) = std::fs::rename(&tmp_olean, &olean_path) {
         return Err(io_portable(
             path,
@@ -465,53 +1010,185 @@ fn build_artifact(path: &Path, opts: &Options, repo_root: &Path) -> ArtifactResu
         ));
     }
     if let Err(err) = write_atomic(&ok_path, "ok\n") {
+        let _ = std::fs::remove_file(&olean_path);
         return Err(io_portable(path, "io.write", err));
+    }
+    if artifact_input_fingerprint(path, opts, repo_root, proof_environment).as_ref()
+        != Ok(&expected_inputs)
+    {
+        let _ = std::fs::remove_file(&ok_path);
+        let _ = std::fs::remove_file(&olean_path);
+        return Err(io_portable(
+            path,
+            "internal.artifact_inputs_changed",
+            "module inputs changed while publishing its verified artifact; retry the check".into(),
+        ));
+    }
+    if let Err(message) = require_prepared_inputs(
+        &prep.root_path,
+        opts,
+        &prep,
+        "while publishing the dependency artifact",
+    ) {
+        let _ = std::fs::remove_file(&ok_path);
+        let _ = std::fs::remove_file(&olean_path);
+        return Err(io_portable(
+            path,
+            "internal.artifact_inputs_changed",
+            message,
+        ));
     }
     let mut warnings: Vec<PortableDiag> =
         lean::dedup_by_name(lean::diagnose_warnings(&prep.emitted, &prep.vc, &messages))
             .iter()
             .map(|d| to_portable(&mods, d))
             .collect();
-    warnings.extend(
-        prep.dep_warnings
-            .iter()
-            .map(|d| to_portable(&mods, d)),
-    );
+    warnings.extend(prep.dep_warnings.iter().map(|d| to_portable(&mods, d)));
     Ok(Arc::new(ModuleArtifact {
         lean_name: prep.lean_name,
         names: prep.emitted.names.clone(),
         display,
         path: path.to_path_buf(),
+        source,
+        proof_fingerprint: prep.proof_fingerprint.clone(),
+        inputs: prep.input_snapshot.clone(),
         warnings,
     }))
+}
+
+/// Materialize the root document at a content-addressed, immutable path.
+/// Different source/profile/prelude versions therefore cannot overwrite the
+/// bytes a concurrent daemon or batch check is reading. Identical versions
+/// converge on the same exact file and may safely share a warm LSP document.
+pub fn write_root_generated(
+    repo_root: &Path,
+    opts: &Options,
+    prep: &Prepared,
+) -> Result<PathBuf, String> {
+    require_prepared_inputs(
+        &prep.root_path,
+        opts,
+        prep,
+        "before writing the generated root document",
+    )?;
+    prep.proof_environment.materialize_source(repo_root)?;
+    let dir = repo_root.join(".sable-out").join("roots");
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "cannot create generated-root directory {}: {error}",
+            dir.display()
+        )
+    })?;
+    let path = root_generated_path(repo_root, &prep.lean_name);
+    write_immutable(&path, &prep.emitted.lean_source)?;
+    require_prepared_inputs(
+        &prep.root_path,
+        opts,
+        prep,
+        "while writing the generated root document",
+    )?;
+    Ok(path)
+}
+
+fn root_generated_path(repo_root: &Path, lean_name: &str) -> PathBuf {
+    repo_root
+        .join(".sable-out")
+        .join("roots")
+        .join(format!("{lean_name}.lean"))
 }
 
 /// Record a root check's successful verification as an artifact stamp,
 /// so importers reuse it instead of re-proving (the olean is compiled
 /// on first import if this check ran through the daemon).
-pub fn stamp_verified(repo_root: &Path, prep: &Prepared) -> Result<(), String> {
+pub fn stamp_verified(repo_root: &Path, opts: &Options, prep: &Prepared) -> Result<(), String> {
+    require_prepared_inputs(
+        &prep.root_path,
+        opts,
+        prep,
+        "before stamping the root artifact",
+    )?;
+    prep.proof_environment.validate_built(
+        &prep.proof_environment.ensure_built(repo_root)?,
+    )?;
     let dir = lean::modules_dir(repo_root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    write_atomic(
+    write_immutable(
         &dir.join(format!("{}.lean", prep.lean_name)),
         &prep.emitted.lean_source,
     )?;
-    write_atomic(&dir.join(format!("{}.ok", prep.lean_name)), "ok\n")
+    let ok_path = dir.join(format!("{}.ok", prep.lean_name));
+    write_atomic(&ok_path, "ok\n")?;
+    if let Err(error) = require_prepared_inputs(
+        &prep.root_path,
+        opts,
+        prep,
+        "while stamping the root artifact",
+    ) {
+        let _ = std::fs::remove_file(&ok_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Atomic-enough write for concurrent checkers: temp file + rename, so
 /// readers never see a torn file.
 fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let tmp = path.with_extension(format!("tmp{}.{}", std::process::id(), temp_nonce()));
     std::fs::write(&tmp, content).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("cannot move {}: {e}", tmp.display()))
+}
+
+/// Publish a content-addressed file without ever replacing an existing path.
+/// `hard_link` is the atomic create-if-absent operation; a racing identical
+/// writer merely verifies the winner's bytes.
+fn write_immutable(path: &Path, content: &str) -> Result<(), String> {
+    if path.is_file() {
+        return require_file_content(path, content);
+    }
+    let tmp = path.with_extension(format!("tmp{}.{}", std::process::id(), temp_nonce()));
+    std::fs::write(&tmp, content).map_err(|error| {
+        format!(
+            "cannot write temporary generated document {}: {error}",
+            tmp.display()
+        )
+    })?;
+    let publish = std::fs::hard_link(&tmp, path);
+    let _ = std::fs::remove_file(&tmp);
+    match publish {
+        Ok(()) => require_file_content(path, content),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            require_file_content(path, content)
+        }
+        Err(error) => Err(format!(
+            "cannot publish generated document {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn require_file_content(path: &Path, expected: &str) -> Result<(), String> {
+    let actual = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read generated document {}: {error}", path.display()))?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "content-addressed generated document {} contains different bytes",
+            path.display()
+        ))
+    }
+}
+
+fn temp_nonce() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// `<stem>_<hash>` — the content-addressed Lean module name. The hash
 /// seeds with the prelude (sources, toolchain pin, lakefile), so a
 /// prelude change invalidates every artifact; dep artifacts are pinned
 /// transitively through the `import` lines inside `content`.
-fn artifact_name(path: &Path, content: &str, repo_root: &Path) -> String {
+fn artifact_name(path: &Path, content: &str, proof_fingerprint: &str) -> String {
     let stem: String = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -524,7 +1201,7 @@ fn artifact_name(path: &Path, content: &str, repo_root: &Path) -> String {
     } else {
         stem
     };
-    let h = fnv64(prelude_hash(repo_root), content.as_bytes());
+    let h = fnv64(fnv64(0, proof_fingerprint.as_bytes()), content.as_bytes());
     format!("{stem}_{h:016x}")
 }
 
@@ -537,29 +1214,50 @@ fn fnv64(seed: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// Hash of everything the prelude contributes to a proof: the Lean
-/// sources, the toolchain pin, and the lakefile. Computed once per
-/// process.
-fn prelude_hash(repo_root: &Path) -> u64 {
-    static HASH: OnceLock<u64> = OnceLock::new();
-    *HASH.get_or_init(|| {
-        let lean_dir = repo_root.join("lean");
-        let mut files: Vec<PathBuf> = vec![
-            lean_dir.join("lean-toolchain"),
-            lean_dir.join("lakefile.toml"),
-            lean_dir.join("Sable.lean"),
-        ];
-        if let Ok(entries) = std::fs::read_dir(lean_dir.join("Sable")) {
-            files.extend(entries.filter_map(|e| Some(e.ok()?.path())));
-        }
-        files.sort();
-        let mut h = 0u64;
-        for f in files {
-            h = fnv64(h, f.to_string_lossy().as_bytes());
-            if let Ok(content) = std::fs::read(&f) {
-                h = fnv64(h, &content);
-            }
-        }
-        h
-    })
+#[cfg(test)]
+mod tests {
+    use super::{SourceSnapshot, artifact_name, root_generated_path};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    #[test]
+    fn root_generated_paths_bind_content_and_proof_environment() {
+        let source = Path::new("left/main.sable");
+        let first = artifact_name(source, "import Sable\n-- first\n", "proof-a");
+        let edited = artifact_name(source, "import Sable\n-- edited\n", "proof-a");
+        let new_proof = artifact_name(source, "import Sable\n-- first\n", "proof-b");
+
+        assert_ne!(first, edited);
+        assert_ne!(first, new_proof);
+        assert_ne!(
+            root_generated_path(Path::new("/repo"), &first),
+            root_generated_path(Path::new("/repo"), &edited)
+        );
+        assert_eq!(
+            root_generated_path(Path::new("/repo"), &first),
+            root_generated_path(Path::new("/repo"), &first)
+        );
+    }
+
+    #[test]
+    fn dependency_snapshot_keeps_exact_resolved_subgraph() {
+        // A imports B then D; B imports C. Edge storage may be postorder,
+        // while the canonical snapshot must match loading B as its own root.
+        let graph = SourceSnapshot {
+            modules: ["A", "B", "C", "D"]
+                .into_iter()
+                .map(|name| (PathBuf::from(format!("/{name}.sable")), Arc::from(name)))
+                .collect(),
+            edges: vec![(1, 2), (0, 1), (0, 3)],
+        };
+        let b = graph.rooted_at(Path::new("/B.sable")).unwrap();
+        assert_eq!(
+            b.modules
+                .iter()
+                .map(|(path, _)| path.as_path())
+                .collect::<Vec<_>>(),
+            [Path::new("/B.sable"), Path::new("/C.sable")]
+        );
+        assert_eq!(b.edges, vec![(0, 1)]);
+    }
 }

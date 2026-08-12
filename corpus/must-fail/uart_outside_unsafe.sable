@@ -1,0 +1,5 @@
+// expect-error: device.outside_unsafe
+
+fn poll(resource &mut Uart uart) -> u8 {
+    return uart_status(&mut uart);
+}

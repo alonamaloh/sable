@@ -863,6 +863,9 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
         match μ.recordValueAt a k' tag with
         | some _ => .run k ρ σ (μ.setRecordValue a k' none)
         | none => .undef)
+  | .run (.testUartProfile _ :: _) _ _ _ => some .undef
+  | .run (.uartStatus _ :: _) _ _ _ => some .undef
+  | .run (.uartWrite _ :: _) _ _ _ => some .undef
   | .done _ => none
   | .trapped _ => none
   | .undef => none
@@ -1014,6 +1017,9 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   | cellDropRecord_undef_ptr h hv =>
       simp [stepF, h.evalE_eq, EOut.stepPtr_ok_of_ne _ hv]
   | cellDropRecord_abort h => simp [stepF, h.evalE_eq]
+  | testUartProfile_undef => rfl
+  | uartStatus_undef => rfl
+  | uartWrite_undef => rfl
 
 private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Int → Config}
@@ -1352,6 +1358,15 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           cases hc : μ.recordValueAt a k' tag with
           | some value => simpa [hc] using Step.cellDropRecord_ok he hc
           | none => simpa [hc] using Step.cellDropRecord_bad he hc
+      | testUartProfile script =>
+          simp only [stepF, Option.some.injEq] at h
+          exact h ▸ .testUartProfile_undef
+      | uartStatus dst =>
+          simp only [stepF, Option.some.injEq] at h
+          exact h ▸ .uartStatus_undef
+      | uartWrite value =>
+          simp only [stepF, Option.some.injEq] at h
+          exact h ▸ .uartWrite_undef
 
 /-- The two presentations of the machine step agree. -/
 theorem step_iff_stepF {P : Prog} {cap : Int} {c c' : Config} :

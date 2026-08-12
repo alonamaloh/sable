@@ -1,15 +1,14 @@
 # Unsafe Sable — design and implementation plan
 
-*Status: implementation proposal, 2026-08-11. The architecture is concrete
-enough for a prototype; the surface syntax stays provisional until the first
-vertical slice works.*
+*Status: implemented historical plan through the unsafe-Sable v1 checkpoint,
+2026-08-12. U0–U9 and the first formal U10 profile landed; broader device/ISA
+work remains deliberately deferred.*
 
 *This is the **specification** half of a pair. The **argument** —  the forcing
-examples, why this decomposition rather than another, and the questions still
-open to taste — lives in `docs/notes/unsafe-sketch.md`, which this document
-assumes and does not repeat. Read that first if you want to disagree with the
-design; read this one to build it. When U1 concludes, the chosen interpretation
-becomes an ADR, and that ADR supersedes both on the points it decides.*
+examples, why this decomposition rather than another, and the questions that
+were open to taste — lives in `docs/notes/unsafe-sketch.md`, which this document
+assumes and does not repeat. The numbered ADRs now supersede both notes on every
+point they decided.*
 
 *Provenance: a first draft argued from systems examples (Claude); an external
 design review proposed the affine-resource architecture (GPT-5.6); a synthesis
@@ -24,10 +23,10 @@ profile sections; the allocator benchmark in the goals document; ADR 0011
 verification), ADR 0020 (class values as places), and ADR 0021 (`Integer` and
 path-sensitive affinity).*
 
-## Current repository state
+## Starting repository state *(historical)*
 
-Two developments since the first unsafe sketch materially improve the starting
-point without changing its central design.
+At the start of this plan, two developments since the first unsafe sketch
+materially improved the starting point without changing its central design.
 
 - **ADR 0020 landed class values as places.** Sable now has class-valued fields,
   by-value class parameters that consume their argument, and borrows of class
@@ -300,22 +299,31 @@ path-sensitive move rule.
 
 ### Loops
 
-The live resource shape at every backedge must equal the shape at the loop head.
-Views may change and are described by loop invariants. Creating one resource per
-iteration without consuming or reintegrating it is rejected.
+The live resource shape at every backedge must equal the shape captured at the
+loop head **before the condition**. The condition is part of the transition: its
+mutable borrows participate in havoc, its moves participate in shape checking,
+and a false result exits with the condition's post-state rather than restoring
+the pre-condition snapshot. Views may change and are described by loop
+invariants. Creating one resource per iteration without consuming or
+reintegrating it is rejected.
+
+Variants use the same boundary. The measure is captured before the condition
+and compared with its value after each taken body, including the final body
+iteration. Measuring after an effectful condition can prove termination of a
+diverging head-to-head cycle, so both VCgen and the dynamic monitor enforce the
+pre-condition-head to post-body rule.
 
 The first slice should reject outstanding resource borrows across a backedge.
 This can be relaxed later if a benchmark requires it.
 
-**Framing is not new machinery.** A resource untouched by the loop body keeps
-its view facts for free: vcgen's havoc set is built by `collect_assigned` plus
-`collect_mut_borrows` (`vcgen.rs`), and a `resource &mut R` argument lands in
-the latter exactly as `&mut [T]` does today. So "unchanged resources are framed,
-mutated ones are restated as invariants" falls out of the existing loop rule.
-The genuine design question is narrower: a `resource &mut` in a loop body must
-havoc the resource's **view**, never its **token identity** — the token is what
-the shape check preserves across the backedge, and confusing the two would make
-every loop drop the authority it is carrying.
+**Framing is not new machinery.** A resource untouched by the condition and
+body keeps its view facts for free. Havoc discovery exhaustively traverses
+nested statement operands, `unsafe`/`expose`, ordinary and trait calls, and
+sealed raw/resource/device operations; a `resource &mut R` lands in the same
+machinery as `&mut [T]`. So "unchanged resources are framed, mutated ones are
+restated as invariants" falls out of the existing loop rule. A mutable borrow
+havocs the resource's **view**, never its **token identity** — the token is what
+the shape check preserves across the backedge.
 
 **Backedge shape preservation is a metatheorem obligation, not only a checker
 rule.** `Own(rawHeap, Delta)` is never a hypothesis in a generated VC. At a loop
@@ -896,7 +904,10 @@ world model for tests.
 Separate verification already gives Sable content-addressed module artifacts.
 Unsafe/FFI metadata should travel with those artifacts.
 
-Each verified module should emit a manifest containing:
+The implemented manifest slice records audited extern ids and, when present,
+the selected formal machine profile id/hash plus the machine intrinsics used.
+Those entries are emitted into the generated Lean content, so they participate
+in the existing artifact hash. The eventual complete manifest should contain:
 
 - selected machine profile and profile hash;
 - machine intrinsics used;
@@ -906,26 +917,32 @@ Each verified module should emit a manifest containing:
 - unsafe blocks and source spans;
 - public interfaces exposing raw or resource types.
 
-**The manifest is hashed into the artifact, not stored beside it.** ADR 0018's
-artifact hash is `fnv64(prelude_hash, generated_lean_content)` — a manifest is
-not generated Lean, so the two statements "stored beside the artifact" and
-"included in the hash" are a real fork, and the second is correct: an
-artifact's validity is mere existence of its `.ok` file, so an artifact must not
-survive a change to what it trusted. Changing an audit id, adding an intrinsic,
-or introducing an `assume` has to invalidate the artifact exactly as changing a
-proof does. Concretely, U5 emits the manifest-relevant declarations into the
-hashed content (a comment header is enough — the hash is over bytes), which
-costs nothing and reuses the staleness machinery whole. Importers union
-dependency manifests. A later refinement can slice the manifest per export
-using the call graph; module-level transitive manifests are sufficient for the
-prototype.
+**The manifest is hashed into the generated content, not stored beside it.**
+Changing an audit id, adding an intrinsic, or introducing an `assume` therefore
+changes the document that Lean checks. U10 hardened reuse beyond the original
+ADR 0018 existence rule: `.ok` is necessary but not sufficient. The exact
+generated bytes, immutable proof environment, and canonical Sable source graph
+(paths, bytes, resolved edges, and order) must all agree. Roots and module
+documents publish immutably and compare exact bytes on collision; the
+in-process cache retains only identical work currently in flight.
 
-Suggested status language:
+`proof-env-v2` captures every local Lean source plus `lean-toolchain`,
+`lakefile.toml`, and `lake-manifest.json` before profile/VC work. A per-id lock
+builds that repo-shaped snapshot once with one Lake job, writes READY last, and
+serves the same build and generated text to batch Lean or the daemon. Its FNV id
+is only a compact name: exact byte-map comparison fails closed on collisions.
+The narrower displayed UART profile hash still covers the recursive local
+`MMIO`/`SVMUart` import closure plus the toolchain and Lake file. A later
+refinement can slice manifests per export; module-level transitive manifests
+remain sufficient for the prototype.
+
+Current profile-aware status language has the following shape:
 
 ```text
 status: fully verified
-unsafe blocks:       14  (all obligations proved)
-machine intrinsics:   4  (SVM profile: raw-memory-v1)
+unsafe regions: 2
+machine profile: uart-poll-v1 (fnv64:...)
+machine intrinsics: uart_status, uart_write
 extern assumptions:   0
 source assumes:       0
 defers:               0
@@ -941,8 +958,10 @@ extern assumptions: 2
 ```
 
 Do not print `fully verified` when unproved extern contracts remain. Machine
-intrinsics defined by the selected formal profile are part of the declared axiom
-base, not hidden source assumptions.
+intrinsics defined by the selected formal profile are a declared,
+kernel-checked semantic dependency, not an audited extern or hidden source
+assumption. The profile hash exists to make that dependency visible and to
+invalidate cached evidence when its formal definition changes.
 
 ## What `unsafe {}` means
 
@@ -990,7 +1009,7 @@ the arena exist and there is evidence rather than taste.
 
 A device register is not a `PointsTo<u32>` plus a volatile bit.
 
-A machine profile should provide capabilities such as:
+A future general machine profile might provide capabilities such as:
 
 ```text
 MmioRegion<Device>
@@ -998,12 +1017,27 @@ PrivilegedCpu<State>
 ```
 
 and intrinsics whose semantics update an explicit environment state and append
-observable events to a trace.
+observable events to a trace. U10 deliberately began with a specialized
+capability instead: affine `resource Uart` under the formal `uart-poll-v1`
+profile (ADR 0057). It cannot be fabricated, cast from an integer, or passed
+through an extern; the existing extern ABI is an explicit resource whitelist
+(`RawSpan`, `OpenFile`, and `PosixWorld`) that does not include `Uart`. The
+signature authority budget is one: a function, method, initializer, or template
+may declare zero or one explicit UART parameter, never two. A second would be
+unsound for the singleton UART0 model, and owned or borrowed `Uart` resource
+fields are rejected in both ordinary and generic classes until device identities
+and functional field write-back exist. Production provisioning remains deferred,
+while test-only `test_uart(script)` supplies deterministic authority to `test_`
+functions.
 
-Device reads consume values from an input oracle supplied as part of the
-machine configuration. Parameterizing the machine by an oracle preserves
-determinism in the same way the existing allocation-capacity parameter does.
-Correctness quantifies over admissible oracles.
+`unsafe uart_status(&mut uart)` consumes a value from the profile's input oracle,
+advances its cursor, appends a chronological status-read event, and records
+readiness. `unsafe uart_write(byte, &mut uart)` requires the checked ready state,
+appends a transmit event, and clears readiness. Parameterizing the machine by
+an oracle preserves determinism in the same way the existing
+allocation-capacity parameter does; correctness quantifies over admissible
+oracles. `unsafe` admits the device vocabulary but suppresses none of these
+obligations.
 
 Driver specifications should normally use trace projections:
 
@@ -1013,8 +1047,10 @@ uartWrites(trace, UART0) = expectedBytes
 
 rather than expose the complete global event list in every contract.
 
-A fixed-address UART capability comes from a platform profile or audited boot
-fact, not from a general integer-to-pointer cast.
+A fixed-address UART capability will come from a platform profile or audited
+boot fact, not from a general integer-to-pointer cast. The current numeric
+register labels are observations internal to `uart-poll-v1`, not a general MMIO
+address space.
 
 Page-table writes, TLB invalidation, interrupt masking, and similar operations
 follow the same pattern against a formal ISA/profile model.
@@ -1035,6 +1071,11 @@ resource.branch_shape_mismatch
 resource.loop_shape_mismatch
 resource.escape
 raw.unsafe_required
+device.outside_unsafe
+uart.profile_outside_test
+uart.multiple_authority
+uart.field_unsupported
+extern.param_abi
 ```
 
 These cover duplicate/consumed authority, illegal borrows, mismatched resource
@@ -1051,6 +1092,7 @@ misaligned typed conversion
 nonadjacent join
 copy range exceeds source or destination
 wrong allocation or allocator identity
+UART write without an observed ready status
 ```
 
 These are mathematical preconditions over resource views and therefore named
@@ -1067,6 +1109,8 @@ use after free
 double free
 type confusion
 overlapping copy_nonoverlapping
+UART intrinsic without a selected profile
+UART write before readiness
 ```
 
 A source program rejected for duplicating a resource cannot be executed by
@@ -1455,15 +1499,15 @@ loan-allocation model (allocate, copy in, run, copy back, release),
 wrong lowering diverges. The interpreter's raw failures classify as `undef`
 while keeping a precise message — the licence ADR 0025 granted.
 
-Two things recorded rather than hidden. **The exposure's exit obligation is
+Two things were recorded rather than hidden. **The exposure's exit obligation is
 currently unfalsifiable**: every operation in this surface preserves
 reconstructibility, so it always closes. `take8` is what will make it bite — it
 is in the machine but not the surface, and needs a strengthened
 `write_reconstructible`. So the plan's negative subject "read an uninitialized
 byte" is unreachable for now; `load8_init`, a real obligation on every load, is
-the guard that exists instead. And **a stale warm `sable daemon` serves the old
-prelude after a `lake build`**, which cost real time here and will cost it
-again.
+the guard that exists instead. At this rung a warm daemon could serve the old
+prelude after `lake build`; U10's request-selected immutable proof environments
+and per-environment daemon restart close that stale-prelude path.
 
 ### U5 — deterministic extern shim and trust manifest *(done 2026-08-11, ADR 0027)*
 
@@ -1487,11 +1531,12 @@ status: verified relative to audited boundary
 ```
 
 The manifest goes **inside** the hashed content as a comment header, as this note
-already argued it must: an artifact's validity is mere existence of its `.ok`
-file, so it must not survive a change to what it trusted. Verified — `test.fill.v1`
-and `test.fill.v2` hash differently. Imports need no union step, since the flat
-merge already puts a dependency's externs in the importer's program, and an
-importer's status names the boundary it inherited.
+already argued it must, so a change to what a proof trusted changes the artifact
+name. Verified — `test.fill.v1` and `test.fill.v2` hash differently. Imports need
+no union step, since the flat merge already puts a dependency's externs in the
+importer's program, and an importer's status names the boundary it inherited.
+U10 later added exact generated-byte, source-graph, and proof-environment checks
+before any such artifact can be reused.
 
 Effects are **structural**, through the resource parameters: only a passed
 `resource &mut R` may change, a `resource &R` frames itself, and there is no
@@ -1522,11 +1567,13 @@ version the program was verified against. An unknown id traps rather than runnin
 the empty body, because a contract that appears to hold because nothing happened
 is the one outcome a monitor must never produce (`corpus/test-fails/extern_no_shim.sable`).
 
-Still open: the rest of the manifest (machine profile and hash, intrinsics used,
-per-export slicing — the profile has no selection mechanism yet, and slicing is
-already marked optional for the prototype), and any real ABI. Nothing is compiled
-or linked; what this rung establishes is the contract shape and the trust
-bookkeeping.
+The profile part of that open item is now closed by U10's first slice: generated
+content records `uart-poll-v1`, its device intrinsics, and a hash of the
+recursive local Lean import closure plus the toolchain and Lake pins. Per-export
+slicing remains optional and open, as does any real ABI. Nothing is compiled or
+linked yet; U5 established the foreign contract shape and trust bookkeeping,
+while U10 makes a formal machine dependency equally visible without
+misclassifying it as audited trust.
 
 ### U6 — POSIX-shaped handles and scripted worlds *(done 2026-08-11, ADR 0028)*
 
@@ -2169,30 +2216,120 @@ including successful record projection and pointer-option outcomes plus
 uninitialized read, repeated initialization, and conversion from an occupied
 cell. Prototype criterion 7 is therefore met for the U9 record slice.
 
-### U10 — MMIO and privileged-state profile
+### U10 — MMIO and privileged-state profile *(first slice complete; unsafe-v1 stopping point, 2026-08-12, ADR 0057)*
 
-Only after the raw-memory and resource architecture has survived U9:
+The first slice is deliberately a UART profile rather than a general MMIO
+language. `resource Uart` is affine authority and is excluded from the explicit
+extern ABI resource whitelist (`RawSpan`, `OpenFile`, and `PosixWorld`). It
+cannot be constructed or cast in ordinary code. A function, method,
+initializer, or template may declare zero or one explicit UART authority
+parameter; `uart.multiple_authority` rejects a second because both executable
+models operate on one UART0 while VCgen would treat two views as independent.
+Owned or borrowed `Uart` resource fields are rejected, including in generic
+classes (`uart.field_unsupported`), so capability flow remains explicit in this
+first slice. Production platform provisioning is still deferred. Tests may
+select a deterministic oracle with the sealed `test_uart` constructor, which
+is confined to `test_` functions: script 0 is immediately ready, script 1 is
+ready on its third status read, and other scripts remain not-ready.
 
-- add trace events and input oracles to a profile-specific machine model;
-- add platform-provided MMIO capabilities;
-- verify a UART polling/transmit driver;
-- expose trace projections in contracts;
-- later add page-table and privileged instruction subjects against a formal ISA
-  profile.
+The device operations are a distinct intrinsic category. Both require
+`unsafe`, but neither waives checking:
 
-Concurrency, DMA ownership transfer, and atomics remain out of scope.
+- `uart_status(&mut uart) -> u8` consumes the next oracle value, advances the
+  cursor, appends a status-register read to the ordered MMIO trace, and updates
+  readiness;
+- `uart_write(byte, &mut uart)` owes the named ready-state VC, appends a
+  transmit-register write, and clears readiness so the next write requires a
+  new successful poll.
 
-## Corpus plan
+The proof view carries the same functional transitions and exposes `writes` as
+the usual driver-facing trace projection. `corpus/verifies/uart.sable` is the
+bounded acceptance driver: it either sees readiness and appends exactly the
+requested byte to that projection or exhausts its polling budget without a
+write. It assumes no fairness or eventual readiness. All 16 obligations verify;
+4/4 dynamic fixtures cover immediate, delayed, and never-ready scripts plus
+direct evaluation of `test_uart(0)` as an erased resource argument.
+
+The formal implementation composes `lean/Sable/SVMUart.lean` around the core
+SVM instead of adding device state to every old rule. Non-device steps delegate
+to the core; profile statements are meaningful only under the selected wrapper.
+Its relational step relation and executable stepper agree in both directions,
+with determinism and progress proved. A bare wrapper run renders exactly like
+the pre-profile core, while a selected run retains the ordered trace and oracle
+cursor for comparison. The single-job Lean build is green and the Rust/Lean
+differential gate agrees on 69/69 subjects, including readiness clearing, exact
+trace order/cursor movement, budget exhaustion, invalid writes, rejected
+profile reselection before replacement-script evaluation, and selection through
+assignment, discard, and inferred declaration.
+
+Generated verification content records the profile id `uart-poll-v1`, the
+intrinsics used, and a stable content hash over the recursive repository-local
+Lean import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus
+`lean-toolchain` and `lakefile.toml`. This dependency is checked by the Lean
+kernel and is not an extern assumption. It is derived from the same immutable
+`proof-env-v2` source snapshot used by VC generation, dependency checks, batch
+Lean, and the daemon. The broader proof-environment id pins every local Lean
+source plus the toolchain, Lake file, and `lake-manifest.json`; module artifacts
+also pin the exact canonical Sable paths, bytes, resolved edges, and order.
+Generated documents publish immutably and exact bytes are checked on reuse, so
+the compact FNV ids cannot authorize a colliding artifact by themselves.
+
+U10's audit results apply beyond devices. Loop mutation discovery now traverses
+the condition and body exhaustively, including nested statement operands,
+`unsafe`/`expose`, calls, and sealed raw/resource/device operations. Affine shape
+and variants are captured before the condition; a false condition retains its
+post-state; and both VCgen and the interpreter compare the head value with the
+post-body value for every taken iteration, including the last. Trait calls now
+receive the ordinary overlapping-borrow check, while UART-bearing trait
+signatures are rejected until abstract trait contracts can carry resource
+state.
+
+Erasure removes authority values, not source evaluation. The interpreter runs
+resource-valued call arguments and transformation operands left-to-right before
+discarding their proof-only values. SVM lowering preserves `test_uart` selection
+in explicit/inferred declarations, assignment, and discard; an authority-only
+resource operation erases only when all operands are syntactically runtime-inert
+and otherwise fails lowering.
+
+The sound loop rule exposed free-list traversal/search proofs that had relied on
+stale facts. `free_list_walk_unchanged` now posts both `state = old state` and the
+restored `StoredChain`; insert-location and first-fit transport their current
+facts through the same frame invariant. Targeted checks prove 33/33, 13/13, and
+22/22 obligations across those three function pairs. Focused Rust library tests
+are green at 9/9, and the complete single-worker serial corpus is green in
+297.65s. The complete serial Rust suite is green as well: units, corpus,
+randomized allocator, grind-budget, LSP, SVM differential, and doc tests.
+
+This first formal profile completes M44 and is the **defensible unsafe-Sable v1
+stopping point**. Broader U10 remains deliberately deferred: production
+capability provisioning and native fixed-address lowering, generic
+MMIO/device-description surfaces, UART receive/interrupt/error/timing models,
+page-table or privileged-instruction subjects against a formal ISA,
+concurrency, DMA ownership transfer, and atomics. LLVM IR lowering is now the
+active next milestone.
+
+## Representative final unsafe-v1 corpus coverage
+
+These are current filenames from the green serial gate, not the hypothetical
+names from the original plan. The full directories contain the exhaustive
+matrix.
 
 ### `corpus/verifies`
 
 ```text
-resource_flow.sable
 unsafe_copy.sable
-ffi_fill.sable
-posix_file.sable
+resources.sable
+posix_read.sable
 bump_arena.sable
-free_list.sable
+static_root.sable
+system_root.sable
+typed_cells.sable
+typed_records.sable
+resource_map.sable
+free_list_walk.sable
+free_list_insert_location.sable
+free_list_first_fit.sable
+free_list_return.sable
 intrusive_list.sable
 uart.sable
 ```
@@ -2201,41 +2338,57 @@ uart.sable
 
 ```text
 resource_use_after_move.sable
-resource_double_borrow.sable
+resource_borrow_conflict.sable
 resource_branch_shape.sable
 resource_loop_shape.sable
-raw_escape.sable
 raw_outside_unsafe.sable
-raw_bad_join.sable
-raw_uninitialized_read.sable
-raw_wrong_allocator.sable
-raw_double_free.sable
+expose_return_pointer.sable
+resource_join_nonadjacent.sable
+typed_cell_read_uninit.sable
+system_root_wrong_release.sable
+loop_nested_unsafe_stale.sable
+loop_condition_mutation_stale.sable
+loop_condition_resource_shape.sable
+loop_condition_variant_effect.sable
+trait_borrow_conflict.sable
+uart_extern.sable
+uart_multiple_authority.sable
+uart_outside_unsafe.sable
+uart_profile_outside_test.sable
+uart_resource_field.sable
+uart_trait_unsupported.sable
+uart_use_after_move.sable
+uart_write_without_ready.sable
 ```
 
-Some names above are verification failures rather than checker failures; each
-file should assert the stable diagnostic or obligation name appropriate to its
-layer.
+Some cases are verification failures rather than checker failures; every file
+asserts the stable diagnostic or obligation name appropriate to its layer.
 
 ### `corpus/test-fails`
 
 Dynamic tests for bypassed/malformed operations:
 
 ```text
-raw_oob.sable
-raw_use_after_free.sable
-raw_type_confusion.sable
-raw_overlap_copy.sable
+typed_record_double_init.sable
+resource_map_duplicate_put.sable
+resource_map_take_missing.sable
+loop_condition_variant_order.sable
+uart_profile_reselection.sable
+uart_write_before_ready.sable
 ```
 
 ### `corpus/svm-diff`
 
-Add direct SVM subjects for every raw operation, both successful and `undef`,
-plus evaluation-order cases where the identity of the first failing operation
-matters.
+The differential set contains successful and `undef` raw/typed operations plus
+evaluation-order cases where the identity of the first failing operation
+matters. `uart_profile.sable` adds immediate, delayed, and never-ready polling,
+a write without readiness, readiness clearing, rejection of a second profile
+selection before replacement-script evaluation, and selection through
+assignment, discarded expression, and inferred declaration.
 
 ## Prototype acceptance criteria
 
-The architecture passes its first experiment only if all of the following hold.
+The architecture passed its first experiment because all of the following hold.
 
 1. `copy_prefix` has a short value-level contract and contains no explicit heap
    predicate.
@@ -2254,8 +2407,8 @@ The architecture passes its first experiment only if all of the following hold.
 9. The compiler reports unsafe blocks separately from actual trust dependencies.
 10. Folding evidence leaves a safe wrapper that reads like ordinary Sable.
 
-Failure of any item is useful information. The response should be to simplify or
-strengthen the resource abstraction, not to expose general separation logic
+These remain regression criteria: a future failure should simplify or
+strengthen the resource abstraction, not expose general separation logic
 prematurely.
 
 ## Explicitly excluded from unsafe v1
@@ -2301,9 +2454,9 @@ The central bet remains:
 > **Make raw pointers useless without affine erased resources, and make those
 > resources visible to Lean only through pure views.**
 
-The current repository has already validated the first half of the checker
-story: affine moves are source-level flow facts, and the logic reasons about the
-same class value whether it arrived by borrow or by move. The next argument
-should be executable. Start with the concrete Lean probe, then a byte-only
-resource checker and raw SVM heap, and stop at `copy_prefix` long enough to judge
-whether the abstraction really preserves Sable's readability.
+The completed ladder validates the whole prototype argument: affine moves are
+source-level flow facts; Lean sees only pure resource views; safe wrappers,
+typed storage, a verified allocator, aggregate authority, intrusive records,
+and a formal device profile compose without exposing separation logic. The
+remaining device/ISA extensions are independent future profiles, not gaps in
+unsafe Sable v1. The next executable argument is the LLVM backend.

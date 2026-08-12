@@ -2,7 +2,7 @@
 //! didOpen a file with a type error, and assert the published diagnostics
 //! carry the Sable diagnostic code and the right position.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use std::process::{Command, Stdio};
 

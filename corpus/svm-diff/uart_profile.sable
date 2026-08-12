@@ -1,0 +1,88 @@
+// Observable UART subjects for the `uart-poll-v1` wrapper. The differential
+// harness compares the terminal result, oracle cursor, and chronological MMIO
+// trace; returning the right scalar while dropping or reordering an access is
+// therefore a divergence.
+
+fn test_immediate_write() {
+    mut resource Uart uart = test_uart(0);
+    unsafe {
+        u8 status = uart_status(&mut uart);
+        if (status != 0) {
+            uart_write(65, &mut uart);
+        }
+    }
+}
+
+fn test_delayed_write() {
+    mut resource Uart uart = test_uart(1);
+    unsafe {
+        u8 a = uart_status(&mut uart);
+        u8 b = uart_status(&mut uart);
+        u8 c = uart_status(&mut uart);
+        if (c != 0) {
+            uart_write(66, &mut uart);
+        }
+    }
+}
+
+fn test_never_ready() {
+    mut resource Uart uart = test_uart(2);
+    unsafe {
+        u8 a = uart_status(&mut uart);
+        u8 b = uart_status(&mut uart);
+    }
+}
+
+fn test_write_before_ready() {
+    mut resource Uart uart = test_uart(1);
+    unsafe {
+        uart_write(67, &mut uart);
+    }
+}
+
+fn test_readiness_clears_after_write() {
+    mut resource Uart uart = test_uart(0);
+    unsafe {
+        u8 ready = uart_status(&mut uart);
+        uart_write(68, &mut uart);
+        uart_write(69, &mut uart);
+    }
+}
+
+fn test_profile_reselection() {
+    mut resource Uart first = test_uart(0);
+    mut resource Uart second = test_uart(1);
+}
+
+fn test_profile_reselection_beats_script_trap() {
+    mut resource Uart first = test_uart(0);
+    u64 zero = 0;
+    mut resource Uart second = test_uart(1 / zero);
+}
+
+// Resource storage is erased, but selecting the profile while assigning into
+// that storage is not. The initializer selects the first profile; the legal
+// reassignment must then trap as a reselection. A lowerer that drops the whole
+// assignment would incorrectly terminate normally.
+fn test_profile_selection_by_assignment() {
+    mut resource Uart uart = test_uart(0);
+    uart = test_uart(1);
+    unsafe {
+        u8 status = uart_status(&mut uart);
+    }
+}
+
+// Discarding the affine view is permitted for this non-mandatory test
+// capability. Profile selection remains an observable runtime transition.
+fn test_discarded_profile_selection() {
+    test_uart(1);
+}
+
+// Inferred resource declarations use the same runtime-effect lowering as an
+// explicitly typed resource declaration.
+fn test_inferred_profile_selection() {
+    var mut uart = test_uart(2);
+    unsafe {
+        u8 status = uart_status(&mut uart);
+    }
+}

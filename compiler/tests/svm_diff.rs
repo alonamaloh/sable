@@ -9,7 +9,7 @@
 //! The harness is strict by construction: a function that cannot be
 //! lowered to the machine's core subset is a hard failure, not a skip.
 
-use sable::{load_checked, Options};
+use sable::{Options, load_checked};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -72,23 +72,23 @@ fn svm_differential() {
             let id = format!("{stem}::{}", f.name);
             let term = sable::svm::lower_fn(&program, f)
                 .unwrap_or_else(|e| panic!("{id} is not in the SVM core subset: {e}"));
-            let outcome = sable::svm::canonical_outcome(
+            let outcome = sable::svm::canonical_observed(
                 &program,
-                sable::interp::run_fn(&program, &mods, &f.name),
+                sable::interp::run_fn_observed(&program, &mods, &f.name),
             );
             cases.push((id, fi, term, outcome));
         }
     }
 
     // One generated driver, one Lean invocation for the whole corpus.
-    let mut driver = String::from("import Sable.SVMEval\nopen Sable.SVM\n");
+    let mut driver = String::from("import Sable.SVMUart\nopen Sable.SVM\n");
     for (fi, entries) in &progs {
         driver.push_str(&format!("def prog{fi} : Prog := Prog.ofList [{entries}]\n"));
     }
     for (i, (id, fi, term, _)) in cases.iter().enumerate() {
         driver.push_str(&format!("def p{i} : List Stmt := {term}\n"));
         driver.push_str(&format!(
-            "#eval IO.println (\"{id}\\t\" ++ (run prog{fi} {CAP} {FUEL} (.run p{i} Env.empty [] .empty)).render)\n"
+            "#eval IO.println (\"{id}\\t\" ++ (Sable.SVMUart.run prog{fi} {CAP} {FUEL} (Sable.SVMUart.Config.bare (.run p{i} Env.empty [] .empty))).render)\n"
         ));
     }
     let driver_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("svm_diff_driver.lean");

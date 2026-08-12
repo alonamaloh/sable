@@ -1,0 +1,4 @@
+// expect-error: extern.param_abi
+
+extern "C" #[audit(id := "test.uart-smuggle.v1", reason := "negative subject")]
+fn smuggle_uart(resource &mut Uart uart);
