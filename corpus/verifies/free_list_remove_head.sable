@@ -41,6 +41,9 @@ pub class FreeListState {
 ///        result.span.len = size
 /// post #[label(owner)] result.allocator = state.allocator
 /// post #[label(root)] result.span.alloc = state.root.alloc
+/// post #[label(returnable)]
+///        Sable.AllocatorView.returnable state
+///          (Sable.FreeBlockView.toLease result)
 pub fn free_list_remove_head(raw<u8> base,
                              &mut FreeListState list,
                              resource &mut AllocatorState state,
@@ -169,3 +172,15 @@ pub fn free_list_remove_head(raw<u8> base,
 ///     header.sizeCell.alloc = _old_state.root.alloc :=
 ///       hstored.2.2.2.2.2
 ///     _ = state.root.alloc := by rw [h_state_step_header]; rfl
+
+/// discharge free_list_remove_head.post.returnable by
+///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
+///   have hnode : _header2 = header := by
+///     rw [h_header2_step,
+///       Sable.AllocatorView.storesHeader_headerAt hstored]
+///   have hreturn :=
+///     Sable.AllocatorView.StoredChain.takeMatchingHead_returnable
+///       h_pre_chain (by simpa using h_pre_nonempty) hstored hfields
+///   rw [h_state_step_header, h_result, h_free4_block,
+///     h_node_clear, hnode]
+///   exact hreturn

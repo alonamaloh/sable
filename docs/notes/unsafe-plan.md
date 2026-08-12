@@ -2016,12 +2016,25 @@ fixtures exercise whole and split behavior and rejoin the precise original
 system root. Every new obligation is proved with zero assumptions or
 deferrals, and the complete corpus passes with one worker.
 
-Next implement client `free` as sorted insertion of the exact matching lease,
-then coalesce with the predecessor and successor through proved adjacency and
-`FreeBlock` joins. Keep insertion and coalescing ordinary verified policy over
-sealed role transitions; add local wrong-owner/double-return/subregion guards
-and randomized dynamic comparison only after the structural insert proof is
-stable.
+**The U8g1 returnable-lease and head-insertion slice is complete (2026-08-12,
+ADR 0050).** Allocation now exports `AllocatorView.returnable`: the exact
+owner/key/positive-root extent has an empty aggregate slot and no allocator
+entry begins in its interior. Exact head removal establishes that frame;
+prefix allocation and storing a suffix header preserve it. Ordinary verified
+`free_list_insert_head` consumes the mandatory lease, reconstructs its real
+two-word header, and restores `StoredChain` in front of the old runtime head.
+Both whole and split dynamic fixtures now return the same allocated lease
+through that operation before restoring and releasing the root. Every new
+obligation is proved with zero assumptions or deferrals.
+
+Next generalize this to arbitrary sorted insertion. Carry an explicit
+predecessor/current gap witness through a read-only location pass, then rebuild
+the predecessor link around the exact returned lease. Do not infer predecessor
+nonoverlap from `returnable` alone: it rules out allocator entries at or inside
+the lease, but does not identify an earlier block's end. Once the structural
+insert is stable, coalesce with predecessor and successor through proved
+adjacency and `FreeBlock` joins, then add local wrong-owner/double-return/
+subregion guards and randomized dynamic comparison.
 
 Exit criteria:
 

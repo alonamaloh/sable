@@ -26,6 +26,7 @@ use free_list_remove_head;
 ///          (if need + Sable.freeHeaderBytes ≤ size then need else size)
 /// post #[label(owner)] result.allocator = state.allocator
 /// post #[label(root)] result.span.alloc = state.root.alloc
+/// post #[label(returnable)] state.returnable result
 pub fn free_list_allocate_head(raw<u8> base,
                                &mut FreeListState list,
                                resource &mut AllocatorState state,
@@ -242,6 +243,29 @@ pub fn free_list_allocate_head(raw<u8> base,
 ///   simpa [Sable.FreeBlockView.toLease, Sable.FreeBlockView.prefix,
 ///     Sable.AllocatorView.putHeader] using
 ///     h_free_list_remove_head_post_root
+
+/// discharge free_list_allocate_head.post.returnable by
+///   have hprefix : state.returnable block_2.toLease := by
+///     rw [h_block_prefix]
+///     apply Sable.AllocatorView.returnable_prefix
+///       h_free_list_remove_head_post_returnable
+///     constructor
+///     · exact h_fact_0_need_need_block_span_l.1
+///     · change need ≤ block.span.len
+///       omega
+///   have hkey : remainder_header.key = block.key + need := by
+///     simp [h_remainder_header_init, h_header6_header,
+///       h_free5_suffix, Sable.FreeHeaderView.putFields,
+///       Sable.FreeBlockView.toHeader, Sable.FreeBlockView.suffix]
+///   have houtside :
+///       block_2.toLease.key + block_2.toLease.span.len ≤
+///         remainder_header.key := by
+///     rw [hkey, h_block_prefix]
+///     simp [Sable.FreeBlockView.toLease,
+///       Sable.FreeBlockView.prefix]
+///   rw [h_result, h_lease11_lease, h_state_put_header]
+///   exact Sable.AllocatorView.returnable_putHeaderOutside
+///     hprefix (Or.inr houtside)
 
 /// discharge free_list_allocate_head.post.head.2 by
 ///   have hwhole : ¬ need + Sable.freeHeaderBytes ≤ size := by

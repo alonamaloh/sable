@@ -8,8 +8,15 @@
 // expect-skip: result.key = (old list).head
 // expect-skip: result.allocator = state.allocator
 // expect-skip: result.span.alloc = state.root.alloc
+// expect-skip: Sable.AllocatorView.returnable state
+// expect-skip: state.returnable result
+// expect-skip: state.returnable lease
+// expect-skip: lease.key = key
+// expect-skip: lease.span.len = size
+// expect-skip: Sable.freeHeaderBytes ≤ size
 
 use free_list_allocate_head;
+use free_list_insert_head;
 use free_list_remove_head;
 
 /// pre actual = expected
@@ -30,8 +37,19 @@ fn test_free_list_allocate_head_split() {
     var mut list = FreeListState::make(0, 64);
     resource BlockLease lease = free_list_allocate_head(
         base, &mut list, &mut state, 32, 64, 64);
-    resource FreeBlock left = block_lease_free(lease);
     expect_eq_u64(list.head, 32);
+
+    free_list_insert_head(
+        base, &mut list, &mut state, 0, 32, lease);
+    expect_eq_u64(list.head, 0);
+
+    mut resource FreeHeader returned =
+        allocator_take_header(&mut state, 0);
+    unsafe {
+        raw_header_clear(base, &mut returned);
+        resource FreeBlock left =
+            raw_from_free_header(base, returned);
+    }
 
     mut resource FreeHeader remainder =
         allocator_take_header(&mut state, 32);
@@ -61,9 +79,19 @@ fn test_free_list_allocate_head_whole() {
     var mut list = FreeListState::make(0, 32);
     resource BlockLease lease = free_list_allocate_head(
         base, &mut list, &mut state, 24, 32, 32);
-    resource FreeBlock whole_free = block_lease_free(lease);
     expect_eq_u64(list.head, 32);
 
+    free_list_insert_head(
+        base, &mut list, &mut state, 0, 32, lease);
+    expect_eq_u64(list.head, 0);
+
+    mut resource FreeHeader returned =
+        allocator_take_header(&mut state, 0);
+    unsafe {
+        raw_header_clear(base, &mut returned);
+        resource FreeBlock whole_free =
+            raw_from_free_header(base, returned);
+    }
     allocator_put_free(&mut state, whole_free);
     resource RawSpan whole = allocator_destroy(state);
     unsafe system_dealloc(base, whole, release);

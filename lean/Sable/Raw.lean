@@ -722,6 +722,92 @@ def AllocatorView.clearInterior
   ∀ k, key < k → k < key + size →
     v.free k = none ∧ v.headers k = none
 
+/-- A client lease can be returned to this allocator view without colliding
+with an aggregate role. Besides allocator identity and an empty key slot, the
+lease names one positive offset-derived extent in the allocator root and no
+free/header entry begins strictly inside it. This is the frame allocation
+produces and sorted insertion consumes. -/
+def AllocatorView.returnable
+    (v : AllocatorView) (lease : BlockLeaseView) : Prop :=
+  v.canPut lease ∧
+  lease.key = lease.span.off ∧
+  0 < lease.span.len ∧
+  lease.span.alloc = v.root.alloc ∧
+  v.clearInterior lease.key lease.span.len
+
+theorem AllocatorView.returnable_canPutHeader
+    {v : AllocatorView} {lease : BlockLeaseView}
+    {header : FreeHeaderView}
+    (hreturn : v.returnable lease)
+    (hkey : header.key = lease.key)
+    (hwf : header.wf)
+    (howner : header.allocator = lease.allocator) :
+    v.canPutHeader header := by
+  refine ⟨howner.trans hreturn.1.1, hwf, ?_, ?_⟩
+  · rw [hkey]
+    exact hreturn.1.2.1
+  · rw [hkey]
+    exact hreturn.1.2.2
+
+theorem AllocatorView.returnable_clearInterior
+    {v : AllocatorView} {lease : BlockLeaseView}
+    {key size : Int}
+    (hreturn : v.returnable lease)
+    (hkey : lease.key = key) (hsize : lease.span.len = size) :
+    v.clearInterior key size := by
+  simpa [hkey, hsize] using hreturn.2.2.2.2
+
+theorem AllocatorView.returnable_takeHeader_ne
+    {v : AllocatorView} {lease : BlockLeaseView} {removed : Int}
+    (hreturn : v.returnable lease) (hne : lease.key ≠ removed) :
+    (v.takeHeader removed).returnable lease := by
+  rcases hreturn with ⟨⟨howner, hfree, hheader⟩,
+    hwhole, hpositive, hroot, hclear⟩
+  refine ⟨⟨howner, hfree, ?_⟩, hwhole, hpositive, hroot, ?_⟩
+  · simpa [AllocatorView.takeHeader, hne] using hheader
+  · intro k hlo hhi
+    obtain ⟨hfreeK, hheaderK⟩ := hclear k hlo hhi
+    refine ⟨hfreeK, ?_⟩
+    by_cases hk : k = removed
+    · simp [AllocatorView.takeHeader, hk]
+    · simpa [AllocatorView.takeHeader, hk] using hheaderK
+
+/-- Parking a header wholly before or after a client lease preserves the
+lease's exact return slot and interior frame. -/
+theorem AllocatorView.returnable_putHeaderOutside
+    {v : AllocatorView} {lease : BlockLeaseView}
+    {header : FreeHeaderView}
+    (hreturn : v.returnable lease)
+    (houtside : header.key < lease.key ∨
+      lease.key + lease.span.len ≤ header.key) :
+    (v.putHeader header).returnable lease := by
+  rcases hreturn with ⟨⟨howner, hfree, hheader⟩,
+    hwhole, hpositive, hroot, hclear⟩
+  have hne : lease.key ≠ header.key := by omega
+  refine ⟨⟨howner, hfree, ?_⟩, hwhole, hpositive, hroot, ?_⟩
+  · simpa [AllocatorView.putHeader, hne] using hheader
+  · intro k hlo hhi
+    have hk : k ≠ header.key := by omega
+    obtain ⟨hfreeK, hheaderK⟩ := hclear k hlo hhi
+    exact ⟨hfreeK,
+      by simpa [AllocatorView.putHeader, hk] using hheaderK⟩
+
+/-- Any positive prefix of a returnable lease remains returnable. The suffix
+may subsequently be materialized as a header at the prefix's end. -/
+theorem AllocatorView.returnable_prefix
+    {v : AllocatorView} {lease : BlockLeaseView} {n : Int}
+    (hreturn : v.returnable lease)
+    (hn : 0 < n ∧ n ≤ lease.span.len) :
+    v.returnable (lease.toFree.prefix n).toLease := by
+  rcases hreturn with ⟨⟨howner, hfree, hheader⟩,
+    hwhole, hpositive, hroot, hclear⟩
+  refine ⟨⟨howner, hfree, hheader⟩, hwhole, hn.1, hroot, ?_⟩
+  intro k hlo hhi
+  simp [FreeBlockView.toLease, FreeBlockView.prefix,
+    BlockLeaseView.toFree] at hlo hhi
+  apply hclear k hlo
+  omega
+
 theorem AllocatorView.clearInterior_takeHeader
     {v : AllocatorView} {key size : Int}
     (hclear : v.clearInterior key size) :
@@ -941,6 +1027,51 @@ theorem AllocatorView.StoredChain.takeMatchingHead
   simp only [hsameSize] at extent hclear hsize horder
   simp only [hsameNext] at horder hbound tail
   exact ⟨extent, hclear, hsize, horder, hbound, tail⟩
+
+/-- Taking an exact stored head yields a returnable whole-block lease after
+its two header fields are cleared. This is the bridge from list removal to the
+public free operation's collision frame. -/
+theorem AllocatorView.StoredChain.takeMatchingHead_returnable
+    {v : AllocatorView} {limit head size next : Int}
+    {header : FreeHeaderView}
+    (chain : v.StoredChain limit head) (notEnd : head ≠ limit)
+    (stored : v.storesHeader head header)
+    (fields : header.hasFields size next) :
+    (v.takeHeader head).returnable header.clearFields.toFree.toLease := by
+  have matched := chain.takeMatchingHead notEnd stored fields
+  have hwf := stored.2.2.2.1
+  unfold FreeHeaderView.wf at hwf
+  obtain ⟨hsizeWf, hnextWf, hkeyoff, halloc, hpayloadAlloc,
+    hoff, hpayloadoff, hpayloadlen⟩ := hwf
+  have leaseKey : header.clearFields.toFree.toLease.key = head := by
+    change header.clearFields.toFree.key = head
+    rw [FreeHeaderView.clearFields_toFree_key]
+    exact stored.2.2.1
+  have leaseLen : header.clearFields.toFree.toLease.span.len = size := by
+    change header.clearFields.toFree.span.len = size
+    rw [FreeHeaderView.clearFields_toFree_span_len]
+    exact matched.1
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · refine ⟨?_, ?_, ?_⟩
+    · change header.clearFields.toFree.allocator =
+        (v.takeHeader head).allocator
+      simpa [AllocatorView.takeHeader] using stored.2.2.2.2.1
+    · rw [leaseKey]
+      simpa [AllocatorView.takeHeader] using stored.2.1
+    · rw [leaseKey]
+      simp [AllocatorView.takeHeader]
+  · simpa [FreeBlockView.toLease, FreeHeaderView.toFree,
+      FreeHeaderView.rawCell, FreeHeaderView.clearFields,
+      PointsToView.clear] using hkeyoff
+  · rw [leaseLen]
+    have hmin := matched.2.2.1
+    simp [freeHeaderBytes, u64.layout] at hmin
+    omega
+  · change header.clearFields.toFree.span.alloc =
+      (v.takeHeader head).root.alloc
+    simpa [AllocatorView.takeHeader] using stored.2.2.2.2.2
+  · rw [leaseKey, leaseLen]
+    exact matched.2.1
 
 theorem AllocatorView.StoredChain.prependAfterPut
     {v : AllocatorView} {header : FreeHeaderView}
