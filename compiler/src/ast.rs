@@ -631,6 +631,17 @@ pub enum Stmt {
         kw_span: Span,
         body: Vec<Stmt>,
     },
+    /// `unsafe static_alloc(N) as (p, resource m);` — acquire one fresh,
+    /// program-lifetime raw root. There is deliberately no deallocation
+    /// authority on this rung (ADR 0033).
+    StaticAlloc {
+        kw_span: Span,
+        size: Expr,
+        ptr: String,
+        ptr_span: Span,
+        res: String,
+        res_span: Span,
+    },
     /// `unsafe expose &a as (p, resource m) { ... }` — the bridge from a
     /// safe `[u8]` to raw bytes. The body sees a pointer and a resource
     /// naming the array's storage; at scope exit the array is what the

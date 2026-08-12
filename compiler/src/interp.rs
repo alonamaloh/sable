@@ -858,6 +858,15 @@ impl<'a> Interp<'a> {
             }
             // `unsafe { ... }` is a marker: the block runs like any other.
             Stmt::Unsafe { body, .. } => self.exec_open_block(body, frame, locals),
+            Stmt::StaticAlloc { size, ptr, res, .. } => {
+                let RtVal::Int(n) = self.eval(size, frame)? else {
+                    unreachable!("checked: u64 literal")
+                };
+                let alloc = self.raw.fresh(vec![None; n as usize]);
+                frame.vars.insert(ptr.clone(), RtVal::Ptr(alloc, 0));
+                frame.vars.insert(res.clone(), RtVal::Unit);
+                Ok(Flow::Normal)
+            }
             // Exposure: copy the array's bytes into a fresh loan
             // allocation, run the body, copy the final bytes back, and
             // kill the allocation. Modelling it as a real copy is what
@@ -1899,7 +1908,9 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
 
 fn stmt_span(stmt: &Stmt) -> crate::span::Span {
     match stmt {
-        Stmt::Unsafe { kw_span, .. } | Stmt::Expose { kw_span, .. } => *kw_span,
+        Stmt::Unsafe { kw_span, .. }
+        | Stmt::StaticAlloc { kw_span, .. }
+        | Stmt::Expose { kw_span, .. } => *kw_span,
         Stmt::Decl { name_span, .. } | Stmt::Assign { name_span, .. } => *name_span,
         Stmt::Assert(c) => c.line_span,
         Stmt::If { cond, .. } => cond.span,

@@ -97,6 +97,19 @@ structure SpanView where
   len : Int
   bytes : Seq ByteState
 
+/-- A fresh raw root: every byte exists but has no value yet. -/
+def SpanView.uninit (alloc len : Int) : SpanView :=
+  { alloc, off := 0, len, bytes := ⟨len, fun _ => .uninit⟩ }
+
+@[simp] theorem SpanView.uninit_alloc (alloc len : Int) :
+    (SpanView.uninit alloc len).alloc = alloc := rfl
+@[simp] theorem SpanView.uninit_off (alloc len : Int) :
+    (SpanView.uninit alloc len).off = 0 := rfl
+@[simp] theorem SpanView.uninit_len (alloc len : Int) :
+    (SpanView.uninit alloc len).len = len := rfl
+@[simp] theorem SpanView.uninit_get (alloc len k : Int) :
+    (SpanView.uninit alloc len).bytes.get k = .uninit := rfl
+
 /-- Well-formedness of a span view, assumed at every binding site: a
 length is nonnegative and its byte sequence covers it. Authority is not
 in here; this is the shape of the value. -/

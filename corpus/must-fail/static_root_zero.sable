@@ -1,0 +1,4 @@
+// expect-error: static_root.size
+fn zero_root() {
+    unsafe static_alloc(0) as (p, resource mem);
+}

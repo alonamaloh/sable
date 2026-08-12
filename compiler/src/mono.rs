@@ -378,6 +378,7 @@ fn prepare_stmts(
             | Stmt::ExprStmt(e)
             | Stmt::VarDecl { init: e, .. }
             | Stmt::FieldAssign { value: e, .. }
+            | Stmt::StaticAlloc { size: e, .. }
             | Stmt::Return { value: Some(e), .. } => prepare_expr(e, bound_params),
             Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
             Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
@@ -677,6 +678,7 @@ impl Mono {
                 | Stmt::ExprStmt(e)
                 | Stmt::VarDecl { init: e, .. }
                 | Stmt::FieldAssign { value: e, .. }
+                | Stmt::StaticAlloc { size: e, .. }
                 | Stmt::Return { value: Some(e), .. } => self.rewrite_expr(e, depth)?,
                 Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
                     self.rewrite_stmts(body, depth)?
@@ -844,7 +846,8 @@ fn subst_stmts(
             Stmt::Assign { value, .. }
             | Stmt::ExprStmt(value)
             | Stmt::VarDecl { init: value, .. }
-            | Stmt::FieldAssign { value, .. } => subst_expr(value, args, bound_calls)?,
+            | Stmt::FieldAssign { value, .. }
+            | Stmt::StaticAlloc { size: value, .. } => subst_expr(value, args, bound_calls)?,
             Stmt::Return { value: Some(e), .. } => subst_expr(e, args, bound_calls)?,
             Stmt::Return { value: None, .. } => {}
             Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {

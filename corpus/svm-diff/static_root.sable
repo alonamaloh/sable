@@ -1,0 +1,14 @@
+// Static root acquisition lowers to the SVM allocation instruction but has
+// no corresponding free: it remains live for the rest of execution.
+
+fn subj() -> u64 {
+    unsafe static_alloc(8) as (p, resource mem);
+    mut u64 out = 0;
+    unsafe {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        raw_cell_init_u64(p, 73, &mut cell);
+        out = raw_cell_take_u64(p, &mut cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+    }
+    return out;
+}

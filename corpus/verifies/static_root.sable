@@ -1,0 +1,16 @@
+// A program-lifetime raw root (ADR 0033). It has fresh provenance and no
+// deallocation token; abandoning the returned raw authority is an explicit
+// leak, which affine ownership permits on this rung.
+
+/// post result = 55
+pub fn static_root_u64() -> u64 {
+    unsafe static_alloc(8) as (p, resource mem);
+    mut u64 out = 0;
+    unsafe {
+        mut resource PointsTo<u64> cell = raw_into_cell_u64(p, mem);
+        raw_cell_init_u64(p, 55, &mut cell);
+        out = raw_cell_take_u64(p, &mut cell);
+        resource RawSpan bytes = raw_from_cell_u64(p, cell);
+    }
+    return out;
+}

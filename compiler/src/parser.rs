@@ -1860,6 +1860,33 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `static_alloc(N) as (p, resource m);`, after `unsafe`.
+    fn static_alloc_stmt(&mut self, kw_span: Span) -> PResult<Stmt> {
+        let (op, _) = self.ident()?;
+        debug_assert_eq!(op, "static_alloc");
+        self.expect(Tok::LParen)?;
+        let size = self.expr()?;
+        self.expect(Tok::RParen)?;
+        match self.peek() {
+            Tok::Ident(kw) if kw == "as" => { self.bump(); }
+            _ => return Err(self.error_expected("`as`")),
+        }
+        self.expect(Tok::LParen)?;
+        let (ptr, ptr_span) = self.ident()?;
+        if is_reserved_name(&ptr) {
+            return Err(reserved_name_error(&ptr, ptr_span, "variable"));
+        }
+        self.expect(Tok::Comma)?;
+        self.expect(Tok::KwResource)?;
+        let (res, res_span) = self.ident()?;
+        if is_reserved_name(&res) {
+            return Err(reserved_name_error(&res, res_span, "variable"));
+        }
+        self.expect(Tok::RParen)?;
+        self.expect(Tok::Semi)?;
+        Ok(Stmt::StaticAlloc { kw_span, size, ptr, ptr_span, res, res_span })
+    }
+
     fn stmt(&mut self) -> PResult<Stmt> {
         match self.peek().clone() {
             // `mut <decl>` — the declared local is mutable (ADR 0016).
@@ -1977,6 +2004,9 @@ impl<'a> Parser<'a> {
                 // which is where raw operations may be called.
                 if self.at(&Tok::KwExpose) {
                     return self.expose_stmt(kw_span);
+                }
+                if matches!(self.peek(), Tok::Ident(op) if op == "static_alloc") {
+                    return self.static_alloc_stmt(kw_span);
                 }
                 let body = self.block()?;
                 Ok(Stmt::Unsafe { kw_span, body })
@@ -3008,6 +3038,13 @@ fn is_reserved_name(name: &str) -> bool {
         "raw_load8",
         "raw_store8",
         "raw_copy_nonoverlapping",
+        "raw_into_cell_u64",
+        "raw_from_cell_u64",
+        "raw_cell_init_u64",
+        "raw_cell_read_u64",
+        "raw_cell_take_u64",
+        "raw_cell_drop_u64",
+        "static_alloc",
         "expose",
         "as",
     ];

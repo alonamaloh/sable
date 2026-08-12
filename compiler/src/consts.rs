@@ -108,6 +108,7 @@ fn subst_stmts(
             | Stmt::ExprStmt(e)
             | Stmt::VarDecl { init: e, .. }
             | Stmt::FieldAssign { value: e, .. }
+            | Stmt::StaticAlloc { size: e, .. }
             | Stmt::Return { value: Some(e), .. } => subst_expr(e, values),
             Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
             Stmt::Assert(c) => c.text = subst_clause_text(&c.text, text_map),

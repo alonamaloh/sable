@@ -1,0 +1,9 @@
+use static_root;
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+fn test_static_root_u64() {
+    expect_eq_u64(static_root_u64(), 55);
+}

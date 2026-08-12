@@ -1501,6 +1501,52 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 ctx.in_unsafe = outer;
                 returned = r?;
             }
+            Stmt::StaticAlloc {
+                size,
+                ptr,
+                ptr_span,
+                res,
+                res_span,
+                ..
+            } => {
+                check_expr(ctx, size, Some(Ty::Int(IntTy::U64)))?;
+                let ExprKind::IntLit(n) = size.kind else {
+                    return Err(Diagnostic {
+                        name: "static_root.literal_size".into(),
+                        title: "a static root needs a compile-time literal size".into(),
+                        span: size.span,
+                        label: "use an integer literal from 1 through 50000000".into(),
+                        notes: vec![],
+                    });
+                };
+                if !(1..=50_000_000).contains(&n) {
+                    return Err(Diagnostic {
+                        name: "static_root.size".into(),
+                        title: format!("static root size {n} is outside the supported profile"),
+                        span: size.span,
+                        label: "expected 1 through 50000000 bytes".into(),
+                        notes: vec![],
+                    });
+                }
+                for (name, span, ty, mutable) in [
+                    (ptr.as_str(), ptr_span, Ty::Raw(IntTy::U8), false),
+                    (res.as_str(), res_span, Ty::Res(ResKind::RawSpan), true),
+                ] {
+                    if !ctx.declared.insert(name.to_string()) {
+                        return Err(Diagnostic {
+                            name: "type.duplicate_name".into(),
+                            title: format!("duplicate variable name `{name}`"),
+                            span: *span,
+                            label: "already declared in this function".into(),
+                            notes: vec![],
+                        });
+                    }
+                    ctx.vars.insert(name.to_string(), VarInfo {
+                        ty, initialized: true, mutable, branded: false, obligation: false,
+                    });
+                }
+                ctx.unsafe_blocks += 1;
+            }
             Stmt::Expose {
                 kw_span,
                 array,
@@ -1823,7 +1869,9 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
 
 fn stmt_span(stmt: &Stmt) -> Span {
     match stmt {
-        Stmt::Unsafe { kw_span, .. } | Stmt::Expose { kw_span, .. } => *kw_span,
+        Stmt::Unsafe { kw_span, .. }
+        | Stmt::StaticAlloc { kw_span, .. }
+        | Stmt::Expose { kw_span, .. } => *kw_span,
         Stmt::Decl { name_span, .. } => *name_span,
         Stmt::Assert(c) => c.line_span,
         Stmt::Assign { name_span, .. } => *name_span,

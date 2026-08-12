@@ -1,0 +1,4 @@
+// expect-error: static_root.literal_size
+fn nonliteral(u64 n) {
+    unsafe static_alloc(n) as (p, resource mem);
+}

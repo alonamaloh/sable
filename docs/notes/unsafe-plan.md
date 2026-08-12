@@ -1744,9 +1744,18 @@ interpreter, and SVM take the `u64` cell geometry from their canonical type
 mapping rather than duplicating the literal eight. This adds no byte
 representation and no forgeable runtime layout value.
 
+**Slice U7b3 is complete (2026-08-12, ADR 0033):**
+`unsafe static_alloc(N) as (p, resource mem);` is the first root source. `N`
+is a positive profile-bounded literal; the result is fresh provenance plus one
+full uninitialized `RawSpan`, and there is deliberately no deallocation token.
+The allocation remains live for the program execution, so the bindings are not
+loan-branded and the resource may move into the bump arena. VCgen uses
+`SpanView.uninit`; the interpreter keeps the allocation live; SVM lowering is
+its existing fresh raw allocation instruction. Repeated execution creates
+another leaking program-lifetime root rather than reacquiring a singleton.
+
 Remaining U7b work:
 
-- root/static allocation sources;
 - a program-lifetime static bump arena.
 
 Do not introduce `SystemDealloc` on this rung. The static root is deliberately

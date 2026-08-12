@@ -1277,6 +1277,36 @@ impl<'a> Generator<'a> {
                 inner.extend_from_slice(rest);
                 self.exec(&inner, tail);
             }
+            Stmt::StaticAlloc { size, ptr, res, .. } => {
+                let Val::Int(n) = self.eval(size) else {
+                    unreachable!("checked: u64 size")
+                };
+                let alloc = self.hinted_sym("_static_alloc", Some(ptr.clone()));
+                self.binders.push((alloc.clone(), "Int".into()));
+                let view = self.hinted_sym("_view", Some(res.clone()));
+                self.binders
+                    .push((view.clone(), ResKind::RawSpan.view_ty().into()));
+                self.push_hyp_unique(
+                    format!("h_{res}_static"),
+                    format!("{view} = Sable.SpanView.uninit {alloc} {n}"),
+                );
+                self.push_hyp_unique(
+                    format!("h_{res}_wf"),
+                    format!("0 ≤ {view}.len ∧ {view}.len ≤ {view}.bytes.len"),
+                );
+                self.env.insert(res.clone(), Val::View(view.clone()));
+                self.var_tys
+                    .insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                let p = self.hinted_sym("_ptr", Some(ptr.clone()));
+                self.binders.push((p.clone(), "Sable.RawPtr".into()));
+                self.push_hyp_unique(
+                    format!("h_{ptr}_static"),
+                    format!("{p} = Sable.SpanView.start ({view})"),
+                );
+                self.env.insert(ptr.clone(), Val::Ptr(p));
+                self.var_tys.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                self.exec(rest, tail);
+            }
             // Lexical exposure. Entry hands the body a span whose bytes
             // are the array's elements, all initialized, at offset 0 of a
             // fresh loan allocation. Exit takes it back: the array becomes
