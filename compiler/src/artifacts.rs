@@ -144,16 +144,16 @@ pub fn from_portable(mods: &ModuleSet, pd: &PortableDiag) -> Diagnostic {
 
 /// A module through the front end, vcgen, and per-module emission, with
 /// every imported module's artifact ensured (verified) first.
-pub struct Prepared {
-    pub program: crate::ast::Program,
-    pub vc: VcResult,
-    pub emitted: Emitted,
+pub(crate) struct Prepared {
+    pub(crate) program: crate::ast::Program,
+    pub(crate) vc: VcResult,
+    pub(crate) emitted: Emitted,
     /// Content-addressed artifact name for this module.
-    pub lean_name: String,
+    pub(crate) lean_name: String,
     /// Exact proof environment used to derive `lean_name` and emit this
     /// artifact. Verification and stamping must compare against this value;
     /// recomputing a request fingerprint would hide an intervening edit.
-    pub proof_fingerprint: String,
+    pub(crate) proof_fingerprint: String,
     /// Exact captured bytes behind `proof_fingerprint`. Profile generation,
     /// dependency verification, batch Lean, and the daemon all use this same
     /// immutable handle rather than re-reading the mutable checkout.
@@ -171,7 +171,7 @@ pub struct Prepared {
     pub unsafe_regions: usize,
 }
 
-pub fn prepare(
+pub(crate) fn prepare(
     path: &Path,
     opts: &Options,
     repo_root: &Path,
@@ -1056,7 +1056,7 @@ fn build_artifact(
 /// Different source/profile/prelude versions therefore cannot overwrite the
 /// bytes a concurrent daemon or batch check is reading. Identical versions
 /// converge on the same exact file and may safely share a warm LSP document.
-pub fn write_root_generated(
+pub(crate) fn write_root_generated(
     repo_root: &Path,
     opts: &Options,
     prep: &Prepared,
@@ -1096,7 +1096,11 @@ fn root_generated_path(repo_root: &Path, lean_name: &str) -> PathBuf {
 /// Record a root check's successful verification as an artifact stamp,
 /// so importers reuse it instead of re-proving (the olean is compiled
 /// on first import if this check ran through the daemon).
-pub fn stamp_verified(repo_root: &Path, opts: &Options, prep: &Prepared) -> Result<(), String> {
+pub(crate) fn stamp_verified(
+    repo_root: &Path,
+    opts: &Options,
+    prep: &Prepared,
+) -> Result<(), String> {
     require_prepared_inputs(
         &prep.root_path,
         opts,

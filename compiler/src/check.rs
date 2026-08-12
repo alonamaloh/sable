@@ -332,6 +332,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
 }
 
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
+    validate_declared_aggregate_payloads(program)?;
     let mut unsafe_regions = 0usize;
     let traits_c: Vec<TraitDecl> = program.traits.clone();
     check_uart_trait_methods(&traits_c)?;
@@ -819,9 +820,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         call_graph.insert(f.name.clone(), ctx.calls);
     }
 
-    // Fn templates (ADR 0009): typecheck against the abstract model —
-    // TParam flows as an ordinary integer type; the TParam-specific
-    // gates (literals, conversions, division) fire on the way.
+    // Fn templates (ADR 0009): typecheck against the abstract integer
+    // model. `Ty::Param` stays distinct from `IntTy`; parameter-specific
+    // gates (literals, conversions, division) fire explicitly on the way.
     let mut templates = std::mem::take(&mut program.fn_templates);
     for f in &mut templates {
         check_uart_params(&f.params)?;
@@ -1108,7 +1109,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
     }
 
     // Class templates (ADR 0009): members typecheck against the
-    // abstract model; TParam flows as an ordinary integer type. Template
+    // abstract integer model; `Ty::Param` stays distinct from `IntTy`. Template
     // bodies may not reference other classes (their metas are not in
     // scope here) — diagnosed as unknown names.
     let mut ctemplates = std::mem::take(&mut program.class_templates);
@@ -1408,6 +1409,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 init,
                 mutable,
             } => {
+                validate_aggregate_ty(*ty, *name_span)?;
                 if !ctx.declared.insert(name.clone()) {
                     return Err(Diagnostic {
                         name: "type.duplicate_name".into(),
@@ -2072,7 +2074,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
-                if elem != IntTy::U8 {
+                let elem_ty = aggregate_payload_ty(elem, *array_span)?;
+                if elem_ty != Ty::Int(IntTy::U8) {
                     return Err(Diagnostic {
                         name: "expose.element_type".into(),
                         title: format!("cannot expose `[{}]` as bytes yet", elem.name()),
@@ -2291,7 +2294,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 };
                 ctx.require_field_init(field, *field_span)?;
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(Ty::Int(elem)))?;
+                check_expr(ctx, value, Some(aggregate_payload_ty(elem, *field_span)?))?;
             }
             Stmt::Store {
                 array,
@@ -2351,7 +2354,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     return Err(moved_out(ctx, &place, *array_span, "store"));
                 }
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(Ty::Int(elem)))?;
+                check_expr(ctx, value, Some(aggregate_payload_ty(elem, *array_span)?))?;
             }
         }
     }
@@ -2402,6 +2405,109 @@ fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
     }
 }
 
+/// The checked value type represented by an aggregate payload.
+///
+/// G1.0 gives bool and POD-record payloads an honest AST representation
+/// before their runtime and proof models exist. Any operation that reads,
+/// writes, or constructs such a payload therefore fails closed at this one
+/// boundary. A retained template parameter remains an abstract integer value
+/// for ADR 0009 without being encoded as `IntTy`.
+fn aggregate_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
+    match payload {
+        ValueTy::Int(IntTy::TParam(_)) => Err(Diagnostic {
+            name: "type.aggregate_payload_noncanonical".into(),
+            title: "legacy integer type-parameter storage is not valid in an aggregate".into(),
+            span,
+            label: "aggregate parameters must use the explicit declaration-parameter form".into(),
+            notes: vec![],
+        }),
+        ValueTy::Int(integer) => Ok(Ty::Int(integer)),
+        ValueTy::Param(parameter) => Ok(Ty::Param(parameter)),
+        ValueTy::Bool | ValueTy::Record(_) => Err(Diagnostic {
+            name: "type.aggregate_payload_unsupported".into(),
+            title: format!(
+                "aggregate payload type `{}` is not supported yet",
+                payload.name()
+            ),
+            span,
+            label: "array and option operations currently require an integer payload".into(),
+            notes: vec![(
+                "note".into(),
+                "the AST records this type without granting runtime or proof semantics; \
+                 enable those layers together before accepting the operation"
+                    .into(),
+            )],
+        }),
+    }
+}
+
+fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
+    match ty {
+        Ty::Array(payload, _) | Ty::Option(payload) => {
+            aggregate_payload_ty(payload, span).map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
+    fn function(function: &Fn) -> CResult<()> {
+        for parameter in &function.params {
+            validate_aggregate_ty(parameter.ty, parameter.span)?;
+        }
+        validate_aggregate_ty(function.ret, function.name_span)
+    }
+
+    for function_ in program.fns.iter().chain(&program.fn_templates) {
+        function(function_)?;
+    }
+    for class in program.classes.iter().chain(&program.class_templates) {
+        for field in &class.fields {
+            validate_aggregate_ty(field.ty, field.span)?;
+        }
+        for initializer in &class.inits {
+            function(initializer)?;
+        }
+        for method in &class.methods {
+            function(&method.f)?;
+        }
+    }
+    for record in &program.records {
+        for field in &record.fields {
+            validate_aggregate_ty(field.ty, field.span)?;
+        }
+    }
+    for trait_ in &program.traits {
+        for method in &trait_.methods {
+            function(method)?;
+        }
+    }
+    for implementation in &program.impls {
+        for function_ in &implementation.fns {
+            function(function_)?;
+        }
+    }
+    Ok(())
+}
+
+/// Normalize the one legacy expression-only parameter representation used by
+/// `widen<T>` / `narrow<T>` into the declaration-position type identity.
+fn legacy_integer_ty(integer: IntTy) -> Ty {
+    match integer {
+        IntTy::TParam(index) => Ty::Param(TypeParamId::from_legacy(index)),
+        concrete => Ty::Int(concrete),
+    }
+}
+
+fn is_integer_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+        || matches!(ty, Ty::Param(_))
+}
+
+fn is_abstract_integer_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Param(_))
+}
+
 fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
     let ty = infer_expr(ctx, e, expected)?;
     if let Some(exp) = expected {
@@ -2430,7 +2536,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     let ty = match &mut e.kind {
         ExprKind::IntLit(n) => {
             let t = match expected {
-                Some(Ty::Int(t)) => t,
+                Some(t) if is_integer_ty(t) => t,
                 Some(other) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -2453,16 +2559,25 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     });
                 }
             };
-            if !matches!(t, IntTy::TParam(_)) && (*n < t.min() || *n > t.max()) {
-                return Err(Diagnostic {
-                    name: "type.literal_out_of_range".into(),
-                    title: format!("literal `{n}` does not fit in `{}`", t.name()),
-                    span,
-                    label: format!("`{}` holds {}..={}", t.name(), t.min(), t.max()),
-                    notes: vec![],
-                });
+            if let Ty::Int(integer) = t {
+                if !matches!(integer, IntTy::TParam(_))
+                    && (*n < integer.min() || *n > integer.max())
+                {
+                    return Err(Diagnostic {
+                        name: "type.literal_out_of_range".into(),
+                        title: format!("literal `{n}` does not fit in `{}`", integer.name()),
+                        span,
+                        label: format!(
+                            "`{}` holds {}..={}",
+                            integer.name(),
+                            integer.min(),
+                            integer.max()
+                        ),
+                        notes: vec![],
+                    });
+                }
             }
-            Ty::Int(t)
+            t
         }
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
@@ -2574,7 +2689,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         } => {
             let elem = array_elem_ty(ctx, array, *array_span)?;
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            Ty::Int(elem)
+            aggregate_payload_ty(elem, *array_span)?
         }
         ExprKind::Len { array } => {
             // `a.len` on a class receiver is the FIELD named `len`
@@ -2595,8 +2710,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             Ty::Int(IntTy::U64)
         }
         ExprKind::Widen { target, arg } => {
+            let target_ty = legacy_integer_ty(*target);
             let src = match check_expr(ctx, arg, None) {
-                Ok(Ty::Int(t)) => t,
+                Ok(ty) if is_integer_ty(ty) => ty,
                 Ok(other) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -2610,14 +2726,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     // Literals need context; widening a literal is pointless
                     // but legal — retry with the target type.
                     if d.name == "type.ambiguous_literal" {
-                        check_expr(ctx, arg, Some(Ty::Int(*target)))?;
-                        *target
+                        check_expr(ctx, arg, Some(target_ty))?;
+                        target_ty
                     } else {
                         return Err(d);
                     }
                 }
             };
-            if matches!(src, IntTy::TParam(_)) || matches!(target, IntTy::TParam(_)) {
+            if is_abstract_integer_ty(src) || is_abstract_integer_ty(target_ty) {
                 return Err(Diagnostic {
                     name: "concepts.template_conv".into(),
                     title: "`widen`/`narrow` on a type parameter".into(),
@@ -2628,6 +2744,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            let (Ty::Int(src), Ty::Int(target)) = (src, target_ty) else {
+                unreachable!("abstract conversion types were rejected above")
+            };
             if src.min() < target.min() || src.max() > target.max() {
                 return Err(Diagnostic {
                     name: "type.narrowing_widen".into(),
@@ -2648,13 +2767,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     )],
                 });
             }
-            Ty::Int(*target)
+            Ty::Int(target)
         }
         ExprKind::Narrow { target, arg } => {
             // Any integer type to any integer type; the range fact is a
             // proof obligation (`narrow.range`), not a typing rule.
+            let target_ty = legacy_integer_ty(*target);
             match check_expr(ctx, arg, None) {
-                Ok(Ty::Int(_)) => {}
+                Ok(ty) if is_integer_ty(ty) => {}
                 Ok(other) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -2666,13 +2786,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 Err(d) => {
                     if d.name == "type.ambiguous_literal" {
-                        check_expr(ctx, arg, Some(Ty::Int(*target)))?;
+                        check_expr(ctx, arg, Some(target_ty))?;
                     } else {
                         return Err(d);
                     }
                 }
             }
-            Ty::Int(*target)
+            target_ty
         }
         ExprKind::IsSome { operand } => {
             match check_expr(ctx, operand, None)? {
@@ -2690,7 +2810,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             Ty::Bool
         }
         ExprKind::OptValue { operand } => match check_expr(ctx, operand, None)? {
-            Ty::Option(it) => Ty::Int(it),
+            Ty::Option(payload) => aggregate_payload_ty(payload, span)?,
             Ty::OptionRaw(ri) => Ty::RawRecord(ri),
             other => {
                 return Err(Diagnostic {
@@ -2734,6 +2854,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             };
             match fty {
                 Ty::Int(it) => Ty::Int(*it),
+                Ty::Param(parameter) => Ty::Param(*parameter),
                 Ty::Array(..) => {
                     return Err(Diagnostic {
                         name: "type.array_field_value".into(),
@@ -2836,7 +2957,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
             };
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            Ty::Int(elem)
+            aggregate_payload_ty(elem, span)?
         }
         ExprKind::TraitCall {
             param,
@@ -2867,11 +2988,26 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             };
-            // In the trait, `Self` is TParam(0); in this template, the
-            // bounded parameter is TParam(pidx).
+            // In the trait, `Self` is parameter 0; in this template, the
+            // bounded parameter is `pidx`. Remap both direct and aggregate
+            // payload positions without turning either into an `IntTy`.
             let remap = |t: Ty| -> Ty {
+                let remap_payload = |payload: ValueTy| match payload {
+                    ValueTy::Param(parameter) if parameter.index() == 0 => {
+                        ValueTy::Param(TypeParamId::from_legacy(pidx))
+                    }
+                    ValueTy::Int(IntTy::TParam(0)) => {
+                        ValueTy::Param(TypeParamId::from_legacy(pidx))
+                    }
+                    other => other,
+                };
                 match t {
-                    Ty::Int(IntTy::TParam(0)) => Ty::Int(IntTy::TParam(pidx)),
+                    Ty::Param(parameter) if parameter.index() == 0 => {
+                        Ty::Param(TypeParamId::from_legacy(pidx))
+                    }
+                    Ty::Int(IntTy::TParam(0)) => Ty::Param(TypeParamId::from_legacy(pidx)),
+                    Ty::Array(payload, mutability) => Ty::Array(remap_payload(payload), mutability),
+                    Ty::Option(payload) => Ty::Option(remap_payload(payload)),
                     other => other,
                 }
             };
@@ -3398,7 +3534,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::AllocArray { elem, len, init } => {
             let elem = *elem;
             check_expr(ctx, len, Some(Ty::Int(IntTy::U64)))?;
-            check_expr(ctx, init, Some(Ty::Int(elem)))?;
+            check_expr(ctx, init, Some(aggregate_payload_ty(elem, span)?))?;
             Ty::Array(elem, Mutability::Owned)
         }
         ExprKind::SelfField { field } => {
@@ -3448,7 +3584,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ctx.require_field_init(field, span)?;
             }
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            Ty::Int(elem)
+            aggregate_payload_ty(elem, span)?
         }
         ExprKind::CtorCall {
             class,
@@ -3667,8 +3803,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::ArrayLit(elems) => match expected {
             Some(Ty::Array(t, Mutability::Owned)) => {
+                let element_ty = aggregate_payload_ty(t, span)?;
                 for el in elems {
-                    check_expr(ctx, el, Some(Ty::Int(t)))?;
+                    check_expr(ctx, el, Some(element_ty))?;
                 }
                 Ty::Array(t, Mutability::Owned)
             }
@@ -3922,7 +4059,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::SomeE(inner) => match expected {
             Some(Ty::Option(t)) => {
-                check_expr(ctx, inner, Some(Ty::Int(t)))?;
+                check_expr(ctx, inner, Some(aggregate_payload_ty(t, span)?))?;
                 Ty::Option(t)
             }
             Some(Ty::OptionRaw(ri)) => {
@@ -3957,7 +4094,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 let t = check_expr(ctx, operand, expected)?;
                 match t {
                     Ty::Int(it) if it.signed() => t,
-                    Ty::Int(_) => {
+                    Ty::Int(_) | Ty::Param(_) => {
                         return Err(Diagnostic {
                             name: "type.neg_unsigned".into(),
                             title: "unary minus on an unsigned value".into(),
@@ -4096,11 +4233,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             if op.is_arith() {
                 let expected_int = match expected {
-                    Some(Ty::Int(_)) => expected,
+                    Some(ty) if is_integer_ty(ty) => expected,
                     _ => None,
                 };
                 let t = infer_int_pair(ctx, lhs, rhs, expected_int, op_span)?;
-                if matches!(op, BinOp::Div | BinOp::Rem) && matches!(t, IntTy::TParam(_)) {
+                if matches!(op, BinOp::Div | BinOp::Rem) && is_abstract_integer_ty(t) {
                     return Err(Diagnostic {
                         name: "concepts.template_div".into(),
                         title: "division on a type parameter".into(),
@@ -4112,7 +4249,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     });
                 }
-                Ty::Int(t)
+                t
             } else if op.is_comparison() {
                 let _t = infer_int_pair(ctx, lhs, rhs, None, op_span)?;
                 Ty::Bool
@@ -5125,13 +5262,16 @@ fn reject_view_read(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
     })
 }
 
-fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<IntTy> {
+fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<ValueTy> {
     reject_view_read(ctx, array, span)?;
     match ctx.vars.get(array) {
         Some(VarInfo {
             ty: Ty::Array(t, _),
             ..
-        }) => Ok(*t),
+        }) => {
+            aggregate_payload_ty(*t, span)?;
+            Ok(*t)
+        }
         Some(v) => Err(Diagnostic {
             name: "type.not_an_array".into(),
             title: format!("`{array}` is not an array"),
@@ -5157,24 +5297,24 @@ fn infer_int_pair(
     rhs: &mut Expr,
     expected: Option<Ty>,
     op_span: Span,
-) -> CResult<IntTy> {
+) -> CResult<Ty> {
     let lhs_literal = is_literal_only(lhs);
     let rhs_literal = is_literal_only(rhs);
     let t = if lhs_literal && !rhs_literal {
         let t = int_of(ctx, rhs, expected, op_span)?;
-        check_expr(ctx, lhs, Some(Ty::Int(t)))?;
+        check_expr(ctx, lhs, Some(t))?;
         t
     } else {
         let t = int_of(ctx, lhs, expected, op_span)?;
-        check_expr(ctx, rhs, Some(Ty::Int(t)))?;
+        check_expr(ctx, rhs, Some(t))?;
         t
     };
     Ok(t)
 }
 
-fn int_of(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>, op_span: Span) -> CResult<IntTy> {
+fn int_of(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>, op_span: Span) -> CResult<Ty> {
     match check_expr(ctx, e, expected)? {
-        Ty::Int(t) => Ok(t),
+        ty if is_integer_ty(ty) => Ok(ty),
         other => Err(Diagnostic {
             name: "type.mismatch".into(),
             title: format!("arithmetic/comparison on `{}`", other.name()),

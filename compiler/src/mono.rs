@@ -1,7 +1,8 @@
 //! Monomorphization (ADR 0006): between parse and typecheck, every
 //! generic declaration is expanded into one ordinary declaration per
-//! distinct instantiation reachable from the non-generic roots. No later
-//! stage — checker, VCgen, interpreter, LSP — ever sees a type variable.
+//! distinct instantiation reachable from the non-generic roots. Ordinary
+//! declarations are fully concrete afterward; retained ADR 0009 templates
+//! deliberately keep explicit type parameters for checker/VCgen modeling.
 //!
 //! Instances are mangled `Vec_i32`; spans point into the generic source,
 //! so diagnostics land on the template with the instance visible in the
@@ -19,6 +20,8 @@ const DEPTH_CAP: usize = 32;
 
 pub fn monomorphize(program: &mut Program) -> MResult<()> {
     preflight_source_names(program)?;
+    reject_input_proof_reuse(program)?;
+    validate_declaration_type_params(program)?;
     validate_v1_type_args(program)?;
     let mut fn_templates: HashMap<String, Fn> = HashMap::new();
     let mut class_templates: HashMap<String, ClassDecl> = HashMap::new();
@@ -331,7 +334,7 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
     ctx.new_classes.sort_by(|a, b| a.name.cmp(&b.name));
     program.fns.extend(ctx.new_fns);
     program.classes.extend(ctx.new_classes);
-    Ok(())
+    validate_concrete_output(program)
 }
 
 /// Monomorphization removes generic declarations before the checker sees the
@@ -375,6 +378,331 @@ fn preflight_source_names(program: &Program) -> MResult<()> {
                 label: "class/function names share one namespace".into(),
                 notes: vec![],
             });
+        }
+    }
+    Ok(())
+}
+
+/// `ProofReuse` is an authorization produced by this pass, not source or
+/// caller metadata. Reject a pre-populated marker before any declaration is
+/// moved or rewritten so synthetic `Program` callers cannot suppress VCs.
+fn reject_input_proof_reuse(program: &Program) -> MResult<()> {
+    fn function(function: &Fn) -> MResult<()> {
+        if !function.proof_reuse.is_none() {
+            return Err(Diagnostic {
+                name: "mono.forged_proof_reuse".into(),
+                title: "proof reuse was supplied before monomorphization".into(),
+                span: function.name_span,
+                label: "only monomorphization may authorize ADR 0009 proof reuse".into(),
+                notes: vec![],
+            });
+        }
+        Ok(())
+    }
+
+    fn class(class: &ClassDecl) -> MResult<()> {
+        if !class.proof_reuse.is_none() {
+            return Err(Diagnostic {
+                name: "mono.forged_proof_reuse".into(),
+                title: "proof reuse was supplied before monomorphization".into(),
+                span: class.name_span,
+                label: "only monomorphization may authorize ADR 0009 proof reuse".into(),
+                notes: vec![],
+            });
+        }
+        for initializer in &class.inits {
+            function(initializer)?;
+        }
+        for method in &class.methods {
+            function(&method.f)?;
+        }
+        Ok(())
+    }
+
+    for function_ in program.fns.iter().chain(&program.fn_templates) {
+        function(function_)?;
+    }
+    for class_ in program.classes.iter().chain(&program.class_templates) {
+        class(class_)?;
+    }
+    for trait_ in &program.traits {
+        for method in &trait_.methods {
+            function(method)?;
+        }
+    }
+    for impl_ in &program.impls {
+        for function_ in &impl_.fns {
+            function(function_)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate declaration-position parameter identities before substitution.
+/// The substitution helpers deliberately use direct indexing once this
+/// invariant is established, so malformed synthetic ASTs must fail here
+/// rather than panic partway through monomorphization.
+fn validate_declaration_type_params(program: &Program) -> MResult<()> {
+    fn validate_parameter(
+        parameter: TypeParamId,
+        arity: usize,
+        span: Span,
+        representation: &str,
+    ) -> MResult<()> {
+        if parameter.index() >= arity {
+            return Err(Diagnostic {
+                name: "mono.type_param_out_of_bounds".into(),
+                title: "type parameter is outside its declaration".into(),
+                span,
+                label: format!(
+                    "{representation} refers to type parameter #{}, but this declaration has {arity}",
+                    parameter.index()
+                ),
+                notes: vec![],
+            });
+        }
+        Ok(())
+    }
+
+    fn legacy_integer(
+        integer: IntTy,
+        arity: usize,
+        span: Span,
+        representation: &str,
+        canonical_here: bool,
+    ) -> MResult<()> {
+        let IntTy::TParam(index) = integer else {
+            return Ok(());
+        };
+        let parameter = TypeParamId::from_legacy(index);
+        validate_parameter(parameter, arity, span, representation)?;
+        if !canonical_here {
+            return Err(Diagnostic {
+                name: "mono.noncanonical_type_param".into(),
+                title: "legacy integer parameter representation is not canonical here".into(),
+                span,
+                label: format!(
+                    "{representation} must use the explicit declaration type-parameter form"
+                ),
+                notes: vec![],
+            });
+        }
+        Ok(())
+    }
+
+    fn value(ty: ValueTy, arity: usize, span: Span, representation: &str) -> MResult<()> {
+        match ty {
+            ValueTy::Param(parameter_) => {
+                validate_parameter(parameter_, arity, span, representation)
+            }
+            ValueTy::Int(integer) => legacy_integer(integer, arity, span, representation, false),
+            ValueTy::Bool | ValueTy::Record(_) => Ok(()),
+        }
+    }
+
+    fn checked_ty(ty: Ty, arity: usize, span: Span) -> MResult<()> {
+        match ty {
+            Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, "type"),
+            Ty::Int(integer) => legacy_integer(integer, arity, span, "value type", false),
+            Ty::Array(element, _) => value(element, arity, span, "array element type"),
+            Ty::Option(element) => value(element, arity, span, "option payload type"),
+            // Raw pointer element types and conversion targets still use the
+            // legacy IntTy-shaped syntax in G1.0, so a bounded TParam is the
+            // canonical representation in those positions.
+            Ty::Raw(integer) => {
+                legacy_integer(integer, arity, span, "raw-pointer element type", true)
+            }
+            Ty::Bool
+            | Ty::Class(_)
+            | Ty::ClassRef(..)
+            | Ty::Record(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::RawRecord(_)
+            | Ty::ResRef(..)
+            | Ty::Unit => Ok(()),
+        }
+    }
+
+    fn expression(expr: &Expr, arity: usize) -> MResult<()> {
+        if let Some(ty) = expr.ty {
+            checked_ty(ty, arity, expr.span)?;
+        }
+        match &expr.kind {
+            ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
+                legacy_integer(*target, arity, expr.span, "integer conversion target", true)?;
+                expression(arg, arity)
+            }
+            ExprKind::AllocArray { elem, len, init } => {
+                value(*elem, arity, expr.span, "array allocation element type")?;
+                expression(len, arity)?;
+                expression(init, arity)
+            }
+            ExprKind::Unary { operand, .. }
+            | ExprKind::IsSome { operand }
+            | ExprKind::OptValue { operand }
+            | ExprKind::SomeE(operand) => expression(operand, arity),
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expression(lhs, arity)?;
+                expression(rhs, arity)
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::CtorCall { args, .. }
+            | ExprKind::MethodCall { args, .. }
+            | ExprKind::TraitCall { args, .. }
+            | ExprKind::RawOp { args, .. }
+            | ExprKind::ResOp { args, .. }
+            | ExprKind::DeviceOp { args, .. }
+            | ExprKind::ArrayLit(args)
+            | ExprKind::RecordLit { args, .. } => {
+                for argument in args {
+                    expression(argument, arity)?;
+                }
+                Ok(())
+            }
+            ExprKind::Index { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. } => expression(index, arity),
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Var(_)
+            | ExprKind::Len { .. }
+            | ExprKind::NoneE
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::Borrow { .. } => Ok(()),
+        }
+    }
+
+    fn statements(stmts: &[Stmt], arity: usize) -> MResult<()> {
+        for statement in stmts {
+            match statement {
+                Stmt::Decl {
+                    ty,
+                    name_span,
+                    init,
+                    ..
+                } => {
+                    checked_ty(*ty, arity, *name_span)?;
+                    if let Some(initializer) = init {
+                        expression(initializer, arity)?;
+                    }
+                }
+                Stmt::VarDecl {
+                    name_span,
+                    init,
+                    ty,
+                    ..
+                } => {
+                    if let Some(ty) = ty {
+                        checked_ty(*ty, arity, *name_span)?;
+                    }
+                    expression(init, arity)?;
+                }
+                Stmt::Assign { value, .. }
+                | Stmt::ExprStmt(value)
+                | Stmt::FieldAssign { value, .. }
+                | Stmt::StaticAlloc { size: value, .. }
+                | Stmt::SystemAlloc { size: value, .. }
+                | Stmt::Return {
+                    value: Some(value), ..
+                } => expression(value, arity)?,
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
+                    expression(ptr, arity)?;
+                    expression(res, arity)?;
+                    expression(release, arity)?;
+                }
+                Stmt::Store { index, value, .. } | Stmt::FieldStore { index, value, .. } => {
+                    expression(index, arity)?;
+                    expression(value, arity)?;
+                }
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    expression(cond, arity)?;
+                    statements(then_block, arity)?;
+                    if let Some(else_block) = else_block {
+                        statements(else_block, arity)?;
+                    }
+                }
+                Stmt::While { cond, body, .. } => {
+                    expression(cond, arity)?;
+                    statements(body, arity)?;
+                }
+                Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => statements(body, arity)?,
+                Stmt::Return { value: None, .. } | Stmt::Assert(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn function(function: &Fn, arity: usize) -> MResult<()> {
+        for parameter_ in &function.params {
+            checked_ty(parameter_.ty, arity, parameter_.span)?;
+        }
+        checked_ty(function.ret, arity, function.name_span)?;
+        statements(&function.body, arity)
+    }
+
+    fn class(class: &ClassDecl) -> MResult<()> {
+        let arity = class.type_params.len();
+        for field in &class.fields {
+            checked_ty(field.ty, arity, field.span)?;
+        }
+        for initializer in &class.inits {
+            function(initializer, arity)?;
+        }
+        for method in &class.methods {
+            function(&method.f, arity)?;
+        }
+        if let Some(deinitializer) = &class.deinit {
+            statements(deinitializer, arity)?;
+        }
+        Ok(())
+    }
+
+    for function_ in &program.fns {
+        function(function_, function_.type_params.len())?;
+    }
+    for function_ in &program.fn_templates {
+        function(function_, function_.type_params.len())?;
+    }
+    for class_ in &program.classes {
+        class(class_)?;
+    }
+    for record in &program.records {
+        for field in &record.fields {
+            checked_ty(field.ty, 0, field.span)?;
+        }
+    }
+    for constant in &program.consts {
+        legacy_integer(constant.ty, 0, constant.span, "constant type", true)?;
+    }
+    for class_ in &program.class_templates {
+        class(class_)?;
+    }
+    for trait_ in &program.traits {
+        for method in &trait_.methods {
+            function(method, 1)?;
+        }
+    }
+    for implementation in &program.impls {
+        legacy_integer(
+            implementation.for_ty,
+            0,
+            implementation.for_span,
+            "impl target type",
+            true,
+        )?;
+        for function_ in &implementation.fns {
+            function(function_, 0)?;
         }
     }
     Ok(())
@@ -544,6 +872,244 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
         for function_ in &impl_.fns {
             function(function_, 0)?;
         }
+    }
+    Ok(())
+}
+
+/// Enforce mono's public postcondition for ordinary declarations. Retained
+/// templates and traits intentionally keep parameters for ADR 0009 template
+/// verification; everything that proceeds through the ordinary checker,
+/// VCgen, interpreter, or backend must be concrete.
+fn validate_concrete_output(program: &Program) -> MResult<()> {
+    fn escaped(span: Span, parameter: TypeParamId, representation: &str) -> Diagnostic {
+        Diagnostic {
+            name: "mono.unsubstituted_type_param".into(),
+            title: "a type parameter escaped monomorphization".into(),
+            span,
+            label: format!(
+                "type parameter #{} remains in an ordinary {representation}",
+                parameter.index()
+            ),
+            notes: vec![(
+                "note".into(),
+                "only retained generic templates may contain type parameters".into(),
+            )],
+        }
+    }
+
+    fn integer(ty: IntTy, span: Span, representation: &str) -> MResult<()> {
+        if let IntTy::TParam(index) = ty {
+            return Err(escaped(
+                span,
+                TypeParamId::from_legacy(index),
+                representation,
+            ));
+        }
+        Ok(())
+    }
+
+    fn value(ty: ValueTy, span: Span, representation: &str) -> MResult<()> {
+        match ty {
+            ValueTy::Param(parameter) => Err(escaped(span, parameter, representation)),
+            ValueTy::Int(integer_ty) => integer(integer_ty, span, representation),
+            ValueTy::Bool | ValueTy::Record(_) => Ok(()),
+        }
+    }
+
+    fn checked_ty(ty: Ty, span: Span) -> MResult<()> {
+        match ty {
+            Ty::Param(parameter) => Err(escaped(span, parameter, "type")),
+            Ty::Int(integer_ty) => integer(integer_ty, span, "integer type"),
+            Ty::Array(element, _) => value(element, span, "array element type"),
+            Ty::Option(element) => value(element, span, "option payload type"),
+            Ty::Raw(integer_ty) => integer(integer_ty, span, "raw-pointer element type"),
+            Ty::Bool
+            | Ty::Class(_)
+            | Ty::ClassRef(..)
+            | Ty::Record(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::RawRecord(_)
+            | Ty::ResRef(..)
+            | Ty::Unit => Ok(()),
+        }
+    }
+
+    fn expression(expr: &Expr) -> MResult<()> {
+        if let Some(ty) = expr.ty {
+            checked_ty(ty, expr.span)?;
+        }
+        match &expr.kind {
+            ExprKind::Unary { operand, .. }
+            | ExprKind::IsSome { operand }
+            | ExprKind::OptValue { operand }
+            | ExprKind::SomeE(operand) => expression(operand),
+            ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
+                integer(*target, expr.span, "integer conversion target")?;
+                expression(arg)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                expression(lhs)?;
+                expression(rhs)
+            }
+            ExprKind::Call {
+                type_args, args, ..
+            }
+            | ExprKind::CtorCall {
+                type_args, args, ..
+            } => {
+                if let Some(argument) = type_args.first() {
+                    return Err(Diagnostic {
+                        name: "mono.unsubstituted_type_arg".into(),
+                        title: "a generic type argument escaped monomorphization".into(),
+                        span: argument.span,
+                        label: "ordinary calls and constructors must name concrete emitted declarations"
+                            .into(),
+                        notes: vec![],
+                    });
+                }
+                for argument in args {
+                    expression(argument)?;
+                }
+                Ok(())
+            }
+            ExprKind::MethodCall { args, .. }
+            | ExprKind::TraitCall { args, .. }
+            | ExprKind::RawOp { args, .. }
+            | ExprKind::ResOp { args, .. }
+            | ExprKind::DeviceOp { args, .. }
+            | ExprKind::ArrayLit(args)
+            | ExprKind::RecordLit { args, .. } => {
+                for argument in args {
+                    expression(argument)?;
+                }
+                Ok(())
+            }
+            ExprKind::Index { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. } => expression(index),
+            ExprKind::AllocArray { elem, len, init } => {
+                value(*elem, expr.span, "array allocation element type")?;
+                expression(len)?;
+                expression(init)
+            }
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Var(_)
+            | ExprKind::Len { .. }
+            | ExprKind::NoneE
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::Borrow { .. } => Ok(()),
+        }
+    }
+
+    fn statements(stmts: &[Stmt]) -> MResult<()> {
+        for statement in stmts {
+            match statement {
+                Stmt::Decl {
+                    ty,
+                    name_span,
+                    init,
+                    ..
+                } => {
+                    checked_ty(*ty, *name_span)?;
+                    if let Some(initializer) = init {
+                        expression(initializer)?;
+                    }
+                }
+                Stmt::VarDecl {
+                    name_span,
+                    init,
+                    ty,
+                    ..
+                } => {
+                    if let Some(ty) = ty {
+                        checked_ty(*ty, *name_span)?;
+                    }
+                    expression(init)?;
+                }
+                Stmt::Assign { value, .. }
+                | Stmt::ExprStmt(value)
+                | Stmt::FieldAssign { value, .. }
+                | Stmt::StaticAlloc { size: value, .. }
+                | Stmt::SystemAlloc { size: value, .. }
+                | Stmt::Return {
+                    value: Some(value), ..
+                } => expression(value)?,
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
+                    expression(ptr)?;
+                    expression(res)?;
+                    expression(release)?;
+                }
+                Stmt::Store { index, value, .. } | Stmt::FieldStore { index, value, .. } => {
+                    expression(index)?;
+                    expression(value)?;
+                }
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    expression(cond)?;
+                    statements(then_block)?;
+                    if let Some(else_block) = else_block {
+                        statements(else_block)?;
+                    }
+                }
+                Stmt::While { cond, body, .. } => {
+                    expression(cond)?;
+                    statements(body)?;
+                }
+                Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => statements(body)?,
+                Stmt::Return { value: None, .. } | Stmt::Assert(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn function(function: &Fn) -> MResult<()> {
+        for parameter in &function.params {
+            checked_ty(parameter.ty, parameter.span)?;
+        }
+        checked_ty(function.ret, function.name_span)?;
+        statements(&function.body)
+    }
+
+    fn class(class: &ClassDecl) -> MResult<()> {
+        for field in &class.fields {
+            checked_ty(field.ty, field.span)?;
+        }
+        for initializer in &class.inits {
+            function(initializer)?;
+        }
+        for method in &class.methods {
+            function(&method.f)?;
+        }
+        if let Some(deinitializer) = &class.deinit {
+            statements(deinitializer)?;
+        }
+        Ok(())
+    }
+
+    for function_ in &program.fns {
+        function(function_)?;
+    }
+    for class_ in &program.classes {
+        class(class_)?;
+    }
+    for record in &program.records {
+        for field in &record.fields {
+            checked_ty(field.ty, field.span)?;
+        }
+    }
+    for constant in &program.consts {
+        integer(constant.ty, constant.span, "constant type")?;
     }
     Ok(())
 }
@@ -1125,6 +1691,7 @@ impl Mono {
     }
 
     fn instantiate(&mut self, req: Request) -> MResult<()> {
+        let proof_reuse = adr0009_int_model_reuse(&req.key.template, &req.args, req.span)?;
         if req.key.kind == TemplateKind::Class {
             let template = self.class_templates[&req.key.template].clone();
             let mut c = template;
@@ -1132,7 +1699,7 @@ impl Mono {
             let bounds = std::mem::take(&mut c.type_bounds);
             let (text_map, bound_calls) = self.subst_maps(&param_names, &bounds, &req.args);
             c.name = req.emitted_name;
-            c.from_template = Some(req.key.template.clone());
+            c.proof_reuse = proof_reuse;
             for fld in &mut c.fields {
                 subst_ty(&mut fld.ty, &req.args);
             }
@@ -1159,7 +1726,7 @@ impl Mono {
             f.name = req.emitted_name;
             // Template-verified instances (ADR 0009): skip their own
             // obligations; owe the substituted `requires`.
-            f.from_template = Some(req.key.template.clone());
+            f.proof_reuse = proof_reuse;
             self.subst_fn(&mut f, &req.args, &text_map, &bound_calls, req.depth)?;
             self.new_fns.push(f);
         }
@@ -1413,16 +1980,51 @@ impl Mono {
     }
 }
 
+fn adr0009_int_model_reuse(template: &str, args: &[IntTy], span: Span) -> MResult<ProofReuse> {
+    if let Some(index) = args.iter().find_map(|argument| match argument {
+        IntTy::TParam(index) => Some(*index),
+        _ => None,
+    }) {
+        return Err(unsupported_type_arg(
+            span,
+            GenericTyError::UnsubstitutedTypeParameter(TypeParamId::from_legacy(index)),
+        ));
+    }
+    Ok(ProofReuse::adr0009_int_model(template.to_string()))
+}
+
 fn subst_intty(t: &mut IntTy, args: &[IntTy]) {
     if let IntTy::TParam(i) = t {
         *t = args[*i as usize];
     }
 }
 
+fn subst_value_ty(t: &mut ValueTy, args: &[IntTy]) {
+    match *t {
+        ValueTy::Param(parameter) => *t = ValueTy::Int(args[parameter.index()]),
+        ValueTy::Int(mut integer) => {
+            subst_intty(&mut integer, args);
+            *t = ValueTy::Int(integer);
+        }
+        ValueTy::Bool | ValueTy::Record(_) => {}
+    }
+}
+
 fn subst_ty(t: &mut Ty, args: &[IntTy]) {
-    match t {
-        Ty::Int(it) => subst_intty(it, args),
-        Ty::Array(it, _) | Ty::Option(it) => subst_intty(it, args),
+    match *t {
+        Ty::Param(parameter) => *t = Ty::Int(args[parameter.index()]),
+        Ty::Int(mut integer) => {
+            subst_intty(&mut integer, args);
+            *t = Ty::Int(integer);
+        }
+        Ty::Array(mut element, mutability) => {
+            subst_value_ty(&mut element, args);
+            *t = Ty::Array(element, mutability);
+        }
+        Ty::Option(mut element) => {
+            subst_value_ty(&mut element, args);
+            *t = Ty::Option(element);
+        }
         _ => {}
     }
 }
@@ -1443,9 +2045,16 @@ fn subst_stmts(
                     subst_expr(e, args, bound_calls)?;
                 }
             }
+            Stmt::VarDecl {
+                init: value, ty, ..
+            } => {
+                if let Some(ty) = ty {
+                    subst_ty(ty, args);
+                }
+                subst_expr(value, args, bound_calls)?;
+            }
             Stmt::Assign { value, .. }
             | Stmt::ExprStmt(value)
-            | Stmt::VarDecl { init: value, .. }
             | Stmt::FieldAssign { value, .. }
             | Stmt::StaticAlloc { size: value, .. }
             | Stmt::SystemAlloc { size: value, .. } => subst_expr(value, args, bound_calls)?,
@@ -1501,13 +2110,16 @@ fn subst_stmts(
 }
 
 fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult<()> {
+    if let Some(ty) = &mut e.ty {
+        subst_ty(ty, args);
+    }
     match &mut e.kind {
         ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
             subst_intty(target, args);
             subst_expr(arg, args, bound_calls)?;
         }
         ExprKind::AllocArray { elem, len, init } => {
-            subst_intty(elem, args);
+            subst_value_ty(elem, args);
             subst_expr(len, args, bound_calls)?;
             subst_expr(init, args, bound_calls)?;
         }
@@ -2222,6 +2834,52 @@ fn dormant<T>(T value) -> T {
     }
 
     #[test]
+    fn rejects_out_of_bounds_declaration_parameters_before_substitution() {
+        let mut program = parse_program(
+            r#"
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn root() -> u8 {
+    return identity<u8>(7);
+}
+"#,
+        );
+        let template = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "identity")
+            .expect("identity template");
+        let span = template.params[0].span;
+        template.params[0].ty = Ty::Param(TypeParamId::from_legacy(1));
+
+        let error = monomorphize(&mut program)
+            .expect_err("a malformed declaration parameter must not index past its arguments");
+        assert_eq!(error.name, "mono.type_param_out_of_bounds");
+        assert_eq!(error.span, span);
+        assert!(error.label.contains("parameter #1"));
+        assert!(error.label.contains("has 1"));
+    }
+
+    #[test]
+    fn rejects_forged_proof_reuse_before_any_vc_can_be_skipped() {
+        let mut program = parse_program(
+            r#"
+fn root() -> u8 {
+    return 7;
+}
+"#,
+        );
+        let span = program.fns[0].name_span;
+        program.fns[0].proof_reuse = ProofReuse::adr0009_int_model("forged".into());
+
+        let error = monomorphize(&mut program).expect_err("proof reuse is mono-authored");
+        assert_eq!(error.name, "mono.forged_proof_reuse");
+        assert_eq!(error.span, span);
+    }
+
+    #[test]
     fn prepares_trait_calls_nested_in_option_construction() {
         let program = parse_and_monomorphize(
             r#"
@@ -2283,5 +2941,106 @@ fn root() -> option<u64> {
             panic!("expected the instance to return an option");
         };
         assert!(matches!(inner.kind, ExprKind::Call { .. }));
+    }
+
+    #[test]
+    fn integer_instances_substitute_value_types_and_record_proof_domain() {
+        let program = parse_and_monomorphize(
+            r#"
+fn make<T>(T value) -> option<T> {
+    [T] items = alloc_array<T>(1, value);
+    return some(items[0]);
+}
+
+fn root() -> option<u16> {
+    return make<u16>(7);
+}
+"#,
+        );
+
+        let instance = program
+            .fns
+            .iter()
+            .find(|function| function.name == "make_u16")
+            .expect("concrete integer instance");
+        assert_eq!(instance.params[0].ty, Ty::Int(IntTy::U16));
+        assert_eq!(instance.ret, Ty::Option(ValueTy::Int(IntTy::U16)));
+        assert_eq!(instance.proof_reuse.template(), Some("make"));
+        assert!(matches!(
+            &instance.proof_reuse,
+            ProofReuse::Adr0009IntModel(_)
+        ));
+
+        let Stmt::Decl {
+            ty,
+            init: Some(initializer),
+            ..
+        } = &instance.body[0]
+        else {
+            panic!("expected instantiated array declaration");
+        };
+        assert_eq!(*ty, Ty::Array(ValueTy::Int(IntTy::U16), Mutability::Owned));
+        let ExprKind::AllocArray { elem, .. } = &initializer.kind else {
+            panic!("expected instantiated allocation");
+        };
+        assert_eq!(*elem, ValueTy::Int(IntTy::U16));
+
+        validate_concrete_output(&program).expect("ordinary output is fully concrete");
+        let retained = program
+            .fn_templates
+            .iter()
+            .find(|function| function.name == "make")
+            .expect("retained template");
+        assert_eq!(
+            retained.params[0].ty,
+            Ty::Param(TypeParamId::from_legacy(0))
+        );
+        assert_eq!(
+            retained.ret,
+            Ty::Option(ValueTy::Param(TypeParamId::from_legacy(0)))
+        );
+    }
+
+    #[test]
+    fn rejects_every_parameter_representation_in_ordinary_output() {
+        let base = parse_program(
+            r#"
+fn root(i32 value) -> i32 {
+    [i32] items = alloc_array<i32>(1, value);
+    return value;
+}
+"#,
+        );
+        let parameter = TypeParamId::from_legacy(0);
+
+        let mut direct = base.clone();
+        direct.fns[0].params[0].ty = Ty::Param(parameter);
+        let error = monomorphize(&mut direct).expect_err("direct parameter must not escape");
+        assert_eq!(error.name, "mono.type_param_out_of_bounds");
+
+        let mut noncanonical_array = base.clone();
+        let Stmt::Decl { ty, .. } = &mut noncanonical_array.fns[0].body[0] else {
+            panic!("expected array declaration");
+        };
+        *ty = Ty::Array(ValueTy::Int(IntTy::TParam(0)), Mutability::Owned);
+        let error = monomorphize(&mut noncanonical_array)
+            .expect_err("legacy parameter in a value type must not escape");
+        assert_eq!(error.name, "mono.type_param_out_of_bounds");
+
+        let mut allocation = base;
+        let Stmt::Decl {
+            init: Some(initializer),
+            ..
+        } = &mut allocation.fns[0].body[0]
+        else {
+            panic!("expected initialized array declaration");
+        };
+        let ExprKind::AllocArray { elem, .. } = &mut initializer.kind else {
+            panic!("expected allocation");
+        };
+        *elem = ValueTy::Param(parameter);
+        let error =
+            monomorphize(&mut allocation).expect_err("allocation parameter must not escape");
+        assert_eq!(error.name, "mono.type_param_out_of_bounds");
     }
 }

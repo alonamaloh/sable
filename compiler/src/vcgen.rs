@@ -282,11 +282,272 @@ fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
     (uses_uart || !used.is_empty(), used)
 }
 
+/// Recover the abstract/concrete integer model used by the retained ADR 0009
+/// proof domain. G1.0 represents array/option payloads honestly, but the proof
+/// generator still only has semantics for integer payloads. Keep that boundary
+/// fail-closed so a future bool or POD-record value cannot silently be emitted
+/// as Lean `Int`.
+fn adr0009_int_model(ty: ValueTy) -> IntTy {
+    ty.int_model().unwrap_or_else(|| match ty {
+        ValueTy::Int(IntTy::TParam(_)) => {
+            unreachable!("non-canonical legacy type parameter in a value type")
+        }
+        ValueTy::Bool => unreachable!("G1.0 VC generation does not support bool payloads"),
+        ValueTy::Record(_) => {
+            unreachable!("G1.0 VC generation does not support POD-record payloads")
+        }
+        ValueTy::Int(_) | ValueTy::Param(_) => {
+            unreachable!("ValueTy::int_model rejected an ADR 0009 integer model")
+        }
+    })
+}
+
+/// Integer-valued declaration/expression type in an ordinary instance or a
+/// retained template. The latter uses `Ty::Param` rather than pretending that
+/// an arbitrary type parameter is intrinsically an `IntTy`.
+fn adr0009_ty_int_model(ty: Ty) -> IntTy {
+    match ty {
+        Ty::Int(IntTy::TParam(_)) => {
+            unreachable!("non-canonical legacy scalar parameter in VC generation")
+        }
+        Ty::Int(integer) => integer,
+        Ty::Param(parameter) => adr0009_int_model(ValueTy::Param(parameter)),
+        _ => unreachable!("checked: expected an integer or ADR 0009 template parameter"),
+    }
+}
+
+fn lean_array_ty(element: ValueTy) -> String {
+    let _ = adr0009_int_model(element);
+    "Sable.Seq Int".into()
+}
+
+fn lean_option_ty(element: ValueTy) -> String {
+    let _ = adr0009_int_model(element);
+    "Option Int".into()
+}
+
+fn validate_vc_value_ty(ty: ValueTy, allow_param: bool, context: &str) -> Result<(), String> {
+    match ty {
+        ValueTy::Int(IntTy::TParam(_)) => Err(format!(
+            "internal G1.0 VC type error: non-canonical legacy parameter in {context}"
+        )),
+        ValueTy::Int(_) => Ok(()),
+        ValueTy::Param(_) if allow_param => Ok(()),
+        ValueTy::Param(_) => Err(format!(
+            "internal G1.0 VC type error: type parameter escaped monomorphization in {context}"
+        )),
+        ValueTy::Bool => Err(format!(
+            "internal G1.0 VC type error: bool payload reached {context} before bool proof semantics"
+        )),
+        ValueTy::Record(_) => Err(format!(
+            "internal G1.0 VC type error: POD-record payload reached {context} before record proof semantics"
+        )),
+    }
+}
+
+fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
+    match ty {
+        Ty::Param(_) if !allow_param => Err(format!(
+            "internal G1.0 VC type error: type parameter escaped monomorphization in {context}"
+        )),
+        Ty::Int(IntTy::TParam(_)) => Err(format!(
+            "internal G1.0 VC type error: non-canonical legacy scalar parameter in {context}"
+        )),
+        Ty::Array(element, _) | Ty::Option(element) => {
+            validate_vc_value_ty(element, allow_param, context)
+        }
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::ClassRef(..)
+        | Ty::Record(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::ResRef(..)
+        | Ty::Unit => Ok(()),
+    }
+}
+
+fn validate_vc_expr(expr: &Expr, allow_param: bool, context: &str) -> Result<(), String> {
+    if let Some(ty) = expr.ty {
+        validate_vc_ty(ty, allow_param, context)?;
+    }
+    match &expr.kind {
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Widen { arg: operand, .. }
+        | ExprKind::Narrow { arg: operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => validate_vc_expr(operand, allow_param, context),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            validate_vc_expr(lhs, allow_param, context)?;
+            validate_vc_expr(rhs, allow_param, context)
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::TraitCall { args, .. }
+        | ExprKind::MethodCall { args, .. }
+        | ExprKind::ArrayLit(args) => {
+            for arg in args {
+                validate_vc_expr(arg, allow_param, context)?;
+            }
+            Ok(())
+        }
+        ExprKind::Index { index, .. }
+        | ExprKind::SelfFieldIndex { index, .. }
+        | ExprKind::ClassFieldIndex { index, .. } => validate_vc_expr(index, allow_param, context),
+        ExprKind::AllocArray { elem, len, init } => {
+            validate_vc_value_ty(*elem, allow_param, context)?;
+            validate_vc_expr(len, allow_param, context)?;
+            validate_vc_expr(init, allow_param, context)
+        }
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Len { .. }
+        | ExprKind::NoneE
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::Borrow { .. } => Ok(()),
+    }
+}
+
+fn validate_vc_block(block: &[Stmt], allow_param: bool, context: &str) -> Result<(), String> {
+    for statement in block {
+        match statement {
+            Stmt::Decl { ty, init, .. } => {
+                validate_vc_ty(*ty, allow_param, context)?;
+                if let Some(init) = init {
+                    validate_vc_expr(init, allow_param, context)?;
+                }
+            }
+            Stmt::VarDecl { init, ty, .. } => {
+                if let Some(ty) = ty {
+                    validate_vc_ty(*ty, allow_param, context)?;
+                }
+                validate_vc_expr(init, allow_param, context)?;
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::FieldAssign { value, .. }
+            | Stmt::ExprStmt(value) => validate_vc_expr(value, allow_param, context)?,
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                validate_vc_expr(cond, allow_param, context)?;
+                validate_vc_block(then_block, allow_param, context)?;
+                if let Some(else_block) = else_block {
+                    validate_vc_block(else_block, allow_param, context)?;
+                }
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    validate_vc_expr(value, allow_param, context)?;
+                }
+            }
+            Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                validate_vc_expr(index, allow_param, context)?;
+                validate_vc_expr(value, allow_param, context)?;
+            }
+            Stmt::While { cond, body, .. } => {
+                validate_vc_expr(cond, allow_param, context)?;
+                validate_vc_block(body, allow_param, context)?;
+            }
+            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                validate_vc_block(body, allow_param, context)?;
+            }
+            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                validate_vc_expr(size, allow_param, context)?;
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                validate_vc_expr(ptr, allow_param, context)?;
+                validate_vc_expr(res, allow_param, context)?;
+                validate_vc_expr(release, allow_param, context)?;
+            }
+            Stmt::Assert(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_vc_fn(function: &Fn, allow_param: bool, context: &str) -> Result<(), String> {
+    for parameter in &function.params {
+        validate_vc_ty(parameter.ty, allow_param, context)?;
+    }
+    validate_vc_ty(function.ret, allow_param, context)?;
+    validate_vc_block(&function.body, allow_param, context)
+}
+
+fn validate_vc_class(class: &ClassDecl, allow_param: bool) -> Result<(), String> {
+    let context = format!("class `{}`", class.name);
+    for field in &class.fields {
+        validate_vc_ty(field.ty, allow_param, &context)?;
+    }
+    for init in &class.inits {
+        validate_vc_fn(init, allow_param, &context)?;
+    }
+    for method in &class.methods {
+        validate_vc_fn(&method.f, allow_param, &context)?;
+    }
+    if let Some(deinit) = &class.deinit {
+        validate_vc_block(deinit, allow_param, &context)?;
+    }
+    Ok(())
+}
+
+fn validate_vc_type_domain(program: &Program) -> Result<(), String> {
+    for function in &program.fns {
+        validate_vc_fn(function, false, &format!("function `{}`", function.name))?;
+    }
+    for function in &program.fn_templates {
+        validate_vc_fn(function, true, &format!("template `{}`", function.name))?;
+    }
+    for class in &program.classes {
+        validate_vc_class(class, false)?;
+    }
+    for class in &program.class_templates {
+        validate_vc_class(class, true)?;
+    }
+    for record in &program.records {
+        for field in &record.fields {
+            validate_vc_ty(field.ty, false, &format!("record `{}`", record.name))?;
+        }
+    }
+    for trait_decl in &program.traits {
+        for method in &trait_decl.methods {
+            validate_vc_fn(method, true, &format!("trait `{}`", trait_decl.name))?;
+        }
+    }
+    for implementation in &program.impls {
+        for function in &implementation.fns {
+            validate_vc_fn(
+                function,
+                false,
+                &format!("impl `{}`", implementation.trait_name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> String {
     match ty {
-        Ty::Int(_) => "Int".into(),
+        Ty::Int(_) | Ty::Param(_) => "Int".into(),
         Ty::Bool => "Bool".into(),
-        Ty::Array(..) => "Sable.Seq Int".into(),
+        Ty::Array(element, _) => lean_array_ty(element),
         // A class-valued field is a nested structure (ADR 0020).
         Ty::Class(ci) => lean_class_name(&classes[ci].name),
         Ty::Record(ri) => lean_record_name(&records[ri].name),
@@ -295,7 +556,7 @@ fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> Strin
         // gains a value and no obligation (ADR 0024/0029).
         Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(k, records),
         Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
-        Ty::Option(_) => "Option Int".into(),
+        Ty::Option(element) => lean_option_ty(element),
         Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
         _ => unreachable!("checked: field types"),
     }
@@ -347,7 +608,7 @@ fn emit_extern_clause_wfs(
     let mut binders: Vec<(String, String)> = Vec::new();
     for p in &f.params {
         match p.ty {
-            Ty::Int(_) => binders.push((p.name.clone(), "Int".into())),
+            Ty::Int(_) | Ty::Param(_) => binders.push((p.name.clone(), "Int".into())),
             Ty::Bool => binders.push((p.name.clone(), "Bool".into())),
             Ty::Raw(_) | Ty::RawRecord(_) => binders.push((p.name.clone(), "Sable.RawPtr".into())),
             Ty::Res(k) | Ty::ResRef(k, _) => {
@@ -359,7 +620,7 @@ fn emit_extern_clause_wfs(
                     ));
                 }
             }
-            Ty::Array(..) => binders.push((p.name.clone(), "Sable.Seq Int".into())),
+            Ty::Array(element, _) => binders.push((p.name.clone(), lean_array_ty(element))),
             Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                 binders.push((p.name.clone(), lean_class_name(&program.classes[ci].name)))
             }
@@ -367,7 +628,10 @@ fn emit_extern_clause_wfs(
                 binders.push((p.name.clone(), lean_record_name(&program.records[ri].name)))
             }
             Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
-            Ty::Option(_) | Ty::Unit => {}
+            Ty::Option(element) => {
+                let _ = adr0009_int_model(element);
+            }
+            Ty::Unit => {}
         }
     }
     for (i, c) in f.pres.iter().enumerate() {
@@ -396,12 +660,13 @@ fn emit_extern_clause_wfs(
     }
 }
 
-pub fn generate(
+pub(crate) fn generate(
     program: &Program,
     sigs: &HashMap<String, FnSig>,
     source: &str,
     repo_root: &Path,
 ) -> Result<VcResult, String> {
+    validate_vc_type_domain(program)?;
     let fn_map: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let trait_map: HashMap<&str, &TraitDecl> = program
         .traits
@@ -595,7 +860,18 @@ pub fn generate(
         // Template-verified instances (ADR 0009): the template theorems
         // cover their obligations; the residue is the substituted
         // `requires` — pure numeric facts about concrete bounds.
-        if let Some(tname) = &f.from_template {
+        if let ProofReuse::Adr0009IntModel(reuse) = &f.proof_reuse {
+            let tname = reuse.template();
+            if !program
+                .fn_templates
+                .iter()
+                .any(|template| template.name == *tname)
+            {
+                return Err(format!(
+                    "internal proof-reuse error: function `{}` names missing ADR 0009 template `{tname}`",
+                    f.name
+                ));
+            }
             for (i, req) in f.requires.iter().enumerate() {
                 let name = format!("{}.requires.{}", f.name, cslug(req));
                 result.obligations.push(Obligation {
@@ -743,7 +1019,18 @@ pub fn generate(
     for c in &program.classes {
         // Template-verified class instances (ADR 0009): the
         // template's theorems cover their member obligations.
-        if c.from_template.is_some() {
+        if let ProofReuse::Adr0009IntModel(reuse) = &c.proof_reuse {
+            let template = reuse.template();
+            if !program
+                .class_templates
+                .iter()
+                .any(|retained| retained.name == *template)
+            {
+                return Err(format!(
+                    "internal proof-reuse error: class `{}` names missing ADR 0009 template `{template}`",
+                    c.name
+                ));
+            }
             continue;
         }
         for init in &c.inits {
@@ -775,7 +1062,7 @@ pub fn generate(
                     type_params: Vec::new(),
                     type_bounds: Vec::new(),
                     requires: Vec::new(),
-                    from_template: None,
+                    proof_reuse: ProofReuse::None,
                     params: Vec::new(),
                     ret: Ty::Unit,
                     pres: Vec::new(),
@@ -935,10 +1222,11 @@ impl<'a> Generator<'a> {
             Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) => lean_res_view_ty(*k, self.records),
             Some(Ty::Raw(_)) | Some(Ty::RawRecord(_)) => "Sable.RawPtr".to_string(),
             Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".to_string(),
-            Some(Ty::Option(_)) => "Option Int".to_string(),
-            Some(Ty::Int(_)) => "Int".to_string(),
+            Some(Ty::Option(element)) => lean_option_ty(*element),
+            Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
-            _ => "Sable.Seq Int".to_string(),
+            Some(Ty::Array(element, _)) => lean_array_ty(*element),
+            Some(Ty::Unit) | None => unreachable!("checked: value has a Lean binder type"),
         }
     }
 
@@ -960,9 +1248,9 @@ impl<'a> Generator<'a> {
             .var_tys
             .iter()
             .filter_map(|(name, ty)| match ty {
-                Ty::Int(_) => Some((name.clone(), "Int".to_string())),
+                Ty::Int(_) | Ty::Param(_) => Some((name.clone(), "Int".to_string())),
                 Ty::Bool => Some((name.clone(), "Bool".to_string())),
-                Ty::Array(..) => Some((name.clone(), "Sable.Seq Int".to_string())),
+                Ty::Array(element, _) => Some((name.clone(), lean_array_ty(*element))),
                 Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                     Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
                 }
@@ -974,7 +1262,11 @@ impl<'a> Generator<'a> {
                 }
                 Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
-                Ty::Option(_) | Ty::Unit => None,
+                Ty::Option(element) => {
+                    let _ = adr0009_int_model(*element);
+                    None
+                }
+                Ty::Unit => None,
             })
             .collect();
         vars.sort();
@@ -1011,6 +1303,13 @@ impl<'a> Generator<'a> {
                     self.push_hyp_unique(
                         format!("h_field_{}_range", fld.name),
                         self.r_prop(&format!("({binder}.{})", fld.name), it),
+                    );
+                }
+                Ty::Param(parameter) => {
+                    let model = adr0009_ty_int_model(Ty::Param(parameter));
+                    self.push_hyp_unique(
+                        format!("h_field_{}_range", fld.name),
+                        self.r_prop(&format!("({binder}.{})", fld.name), model),
                     );
                 }
                 Ty::Array(elem, _) => {
@@ -1284,6 +1583,13 @@ impl<'a> Generator<'a> {
                         .push((format!("h_{}_range", p.name), self.r_prop(&p.name, it)));
                     self.env.insert(p.name.clone(), Val::Int(p.name.clone()));
                 }
+                Ty::Param(parameter) => {
+                    let model = adr0009_ty_int_model(Ty::Param(parameter));
+                    self.binders.push((p.name.clone(), "Int".into()));
+                    self.hyps
+                        .push((format!("h_{}_range", p.name), self.r_prop(&p.name, model)));
+                    self.env.insert(p.name.clone(), Val::Int(p.name.clone()));
+                }
                 Ty::Bool => {
                     self.binders.push((p.name.clone(), "Bool".into()));
                     self.env
@@ -1298,7 +1604,7 @@ impl<'a> Generator<'a> {
                         Mutability::Shared => p.name.clone(),
                         Mutability::Owned => unreachable!("owned arrays are test-only locals"),
                     };
-                    self.binders.push((binder.clone(), "Sable.Seq Int".into()));
+                    self.binders.push((binder.clone(), lean_array_ty(elem)));
                     self.hyps.push((
                         format!("h_{}_len", p.name),
                         format!("0 ≤ {binder}.len ∧ {binder}.len ≤ u64.max"),
@@ -1316,7 +1622,11 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
-                Ty::Option(_) | Ty::Unit => {
+                Ty::Option(element) => {
+                    let _ = adr0009_int_model(element);
+                    unreachable!("checked: no option parameters")
+                }
+                Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
             }
@@ -1372,7 +1682,8 @@ impl<'a> Generator<'a> {
 
     fn result_lean_ty(&self) -> String {
         match self.f.ret {
-            Ty::Option(_) => "Option Int".into(),
+            Ty::Int(_) | Ty::Param(_) => "Int".into(),
+            Ty::Option(element) => lean_option_ty(element),
             Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
             // Bool results are Prop-valued in the logic: posts like
             // `result → P` splice with no coercion noise.
@@ -1385,7 +1696,9 @@ impl<'a> Generator<'a> {
             Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(k, self.records),
             Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
             Ty::Unit => "Unit".into(),
-            _ => "Int".into(),
+            Ty::Array(..) | Ty::ClassRef(..) => {
+                unreachable!("checked: borrowed values and arrays are not return types")
+            }
         }
     }
 
@@ -2213,7 +2526,7 @@ impl<'a> Generator<'a> {
                                 let prior = substitute(&chain, &stale_map, None);
                                 self.fresh += 1;
                                 let b = format!("_self{}_{}", self.fresh, fld.name);
-                                self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                                self.binders.push((b.clone(), lean_array_ty(elem)));
                                 if !havoc_set
                                     .iter()
                                     .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
@@ -2243,6 +2556,16 @@ impl<'a> Generator<'a> {
                                 );
                                 self.env.insert(key, Val::Int(b));
                             }
+                            (Ty::Param(parameter), Some(Val::Int(_))) => {
+                                self.fresh += 1;
+                                let b = format!("_self{}_{}", self.fresh, fld.name);
+                                self.binders.push((b.clone(), "Int".into()));
+                                self.push_hyp_unique(
+                                    format!("h_self_{}_range", fld.name),
+                                    self.r_prop(&b, adr0009_ty_int_model(Ty::Param(parameter))),
+                                );
+                                self.env.insert(key, Val::Int(b));
+                            }
                             _ => {}
                         }
                     }
@@ -2257,13 +2580,20 @@ impl<'a> Generator<'a> {
                         .push((format!("h_{name}_range"), self.r_prop(name, it)));
                     self.env.insert(name.clone(), Val::Int(name.clone()));
                 }
+                Some(Ty::Param(parameter)) => {
+                    let model = adr0009_ty_int_model(Ty::Param(*parameter));
+                    self.binders.push((name.clone(), "Int".into()));
+                    self.hyps
+                        .push((format!("h_{name}_range"), self.r_prop(name, model)));
+                    self.env.insert(name.clone(), Val::Int(name.clone()));
+                }
                 Some(Ty::Bool) => {
                     self.binders.push((name.clone(), "Bool".into()));
                     self.env
                         .insert(name.clone(), Val::Prop(format!("({name} = true)")));
                 }
-                Some(Ty::Option(_)) => {
-                    self.binders.push((name.clone(), "Option Int".into()));
+                Some(Ty::Option(element)) => {
+                    self.binders.push((name.clone(), lean_option_ty(*element)));
                     self.env.insert(name.clone(), Val::Opt(name.clone()));
                 }
                 // A loop body called &mut methods on this class value (or,
@@ -2307,7 +2637,7 @@ impl<'a> Generator<'a> {
                         Some(Val::Arr(s)) => Some(substitute(s, &stale_map, None)),
                         _ => None,
                     };
-                    self.binders.push((name.clone(), "Sable.Seq Int".into()));
+                    self.binders.push((name.clone(), lean_array_ty(elem)));
                     if let Some(prior) = prior {
                         if !havoc_set
                             .iter()
@@ -2335,7 +2665,7 @@ impl<'a> Generator<'a> {
                     // sound to assume at havoc.
                     let elem = *elem;
                     let entry = self.entry_states[name.as_str()].clone();
-                    self.binders.push((name.clone(), "Sable.Seq Int".into()));
+                    self.binders.push((name.clone(), lean_array_ty(elem)));
                     self.hyps.push((
                         format!("h_{name}_len"),
                         format!("({name}.len) = ({entry}.len)"),
@@ -2366,8 +2696,8 @@ impl<'a> Generator<'a> {
                 // A literal at type `T` cannot be range-checked
                 // statically: emit a fits-VC against the model
                 // (ADR 0009); dischargeable from `wf`/`requires`.
-                if let Some(Ty::Int(it @ IntTy::TParam(_))) = e.ty {
-                    let goal = self.r_prop(&v, it);
+                if let Some(ty @ (Ty::Param(_) | Ty::Int(IntTy::TParam(_)))) = e.ty {
+                    let goal = self.r_prop(&v, adr0009_ty_int_model(ty));
                     let ob = self.obligation(
                         &format!("{}.lit.{}", self.fname, slug(&v)),
                         format!("literal `{n}` must fit the type parameter"),
@@ -4281,7 +4611,10 @@ impl<'a> Generator<'a> {
             ExprKind::ArrayLit(elems) => {
                 let hint = self.name_hint.take();
                 let b = self.hinted_sym("_lit", hint);
-                self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                let Some(Ty::Array(element, _)) = e.ty else {
+                    unreachable!("checked: array literal has an array type")
+                };
+                self.binders.push((b.clone(), lean_array_ty(element)));
                 let h1 = self.fresh_hyp("h_lit");
                 self.hyps.push((h1, format!("({b}.len) = {}", elems.len())));
                 for (i, el) in elems.iter().enumerate() {
@@ -4297,9 +4630,7 @@ impl<'a> Generator<'a> {
                 let Val::Int(i) = self.eval(index) else {
                     unreachable!()
                 };
-                let Ty::Int(elem) = e.ty.unwrap() else {
-                    unreachable!()
-                };
+                let model = adr0009_ty_int_model(e.ty.expect("checked: array index type"));
                 let arr = self.arr_str(array);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
                 let ob = self.obligation(
@@ -4314,14 +4645,11 @@ impl<'a> Generator<'a> {
                 // Element range follows from the array's element fact +
                 // the just-proven bounds; assuming it here saves the
                 // automation a quantifier instantiation.
-                self.assume_fact(&format!(
-                    "{} ≤ {value} ∧ {value} ≤ {}",
-                    self.t_min(elem),
-                    self.t_max(elem)
-                ));
+                let range = self.r_prop(&value, model);
+                self.assume_fact(&range);
                 Val::Int(value)
             }
-            ExprKind::AllocArray { len, init, .. } => {
+            ExprKind::AllocArray { elem, len, init } => {
                 let hint = self.name_hint.take();
                 let Val::Int(n) = self.eval(len) else {
                     unreachable!()
@@ -4332,7 +4660,7 @@ impl<'a> Generator<'a> {
                 // Allocation succeeds symbolically: failure is the named
                 // OOM trap (design §10), not a proof obligation.
                 let b = self.hinted_sym("_alloc", hint);
-                self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                self.binders.push((b.clone(), lean_array_ty(*elem)));
                 let h1 = self.fresh_hyp("h_alloc");
                 self.hyps.push((h1, format!("({b}.len) = {n}")));
                 let h2 = self.fresh_hyp("h_alloc");
@@ -4418,9 +4746,7 @@ impl<'a> Generator<'a> {
                 let Val::Int(i) = self.eval(index) else {
                     unreachable!()
                 };
-                let Ty::Int(elem) = e.ty.unwrap() else {
-                    unreachable!()
-                };
+                let model = adr0009_ty_int_model(e.ty.expect("checked: field index type"));
                 let arr = self.self_field_str(field);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
                 let ob = self.obligation(
@@ -4432,11 +4758,8 @@ impl<'a> Generator<'a> {
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
                 let value = format!("({arr}.get {i})");
-                self.assume_fact(&format!(
-                    "{} ≤ {value} ∧ {value} ≤ {}",
-                    self.t_min(elem),
-                    self.t_max(elem)
-                ));
+                let range = self.r_prop(&value, model);
+                self.assume_fact(&range);
                 Val::Int(value)
             }
             ExprKind::CtorCall {
@@ -4601,12 +4924,15 @@ impl<'a> Generator<'a> {
                 }
                 let ret_sym = self.hinted_sym("_r", hint);
                 match m.ret {
-                    Ty::Int(it) => {
+                    ty @ (Ty::Int(_) | Ty::Param(_)) => {
                         self.binders.push((ret_sym.clone(), "Int".into()));
-                        let range = if let IntTy::TParam(0) = it {
+                        let model = adr0009_ty_int_model(ty);
+                        let is_trait_self = matches!(ty, Ty::Int(IntTy::TParam(0)))
+                            || matches!(ty, Ty::Param(parameter) if parameter.index() == 0);
+                        let range = if is_trait_self {
                             format!("{param}.min ≤ {ret_sym} ∧ {ret_sym} ≤ {param}.max")
                         } else {
-                            self.r_prop(&ret_sym, it)
+                            self.r_prop(&ret_sym, model)
                         };
                         self.hyps.push((
                             format!("h_{}_range", ret_sym.trim_start_matches('_')),
@@ -4703,13 +5029,15 @@ impl<'a> Generator<'a> {
                 // Result symbol.
                 let ret_sym = self.hinted_sym("_r", hint);
                 match m.f.ret {
-                    Ty::Int(it) => {
+                    ty @ (Ty::Int(_) | Ty::Param(_)) => {
                         self.binders.push((ret_sym.clone(), "Int".into()));
                         let h = format!("h_{}_range", ret_sym.trim_start_matches('_'));
-                        self.hyps.push((h, self.r_prop(&ret_sym, it)));
+                        self.hyps
+                            .push((h, self.r_prop(&ret_sym, adr0009_ty_int_model(ty))));
                     }
-                    Ty::Option(_) => {
-                        self.binders.push((ret_sym.clone(), "Option Int".into()));
+                    Ty::Option(element) => {
+                        self.binders
+                            .push((ret_sym.clone(), lean_option_ty(element)));
                     }
                     Ty::Bool => {
                         self.binders.push((ret_sym.clone(), "Prop".into()));
@@ -4789,6 +5117,7 @@ impl<'a> Generator<'a> {
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
                     Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
+                    Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -4798,9 +5127,7 @@ impl<'a> Generator<'a> {
                         unreachable!()
                     };
                     let value = format!("(-{v})");
-                    let Ty::Int(it) = e.ty.unwrap() else {
-                        unreachable!()
-                    };
+                    let it = adr0009_ty_int_model(e.ty.expect("checked: negation result type"));
                     let goal = self.r_prop(&value, it);
                     let ob = self.obligation(
                         &format!("{}.overflow.{}", self.fname, slug(self.src(e.span))),
@@ -4838,9 +5165,7 @@ impl<'a> Generator<'a> {
                         _ => unreachable!(),
                     };
                     let value = format!("({l} {lean_op} {r})");
-                    let Ty::Int(it) = e.ty.unwrap() else {
-                        unreachable!()
-                    };
+                    let it = adr0009_ty_int_model(e.ty.expect("checked: arithmetic result type"));
                     match op {
                         BinOp::Add | BinOp::Sub | BinOp::Mul => {
                             let goal = self.r_prop(&value, it);
@@ -4985,7 +5310,7 @@ impl<'a> Generator<'a> {
                     let old_chain = subst_map[&p.name].clone();
                     self.fresh += 1;
                     let b = format!("_arr{}", self.fresh);
-                    self.binders.push((b.clone(), "Sable.Seq Int".into()));
+                    self.binders.push((b.clone(), lean_array_ty(elem)));
                     self.hyps.push((
                         format!("h_{array}_len"),
                         format!("({b}.len) = ({old_chain}.len)"),
@@ -5009,15 +5334,16 @@ impl<'a> Generator<'a> {
 
                 let ret_sym = self.hinted_sym("_r", hint);
                 match sig.ret {
-                    Ty::Int(ret_it) => {
+                    ty @ (Ty::Int(_) | Ty::Param(_)) => {
                         self.binders.push((ret_sym.clone(), "Int".into()));
                         self.hyps.push((
                             format!("h_{}_range", ret_sym.trim_start_matches('_')),
-                            self.r_prop(&ret_sym, ret_it),
+                            self.r_prop(&ret_sym, adr0009_ty_int_model(ty)),
                         ));
                     }
-                    Ty::Option(_) => {
-                        self.binders.push((ret_sym.clone(), "Option Int".into()));
+                    Ty::Option(element) => {
+                        self.binders
+                            .push((ret_sym.clone(), lean_option_ty(element)));
                     }
                     Ty::Bool => {
                         self.binders.push((ret_sym.clone(), "Prop".into()));
@@ -5074,6 +5400,7 @@ impl<'a> Generator<'a> {
                     Ty::Class(_) => Val::Obj(ret_sym),
                     Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
                     Ty::Raw(_) => Val::Ptr(ret_sym),
+                    Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -5276,7 +5603,7 @@ impl<'a> Generator<'a> {
         }
         for p in &self.f.params {
             match p.ty {
-                Ty::Int(_) => out.push((p.name.clone(), "Int".into())),
+                Ty::Int(_) | Ty::Param(_) => out.push((p.name.clone(), "Int".into())),
                 Ty::Bool => out.push((p.name.clone(), "Bool".into())),
                 Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                     let lean = lean_class_name(&self.classes[ci].name);
@@ -5288,10 +5615,11 @@ impl<'a> Generator<'a> {
                 Ty::Record(ri) => {
                     out.push((p.name.clone(), lean_record_name(&self.records[ri].name)))
                 }
-                Ty::Array(..) => {
-                    out.push((p.name.clone(), "Sable.Seq Int".into()));
+                Ty::Array(element, _) => {
+                    let lean_ty = lean_array_ty(element);
+                    out.push((p.name.clone(), lean_ty.clone()));
                     if let Some(entry) = self.entry_states.get(&p.name) {
-                        out.push((entry.clone(), "Sable.Seq Int".into()));
+                        out.push((entry.clone(), lean_ty));
                     }
                 }
                 Ty::Raw(_) | Ty::RawRecord(_) => out.push((p.name.clone(), "Sable.RawPtr".into())),
@@ -5302,7 +5630,10 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), lean_res_view_ty(k, self.records)));
                     }
                 }
-                Ty::Option(_) | Ty::Unit => {}
+                Ty::Option(element) => {
+                    let _ = adr0009_int_model(element);
+                }
+                Ty::Unit => {}
             }
         }
         match self.cctx {
@@ -5405,13 +5736,15 @@ impl<'a> Generator<'a> {
         }
         range_prop(value, it)
     }
-    fn t_min(&self, it: IntTy) -> String {
+    fn t_min(&self, ty: ValueTy) -> String {
+        let it = adr0009_int_model(ty);
         if let IntTy::TParam(i) = it {
             return format!("{}.min", self.tparams[i as usize]);
         }
         it.lean_min()
     }
-    fn t_max(&self, it: IntTy) -> String {
+    fn t_max(&self, ty: ValueTy) -> String {
+        let it = adr0009_int_model(ty);
         if let IntTy::TParam(i) = it {
             return format!("{}.max", self.tparams[i as usize]);
         }
@@ -6032,4 +6365,34 @@ pub fn slug(text: &str) -> String {
     }
     let out = out.trim_matches('_').to_string();
     if out.is_empty() { "e".to_string() } else { out }
+}
+
+#[cfg(test)]
+mod g1_type_domain_tests {
+    use super::*;
+
+    #[test]
+    fn retained_templates_require_canonical_scalar_parameters() {
+        let parameter = TypeParamId::from_legacy(3);
+        assert!(validate_vc_ty(Ty::Param(parameter), true, "test template").is_ok());
+        let error = validate_vc_ty(Ty::Int(IntTy::TParam(3)), true, "test template")
+            .expect_err("legacy declaration-position parameter must fail closed");
+        assert!(error.contains("non-canonical legacy scalar parameter"));
+    }
+
+    #[test]
+    fn g1_aggregate_payloads_fail_closed_before_semantics() {
+        let bool_error =
+            validate_vc_ty(Ty::Option(ValueTy::Bool), false, "unused ordinary function")
+                .expect_err("bool options are represented but not proved in G1.0");
+        assert!(bool_error.contains("bool payload"));
+
+        let record_error = validate_vc_ty(
+            Ty::Array(ValueTy::Record(0), Mutability::Shared),
+            false,
+            "unused ordinary function",
+        )
+        .expect_err("record arrays are represented but not proved in G1.0");
+        assert!(record_error.contains("POD-record payload"));
+    }
 }

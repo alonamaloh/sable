@@ -689,16 +689,51 @@ working hypothesis, not a promise that evidence cannot reorder it:
      one runtime category while traits and constants remain separate; recursive
      nominal visibility is exhaustive, restrictive imports include public
      constants, and duplicate trait/impl members diagnose in source order. The
-     The complete low-concurrency command (`CARGO_BUILD_JOBS=1`,
+     complete low-concurrency command (`CARGO_BUILD_JOBS=1`,
      `CARGO_INCREMENTAL=0`, `SABLE_TEST_JOBS=1`, `SABLE_LEAN_JOBS=1`,
      `SABLE_REQUIRE_CLANG=1`, Cargo `-j1`, Rust `--test-threads=1`) is green:
      library 82/82; all 368 verifier/must-fail/dynamic/dynamic-failure corpus
      subjects in 424.42s; LLVM CLI 6/6; exact-`VerifiedProgram`
      interpreter↔Clang differential at `-O0` and `-O2`; SVM 69/69; allocator,
-     grind-budget, and LSP gates green. **G1 is next:** give Boolean/POD shapes
-     checking, verification, interpreter, and LLVM semantics.
-   - **G1 — Boolean/POD aggregates:** establish the first non-integer aggregate
-     storage, value, verification, interpreter, and LLVM paths.
+     grind-budget, and LSP gates green.
+   - **G1 — Boolean/POD aggregates (in progress):** establish the first
+     non-integer aggregate storage, value, verification, interpreter, and LLVM
+     paths.
+
+     **G1.0 — representation and proof provenance (complete):** declaration
+     parameters now use `Ty::Param(TypeParamId)`, and
+     aggregate payloads use `ValueTy::{Int, Bool, Record, Param}`. This is an
+     internal separation of concerns, not a usable Boolean/POD feature: parser
+     and checker acceptance is not widened, and concrete Boolean/record arrays
+     and options remain fail-closed. Mono validates every declaration parameter
+     id before direct-index substitution, rejects noncanonical legacy parameter
+     forms, and exhaustively checks afterward that ordinary declarations contain
+     no parameter. Retained ADR 0009 templates intentionally remain abstract.
+
+     Proof reuse is now the explicit
+     `ProofReuse::Adr0009IntModel` capability with an opaque payload. Its fields
+     are private and its constructor is crate-private, so external AST callers
+     can inspect but cannot forge it. Mono rejects a caller-supplied marker and
+     authors it only for instances licensed by the existing concrete-integer
+     domain; VCgen recognizes only that exact variant. The preparation and
+     VC-generation entry points are crate-private as well. Checker and VCgen
+     reject Boolean/POD aggregate semantics independently, the interpreter and
+     SVM repeat the fail-closed guard, and module visibility follows nominal
+     records carried inside aggregate payloads. Existing integer programs keep
+     their previous semantics.
+
+     The complete low-concurrency closure command was
+     `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. It passed 101/101 library tests; all 368
+     corpus subjects (79 verifies, 228 must-fail, 44 dynamic, 17 dynamic-fail)
+     in 382.78s; LLVM CLI 6/6; the exact-`VerifiedProgram`
+     interpreter↔Clang differential at `-O0` and `-O2` 1/1; and SVM 69/69.
+     Randomized allocator, grind-budget, LSP, and documentation gates were
+     green. G1.0 is closed.
+
+     **Next slice — `option<bool>`:** add one complete non-integer vertical path
+     without weakening any of G1.0's independent rejection boundaries.
    - **G2 — affine options:** carry ownership and destruction correctly through
      present/absent aggregate values.
    - **G3 — slots and `Vec`:** make generic element storage and movement real

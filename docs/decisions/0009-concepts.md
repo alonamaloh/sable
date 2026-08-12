@@ -98,3 +98,49 @@ kernel-checked per instantiation.
 - Literals used at type `T` (e.g. `alloc_array<T>(n, 0)`) generate
   range obligations against `T.min`/`T.max`, dischargeable from `wf`
   or `requires`.
+
+## G1.0 amendment: explicit proof provenance (closed 2026-08-12)
+
+The original implementation represented a declaration type parameter through
+`IntTy::TParam` and carried template proof reuse as an optional template name.
+That was adequate while every legal instantiation was an integer, but it was
+not an adequate boundary for G1: a future Boolean or POD instance must not look
+integer-valued by representation or inherit a theorem proved only over
+`Sable.IntModel`.
+
+G1.0 therefore makes both facts explicit:
+
+1. Declaration positions use `Ty::Param(TypeParamId)`; array and option
+   payloads use `ValueTy::{Int, Bool, Record, Param}`. The legacy
+   `IntTy::TParam` remains only where integer syntax still requires it, such as
+   conversion targets, and may not stand in for a declaration parameter.
+2. A concrete instance may reuse a template proof only through
+   `ProofReuse::Adr0009IntModel` with an opaque authorization payload. The
+   payload fields are private and its constructor is crate-private: an external
+   AST caller can inspect the authorization but cannot forge it.
+   Monomorphization rejects any pre-populated marker and is the only pipeline
+   pass that authors this capability. VC generation skips instance obligations
+   only for that exact variant. Preparation and VC-generation entry points are
+   crate-private, closing the corresponding external direct-call path.
+3. Before substitution, monomorphization validates every declaration parameter
+   id and rejects out-of-bounds or noncanonical forms. After expansion it checks
+   exhaustively that every ordinary declaration is concrete; only retained
+   templates may contain `Param`.
+4. Boolean and POD payloads have representation but no semantics at this
+   checkpoint. The checker and VC generator reject them independently; the
+   interpreter and SVM repeat the fail-closed guard at their execution and
+   lowering boundaries. Module visibility still descends through nominal
+   record payloads.
+
+This amendment narrows the authorization described in decision 4; it does not
+widen ADR 0009's proof domain. Existing integer instances retain their behavior.
+The next semantic slice is `option<bool>`.
+
+G1.0 is closed by
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. The run
+passed 101/101 library tests; all 368 corpus subjects (79 verifies, 228
+must-fail, 44 dynamic, 17 dynamic-fail) in 382.78s; LLVM CLI 6/6; the exact
+`VerifiedProgram` interpreter↔Clang differential at `-O0` and `-O2` 1/1; and
+SVM differential 69/69. The randomized allocator, grind-budget, LSP, and
+documentation gates were green.

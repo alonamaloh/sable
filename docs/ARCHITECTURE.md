@@ -49,7 +49,14 @@ mono (compiler/src/mono.rs)           monomorphization (ADR 0006/0007): expands
   │                                   kind, template base, and original canonical args;
   │                                   exact requests deduplicate while a registry rejects
   │                                   ambiguous legacy emitted names deterministically.
-  │                                   No later stage sees a type variable.
+  │                                   G1.0 validates declaration parameter identities
+  │                                   before substitution and checks that every ordinary
+  │                                   output is concrete. Retained ADR 0009 templates alone
+  │                                   carry explicit Ty::Param/ValueTy::Param values into
+  │                                   checking and VC generation. Only mono may attach the
+  │                                   exact ADR0009IntModel proof-reuse capability; its
+  │                                   authorization payload is opaque, and preparation plus
+  │                                   VC-generation entry points are crate-private.
   ▼
 typecheck (compiler/src/check.rs)     types, call graph, and one flow-sensitive
   │                                   pass carrying definite initialization and
@@ -176,6 +183,42 @@ this completed scalar boundary and are future M46+ work.
   registry rejects ambiguous legacy spellings and collisions with source,
   template, or impl-lowered names deterministically. Duplicate traits, impl
   specs, and impl methods likewise diagnose the second source declaration.
+- **Parameter identity and proof provenance are explicit before aggregate
+  semantics widen.** G1.0 represents declaration parameters as
+  `Ty::Param(TypeParamId)` and storable array/option payloads as
+  `ValueTy::{Int, Bool, Record, Param}`. It no longer makes a parameter look
+  intrinsically integer-valued merely because ADR 0009's current proof model
+  is integer-only. Before substitution, mono checks every declaration-position
+  parameter id (including expression annotations, conversions, and
+  `alloc_array` element types), rejecting out-of-bounds and noncanonical legacy
+  forms. After expansion it exhaustively rejects a parameter left in any
+  ordinary declaration; retained templates are the sole exception.
+
+  Template-proof reuse is a named capability,
+  `ProofReuse::Adr0009IntModel`, rather than a nullable template name. Its
+  payload has private fields and a crate-private constructor: external AST
+  callers may inspect the marker but cannot manufacture it. Mono rejects a
+  pre-populated capability and is its only pipeline author; the preparation and
+  VC-generation entry points are likewise crate-private, so external callers
+  cannot route a hand-built program around that check. VCgen skips instance
+  obligations only when the exact variant is present. This prevents a later
+  Boolean or record instance from silently inheriting a theorem proved over
+  `Sable.IntModel`. The checker and VCgen independently reject non-integer
+  aggregate payloads; the interpreter and SVM repeat the fail-closed guard at
+  their own execution/lowering boundaries. Module visibility also descends
+  through `ValueTy::Record`, so a nominal payload cannot bypass a restrictive
+  import. G1.0 therefore changes representation and invariants, not the
+  accepted language: Boolean/POD arrays and options remain unusable, and
+  existing integer behavior is preserved.
+
+  G1.0 is closed by the complete low-concurrency command
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+  SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`. It
+  passed 101/101 library tests; all 368 corpus subjects (79 verifies, 228
+  must-fail, 44 dynamic, 17 dynamic-fail) in 382.78s; LLVM CLI 6/6; the exact
+  verified-program interpreter↔Clang differential at `-O0` and `-O2` 1/1;
+  and SVM differential 69/69. Randomized allocator, grind-budget, LSP, and
+  documentation gates were green. The next semantic slice is `option<bool>`.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

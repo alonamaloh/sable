@@ -14,9 +14,11 @@ pub enum IntTy {
     I16,
     I32,
     I64,
-    /// A type parameter of the enclosing generic declaration (index into
-    /// its parameter list). Exists only between parse and
-    /// monomorphization; every later stage may assert its absence.
+    /// Legacy integer-expression representation of a type parameter in
+    /// `widen<T>` / `narrow<T>` and G0 compatibility helpers. Declaration
+    /// positions use `Ty::Param` / `ValueTy::Param`, so a parameter is not
+    /// accidentally treated as an integer merely because v1 instances are
+    /// currently integer-only.
     TParam(u8),
 }
 
@@ -106,17 +108,18 @@ impl IntTy {
     }
 }
 
-/// The legacy AST stores a generic parameter in `IntTy::TParam(u8)`, so G0
-/// keeps the same 256-parameter ceiling explicitly instead of silently
+/// The original AST stored every generic parameter in `IntTy::TParam(u8)`, so
+/// G0 keeps the same 256-parameter ceiling explicitly instead of silently
 /// truncating a parser index with `as u8`.
 pub const MAX_TYPE_PARAMS: usize = u8::MAX as usize + 1;
 
 /// Stable index of a parameter in its enclosing generic declaration.
 ///
-/// This is deliberately distinct from `IntTy::TParam`: the recursive generic
-/// type tree is not intrinsically integer-typed. Construction is checked
-/// against the legacy G0 ceiling while existing AST type positions still use
-/// the `u8` representation.
+/// This is deliberately distinct from `IntTy::TParam`: neither the recursive
+/// generic type tree nor a declaration-position type parameter is
+/// intrinsically integer-typed. Construction is checked against the legacy G0
+/// ceiling while the remaining integer-expression compatibility positions
+/// still use the `u8` representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeParamId(u32);
 
@@ -414,10 +417,64 @@ fn push_length_prefixed(out: &mut String, value: &str) {
     out.push_str(value);
 }
 
+/// A storable, copyable value payload used by arrays and options.
+///
+/// G1 deliberately separates this from `IntTy`: parsed template parameters
+/// retain their own identity until monomorphization, and the concrete bool and
+/// POD-record cases have an honest representation before their runtime/proof
+/// semantics are enabled. The parser continues to admit only integers and
+/// in-scope parameters in these positions for now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ValueTy {
+    Int(IntTy),
+    Bool,
+    Record(usize),
+    Param(TypeParamId),
+}
+
+impl ValueTy {
+    pub fn name(self) -> String {
+        match self {
+            ValueTy::Int(ty) => ty.name().to_string(),
+            ValueTy::Bool => "bool".to_string(),
+            ValueTy::Record(_) => "record".to_string(),
+            ValueTy::Param(parameter) => format!("<T{}>", parameter.index()),
+        }
+    }
+
+    pub fn is_concrete(self) -> bool {
+        !matches!(self, ValueTy::Param(_) | ValueTy::Int(IntTy::TParam(_)))
+    }
+
+    /// The ADR 0009 integer model carried by this value type. A retained
+    /// template parameter maps to its legacy abstract integer binder; concrete
+    /// Boolean/POD payloads deliberately do not.
+    pub fn int_model(self) -> Option<IntTy> {
+        match self {
+            ValueTy::Int(IntTy::TParam(_)) => None,
+            ValueTy::Int(integer) => Some(integer),
+            ValueTy::Param(parameter) => Some(IntTy::TParam(parameter.legacy_index())),
+            ValueTy::Bool | ValueTy::Record(_) => None,
+        }
+    }
+}
+
+impl From<IntTy> for ValueTy {
+    fn from(ty: IntTy) -> ValueTy {
+        match ty {
+            IntTy::TParam(index) => ValueTy::Param(TypeParamId::from_legacy(index)),
+            concrete => ValueTy::Int(concrete),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
     Int(IntTy),
     Bool,
+    /// A declaration-position type parameter. This exists only in retained
+    /// generic templates; every ordinary declaration is concrete after mono.
+    Param(TypeParamId),
     /// A class value (owned local); index into `Program::classes`.
     Class(usize),
     /// A borrow of a class: `&Nat` (shared — ADR 0010) or `&mut Nat`
@@ -428,11 +485,13 @@ pub enum Ty {
     /// layout. Records are deliberately distinct from affine classes:
     /// they have no invariant, methods, resources, or destructor (ADR 0054).
     Record(usize),
-    /// Borrowed array of integers: `&[i32]` (shared) or `&mut [i32]`
-    /// (unique, mutable). Parameters only.
-    Array(IntTy, Mutability),
-    /// `option<u64>` etc. Return types only.
-    Option(IntTy),
+    /// Borrowed array: `&[i32]` (shared) or `&mut [i32]` (unique, mutable).
+    /// Parameters only. Non-integer concrete payloads are represented but not
+    /// admitted by the checked language yet.
+    Array(ValueTy, Mutability),
+    /// `option<u64>` etc. Return types only. As with arrays, G1 represents the
+    /// future bool/POD cases before enabling their semantics.
+    Option(ValueTy),
     /// `option<raw<R>>` for an explicitly laid-out record. This is an
     /// abstract nullable pointer value, not a byte representation.
     OptionRaw(usize),
@@ -892,10 +951,22 @@ impl Ty {
         matches!(self, Ty::Res(_) | Ty::ResRef(..))
     }
 
+    /// Return the integer model for concrete integer values and retained
+    /// ADR 0009 template parameters. Ordinary post-mono declarations never
+    /// contain `Ty::Param`; this helper keeps template checking explicit.
+    pub fn int_model(self) -> Option<IntTy> {
+        match self {
+            Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Some(integer),
+            Ty::Param(parameter) => Some(IntTy::TParam(parameter.legacy_index())),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> String {
         match self {
             Ty::Int(t) => t.name().to_string(),
             Ty::Bool => "bool".to_string(),
+            Ty::Param(parameter) => format!("<T{}>", parameter.index()),
             Ty::Array(t, Mutability::Shared) => format!("&[{}]", t.name()),
             Ty::Array(t, Mutability::Mut) => format!("&mut [{}]", t.name()),
             Ty::Array(t, Mutability::Owned) => format!("[{}]", t.name()),
@@ -1053,7 +1124,7 @@ pub enum ExprKind {
     /// `alloc_array<T>(len, init)` — a fresh owned array (design §7/§10:
     /// allocation failure is a named OOM trap, not a VC).
     AllocArray {
-        elem: IntTy,
+        elem: ValueTy,
         len: Box<Expr>,
         init: Box<Expr>,
     },
@@ -1289,6 +1360,59 @@ pub struct Param {
     pub consumes: bool,
 }
 
+/// Why a concrete monomorphized declaration may reuse a retained template's
+/// proof instead of generating its own obligations.
+///
+/// Naming the ADR 0009 integer model in the variant makes the proof domain
+/// explicit: future bool/record instances cannot silently inherit a theorem
+/// proved only for integer-valued templates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofReuse {
+    None,
+    /// Opaque authorization issued only by monomorphization after validating
+    /// a concrete all-integer instantiation. External AST callers may inspect
+    /// this marker but cannot forge its private payload.
+    Adr0009IntModel(Adr0009IntModelReuse),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adr0009IntModelReuse {
+    template: String,
+    _mono_authority: (),
+}
+
+impl Adr0009IntModelReuse {
+    pub fn template(&self) -> &str {
+        &self.template
+    }
+}
+
+impl ProofReuse {
+    pub fn template(&self) -> Option<&str> {
+        match self {
+            ProofReuse::None => None,
+            ProofReuse::Adr0009IntModel(reuse) => Some(reuse.template()),
+        }
+    }
+
+    pub fn is_none(&self) -> bool {
+        matches!(self, ProofReuse::None)
+    }
+
+    pub(crate) fn adr0009_int_model(template: String) -> ProofReuse {
+        ProofReuse::Adr0009IntModel(Adr0009IntModelReuse {
+            template,
+            _mono_authority: (),
+        })
+    }
+}
+
+impl Default for ProofReuse {
+    fn default() -> ProofReuse {
+        ProofReuse::None
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Fn {
     /// Exported to importers (`pub fn`, ADR 0019). Methods, inits,
@@ -1311,7 +1435,7 @@ pub struct Fn {
     /// Set by mono on instances of a template-verified generic: the
     /// instance skips its own obligations (the template's theorems
     /// cover them) and owes only the substituted `requires`.
-    pub from_template: Option<String>,
+    pub proof_reuse: ProofReuse,
     pub params: Vec<Param>,
     pub ret: Ty,
     pub pres: Vec<Clause>,
@@ -1455,7 +1579,7 @@ pub struct ClassDecl {
     pub type_bounds: Vec<Option<String>>,
     /// Set by mono on instances of a template-verified generic class
     /// (ADR 0009): members skip their own obligations.
-    pub from_template: Option<String>,
+    pub proof_reuse: ProofReuse,
     pub fields: Vec<Field>,
     /// Class invariant clauses — interface blocks (design §7).
     pub invariants: Vec<Clause>,
@@ -1591,6 +1715,29 @@ mod generic_ty_tests {
             MAX_TYPE_PARAMS - 1
         );
         assert_eq!(TypeParamId::new(MAX_TYPE_PARAMS), None);
+    }
+
+    #[test]
+    fn value_types_normalize_legacy_parameters_without_claiming_integer_semantics() {
+        let parameter = TypeParamId::from_legacy(7);
+        assert_eq!(ValueTy::from(IntTy::I32), ValueTy::Int(IntTy::I32));
+        assert_eq!(ValueTy::from(IntTy::TParam(7)), ValueTy::Param(parameter));
+        assert!(!ValueTy::Param(parameter).is_concrete());
+        assert!(!ValueTy::Int(IntTy::TParam(7)).is_concrete());
+        assert!(ValueTy::Bool.is_concrete());
+        assert_eq!(Ty::Param(parameter).name(), "<T7>");
+        assert_eq!(Ty::Option(ValueTy::Param(parameter)).name(), "option<<T7>>");
+    }
+
+    #[test]
+    fn proof_reuse_names_its_integer_model_domain() {
+        let none = ProofReuse::None;
+        assert!(none.is_none());
+        assert_eq!(none.template(), None);
+
+        let reuse = ProofReuse::adr0009_int_model("identity".into());
+        assert!(!reuse.is_none());
+        assert_eq!(reuse.template(), Some("identity"));
     }
 
     #[test]

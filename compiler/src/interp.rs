@@ -86,6 +86,227 @@ type IResult<T> = Result<T, Trap>;
 
 const FUEL: u64 = 50_000_000;
 
+/// The interpreter still stores ordinary arrays and options as `i128`
+/// payloads.  G1 makes other payload kinds representable in the checked AST,
+/// so raw `Program` callers need the same explicit domain boundary as normal
+/// checked callers: a newly representable payload must not silently inherit
+/// the old integer runtime semantics.
+fn validate_interp_program(program: &Program) -> Result<(), String> {
+    // Retained generic templates are proof artifacts and are never executed by
+    // the interpreter.  They intentionally contain `ValueTy::Param`; validate
+    // only the executable, monomorphized portion of the program.
+    for function in &program.fns {
+        validate_interp_fn(function)?;
+    }
+
+    for class in &program.classes {
+        for field in &class.fields {
+            validate_interp_ty(field.ty, &format!("field `{}.{}`", class.name, field.name))?;
+        }
+        for init in &class.inits {
+            validate_interp_fn(init)?;
+        }
+        for method in &class.methods {
+            validate_interp_fn(&method.f)?;
+        }
+        if let Some(deinit) = &class.deinit {
+            validate_interp_stmts(deinit)?;
+        }
+    }
+
+    for record in &program.records {
+        for field in &record.fields {
+            validate_interp_ty(field.ty, &format!("field `{}.{}`", record.name, field.name))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_interp_fn(function: &Fn) -> Result<(), String> {
+    for param in &function.params {
+        validate_interp_ty(param.ty, &format!("parameter `{}`", param.name))?;
+    }
+    validate_interp_ty(function.ret, &format!("return type of `{}`", function.name))?;
+    validate_interp_stmts(&function.body)
+}
+
+fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
+    match ty {
+        Ty::Array(payload, _) => validate_interp_payload(payload, context, "array"),
+        Ty::Option(payload) => validate_interp_payload(payload, context, "option"),
+        Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
+            "interp.type_parameter_unsupported: {context} contains an unresolved type parameter"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_interp_payload(payload: ValueTy, context: &str, aggregate: &str) -> Result<(), String> {
+    match payload {
+        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        _ => Err(format!(
+            "interp.aggregate_payload_unsupported: {context} has {aggregate} payload `{}`; \
+             the interpreter currently executes only concrete integer payloads",
+            payload.name()
+        )),
+    }
+}
+
+fn validate_interp_stmts(stmts: &[Stmt]) -> Result<(), String> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Decl { ty, init, name, .. } => {
+                validate_interp_ty(*ty, &format!("declaration `{name}`"))?;
+                if let Some(init) = init {
+                    validate_interp_expr(init)?;
+                }
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::ExprStmt(value)
+            | Stmt::FieldAssign { value, .. } => validate_interp_expr(value)?,
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                validate_interp_expr(cond)?;
+                validate_interp_stmts(then_block)?;
+                if let Some(else_block) = else_block {
+                    validate_interp_stmts(else_block)?;
+                }
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    validate_interp_expr(value)?;
+                }
+            }
+            Stmt::Assert(_) => {}
+            Stmt::VarDecl { name, init, ty, .. } => {
+                if let Some(ty) = ty {
+                    validate_interp_ty(*ty, &format!("inferred declaration `{name}`"))?;
+                }
+                validate_interp_expr(init)?;
+            }
+            Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                validate_interp_expr(index)?;
+                validate_interp_expr(value)?;
+            }
+            Stmt::While { cond, body, .. } => {
+                validate_interp_expr(cond)?;
+                validate_interp_stmts(body)?;
+            }
+            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                validate_interp_stmts(body)?;
+            }
+            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                validate_interp_expr(size)?;
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                validate_interp_expr(ptr)?;
+                validate_interp_expr(res)?;
+                validate_interp_expr(release)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_interp_expr(expr: &Expr) -> Result<(), String> {
+    if let Some(ty) = expr.ty {
+        validate_interp_ty(ty, "expression annotation")?;
+    }
+
+    match &expr.kind {
+        ExprKind::Index { index, .. } => {
+            match expr.ty {
+                Some(Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_)) => {}
+                Some(ty) => {
+                    return Err(format!(
+                        "interp.index_result_unsupported: array index result has type `{}`; \
+                         the interpreter requires a concrete integer annotation",
+                        ty.name()
+                    ));
+                }
+                None => {
+                    return Err(
+                        "interp.index_result_unsupported: array index result has no type; \
+                         the interpreter requires a concrete integer annotation"
+                            .into(),
+                    );
+                }
+            }
+            validate_interp_expr(index)?;
+        }
+        ExprKind::AllocArray { elem, len, init } => {
+            validate_interp_payload(*elem, "alloc_array", "array")?;
+            validate_interp_expr(len)?;
+            validate_interp_expr(init)?;
+        }
+        ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
+            if matches!(target, IntTy::TParam(_)) {
+                return Err(
+                    "interp.type_parameter_unsupported: conversion target contains an unresolved type parameter"
+                        .into(),
+                );
+            }
+            validate_interp_expr(arg)?;
+        }
+        ExprKind::Call {
+            type_args, args, ..
+        }
+        | ExprKind::CtorCall {
+            type_args, args, ..
+        } => {
+            if !type_args.is_empty() {
+                return Err(
+                    "interp.type_parameter_unsupported: generic type arguments escaped monomorphization"
+                        .into(),
+                );
+            }
+            for arg in args {
+                validate_interp_expr(arg)?;
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => validate_interp_expr(operand)?,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            validate_interp_expr(lhs)?;
+            validate_interp_expr(rhs)?;
+        }
+        ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::TraitCall { args, .. }
+        | ExprKind::MethodCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::ArrayLit(args) => {
+            for arg in args {
+                validate_interp_expr(arg)?;
+            }
+        }
+        ExprKind::SelfFieldIndex { index, .. } | ExprKind::ClassFieldIndex { index, .. } => {
+            validate_interp_expr(index)?;
+        }
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Len { .. }
+        | ExprKind::NoneE
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::Borrow { .. } => {}
+    }
+    Ok(())
+}
+
 /// Most resources are wholly erased even in the interpreter. A resource map
 /// alone carries sanitizer shadow metadata so invalid test code can be caught
 /// independently of Lean; that metadata must follow ordinary Sable calls even
@@ -101,6 +322,19 @@ fn has_resource_shadow(ty: Ty) -> bool {
 }
 
 pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<TestReport> {
+    if let Err(error) = validate_interp_program(program) {
+        return program
+            .fns
+            .iter()
+            .filter(|function| function.name.starts_with("test_"))
+            .map(|function| TestReport {
+                name: function.name.clone(),
+                outcome: Err(error.clone()),
+                skipped: Vec::new(),
+            })
+            .collect();
+    }
+
     let source = mods.combined_source.as_str();
     let ghosts = GhostDefs::from_items(&program.ghosts);
     let fns: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -154,6 +388,15 @@ pub fn run_fn_observed(
     mods: &crate::modules::ModuleSet,
     name: &str,
 ) -> ObservedRun {
+    if let Err(error) = validate_interp_program(program) {
+        return ObservedRun {
+            outcome: Err(error),
+            mmio: Vec::new(),
+            uart_profile: None,
+            uart_cursor: 0,
+        };
+    }
+
     let ghosts = GhostDefs::from_items(&program.ghosts);
     let fns: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let f = fns[name];
@@ -2550,5 +2793,163 @@ fn stmt_span(stmt: &Stmt) -> crate::span::Span {
         Stmt::VarDecl { name_span, .. } => *name_span,
         Stmt::FieldAssign { field_span, .. } => *field_span,
         Stmt::FieldStore { field_span, .. } => *field_span,
+    }
+}
+
+#[cfg(test)]
+mod g1_payload_guard_tests {
+    use super::*;
+    use crate::span::Span;
+
+    fn empty_program() -> Program {
+        Program {
+            fns: Vec::new(),
+            fn_templates: Vec::new(),
+            class_templates: Vec::new(),
+            classes: Vec::new(),
+            records: Vec::new(),
+            traits: Vec::new(),
+            impls: Vec::new(),
+            discharges: Vec::new(),
+            ghosts: Vec::new(),
+            defers: Vec::new(),
+            assumes: Vec::new(),
+            operators: Vec::new(),
+            uses: Vec::new(),
+            consts: Vec::new(),
+        }
+    }
+
+    fn function(name: &str, ret: Ty, body: Vec<Stmt>) -> Fn {
+        Fn {
+            is_pub: false,
+            extern_info: None,
+            name: name.into(),
+            name_span: Span::new(0, 0),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            requires: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            params: Vec::new(),
+            ret,
+            pres: Vec::new(),
+            posts: Vec::new(),
+            variant: None,
+            body,
+            span: Span::new(0, 0),
+        }
+    }
+
+    fn expr(kind: ExprKind, ty: Option<Ty>) -> Expr {
+        Expr {
+            kind,
+            span: Span::new(0, 0),
+            ty,
+        }
+    }
+
+    fn int_lit(value: i128) -> Expr {
+        expr(ExprKind::IntLit(value), Some(Ty::Int(IntTy::U64)))
+    }
+
+    #[test]
+    fn rejects_every_non_integer_option_payload() {
+        let unsupported = [
+            ValueTy::Bool,
+            ValueTy::Record(0),
+            ValueTy::Param(TypeParamId::from_legacy(0)),
+            ValueTy::Int(IntTy::TParam(0)),
+        ];
+
+        for payload in unsupported {
+            let mut program = empty_program();
+            program
+                .fns
+                .push(function("subject", Ty::Option(payload), Vec::new()));
+            let error = validate_interp_program(&program)
+                .expect_err("a non-integer option must not inherit i128 execution");
+            assert!(
+                error.starts_with("interp.aggregate_payload_unsupported:"),
+                "{payload:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursively_checks_alloc_array_element_metadata() {
+        let allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(int_lit(1)),
+                init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
+            },
+            Some(Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned)),
+        );
+        let mut program = empty_program();
+        program.fns.push(function(
+            "subject",
+            Ty::Unit,
+            vec![Stmt::Unsafe {
+                kw_span: Span::new(0, 0),
+                body: vec![Stmt::ExprStmt(allocation)],
+            }],
+        ));
+
+        assert_eq!(
+            validate_interp_program(&program).unwrap_err(),
+            "interp.aggregate_payload_unsupported: alloc_array has array payload `bool`; \
+             the interpreter currently executes only concrete integer payloads"
+        );
+    }
+
+    #[test]
+    fn index_requires_a_concrete_integer_result_annotation() {
+        let load = expr(
+            ExprKind::Index {
+                array: "values".into(),
+                array_span: Span::new(0, 0),
+                index: Box::new(int_lit(0)),
+            },
+            Some(Ty::Bool),
+        );
+        let mut program = empty_program();
+        program.fns.push(function(
+            "subject",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(load),
+                span: Span::new(0, 0),
+            }],
+        ));
+
+        assert_eq!(
+            validate_interp_program(&program).unwrap_err(),
+            "interp.index_result_unsupported: array index result has type `bool`; \
+             the interpreter requires a concrete integer annotation"
+        );
+    }
+
+    #[test]
+    fn permits_integer_execution_and_ignores_retained_templates() {
+        let mut program = empty_program();
+        program.fns.push(function(
+            "subject",
+            Ty::Option(ValueTy::Int(IntTy::U64)),
+            vec![Stmt::Return {
+                value: Some(expr(
+                    ExprKind::NoneE,
+                    Some(Ty::Option(ValueTy::Int(IntTy::U64))),
+                )),
+                span: Span::new(0, 0),
+            }],
+        ));
+        program.fn_templates.push(function(
+            "template",
+            Ty::Option(ValueTy::Param(TypeParamId::from_legacy(0))),
+            Vec::new(),
+        ));
+
+        validate_interp_program(&program)
+            .expect("the executable integer domain should remain unchanged");
     }
 }

@@ -302,7 +302,7 @@ pub fn load(
 /// text) sees the whole DAG. Enforced on the per-module parses, before
 /// the flat merge erases ownership.
 fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
-    use crate::ast::{Expr, ExprKind, GenericTy, RawOp, ResKind, Stmt, Ty, TypeArg};
+    use crate::ast::{Expr, ExprKind, GenericTy, RawOp, ResKind, Stmt, Ty, TypeArg, ValueTy};
 
     // Each legal source namespace gets its own global index. Runtime items
     // deliberately share one table; traits and constants do not participate
@@ -438,6 +438,21 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
         }
     }
 
+    /// Collect every nominal reference carried by a storable aggregate
+    /// payload. Keeping this match exhaustive prevents a newly represented
+    /// payload kind from silently bypassing module visibility.
+    fn walk_value_ty(
+        ty: &ValueTy,
+        span: Span,
+        record_externs: &[String],
+        refs: &mut Vec<(ItemNamespace, String, Span)>,
+    ) {
+        match ty {
+            ValueTy::Record(index) => push_record_ref(*index, span, record_externs, refs),
+            ValueTy::Int(_) | ValueTy::Bool | ValueTy::Param(_) => {}
+        }
+    }
+
     /// Collect every nominal reference carried by a checked `Ty`. Keeping the
     /// match exhaustive makes a new type form a visibility-pass compile error
     /// rather than an accidental bypass.
@@ -479,7 +494,10 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     push_record_ref(index, span, record_externs, refs);
                 }
             }
-            Ty::Int(_) | Ty::Bool | Ty::Array(_, _) | Ty::Option(_) | Ty::Raw(_) | Ty::Unit => {}
+            Ty::Array(element, _) | Ty::Option(element) => {
+                walk_value_ty(element, span, record_externs, refs)
+            }
+            Ty::Int(_) | Ty::Param(_) | Ty::Bool | Ty::Raw(_) | Ty::Unit => {}
         }
     }
 
@@ -605,7 +623,8 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     walk_expr(el, refs, const_names, record_externs);
                 }
             }
-            ExprKind::AllocArray { len, init, .. } => {
+            ExprKind::AllocArray { elem, len, init } => {
+                walk_value_ty(elem, e.span, record_externs, refs);
                 walk_expr(len, refs, const_names, record_externs);
                 walk_expr(init, refs, const_names, record_externs);
             }
@@ -1185,6 +1204,7 @@ fn collision(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{ExprKind, Mutability, Stmt, Ty, ValueTy};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1223,6 +1243,95 @@ mod tests {
         match load(&fixture.root(), &[]) {
             Err((diagnostic, _)) => diagnostic,
             Ok(_) => panic!("module fixture unexpectedly loaded"),
+        }
+    }
+
+    fn parse_fixture(fixture: &FixtureDir) -> Loading {
+        let mut loading = Loading {
+            set: ModuleSet {
+                modules: Vec::new(),
+                combined_source: String::new(),
+                import_edges: Vec::new(),
+            },
+            programs: Vec::new(),
+            seen: Vec::new(),
+            stack: Vec::new(),
+            module_paths: Vec::new(),
+            imports: Vec::new(),
+            externs: Vec::new(),
+            record_externs: Vec::new(),
+        };
+        if let Err(diagnostic) = load_file(&mut loading, &fixture.root(), None) {
+            panic!(
+                "module fixture should parse before synthetic mutation:\n{}",
+                loading.set.render(&diagnostic)
+            );
+        }
+        loading
+    }
+
+    #[derive(Clone, Copy)]
+    enum AggregateRecordSite {
+        ArrayParameter,
+        OptionReturn,
+        AllocationElement,
+    }
+
+    fn inject_record_payload(loading: &mut Loading, record_name: &str, site: AggregateRecordSite) {
+        let root_index = 0;
+        let record_index = loading
+            .record_externs
+            .iter()
+            .find(|(module, _)| *module == root_index)
+            .and_then(|(_, records)| records.iter().position(|name| name == record_name))
+            .expect("record is present in the root module's checked index space");
+        let root = loading
+            .programs
+            .iter_mut()
+            .find(|(module, _)| *module == root_index)
+            .map(|(_, program)| program)
+            .expect("root program is parsed");
+
+        match site {
+            AggregateRecordSite::ArrayParameter => {
+                let function = root
+                    .fns
+                    .iter_mut()
+                    .find(|function| function.name == "aggregate")
+                    .expect("aggregate function exists");
+                function.params[0].ty =
+                    Ty::Array(ValueTy::Record(record_index), Mutability::Shared);
+            }
+            AggregateRecordSite::OptionReturn => {
+                let function = root
+                    .fns
+                    .iter_mut()
+                    .find(|function| function.name == "aggregate")
+                    .expect("aggregate function exists");
+                function.ret = Ty::Option(ValueTy::Record(record_index));
+            }
+            AggregateRecordSite::AllocationElement => {
+                let function = root
+                    .fns
+                    .iter_mut()
+                    .find(|function| function.name == "allocation")
+                    .expect("allocation function exists");
+                let expression = function
+                    .body
+                    .iter_mut()
+                    .find_map(|statement| match statement {
+                        Stmt::Decl {
+                            init: Some(expression),
+                            ..
+                        } => Some(expression),
+                        _ => None,
+                    })
+                    .expect("allocation initializer exists");
+                let ExprKind::AllocArray { elem, .. } = &mut expression.kind else {
+                    panic!("initializer is an array allocation");
+                };
+                *elem = ValueTy::Record(record_index);
+            }
         }
     }
 
@@ -1336,6 +1445,79 @@ fn read() -> u64 {
         let diagnostic = load_error(&fixture);
         assert_eq!(diagnostic.name, "module.not_imported");
         assert!(diagnostic.title.contains("Shared"));
+    }
+
+    #[test]
+    fn aggregate_record_payloads_obey_private_visibility() {
+        for site in [
+            AggregateRecordSite::ArrayParameter,
+            AggregateRecordSite::OptionReturn,
+            AggregateRecordSite::AllocationElement,
+        ] {
+            let fixture = FixtureDir::new(&[
+                (
+                    "types.sable",
+                    "record Hidden #[layout(size := 1, align := 1)] {}\n",
+                ),
+                (
+                    "root.sable",
+                    r#"use types;
+
+fn aggregate(&[u64] values) -> option<u64> {
+    return none;
+}
+
+fn allocation() {
+    [u64] values = alloc_array<u64>(1, 0);
+}
+"#,
+                ),
+            ]);
+            let mut loading = parse_fixture(&fixture);
+            inject_record_payload(&mut loading, "Hidden", site);
+
+            let diagnostic = enforce_visibility(&loading)
+                .expect_err("synthetic aggregate record payload should be private");
+            assert_eq!(diagnostic.name, "module.private");
+            assert!(diagnostic.title.contains("Hidden"));
+        }
+    }
+
+    #[test]
+    fn aggregate_record_payloads_require_a_direct_import() {
+        for site in [
+            AggregateRecordSite::ArrayParameter,
+            AggregateRecordSite::OptionReturn,
+            AggregateRecordSite::AllocationElement,
+        ] {
+            let fixture = FixtureDir::new(&[
+                (
+                    "types.sable",
+                    "pub record Shared #[layout(size := 1, align := 1)] {}\n",
+                ),
+                ("middle.sable", "use types;\n"),
+                (
+                    "root.sable",
+                    r#"use middle;
+
+fn aggregate(&[u64] values) -> option<u64> {
+    return none;
+}
+
+fn allocation() {
+    [u64] values = alloc_array<u64>(1, 0);
+}
+"#,
+                ),
+            ]);
+            let mut loading = parse_fixture(&fixture);
+            inject_record_payload(&mut loading, "Shared", site);
+
+            let diagnostic = enforce_visibility(&loading)
+                .expect_err("synthetic aggregate record payload should require a direct import");
+            assert_eq!(diagnostic.name, "module.not_imported");
+            assert!(diagnostic.title.contains("Shared"));
+        }
     }
 
     #[test]

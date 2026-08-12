@@ -1119,6 +1119,29 @@ impl<'a> Parser<'a> {
             })
     }
 
+    /// The currently admitted array/option payload grammar: concrete integer
+    /// types plus an in-scope declaration parameter. Unlike `int_ty`, this
+    /// preserves a parameter as `ValueTy::Param`, so later stages cannot infer
+    /// integer semantics from its representation. Bool and record payloads
+    /// remain a later G1 semantic slice.
+    fn value_ty(&mut self) -> PResult<(ValueTy, Span)> {
+        let (name, span) = self.ident()?;
+        if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
+            let parameter = TypeParamId::new(index)
+                .expect("type_param_list enforces the type-parameter ceiling");
+            return Ok((ValueTy::Param(parameter), span));
+        }
+        IntTy::from_name(&name)
+            .map(|ty| (ValueTy::Int(ty), span))
+            .ok_or_else(|| Diagnostic {
+                name: "parse.unknown_type".into(),
+                title: format!("unknown integer type `{name}`"),
+                span,
+                label: "expected `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter".into(),
+                notes: vec![],
+            })
+    }
+
     /// `<T, U>` / `<K: Hashable, V>` after a declaration name.
     fn type_param_list(&mut self) -> PResult<(Vec<String>, Vec<Option<String>>)> {
         if !self.at(&Tok::Lt) {
@@ -1222,7 +1245,7 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect(Tok::LBracket)?;
-            let (elem, _) = self.int_ty()?;
+            let (elem, _) = self.value_ty()?;
             let end = self.expect(Tok::RBracket)?.span;
             return Ok((Ty::Array(elem, mutability), start.join(end)));
         }
@@ -1297,7 +1320,7 @@ impl<'a> Parser<'a> {
                 }),
             };
         }
-        let (elem, _) = self.int_ty()?;
+        let (elem, _) = self.value_ty()?;
         let end = self.expect(Tok::Gt)?.span;
         Ok((Ty::Option(elem), start.join(end)))
     }
@@ -1517,9 +1540,9 @@ impl<'a> Parser<'a> {
             return Ok((Ty::Bool, span));
         }
         if let Some(i) = self.tparams.iter().position(|p| *p == name) {
-            let index = u8::try_from(i)
-                .expect("type_param_list enforces the legacy type-parameter ceiling");
-            return Ok((Ty::Int(IntTy::TParam(index)), span));
+            let parameter =
+                TypeParamId::new(i).expect("type_param_list enforces the type-parameter ceiling");
+            return Ok((Ty::Param(parameter), span));
         }
         IntTy::from_name(&name)
             .map(|t| (Ty::Int(t), span))
@@ -1654,7 +1677,7 @@ impl<'a> Parser<'a> {
                 }
                 Tok::LBracket => {
                     self.bump();
-                    let (elem, _) = self.int_ty()?;
+                    let (elem, _) = self.value_ty()?;
                     self.expect(Tok::RBracket)?;
                     let (fname, fspan) = self.ident()?;
                     self.expect(Tok::Semi)?;
@@ -1722,7 +1745,7 @@ impl<'a> Parser<'a> {
             name_span,
             type_params,
             type_bounds,
-            from_template: None,
+            proof_reuse: ProofReuse::None,
             fields,
             invariants,
             inits,
@@ -1961,7 +1984,7 @@ impl<'a> Parser<'a> {
             type_params: Vec::new(),
             type_bounds: Vec::new(),
             requires: Vec::new(),
-            from_template: None,
+            proof_reuse: ProofReuse::None,
             params,
             ret: Ty::Unit,
             pres: Vec::new(),
@@ -2013,7 +2036,7 @@ impl<'a> Parser<'a> {
                 type_params: Vec::new(),
                 type_bounds: Vec::new(),
                 requires: Vec::new(),
-                from_template: None,
+                proof_reuse: ProofReuse::None,
                 params,
                 ret,
                 pres: Vec::new(),
@@ -2254,7 +2277,7 @@ impl<'a> Parser<'a> {
             type_params,
             type_bounds,
             requires: Vec::new(),
-            from_template: None,
+            proof_reuse: ProofReuse::None,
             params,
             ret,
             pres: Vec::new(),
@@ -2383,7 +2406,7 @@ impl<'a> Parser<'a> {
                 type_params: Vec::new(),
                 type_bounds: Vec::new(),
                 requires: Vec::new(),
-                from_template: None,
+                proof_reuse: ProofReuse::None,
                 params,
                 ret,
                 pres: Vec::new(),
@@ -2484,7 +2507,7 @@ impl<'a> Parser<'a> {
                 type_params: Vec::new(),
                 type_bounds: Vec::new(),
                 requires: Vec::new(),
-                from_template: None,
+                proof_reuse: ProofReuse::None,
                 params,
                 ret,
                 pres: Vec::new(),
@@ -2627,7 +2650,14 @@ impl<'a> Parser<'a> {
         }
 
         self.expect(Tok::LParen)?;
-        let (ity, _) = self.int_ty()?;
+        let (value_ty, _) = self.value_ty()?;
+        let loop_ty = match value_ty {
+            ValueTy::Int(integer) => Ty::Int(integer),
+            ValueTy::Param(parameter) => Ty::Param(parameter),
+            ValueTy::Bool | ValueTy::Record(_) => {
+                unreachable!("value_ty currently admits only integers and parameters")
+            }
+        };
         let (index, index_span) = self.ident()?;
         if is_reserved_name(&index) {
             return Err(reserved_name_error(&index, index_span, "loop index"));
@@ -2750,7 +2780,7 @@ impl<'a> Parser<'a> {
 
         Ok(vec![
             Stmt::Decl {
-                ty: Ty::Int(ity),
+                ty: loop_ty,
                 name: index,
                 name_span: index_span,
                 init: Some(init),
@@ -2972,7 +3002,7 @@ impl<'a> Parser<'a> {
                         })
                         .collect();
                     self.pending.push(Stmt::Decl {
-                        ty: Ty::Array(IntTy::U8, Mutability::Owned),
+                        ty: Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
                         name: temp.clone(),
                         name_span: lit_span,
                         init: Some(Expr {
@@ -3105,7 +3135,7 @@ impl<'a> Parser<'a> {
                 // `[i32] a = [1, 2, 3];` — owned array local (tests only;
                 // the checker enforces the context).
                 self.bump();
-                let (elem, _) = self.int_ty()?;
+                let (elem, _) = self.value_ty()?;
                 self.expect(Tok::RBracket)?;
                 let (name, name_span) = self.ident()?;
                 if is_reserved_name(&name) {
@@ -3832,7 +3862,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(name) if name == "alloc_array" => {
                 self.bump();
                 self.expect(Tok::Lt)?;
-                let (elem, _) = self.int_ty()?;
+                let (elem, _) = self.value_ty()?;
                 self.expect(Tok::Gt)?;
                 self.expect(Tok::LParen)?;
                 let len = self.expr()?;
@@ -4673,6 +4703,40 @@ mod generic_type_arg_tests {
     }
 
     #[test]
+    fn declaration_type_parameters_keep_non_integer_representations() {
+        let source = r#"
+fn plumbing<T>(&[T] input, T value) -> option<T> {
+    [T] copy = alloc_array<T>(input.len, value);
+    return some(copy[0]);
+}
+"#;
+        let program = parse_source(source).unwrap();
+        let function = &program.fns[0];
+        let parameter = TypeParamId::from_legacy(0);
+
+        assert_eq!(
+            function.params[0].ty,
+            Ty::Array(ValueTy::Param(parameter), Mutability::Shared)
+        );
+        assert_eq!(function.params[1].ty, Ty::Param(parameter));
+        assert_eq!(function.ret, Ty::Option(ValueTy::Param(parameter)));
+
+        let Stmt::Decl {
+            ty,
+            init: Some(initializer),
+            ..
+        } = &function.body[0]
+        else {
+            panic!("expected the owned array declaration");
+        };
+        assert_eq!(*ty, Ty::Array(ValueTy::Param(parameter), Mutability::Owned));
+        let ExprKind::AllocArray { elem, .. } = &initializer.kind else {
+            panic!("expected alloc_array initializer");
+        };
+        assert_eq!(*elem, ValueTy::Param(parameter));
+    }
+
+    #[test]
     fn type_parameter_ceiling_accepts_256_and_rejects_the_257th_name() {
         let names = type_parameter_names(MAX_TYPE_PARAMS);
         let last = format!("T{}", MAX_TYPE_PARAMS - 1);
@@ -4680,8 +4744,9 @@ mod generic_type_arg_tests {
         let program = parse_source(&source).unwrap();
 
         assert_eq!(program.fns[0].type_params.len(), MAX_TYPE_PARAMS);
-        assert_eq!(program.fns[0].params[0].ty, Ty::Int(IntTy::TParam(u8::MAX)));
-        assert_eq!(program.fns[0].ret, Ty::Int(IntTy::TParam(u8::MAX)));
+        let last_parameter = TypeParamId::from_legacy(u8::MAX);
+        assert_eq!(program.fns[0].params[0].ty, Ty::Param(last_parameter));
+        assert_eq!(program.fns[0].ret, Ty::Param(last_parameter));
 
         let names = type_parameter_names(MAX_TYPE_PARAMS + 1);
         let source = format!("fn too_wide<{names}>() {{}}\n");

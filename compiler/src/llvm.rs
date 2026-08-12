@@ -1886,7 +1886,7 @@ fn diag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{Param, Program};
+    use crate::ast::{Param, Program, ProofReuse, ValueTy};
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
         Expr {
@@ -1905,7 +1905,7 @@ mod tests {
             type_params: Vec::new(),
             type_bounds: Vec::new(),
             requires: Vec::new(),
-            from_template: None,
+            proof_reuse: ProofReuse::None,
             params: Vec::<Param>::new(),
             ret,
             pres: Vec::new(),
@@ -2096,7 +2096,7 @@ mod tests {
         );
         unrelated.params = vec![parameter(
             "values",
-            Ty::Array(IntTy::I32, crate::ast::Mutability::Shared),
+            Ty::Array(ValueTy::Int(IntTy::I32), crate::ast::Mutability::Shared),
         )];
         let program = program(vec![entry, unrelated]);
 
@@ -2122,7 +2122,7 @@ mod tests {
             Ty::Bool,
             vec![
                 Stmt::Decl {
-                    ty: Ty::Array(IntTy::I32, crate::ast::Mutability::Owned),
+                    ty: Ty::Array(ValueTy::Int(IntTy::I32), crate::ast::Mutability::Owned),
                     name: "values".into(),
                     name_span: Span::new(0, 1),
                     init: None,

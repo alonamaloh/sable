@@ -29,11 +29,200 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
+/// The current SVM represents arrays and ordinary options with integer
+/// machine values. Keep that representation boundary explicit while G1 grows
+/// the checked AST's payload vocabulary: a new payload kind must not inherit
+/// integer lowering merely because the emitted constructor is untyped.
+fn validate_fn_payloads(f: &Fn) -> Result<(), String> {
+    for param in &f.params {
+        validate_ty_payload(param.ty, &format!("parameter `{}`", param.name))?;
+    }
+    validate_ty_payload(f.ret, &format!("return type of `{}`", f.name))?;
+    validate_stmt_payloads(&f.body)
+}
+
+fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
+    match ty {
+        Ty::Array(payload, _) => validate_payload(payload, context, "array"),
+        Ty::Option(payload) => validate_payload(payload, context, "option"),
+        Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
+            "svm.type_parameter_unsupported: {context} contains an unresolved type parameter"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_payload(payload: ValueTy, context: &str, aggregate: &str) -> Result<(), String> {
+    match payload {
+        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        _ => Err(format!(
+            "svm.aggregate_payload_unsupported: {context} has {aggregate} payload `{}`; \
+             the SVM currently lowers only concrete integer payloads",
+            payload.name()
+        )),
+    }
+}
+
+fn validate_stmt_payloads(stmts: &[Stmt]) -> Result<(), String> {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Decl { ty, init, name, .. } => {
+                validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
+                if let Some(init) = init {
+                    validate_expr_payloads(init)?;
+                }
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::ExprStmt(value)
+            | Stmt::FieldAssign { value, .. } => validate_expr_payloads(value)?,
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                validate_expr_payloads(cond)?;
+                validate_stmt_payloads(then_block)?;
+                if let Some(else_block) = else_block {
+                    validate_stmt_payloads(else_block)?;
+                }
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    validate_expr_payloads(value)?;
+                }
+            }
+            Stmt::Assert(_) => {}
+            Stmt::VarDecl { name, init, ty, .. } => {
+                if let Some(ty) = ty {
+                    validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
+                }
+                validate_expr_payloads(init)?;
+            }
+            Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                validate_expr_payloads(index)?;
+                validate_expr_payloads(value)?;
+            }
+            Stmt::While { cond, body, .. } => {
+                validate_expr_payloads(cond)?;
+                validate_stmt_payloads(body)?;
+            }
+            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                validate_stmt_payloads(body)?;
+            }
+            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                validate_expr_payloads(size)?;
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                validate_expr_payloads(ptr)?;
+                validate_expr_payloads(res)?;
+                validate_expr_payloads(release)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_expr_payloads(expr: &Expr) -> Result<(), String> {
+    if let Some(ty) = expr.ty {
+        validate_ty_payload(ty, "expression annotation")?;
+    }
+
+    match &expr.kind {
+        ExprKind::Index { index, .. } => {
+            match expr.ty {
+                Some(Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_)) => {}
+                Some(ty) => {
+                    return Err(format!(
+                        "svm.index_result_unsupported: array index result has type `{}`; \
+                         the SVM requires a concrete integer annotation",
+                        ty.name()
+                    ));
+                }
+                None => {
+                    return Err(
+                        "svm.index_result_unsupported: array index result has no type; \
+                         the SVM requires a concrete integer annotation"
+                            .into(),
+                    );
+                }
+            }
+            validate_expr_payloads(index)?;
+        }
+        ExprKind::AllocArray { elem, len, init } => {
+            validate_payload(*elem, "alloc_array", "array")?;
+            validate_expr_payloads(len)?;
+            validate_expr_payloads(init)?;
+        }
+        ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
+            if matches!(target, IntTy::TParam(_)) {
+                return Err(
+                    "svm.type_parameter_unsupported: conversion target contains an unresolved type parameter"
+                        .into(),
+                );
+            }
+            validate_expr_payloads(arg)?;
+        }
+        ExprKind::Call {
+            type_args, args, ..
+        }
+        | ExprKind::CtorCall {
+            type_args, args, ..
+        } => {
+            if !type_args.is_empty() {
+                return Err(
+                    "svm.type_parameter_unsupported: generic type arguments escaped monomorphization"
+                        .into(),
+                );
+            }
+            for arg in args {
+                validate_expr_payloads(arg)?;
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => validate_expr_payloads(operand)?,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            validate_expr_payloads(lhs)?;
+            validate_expr_payloads(rhs)?;
+        }
+        ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::TraitCall { args, .. }
+        | ExprKind::MethodCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::ArrayLit(args) => {
+            for arg in args {
+                validate_expr_payloads(arg)?;
+            }
+        }
+        ExprKind::SelfFieldIndex { index, .. } | ExprKind::ClassFieldIndex { index, .. } => {
+            validate_expr_payloads(index)?;
+        }
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Len { .. }
+        | ExprKind::NoneE
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::Borrow { .. } => {}
+    }
+    Ok(())
+}
+
 /// Lower a zero-argument function's body to a Lean `List Stmt` term.
 pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
     if !f.params.is_empty() {
         return Err("differential subjects must take no parameters".into());
     }
+    validate_fn_payloads(f)?;
     lower_block(&LowerCtx { program }, &f.body)
 }
 
@@ -43,6 +232,7 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
 /// caller has no machine analog yet).
 pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
     let ctx = LowerCtx { program };
+    validate_fn_payloads(f)?;
     for p in &f.params {
         match p.ty {
             Ty::Int(_) | Ty::Bool => {}
@@ -936,6 +1126,151 @@ mod tests {
         }
     }
 
+    fn empty_program() -> Program {
+        Program {
+            fns: Vec::new(),
+            fn_templates: Vec::new(),
+            class_templates: Vec::new(),
+            classes: Vec::new(),
+            records: Vec::new(),
+            traits: Vec::new(),
+            impls: Vec::new(),
+            discharges: Vec::new(),
+            ghosts: Vec::new(),
+            defers: Vec::new(),
+            assumes: Vec::new(),
+            operators: Vec::new(),
+            uses: Vec::new(),
+            consts: Vec::new(),
+        }
+    }
+
+    fn checked_fn(ret: Ty, body: Vec<Stmt>) -> Fn {
+        Fn {
+            is_pub: false,
+            extern_info: None,
+            name: "subject".into(),
+            name_span: Span::new(0, 0),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            requires: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            params: Vec::new(),
+            ret,
+            pres: Vec::new(),
+            posts: Vec::new(),
+            variant: None,
+            body,
+            span: Span::new(0, 0),
+        }
+    }
+
+    #[test]
+    fn lowering_rejects_every_non_integer_option_payload() {
+        let program = empty_program();
+        let unsupported = [
+            ValueTy::Bool,
+            ValueTy::Record(0),
+            ValueTy::Param(TypeParamId::from_legacy(0)),
+            ValueTy::Int(IntTy::TParam(0)),
+        ];
+
+        for payload in unsupported {
+            let function = checked_fn(Ty::Option(payload), Vec::new());
+            let error = lower_fn(&program, &function)
+                .expect_err("a non-integer option must not inherit integer SVM lowering");
+            assert!(
+                error.starts_with("svm.aggregate_payload_unsupported:"),
+                "{payload:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowering_rejects_non_integer_array_declaration() {
+        let program = empty_program();
+        let function = checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+                name: "values".into(),
+                name_span: Span::new(0, 0),
+                init: None,
+                mutable: false,
+            }],
+        );
+
+        let error = lower_fn(&program, &function)
+            .expect_err("a Boolean array must not inherit integer SVM lowering");
+        assert_eq!(
+            error,
+            "svm.aggregate_payload_unsupported: declaration `values` has array payload `bool`; \
+             the SVM currently lowers only concrete integer payloads"
+        );
+    }
+
+    #[test]
+    fn lowering_checks_alloc_array_element_even_if_annotation_is_integer() {
+        let program = empty_program();
+        let allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Record(0),
+                len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+            },
+            Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+        );
+        let function = checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+                name: "values".into(),
+                name_span: Span::new(0, 0),
+                init: Some(allocation),
+                mutable: false,
+            }],
+        );
+
+        let error = lower_fn(&program, &function)
+            .expect_err("AllocArray's own payload must be checked independently");
+        assert_eq!(
+            error,
+            "svm.aggregate_payload_unsupported: alloc_array has array payload `record`; \
+             the SVM currently lowers only concrete integer payloads"
+        );
+    }
+
+    #[test]
+    fn lowering_requires_concrete_integer_index_annotation() {
+        let program = empty_program();
+        let load = expr(
+            ExprKind::Index {
+                array: "values".into(),
+                array_span: Span::new(0, 0),
+                index: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64))),
+            },
+            Ty::Bool,
+        );
+        let function = checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: Ty::Bool,
+                name: "value".into(),
+                name_span: Span::new(0, 0),
+                init: Some(load),
+                mutable: false,
+            }],
+        );
+
+        let error = lower_fn(&program, &function)
+            .expect_err("SVM index loads produce concrete integer machine values");
+        assert_eq!(
+            error,
+            "svm.index_result_unsupported: array index result has type `bool`; \
+             the SVM requires a concrete integer annotation"
+        );
+    }
+
     #[test]
     fn erased_resource_op_accepts_unannotated_resource_place() {
         let mem = Expr {
@@ -971,22 +1306,7 @@ mod tests {
             Ty::Int(IntTy::U64),
         );
 
-        let program = Program {
-            fns: Vec::new(),
-            fn_templates: Vec::new(),
-            class_templates: Vec::new(),
-            classes: Vec::new(),
-            records: Vec::new(),
-            traits: Vec::new(),
-            impls: Vec::new(),
-            discharges: Vec::new(),
-            ghosts: Vec::new(),
-            defers: Vec::new(),
-            assumes: Vec::new(),
-            operators: Vec::new(),
-            uses: Vec::new(),
-            consts: Vec::new(),
-        };
+        let program = empty_program();
         let error = lower_resource_op_stmt(
             &LowerCtx { program: &program },
             ResOp::SplitOff,
