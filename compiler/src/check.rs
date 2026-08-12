@@ -25,6 +25,13 @@ pub struct ClassMeta {
     pub methods: Vec<(String, Vec<Param>, Ty, SelfKind)>,
 }
 
+#[derive(Clone)]
+pub struct RecordMeta {
+    pub name: String,
+    pub fields: Vec<(String, Ty)>,
+    pub layout: StorageLayout,
+}
+
 pub struct CheckResult {
     pub sigs: HashMap<String, FnSig>,
     /// How many `unsafe` regions the program opened. Reported by the
@@ -91,6 +98,7 @@ struct Ctx<'a> {
     /// nowhere else (ADR 0029).
     in_deinit: bool,
     class_metas: &'a [ClassMeta],
+    record_metas: &'a [RecordMeta],
     /// Name and declaration span of the enclosing class's
     /// `#[must_consume]` fields; empty outside a class member. A field
     /// keeps its marker when it is given a new value, so the sink needs
@@ -169,7 +177,10 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
         });
     }
     for p in &f.params {
-        let ok = matches!(p.ty, Ty::Int(_) | Ty::Raw(_) | Ty::ResRef(..) | Ty::Res(_));
+        let ok = matches!(
+            p.ty,
+            Ty::Int(_) | Ty::Raw(_) | Ty::RawRecord(_) | Ty::ResRef(..) | Ty::Res(_)
+        );
         if !ok {
             return Err(Diagnostic {
                 name: "extern.param_abi".into(),
@@ -268,12 +279,133 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         );
     }
 
+    // POD record signatures and explicit layout validation (ADR 0054).
+    // This is intentionally independent of class validation: the two
+    // categories share a source namespace, not ownership semantics.
+    let mut record_metas: Vec<RecordMeta> = Vec::new();
+    {
+        let mut seen: HashSet<String> = sigs.keys().cloned().collect();
+        for r in &program.records {
+            if !seen.insert(r.name.clone()) {
+                return Err(Diagnostic {
+                    name: "record.duplicate".into(),
+                    title: format!("`{}` is defined twice", r.name),
+                    span: r.name_span,
+                    label: "functions, classes, and records share one namespace".into(),
+                    notes: vec![],
+                });
+            }
+            if r.layout.size <= 0
+                || r.layout.align <= 0
+                || (r.layout.align & (r.layout.align - 1)) != 0
+            {
+                return Err(Diagnostic {
+                    name: "record.bad_layout".into(),
+                    title: format!("record `{}` has an invalid layout", r.name),
+                    span: r.layout_span,
+                    label: "size must be positive; alignment must be a positive power of two"
+                        .into(),
+                    notes: vec![(
+                        "note".into(),
+                        "layout establishes storage geometry only; it does not grant a byte \
+                         representation"
+                            .into(),
+                    )],
+                });
+            }
+            let mut fields = Vec::new();
+            let mut field_names = HashSet::new();
+            let mut extents: Vec<(i128, i128, &str, Span)> = Vec::new();
+            for field in &r.fields {
+                if !field_names.insert(field.name.clone()) {
+                    return Err(Diagnostic {
+                        name: "record.duplicate_field".into(),
+                        title: format!("duplicate field `{}`", field.name),
+                        span: field.span,
+                        label: "already declared in this record".into(),
+                        notes: vec![],
+                    });
+                }
+                let field_layout = match field.ty {
+                    Ty::Int(it) if !matches!(it, IntTy::TParam(_)) => it.layout(),
+                    Ty::RawRecord(_) | Ty::OptionRaw(_) => StorageLayout { size: 8, align: 8 },
+                    other => {
+                        return Err(Diagnostic {
+                            name: "record.field_type".into(),
+                            title: format!(
+                                "field `{}` has non-raw-storable type `{}`",
+                                field.name,
+                                other.name()
+                            ),
+                            span: field.span,
+                            label: "records initially hold integers and nullable/non-null raw record pointers"
+                                .into(),
+                            notes: vec![(
+                                "note".into(),
+                                "classes, resources, arrays, and nested records need separate \
+                                 ownership or layout decisions"
+                                    .into(),
+                            )],
+                        });
+                    }
+                };
+                let end = field.offset.checked_add(field_layout.size).ok_or_else(|| Diagnostic {
+                    name: "record.field_out_of_bounds".into(),
+                    title: format!("field `{}` extent overflows", field.name),
+                    span: field.offset_span,
+                    label: "offset plus field size is not representable".into(),
+                    notes: vec![],
+                })?;
+                if field.offset < 0
+                    || field.offset % field_layout.align != 0
+                    || end > r.layout.size
+                {
+                    return Err(Diagnostic {
+                        name: "record.field_out_of_bounds".into(),
+                        title: format!("field `{}` does not fit its declared record layout", field.name),
+                        span: field.offset_span,
+                        label: format!(
+                            "offset {} must be {}-aligned and the {}-byte field must end by {}",
+                            field.offset, field_layout.align, field_layout.size, r.layout.size
+                        ),
+                        notes: vec![],
+                    });
+                }
+                if let Some((_, _, other, other_span)) = extents
+                    .iter()
+                    .find(|(lo, hi, _, _)| field.offset < *hi && *lo < end)
+                {
+                    return Err(Diagnostic {
+                        name: "record.overlapping_fields".into(),
+                        title: format!("fields `{other}` and `{}` overlap", field.name),
+                        span: field.offset_span,
+                        label: "record fields must occupy disjoint half-open extents".into(),
+                        notes: vec![(
+                            "note".into(),
+                            format!("the earlier field's offset is declared at byte {}", other_span.start),
+                        )],
+                    });
+                }
+                extents.push((field.offset, end, field.name.as_str(), field.offset_span));
+                fields.push((field.name.clone(), field.ty));
+            }
+            record_metas.push(RecordMeta {
+                name: r.name.clone(),
+                fields,
+                layout: r.layout,
+            });
+        }
+    }
+
     // Class signatures + validation.
     let mut class_metas: Vec<ClassMeta> = Vec::new();
     {
         let mut seen = HashSet::new();
         for c in &program.classes {
-            if !seen.insert(c.name.clone()) || sigs.contains_key(&c.name) {
+            if !seen.insert(c.name.clone())
+                || sigs.contains_key(&c.name)
+                || program.records.iter().any(|r| r.name == c.name)
+            {
                 return Err(Diagnostic {
                     name: "type.duplicate_class".into(),
                     title: format!("`{}` is defined twice", c.name),
@@ -495,6 +627,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_init: false,
             in_deinit: false,
             class_metas: &class_metas,
+            record_metas: &record_metas,
             tbounds: HashMap::new(),
             operators: &operators,
             traits: &traits_c,
@@ -573,6 +706,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_init: false,
             in_deinit: false,
             class_metas: &class_metas,
+            record_metas: &record_metas,
             tbounds: tbounds_of(&f.type_params, &f.type_bounds),
             operators: &operators,
             traits: &traits_c,
@@ -650,6 +784,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_init: true,
             in_deinit: false,
                 class_metas: &class_metas,
+                record_metas: &record_metas,
                 tbounds: HashMap::new(),
                 operators: &operators,
                 traits: &traits_c,
@@ -719,6 +854,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_init: false,
             in_deinit: false,
                 class_metas: &class_metas,
+                record_metas: &record_metas,
                 tbounds: HashMap::new(),
                 operators: &operators,
                 traits: &traits_c,
@@ -795,6 +931,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_init: false,
                 in_deinit: true,
                 class_metas: &class_metas,
+                record_metas: &record_metas,
                 tbounds: HashMap::new(),
                 operators: &operators,
                 traits: &traits_c,
@@ -909,6 +1046,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_init: true,
             in_deinit: false,
                     class_metas: &tmetas,
+                    record_metas: &record_metas,
                     tbounds: ctb.clone(),
                     operators: &operators,
                     traits: &traits_c,
@@ -974,6 +1112,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_init: false,
             in_deinit: false,
                     class_metas: &tmetas,
+                    record_metas: &record_metas,
                     tbounds: ctb.clone(),
                     operators: &operators,
                     traits: &traits_c,
@@ -1049,6 +1188,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_init: false,
                     in_deinit: true,
                     class_metas: &tmetas,
+                    record_metas: &record_metas,
                     tbounds: ctb.clone(),
                     operators: &operators,
                     traits: &traits_c,
@@ -1161,7 +1301,14 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     // of raw memory is an ordinary number, and branding it
                     // would forbid returning the very thing the raw
                     // operations exist to produce.
-                    branded = matches!(ty, Ty::Raw(_) | Ty::Res(_)) && brand_of(ctx, e);
+                    branded = matches!(
+                        ty,
+                        Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Record(_)
+                            | Ty::Res(_)
+                    ) && brand_of(ctx, e);
                     // `resource RawSpan t = s;` — a local-to-local move,
                     // the same rule classes follow (ADR 0020/0024). A
                     // declaration is not an escape: the new local inherits
@@ -1582,7 +1729,14 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // rather than laundering it — which only works if the
                 // brand is actually computed here, exactly as a typed
                 // declaration computes it.
-                let branded = matches!(t, Ty::Raw(_) | Ty::Res(_)) && brand_of(ctx, init);
+                let branded = matches!(
+                    t,
+                    Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Record(_)
+                        | Ty::Res(_)
+                ) && brand_of(ctx, init);
                 let must_consume = transfer(ctx, init, None)?;
                 if t == Ty::Unit {
                     return Err(Diagnostic {
@@ -2375,7 +2529,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::IsSome { operand } => {
             match check_expr(ctx, operand, None)? {
-                Ty::Option(_) => {}
+                Ty::Option(_) | Ty::OptionRaw(_) => {}
                 other => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -2390,6 +2544,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::OptValue { operand } => match check_expr(ctx, operand, None)? {
             Ty::Option(it) => Ty::Int(it),
+            Ty::OptionRaw(ri) => Ty::RawRecord(ri),
             other => {
                 return Err(Diagnostic {
                     name: "type.mismatch".into(),
@@ -2405,6 +2560,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             obj_span,
             field,
         } => {
+            if matches!(ctx.vars.get(obj.as_str()).map(|v| v.ty), Some(Ty::Record(_))) {
+                let record_obj = obj.clone();
+                let record_obj_span = *obj_span;
+                let record_field = field.clone();
+                e.kind = ExprKind::RecordField {
+                    obj: record_obj,
+                    obj_span: record_obj_span,
+                    field: record_field,
+                };
+                return infer_expr(ctx, e, expected);
+            }
             let ci = class_of(ctx, obj, *obj_span)?;
             let meta = &ctx.class_metas[ci];
             let Some((_, fty)) = meta.fields.iter().find(|(n, _)| n == field) else {
@@ -2437,6 +2603,51 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     });
                 }
             }
+        }
+        ExprKind::RecordField {
+            obj,
+            obj_span,
+            field,
+        } => {
+            let Some(info) = ctx.vars.get(obj.as_str()) else {
+                return Err(Diagnostic {
+                    name: "type.unknown_variable".into(),
+                    title: format!("unknown variable `{obj}`"),
+                    span: *obj_span,
+                    label: "not declared".into(),
+                    notes: vec![],
+                });
+            };
+            if !info.initialized {
+                return Err(Diagnostic {
+                    name: "type.uninitialized".into(),
+                    title: format!("`{obj}` may be read before initialization"),
+                    span: *obj_span,
+                    label: "record field read needs an initialized value".into(),
+                    notes: vec![],
+                });
+            }
+            let Ty::Record(ri) = info.ty else {
+                return Err(Diagnostic {
+                    name: "type.mismatch".into(),
+                    title: format!("`{obj}` is not a record value"),
+                    span: *obj_span,
+                    label: "record field access".into(),
+                    notes: vec![],
+                });
+            };
+            let meta = &ctx.record_metas[ri];
+            meta.fields
+                .iter()
+                .find(|(name, _)| name == field)
+                .map(|(_, ty)| *ty)
+                .ok_or_else(|| Diagnostic {
+                    name: "type.unknown_field".into(),
+                    title: format!("`{}` has no field `{field}`", meta.name),
+                    span,
+                    label: "unknown record field".into(),
+                    notes: vec![],
+                })?
         }
         ExprKind::ClassFieldLen { obj, field } => {
             let ci = class_of(ctx, obj, span)?;
@@ -2585,6 +2796,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::FromCellU64 => arg_kind(1),
                 RawOp::CellInitU64 => arg_kind(2),
                 RawOp::CellReadU64 | RawOp::CellTakeU64 | RawOp::CellDropU64 => arg_kind(1),
+                RawOp::IntoCellRecord(_) => arg_kind(1),
+                RawOp::FromCellRecord(_) => arg_kind(1),
+                RawOp::CellInitRecord(_) => arg_kind(2),
+                RawOp::CellReadRecord(_)
+                | RawOp::CellTakeRecord(_)
+                | RawOp::CellDropRecord(_) => arg_kind(1),
                 _ => None,
             };
             let leased_role = matches!(
@@ -2615,6 +2832,29 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     raw,
                     if leased_role { leased_cell_unique } else { cell_unique },
                 ],
+                RawOp::IntoCellRecord(ri) => vec![
+                    Ty::RawRecord(ri),
+                    Ty::Res(ResKind::RawSpan),
+                ],
+                RawOp::FromCellRecord(ri) => vec![
+                    Ty::RawRecord(ri),
+                    Ty::Res(ResKind::PointsToRecord(ri)),
+                ],
+                RawOp::CellInitRecord(ri) => vec![
+                    Ty::RawRecord(ri),
+                    Ty::Record(ri),
+                    Ty::ResRef(ResKind::PointsToRecord(ri), Mutability::Mut),
+                ],
+                RawOp::CellReadRecord(ri) => vec![
+                    Ty::RawRecord(ri),
+                    Ty::ResRef(ResKind::PointsToRecord(ri), Mutability::Shared),
+                ],
+                RawOp::CellTakeRecord(ri) | RawOp::CellDropRecord(ri) => vec![
+                    Ty::RawRecord(ri),
+                    Ty::ResRef(ResKind::PointsToRecord(ri), Mutability::Mut),
+                ],
+                RawOp::CastRecord(_) => vec![raw],
+                RawOp::PointerOffsetRecord(ri) => vec![Ty::RawRecord(ri)],
                 RawOp::IntoFreeHeader => vec![raw, free_block],
                 RawOp::FromFreeHeader => vec![raw, free_header],
                 RawOp::HeaderInit => vec![raw, u64t, u64t, free_header_unique],
@@ -2640,6 +2880,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::FromCellU64 => if leased_role { leased } else { span },
                 RawOp::CellInitU64 | RawOp::CellDropU64 => Ty::Unit,
                 RawOp::CellReadU64 | RawOp::CellTakeU64 => u64t,
+                RawOp::IntoCellRecord(ri) => Ty::Res(ResKind::PointsToRecord(ri)),
+                RawOp::FromCellRecord(_) => span,
+                RawOp::CellInitRecord(_) | RawOp::CellDropRecord(_) => Ty::Unit,
+                RawOp::CellReadRecord(ri) | RawOp::CellTakeRecord(ri) => Ty::Record(ri),
+                RawOp::CastRecord(ri) => Ty::RawRecord(ri),
+                RawOp::PointerOffsetRecord(_) => u64t,
                 RawOp::IntoFreeHeader => free_header,
                 RawOp::FromFreeHeader => free_block,
                 RawOp::HeaderInit | RawOp::HeaderClear => Ty::Unit,
@@ -2849,28 +3095,60 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(ResKind::FreeBlock)
                 }
                 ResOp::ResourceMapEmpty => {
-                    Ty::Res(ResKind::ResourceMapPointsToU64)
+                    match expected {
+                        Some(Ty::Res(kind @ ResKind::ResourceMapPointsToU64))
+                        | Some(Ty::Res(kind @ ResKind::ResourceMapPointsToRecord(_))) => {
+                            Ty::Res(kind)
+                        }
+                        _ => Ty::Res(ResKind::ResourceMapPointsToU64),
+                    }
                 }
                 ResOp::ResourceMapTake => {
-                    let map = Ty::ResRef(
-                        ResKind::ResourceMapPointsToU64,
-                        Mutability::Mut,
-                    );
+                    let Some(map_kind @ (ResKind::ResourceMapPointsToU64
+                        | ResKind::ResourceMapPointsToRecord(_))) =
+                        resource_arg_kind(ctx, &args[0])
+                    else {
+                        return Err(Diagnostic {
+                            name: "resource.map_type".into(),
+                            title: "`resource_map_take` needs a supported resource map".into(),
+                            span: args[0].span,
+                            label: "expected a mutable ResourceMap borrow".into(),
+                            notes: vec![],
+                        });
+                    };
+                    let map = Ty::ResRef(map_kind, Mutability::Mut);
                     require_explicit_borrow(ctx, &args[0], map)?;
                     check_expr(ctx, &mut args[0], Some(map))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_borrow_conflicts(ctx, args, None)?;
-                    Ty::Res(ResKind::PointsToU64)
+                    Ty::Res(match map_kind {
+                        ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
+                        ResKind::ResourceMapPointsToRecord(ri) => ResKind::PointsToRecord(ri),
+                        _ => unreachable!(),
+                    })
                 }
                 ResOp::ResourceMapPut => {
-                    let map = Ty::ResRef(
-                        ResKind::ResourceMapPointsToU64,
-                        Mutability::Mut,
-                    );
+                    let Some(map_kind @ (ResKind::ResourceMapPointsToU64
+                        | ResKind::ResourceMapPointsToRecord(_))) =
+                        resource_arg_kind(ctx, &args[0])
+                    else {
+                        return Err(Diagnostic {
+                            name: "resource.map_type".into(),
+                            title: "`resource_map_put` needs a supported resource map".into(),
+                            span: args[0].span,
+                            label: "expected a mutable ResourceMap borrow".into(),
+                            notes: vec![],
+                        });
+                    };
+                    let map = Ty::ResRef(map_kind, Mutability::Mut);
                     require_explicit_borrow(ctx, &args[0], map)?;
                     check_expr(ctx, &mut args[0], Some(map))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
-                    let cell = Ty::Res(ResKind::PointsToU64);
+                    let cell = Ty::Res(match map_kind {
+                        ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
+                        ResKind::ResourceMapPointsToRecord(ri) => ResKind::PointsToRecord(ri),
+                        _ => unreachable!(),
+                    });
                     check_expr(ctx, &mut args[2], Some(cell))?;
                     transfer(ctx, &args[2], None)?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -3124,8 +3402,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // A method is a callee like any other: it can launder a brand
             // only if its signature can give storage back.
             let launders = match ret {
-                Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
+                Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::ResRef(..) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
+                Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
                 _ => false,
             };
             for (arg, p) in args.iter_mut().zip(&params) {
@@ -3403,6 +3686,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 check_expr(ctx, inner, Some(Ty::Int(t)))?;
                 Ty::Option(t)
             }
+            Some(Ty::OptionRaw(ri)) => {
+                check_expr(ctx, inner, Some(Ty::RawRecord(ri)))?;
+                Ty::OptionRaw(ri)
+            }
             _ => {
                 return Err(Diagnostic {
                     name: "type.option_position".into(),
@@ -3415,6 +3702,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         },
         ExprKind::NoneE => match expected {
             Some(Ty::Option(t)) => Ty::Option(t),
+            Some(Ty::OptionRaw(ri)) => Ty::OptionRaw(ri),
             _ => {
                 return Err(Diagnostic {
                     name: "type.option_position".into(),
@@ -3667,8 +3955,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // stops C stashing the pointer in a foreign global — and it is
             // part of what the contract's audit id covers.
             let launders = match ret {
-                Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
+                Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::ResRef(..) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
+                Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
                 _ => false,
             };
             for (arg, pty) in args.iter_mut().zip(param_tys) {
@@ -3726,6 +4019,40 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ctx.calls.push(callee.clone());
             }
             ret
+        }
+        ExprKind::RecordLit {
+            record,
+            record_span,
+            args,
+        } => {
+            let Some(ri) = ctx.record_metas.iter().position(|r| r.name == *record) else {
+                return Err(Diagnostic {
+                    name: "record.unknown_type".into(),
+                    title: format!("unknown record `{record}`"),
+                    span: *record_span,
+                    label: "not declared".into(),
+                    notes: vec![],
+                });
+            };
+            let meta = &ctx.record_metas[ri];
+            if args.len() != meta.fields.len() {
+                return Err(Diagnostic {
+                    name: "record.arity".into(),
+                    title: format!(
+                        "record `{record}` has {} field(s), {} value(s) given",
+                        meta.fields.len(),
+                        args.len()
+                    ),
+                    span,
+                    label: "values are supplied in field declaration order".into(),
+                    notes: vec![],
+                });
+            }
+            let field_tys: Vec<Ty> = meta.fields.iter().map(|(_, ty)| *ty).collect();
+            for (arg, field_ty) in args.iter_mut().zip(field_tys) {
+                check_expr(ctx, arg, Some(field_ty))?;
+            }
+            Ty::Record(ri)
         }
     };
     e.ty = Some(ty);
@@ -4391,10 +4718,20 @@ fn class_holds_storage(metas: &[ClassMeta], ci: usize, depth: usize) -> bool {
         return true;
     }
     metas[ci].fields.iter().any(|(_, ty)| match ty {
-        Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
+        Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
         Ty::Class(fci) => class_holds_storage(metas, *fci, depth + 1),
+        // Records cannot currently be class fields, but treating one as a
+        // storage container is the conservative answer if that surface grows.
+        Ty::Record(_) => true,
         _ => false,
     })
+}
+
+fn record_holds_storage(metas: &[RecordMeta], ri: usize) -> bool {
+    metas[ri]
+        .fields
+        .iter()
+        .any(|(_, ty)| matches!(ty, Ty::RawRecord(_) | Ty::OptionRaw(_)))
 }
 
 /// Whether an expression's value inherits a loan brand. Provenance is
@@ -4408,6 +4745,11 @@ fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
         ExprKind::RawOp { args, .. } | ExprKind::ResOp { args, .. } => {
             args.iter().any(|a| brand_of(ctx, a))
         }
+        ExprKind::SomeE(inner) | ExprKind::OptValue { operand: inner }
+        | ExprKind::IsSome { operand: inner } => brand_of(ctx, inner),
+        ExprKind::RecordLit { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
+        ExprKind::RecordField { obj, .. } =>
+            ctx.vars.get(obj.as_str()).is_some_and(|v| v.branded),
         _ => false,
     }
 }
@@ -4436,7 +4778,17 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
         }
         _ => e.ty,
     };
-    if !ty.is_some_and(|t| matches!(t, Ty::Raw(_) | Ty::Res(_) | Ty::ResRef(..))) {
+    if !ty.is_some_and(|t| {
+        matches!(
+            t,
+            Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::OptionRaw(_)
+                | Ty::Record(_)
+                | Ty::Res(_)
+                | Ty::ResRef(..)
+        )
+    }) {
         return Ok(());
     }
     let name = match &e.kind {

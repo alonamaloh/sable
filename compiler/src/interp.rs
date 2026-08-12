@@ -20,6 +20,13 @@ pub enum RtVal {
     Bool(bool),
     Arr(Rc<RefCell<Vec<i128>>>),
     Opt(Option<i128>),
+    PtrOpt(Option<(i128, i128)>),
+    /// A POD record is a plain copyable value, distinct from an affine
+    /// class object and its destructor-bearing field storage (ADR 0054).
+    Record {
+        record: usize,
+        fields: HashMap<String, RtVal>,
+    },
     Obj {
         class: usize,
         fields: Rc<RefCell<HashMap<String, RtVal>>>,
@@ -64,6 +71,8 @@ fn has_resource_shadow(ty: Ty) -> bool {
         ty,
         Ty::Res(ResKind::ResourceMapPointsToU64)
             | Ty::ResRef(ResKind::ResourceMapPointsToU64, _)
+            | Ty::Res(ResKind::ResourceMapPointsToRecord(_))
+            | Ty::ResRef(ResKind::ResourceMapPointsToRecord(_), _)
     )
 }
 
@@ -81,6 +90,7 @@ pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<Tes
             let mut interp = Interp {
                 fns: &fns,
                 classes,
+                records: &program.records,
                 ghosts: &ghosts,
                 source,
                 fuel: FUEL,
@@ -115,6 +125,7 @@ pub fn run_fn(
     let mut interp = Interp {
         fns: &fns,
         classes: &program.classes,
+        records: &program.records,
         ghosts: &ghosts,
         source: mods.combined_source.as_str(),
         fuel: FUEL,
@@ -139,6 +150,7 @@ enum Flow {
 struct Interp<'a> {
     fns: &'a HashMap<&'a str, &'a Fn>,
     classes: &'a [ClassDecl],
+    records: &'a [RecordDecl],
     ghosts: &'a GhostDefs,
     source: &'a str,
     fuel: u64,
@@ -172,6 +184,15 @@ struct RawAlloc {
     /// cell are inaccessible until the uninitialized cell is converted
     /// back (ADR 0031).
     cells_u64: HashMap<i128, Option<i128>>,
+    /// Starts of abstract record-typed extents. The record index is the
+    /// executable type tag; values stay abstract rather than serialized.
+    cells_record: HashMap<i128, RecordCell>,
+}
+
+struct RecordCell {
+    record: usize,
+    layout: StorageLayout,
+    value: Option<RtVal>,
 }
 
 impl RawHeap {
@@ -184,6 +205,7 @@ impl RawHeap {
                 live: true,
                 bytes,
                 cells_u64: HashMap::new(),
+                cells_record: HashMap::new(),
             },
         );
         id
@@ -195,7 +217,15 @@ impl RawHeap {
             .cells_u64
             .keys()
             .any(|start| *start <= off && off < *start + IntTy::U64.layout().size);
-        if al.live && off >= 0 && (off as usize) < al.bytes.len() && !covered {
+        let record_covered = al.cells_record.iter().any(|(start, cell)| {
+            *start <= off && off < *start + cell.layout.size
+        });
+        if al.live
+            && off >= 0
+            && (off as usize) < al.bytes.len()
+            && !covered
+            && !record_covered
+        {
             Some(al)
         } else {
             None
@@ -1439,6 +1469,14 @@ impl<'a> Interp<'a> {
                         let (a, o) = ptr_at(0);
                         Ok(RtVal::Ptr(a, o + int_at(1)))
                     }
+                    RawOp::CastRecord(_) => {
+                        let (a, o) = ptr_at(0);
+                        Ok(RtVal::Ptr(a, o))
+                    }
+                    RawOp::PointerOffsetRecord(_) => {
+                        let (_, o) = ptr_at(0);
+                        Ok(RtVal::Int(o))
+                    }
                     RawOp::Load8 => {
                         let (a, o) = ptr_at(0);
                         match self.raw.live_at(a, o).map(|al| al.bytes[o as usize]) {
@@ -1746,6 +1784,144 @@ impl<'a> Interp<'a> {
                             ))),
                         }
                     }
+                    RawOp::IntoCellRecord(ri) => {
+                        let (a, o) = ptr_at(0);
+                        let layout = self.records[*ri].layout;
+                        if o % layout.align != 0 {
+                            return Err(bad(format!(
+                                "raw_into_cell<{}> needs {}-byte alignment: {a}+{o}",
+                                self.records[*ri].name, layout.align
+                            )));
+                        }
+                        for i in 0..layout.size {
+                            if self.raw.live_at(a, o + i).is_none() {
+                                return Err(bad(format!(
+                                    "raw_into_cell<{}> needs {} raw bytes at {a}+{o}",
+                                    self.records[*ri].name, layout.size
+                                )));
+                            }
+                        }
+                        let al = self.raw.allocs.get_mut(&a).expect("live_at checked");
+                        al.cells_record.insert(
+                            o,
+                            RecordCell {
+                                record: *ri,
+                                layout,
+                                value: None,
+                            },
+                        );
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::FromCellRecord(ri) => {
+                        let (a, o) = ptr_at(0);
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_from_cell names absent allocation {a}"))
+                        })?;
+                        if !al.live {
+                            return Err(bad(format!("raw_from_cell names dead allocation {a}")));
+                        }
+                        let Some(cell) = al.cells_record.get(&o) else {
+                            return Err(bad(format!(
+                                "raw_from_cell<{}> needs a typed cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        };
+                        if cell.record != *ri || cell.value.is_some() {
+                            return Err(bad(format!(
+                                "raw_from_cell<{}> needs a matching uninitialized cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        }
+                        let layout = cell.layout;
+                        al.cells_record.remove(&o);
+                        for i in 0..layout.size {
+                            al.bytes[(o + i) as usize] = Some(0);
+                        }
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::CellInitRecord(ri) => {
+                        let (a, o) = ptr_at(0);
+                        let value = vals[1].clone();
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_cell_init names absent allocation {a}"))
+                        })?;
+                        let Some(cell) = al.cells_record.get_mut(&o) else {
+                            return Err(bad(format!(
+                                "raw_cell_init<{}> needs a typed cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        };
+                        if !al.live || cell.record != *ri || cell.value.is_some() {
+                            return Err(bad(format!(
+                                "raw_cell_init<{}> needs a matching uninitialized cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        }
+                        cell.value = Some(value);
+                        Ok(RtVal::Unit)
+                    }
+                    RawOp::CellReadRecord(ri) => {
+                        let (a, o) = ptr_at(0);
+                        let value = self
+                            .raw
+                            .allocs
+                            .get(&a)
+                            .filter(|al| al.live)
+                            .and_then(|al| al.cells_record.get(&o))
+                            .filter(|cell| cell.record == *ri)
+                            .and_then(|cell| cell.value.as_ref())
+                            .cloned();
+                        value.ok_or_else(|| {
+                            bad(format!(
+                                "raw_cell_read<{}> needs a matching initialized cell at {a}+{o}",
+                                self.records[*ri].name
+                            ))
+                        })
+                    }
+                    RawOp::CellTakeRecord(ri) => {
+                        let (a, o) = ptr_at(0);
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_cell_take names absent allocation {a}"))
+                        })?;
+                        let Some(cell) = al.cells_record.get_mut(&o) else {
+                            return Err(bad(format!(
+                                "raw_cell_take<{}> needs a typed cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        };
+                        if !al.live || cell.record != *ri {
+                            return Err(bad(format!(
+                                "raw_cell_take<{}> needs a matching initialized cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        }
+                        cell.value.take().ok_or_else(|| {
+                            bad(format!(
+                                "raw_cell_take<{}> needs an initialized cell at {a}+{o}",
+                                self.records[*ri].name
+                            ))
+                        })
+                    }
+                    RawOp::CellDropRecord(ri) => {
+                        let (a, o) = ptr_at(0);
+                        let al = self.raw.allocs.get_mut(&a).ok_or_else(|| {
+                            bad(format!("raw_cell_drop names absent allocation {a}"))
+                        })?;
+                        let Some(cell) = al.cells_record.get_mut(&o) else {
+                            return Err(bad(format!(
+                                "raw_cell_drop<{}> needs a typed cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        };
+                        if !al.live || cell.record != *ri || cell.value.is_none() {
+                            return Err(bad(format!(
+                                "raw_cell_drop<{}> needs a matching initialized cell at {a}+{o}",
+                                self.records[*ri].name
+                            )));
+                        }
+                        cell.value = None;
+                        Ok(RtVal::Unit)
+                    }
                 }
             }
 
@@ -1771,22 +1947,22 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Int(arr[idx as usize]))
             }
             ExprKind::IsSome { operand } => {
-                let RtVal::Opt(o) = self.eval(operand, frame)? else {
-                    unreachable!("checked: option operand")
-                };
-                Ok(RtVal::Bool(o.is_some()))
+                match self.eval(operand, frame)? {
+                    RtVal::Opt(o) => Ok(RtVal::Bool(o.is_some())),
+                    RtVal::PtrOpt(o) => Ok(RtVal::Bool(o.is_some())),
+                    _ => unreachable!("checked: option operand"),
+                }
             }
             ExprKind::OptValue { operand } => {
-                let RtVal::Opt(o) = self.eval(operand, frame)? else {
-                    unreachable!("checked: option operand")
-                };
-                match o {
-                    Some(v) => Ok(RtVal::Int(v)),
-                    None => Err(Trap {
-                        undef: false,
-                        message: "`.value` of an empty option".into(),
-                        span: e.span,
-                    }),
+                match self.eval(operand, frame)? {
+                    RtVal::Opt(Some(v)) => Ok(RtVal::Int(v)),
+                    RtVal::PtrOpt(Some((a, o))) => Ok(RtVal::Ptr(a, o)),
+                    RtVal::Opt(None) | RtVal::PtrOpt(None) => Err(Trap {
+                            undef: false,
+                            message: "`.value` of an empty option".into(),
+                            span: e.span,
+                        }),
+                    _ => unreachable!("checked: option operand"),
                 }
             }
             ExprKind::TraitCall { .. } => {
@@ -1798,6 +1974,12 @@ impl<'a> Interp<'a> {
                 };
                 let v = fields.borrow()[field.as_str()].clone();
                 Ok(v)
+            }
+            ExprKind::RecordField { obj, field, .. } => {
+                let RtVal::Record { fields, .. } = frame.vars[obj.as_str()].clone() else {
+                    unreachable!("checked: record receiver")
+                };
+                Ok(fields[field.as_str()].clone())
             }
             ExprKind::ClassFieldLen { obj, field } => {
                 let RtVal::Obj { fields, .. } = frame.vars[obj.as_str()].clone() else {
@@ -1845,10 +2027,25 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Int(v))
             }
             ExprKind::SomeE(inner) => {
-                let v = self.eval_int(inner, frame)?;
-                Ok(RtVal::Opt(Some(v)))
+                match e.ty {
+                    Some(Ty::Option(_)) => {
+                        let v = self.eval_int(inner, frame)?;
+                        Ok(RtVal::Opt(Some(v)))
+                    }
+                    Some(Ty::OptionRaw(_)) => {
+                        let RtVal::Ptr(a, o) = self.eval(inner, frame)? else {
+                            unreachable!("checked: raw pointer option")
+                        };
+                        Ok(RtVal::PtrOpt(Some((a, o))))
+                    }
+                    _ => unreachable!("checked: option construction"),
+                }
             }
-            ExprKind::NoneE => Ok(RtVal::Opt(None)),
+            ExprKind::NoneE => match e.ty {
+                Some(Ty::Option(_)) => Ok(RtVal::Opt(None)),
+                Some(Ty::OptionRaw(_)) => Ok(RtVal::PtrOpt(None)),
+                _ => unreachable!("checked: option construction"),
+            },
             ExprKind::ArrayLit(elems) => {
                 let mut v = Vec::with_capacity(elems.len());
                 for el in elems {
@@ -1938,6 +2135,23 @@ impl<'a> Interp<'a> {
                     vals.push(self.eval_moved(a, frame)?);
                 }
                 self.construct(ci, init, vals, e.span)
+            }
+            ExprKind::RecordLit { record, args, .. } => {
+                let ri = self
+                    .records
+                    .iter()
+                    .position(|r| r.name == *record)
+                    .expect("checked: record exists");
+                let field_names: Vec<String> = self.records[ri]
+                    .fields
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect();
+                let mut fields = HashMap::new();
+                for (name, arg) in field_names.into_iter().zip(args) {
+                    fields.insert(name, self.eval(arg, frame)?);
+                }
+                Ok(RtVal::Record { record: ri, fields })
             }
             ExprKind::MethodCall {
                 recv, method, args, ..
@@ -2101,6 +2315,13 @@ fn deep_copy(v: &RtVal) -> RtVal {
                     .collect(),
             )),
         },
+        RtVal::Record { record, fields } => RtVal::Record {
+            record: *record,
+            fields: fields
+                .iter()
+                .map(|(name, value)| (name.clone(), deep_copy(value)))
+                .collect(),
+        },
         other => other.clone(),
     }
 }
@@ -2111,6 +2332,7 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
         RtVal::Bool(b) => SpecVal::Bool(*b),
         RtVal::Arr(a) => SpecVal::Arr(a.borrow().clone()),
         RtVal::Opt(o) => SpecVal::Opt(*o),
+        RtVal::PtrOpt(_) => return None,
         RtVal::Obj { fields, .. } => SpecVal::Obj(
             fields
                 .borrow()
@@ -2118,6 +2340,13 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
                 .filter_map(|(k, v)| spec_of(v).map(|sv| (k.clone(), sv)))
                 .collect(),
         ),
+        RtVal::Record { fields, .. } => {
+            let mut out = HashMap::new();
+            for (name, value) in fields {
+                out.insert(name.clone(), spec_of(value)?);
+            }
+            SpecVal::Obj(out)
+        }
         // A pointer has no specification value: contracts speak about
         // views, and a view is not something the monitor can see.
         RtVal::Ptr(..) => return None,

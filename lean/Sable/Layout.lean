@@ -29,6 +29,19 @@ def i32.layout : Layout := ⟨4, 4⟩
 def u64.layout : Layout := ⟨8, 8⟩
 def i64.layout : Layout := ⟨8, 8⟩
 
+/-- Target geometry of a raw pointer and its nullable option niche. This is
+layout only: it does not assign a byte encoding to provenance or to `none`
+(ADR 0054). -/
+def rawPtr.layout : Layout := ⟨8, 8⟩
+
+/-- A field is wholly inside its record and begins at a valid alignment. -/
+def Layout.fieldFits (outer field : Layout) (off : Int) : Prop :=
+  0 ≤ off ∧ off % field.align = 0 ∧ off + field.size ≤ outer.size
+
+/-- Half-open field extents at their declared offsets do not overlap. -/
+def Layout.fieldsDisjoint (a : Layout) (ao : Int) (b : Layout) (bo : Int) : Prop :=
+  ao + a.size ≤ bo ∨ bo + b.size ≤ ao
+
 @[simp] theorem u8.layout_size : Sable.u8.layout.size = 1 := rfl
 @[simp] theorem u8.layout_align : Sable.u8.layout.align = 1 := rfl
 @[simp] theorem i8.layout_size : Sable.i8.layout.size = 1 := rfl
@@ -45,6 +58,8 @@ def i64.layout : Layout := ⟨8, 8⟩
 @[simp] theorem u64.layout_align : Sable.u64.layout.align = 8 := rfl
 @[simp] theorem i64.layout_size : Sable.i64.layout.size = 8 := rfl
 @[simp] theorem i64.layout_align : Sable.i64.layout.align = 8 := rfl
+@[simp] theorem rawPtr.layout_size : Sable.rawPtr.layout.size = 8 := rfl
+@[simp] theorem rawPtr.layout_align : Sable.rawPtr.layout.align = 8 := rfl
 
 theorem u8.layout_wf : u8.layout.wf := by
   refine ⟨by decide, by decide, ⟨0, rfl⟩⟩
@@ -61,6 +76,8 @@ theorem i32.layout_wf : i32.layout.wf := by
 theorem u64.layout_wf : u64.layout.wf := by
   refine ⟨by decide, by decide, ⟨3, rfl⟩⟩
 theorem i64.layout_wf : i64.layout.wf := by
+  refine ⟨by decide, by decide, ⟨3, rfl⟩⟩
+theorem rawPtr.layout_wf : rawPtr.layout.wf := by
   refine ⟨by decide, by decide, ⟨3, rfl⟩⟩
 
 end Sable

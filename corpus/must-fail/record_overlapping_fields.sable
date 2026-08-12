@@ -1,0 +1,6 @@
+// expect-error: record.overlapping_fields
+
+record Overlap #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(0)] u64 right;
+}

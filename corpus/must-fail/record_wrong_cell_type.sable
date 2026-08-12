@@ -1,0 +1,19 @@
+// expect-error: type.mismatch
+
+record Left #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+record Right #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+fn wrong_record_cell_type() {
+    unsafe static_alloc(8) as (base, resource bytes);
+    unsafe {
+        raw<Left> left_ptr = raw_cast<Left>(base);
+        mut resource PointsTo<Left> cell = raw_into_cell<Left>(left_ptr, bytes);
+        Right wrong = Right(7);
+        raw_cell_init<Left>(left_ptr, wrong, &mut cell);
+    }
+}

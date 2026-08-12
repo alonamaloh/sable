@@ -113,6 +113,8 @@ struct Loading {
     /// Per module: the extern class-name table its parse was seeded
     /// with, so parse-time `Ty::Class` indices resolve back to names.
     externs: Vec<(usize, Vec<String>)>,
+    /// Parallel merged-index table for explicitly laid-out records.
+    record_externs: Vec<(usize, Vec<String>)>,
 }
 
 /// Load `root` and its transitive imports; returns the merged program
@@ -133,6 +135,7 @@ pub fn load(
         module_paths: module_paths.to_vec(),
         imports: Vec::new(),
         externs: Vec::new(),
+        record_externs: Vec::new(),
     };
     if let Err(d) = load_file(&mut loading, root, None) {
         // Errors carry combined-source spans; hand back the partial set
@@ -170,6 +173,9 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
         }
         for c in &p.classes {
             items.entry(c.name.as_str()).or_insert((*idx, c.is_pub));
+        }
+        for r in &p.records {
+            items.entry(r.name.as_str()).or_insert((*idx, r.is_pub));
         }
         for t in &p.traits {
             items.entry(t.name.as_str()).or_insert((*idx, t.is_pub));
@@ -287,6 +293,16 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     walk_expr(a, refs, const_names);
                 }
             }
+            ExprKind::RecordLit {
+                record,
+                record_span,
+                args,
+            } => {
+                refs.push((record.clone(), *record_span));
+                for a in args {
+                    walk_expr(a, refs, const_names);
+                }
+            }
             ExprKind::MethodCall { args, .. } | ExprKind::TraitCall { args, .. } => {
                 for a in args {
                     walk_expr(a, refs, const_names);
@@ -331,6 +347,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             | ExprKind::SelfField { .. }
             | ExprKind::SelfFieldLen { .. }
             | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
             | ExprKind::ClassFieldLen { .. } => {}
         }
     }
@@ -398,9 +415,15 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             .find(|(i, _)| i == idx)
             .map(|(_, e)| e.as_slice())
             .unwrap_or(&[]);
+        let record_externs: &[String] = loading
+            .record_externs
+            .iter()
+            .find(|(i, _)| i == idx)
+            .map(|(_, e)| e.as_slice())
+            .unwrap_or(&[]);
         let mut refs: Vec<(String, Span)> = Vec::new();
 
-        let mut walk_fn = |f: &crate::ast::Fn, refs: &mut Vec<(String, Span)>| {
+        let walk_fn = |f: &crate::ast::Fn, refs: &mut Vec<(String, Span)>| {
             walk_stmts(&f.body, refs, &consts);
             for (ty, span) in f
                 .params
@@ -408,10 +431,26 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 .map(|pa| (&pa.ty, pa.span))
                 .chain(std::iter::once((&f.ret, f.name_span)))
             {
-                if let Ty::Class(ci) | Ty::ClassRef(ci, _) = ty {
-                    if let Some(name) = externs.get(*ci) {
-                        refs.push((name.clone(), span));
+                match ty {
+                    Ty::Class(ci) | Ty::ClassRef(ci, _) => {
+                        if let Some(name) = externs.get(*ci) {
+                            refs.push((name.clone(), span));
+                        }
                     }
+                    Ty::Record(ri) | Ty::RawRecord(ri) | Ty::OptionRaw(ri) => {
+                        if let Some(name) = record_externs.get(*ri) {
+                            refs.push((name.clone(), span));
+                        }
+                    }
+                    Ty::Res(crate::ast::ResKind::PointsToRecord(ri))
+                    | Ty::Res(crate::ast::ResKind::ResourceMapPointsToRecord(ri))
+                    | Ty::ResRef(crate::ast::ResKind::PointsToRecord(ri), _)
+                    | Ty::ResRef(crate::ast::ResKind::ResourceMapPointsToRecord(ri), _) => {
+                        if let Some(name) = record_externs.get(*ri) {
+                            refs.push((name.clone(), span));
+                        }
+                    }
+                    _ => {}
                 }
             }
             for b in f.type_bounds.iter().flatten() {
@@ -441,6 +480,18 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             }
             for b in c.type_bounds.iter().flatten() {
                 refs.push((b.clone(), c.name_span));
+            }
+        }
+        for r in &p.records {
+            for fi in &r.fields {
+                match fi.ty {
+                    Ty::RawRecord(ri) | Ty::OptionRaw(ri) | Ty::Record(ri) => {
+                        if let Some(name) = record_externs.get(ri) {
+                            refs.push((name.clone(), fi.span));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         for im in &p.impls {
@@ -610,6 +661,7 @@ fn load_file(
                     || dep.fn_templates.iter().any(|f| f.name == *n)
                     || dep.classes.iter().any(|c| c.name == *n)
                     || dep.class_templates.iter().any(|c| c.name == *n)
+                    || dep.records.iter().any(|r| r.name == *n)
                     || dep.traits.iter().any(|t| t.name == *n);
                 if !known {
                     return Err(Diagnostic {
@@ -634,9 +686,15 @@ fn load_file(
         .iter()
         .flat_map(|(_, p)| p.classes.iter().map(|c| c.name.clone()))
         .collect();
+    let extern_records: Vec<String> = loading
+        .programs
+        .iter()
+        .flat_map(|(_, p)| p.records.iter().map(|r| r.name.clone()))
+        .collect();
     // The combined program text mirrors the combined source (same
     // lengths, proof lines blanked).
     loading.externs.push((idx, extern_classes.clone()));
+    loading.record_externs.push((idx, extern_records.clone()));
     let combined_program: String = {
         let mut buf = String::new();
         for m in &loading.set.modules {
@@ -651,6 +709,7 @@ fn load_file(
         &combined_lines,
         &combined_program,
         &extern_classes,
+        &extern_records,
     )?;
     loading.programs.push((idx, program));
     loading.stack.pop();
@@ -734,10 +793,16 @@ fn merge(loading: Loading) -> Result<(Program, ModuleSet), (Diagnostic, ModuleSe
                 return Err((collision("class", &c.name, c.name_span), loading.set));
             }
         }
+        for r in &p.records {
+            if merged.records.iter().any(|d| d.name == r.name) {
+                return Err((collision("record", &r.name, r.name_span), loading.set));
+            }
+        }
         merged.fns.extend(p.fns);
         merged.fn_templates.extend(p.fn_templates);
         merged.class_templates.extend(p.class_templates);
         merged.classes.extend(p.classes);
+        merged.records.extend(p.records);
         merged.traits.extend(p.traits);
         merged.impls.extend(p.impls);
         merged.discharges.extend(p.discharges);

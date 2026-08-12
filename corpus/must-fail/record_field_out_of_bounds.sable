@@ -1,0 +1,5 @@
+// expect-error: record.field_out_of_bounds
+
+record TooSmall #[layout(size := 8, align := 8)] {
+    #[offset(8)] u64 outside;
+}

@@ -400,6 +400,7 @@ fn lower_expr(e: &Expr) -> Result<String, String> {
             let lowered = lowered?;
             match op {
                 RawOp::Offset => format!("(.ptrAdd {} {})", lowered[0], lowered[1]),
+                RawOp::CastRecord(_) => lowered[0].clone(),
                 // The rest are statements in the machine (§ADR 0025), so
                 // they cannot appear in expression position here; the
                 // statement lowering handles them.
@@ -462,6 +463,7 @@ fn lower_expr(e: &Expr) -> Result<String, String> {
         ),
         ExprKind::Call { .. }
         | ExprKind::CtorCall { .. }
+        | ExprKind::RecordLit { .. }
         | ExprKind::MethodCall { .. }
         | ExprKind::TraitCall { .. } => {
             return Err("calls are outside the SVM core subset".into());
@@ -479,6 +481,7 @@ fn lower_expr(e: &Expr) -> Result<String, String> {
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::SelfFieldIndex { .. }
         | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
         | ExprKind::ClassFieldLen { .. }
         | ExprKind::ClassFieldIndex { .. } => {
             return Err("class members are outside the SVM core subset".into());
@@ -532,6 +535,8 @@ pub fn canonical_outcome(res: Result<RtVal, String>) -> String {
             RtVal::Ptr(a, o) => format!("done ptr {a}+{o}"),
             RtVal::Opt(None) => "done opt none".into(),
             RtVal::Opt(Some(n)) => format!("done opt some {n}"),
+            RtVal::PtrOpt(_) => "unclassified: pointer option".into(),
+            RtVal::Record { .. } => "unclassified: record value".into(),
             RtVal::Obj { .. } => "unclassified: class value".into(),
             RtVal::ResMap(..) => "unclassified: erased resource map".into(),
         },

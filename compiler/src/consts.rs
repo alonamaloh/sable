@@ -180,6 +180,7 @@ fn subst_expr(e: &mut Expr, values: &HashMap<String, i128>) {
         }
         ExprKind::Call { args, .. }
         | ExprKind::CtorCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
         | ExprKind::TraitCall { args, .. }
         | ExprKind::MethodCall { args, .. }
         | ExprKind::ArrayLit(args) => {
@@ -201,6 +202,7 @@ fn subst_expr(e: &mut Expr, values: &HashMap<String, i128>) {
         | ExprKind::SelfField { .. }
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
         | ExprKind::ClassFieldLen { .. }
         | ExprKind::Borrow { .. } => {}
     }

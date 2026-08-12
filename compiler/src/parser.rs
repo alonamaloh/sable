@@ -30,6 +30,9 @@ pub struct Parser<'a> {
     /// Names of classes declared anywhere in the file (pre-scanned so
     /// `&Nat` parameters and `-> Nat` returns resolve — ADR 0010).
     class_names: Vec<String>,
+    /// Names of POD records declared anywhere in the file. As with classes,
+    /// a pre-scan permits self-referential `raw<R>` fields and forward uses.
+    record_names: Vec<String>,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -40,7 +43,7 @@ pub fn parse(
     lines: &LineMap,
     text: &str,
 ) -> PResult<Program> {
-    parse_module(tokens, blocks, lines, text, &[])
+    parse_module(tokens, blocks, lines, text, &[], &[])
 }
 
 /// Parse one module. `extern_classes` are classes from already-loaded
@@ -52,6 +55,7 @@ pub fn parse_module(
     lines: &LineMap,
     text: &str,
     extern_classes: &[String],
+    extern_records: &[String],
 ) -> PResult<Program> {
     // Non-generic classes only, in declaration order — this matches
     // their indices in `program.classes` after monomorphization
@@ -62,6 +66,14 @@ pub fn parse_module(
         if matches!(w[0].tok, Tok::KwClass) && !matches!(w[2].tok, Tok::Lt) {
             if let Tok::Ident(n) = &w[1].tok {
                 class_names.push(n.clone());
+            }
+        }
+    }
+    let mut record_names: Vec<String> = extern_records.to_vec();
+    for w in tokens.windows(2) {
+        if matches!(w[0].tok, Tok::KwRecord) {
+            if let Tok::Ident(n) = &w[1].tok {
+                record_names.push(n.clone());
             }
         }
     }
@@ -77,9 +89,11 @@ pub fn parse_module(
         text,
         tparams: Vec::new(),
         class_names,
+        record_names,
     };
     let mut fns = Vec::new();
     let mut classes = Vec::new();
+    let mut records = Vec::new();
     let mut traits = Vec::new();
     let mut impls = Vec::new();
     let mut operators = Vec::new();
@@ -97,6 +111,7 @@ pub fn parse_module(
             let span = parser.peek_span();
             parser.bump();
             if !(parser.at(&Tok::KwClass)
+                || parser.at(&Tok::KwRecord)
                 || matches!(parser.peek(), Tok::Ident(n) if n == "trait" || n == "const" || n == "fn")
                 || parser.at(&Tok::KwFn)
                 || parser.at(&Tok::KwExtern))
@@ -105,7 +120,7 @@ pub fn parse_module(
                     name: "module.bad_pub".into(),
                     title: "`pub` does not apply here".into(),
                     span,
-                    label: "only `fn`, `class`, `trait`, and `const` take `pub`".into(),
+                    label: "only `fn`, `class`, `record`, `trait`, and `const` take `pub`".into(),
                     notes: vec![(
                         "note".into(),
                         "impls and operator bindings export with their trait/class; \
@@ -120,6 +135,10 @@ pub fn parse_module(
             let mut c = parser.parse_class()?;
             c.is_pub = is_pub;
             classes.push(c);
+        } else if parser.at(&Tok::KwRecord) {
+            let mut r = parser.parse_record()?;
+            r.is_pub = is_pub;
+            records.push(r);
         } else if matches!(parser.peek(), Tok::Ident(n) if n == "trait") {
             let mut t = parser.parse_trait()?;
             t.is_pub = is_pub;
@@ -195,6 +214,7 @@ pub fn parse_module(
     Ok(Program {
         fns,
         classes,
+        records,
         fn_templates: Vec::new(),
         class_templates: Vec::new(),
         traits,
@@ -474,7 +494,9 @@ impl<'a> Parser<'a> {
         loop {
             match self.tokens.get(i).map(|t| &t.tok) {
                 Some(Tok::Ident(n))
-                    if IntTy::from_name(n).is_some() || self.tparams.iter().any(|p| p == n) => {}
+                    if IntTy::from_name(n).is_some()
+                        || self.tparams.iter().any(|p| p == n)
+                        || self.record_names.iter().any(|r| r == n) => {}
                 _ => return false,
             }
             i += 1;
@@ -583,6 +605,9 @@ impl<'a> Parser<'a> {
         if self.at(&Tok::KwRaw) {
             return self.raw_ty();
         }
+        if matches!(self.peek(), Tok::Ident(n) if n == "option") {
+            return self.option_ty();
+        }
         if self.at(&Tok::Amp) {
             let start = self.bump().span;
             let mutability = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
@@ -610,6 +635,10 @@ impl<'a> Parser<'a> {
                 let span = self.bump().span;
                 return Ok((Ty::Class(ci), span));
             }
+            if let Some(ri) = self.record_names.iter().position(|r| r == n) {
+                let span = self.bump().span;
+                return Ok((Ty::Record(ri), span));
+            }
         }
         self.scalar_ty()
     }
@@ -618,6 +647,13 @@ impl<'a> Parser<'a> {
     fn raw_ty(&mut self) -> PResult<(Ty, Span)> {
         let start = self.expect(Tok::KwRaw)?.span;
         self.expect(Tok::Lt)?;
+        if let Tok::Ident(name) = self.peek() {
+            if let Some(ri) = self.record_names.iter().position(|r| r == name) {
+                let elem_span = self.bump().span;
+                let end = self.expect(Tok::Gt)?.span;
+                return Ok((Ty::RawRecord(ri), start.join(elem_span).join(end)));
+            }
+        }
         let (elem, elem_span) = self.int_ty()?;
         let end = self.expect(Tok::Gt)?.span;
         if elem != IntTy::U8 {
@@ -636,6 +672,65 @@ impl<'a> Parser<'a> {
             });
         }
         Ok((Ty::Raw(elem), start.join(end)))
+    }
+
+    /// The two option families currently admitted by the language:
+    /// integer options and nullable pointers to explicit records.
+    fn option_ty(&mut self) -> PResult<(Ty, Span)> {
+        let (name, start) = self.ident()?;
+        debug_assert_eq!(name, "option");
+        self.expect(Tok::Lt)?;
+        if self.at(&Tok::KwRaw) {
+            let (raw, _) = self.raw_ty()?;
+            let end = self.expect(Tok::Gt)?.span;
+            return match raw {
+                Ty::RawRecord(ri) => Ok((Ty::OptionRaw(ri), start.join(end))),
+                _ => Err(Diagnostic {
+                    name: "record.option_pointer_type".into(),
+                    title: "nullable raw pointers require a record pointee".into(),
+                    span: start.join(end),
+                    label: "expected `option<raw<Record>>`".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "integer options remain `option<u8>` through `option<u64>`; raw byte \
+                         pointers do not yet have a nullable storage role"
+                            .into(),
+                    )],
+                }),
+            };
+        }
+        let (elem, _) = self.int_ty()?;
+        let end = self.expect(Tok::Gt)?.span;
+        Ok((Ty::Option(elem), start.join(end)))
+    }
+
+    fn signed_int_literal(&mut self) -> PResult<(i128, Span)> {
+        let neg = if self.at(&Tok::Minus) {
+            Some(self.bump().span)
+        } else {
+            None
+        };
+        match self.bump() {
+            Token { tok: Tok::Int(n), span } => Ok((if neg.is_some() { -n } else { n },
+                neg.map_or(span, |s| s.join(span)))),
+            t => Err(Diagnostic {
+                name: "parse.expected".into(),
+                title: "expected an integer literal".into(),
+                span: t.span,
+                label: "layout geometry must be a literal".into(),
+                notes: vec![],
+            }),
+        }
+    }
+
+    fn record_field_ty(&mut self) -> PResult<(Ty, Span)> {
+        if self.at(&Tok::KwRaw) {
+            return self.raw_ty();
+        }
+        if matches!(self.peek(), Tok::Ident(n) if n == "option") {
+            return self.option_ty();
+        }
+        self.scalar_ty()
     }
 
     /// `resource R` (owned, moved), `resource &R`, or `resource &mut R`.
@@ -676,57 +771,118 @@ impl<'a> Parser<'a> {
                 });
             }
             self.expect(Tok::Lt)?;
-            let (value_elem, value_elem_span) = self.int_ty()?;
+            let (record_elem, value_elem_span) = if let Tok::Ident(elem) = self.peek() {
+                if let Some(ri) = self.record_names.iter().position(|r| r == elem) {
+                    let span = self.bump().span;
+                    (Some(ri), span)
+                } else {
+                    let (elem, span) = self.int_ty()?;
+                    if elem != IntTy::U64 {
+                        return Err(Diagnostic {
+                            name: "resource.map_type".into(),
+                            title: "this `ResourceMap` value type is not supported yet".into(),
+                            span,
+                            label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
+                            notes: vec![],
+                        });
+                    }
+                    (None, span)
+                }
+            } else {
+                let (elem, span) = self.int_ty()?;
+                if elem != IntTy::U64 {
+                    return Err(Diagnostic {
+                        name: "resource.map_type".into(),
+                        title: "this `ResourceMap` value type is not supported yet".into(),
+                        span,
+                        label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
+                        notes: vec![],
+                    });
+                }
+                (None, span)
+            };
             self.expect(Tok::Gt)?;
             let end = self.expect(Tok::Gt)?.span;
-            if key != IntTy::U64 || value_elem != IntTy::U64 {
+            if key != IntTy::U64 {
                 return Err(Diagnostic {
                     name: "resource.map_type".into(),
                     title: "this `ResourceMap` instantiation is not supported yet".into(),
-                    span: if key != IntTy::U64 {
-                        key_span
-                    } else {
-                        value_elem_span
-                    },
-                    label: "the first aggregate slice supports \
-                            `ResourceMap<u64, PointsTo<u64>>`"
-                        .into(),
+                    span: key_span,
+                    label: "resource-map keys are `u64` arena offsets in v1".into(),
                     notes: vec![(
                         "note".into(),
-                        "typed records and their layout must be established before maps of \
-                         node permissions can be admitted honestly"
+                        "the one-arena intrusive-list profile deliberately avoids \
+                         cross-allocation pointer keys"
                             .into(),
                     )],
                 });
             }
-            (ResKind::ResourceMapPointsToU64, end)
-        } else if name == "PointsTo" || name == "LeasedPointsTo" {
-            self.expect(Tok::Lt)?;
-            let (elem, elem_span) = self.int_ty()?;
-            let end = self.expect(Tok::Gt)?.span;
-            if elem != IntTy::U64 {
-                return Err(Diagnostic {
-                    name: "resource.points_to_type".into(),
-                    title: format!("`PointsTo<{}>` is not supported yet", elem.name()),
-                    span: elem_span,
-                    label: "the first typed-storage slice supports `PointsTo<u64>`".into(),
-                    notes: vec![(
-                        "note".into(),
-                        "layout is now compiler-established proof vocabulary, but the \
-                         typed-cell operation surface remains `u64`-only until type tags \
-                         and one explicitly laid-out record are carried through every layer"
-                            .into(),
-                    )],
-                });
-            }
+            let _ = value_elem_span;
             (
-                if name == "PointsTo" {
-                    ResKind::PointsToU64
-                } else {
-                    ResKind::LeasedPointsToU64
-                },
+                record_elem.map_or(
+                    ResKind::ResourceMapPointsToU64,
+                    ResKind::ResourceMapPointsToRecord,
+                ),
                 end,
             )
+        } else if name == "PointsTo" || name == "LeasedPointsTo" {
+            self.expect(Tok::Lt)?;
+            if let Tok::Ident(elem) = self.peek() {
+                if let Some(ri) = self.record_names.iter().position(|r| r == elem) {
+                    let elem_span = self.bump().span;
+                    let end = self.expect(Tok::Gt)?.span;
+                    if name == "LeasedPointsTo" {
+                        return Err(Diagnostic {
+                            name: "resource.points_to_type".into(),
+                            title: "allocator leases support only `u64` typed cells".into(),
+                            span: elem_span,
+                            label: "use ordinary `PointsTo<Record>` authority".into(),
+                            notes: vec![],
+                        });
+                    }
+                    (ResKind::PointsToRecord(ri), end)
+                } else {
+                    let (elem, elem_span) = self.int_ty()?;
+                    let end = self.expect(Tok::Gt)?.span;
+                    if elem != IntTy::U64 {
+                        return Err(Diagnostic {
+                            name: "resource.points_to_type".into(),
+                            title: format!("`PointsTo<{}>` is not supported yet", elem.name()),
+                            span: elem_span,
+                            label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
+                            notes: vec![],
+                        });
+                    }
+                    (
+                        if name == "PointsTo" {
+                            ResKind::PointsToU64
+                        } else {
+                            ResKind::LeasedPointsToU64
+                        },
+                        end,
+                    )
+                }
+            } else {
+                let (elem, elem_span) = self.int_ty()?;
+                let end = self.expect(Tok::Gt)?.span;
+                if elem != IntTy::U64 {
+                    return Err(Diagnostic {
+                        name: "resource.points_to_type".into(),
+                        title: format!("`PointsTo<{}>` is not supported yet", elem.name()),
+                        span: elem_span,
+                        label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
+                        notes: vec![],
+                    });
+                }
+                (
+                    if name == "PointsTo" {
+                        ResKind::PointsToU64
+                    } else {
+                        ResKind::LeasedPointsToU64
+                    },
+                    end,
+                )
+            }
         } else {
             let Some(kind) = ResKind::from_name(&name) else {
                 return Err(Diagnostic {
@@ -785,12 +941,12 @@ impl<'a> Parser<'a> {
                 self.bump();
                 return Ok(Ty::Class(ci));
             }
-            if name == "option" {
+            if let Some(ri) = self.record_names.iter().position(|r| r == name) {
                 self.bump();
-                self.expect(Tok::Lt)?;
-                let (elem, _) = self.int_ty()?;
-                self.expect(Tok::Gt)?;
-                return Ok(Ty::Option(elem));
+                return Ok(Ty::Record(ri));
+            }
+            if name == "option" {
+                return Ok(self.option_ty()?.0);
             }
         }
         Ok(self.scalar_ty()?.0)
@@ -967,6 +1123,110 @@ impl<'a> Parser<'a> {
             inits,
             methods,
             deinit,
+            span: start.join(end),
+        })
+    }
+
+    /// A POD record has no members or proof blocks. Its complete target
+    /// geometry is stated explicitly and checked later against the field
+    /// layouts (ADR 0054):
+    ///
+    /// `record R #[layout(size := N, align := A)] {`
+    /// `  #[offset(K)] T field;`
+    /// `}`
+    fn parse_record(&mut self) -> PResult<RecordDecl> {
+        let start = self.expect(Tok::KwRecord)?.span;
+        let (name, name_span) = self.ident()?;
+
+        self.expect(Tok::Hash)?;
+        self.expect(Tok::LBracket)?;
+        let (attr, attr_span) = self.ident()?;
+        if attr != "layout" {
+            return Err(Diagnostic {
+                name: "record.missing_layout".into(),
+                title: format!("record `{name}` needs an explicit layout"),
+                span: attr_span,
+                label: "expected `layout(size := ..., align := ...)`".into(),
+                notes: vec![(
+                    "note".into(),
+                    "raw-storable records do not inherit class layout or an implicit ABI"
+                        .into(),
+                )],
+            });
+        }
+        self.expect(Tok::LParen)?;
+        let (size_key, size_key_span) = self.ident()?;
+        if size_key != "size" {
+            return Err(Diagnostic {
+                name: "record.layout_syntax".into(),
+                title: "record layout starts with `size`".into(),
+                span: size_key_span,
+                label: "expected `size := <literal>`".into(),
+                notes: vec![],
+            });
+        }
+        self.expect(Tok::Colon)?;
+        self.expect(Tok::Assign)?;
+        let (size, size_span) = self.signed_int_literal()?;
+        self.expect(Tok::Comma)?;
+        let (align_key, align_key_span) = self.ident()?;
+        if align_key != "align" {
+            return Err(Diagnostic {
+                name: "record.layout_syntax".into(),
+                title: "record layout needs `align` after `size`".into(),
+                span: align_key_span,
+                label: "expected `align := <literal>`".into(),
+                notes: vec![],
+            });
+        }
+        self.expect(Tok::Colon)?;
+        self.expect(Tok::Assign)?;
+        let (align, align_span) = self.signed_int_literal()?;
+        self.expect(Tok::RParen)?;
+        let attr_end = self.expect(Tok::RBracket)?.span;
+        let layout_span = attr_span.join(size_span).join(align_span).join(attr_end);
+
+        self.expect(Tok::LBrace)?;
+        let mut fields = Vec::new();
+        while !self.at(&Tok::RBrace) {
+            if self.at(&Tok::Eof) {
+                return Err(self.error_expected("`}`"));
+            }
+            self.expect(Tok::Hash)?;
+            self.expect(Tok::LBracket)?;
+            let (offset_attr, offset_attr_span) = self.ident()?;
+            if offset_attr != "offset" {
+                return Err(Diagnostic {
+                    name: "record.missing_offset".into(),
+                    title: "record fields need an explicit offset".into(),
+                    span: offset_attr_span,
+                    label: "expected `#[offset(<literal>)]`".into(),
+                    notes: vec![],
+                });
+            }
+            self.expect(Tok::LParen)?;
+            let (offset, offset_span) = self.signed_int_literal()?;
+            self.expect(Tok::RParen)?;
+            self.expect(Tok::RBracket)?;
+            let (ty, _) = self.record_field_ty()?;
+            let (field, field_span) = self.ident()?;
+            self.expect(Tok::Semi)?;
+            fields.push(RecordField {
+                name: field,
+                ty,
+                offset,
+                span: field_span,
+                offset_span,
+            });
+        }
+        let end = self.expect(Tok::RBrace)?.span;
+        Ok(RecordDecl {
+            is_pub: false,
+            name,
+            name_span,
+            layout: StorageLayout { size, align },
+            layout_span,
+            fields,
             span: start.join(end),
         })
     }
@@ -2236,12 +2496,9 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::Ident(first) if first == "option" && self.peek2() == &Tok::Lt => {
-                // `option<u32> r = decode(...);` — option local (ADR 0008;
-                // must be initialized).
-                self.bump();
-                self.expect(Tok::Lt)?;
-                let (elem, _) = self.int_ty()?;
-                self.expect(Tok::Gt)?;
+                // Integer options and nullable record pointers are both
+                // initialized values; neither has an implicit default.
+                let (ty, _) = self.option_ty()?;
                 let (name, name_span) = self.ident()?;
                 if is_reserved_name(&name) {
                     return Err(reserved_name_error(&name, name_span, "variable"));
@@ -2250,7 +2507,7 @@ impl<'a> Parser<'a> {
                 let init = self.expr()?;
                 self.expect(Tok::Semi)?;
                 Ok(Stmt::Decl {
-                    ty: Ty::Option(elem),
+                    ty,
                     name,
                     name_span,
                     init: Some(init),
@@ -2302,7 +2559,12 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident(first) => {
                 if let Tok::Ident(_) = self.peek2() {
-                    let (ty, _) = self.scalar_ty()?;
+                    let ty = if let Some(ri) = self.record_names.iter().position(|r| r == &first) {
+                        self.bump();
+                        Ty::Record(ri)
+                    } else {
+                        self.scalar_ty()?.0
+                    };
                     let (name, name_span) = self.ident()?;
                     if is_reserved_name(&name) {
                         return Err(reserved_name_error(&name, name_span, "variable"));
@@ -2783,6 +3045,91 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::Ident(record)
+                if self.record_names.iter().any(|r| r == &record)
+                    && self.peek2() == &Tok::LParen =>
+            {
+                let record_span = self.bump().span;
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    loop {
+                        args.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                Ok(Expr {
+                    kind: ExprKind::RecordLit {
+                        record,
+                        record_span,
+                        args,
+                    },
+                    span: record_span.join(close),
+                    ty: None,
+                })
+            }
+            Tok::Ident(name)
+                if matches!(
+                    name.as_str(),
+                    "raw_into_cell"
+                        | "raw_from_cell"
+                        | "raw_cell_init"
+                        | "raw_cell_read"
+                        | "raw_cell_take"
+                        | "raw_cell_drop"
+                        | "raw_cast"
+                        | "raw_pointer_offset"
+                ) && self.peek2() == &Tok::Lt =>
+            {
+                let op_name = name;
+                let op_span = self.bump().span;
+                self.expect(Tok::Lt)?;
+                let (record, record_span) = self.ident()?;
+                let Some(ri) = self.record_names.iter().position(|r| r == &record) else {
+                    return Err(Diagnostic {
+                        name: "record.unknown_type".into(),
+                        title: format!("unknown record `{record}`"),
+                        span: record_span,
+                        label: "typed record operations require a declared `record`".into(),
+                        notes: vec![],
+                    });
+                };
+                self.expect(Tok::Gt)?;
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    loop {
+                        args.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                let op = match op_name.as_str() {
+                    "raw_into_cell" => RawOp::IntoCellRecord(ri),
+                    "raw_from_cell" => RawOp::FromCellRecord(ri),
+                    "raw_cell_init" => RawOp::CellInitRecord(ri),
+                    "raw_cell_read" => RawOp::CellReadRecord(ri),
+                    "raw_cell_take" => RawOp::CellTakeRecord(ri),
+                    "raw_cell_drop" => RawOp::CellDropRecord(ri),
+                    "raw_cast" => RawOp::CastRecord(ri),
+                    "raw_pointer_offset" => RawOp::PointerOffsetRecord(ri),
+                    _ => unreachable!(),
+                };
+                Ok(Expr {
+                    kind: ExprKind::RawOp { op, op_span, args },
+                    span: op_span.join(close),
+                    ty: None,
+                })
+            }
             Tok::Ident(name) if RawOp::from_name(&name).is_some() => {
                 let op = RawOp::from_name(&name).expect("checked");
                 self.bump();
@@ -3247,7 +3594,9 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
                 expr_vars(a, out);
             }
         }
-        ExprKind::ClassField { obj, .. } | ExprKind::ClassFieldLen { obj, .. } => {
+        ExprKind::ClassField { obj, .. }
+        | ExprKind::RecordField { obj, .. }
+        | ExprKind::ClassFieldLen { obj, .. } => {
             out.insert(obj.clone());
         }
         ExprKind::ClassFieldIndex { obj, index, .. } => {
@@ -3281,6 +3630,11 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
             expr_vars(index, out);
         }
         ExprKind::CtorCall { args, .. } => {
+            for a in args {
+                expr_vars(a, out);
+            }
+        }
+        ExprKind::RecordLit { args, .. } => {
             for a in args {
                 expr_vars(a, out);
             }

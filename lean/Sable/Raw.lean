@@ -167,6 +167,46 @@ theorem insert_erase_roundTrip
         simpa using hempty.symm
       · simp [h]
 
+/-- Generic entry well-formedness for a resource map. Resource-specific
+instances supply only the pure view predicate; hidden ownership separation
+remains in the resource-context interpretation (ADRs 0053–0054). -/
+def wfWith
+    (pred : V → Prop) (m : ResourceMapView K V) : Prop :=
+  ∀ key value, m.entries key = some value → pred value
+
+theorem wfWith_entry
+    {pred : V → Prop} {m : ResourceMapView K V}
+    (hwf : m.wfWith pred) {key : K} {value : V}
+    (hentry : m.entries key = some value) : pred value :=
+  hwf key value hentry
+
+@[simp] theorem wfWith_empty (pred : V → Prop) :
+    (empty : ResourceMapView K V).wfWith pred := by
+  intro key value hentry
+  simp at hentry
+
+theorem wfWith_erase
+    {pred : V → Prop} {m : ResourceMapView K V}
+    (hwf : m.wfWith pred) (key : K) : (m.erase key).wfWith pred := by
+  intro other value hentry
+  have hne : other ≠ key := by
+    intro heq
+    subst other
+    simp at hentry
+  exact hwf other value (by simpa [erase, hne] using hentry)
+
+theorem wfWith_insert
+    {pred : V → Prop} {m : ResourceMapView K V}
+    (hwf : m.wfWith pred) (key : K) {value : V}
+    (hvalue : pred value) : (m.insert key value).wfWith pred := by
+  intro other stored hentry
+  by_cases heq : other = key
+  · subst other
+    simp only [insert_eq] at hentry
+    cases hentry
+    exact hvalue
+  · exact hwf other stored (by simpa [insert, heq] using hentry)
+
 /-! The first source-language instance: `u64` keys and `PointsTo<u64>`
 entries. A total selector keeps generated terms first-order; its fallback is
 unobservable because every use carries `canTakeU64`. -/

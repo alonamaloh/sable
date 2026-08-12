@@ -1,0 +1,5 @@
+// expect-error: record.bad_layout
+
+record BadLayout #[layout(size := 8, align := 3)] {
+    #[offset(0)] u64 value;
+}

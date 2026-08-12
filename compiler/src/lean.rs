@@ -125,6 +125,112 @@ pub fn emit(
     }
     e.push("");
 
+    for r in &vc.records {
+        let lean_name = crate::vcgen::lean_record_name(&r.name);
+        if exclude.classes.contains(&lean_name) {
+            continue;
+        }
+        names.classes.insert(lean_name.clone());
+        let first = e.line + 1;
+        e.push(&format!("structure {lean_name} where"));
+        for field in &r.fields {
+            e.push(&format!("  {} : {}", field.name, field.lean_ty));
+        }
+        e.push("");
+        e.push(&format!("namespace {lean_name}"));
+        e.push(&format!(
+            "def layout : Sable.Layout := ⟨{}, {}⟩",
+            r.layout.size, r.layout.align
+        ));
+        e.push(&format!(
+            "@[simp] theorem layout_size : layout.size = {} := rfl",
+            r.layout.size
+        ));
+        e.push(&format!(
+            "@[simp] theorem layout_align : layout.align = {} := rfl",
+            r.layout.align
+        ));
+        for field in &r.fields {
+            e.push(&format!("def {}Offset : Int := {}", field.name, field.offset));
+        }
+        let mut exponent = 0u32;
+        let mut align = r.layout.align;
+        while align > 1 {
+            align /= 2;
+            exponent += 1;
+        }
+        e.push("theorem layout_wf : layout.wf := by");
+        e.push(&format!(
+            "  refine ⟨by decide, by decide, ⟨{exponent}, rfl⟩⟩"
+        ));
+        for field in &r.fields {
+            e.push(&format!(
+                "theorem {}_fits : Sable.Layout.fieldFits layout {} {}Offset := by simp [Sable.Layout.fieldFits, layout, {}Offset, {}]",
+                field.name, field.layout, field.name, field.name, field.layout
+            ));
+        }
+        for left in 0..r.fields.len() {
+            for right in (left + 1)..r.fields.len() {
+                let lfield = &r.fields[left];
+                let rfield = &r.fields[right];
+                e.push(&format!(
+                    "theorem {}_{}_disjoint : Sable.Layout.fieldsDisjoint {} {}Offset {} {}Offset := by simp [Sable.Layout.fieldsDisjoint, {}Offset, {}Offset, {}, {}]",
+                    lfield.name,
+                    rfield.name,
+                    lfield.layout,
+                    lfield.name,
+                    rfield.layout,
+                    rfield.name,
+                    lfield.name,
+                    rfield.name,
+                    lfield.layout,
+                    rfield.layout
+                ));
+            }
+        }
+        let value_wf: Vec<&str> = r.fields.iter().filter_map(|f| f.wf.as_deref()).collect();
+        e.push(&format!("def wf (value : {lean_name}) : Prop :="));
+        e.push(&format!(
+            "  {}",
+            if value_wf.is_empty() {
+                "True".to_string()
+            } else {
+                value_wf.join(" ∧ ")
+            }
+        ));
+        e.push(&format!(
+            "def cellWf (cell : Sable.PointsToView {lean_name}) : Prop :="
+        ));
+        e.push("  cell.layout = layout ∧ 0 ≤ cell.off ∧ cell.off % cell.layout.align = 0 ∧");
+        e.push("    match cell.state with | .uninit => True | .init value => wf value");
+        e.push(&format!(
+            "def fromSpan (span : Sable.SpanView) : Sable.PointsToView {lean_name} :="
+        ));
+        e.push("  { alloc := span.alloc, off := span.off, layout := layout, state := .uninit }");
+        e.push("@[simp] theorem fromSpan_alloc (span : Sable.SpanView) : (fromSpan span).alloc = span.alloc := rfl");
+        e.push("@[simp] theorem fromSpan_off (span : Sable.SpanView) : (fromSpan span).off = span.off := rfl");
+        e.push("@[simp] theorem fromSpan_layout (span : Sable.SpanView) : (fromSpan span).layout = layout := rfl");
+        e.push("@[simp] theorem fromSpan_state (span : Sable.SpanView) : (fromSpan span).state = .uninit := rfl");
+        e.push(&format!(
+            "def toSpan (cell : Sable.PointsToView {lean_name}) : Sable.SpanView :="
+        ));
+        e.push("  { alloc := cell.alloc, off := cell.off, len := cell.layout.size,");
+        e.push("    bytes := ⟨cell.layout.size, fun _ => .init 0⟩ }");
+        e.push(&format!("@[simp] theorem toSpan_alloc (cell : Sable.PointsToView {lean_name}) : (toSpan cell).alloc = cell.alloc := rfl"));
+        e.push(&format!("@[simp] theorem toSpan_off (cell : Sable.PointsToView {lean_name}) : (toSpan cell).off = cell.off := rfl"));
+        e.push(&format!("@[simp] theorem toSpan_len (cell : Sable.PointsToView {lean_name}) : (toSpan cell).len = cell.layout.size := rfl"));
+        e.push(&format!("end {lean_name}"));
+        e.push("");
+        map.push(MapEntry {
+            first_line: first,
+            last_line: e.line,
+            target: MapTarget::Clause {
+                span: r.span,
+                desc: "record declaration".into(),
+            },
+        });
+    }
+
     for c in &vc.classes {
         let lean_name = crate::vcgen::lean_class_name(&c.name);
         if exclude.classes.contains(&lean_name) {

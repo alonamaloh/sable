@@ -1,0 +1,10 @@
+use typed_records;
+
+/// pre x = y
+fn expect_eq_u64(u64 x, u64 y) {
+}
+
+fn test_typed_record_round_trips() {
+    expect_eq_u64(typed_record_round_trip(), 77);
+    expect_eq_u64(typed_record_map_round_trip(), 91);
+}

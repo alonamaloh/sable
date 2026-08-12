@@ -55,6 +55,7 @@ pub struct ClauseWf {
 pub struct VcResult {
     pub ghosts: Vec<GhostItem>,
     pub classes: Vec<ClassEmit>,
+    pub records: Vec<RecordEmit>,
     pub clause_wfs: Vec<ClauseWf>,
     pub obligations: Vec<Obligation>,
     /// What this module trusts (ADR 0027). Emitted into the generated
@@ -79,19 +80,61 @@ pub struct ClassEmit {
     pub span: Span,
 }
 
-fn lean_field_ty(ty: Ty, classes: &[ClassDecl]) -> String {
+#[derive(Debug, Clone)]
+pub struct RecordEmit {
+    pub name: String,
+    pub fields: Vec<RecordFieldEmit>,
+    pub layout: StorageLayout,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordFieldEmit {
+    pub name: String,
+    pub lean_ty: String,
+    pub layout: String,
+    pub offset: i128,
+    pub wf: Option<String>,
+}
+
+fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> String {
     match ty {
         Ty::Int(_) => "Int".into(),
         Ty::Bool => "Bool".into(),
         Ty::Array(..) => "Sable.Seq Int".into(),
         // A class-valued field is a nested structure (ADR 0020).
         Ty::Class(ci) => lean_class_name(&classes[ci].name),
+        Ty::Record(ri) => lean_record_name(&records[ri].name),
         // A resource field contributes its *view* to the structure. The
         // authority it carries stays a checker property, so the class
         // gains a value and no obligation (ADR 0024/0029).
-        Ty::Res(k) | Ty::ResRef(k, _) => k.view_ty().into(),
-        Ty::Raw(_) => "Sable.RawPtr".into(),
+        Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(k, records),
+        Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
+        Ty::Option(_) => "Option Int".into(),
+        Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
         _ => unreachable!("checked: field types"),
+    }
+}
+
+fn lean_record_field_layout(ty: Ty) -> String {
+    match ty {
+        Ty::Int(it) => it.lean_layout(),
+        Ty::RawRecord(_) | Ty::OptionRaw(_) => "Sable.rawPtr.layout".into(),
+        _ => unreachable!("checked: record fields are raw-storable"),
+    }
+}
+
+fn lean_res_view_ty(kind: ResKind, records: &[RecordDecl]) -> String {
+    match kind {
+        ResKind::PointsToRecord(ri) => format!(
+            "Sable.PointsToView {}",
+            lean_record_name(&records[ri].name)
+        ),
+        ResKind::ResourceMapPointsToRecord(ri) => format!(
+            "Sable.ResourceMapView Int (Sable.PointsToView {})",
+            lean_record_name(&records[ri].name)
+        ),
+        _ => kind.view_ty().into(),
     }
 }
 
@@ -122,17 +165,25 @@ fn emit_extern_clause_wfs(
         match p.ty {
             Ty::Int(_) => binders.push((p.name.clone(), "Int".into())),
             Ty::Bool => binders.push((p.name.clone(), "Bool".into())),
-            Ty::Raw(_) => binders.push((p.name.clone(), "Sable.RawPtr".into())),
+            Ty::Raw(_) | Ty::RawRecord(_) =>
+                binders.push((p.name.clone(), "Sable.RawPtr".into())),
             Ty::Res(k) | Ty::ResRef(k, _) => {
-                binders.push((p.name.clone(), k.view_ty().into()));
+                binders.push((p.name.clone(), lean_res_view_ty(k, &program.records)));
                 if matches!(p.ty, Ty::ResRef(_, Mutability::Mut)) {
-                    binders.push((format!("_old_{}", p.name), k.view_ty().into()));
+                    binders.push((
+                        format!("_old_{}", p.name),
+                        lean_res_view_ty(k, &program.records),
+                    ));
                 }
             }
             Ty::Array(..) => binders.push((p.name.clone(), "Sable.Seq Int".into())),
             Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                 binders.push((p.name.clone(), lean_class_name(&program.classes[ci].name)))
             }
+            Ty::Record(ri) =>
+                binders.push((p.name.clone(), lean_record_name(&program.records[ri].name))),
+            Ty::OptionRaw(_) =>
+                binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
             Ty::Option(_) | Ty::Unit => {}
         }
     }
@@ -184,9 +235,41 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 fields: c
                     .fields
                     .iter()
-                    .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes)))
+                    .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes, &program.records)))
                     .collect(),
                 span: c.name_span,
+            })
+            .collect(),
+        records: program
+            .records
+            .iter()
+            .map(|r| RecordEmit {
+                name: r.name.clone(),
+                fields: r
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        RecordFieldEmit {
+                            name: f.name.clone(),
+                            lean_ty: lean_field_ty(
+                                f.ty,
+                                &program.classes,
+                                &program.records,
+                            ),
+                            layout: lean_record_field_layout(f.ty),
+                            offset: f.offset,
+                            wf: match f.ty {
+                                Ty::Int(it) => Some(format!(
+                                    "{} ≤ value.{} ∧ value.{} ≤ {}",
+                                    it.lean_min(), f.name, f.name, it.lean_max()
+                                )),
+                                _ => None,
+                            },
+                        }
+                    })
+                    .collect(),
+                layout: r.layout,
+                span: r.name_span,
             })
             .collect(),
         clause_wfs: Vec::new(),
@@ -220,7 +303,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             fields: c
                 .fields
                 .iter()
-                .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes)))
+                .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes, &program.records)))
                 .collect(),
             span: c.name_span,
         });
@@ -231,7 +314,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
         let binders: Vec<(String, String)> = c
             .fields
             .iter()
-            .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes)))
+            .map(|f| (f.name.clone(), lean_field_ty(f.ty, &program.classes, &program.records)))
             .collect();
         for (i, inv) in c.invariants.iter().enumerate() {
             let mut wf_binders: Vec<(String, String)> = Vec::new();
@@ -263,6 +346,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             fname,
             cctx,
             classes: &program.classes,
+            records: &program.records,
             sigs,
             fn_map: &fn_map,
             class_map: &class_map,
@@ -328,6 +412,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
             fname: f.name.clone(),
             cctx: Cctx::None,
             classes: &program.classes,
+            records: &program.records,
             sigs,
             fn_map: &fn_map,
             class_map: &class_map,
@@ -399,6 +484,7 @@ pub fn generate(program: &Program, sigs: &HashMap<String, FnSig>, source: &str) 
                 fname,
                 cctx,
                 classes: &program.classes,
+                records: &program.records,
                 sigs,
                 fn_map: &fn_map,
                 class_map: &class_map,
@@ -511,6 +597,9 @@ enum Val {
     Arr(String),
     /// Symbolic class value: a binder or a `{ _ with f := v }` chain.
     Obj(String),
+    /// Symbolic POD record value. It is structurally represented in Lean
+    /// like a class, but has no affine or invariant semantics.
+    Record(String),
     /// Symbolic resource *view*: a binder or a transformation of one.
     /// The token it belongs to is not represented — that is the point.
     View(String),
@@ -550,6 +639,7 @@ struct Generator<'a> {
     fname: String,
     cctx: Cctx<'a>,
     classes: &'a [ClassDecl],
+    records: &'a [RecordDecl],
     sigs: &'a HashMap<String, FnSig>,
     fn_map: &'a HashMap<&'a str, &'a Fn>,
     class_map: &'a HashMap<&'a str, &'a ClassDecl>,
@@ -634,8 +724,12 @@ impl<'a> Generator<'a> {
             Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => {
                 lean_class_name(&self.classes[*ci].name)
             }
-            Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) => k.view_ty().to_string(),
-            Some(Ty::Raw(_)) => "Sable.RawPtr".to_string(),
+            Some(Ty::Record(ri)) => lean_record_name(&self.records[*ri].name),
+            Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) =>
+                lean_res_view_ty(*k, self.records),
+            Some(Ty::Raw(_)) | Some(Ty::RawRecord(_)) => "Sable.RawPtr".to_string(),
+            Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".to_string(),
+            Some(Ty::Option(_)) => "Option Int".to_string(),
             Some(Ty::Int(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             _ => "Sable.Seq Int".to_string(),
@@ -666,12 +760,18 @@ impl<'a> Generator<'a> {
                 Ty::Class(ci) | Ty::ClassRef(ci, _) => {
                     Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
                 }
+                Ty::Record(ri) => {
+                    Some((name.clone(), lean_record_name(&self.records[*ri].name)))
+                }
                 // A resource binds its *view*; the authority it names is
                 // a checker property and appears nowhere in Lean.
                 Ty::Res(k) | Ty::ResRef(k, _) => {
-                    Some((name.clone(), k.view_ty().to_string()))
+                    Some((name.clone(), lean_res_view_ty(*k, self.records)))
                 }
-                Ty::Raw(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
+                Ty::Raw(_) | Ty::RawRecord(_) =>
+                    Some((name.clone(), "Sable.RawPtr".to_string())),
+                Ty::OptionRaw(_) =>
+                    Some((name.clone(), "Option Sable.RawPtr".to_string())),
                 Ty::Option(_) | Ty::Unit => None,
             })
             .collect();
@@ -853,8 +953,9 @@ impl<'a> Generator<'a> {
                 }
                 Target::View(k) => {
                     let b = self.hinted_sym("_view", Some(hint));
-                    self.binders.push((b.clone(), k.view_ty().into()));
-                    for (h, prop) in view_wf_hyps(k, &array, &b) {
+                    self.binders
+                        .push((b.clone(), lean_res_view_ty(k, self.records)));
+                    for (h, prop) in view_wf_hyps(k, &array, &b, self.records) {
                         self.push_hyp_unique(h, prop);
                     }
                     b
@@ -941,6 +1042,19 @@ impl<'a> Generator<'a> {
                     self.push_invariant_hyps(cd, &binder);
                     self.env.insert(p.name.clone(), Val::Obj(binder));
                 }
+                Ty::Record(ri) => {
+                    let lean_record = lean_record_name(&self.records[ri].name);
+                    self.binders.push((
+                        p.name.clone(),
+                        lean_record.clone(),
+                    ));
+                    self.hyps.push((
+                        format!("h_{}_wf", p.name),
+                        format!("{lean_record}.wf {}", p.name),
+                    ));
+                    self.env
+                        .insert(p.name.clone(), Val::Record(p.name.clone()));
+                }
                 // A resource parameter binds its *view* and nothing
                 // else: the authority it carries is a checker property,
                 // and no generated VC ever mentions it (ADR 0022/0024).
@@ -954,15 +1068,21 @@ impl<'a> Generator<'a> {
                     } else {
                         p.name.clone()
                     };
-                    self.binders.push((binder.clone(), k.view_ty().into()));
-                    for (h, prop) in view_wf_hyps(k, &p.name, &binder) {
+                    self.binders
+                        .push((binder.clone(), lean_res_view_ty(k, self.records)));
+                    for (h, prop) in view_wf_hyps(k, &p.name, &binder, self.records) {
                         self.hyps.push((h, prop));
                     }
                     self.env.insert(p.name.clone(), Val::View(binder));
                 }
-                Ty::Raw(_) => {
+                Ty::Raw(_) | Ty::RawRecord(_) => {
                     self.binders.push((p.name.clone(), "Sable.RawPtr".into()));
                     self.env.insert(p.name.clone(), Val::Ptr(p.name.clone()));
+                }
+                Ty::OptionRaw(_) => {
+                    self.binders
+                        .push((p.name.clone(), "Option Sable.RawPtr".into()));
+                    self.env.insert(p.name.clone(), Val::Opt(p.name.clone()));
                 }
                 Ty::Int(it) => {
                     self.binders.push((p.name.clone(), "Int".into()));
@@ -1059,14 +1179,18 @@ impl<'a> Generator<'a> {
     fn result_lean_ty(&self) -> String {
         match self.f.ret {
             Ty::Option(_) => "Option Int".into(),
+            Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
             // Bool results are Prop-valued in the logic: posts like
             // `result → P` splice with no coercion noise.
             Ty::Bool => "Prop".into(),
             // A returned class value is its structure (ADR 0010).
             Ty::Class(ci) => lean_class_name(&self.classes[ci].name),
+            Ty::Record(ri) => lean_record_name(&self.records[ri].name),
             // A returned resource is its view: the authority moves, and
             // the logic sees only what the view says (ADR 0024).
-            Ty::Res(k) | Ty::ResRef(k, _) => k.view_ty().into(),
+            Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(k, self.records),
+            Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
+            Ty::Unit => "Unit".into(),
             _ => "Int".into(),
         }
     }
@@ -1223,15 +1347,8 @@ impl<'a> Generator<'a> {
                 self.exec(rest, tail);
             }
             Stmt::Return { value, .. } => {
-                let result_eq = value.as_ref().map(|value| match &value.kind {
-                    ExprKind::SomeE(inner) => {
-                        let Val::Int(v) = self.eval(inner) else {
-                            unreachable!()
-                        };
-                        format!("(result = some ({v}))")
-                    }
-                    ExprKind::NoneE => "(result = none)".to_string(),
-                    _ => match self.eval(value) {
+                let result_eq = value.as_ref().map(|value| {
+                    match self.eval(value) {
                         Val::Int(v) => format!("(result = {v})"),
                         Val::Opt(v) => format!("(result = {v})"),
                         Val::Prop(p) => format!("(result ↔ ({p}))"),
@@ -1256,6 +1373,7 @@ impl<'a> Generator<'a> {
                             }
                             format!("(result = {chain})")
                         }
+                        Val::Record(record) => format!("(result = {record})"),
                         // Returning a resource returns its authority; in
                         // the logic that is just its view. There is no
                         // `ret_inv` analogue — a view carries its own
@@ -1265,7 +1383,7 @@ impl<'a> Generator<'a> {
                         // no authority, nothing to re-establish (ADR 0026).
                         Val::Ptr(chain) => format!("(result = {chain})"),
                         _ => unreachable!("unit values cannot be returned"),
-                    },
+                    }
                 });
                 self.emit_posts(result_eq);
             }
@@ -1778,7 +1896,12 @@ impl<'a> Generator<'a> {
                     continue;
                 }
                 let s = match val {
-                    Val::Int(s) | Val::Opt(s) | Val::Arr(s) | Val::Obj(s) | Val::View(s)
+                    Val::Int(s)
+                    | Val::Opt(s)
+                    | Val::Arr(s)
+                    | Val::Obj(s)
+                    | Val::Record(s)
+                    | Val::View(s)
                     | Val::Ptr(s) => s,
                     Val::Prop(s) => s,
                     Val::Unit => continue,
@@ -1960,8 +2083,9 @@ impl<'a> Generator<'a> {
                 // two would make every loop drop the authority it carries.
                 Some(Ty::Res(k)) | Some(Ty::ResRef(k, Mutability::Mut)) => {
                     let k = *k;
-                    self.binders.push((name.clone(), k.view_ty().into()));
-                    for (h, prop) in view_wf_hyps(k, name, name) {
+                    self.binders
+                        .push((name.clone(), lean_res_view_ty(k, self.records)));
+                    for (h, prop) in view_wf_hyps(k, name, name, self.records) {
                         self.hyps.push((h, prop));
                     }
                     self.env.insert(name.clone(), Val::View(name.clone()));
@@ -2078,7 +2202,11 @@ impl<'a> Generator<'a> {
                 );
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
-                Val::Int(format!("(({o}).value)"))
+                let value = format!("(({o}).value)");
+                match e.ty {
+                    Some(Ty::RawRecord(_)) => Val::Ptr(value),
+                    _ => Val::Int(value),
+                }
             }
             ExprKind::Widen { arg, .. } => self.eval(arg),
             ExprKind::Narrow { target, arg } => {
@@ -2100,9 +2228,14 @@ impl<'a> Generator<'a> {
                 self.assume_fact(&goal);
                 Val::Int(v)
             }
-            ExprKind::SomeE(_) | ExprKind::NoneE => {
-                unreachable!("checked: options only in return position")
+            ExprKind::SomeE(inner) => {
+                let value = match self.eval(inner) {
+                    Val::Int(v) | Val::Ptr(v) => v,
+                    _ => unreachable!("checked: option payload"),
+                };
+                Val::Opt(format!("some ({value})"))
             }
+            ExprKind::NoneE => Val::Opt("none".into()),
             // The raw operations. Every one carries a *pointer-names-byte*
             // premise instead of a global provenance predicate: same
             // allocation, offset lands inside the span. The resource
@@ -2119,6 +2252,28 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: u64")
                         };
                         Val::Ptr(format!("(Sable.RawPtr.add {p} {d})"))
+                    }
+                    RawOp::CastRecord(_) => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw<u8>")
+                        };
+                        Val::Ptr(p)
+                    }
+                    RawOp::PointerOffsetRecord(_) => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw record pointer")
+                        };
+                        let value = format!("({p}).off");
+                        let goal = range_prop(&value, IntTy::U64);
+                        let ob = self.obligation(
+                            &format!("{}.pointer.offset", self.fname),
+                            "a record pointer's arena offset must fit `u64`".into(),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        Val::Int(value)
                     }
                     RawOp::Load8 => {
                         let Val::Ptr(p) = self.eval(&args[0]) else {
@@ -2537,6 +2692,228 @@ impl<'a> Generator<'a> {
                         self.env.insert(name.clone(), Val::View(c2));
                         Val::Unit
                     }
+                    RawOp::IntoCellRecord(ri) => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw record pointer")
+                        };
+                        let Val::View(bytes) = self.eval(&args[1]) else {
+                            unreachable!("checked: raw span value")
+                        };
+                        let record = lean_record_name(&self.records[*ri].name);
+                        let layout = format!("{record}.layout");
+                        let goal = format!(
+                            "({p}).alloc = ({bytes}).alloc ∧ ({p}).off = ({bytes}).off \
+                             ∧ ({bytes}).len = ({layout}).size \
+                             ∧ ({bytes}).off % ({layout}).align = 0"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.record.from_raw", self.fname),
+                            format!(
+                                "`raw_into_cell<{}>` needs one complete aligned record extent",
+                                self.records[*ri].name
+                            ),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let cell = self.hinted_sym("_cell", hint);
+                        let kind = ResKind::PointsToRecord(*ri);
+                        self.binders.push((
+                            cell.clone(),
+                            lean_res_view_ty(kind, self.records),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{}_cell", cell.trim_start_matches('_')),
+                            format!("{cell} = {record}.fromSpan ({bytes})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", cell.trim_start_matches('_')),
+                            format!("{record}.cellWf {cell}"),
+                        );
+                        Val::View(cell)
+                    }
+                    RawOp::FromCellRecord(ri) => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw record pointer")
+                        };
+                        let Val::View(cell) = self.eval(&args[1]) else {
+                            unreachable!("checked: record cell value")
+                        };
+                        let record = lean_record_name(&self.records[*ri].name);
+                        let goal = format!(
+                            "Sable.PointsToView.names ({cell}) ({p}) ∧ \
+                             ({cell}).state = Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.record.to_raw", self.fname),
+                            format!(
+                                "`raw_from_cell<{}>` needs a matching uninitialized cell",
+                                self.records[*ri].name
+                            ),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let bytes = self.hinted_sym("_view", hint);
+                        self.binders.push((
+                            bytes.clone(),
+                            ResKind::RawSpan.view_ty().into(),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{}_span", bytes.trim_start_matches('_')),
+                            format!("{bytes} = {record}.toSpan ({cell})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_recon", bytes.trim_start_matches('_')),
+                            format!("Sable.SpanView.reconstructible {bytes}"),
+                        );
+                        Val::View(bytes)
+                    }
+                    RawOp::CellInitRecord(ri) => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw record pointer")
+                        };
+                        let Val::Record(value) = self.eval(&args[1]) else {
+                            unreachable!("checked: record value")
+                        };
+                        let Val::View(cell) = self.eval(&args[2]) else {
+                            unreachable!("checked: record cell borrow")
+                        };
+                        let record = lean_record_name(&self.records[*ri].name);
+                        let goal = format!(
+                            "Sable.PointsToView.names ({cell}) ({p}) ∧ \
+                             ({cell}).state = Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.record.init", self.fname),
+                            format!(
+                                "`raw_cell_init<{}>` needs a matching uninitialized cell",
+                                self.records[*ri].name
+                            ),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array: name, .. } = &args[2].kind else {
+                            unreachable!("checked: record cell borrow")
+                        };
+                        let next = self.hinted_sym("_cell", Some(name.clone()));
+                        self.binders.push((
+                            next.clone(),
+                            lean_res_view_ty(ResKind::PointsToRecord(*ri), self.records),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{name}_init"),
+                            format!("{next} = Sable.PointsToView.put ({cell}) ({value})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{name}_wf"),
+                            format!("{record}.cellWf {next}"),
+                        );
+                        self.env.insert(name.clone(), Val::View(next));
+                        Val::Unit
+                    }
+                    RawOp::CellReadRecord(ri) | RawOp::CellTakeRecord(ri) => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw record pointer")
+                        };
+                        let Val::View(cell) = self.eval(&args[1]) else {
+                            unreachable!("checked: record cell borrow")
+                        };
+                        let taking = matches!(op, RawOp::CellTakeRecord(_));
+                        let operation = if taking { "take" } else { "read" };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({cell}) ({p}) ∧ \
+                             ({cell}).state ≠ Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.record.{operation}", self.fname),
+                            format!(
+                                "`raw_cell_{operation}<{}>` needs a matching initialized cell",
+                                self.records[*ri].name
+                            ),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let value = self.hinted_sym("_record", hint);
+                        let record = lean_record_name(&self.records[*ri].name);
+                        self.binders.push((value.clone(), record.clone()));
+                        self.push_hyp_unique(
+                            format!("h_{}_cell_value", value.trim_start_matches('_')),
+                            format!("({cell}).state = Sable.CellState.init ({value})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", value.trim_start_matches('_')),
+                            format!("{record}.wf {value}"),
+                        );
+                        if taking {
+                            let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
+                                unreachable!("checked: record cell borrow")
+                            };
+                            let next = self.hinted_sym("_cell", Some(name.clone()));
+                            self.binders.push((
+                                next.clone(),
+                                lean_res_view_ty(ResKind::PointsToRecord(*ri), self.records),
+                            ));
+                            self.push_hyp_unique(
+                                format!("h_{name}_take"),
+                                format!("{next} = Sable.PointsToView.clear ({cell})"),
+                            );
+                            self.push_hyp_unique(
+                                format!("h_{name}_wf"),
+                                format!("{record}.cellWf {next}"),
+                            );
+                            self.env.insert(name.clone(), Val::View(next));
+                        }
+                        Val::Record(value)
+                    }
+                    RawOp::CellDropRecord(ri) => {
+                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                            unreachable!("checked: raw record pointer")
+                        };
+                        let Val::View(cell) = self.eval(&args[1]) else {
+                            unreachable!("checked: record cell borrow")
+                        };
+                        let goal = format!(
+                            "Sable.PointsToView.names ({cell}) ({p}) ∧ \
+                             ({cell}).state ≠ Sable.CellState.uninit"
+                        );
+                        let ob = self.obligation(
+                            &format!("{}.record.drop", self.fname),
+                            format!(
+                                "`raw_cell_drop<{}>` needs a matching initialized cell",
+                                self.records[*ri].name
+                            ),
+                            e.span,
+                            goal.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&goal);
+                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
+                            unreachable!("checked: record cell borrow")
+                        };
+                        let next = self.hinted_sym("_cell", Some(name.clone()));
+                        let record = lean_record_name(&self.records[*ri].name);
+                        self.binders.push((
+                            next.clone(),
+                            lean_res_view_ty(ResKind::PointsToRecord(*ri), self.records),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{name}_drop"),
+                            format!("{next} = Sable.PointsToView.clear ({cell})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{name}_wf"),
+                            format!("{record}.cellWf {next}"),
+                        );
+                        self.env.insert(name.clone(), Val::View(next));
+                        Val::Unit
+                    }
                     RawOp::IntoFreeHeader => {
                         let Val::Ptr(p) = self.eval(&args[0]) else {
                             unreachable!("checked: raw<u8>")
@@ -2895,7 +3272,9 @@ impl<'a> Generator<'a> {
                         let w = self.hinted_sym("_world", hint);
                         self.binders
                             .push((w.clone(), ResKind::PosixWorld.view_ty().into()));
-                        for (h, prop) in view_wf_hyps(ResKind::PosixWorld, &w, &w) {
+                        for (h, prop) in
+                            view_wf_hyps(ResKind::PosixWorld, &w, &w, self.records)
+                        {
                             self.push_hyp_unique(h, prop);
                         }
                         // A fresh world has handed out no authority yet.
@@ -2909,34 +3288,57 @@ impl<'a> Generator<'a> {
                         Val::View(w)
                     }
                     ResOp::ResourceMapEmpty => {
+                        let Some(Ty::Res(map_kind @ (ResKind::ResourceMapPointsToU64
+                            | ResKind::ResourceMapPointsToRecord(_)))) = e.ty
+                        else {
+                            unreachable!("checked: resource-map result type")
+                        };
                         let map = self.hinted_sym("_resource_map", hint);
-                        self.binders.push((
-                            map.clone(),
-                            ResKind::ResourceMapPointsToU64.view_ty().into(),
-                        ));
+                        self.binders
+                            .push((map.clone(), lean_res_view_ty(map_kind, self.records)));
                         self.push_hyp_unique(
                             format!("h_{}_empty", map.trim_start_matches('_')),
                             format!("{map} = Sable.ResourceMapView.empty"),
                         );
                         for (h, prop) in view_wf_hyps(
-                            ResKind::ResourceMapPointsToU64,
+                            map_kind,
                             map.trim_start_matches('_'),
                             &map,
+                            self.records,
                         ) {
                             self.push_hyp_unique(h, prop);
                         }
                         Val::View(map)
                     }
                     ResOp::ResourceMapTake => {
+                        let Some(map_kind @ (ResKind::ResourceMapPointsToU64
+                            | ResKind::ResourceMapPointsToRecord(_))) =
+                            vc_resource_kind(&self.var_tys, &args[0])
+                        else {
+                            unreachable!("checked: resource-map borrow")
+                        };
+                        let cell_kind = match map_kind {
+                            ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
+                            ResKind::ResourceMapPointsToRecord(ri) => {
+                                ResKind::PointsToRecord(ri)
+                            }
+                            _ => unreachable!(),
+                        };
                         let Val::View(map) = self.eval(&args[0]) else {
                             unreachable!("checked: resource map borrow")
                         };
                         let Val::Int(key) = self.eval(&args[1]) else {
                             unreachable!("checked: u64 key")
                         };
-                        let goal = format!(
-                            "Sable.ResourceMapView.canTakeU64 ({map}) {key}"
-                        );
+                        let goal = match map_kind {
+                            ResKind::ResourceMapPointsToU64 => {
+                                format!("Sable.ResourceMapView.canTakeU64 ({map}) {key}")
+                            }
+                            ResKind::ResourceMapPointsToRecord(_) => {
+                                format!("∃ cell, ({map}).entries {key} = some cell")
+                            }
+                            _ => unreachable!(),
+                        };
                         let ob = self.obligation(
                             &format!(
                                 "{}.resource_map_take.{}",
@@ -2956,7 +3358,7 @@ impl<'a> Generator<'a> {
                             self.hinted_sym("_resource_map", Some(array.clone()));
                         self.binders.push((
                             residual.clone(),
-                            ResKind::ResourceMapPointsToU64.view_ty().into(),
+                            lean_res_view_ty(map_kind, self.records),
                         ));
                         self.push_hyp_unique(
                             format!("h_{array}_take"),
@@ -2964,32 +3366,47 @@ impl<'a> Generator<'a> {
                                 "{residual} = Sable.ResourceMapView.erase ({map}) {key}"
                             ),
                         );
-                        self.push_hyp_unique(
-                            format!("h_{array}_wf"),
-                            format!("Sable.ResourceMapView.wfU64 {residual}"),
-                        );
+                        for (h, prop) in
+                            view_wf_hyps(map_kind, array, &residual, self.records)
+                        {
+                            self.push_hyp_unique(h, prop);
+                        }
                         self.env
                             .insert(array.clone(), Val::View(residual.clone()));
                         let cell = self.hinted_sym("_cell", hint);
-                        self.binders
-                            .push((cell.clone(), ResKind::PointsToU64.view_ty().into()));
-                        self.push_hyp_unique(
-                            format!("h_{}_take", cell.trim_start_matches('_')),
-                            format!(
-                                "{cell} = Sable.ResourceMapView.cellAtU64 ({map}) {key}"
-                            ),
-                        );
+                        self.binders.push((
+                            cell.clone(),
+                            lean_res_view_ty(cell_kind, self.records),
+                        ));
+                        if map_kind == ResKind::ResourceMapPointsToU64 {
+                            self.push_hyp_unique(
+                                format!("h_{}_take", cell.trim_start_matches('_')),
+                                format!(
+                                    "{cell} = Sable.ResourceMapView.cellAtU64 ({map}) {key}"
+                                ),
+                            );
+                        }
                         self.push_hyp_unique(
                             format!("h_{}_entry", cell.trim_start_matches('_')),
                             format!("({map}).entries {key} = some {cell}"),
                         );
-                        self.push_hyp_unique(
-                            format!("h_{}_wf", cell.trim_start_matches('_')),
-                            format!("Sable.PointsToView.wfU64 {cell}"),
-                        );
+                        for (h, prop) in view_wf_hyps(
+                            cell_kind,
+                            cell.trim_start_matches('_'),
+                            &cell,
+                            self.records,
+                        ) {
+                            self.push_hyp_unique(h, prop);
+                        }
                         Val::View(cell)
                     }
                     ResOp::ResourceMapPut => {
+                        let Some(map_kind @ (ResKind::ResourceMapPointsToU64
+                            | ResKind::ResourceMapPointsToRecord(_))) =
+                            vc_resource_kind(&self.var_tys, &args[0])
+                        else {
+                            unreachable!("checked: resource-map borrow")
+                        };
                         let Val::View(map) = self.eval(&args[0]) else {
                             unreachable!("checked: resource map borrow")
                         };
@@ -3019,7 +3436,7 @@ impl<'a> Generator<'a> {
                             self.hinted_sym("_resource_map", Some(array.clone()));
                         self.binders.push((
                             restored.clone(),
-                            ResKind::ResourceMapPointsToU64.view_ty().into(),
+                            lean_res_view_ty(map_kind, self.records),
                         ));
                         self.push_hyp_unique(
                             format!("h_{array}_put"),
@@ -3032,10 +3449,11 @@ impl<'a> Generator<'a> {
                             format!("h_{array}_entry"),
                             format!("({restored}).entries {key} = some {cell}"),
                         );
-                        self.push_hyp_unique(
-                            format!("h_{array}_wf"),
-                            format!("Sable.ResourceMapView.wfU64 {restored}"),
-                        );
+                        for (h, prop) in
+                            view_wf_hyps(map_kind, array, &restored, self.records)
+                        {
+                            self.push_hyp_unique(h, prop);
+                        }
                         self.env.insert(array.clone(), Val::View(restored));
                         Val::Unit
                     }
@@ -3114,6 +3532,7 @@ impl<'a> Generator<'a> {
                             ResKind::RawSpan,
                             root.trim_start_matches('_'),
                             &root,
+                            self.records,
                         ) {
                             self.push_hyp_unique(h, prop);
                         }
@@ -3721,6 +4140,18 @@ impl<'a> Generator<'a> {
                 };
                 Val::Int(project_field(&chain, field))
             }
+            ExprKind::RecordField { obj, field, .. } => {
+                let Val::Record(record) = self.env[obj.as_str()].clone() else {
+                    unreachable!("checked: record receiver")
+                };
+                let projection = format!("({record}).{field}");
+                match e.ty {
+                    Some(Ty::Int(_)) => Val::Int(projection),
+                    Some(Ty::RawRecord(_)) => Val::Ptr(projection),
+                    Some(Ty::OptionRaw(_)) => Val::Opt(projection),
+                    _ => unreachable!("checked: initial record field type"),
+                }
+            }
             ExprKind::ClassFieldLen { obj, field } => {
                 let Val::Obj(chain) = self.env[obj.as_str()].clone() else {
                     unreachable!("checked: class-typed receiver")
@@ -3895,6 +4326,27 @@ impl<'a> Generator<'a> {
                 }
                 Val::Obj(b)
             }
+            ExprKind::RecordLit { record, args, .. } => {
+                let ri = self
+                    .records
+                    .iter()
+                    .position(|r| r.name == *record)
+                    .expect("checked: record exists");
+                let lean_record = lean_record_name(record);
+                let values: Vec<String> = args
+                    .iter()
+                    .map(|arg| match self.eval(arg) {
+                        Val::Int(v) | Val::Opt(v) | Val::Ptr(v) => v,
+                        _ => unreachable!("checked: raw-storable record field"),
+                    })
+                    .collect();
+                let value = format!("({lean_record}.mk {})", values.join(" "));
+                self.push_hyp_unique(
+                    format!("h_{}_wf", slug(self.src(e.span))),
+                    format!("{}.wf {value}", lean_record_name(&self.records[ri].name)),
+                );
+                Val::Record(value)
+            }
             ExprKind::TraitCall {
                 param,
                 method,
@@ -4068,8 +4520,11 @@ impl<'a> Generator<'a> {
                         self.push_invariant_hyps(&rcd, &ret_sym);
                     }
                     Ty::Res(k) | Ty::ResRef(k, _) => {
-                        self.binders.push((ret_sym.clone(), k.view_ty().into()));
-                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym) {
+                        self.binders
+                            .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
+                        for (h, prop) in
+                            view_wf_hyps(k, &ret_sym, &ret_sym, self.records)
+                        {
                             self.push_hyp_unique(h, prop);
                         }
                     }
@@ -4376,8 +4831,11 @@ impl<'a> Generator<'a> {
                     // authority that came with it is the checker's
                     // business, and appears nowhere here (ADR 0024).
                     Ty::Res(k) | Ty::ResRef(k, _) => {
-                        self.binders.push((ret_sym.clone(), k.view_ty().into()));
-                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym) {
+                        self.binders
+                            .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
+                        for (h, prop) in
+                            view_wf_hyps(k, &ret_sym, &ret_sym, self.records)
+                        {
                             self.push_hyp_unique(h, prop);
                         }
                     }
@@ -4607,17 +5065,24 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), lean));
                     }
                 }
+                Ty::Record(ri) => out.push((
+                    p.name.clone(),
+                    lean_record_name(&self.records[ri].name),
+                )),
                 Ty::Array(..) => {
                     out.push((p.name.clone(), "Sable.Seq Int".into()));
                     if let Some(entry) = self.entry_states.get(&p.name) {
                         out.push((entry.clone(), "Sable.Seq Int".into()));
                     }
                 }
-                Ty::Raw(_) => out.push((p.name.clone(), "Sable.RawPtr".into())),
+                Ty::Raw(_) | Ty::RawRecord(_) =>
+                    out.push((p.name.clone(), "Sable.RawPtr".into())),
+                Ty::OptionRaw(_) =>
+                    out.push((p.name.clone(), "Option Sable.RawPtr".into())),
                 Ty::Res(k) | Ty::ResRef(k, _) => {
-                    out.push((p.name.clone(), k.view_ty().into()));
+                    out.push((p.name.clone(), lean_res_view_ty(k, self.records)));
                     if let Some(entry) = self.entry_states.get(&p.name) {
-                        out.push((entry.clone(), k.view_ty().into()));
+                        out.push((entry.clone(), lean_res_view_ty(k, self.records)));
                     }
                 }
                 Ty::Option(_) | Ty::Unit => {}
@@ -4955,7 +5420,12 @@ fn vc_resource_kind(var_tys: &HashMap<String, Ty>, e: &Expr) -> Option<ResKind> 
     }
 }
 
-fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)> {
+fn view_wf_hyps(
+    kind: ResKind,
+    name: &str,
+    binder: &str,
+    records: &[RecordDecl],
+) -> Vec<(String, String)> {
     match kind {
         ResKind::RawSpan => vec![(
             format!("h_{name}_wf"),
@@ -4964,6 +5434,10 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         ResKind::PointsToU64 => vec![(
             format!("h_{name}_wf"),
             format!("Sable.PointsToView.wfU64 {binder}"),
+        )],
+        ResKind::PointsToRecord(ri) => vec![(
+            format!("h_{name}_wf"),
+            format!("{}.cellWf {binder}", lean_record_name(&records[ri].name)),
         )],
         // A descriptor is nonnegative and a position never goes backwards
         // past the start of the file. Nothing about *which* file, and
@@ -5000,6 +5474,13 @@ fn view_wf_hyps(kind: ResKind, name: &str, binder: &str) -> Vec<(String, String)
         ResKind::ResourceMapPointsToU64 => vec![(
             format!("h_{name}_wf"),
             format!("Sable.ResourceMapView.wfU64 {binder}"),
+        )],
+        ResKind::ResourceMapPointsToRecord(ri) => vec![(
+            format!("h_{name}_wf"),
+            format!(
+                "Sable.ResourceMapView.wfWith {}.cellWf {binder}",
+                lean_record_name(&records[ri].name)
+            ),
         )],
     }
 }
@@ -5151,6 +5632,12 @@ fn preprocess_old_params(text: &str, params: &[Param]) -> String {
 /// and `.mk` literals.
 pub fn lean_class_name(name: &str) -> String {
     format!("SableC_{name}")
+}
+
+/// Lean name of a POD record structure. The distinct prefix mirrors the
+/// source category split from affine classes (ADR 0054).
+pub fn lean_record_name(name: &str) -> String {
+    format!("SableR_{name}")
 }
 
 fn project_field(state: &str, field: &str) -> String {

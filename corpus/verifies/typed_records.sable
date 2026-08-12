@@ -1,0 +1,70 @@
+record IntrusiveNode #[layout(size := 24, align := 8)] {
+    #[offset(0)] option<raw<IntrusiveNode>> previous;
+    #[offset(8)] option<raw<IntrusiveNode>> next;
+    #[offset(16)] u64 payload;
+}
+
+/// post result.previous = previous
+/// post result.next = next
+/// post result.payload = payload
+pub fn intrusive_node(
+    option<raw<IntrusiveNode>> previous,
+    option<raw<IntrusiveNode>> next,
+    u64 payload
+) -> IntrusiveNode {
+    return IntrusiveNode(previous, next, payload);
+}
+
+/// post result = node.payload
+pub fn intrusive_payload(IntrusiveNode node) -> u64 {
+    return node.payload;
+}
+
+// The whole typed-record lifecycle is abstract: no byte encoding is exposed.
+// Converting the cleared cell back to RawSpan reconstructs the system root.
+
+/// post result = 77
+pub fn typed_record_round_trip() -> u64 {
+    unsafe system_alloc(24) as (base, resource mem, resource release);
+    mut u64 out = 0;
+    unsafe {
+        raw<IntrusiveNode> node_ptr = raw_cast<IntrusiveNode>(base);
+        mut resource PointsTo<IntrusiveNode> cell =
+            raw_into_cell<IntrusiveNode>(node_ptr, mem);
+        IntrusiveNode node = IntrusiveNode(none, none, 77);
+        raw_cell_init<IntrusiveNode>(node_ptr, node, &mut cell);
+        IntrusiveNode seen = raw_cell_read<IntrusiveNode>(node_ptr, &cell);
+        out = seen.payload;
+        IntrusiveNode taken = raw_cell_take<IntrusiveNode>(node_ptr, &mut cell);
+        resource RawSpan bytes = raw_from_cell<IntrusiveNode>(node_ptr, cell);
+    }
+    unsafe system_dealloc(base, bytes, release);
+    return out;
+}
+
+/// post result = 91
+pub fn typed_record_map_round_trip() -> u64 {
+    unsafe system_alloc(24) as (base, resource mem, resource release);
+    unsafe {
+        raw<IntrusiveNode> node_ptr = raw_cast<IntrusiveNode>(base);
+        mut resource PointsTo<IntrusiveNode> cell =
+            raw_into_cell<IntrusiveNode>(node_ptr, mem);
+        IntrusiveNode node = IntrusiveNode(none, none, 91);
+        raw_cell_init<IntrusiveNode>(node_ptr, node, &mut cell);
+    }
+
+    mut resource ResourceMap<u64, PointsTo<IntrusiveNode>> cells =
+        resource_map_empty();
+    resource_map_put(&mut cells, 7, cell);
+    mut resource PointsTo<IntrusiveNode> back =
+        resource_map_take(&mut cells, 7);
+
+    mut u64 out = 0;
+    unsafe {
+        IntrusiveNode taken = raw_cell_take<IntrusiveNode>(node_ptr, &mut back);
+        out = taken.payload;
+        resource RawSpan bytes = raw_from_cell<IntrusiveNode>(node_ptr, back);
+    }
+    unsafe system_dealloc(base, bytes, release);
+    return out;
+}

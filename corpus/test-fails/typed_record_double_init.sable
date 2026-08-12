@@ -1,0 +1,15 @@
+// expect-test-failure: raw_cell_init<Node> needs a matching uninitialized cell
+
+record Node #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+fn test_typed_record_double_init() {
+    unsafe static_alloc(8) as (base, resource bytes);
+    unsafe {
+        raw<Node> ptr = raw_cast<Node>(base);
+        mut resource PointsTo<Node> cell = raw_into_cell<Node>(ptr, bytes);
+        raw_cell_init<Node>(ptr, Node(1), &mut cell);
+        raw_cell_init<Node>(ptr, Node(2), &mut cell);
+    }
+}

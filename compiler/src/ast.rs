@@ -116,11 +116,18 @@ pub enum Ty {
     /// (unique, mutable through the class's own `&mut self` methods —
     /// ADR 0023). Parameters only.
     ClassRef(usize, Mutability),
+    /// A plain, copyable record value with compiler-checked explicit
+    /// layout. Records are deliberately distinct from affine classes:
+    /// they have no invariant, methods, resources, or destructor (ADR 0054).
+    Record(usize),
     /// Borrowed array of integers: `&[i32]` (shared) or `&mut [i32]`
     /// (unique, mutable). Parameters only.
     Array(IntTy, Mutability),
     /// `option<u64>` etc. Return types only.
     Option(IntTy),
+    /// `option<raw<R>>` for an explicitly laid-out record. This is an
+    /// abstract nullable pointer value, not a byte representation.
+    OptionRaw(usize),
     /// An owned resource: affine authority, erased at runtime, with a
     /// pure view the proof language reads (ADR 0024).
     Res(ResKind),
@@ -128,6 +135,9 @@ pub enum Ty {
     /// address. Carries no authority at all; a load or a store needs a
     /// resource borrow alongside it (ADR 0026).
     Raw(IntTy),
+    /// A statically tagged pointer to an explicitly laid-out record.
+    /// Runtime representation remains provenance plus byte offset.
+    RawRecord(usize),
     /// `resource &R` / `resource &mut R` — a borrow of that authority.
     ResRef(ResKind, Mutability),
     /// No return value (procedures like in-place sorts).
@@ -145,6 +155,8 @@ pub enum ResKind {
     /// typed operation surface remains deliberately u64-only (ADRs
     /// 0031–0032).
     PointsToU64,
+    /// One abstract typed extent containing an explicitly laid-out record.
+    PointsToRecord(usize),
     /// One open file description: the authority to use a descriptor, and
     /// the position that description is at (ADR 0028).
     OpenFile,
@@ -173,6 +185,9 @@ pub enum ResKind {
     /// stable integer key. The parameterized source surface initially admits
     /// only `ResourceMap<u64, PointsTo<u64>>` (ADR 0053).
     ResourceMapPointsToU64,
+    /// The record-typed instance needed by the intrusive-list acceptance
+    /// test. Keys remain arena-relative `u64` offsets in v1.
+    ResourceMapPointsToRecord(usize),
 }
 
 /// The sealed transformations of resource authority. These are not
@@ -300,6 +315,18 @@ pub enum RawOp {
     CellReadU64,
     CellTakeU64,
     CellDropU64,
+    /// Record-typed counterparts. The record index is the static type tag;
+    /// none of these operations grants a byte representation (ADR 0054).
+    IntoCellRecord(usize),
+    FromCellRecord(usize),
+    CellInitRecord(usize),
+    CellReadRecord(usize),
+    CellTakeRecord(usize),
+    CellDropRecord(usize),
+    /// Pure retagging from `raw<u8>` to `raw<R>` and pure observation of
+    /// the arena-relative offset. Neither operation carries authority.
+    CastRecord(usize),
+    PointerOffsetRecord(usize),
     /// Convert the first two words of a FreeBlock to/from an in-band header.
     IntoFreeHeader,
     FromFreeHeader,
@@ -345,6 +372,14 @@ impl RawOp {
             RawOp::CellReadU64 => "raw_cell_read_u64",
             RawOp::CellTakeU64 => "raw_cell_take_u64",
             RawOp::CellDropU64 => "raw_cell_drop_u64",
+            RawOp::IntoCellRecord(_) => "raw_into_cell",
+            RawOp::FromCellRecord(_) => "raw_from_cell",
+            RawOp::CellInitRecord(_) => "raw_cell_init",
+            RawOp::CellReadRecord(_) => "raw_cell_read",
+            RawOp::CellTakeRecord(_) => "raw_cell_take",
+            RawOp::CellDropRecord(_) => "raw_cell_drop",
+            RawOp::CastRecord(_) => "raw_cast",
+            RawOp::PointerOffsetRecord(_) => "raw_pointer_offset",
             RawOp::IntoFreeHeader => "raw_into_free_header",
             RawOp::FromFreeHeader => "raw_from_free_header",
             RawOp::HeaderInit => "raw_header_init",
@@ -357,7 +392,10 @@ impl RawOp {
     /// Only `raw_offset` is pure; the rest touch memory and are the
     /// reason `unsafe` exists.
     pub fn touches_memory(self) -> bool {
-        !matches!(self, RawOp::Offset)
+        !matches!(
+            self,
+            RawOp::Offset | RawOp::CastRecord(_) | RawOp::PointerOffsetRecord(_)
+        )
     }
 
     pub fn arity(self) -> usize {
@@ -368,9 +406,13 @@ impl RawOp {
             RawOp::Copy => 5,
             RawOp::IntoCellU64 | RawOp::FromCellU64 | RawOp::CellReadU64
             | RawOp::CellTakeU64 | RawOp::CellDropU64
+            | RawOp::IntoCellRecord(_) | RawOp::FromCellRecord(_)
+            | RawOp::CellReadRecord(_) | RawOp::CellTakeRecord(_)
+            | RawOp::CellDropRecord(_)
             | RawOp::IntoFreeHeader | RawOp::FromFreeHeader
             | RawOp::HeaderSize | RawOp::HeaderNext | RawOp::HeaderClear => 2,
-            RawOp::CellInitU64 => 3,
+            RawOp::CellInitU64 | RawOp::CellInitRecord(_) => 3,
+            RawOp::CastRecord(_) | RawOp::PointerOffsetRecord(_) => 1,
             RawOp::HeaderInit => 4,
         }
     }
@@ -395,6 +437,7 @@ impl ResKind {
         match self {
             ResKind::RawSpan => "RawSpan",
             ResKind::PointsToU64 => "PointsTo<u64>",
+            ResKind::PointsToRecord(_) => "PointsTo<record>",
             ResKind::OpenFile => "OpenFile",
             ResKind::PosixWorld => "PosixWorld",
             ResKind::SystemDealloc => "SystemDealloc",
@@ -404,6 +447,8 @@ impl ResKind {
             ResKind::FreeBlock => "FreeBlock",
             ResKind::FreeHeader => "FreeHeader",
             ResKind::ResourceMapPointsToU64 => "ResourceMap<u64, PointsTo<u64>>",
+            ResKind::ResourceMapPointsToRecord(_) =>
+                "ResourceMap<u64, PointsTo<record>>",
         }
     }
 
@@ -430,6 +475,8 @@ impl ResKind {
         match self {
             ResKind::RawSpan => "Sable.SpanView",
             ResKind::PointsToU64 => "Sable.PointsToView Int",
+            ResKind::PointsToRecord(_) =>
+                unreachable!("record resource views need the program record table"),
             ResKind::OpenFile => "Sable.OpenFileView",
             ResKind::PosixWorld => "Sable.PosixWorldView",
             ResKind::SystemDealloc => "Sable.SystemDeallocView",
@@ -440,6 +487,8 @@ impl ResKind {
             ResKind::FreeHeader => "Sable.FreeHeaderView",
             ResKind::ResourceMapPointsToU64 =>
                 "Sable.ResourceMapView Int (Sable.PointsToView Int)",
+            ResKind::ResourceMapPointsToRecord(_) =>
+                unreachable!("record resource-map views need the program record table"),
         }
     }
 
@@ -483,11 +532,14 @@ impl Ty {
             Ty::Class(_) => "class".to_string(),
             Ty::ClassRef(_, Mutability::Mut) => "&mut class".to_string(),
             Ty::ClassRef(..) => "&class".to_string(),
+            Ty::Record(_) => "record".to_string(),
             Ty::Raw(t) => format!("raw<{}>", t.name()),
+            Ty::RawRecord(_) => "raw<record>".to_string(),
             Ty::Res(k) => format!("resource {}", k.name()),
             Ty::ResRef(k, Mutability::Mut) => format!("resource &mut {}", k.name()),
             Ty::ResRef(k, _) => format!("resource &{}", k.name()),
             Ty::Option(t) => format!("option<{}>", t.name()),
+            Ty::OptionRaw(_) => "option<raw<record>>".to_string(),
             Ty::Unit => "()".to_string(),
         }
     }
@@ -655,6 +707,15 @@ pub enum ExprKind {
         obj_span: Span,
         field: String,
     },
+    /// `r.f` after the checker resolves `r` as a POD record rather than
+    /// a class. The parser initially produces `ClassField`; keeping a
+    /// distinct checked node prevents later stages from conflating their
+    /// runtime and ownership semantics (ADR 0054).
+    RecordField {
+        obj: String,
+        obj_span: Span,
+        field: String,
+    },
     /// `o.f.len` — array-field length on a class-typed name.
     ClassFieldLen {
         obj: String,
@@ -694,6 +755,13 @@ pub enum ExprKind {
         /// name (or `self`).
         field: Option<String>,
         mutable: bool,
+    },
+    /// Direct positional construction of a POD record in field declaration
+    /// order. Unlike `CtorCall`, this invokes no initializer body.
+    RecordLit {
+        record: String,
+        record_span: Span,
+        args: Vec<Expr>,
     },
 }
 
@@ -1023,6 +1091,29 @@ pub struct ClassDecl {
     pub span: Span,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecordField {
+    pub name: String,
+    pub ty: Ty,
+    pub offset: i128,
+    pub span: Span,
+    pub offset_span: Span,
+}
+
+/// An explicitly laid-out, plain runtime value (ADR 0054). A record is not a
+/// restricted class: its declaration has no member or ownership surface at
+/// all, and the checker validates its complete storage geometry separately.
+#[derive(Debug, Clone)]
+pub struct RecordDecl {
+    pub is_pub: bool,
+    pub name: String,
+    pub name_span: Span,
+    pub layout: StorageLayout,
+    pub layout_span: Span,
+    pub fields: Vec<RecordField>,
+    pub span: Span,
+}
+
 /// `const u64 NAME = <literal>;` — a named compile-time value
 /// (ADR 0016), substituted into program expressions and clause text
 /// before any later stage runs.
@@ -1092,6 +1183,7 @@ pub struct Program {
     pub fn_templates: Vec<Fn>,
     pub class_templates: Vec<ClassDecl>,
     pub classes: Vec<ClassDecl>,
+    pub records: Vec<RecordDecl>,
     /// Consumed entirely by monomorphization (ADR 0007).
     pub traits: Vec<TraitDecl>,
     pub impls: Vec<ImplDecl>,
