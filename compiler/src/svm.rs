@@ -13,19 +13,131 @@
 
 use crate::ast::*;
 use crate::interp::{MmioEvent, ObservedRun, RtVal};
+use std::collections::HashMap;
+
+#[derive(Clone, Copy)]
+struct LocalBinding {
+    ty: Ty,
+    mutable: bool,
+}
 
 /// Program metadata needed while lowering checked, index-bearing AST nodes.
 /// Keeping this context explicit ensures record tags and layouts come from
 /// the same checked program whose function body we lower.
 struct LowerCtx<'a> {
     program: &'a Program,
+    locals: HashMap<String, LocalBinding>,
+    return_ty: Option<Ty>,
 }
 
 impl<'a> LowerCtx<'a> {
+    /// A context for focused expression tests that do not mention a local
+    /// place. Public function lowering always uses `for_function` instead.
+    #[cfg(test)]
+    fn bare(program: &'a Program) -> LowerCtx<'a> {
+        LowerCtx {
+            program,
+            locals: HashMap::new(),
+            return_ty: None,
+        }
+    }
+
+    /// Recover the checked local environment before emitting the untyped Lean
+    /// syntax. Array expressions carry only a source name, so their element
+    /// type cannot be validated from the expression node alone.
+    fn for_function(program: &'a Program, function: &Fn) -> Result<LowerCtx<'a>, String> {
+        let mut ctx = LowerCtx {
+            program,
+            locals: HashMap::new(),
+            return_ty: Some(function.ret),
+        };
+        for parameter in &function.params {
+            ctx.insert_local(&parameter.name, parameter.ty, false)?;
+        }
+        ctx.collect_stmt_locals(&function.body)?;
+        Ok(ctx)
+    }
+
+    fn insert_local(&mut self, name: &str, ty: Ty, mutable: bool) -> Result<(), String> {
+        if self
+            .locals
+            .insert(name.to_string(), LocalBinding { ty, mutable })
+            .is_some()
+        {
+            return Err(format!(
+                "svm.local_type: duplicate checked local `{name}`; local types are ambiguous"
+            ));
+        }
+        Ok(())
+    }
+
+    fn collect_stmt_locals(&mut self, stmts: &[Stmt]) -> Result<(), String> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Decl {
+                    name, ty, mutable, ..
+                } => self.insert_local(name, *ty, *mutable)?,
+                Stmt::VarDecl {
+                    name,
+                    ty: Some(ty),
+                    mutable,
+                    ..
+                } => self.insert_local(name, *ty, *mutable)?,
+                Stmt::VarDecl { name, ty: None, .. } => {
+                    return Err(format!(
+                        "svm.local_type: inferred declaration `{name}` carries no checked type"
+                    ));
+                }
+                Stmt::If {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    self.collect_stmt_locals(then_block)?;
+                    if let Some(else_block) = else_block {
+                        self.collect_stmt_locals(else_block)?;
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::Unsafe { body, .. } => {
+                    self.collect_stmt_locals(body)?;
+                }
+                Stmt::Expose { ptr, res, body, .. } => {
+                    self.insert_local(ptr, Ty::Raw(IntTy::U8), false)?;
+                    self.insert_local(res, Ty::Res(ResKind::RawSpan), false)?;
+                    self.collect_stmt_locals(body)?;
+                }
+                Stmt::StaticAlloc { ptr, res, .. } => {
+                    self.insert_local(ptr, Ty::Raw(IntTy::U8), false)?;
+                    self.insert_local(res, Ty::Res(ResKind::RawSpan), false)?;
+                }
+                Stmt::SystemAlloc {
+                    ptr, res, release, ..
+                } => {
+                    self.insert_local(ptr, Ty::Raw(IntTy::U8), false)?;
+                    self.insert_local(res, Ty::Res(ResKind::RawSpan), false)?;
+                    self.insert_local(release, Ty::Res(ResKind::SystemDealloc), false)?;
+                }
+                Stmt::Assign { .. }
+                | Stmt::Return { .. }
+                | Stmt::ExprStmt(_)
+                | Stmt::Assert(_)
+                | Stmt::FieldAssign { .. }
+                | Stmt::FieldStore { .. }
+                | Stmt::Store { .. }
+                | Stmt::SystemDealloc { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     fn record(&self, index: usize) -> Result<&'a RecordDecl, String> {
         self.program.records.get(index).ok_or_else(|| {
             format!("record index {index} is outside the checked program (lowering bug?)")
         })
+    }
+
+    fn local(&self, name: &str) -> Option<LocalBinding> {
+        self.locals.get(name).copied()
     }
 }
 
@@ -80,6 +192,235 @@ fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String>
             payload.name()
         )),
     }
+}
+
+fn integer_array_element_ty(payload: ValueTy, context: &str) -> Result<Ty, String> {
+    validate_array_payload(payload, context)?;
+    match payload {
+        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
+        _ => unreachable!("validate_array_payload accepted a non-integer payload"),
+    }
+}
+
+fn require_expr_annotation(
+    expr: &Expr,
+    expected: Ty,
+    diagnostic: &str,
+    context: &str,
+) -> Result<(), String> {
+    match expr.ty {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(format!(
+            "{diagnostic}: {context} is annotated `{}`; expected `{}`",
+            actual.name(),
+            expected.name()
+        )),
+        None => Err(format!(
+            "{diagnostic}: {context} carries no checked type; expected `{}`",
+            expected.name()
+        )),
+    }
+}
+
+fn resolve_integer_array(
+    ctx: &LowerCtx<'_>,
+    array: &str,
+    operation: &str,
+) -> Result<(ValueTy, Mutability, bool), String> {
+    let Some(binding) = ctx.local(array) else {
+        return Err(format!(
+            "svm.array_place_type: {operation} names unknown array `{array}`"
+        ));
+    };
+    let Ty::Array(payload, mutability) = binding.ty else {
+        return Err(format!(
+            "svm.array_place_type: {operation} names `{array}` of type `{}`; expected an array",
+            binding.ty.name()
+        ));
+    };
+    validate_array_payload(payload, &format!("{operation} of `{array}`"))?;
+    Ok((payload, mutability, binding.mutable))
+}
+
+fn validate_array_index(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    array: &str,
+    index: &Expr,
+) -> Result<(), String> {
+    let (payload, _, _) = resolve_integer_array(ctx, array, "array index")?;
+    let element = integer_array_element_ty(payload, "array index result")?;
+    require_expr_annotation(
+        expr,
+        element,
+        "svm.array_index_result_type",
+        "array index result",
+    )?;
+    require_expr_annotation(
+        index,
+        Ty::Int(IntTy::U64),
+        "svm.array_index_operand_type",
+        "array index operand",
+    )?;
+    validate_expr_payloads(ctx, index)
+}
+
+fn validate_array_len(ctx: &LowerCtx<'_>, expr: &Expr, array: &str) -> Result<(), String> {
+    resolve_integer_array(ctx, array, "array length")?;
+    require_expr_annotation(
+        expr,
+        Ty::Int(IntTy::U64),
+        "svm.array_len_result_type",
+        "array length result",
+    )
+}
+
+fn validate_alloc_array(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    elem: ValueTy,
+    len: &Expr,
+    init: &Expr,
+) -> Result<(), String> {
+    let element = integer_array_element_ty(elem, "alloc_array")?;
+    require_expr_annotation(
+        expr,
+        Ty::Array(elem, Mutability::Owned),
+        "svm.array_alloc_result_type",
+        "alloc_array result",
+    )?;
+    require_expr_annotation(
+        len,
+        Ty::Int(IntTy::U64),
+        "svm.array_alloc_length_type",
+        "alloc_array length",
+    )?;
+    require_expr_annotation(
+        init,
+        element,
+        "svm.array_alloc_init_type",
+        "alloc_array initializer",
+    )?;
+    validate_expr_payloads(ctx, len)?;
+    validate_expr_payloads(ctx, init)
+}
+
+fn validate_array_literal(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    elements: &[Expr],
+) -> Result<(), String> {
+    let payload = match expr.ty {
+        Some(Ty::Array(payload, Mutability::Owned)) => payload,
+        Some(actual) => {
+            return Err(format!(
+                "svm.array_literal_result_type: array literal is annotated `{}`; expected an owned integer array",
+                actual.name()
+            ));
+        }
+        None => {
+            return Err(
+                "svm.array_literal_result_type: array literal carries no checked type; expected an owned integer array"
+                    .into(),
+            );
+        }
+    };
+    let element = integer_array_element_ty(payload, "array literal")?;
+    for (index, value) in elements.iter().enumerate() {
+        require_expr_annotation(
+            value,
+            element,
+            "svm.array_literal_element_type",
+            &format!("array literal element {}", index + 1),
+        )?;
+        validate_expr_payloads(ctx, value)?;
+    }
+    Ok(())
+}
+
+fn validate_array_store(
+    ctx: &LowerCtx<'_>,
+    array: &str,
+    index: &Expr,
+    value: &Expr,
+) -> Result<(), String> {
+    let (payload, mutability, declared_mutable) = resolve_integer_array(ctx, array, "array store")?;
+    if mutability == Mutability::Shared || (mutability == Mutability::Owned && !declared_mutable) {
+        return Err(format!(
+            "svm.array_store_place: array store targets non-writable `{array}` of type `{}`",
+            Ty::Array(payload, mutability).name()
+        ));
+    }
+    require_expr_annotation(
+        index,
+        Ty::Int(IntTy::U64),
+        "svm.array_store_index_type",
+        "array store index",
+    )?;
+    require_expr_annotation(
+        value,
+        integer_array_element_ty(payload, "array store value")?,
+        "svm.array_store_value_type",
+        "array store value",
+    )?;
+    validate_expr_payloads(ctx, index)?;
+    validate_expr_payloads(ctx, value)
+}
+
+fn validate_array_binding(ty: Ty, name: &str, init: &Expr) -> Result<(), String> {
+    if !matches!(ty, Ty::Array(..)) {
+        return Ok(());
+    }
+    require_expr_annotation(
+        init,
+        ty,
+        "svm.array_binding_type",
+        &format!("initializer of array `{name}`"),
+    )
+}
+
+fn validate_array_rebind(ctx: &LowerCtx<'_>, name: &str) -> Result<(), String> {
+    if matches!(
+        ctx.local(name).map(|binding| binding.ty),
+        Some(Ty::Array(..))
+    ) {
+        return Err(format!(
+            "svm.array_rebind_unsupported: checked array `{name}` is rebound; arrays may only be mutated by element store"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_array_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
+    if let Some(expected @ Ty::Array(..)) = ctx.return_ty {
+        require_expr_annotation(
+            value,
+            expected,
+            "svm.array_return_type",
+            "array return value",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_array_exposure(ctx: &LowerCtx<'_>, array: &str, mutable: bool) -> Result<(), String> {
+    let (payload, mutability, declared_mutable) =
+        resolve_integer_array(ctx, array, "array exposure")?;
+    if payload != ValueTy::Int(IntTy::U8) {
+        return Err(format!(
+            "svm.array_expose_type: exposure names `{array}` of type `{}`; only byte arrays have SVM exposure semantics",
+            Ty::Array(payload, mutability).name()
+        ));
+    }
+    if mutable
+        && (mutability == Mutability::Shared
+            || (mutability == Mutability::Owned && !declared_mutable))
+    {
+        return Err(format!(
+            "svm.array_expose_type: mutable exposure targets non-writable `{array}`"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_option_payload(payload: ValueTy, context: &str) -> Result<(), String> {
@@ -315,12 +656,17 @@ fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), Stri
             Stmt::Decl { ty, init, name, .. } => {
                 validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
                 if let Some(init) = init {
+                    validate_array_binding(*ty, name, init)?;
                     validate_expr_payloads(ctx, init)?;
                 }
             }
-            Stmt::Assign { value, .. }
-            | Stmt::ExprStmt(value)
-            | Stmt::FieldAssign { value, .. } => validate_expr_payloads(ctx, value)?,
+            Stmt::Assign { name, value, .. } => {
+                validate_array_rebind(ctx, name)?;
+                validate_expr_payloads(ctx, value)?;
+            }
+            Stmt::ExprStmt(value) | Stmt::FieldAssign { value, .. } => {
+                validate_expr_payloads(ctx, value)?;
+            }
             Stmt::If {
                 cond,
                 then_block,
@@ -334,6 +680,7 @@ fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), Stri
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
+                    validate_array_return(ctx, value)?;
                     validate_expr_payloads(ctx, value)?;
                 }
             }
@@ -341,18 +688,34 @@ fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), Stri
             Stmt::VarDecl { name, init, ty, .. } => {
                 if let Some(ty) = ty {
                     validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
+                    validate_array_binding(*ty, name, init)?;
                 }
                 validate_expr_payloads(ctx, init)?;
             }
-            Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+            Stmt::FieldStore { index, value, .. } => {
                 validate_expr_payloads(ctx, index)?;
                 validate_expr_payloads(ctx, value)?;
             }
+            Stmt::Store {
+                array,
+                index,
+                value,
+                ..
+            } => validate_array_store(ctx, array, index, value)?,
             Stmt::While { cond, body, .. } => {
                 validate_expr_payloads(ctx, cond)?;
                 validate_stmt_payloads(ctx, body)?;
             }
-            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+            Stmt::Unsafe { body, .. } => {
+                validate_stmt_payloads(ctx, body)?;
+            }
+            Stmt::Expose {
+                array,
+                mutable,
+                body,
+                ..
+            } => {
+                validate_array_exposure(ctx, array, *mutable)?;
                 validate_stmt_payloads(ctx, body)?;
             }
             Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
@@ -472,30 +835,17 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
     }
 
     match &expr.kind {
-        ExprKind::Index { index, .. } => {
-            match expr.ty {
-                Some(Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_)) => {}
-                Some(ty) => {
-                    return Err(format!(
-                        "svm.index_result_unsupported: array index result has type `{}`; \
-                         the SVM requires a concrete integer annotation",
-                        ty.name()
-                    ));
-                }
-                None => {
-                    return Err(
-                        "svm.index_result_unsupported: array index result has no type; \
-                         the SVM requires a concrete integer annotation"
-                            .into(),
-                    );
-                }
-            }
-            validate_expr_payloads(ctx, index)?;
+        ExprKind::Index { array, index, .. } => {
+            validate_array_index(ctx, expr, array, index)?;
         }
         ExprKind::AllocArray { elem, len, init } => {
-            validate_array_payload(*elem, "alloc_array")?;
-            validate_expr_payloads(ctx, len)?;
-            validate_expr_payloads(ctx, init)?;
+            validate_alloc_array(ctx, expr, *elem, len, init)?;
+        }
+        ExprKind::ArrayLit(elements) => {
+            validate_array_literal(ctx, expr, elements)?;
+        }
+        ExprKind::Len { array } => {
+            validate_array_len(ctx, expr, array)?;
         }
         ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
             if matches!(target, IntTy::TParam(_)) {
@@ -561,8 +911,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         | ExprKind::ResOp { args, .. }
         | ExprKind::TraitCall { args, .. }
         | ExprKind::MethodCall { args, .. }
-        | ExprKind::RecordLit { args, .. }
-        | ExprKind::ArrayLit(args) => {
+        | ExprKind::RecordLit { args, .. } => {
             for arg in args {
                 validate_expr_payloads(ctx, arg)?;
             }
@@ -573,7 +922,6 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         ExprKind::IntLit(_)
         | ExprKind::BoolLit(_)
         | ExprKind::Var(_)
-        | ExprKind::Len { .. }
         | ExprKind::SelfField { .. }
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::ClassField { .. }
@@ -589,7 +937,7 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
     if !f.params.is_empty() {
         return Err("differential subjects must take no parameters".into());
     }
-    let ctx = LowerCtx { program };
+    let ctx = LowerCtx::for_function(program, f)?;
     validate_program_option_positions(program)?;
     validate_fn_payloads(&ctx, f)?;
     lower_block(&ctx, &f.body)
@@ -600,7 +948,7 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
 /// machine (arrays are owned values; `&mut` reflection back to the
 /// caller has no machine analog yet).
 pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
-    let ctx = LowerCtx { program };
+    let ctx = LowerCtx::for_function(program, f)?;
     validate_program_option_positions(program)?;
     validate_fn_payloads(&ctx, f)?;
     for p in &f.params {
@@ -688,16 +1036,33 @@ fn lower_stmt_erasing(
         } if ty.is_resource() => lower_erased_resource_bind(ctx, name, e)?,
         Stmt::Decl {
             name,
+            ty,
             init: Some(e),
             ..
-        } => Some(lower_bind(ctx, name, e)?),
+        } => {
+            validate_array_binding(*ty, name, e)?;
+            Some(lower_bind(ctx, name, e)?)
+        }
         Stmt::VarDecl {
             name,
             init,
             ty: Some(ty),
             ..
         } if ty.is_resource() => lower_erased_resource_bind(ctx, name, init)?,
-        Stmt::VarDecl { name, init, .. } => Some(lower_bind(ctx, name, init)?),
+        Stmt::VarDecl {
+            name,
+            init,
+            ty: Some(ty),
+            ..
+        } => {
+            validate_array_binding(*ty, name, init)?;
+            Some(lower_bind(ctx, name, init)?)
+        }
+        Stmt::VarDecl { name, ty: None, .. } => {
+            return Err(format!(
+                "svm.local_type: inferred declaration `{name}` carries no checked type"
+            ));
+        }
         // `unsafe { ... }` is a marker with no machine step of its own.
         Stmt::Unsafe { body, .. } => {
             let inner = lower_block_erasing(ctx, body, erased_resources)?;
@@ -730,6 +1095,7 @@ fn lower_stmt_erasing(
             body,
             ..
         } => {
+            validate_array_exposure(ctx, array, *mutable)?;
             let id = next_loan();
             let loan = format!("_loan{id}");
             let i = format!("_li{id}");
@@ -769,17 +1135,23 @@ fn lower_stmt_erasing(
         Stmt::Assign { name, value, .. } if erased_resources.contains(&name.as_str()) => {
             lower_erased_resource_bind(ctx, name, value)?
         }
-        Stmt::Assign { name, value, .. } => Some(lower_bind(ctx, name, value)?),
+        Stmt::Assign { name, value, .. } => {
+            validate_array_rebind(ctx, name)?;
+            Some(lower_bind(ctx, name, value)?)
+        }
         Stmt::Store {
             array,
             index,
             value,
             ..
-        } => Some(format!(
-            "(.store \"{array}\" {} {})",
-            lower_expr(ctx, index)?,
-            lower_expr(ctx, value)?
-        )),
+        } => {
+            validate_array_store(ctx, array, index, value)?;
+            Some(format!(
+                "(.store \"{array}\" {} {})",
+                lower_expr(ctx, index)?,
+                lower_expr(ctx, value)?
+            ))
+        }
         Stmt::If {
             cond,
             then_block,
@@ -815,7 +1187,10 @@ fn lower_stmt_erasing(
                 lower_block_erasing(ctx, body, erased_resources)?
             ))
         }
-        Stmt::Return { value: Some(e), .. } => Some(format!("(.ret {})", lower_expr(ctx, e)?)),
+        Stmt::Return { value: Some(e), .. } => {
+            validate_array_return(ctx, e)?;
+            Some(format!("(.ret {})", lower_expr(ctx, e)?))
+        }
         Stmt::Return { value: None, .. } => {
             return Err("bare `return;` has no SVM form (fall off the end instead)".into());
         }
@@ -1236,9 +1611,13 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
             }
         }
         ExprKind::Index { array, index, .. } => {
+            validate_array_index(ctx, e, array, index)?;
             format!("(.index \"{array}\" {})", lower_expr(ctx, index)?)
         }
-        ExprKind::Len { array } => format!("(.len \"{array}\")"),
+        ExprKind::Len { array } => {
+            validate_array_len(ctx, e, array)?;
+            format!("(.len \"{array}\")")
+        }
         ExprKind::Widen { target, arg } => {
             format!("(.widen {} {})", lean_ty(*target)?, lower_expr(ctx, arg)?)
         }
@@ -1282,11 +1661,14 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
         ExprKind::RecordField { obj, field, .. } => {
             format!("(.recordField (.var \"{obj}\") \"{field}\")")
         }
-        ExprKind::AllocArray { len, init, .. } => format!(
-            "(.allocArray {} {})",
-            lower_expr(ctx, len)?,
-            lower_expr(ctx, init)?
-        ),
+        ExprKind::AllocArray { elem, len, init } => {
+            validate_alloc_array(ctx, e, *elem, len, init)?;
+            format!(
+                "(.allocArray {} {})",
+                lower_expr(ctx, len)?,
+                lower_expr(ctx, init)?
+            )
+        }
         ExprKind::Call { .. }
         | ExprKind::CtorCall { .. }
         | ExprKind::RecordLit { .. }
@@ -1294,7 +1676,8 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
         | ExprKind::TraitCall { .. } => {
             return Err("calls are outside the SVM core subset".into());
         }
-        ExprKind::ArrayLit(_) => {
+        ExprKind::ArrayLit(elements) => {
+            validate_array_literal(ctx, e, elements)?;
             return Err("array literals are outside the SVM core subset (use alloc_array)".into());
         }
         ExprKind::Borrow { .. } => {
@@ -1558,7 +1941,7 @@ mod tests {
     #[test]
     fn lowering_supports_boolean_option_construction_and_accessors() {
         let program = empty_program();
-        let ctx = LowerCtx { program: &program };
+        let ctx = LowerCtx::bare(&program);
         let bool_option = Ty::Option(ValueTy::Bool);
 
         let some_false = expr(
@@ -1600,7 +1983,7 @@ mod tests {
     #[test]
     fn option_constructors_require_coherent_checked_annotations() {
         let program = empty_program();
-        let ctx = LowerCtx { program: &program };
+        let ctx = LowerCtx::bare(&program);
         let bool_option = Ty::Option(ValueTy::Bool);
 
         let wrong_payload = expr(
@@ -1681,7 +2064,7 @@ mod tests {
     #[test]
     fn option_accessors_require_coherent_checked_annotations() {
         let program = empty_program();
-        let ctx = LowerCtx { program: &program };
+        let ctx = LowerCtx::bare(&program);
         let bool_option = Ty::Option(ValueTy::Bool);
         let int_option = Ty::Option(ValueTy::Int(IntTy::I32));
         let bool_operand = || expr(ExprKind::Var("choice".into()), bool_option);
@@ -1860,7 +2243,7 @@ mod tests {
             consumes: false,
         });
         program.fns.push(choose);
-        let ctx = LowerCtx { program: &program };
+        let ctx = LowerCtx::bare(&program);
         let call = |args: Vec<Expr>, ty: Option<Ty>| Expr {
             kind: ExprKind::Call {
                 callee: "choose".into(),
@@ -1920,9 +2303,7 @@ mod tests {
             consumes: false,
         });
         resource_program.fns.push(consume);
-        let resource_ctx = LowerCtx {
-            program: &resource_program,
-        };
+        let resource_ctx = LowerCtx::bare(&resource_program);
         let erased_resource_call = Expr {
             kind: ExprKind::Call {
                 callee: "consume".into(),
@@ -1944,7 +2325,7 @@ mod tests {
     #[test]
     fn lowering_rejects_boolean_and_nested_residual_type_arguments() {
         let program = empty_program();
-        let ctx = LowerCtx { program: &program };
+        let ctx = LowerCtx::bare(&program);
         for generic in [
             GenericTy::Bool,
             GenericTy::Option(Box::new(GenericTy::Bool)),
@@ -2099,22 +2480,318 @@ mod tests {
         );
         let function = checked_fn(
             Ty::Unit,
-            vec![Stmt::Decl {
-                ty: Ty::Bool,
-                name: "value".into(),
-                name_span: Span::new(0, 0),
-                init: Some(load),
-                mutable: false,
-            }],
+            vec![
+                Stmt::Decl {
+                    ty: Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+                    name: "values".into(),
+                    name_span: Span::new(0, 0),
+                    init: None,
+                    mutable: false,
+                },
+                Stmt::Decl {
+                    ty: Ty::Bool,
+                    name: "value".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(load),
+                    mutable: false,
+                },
+            ],
         );
 
         let error = lower_fn(&program, &function)
             .expect_err("SVM index loads produce concrete integer machine values");
         assert_eq!(
             error,
-            "svm.index_result_unsupported: array index result has type `bool`; \
-             the SVM requires a concrete integer annotation"
+            "svm.array_index_result_type: array index result is annotated `bool`; expected `u8`"
         );
+    }
+
+    #[test]
+    fn array_constructors_require_coherent_checked_annotations() {
+        let program = empty_program();
+        let ctx = LowerCtx::bare(&program);
+        let u8_array = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let allocation = |len: Expr, init: Expr, ty: Option<Ty>| Expr {
+            kind: ExprKind::AllocArray {
+                elem: ValueTy::Int(IntTy::U8),
+                len: Box::new(len),
+                init: Box::new(init),
+            },
+            span: Span::new(0, 0),
+            ty,
+        };
+        let length = || expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64));
+        let byte = || expr(ExprKind::IntLit(7), Ty::Int(IntTy::U8));
+
+        let valid = allocation(length(), byte(), Some(u8_array));
+        validate_expr_payloads(&ctx, &valid).expect("coherent integer allocation preflight");
+        assert_eq!(
+            lower_expr(&ctx, &valid).unwrap(),
+            "(.allocArray (.intLit .u64 2) (.intLit .u8 7))"
+        );
+
+        let malformed = [
+            (
+                allocation(
+                    length(),
+                    byte(),
+                    Some(Ty::Array(ValueTy::Int(IntTy::I32), Mutability::Owned)),
+                ),
+                "svm.array_alloc_result_type:",
+            ),
+            (
+                allocation(length(), byte(), None),
+                "svm.array_alloc_result_type:",
+            ),
+            (
+                allocation(
+                    expr(ExprKind::BoolLit(false), Ty::Bool),
+                    byte(),
+                    Some(u8_array),
+                ),
+                "svm.array_alloc_length_type:",
+            ),
+            (
+                allocation(
+                    length(),
+                    expr(ExprKind::IntLit(7), Ty::Int(IntTy::I32)),
+                    Some(u8_array),
+                ),
+                "svm.array_alloc_init_type:",
+            ),
+        ];
+        for (value, diagnostic) in &malformed {
+            let preflight = validate_expr_payloads(&ctx, value)
+                .expect_err("malformed allocation must fail SVM preflight");
+            assert!(preflight.starts_with(*diagnostic), "{preflight}");
+            let lowering = lower_expr(&ctx, value)
+                .expect_err("direct allocation lowering must re-check cached types");
+            assert!(lowering.starts_with(*diagnostic), "{lowering}");
+        }
+
+        let literal = expr(
+            ExprKind::ArrayLit(vec![byte(), expr(ExprKind::IntLit(8), Ty::Int(IntTy::U8))]),
+            u8_array,
+        );
+        validate_expr_payloads(&ctx, &literal).expect("coherent integer literal preflight");
+        assert_eq!(
+            lower_expr(&ctx, &literal).unwrap_err(),
+            "array literals are outside the SVM core subset (use alloc_array)"
+        );
+
+        let wrong_literal_element = expr(
+            ExprKind::ArrayLit(vec![expr(ExprKind::IntLit(1), Ty::Int(IntTy::I32))]),
+            u8_array,
+        );
+        for error in [
+            validate_expr_payloads(&ctx, &wrong_literal_element).unwrap_err(),
+            lower_expr(&ctx, &wrong_literal_element).unwrap_err(),
+        ] {
+            assert!(
+                error.starts_with("svm.array_literal_element_type:"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_array_operations_resolve_their_checked_local_type() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let function = checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: array_ty,
+                name: "bytes".into(),
+                name_span: Span::new(0, 0),
+                init: None,
+                mutable: true,
+            }],
+        );
+        let ctx = LowerCtx::for_function(&program, &function).unwrap();
+        let index_operand = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64));
+        let index = |array: &str, operand: Expr, ty: Option<Ty>| Expr {
+            kind: ExprKind::Index {
+                array: array.into(),
+                array_span: Span::new(0, 0),
+                index: Box::new(operand),
+            },
+            span: Span::new(0, 0),
+            ty,
+        };
+
+        let valid_index = index("bytes", index_operand(), Some(Ty::Int(IntTy::U8)));
+        validate_expr_payloads(&ctx, &valid_index).expect("coherent integer index preflight");
+        assert_eq!(
+            lower_expr(&ctx, &valid_index).unwrap(),
+            "(.index \"bytes\" (.intLit .u64 0))"
+        );
+
+        let malformed_indices = [
+            (
+                index("bytes", index_operand(), Some(Ty::Int(IntTy::I32))),
+                "svm.array_index_result_type:",
+            ),
+            (
+                index(
+                    "bytes",
+                    expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32)),
+                    Some(Ty::Int(IntTy::U8)),
+                ),
+                "svm.array_index_operand_type:",
+            ),
+            (
+                index("missing", index_operand(), Some(Ty::Int(IntTy::U8))),
+                "svm.array_place_type:",
+            ),
+        ];
+        for (value, diagnostic) in &malformed_indices {
+            let preflight = validate_expr_payloads(&ctx, value)
+                .expect_err("malformed index must fail SVM preflight");
+            assert!(preflight.starts_with(*diagnostic), "{preflight}");
+            let lowering = lower_expr(&ctx, value)
+                .expect_err("direct index lowering must resolve the array place");
+            assert!(lowering.starts_with(*diagnostic), "{lowering}");
+        }
+
+        let valid_len = expr(
+            ExprKind::Len {
+                array: "bytes".into(),
+            },
+            Ty::Int(IntTy::U64),
+        );
+        validate_expr_payloads(&ctx, &valid_len).expect("coherent integer length preflight");
+        assert_eq!(lower_expr(&ctx, &valid_len).unwrap(), "(.len \"bytes\")");
+        let wrong_len = expr(
+            ExprKind::Len {
+                array: "bytes".into(),
+            },
+            Ty::Int(IntTy::I32),
+        );
+        for error in [
+            validate_expr_payloads(&ctx, &wrong_len).unwrap_err(),
+            lower_expr(&ctx, &wrong_len).unwrap_err(),
+        ] {
+            assert!(error.starts_with("svm.array_len_result_type:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn array_stores_and_bindings_recheck_destination_payloads() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Int(IntTy::U8),
+                len: Box::new(expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64))),
+                init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+            },
+            array_ty,
+        );
+        let store = |index: Expr, value: Expr| Stmt::Store {
+            array: "bytes".into(),
+            array_span: Span::new(0, 0),
+            index,
+            value,
+        };
+        let valid_store = store(
+            expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64)),
+            expr(ExprKind::IntLit(9), Ty::Int(IntTy::U8)),
+        );
+        let valid_function = checked_fn(
+            Ty::Int(IntTy::U64),
+            vec![
+                Stmt::Decl {
+                    ty: array_ty,
+                    name: "bytes".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(allocation.clone()),
+                    mutable: true,
+                },
+                valid_store.clone(),
+                Stmt::Return {
+                    value: Some(expr(
+                        ExprKind::Len {
+                            array: "bytes".into(),
+                        },
+                        Ty::Int(IntTy::U64),
+                    )),
+                    span: Span::new(0, 0),
+                },
+            ],
+        );
+        lower_fn(&program, &valid_function).expect("existing integer-array lowering remains valid");
+        let ctx = LowerCtx::for_function(&program, &valid_function).unwrap();
+        assert_eq!(
+            lower_stmt_erasing(&ctx, &valid_store, &[]).unwrap(),
+            Some("(.store \"bytes\" (.intLit .u64 0) (.intLit .u8 9))".into())
+        );
+
+        let bad_index = store(
+            expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32)),
+            expr(ExprKind::IntLit(9), Ty::Int(IntTy::U8)),
+        );
+        let bad_value = store(
+            expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64)),
+            expr(ExprKind::IntLit(9), Ty::Int(IntTy::I32)),
+        );
+        for (statement, diagnostic) in [
+            (&bad_index, "svm.array_store_index_type:"),
+            (&bad_value, "svm.array_store_value_type:"),
+        ] {
+            let preflight = validate_stmt_payloads(&ctx, std::slice::from_ref(statement))
+                .expect_err("malformed store must fail SVM preflight");
+            assert!(preflight.starts_with(diagnostic), "{preflight}");
+            let lowering = lower_stmt_erasing(&ctx, statement, &[])
+                .expect_err("direct store lowering must re-check operands");
+            assert!(lowering.starts_with(diagnostic), "{lowering}");
+        }
+
+        let mismatched_binding = checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: array_ty,
+                name: "bytes".into(),
+                name_span: Span::new(0, 0),
+                init: Some(expr(
+                    ExprKind::AllocArray {
+                        elem: ValueTy::Int(IntTy::I32),
+                        len: Box::new(expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64))),
+                        init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
+                    },
+                    Ty::Array(ValueTy::Int(IntTy::I32), Mutability::Owned),
+                )),
+                mutable: false,
+            }],
+        );
+        let error = lower_fn(&program, &mismatched_binding)
+            .expect_err("array declaration and initializer must agree exactly");
+        assert!(error.starts_with("svm.array_binding_type:"), "{error}");
+
+        let array_return = |returned_ty: Ty| {
+            checked_fn(
+                array_ty,
+                vec![
+                    Stmt::Decl {
+                        ty: array_ty,
+                        name: "bytes".into(),
+                        name_span: Span::new(0, 0),
+                        init: Some(allocation.clone()),
+                        mutable: false,
+                    },
+                    Stmt::Return {
+                        value: Some(expr(ExprKind::Var("bytes".into()), returned_ty)),
+                        span: Span::new(0, 0),
+                    },
+                ],
+            )
+        };
+        lower_fn(&program, &array_return(array_ty))
+            .expect("coherent integer-array return remains lowerable");
+        let wrong_return = array_return(Ty::Array(ValueTy::Int(IntTy::I32), Mutability::Owned));
+        let error = lower_fn(&program, &wrong_return)
+            .expect_err("array result annotations must match the function return type");
+        assert!(error.starts_with("svm.array_return_type:"), "{error}");
     }
 
     #[test]
@@ -2154,7 +2831,7 @@ mod tests {
 
         let program = empty_program();
         let error = lower_resource_op_stmt(
-            &LowerCtx { program: &program },
+            &LowerCtx::bare(&program),
             ResOp::SplitOff,
             &[span, division],
         )
