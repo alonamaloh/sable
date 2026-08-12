@@ -167,6 +167,9 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
              i32 3, label %division_by_zero\n\
              i32 4, label %signed_division_overflow\n\
              i32 5, label %narrow_range\n\
+             i32 6, label %sub_overflow\n\
+             i32 7, label %mul_overflow\n\
+             i32 8, label %neg_overflow\n\
            ]\n\
          add_overflow:\n\
            %add_result = call i8 @__sable_v0_f_9_add_guard__p_i8_i8__r_i8(i8 127, i8 1)\n\
@@ -179,6 +182,15 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
            ret i32 0\n\
          narrow_range:\n\
            %narrow_result = call i8 @__sable_v0_f_12_narrow_guard__p_i32__r_i8(i32 300)\n\
+           ret i32 0\n\
+         sub_overflow:\n\
+           %sub_result = call i8 @__sable_v0_f_9_sub_guard__p_u8_u8__r_u8(i8 0, i8 1)\n\
+           ret i32 0\n\
+         mul_overflow:\n\
+           %mul_result = call i16 @__sable_v0_f_9_mul_guard__p_i16_i16__r_i16(i16 32767, i16 2)\n\
+           ret i32 0\n\
+         neg_overflow:\n\
+           %neg_result = call i64 @__sable_v0_f_9_neg_guard__p_i64__r_i64(i64 -9223372036854775808)\n\
            ret i32 0\n\
          unexpected:\n\
            ret i32 99\n\
@@ -193,6 +205,34 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 328_965, // i8 | (i8 << 8) | (i8 << 16)
             lhs_bits: 127,
             rhs_bits: 1,
+        },
+        TrapCase {
+            label: "subtract overflow",
+            arguments: &["subtract", "overflow", "from", "unsigned", "byte"],
+            kind: 2,
+            type_info: 65_793, // u8 | (u8 << 8) | (u8 << 16)
+            lhs_bits: 0,
+            rhs_bits: 1,
+        },
+        TrapCase {
+            label: "multiply overflow",
+            arguments: &[
+                "multiply", "overflow", "signed", "sixteen", "bit", "integer",
+            ],
+            kind: 3,
+            type_info: 394_758, // i16 | (i16 << 8) | (i16 << 16)
+            lhs_bits: 32_767,
+            rhs_bits: 2,
+        },
+        TrapCase {
+            label: "negation overflow",
+            arguments: &[
+                "negation", "overflow", "signed", "sixty", "four", "bit", "integer",
+            ],
+            kind: 4,
+            type_info: 2_056, // i64 | (i64 << 8), with no rhs type
+            lhs_bits: 9_223_372_036_854_775_808,
+            rhs_bits: 0,
         },
         TrapCase {
             label: "division by zero",

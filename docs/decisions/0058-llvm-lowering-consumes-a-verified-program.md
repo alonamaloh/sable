@@ -1,10 +1,9 @@
 # ADR 0058 — LLVM lowering consumes the verified program
 
-**Decided 2026-08-12; three implementation slices and the executable trap-ABI
-gate landed, milestone in progress.** Unsafe Sable v1 has a
-defensible formal stopping point, but Sable still has no native-code path. The
-first backend should make verified programs runnable without making LLVM part
-of the verifier or introducing a second, subtly different front-end pipeline.
+**Decided and implemented 2026-08-12; scalar v0 complete.** Unsafe Sable v1 had
+a defensible formal stopping point but no native-code path. This backend makes
+verified scalar programs runnable without making LLVM part of the verifier or
+introducing a second, subtly different front-end pipeline.
 
 ## Decision
 
@@ -118,14 +117,13 @@ file. `-o -` streams a completed in-memory document to standard output.
 
 Emitter unit tests inspect deterministic IR and source diagnostics. Where
 `clang` is available, direct native fixtures compile and run at `-O0` and
-`-O2`; the current gate covers successful results and observable trap-ABI
-behavior. A later differential layer will compare those results and traps with
-the Sable interpreter. These end-to-end checks are optional for a normal
-developer environment unless explicitly required (for example by
+`-O2`; the closure gate compares their successful outcomes with the interpreter
+and directly observes trap-ABI behavior. These end-to-end checks are optional
+for a normal developer environment unless explicitly required (for example by
 `SABLE_REQUIRE_CLANG=1`); the ordinary emitter suite never acquires an LLVM
 tool dependency.
 
-The first three slices are now implemented: the opaque `VerifiedProgram`
+Scalar v0 was delivered in three slices: the opaque `VerifiedProgram`
 boundary, root-bound entry selection, CLI, atomic output, provenance comments,
 strict scalar lowering, and a real CFG for branches, loops, comparisons, and
 short circuiting. Local allocation is entry-hoisted while initialization stays
@@ -135,20 +133,25 @@ widening/narrowing, and the versioned weak trap hook plus mandatory
 `llvm.trap`. Its structural tests pin guard dominance, the `min % -1` bypass,
 raw trap payloads, and the absence of poison promises.
 
-Focused library gates are green at 23/23 single-job, non-incremental tests, and
-the complete verified LLVM CLI suite is green at 6/6 single-threaded. Clang was
-present: scalar, CFG, and arithmetic subjects each returned the expected 42 at
-`-O0` and `-O2`. Verification failure
-and audited-assumption rejection leave existing output untouched. A fully
-verified trap subject also compiled at both optimization levels; four
-contract-violating test wrappers produced the exact pinned kind, type-info, and
-raw-operand payloads for add overflow, division by zero, signed `MIN / -1`
-division, and narrowing range. Their strong hook returned, and the following
-`llvm.trap` still terminated each process. These are direct compiled-result and
-trap-ABI gates, not interpreter differentials, and the complete verifier/dynamic
-corpus was not rerun for this checkpoint. Broader strict diagnostics,
-interpreter differentials for both results and traps, and a final serial
-regression remain before the complete v0 backend is declared finished.
+The complete low-concurrency command
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture` is green.
+It includes 26/26 library tests, 6/6 verified LLVM CLI tests, and a 1/1 native
+differential test comparing the exact `VerifiedProgram` interpreter outcome
+with Clang `-O0` and `-O2` for scalar, control-flow, and arithmetic subjects.
+The matrix covers negative divisors, the `MIN % -1` bypass, conversion bounds,
+and a loop condition designed to detect accidental hoisting out of its header.
+Verification failure and audited-assumption rejection leave existing output
+untouched.
+
+The native trap fixture exercises all seven published kinds at both
+optimization levels, with exact kind, type-info, and raw-operand payloads. Its
+strong hook returns, and the following `llvm.trap` still terminates each
+process. The same serial regression kept the SVM Rust/Lean differential green
+at 69/69, completed the full verifier/dynamic corpus in 220.78s, and passed the
+randomized allocator, grind-budget, LSP, and documentation tests. That closes
+the scalar v0 milestone. It does not extend the accepted subset to aggregates:
+aggregate storage, lowering, and ABIs remain M46+ decisions.
 
 ## Consequences
 
@@ -156,7 +159,7 @@ This path gets Sable to native toolchains without expanding the trusted proof
 base: Lean still checks contracts, while the new emitter is an additional
 compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
-The cost is an intentionally narrow first backend and explicit traps/control
+The cost is an intentionally narrow scalar backend and explicit traps/control
 flow where less careful LLVM frontends often rely on poison. Aggregate ABIs,
 extern interoperability, optimization, debug information, object emission,
 and stable cross-module symbols remain separate decisions.

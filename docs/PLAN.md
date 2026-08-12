@@ -10,6 +10,9 @@ capability, checked device intrinsics, observable trace semantics, and a bounded
 verified transmit driver. Broader U10 work—generic MMIO, production
 provisioning, richer UART/ISA models, concurrency, DMA, and atomics—is
 deliberately deferred rather than required before the usability roadmap.
+On that boundary, M45's scalar LLVM v0 backend is also complete: lowering starts
+from the exact Lean-authorized `VerifiedProgram`, preserves checked scalar
+semantics under optimization, and has interpreter/native plus trap-ABI gates.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -562,11 +565,11 @@ MMIO/device-description abstraction, UART receive/interrupt/error/timing models,
 page tables, privileged instructions, any Sail/ISA connection, concurrency,
 DMA, and atomics remain deliberately deferred and require their own decisions.
 
-### M45 — scalar LLVM IR backend *(in progress, ADR 0058)*
+### M45 — scalar LLVM IR backend *(complete 2026-08-12, ADR 0058)*
 
-The first three implementation slices are green, while the complete milestone
-remains in progress. `sable build --emit-llvm` lowers only an opaque `VerifiedProgram`
-containing the exact checked and monomorphized AST whose obligations succeeded
+The scalar v0 acceptance boundary is complete. `sable build --emit-llvm` lowers
+only an opaque `VerifiedProgram` containing the exact checked and monomorphized
+AST whose obligations succeeded
 in Lean; code generation cannot reload, mutate, or independently reconstruct
 the source program. The emitter is handwritten textual LLVM IR with no libLLVM
 dependency. Entry selection is bound to the root span stored inside that
@@ -598,18 +601,27 @@ failure reports raw operand bits through the weak `__sable_rt_trap_v1` hook,
 then the internal `noreturn` helper invokes `llvm.trap` even if the hook returns.
 The emitter uses no `nsw`, `nuw`, `exact`, `inbounds`, or `llvm.assume` shortcut.
 
-Focused library evidence is green at 23/23 single-job, non-incremental tests,
-and the complete verified LLVM CLI suite is green at 6/6 single-threaded. Clang
-was present: the scalar, CFG, and arithmetic subjects each returned the
-expected 42 at both `-O0` and `-O2`. The CLI gate
-also preserves an existing output on verification failure and rejects audited
-assumptions before publication. The verified trap subject also compiled at both
-optimization levels. Four contract-violating wrappers reached add overflow,
-division by zero, signed `MIN / -1` division, and narrow-range guards with the
-exact pinned kind, type-info, and raw-operand payloads; a returning strong hook
-could not suppress the following `llvm.trap`. This is executable native ABI
-evidence, not an interpreter comparison, and the complete verifier/dynamic
-corpus was not rerun for this checkpoint.
+The complete low-concurrency gate is green under
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+That run includes 26/26 library tests, 6/6 verified LLVM CLI tests, and a 1/1
+native differential test comparing the exact `VerifiedProgram` interpreter
+outcome with Clang `-O0` and `-O2` for scalar, control-flow, and arithmetic
+subjects. The arithmetic matrix covers positive and negative divisors,
+`MIN % -1`, and successful conversion boundary values; the separate native trap
+matrix covers failing conversions. The CFG matrix carries a loop condition whose
+repeated native result would expose accidental hoisting.
+The CLI gate also preserves an existing output on verification failure and
+rejects audited assumptions before publication.
+
+The trap ABI gate exercises all seven published kinds at both optimization
+levels and pins the exact kind, type-info, and raw-operand payload. A returning
+strong hook cannot suppress the mandatory following `llvm.trap`. The same
+serial command kept the SVM Rust/Lean differential green at 69/69, completed
+the full verifier/dynamic corpus in 220.78s, and passed the randomized allocator,
+grind-budget, LSP, and documentation tests. This closes M45 without claiming a
+proof of the emitter: the native differential and executable ABI gates test the
+new compiler component while Lean continues to authorize the exact input AST.
 
 The v0 acceptance boundary is intentionally narrow: fixed-width integers,
 booleans, unit, scalar locals/parameters/returns, nonrecursive calls, ordinary
@@ -619,29 +631,38 @@ rejects any unsupported production declaration. Arrays, options, classes,
 records, borrows, raw/resource/device operations, externs, deferred obligations,
 and recursion receive source diagnostics rather than partial lowering.
 
-Arithmetic must retain Sable semantics under optimization: explicit overflow,
+Arithmetic retains Sable semantics under optimization: explicit overflow,
 division, and narrowing guards; Euclidean signed division correction; no
 `nsw`/`nuw`/`inbounds`/`llvm.assume` shortcuts. Internal names use
 length-prefixed mangling without promising a public ABI, and file output is
-atomic. Deterministic emitter tests require no LLVM installation; optional
-future differential runs will compare supported subjects with the interpreter
-under Clang `-O0` and `-O2`; the current Clang gate directly pins successful
-exit values and the versioned trap ABI. Remaining M45 work is the broader
-strict-negative matrix, interpreter differentials for both results and traps,
-and a complete serial regression before declaring the scalar v0 boundary
-finished.
+atomic. Deterministic emitter tests require no LLVM installation; the required
+closure gate additionally used Clang for exact interpreter/native outcomes and
+the versioned trap ABI. Arrays, options, classes, records, and their ABI and
+storage policies are deliberately not smuggled into this result: aggregate
+backend support belongs to M46 and later.
 
 ## Post-U10 usability sequence
 
-With that stopping point reached, LLVM IR lowering is the active next milestone
-(M45/ADR 0058, currently in progress).
-The rest remains a working order, not a promise that evidence cannot reorder it:
+Unsafe Sable v1 and the scalar LLVM v0 boundary are now complete. The next work
+starts the aggregate-generics/backend track at M46+. The order remains a
+working hypothesis, not a promise that evidence cannot reorder it:
 
-1. Complete the scalar LLVM IR backend described above, preserving the checked
-   language semantics and using differential/end-to-end tests to keep lowering
-   honest.
-2. Generalize aggregate values: class type parameters, then arrays and options
-   whose elements are not restricted to the current integer-oriented surface.
+1. **M45 complete:** preserve the scalar LLVM boundary with exact
+   interpreter/native differentials and end-to-end trap tests as later work
+   extends it.
+2. Generalize aggregate values and their lowering in forcing stages:
+
+   - **G0 — recursive types:** make the compiler's type operations recurse
+     structurally and fail closed before widening the accepted surface.
+   - **G1 — Boolean/POD aggregates:** establish the first non-integer aggregate
+     storage, value, verification, interpreter, and LLVM paths.
+   - **G2 — affine options:** carry ownership and destruction correctly through
+     present/absent aggregate values.
+   - **G3 — slots and `Vec`:** make generic element storage and movement real
+     for the existing growable-vector benchmark.
+   - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
+     key/value storage, probing, and its existing verified contracts.
+
 3. Add printing and formatting together with the smallest practical `String`
    standard-library layer.
 4. Introduce `Result`-shaped explicit error handling; keep general surface

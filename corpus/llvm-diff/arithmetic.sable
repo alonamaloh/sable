@@ -11,14 +11,34 @@ fn arithmetic_entry() -> i32 {
     i32 euclid_r_pos = -7 % 3;
     i32 euclid_q_neg = 7 / -3;
     i32 euclid_r_neg = 7 % -3;
+    i32 euclid_q_both_neg = -7 / -3;
+    i32 euclid_r_both_neg = -7 % -3;
+    i8 min_rem = -128 % -1;
     i64 negated = -42;
     i64 widened = widen<i64>(signed_mul);
     i32 narrowed = narrow<i32>(widened);
+    i8 narrow_hi = narrow<i8>(127);
+    i8 narrow_lo = narrow<i8>(-128);
+    u8 narrow_unsigned_hi = narrow<u8>(255);
 
-    // Keep every operation live in the verified result while preserving 42.
+    // Keep every operation live in shallow, verified balance terms. Besides
+    // making the expected value legible, this avoids turning expression-tree
+    // depth into an accidental requirement of the differential harness.
+    i32 copy_balance = widen<i32>(signed_add) - widen<i32>(unsigned_sub);
+    i32 unsigned_balance = widen<i32>(unsigned_div) - narrow<i32>(unsigned_rem);
+    i32 euclid_balance = euclid_q_pos + euclid_r_pos - euclid_q_neg - euclid_r_neg;
+    i32 both_negative_balance = euclid_q_both_neg + euclid_r_both_neg - 5;
+    i32 boundary_balance =
+        widen<i32>(min_rem)
+        + widen<i32>(narrow_hi) + widen<i32>(narrow_lo) + 1
+        + widen<i32>(narrow_unsigned_hi) - 255;
+    i32 negation_balance = narrow<i32>(negated) + 42;
+
     return narrowed
-        + widen<i32>(signed_add) - widen<i32>(unsigned_sub)
-        + widen<i32>(unsigned_div) - narrow<i32>(unsigned_rem)
-        + euclid_q_pos + euclid_r_pos - euclid_q_neg - euclid_r_neg
-        + narrow<i32>(negated) + 42;
+        + copy_balance
+        + unsigned_balance
+        + euclid_balance
+        + both_negative_balance
+        + boundary_balance
+        + negation_balance;
 }

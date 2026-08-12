@@ -156,4 +156,5 @@ grind-budget, LSP, SVM differential, and doc tests.
 Those require additional evidence and separate decisions. The specialized UART
 profile is enough to test the architecture's central claim: devices are
 capabilities plus oracle-driven trace semantics, not ordinary memory. With that
-unsafe-v1 checkpoint reached, LLVM IR lowering is the active next milestone.
+unsafe-v1 checkpoint reached, scalar LLVM lowering followed and completed in
+M45; aggregate generics and aggregate lowering are the next usability stage.

@@ -97,7 +97,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (in progress)
+## Native lowering boundary (scalar v0 complete)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -106,10 +106,10 @@ source or accept an unchecked `Program`. This keeps module resolution,
 monomorphization, checking, VC generation, and Lean evidence on one side of a
 single code-generation boundary rather than building a parallel frontend.
 
-The working `sable build --emit-llvm` path has no libLLVM dependency. The first
-landed slices accept scalar literals, locals, calls, Boolean negation, unit,
+The working `sable build --emit-llvm` path has no libLLVM dependency. Scalar v0
+accepts scalar literals, locals, calls, Boolean negation, unit,
 `if`, `while`, signedness-aware comparisons, CFG short circuiting, explicit
-integer conversions, and checked arithmetic; they reject unsupported code
+integer conversions, and checked arithmetic; it rejects unsupported code
 within the selected `--entry` call closure (or anywhere in whole-module mode).
 Local slots are hoisted to the entry block but their initializer stores remain
 at the source declaration, so loops neither grow the stack nor fabricate
@@ -126,17 +126,21 @@ these checks.
 
 Output carries the exact artifact and proof-environment identities, uses
 versionable length-prefixed internal mangling, and file publication is atomic.
-Focused library gates are green at 23/23 single-job, non-incremental tests, and
-the complete verified CLI suite is green at 6/6 single-threaded. With Clang
-present, verified scalar, CFG, and arithmetic subjects each return 42 at
-`-O0` and `-O2`; LLVM tools remain
-optional for emitting IR. A verified trap subject compiles at both levels, and
-four contract-violating test wrappers observe the exact pinned hook payloads
-for add overflow, division by zero, signed `MIN / -1`, and narrowing range. The
-strong hook returns, after which mandatory `llvm.trap` still terminates the
-process. This is a direct executable ABI gate, not an interpreter differential;
-interpreter comparison and a full-corpus rerun remain before the complete v0
-boundary is declared finished.
+The complete low-concurrency regression
+(`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`) is green:
+26/26 library tests and 6/6 verified LLVM CLI tests, followed by a 1/1 native
+differential gate that compares the exact `VerifiedProgram` interpreter outcome
+with Clang `-O0` and `-O2` for scalar, control-flow, and arithmetic programs.
+Those subjects exercise negative divisors, `MIN % -1`, conversion bounds, and a
+loop condition designed to catch hoisting out of the header. All seven published
+trap kinds are observed with their exact kind, type-info, and raw operand payload
+at both optimization levels; a returning hook still cannot suppress the
+mandatory `llvm.trap`. The same serial run kept the SVM differential green at
+69/69, completed the full verifier/dynamic corpus in 220.78s, and passed the
+randomized allocator, grind-budget, LSP, and documentation tests. LLVM remains
+optional for emitting IR. Aggregate lowering and aggregate ABIs remain outside
+this completed scalar boundary and are future M46+ work.
 
 ## Key invariants
 

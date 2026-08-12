@@ -10,6 +10,11 @@ fn unreachable_rhs() -> bool {
     return true;
 }
 
+/// post result ↔ value > 0
+fn positive(u32 value) -> bool {
+    return value > 0;
+}
+
 /// post result = 42
 fn branch_return() -> i32 {
     if (true) {
@@ -22,10 +27,17 @@ fn branch_return() -> i32 {
 fn control_entry() -> i32 {
     mut u32 phase = 1;
     mut i32 out = 0;
+    mut bool first = true;
     /// invariant phase <= 1
     /// invariant phase = 0 -> out = 42
+    /// invariant phase > 0 -> first = true
     /// variant phase
-    while (phase > 0) {
+    while (positive(phase)) {
+        // If a backend hoists/caches the first true condition, the second
+        // iteration returns 7 instead of rechecking phase and exiting with 42.
+        if (!first) {
+            return 7;
+        }
         if (false_value() && unreachable_rhs()) {
             out = 1;
         } else {
@@ -35,6 +47,7 @@ fn control_entry() -> i32 {
                 out = 2;
             }
         }
+        first = false;
         phase = 0;
     }
     return out;

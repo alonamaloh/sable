@@ -4,7 +4,7 @@
 
 Sable is an imperative, C-flavored language in which **every function carries a machine-checked proof of its contract**. One source file interleaves two languages: a C-like program language with no undefined behavior and an ownership-based memory model, and a Lean 4 proof language that lives entirely on lines beginning with `///`.
 
-**Status: milestones M0–M44 are complete, and unsafe Sable v1 has reached a defensible stopping point.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; broader device and ISA work remains deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
+**Status: milestones M0–M45 are complete. Unsafe Sable v1 has reached a defensible stopping point, and the scalar LLVM IR backend is complete.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; M45 adds verified-to-native scalar LLVM lowering. Broader devices, ISA work, and aggregate backend support remain deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
 
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
 - [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
@@ -51,8 +51,8 @@ sable daemon                             # warm checker: ~0.25s/check instead of
 cd ../lean && lake -Kjobs=1 build
 ```
 
-Native lowering is the active in-progress milestone. Its first working slice
-is the handwritten, libLLVM-free command shown above (full form:
+The scalar LLVM v0 backend is complete. Its handwritten, libLLVM-free command
+is shown above (full form:
 `sable build --emit-llvm [--entry NAME] [-o FILE|-] file.sable`). It consumes
 only an opaque `VerifiedProgram` containing the exact AST accepted by Lean,
 emits scalar literals/locals/calls/Boolean negation/unit plus `if`, `while`,
@@ -62,16 +62,17 @@ not yet implemented. Signed and unsigned add/subtract/multiply and signed
 negation use overflow intrinsics; division/remainder and narrowing are guarded,
 signed division/remainder is corrected to Sable's Euclidean convention, and
 every failure reaches a versioned weak hook and then `llvm.trap`. The emitter
-uses none of LLVM's poison-producing arithmetic promises. Focused library
-evidence is green at 23/23 single-job, non-incremental tests, and the complete
-verified CLI suite is green at 6/6 single-threaded; with Clang present, the
-scalar, CFG, and arithmetic subjects each returned 42 at `-O0` and `-O2`. A
-verified trap subject also compiled at both
-levels: four contract-violating test wrappers produced the pinned add-overflow,
-division-by-zero, signed `MIN / -1`, and narrow-range ABI payloads, and a
-returning strong hook could not suppress `llvm.trap`. These are direct native
-gates, not interpreter differentials; that comparison and a full-corpus rerun
-remain M45 closure work. See
+uses none of LLVM's poison-producing arithmetic promises. The complete serial
+gate is green: 26/26 library tests, 6/6 verified LLVM CLI tests, and a 1/1
+native differential test comparing the exact `VerifiedProgram` interpreter
+outcome with Clang `-O0` and `-O2` for scalar, control-flow, and arithmetic
+subjects. The cases include negative divisors, `MIN % -1`, conversion bounds,
+and a loop condition whose result would expose unsafe hoisting. All seven
+published trap kinds produce the exact pinned payload and still reach the
+mandatory trap at both optimization levels. The same run kept the SVM
+differential at 69/69, completed the full verifier/dynamic corpus in 220.78s,
+and passed the randomized allocator, grind-budget, LSP, and documentation
+tests. Aggregate values and their backend ABI remain future M46+ work. See
 [`docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md`](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md).
 
 - **The bignum pillar** (M15–M16, the Tier-3 opener): arbitrary-precision `Nat` over base-2³² limbs with a normalizing representation invariant ([`corpus/verifies/bignum.sable`](corpus/verifies/bignum.sable)). The entire specification is one recursive ghost valuation, `natVal`, and one line per operation: `cmp` decides the order, `add`/`sub`/`mul` post `natVal result.limbs = natVal a.limbs ⊕ natVal b.limbs`, `div`/`rem` post `… = natVal a.limbs / natVal b.limbs` against Lean's own Euclidean division — with division built *compositionally* (double-and-subtract riding the contracts of the other verified ops, closed by one uniqueness lemma) — and `gcd` is Euclid in fifteen lines whose spec is kernel-check-proven to agree with Lean core's `Int.gcd`. **255 obligations across 10 functions, 73 hand discharges, zero escapes**, every clause monitored dynamically — the first benchmark where the mathematics itself was the test.
@@ -112,7 +113,7 @@ Architecture in one sentence: the Rust compiler (`compiler/`) owns the program l
 
 ## Where this is headed
 
-The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With the unsafe-Sable checkpoint reached, **LLVM IR lowering is now the active next milestone** ([ADR 0058](docs/decisions/0058-llvm-lowering-consumes-a-verified-program.md), implementation in progress), followed provisionally by broader aggregate generics, minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and only then domain-forced floating point; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
+The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1 and scalar LLVM v0 complete, **broader aggregate generics are next**: recursive type handling, Boolean/POD aggregates, affine options, generic slots/`Vec`, then `HashMap`. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
 
 ## Provenance
 

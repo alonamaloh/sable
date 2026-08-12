@@ -2080,6 +2080,149 @@ mod tests {
     }
 
     #[test]
+    fn entry_selection_ignores_only_unreachable_unsupported_functions() {
+        let entry = returning_function(
+            "entry",
+            IntTy::I32,
+            expression(ExprKind::IntLit(42), Ty::Int(IntTy::I32)),
+        );
+        let mut unrelated = function(
+            "unrelated",
+            Ty::Unit,
+            vec![Stmt::Return {
+                value: None,
+                span: Span::new(0, 1),
+            }],
+        );
+        unrelated.params = vec![parameter(
+            "values",
+            Ty::Array(IntTy::I32, crate::ast::Mutability::Shared),
+        )];
+        let program = program(vec![entry, unrelated]);
+
+        let selected = emit_program(
+            &program,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .expect("an unreachable unsupported function is outside the selected executable");
+        assert!(selected.contains("define i32 @main()"));
+        assert!(!selected.contains("unrelated"));
+
+        let whole_module = emit_program(&program, 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(whole_module[0].name, "backend.unsupported");
+    }
+
+    #[test]
+    fn syntactically_unreachable_short_circuit_callee_is_still_selected() {
+        let unsupported = function(
+            "unsupported_rhs",
+            Ty::Bool,
+            vec![
+                Stmt::Decl {
+                    ty: Ty::Array(IntTy::I32, crate::ast::Mutability::Owned),
+                    name: "values".into(),
+                    name_span: Span::new(0, 1),
+                    init: None,
+                    mutable: true,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        let condition = expression(
+            ExprKind::Binary {
+                op: BinOp::And,
+                op_span: Span::new(0, 1),
+                lhs: Box::new(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                rhs: Box::new(call("unsupported_rhs", Ty::Bool)),
+            },
+            Ty::Bool,
+        );
+        let entry = function(
+            "entry",
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::If {
+                    cond: condition,
+                    then_block: vec![Stmt::Return {
+                        value: Some(expression(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
+                        span: Span::new(0, 1),
+                    }],
+                    else_block: None,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::IntLit(42), Ty::Int(IntTy::I32))),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+
+        let error = emit_program(
+            &program(vec![entry, unsupported]),
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error[0].name, "backend.unsupported");
+        assert!(error[0].label.contains("local variable"));
+    }
+
+    #[test]
+    fn recursion_is_rejected_only_when_it_enters_the_selected_closure() {
+        let entry = returning_function(
+            "entry",
+            IntTy::I32,
+            expression(ExprKind::IntLit(42), Ty::Int(IntTy::I32)),
+        );
+        let recursive = function(
+            "recursive",
+            Ty::Int(IntTy::I32),
+            vec![Stmt::Return {
+                value: Some(call("recursive", Ty::Int(IntTy::I32))),
+                span: Span::new(0, 1),
+            }],
+        );
+        let unrelated_program = program(vec![entry, recursive.clone()]);
+
+        emit_program(
+            &unrelated_program,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .expect("unrelated recursion is outside the selected executable");
+        let whole_error = emit_program(&unrelated_program, 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(whole_error[0].name, "backend.recursion_unsupported");
+
+        let reachable_entry = function(
+            "reachable_entry",
+            Ty::Int(IntTy::I32),
+            vec![Stmt::Return {
+                value: Some(call("recursive", Ty::Int(IntTy::I32))),
+                span: Span::new(0, 1),
+            }],
+        );
+        let reachable = program(vec![reachable_entry, recursive]);
+        let reachable_error = emit_program(
+            &reachable,
+            1,
+            &EmitOptions {
+                entry: Some("reachable_entry".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(reachable_error[0].name, "backend.recursion_unsupported");
+    }
+
+    #[test]
     fn comparisons_use_the_checked_integer_signedness() {
         let mut signed = function(
             "signed_less",
