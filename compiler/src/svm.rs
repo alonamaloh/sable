@@ -13,20 +13,23 @@
 
 use crate::ast::*;
 use crate::interp::{MmioEvent, ObservedRun, RtVal};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy)]
 struct LocalBinding {
     ty: Ty,
     mutable: bool,
+    initialized: bool,
 }
 
 /// Program metadata needed while lowering checked, index-bearing AST nodes.
 /// Keeping this context explicit ensures record tags and layouts come from
 /// the same checked program whose function body we lower.
+#[derive(Clone)]
 struct LowerCtx<'a> {
     program: &'a Program,
     locals: HashMap<String, LocalBinding>,
+    declared: HashSet<String>,
     return_ty: Option<Ty>,
 }
 
@@ -38,96 +41,62 @@ impl<'a> LowerCtx<'a> {
         LowerCtx {
             program,
             locals: HashMap::new(),
+            declared: HashSet::new(),
             return_ty: None,
         }
     }
 
-    /// Recover the checked local environment before emitting the untyped Lean
-    /// syntax. Array expressions carry only a source name, so their element
-    /// type cannot be validated from the expression node alone.
+    /// Begin with parameters only. Locals enter `locals` as their declaration
+    /// is crossed, so named array operations cannot resolve a future or
+    /// out-of-scope declaration from a forged checked AST.
     fn for_function(program: &'a Program, function: &Fn) -> Result<LowerCtx<'a>, String> {
         let mut ctx = LowerCtx {
             program,
             locals: HashMap::new(),
+            declared: HashSet::new(),
             return_ty: Some(function.ret),
         };
         for parameter in &function.params {
-            ctx.insert_local(&parameter.name, parameter.ty, false)?;
+            ctx.insert_local(&parameter.name, parameter.ty, false, true)?;
         }
-        ctx.collect_stmt_locals(&function.body)?;
         Ok(ctx)
     }
 
-    fn insert_local(&mut self, name: &str, ty: Ty, mutable: bool) -> Result<(), String> {
-        if self
-            .locals
-            .insert(name.to_string(), LocalBinding { ty, mutable })
-            .is_some()
-        {
+    fn insert_local(
+        &mut self,
+        name: &str,
+        ty: Ty,
+        mutable: bool,
+        initialized: bool,
+    ) -> Result<(), String> {
+        if !self.declared.insert(name.to_string()) {
             return Err(format!(
                 "svm.local_type: duplicate checked local `{name}`; local types are ambiguous"
             ));
         }
+        self.locals.insert(
+            name.to_string(),
+            LocalBinding {
+                ty,
+                mutable,
+                initialized,
+            },
+        );
         Ok(())
     }
 
-    fn collect_stmt_locals(&mut self, stmts: &[Stmt]) -> Result<(), String> {
-        for stmt in stmts {
-            match stmt {
-                Stmt::Decl {
-                    name, ty, mutable, ..
-                } => self.insert_local(name, *ty, *mutable)?,
-                Stmt::VarDecl {
-                    name,
-                    ty: Some(ty),
-                    mutable,
-                    ..
-                } => self.insert_local(name, *ty, *mutable)?,
-                Stmt::VarDecl { name, ty: None, .. } => {
-                    return Err(format!(
-                        "svm.local_type: inferred declaration `{name}` carries no checked type"
-                    ));
-                }
-                Stmt::If {
-                    then_block,
-                    else_block,
-                    ..
-                } => {
-                    self.collect_stmt_locals(then_block)?;
-                    if let Some(else_block) = else_block {
-                        self.collect_stmt_locals(else_block)?;
-                    }
-                }
-                Stmt::While { body, .. } | Stmt::Unsafe { body, .. } => {
-                    self.collect_stmt_locals(body)?;
-                }
-                Stmt::Expose { ptr, res, body, .. } => {
-                    self.insert_local(ptr, Ty::Raw(IntTy::U8), false)?;
-                    self.insert_local(res, Ty::Res(ResKind::RawSpan), false)?;
-                    self.collect_stmt_locals(body)?;
-                }
-                Stmt::StaticAlloc { ptr, res, .. } => {
-                    self.insert_local(ptr, Ty::Raw(IntTy::U8), false)?;
-                    self.insert_local(res, Ty::Res(ResKind::RawSpan), false)?;
-                }
-                Stmt::SystemAlloc {
-                    ptr, res, release, ..
-                } => {
-                    self.insert_local(ptr, Ty::Raw(IntTy::U8), false)?;
-                    self.insert_local(res, Ty::Res(ResKind::RawSpan), false)?;
-                    self.insert_local(release, Ty::Res(ResKind::SystemDealloc), false)?;
-                }
-                Stmt::Assign { .. }
-                | Stmt::Return { .. }
-                | Stmt::ExprStmt(_)
-                | Stmt::Assert(_)
-                | Stmt::FieldAssign { .. }
-                | Stmt::FieldStore { .. }
-                | Stmt::Store { .. }
-                | Stmt::SystemDealloc { .. } => {}
-            }
+    fn initialized_local(&self, name: &str, operation: &str) -> Result<LocalBinding, String> {
+        let Some(binding) = self.local(name) else {
+            return Err(format!(
+                "svm.local_type: {operation} names unknown or out-of-scope local `{name}`"
+            ));
+        };
+        if !binding.initialized {
+            return Err(format!(
+                "svm.local_type: {operation} reads uninitialized local `{name}`"
+            ));
         }
-        Ok(())
+        Ok(binding)
     }
 
     fn record(&self, index: usize) -> Result<&'a RecordDecl, String> {
@@ -145,7 +114,7 @@ impl<'a> LowerCtx<'a> {
 /// integer-only, while ordinary options additionally admit `bool`.  The Lean
 /// constructors are intentionally untyped, so every checked payload must be
 /// classified here instead of inheriting lowering by accident.
-fn validate_fn_payloads(ctx: &LowerCtx<'_>, f: &Fn) -> Result<(), String> {
+fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
     if !f.type_params.is_empty() {
         return Err(format!(
             "svm.type_parameter_unsupported: `{}` is still a generic declaration",
@@ -227,11 +196,7 @@ fn resolve_integer_array(
     array: &str,
     operation: &str,
 ) -> Result<(ValueTy, Mutability, bool), String> {
-    let Some(binding) = ctx.local(array) else {
-        return Err(format!(
-            "svm.array_place_type: {operation} names unknown array `{array}`"
-        ));
-    };
+    let binding = ctx.initialized_local(array, operation)?;
     let Ty::Array(payload, mutability) = binding.ty else {
         return Err(format!(
             "svm.array_place_type: {operation} names `{array}` of type `{}`; expected an array",
@@ -367,16 +332,139 @@ fn validate_array_store(
     validate_expr_payloads(ctx, value)
 }
 
-fn validate_array_binding(ty: Ty, name: &str, init: &Expr) -> Result<(), String> {
-    if !matches!(ty, Ty::Array(..)) {
-        return Ok(());
+fn call_return_ty(ctx: &LowerCtx<'_>, callee: &str) -> Result<Ty, String> {
+    let mut matches = ctx
+        .program
+        .fns
+        .iter()
+        .filter(|function| function.name == callee);
+    let Some(function) = matches.next() else {
+        return Err(format!(
+            "svm.call_target: call target `{callee}` is absent from the executable program"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "svm.call_target: call target `{callee}` is ambiguous in the executable program"
+        ));
     }
-    require_expr_annotation(
-        init,
-        ty,
-        "svm.array_binding_type",
-        &format!("initializer of array `{name}`"),
-    )
+    Ok(function.ret)
+}
+
+/// Recover the type supplied by the expression's checked shape instead of
+/// trusting its cached annotation as a second, forgeable source of truth.
+fn semantic_expr_ty(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    expected: Ty,
+    context: &str,
+) -> Result<Ty, String> {
+    let semantic = match &expr.kind {
+        ExprKind::Var(name) => ctx.initialized_local(name, context)?.ty,
+        ExprKind::AllocArray { elem, .. } => Ty::Array(*elem, Mutability::Owned),
+        ExprKind::ArrayLit(_) => match expr.ty {
+            Some(ty @ Ty::Array(_, Mutability::Owned)) => ty,
+            Some(actual) => {
+                return Err(format!(
+                    "svm.sink_type: {context} is an array literal annotated `{}`",
+                    actual.name()
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "svm.sink_type: {context} is an array literal without a checked type"
+                ));
+            }
+        },
+        ExprKind::Call { callee, .. } => call_return_ty(ctx, callee)?,
+        ExprKind::ResOp { op, args, .. } => semantic_res_op_ty(ctx, *op, args, expected)?,
+        ExprKind::RawOp { op, args, .. } => validate_raw_op(ctx, *op, args)?,
+        ExprKind::DeviceOp { op, args, .. } => validate_device_op(ctx, *op, args)?,
+        ExprKind::IntLit(_) => match expr.ty {
+            Some(actual @ Ty::Int(_)) => actual,
+            _ => {
+                return Err(format!(
+                    "svm.sink_type: {context} has an integer literal with a non-integer annotation"
+                ));
+            }
+        },
+        ExprKind::BoolLit(_) => Ty::Bool,
+        _ => {
+            if matches!(expr.ty, Some(Ty::Array(..))) {
+                return Err(format!(
+                    "svm.sink_type: {context} has an expression shape that cannot produce an array"
+                ));
+            }
+            match expr.ty {
+                Some(actual) => actual,
+                None if expected.is_resource()
+                    && matches!(
+                        expr.kind,
+                        ExprKind::SelfField { .. } | ExprKind::Borrow { .. }
+                    ) =>
+                {
+                    expected
+                }
+                None => {
+                    return Err(format!(
+                        "svm.sink_type: {context} carries no checked result type"
+                    ));
+                }
+            }
+        }
+    };
+    if let Some(annotation) = expr.ty {
+        if annotation != semantic {
+            return Err(format!(
+                "svm.sink_type: {context} is semantically `{}` but annotated `{}`",
+                semantic.name(),
+                annotation.name()
+            ));
+        }
+    } else if !semantic.is_resource() {
+        return Err(format!(
+            "svm.sink_type: {context} carries no checked type; expected `{}`",
+            semantic.name()
+        ));
+    }
+    Ok(semantic)
+}
+
+fn validate_local_var(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    name: &str,
+    operation: &str,
+) -> Result<LocalBinding, String> {
+    let binding = ctx.initialized_local(name, operation)?;
+    match expr.ty {
+        Some(annotation) if annotation != binding.ty => Err(format!(
+            "svm.local_type: {operation} names `{name}` of type `{}` but is annotated `{}`",
+            binding.ty.name(),
+            annotation.name()
+        )),
+        None if !binding.ty.is_resource() => Err(format!(
+            "svm.local_type: {operation} names non-resource `{name}` without a checked type"
+        )),
+        _ => Ok(binding),
+    }
+}
+
+fn validate_sink_type(
+    ctx: &LowerCtx<'_>,
+    expected: Ty,
+    value: &Expr,
+    context: &str,
+) -> Result<(), String> {
+    let actual = semantic_expr_ty(ctx, value, expected, context)?;
+    if actual != expected {
+        return Err(format!(
+            "svm.sink_type: {context} supplies `{}`; destination expects `{}`",
+            actual.name(),
+            expected.name()
+        ));
+    }
+    Ok(())
 }
 
 fn validate_array_rebind(ctx: &LowerCtx<'_>, name: &str) -> Result<(), String> {
@@ -391,16 +479,11 @@ fn validate_array_rebind(ctx: &LowerCtx<'_>, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_array_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
-    if let Some(expected @ Ty::Array(..)) = ctx.return_ty {
-        require_expr_annotation(
-            value,
-            expected,
-            "svm.array_return_type",
-            "array return value",
-        )?;
-    }
-    Ok(())
+fn validate_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
+    let Some(expected) = ctx.return_ty else {
+        return Err("svm.sink_type: return lowering has no function result type".into());
+    };
+    validate_sink_type(ctx, expected, value, "return value")
 }
 
 fn validate_array_exposure(ctx: &LowerCtx<'_>, array: &str, mutable: bool) -> Result<(), String> {
@@ -419,6 +502,42 @@ fn validate_array_exposure(ctx: &LowerCtx<'_>, array: &str, mutable: bool) -> Re
         return Err(format!(
             "svm.array_expose_type: mutable exposure targets non-writable `{array}`"
         ));
+    }
+    Ok(())
+}
+
+fn validate_system_dealloc(
+    ctx: &LowerCtx<'_>,
+    ptr: &Expr,
+    res: &Expr,
+    release: &Expr,
+) -> Result<(), String> {
+    validate_sink_type(ctx, Ty::Raw(IntTy::U8), ptr, "system deallocation pointer")?;
+    for (value, expected, context) in [
+        (
+            res,
+            Ty::Res(ResKind::RawSpan),
+            "system deallocation raw authority",
+        ),
+        (
+            release,
+            Ty::Res(ResKind::SystemDealloc),
+            "system deallocation release authority",
+        ),
+    ] {
+        if !matches!(value.kind, ExprKind::Var(_)) {
+            return Err(format!(
+                "svm.resource_operand_place: {context} must be an active owned resource variable"
+            ));
+        }
+        let actual = resolved_resource_place_ty(ctx, value, context)?;
+        if actual != expected {
+            return Err(format!(
+                "svm.resource_operand_type: {context} supplies `{}`; expected `{}`",
+                actual.name(),
+                expected.name()
+            ));
+        }
     }
     Ok(())
 }
@@ -650,19 +769,117 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), String> {
+fn validate_scoped_stmts(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), String> {
+    let mut child = ctx.clone();
+    let result = validate_stmt_payloads(&mut child, stmts);
+    ctx.declared = child.declared;
+    result
+}
+
+fn block_definitely_returns(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Return { .. } => true,
+        Stmt::If {
+            then_block,
+            else_block: Some(else_block),
+            ..
+        } => block_definitely_returns(then_block) && block_definitely_returns(else_block),
+        Stmt::Unsafe { body, .. } => block_definitely_returns(body),
+        _ => false,
+    })
+}
+
+fn contains_return(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::Return { .. } => true,
+        Stmt::If {
+            then_block,
+            else_block,
+            ..
+        } => contains_return(then_block) || else_block.as_deref().is_some_and(contains_return),
+        Stmt::While { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+            contains_return(body)
+        }
+        _ => false,
+    })
+}
+
+fn merge_if_initialization(
+    ctx: &mut LowerCtx<'_>,
+    before: &HashMap<String, LocalBinding>,
+    then_locals: &HashMap<String, LocalBinding>,
+    then_returns: bool,
+    else_locals: &HashMap<String, LocalBinding>,
+    else_returns: bool,
+) {
+    for (name, original) in before {
+        let initialized = match (then_returns, else_returns) {
+            (false, false) => {
+                then_locals.get(name).is_some_and(|local| local.initialized)
+                    && else_locals.get(name).is_some_and(|local| local.initialized)
+            }
+            (false, true) => then_locals.get(name).is_some_and(|local| local.initialized),
+            (true, false) => else_locals.get(name).is_some_and(|local| local.initialized),
+            (true, true) => original.initialized,
+        };
+        ctx.locals
+            .get_mut(name)
+            .expect("pre-branch local remains active")
+            .initialized = initialized;
+    }
+}
+
+fn merge_executed_scope_initialization(
+    ctx: &mut LowerCtx<'_>,
+    before: &HashMap<String, LocalBinding>,
+    after: &HashMap<String, LocalBinding>,
+) {
+    for name in before.keys() {
+        ctx.locals
+            .get_mut(name)
+            .expect("pre-scope local remains active")
+            .initialized = after
+            .get(name)
+            .expect("pre-scope local remains active in child")
+            .initialized;
+    }
+}
+
+fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
-            Stmt::Decl { ty, init, name, .. } => {
+            Stmt::Decl {
+                ty,
+                init,
+                name,
+                mutable,
+                ..
+            } => {
                 validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
                 if let Some(init) = init {
-                    validate_array_binding(*ty, name, init)?;
                     validate_expr_payloads(ctx, init)?;
+                    validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
                 }
+                ctx.insert_local(name, *ty, *mutable, init.is_some())?;
             }
             Stmt::Assign { name, value, .. } => {
-                validate_array_rebind(ctx, name)?;
+                let Some(binding) = ctx.local(name) else {
+                    return Err(format!(
+                        "svm.local_type: assignment names unknown or out-of-scope local `{name}`"
+                    ));
+                };
+                if !binding.mutable {
+                    return Err(format!(
+                        "svm.local_type: assignment targets immutable local `{name}`"
+                    ));
+                }
                 validate_expr_payloads(ctx, value)?;
+                validate_sink_type(ctx, binding.ty, value, &format!("assignment to `{name}`"))?;
+                validate_array_rebind(ctx, name)?;
+                ctx.locals
+                    .get_mut(name)
+                    .expect("resolved assignment")
+                    .initialized = true;
             }
             Stmt::ExprStmt(value) | Stmt::FieldAssign { value, .. } => {
                 validate_expr_payloads(ctx, value)?;
@@ -673,24 +890,50 @@ fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), Stri
                 else_block,
             } => {
                 validate_expr_payloads(ctx, cond)?;
-                validate_stmt_payloads(ctx, then_block)?;
+                let before = ctx.locals.clone();
+                let mut then_ctx = ctx.clone();
+                validate_stmt_payloads(&mut then_ctx, then_block)?;
+                ctx.declared = then_ctx.declared.clone();
+
+                let mut else_ctx = ctx.clone();
+                else_ctx.locals = before.clone();
                 if let Some(else_block) = else_block {
-                    validate_stmt_payloads(ctx, else_block)?;
+                    validate_stmt_payloads(&mut else_ctx, else_block)?;
+                    ctx.declared = else_ctx.declared.clone();
                 }
+
+                merge_if_initialization(
+                    ctx,
+                    &before,
+                    &then_ctx.locals,
+                    block_definitely_returns(then_block),
+                    &else_ctx.locals,
+                    else_block.as_deref().is_some_and(block_definitely_returns),
+                );
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
-                    validate_array_return(ctx, value)?;
                     validate_expr_payloads(ctx, value)?;
+                    validate_return(ctx, value)?;
                 }
             }
             Stmt::Assert(_) => {}
-            Stmt::VarDecl { name, init, ty, .. } => {
-                if let Some(ty) = ty {
-                    validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
-                    validate_array_binding(*ty, name, init)?;
-                }
+            Stmt::VarDecl {
+                name,
+                init,
+                ty: Some(ty),
+                mutable,
+                ..
+            } => {
+                validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
                 validate_expr_payloads(ctx, init)?;
+                validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+                ctx.insert_local(name, *ty, *mutable, true)?;
+            }
+            Stmt::VarDecl { name, ty: None, .. } => {
+                return Err(format!(
+                    "svm.local_type: inferred declaration `{name}` carries no checked type"
+                ));
             }
             Stmt::FieldStore { index, value, .. } => {
                 validate_expr_payloads(ctx, index)?;
@@ -704,22 +947,61 @@ fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), Stri
             } => validate_array_store(ctx, array, index, value)?,
             Stmt::While { cond, body, .. } => {
                 validate_expr_payloads(ctx, cond)?;
-                validate_stmt_payloads(ctx, body)?;
+                validate_scoped_stmts(ctx, body)?;
             }
-            Stmt::Unsafe { body, .. } => {
-                validate_stmt_payloads(ctx, body)?;
-            }
+            Stmt::Unsafe { body, .. } => validate_stmt_payloads(ctx, body)?,
             Stmt::Expose {
                 array,
                 mutable,
+                ptr,
+                res,
                 body,
                 ..
             } => {
                 validate_array_exposure(ctx, array, *mutable)?;
-                validate_stmt_payloads(ctx, body)?;
+                if contains_return(body) {
+                    return Err(
+                        "svm.expose_return: return inside array exposure would bypass generated copyback and release"
+                            .into(),
+                    );
+                }
+                let before = ctx.locals.clone();
+                let mut child = ctx.clone();
+                child.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
+                child.insert_local(res, Ty::Res(ResKind::RawSpan), *mutable, true)?;
+                let result = validate_stmt_payloads(&mut child, body);
+                ctx.declared = child.declared.clone();
+                result?;
+                merge_executed_scope_initialization(ctx, &before, &child.locals);
             }
-            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+            Stmt::StaticAlloc { size, ptr, res, .. } => {
+                require_expr_annotation(
+                    size,
+                    Ty::Int(IntTy::U64),
+                    "svm.allocation_size_type",
+                    "static allocation size",
+                )?;
                 validate_expr_payloads(ctx, size)?;
+                ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
+                ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
+            }
+            Stmt::SystemAlloc {
+                size,
+                ptr,
+                res,
+                release,
+                ..
+            } => {
+                require_expr_annotation(
+                    size,
+                    Ty::Int(IntTy::U64),
+                    "svm.allocation_size_type",
+                    "system allocation size",
+                )?;
+                validate_expr_payloads(ctx, size)?;
+                ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
+                ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
+                ctx.insert_local(release, Ty::Res(ResKind::SystemDealloc), false, true)?;
             }
             Stmt::SystemDealloc {
                 ptr, res, release, ..
@@ -727,6 +1009,7 @@ fn validate_stmt_payloads(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), Stri
                 validate_expr_payloads(ctx, ptr)?;
                 validate_expr_payloads(ctx, res)?;
                 validate_expr_payloads(ctx, release)?;
+                validate_system_dealloc(ctx, ptr, res, release)?;
             }
         }
     }
@@ -906,10 +1189,40 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             validate_expr_payloads(ctx, lhs)?;
             validate_expr_payloads(ctx, rhs)?;
         }
-        ExprKind::RawOp { args, .. }
-        | ExprKind::DeviceOp { args, .. }
-        | ExprKind::ResOp { args, .. }
-        | ExprKind::TraitCall { args, .. }
+        ExprKind::ResOp { args, .. } => {
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.unwrap_or(Ty::Unit),
+                "sealed resource expression",
+            )?;
+            for arg in args {
+                validate_expr_payloads(ctx, arg)?;
+            }
+        }
+        ExprKind::RawOp { args, .. } => {
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.unwrap_or(Ty::Unit),
+                "raw operation expression",
+            )?;
+            for arg in args {
+                validate_expr_payloads(ctx, arg)?;
+            }
+        }
+        ExprKind::DeviceOp { args, .. } => {
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.unwrap_or(Ty::Unit),
+                "device operation expression",
+            )?;
+            for arg in args {
+                validate_expr_payloads(ctx, arg)?;
+            }
+        }
+        ExprKind::TraitCall { args, .. }
         | ExprKind::MethodCall { args, .. }
         | ExprKind::RecordLit { args, .. } => {
             for arg in args {
@@ -919,9 +1232,11 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         ExprKind::SelfFieldIndex { index, .. } | ExprKind::ClassFieldIndex { index, .. } => {
             validate_expr_payloads(ctx, index)?;
         }
+        ExprKind::Var(name) => {
+            validate_local_var(ctx, expr, name, "variable expression")?;
+        }
         ExprKind::IntLit(_)
         | ExprKind::BoolLit(_)
-        | ExprKind::Var(_)
         | ExprKind::SelfField { .. }
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::ClassField { .. }
@@ -937,10 +1252,11 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
     if !f.params.is_empty() {
         return Err("differential subjects must take no parameters".into());
     }
-    let ctx = LowerCtx::for_function(program, f)?;
     validate_program_option_positions(program)?;
-    validate_fn_payloads(&ctx, f)?;
-    lower_block(&ctx, &f.body)
+    let mut validation_ctx = LowerCtx::for_function(program, f)?;
+    validate_fn_payloads(&mut validation_ctx, f)?;
+    let mut lowering_ctx = LowerCtx::for_function(program, f)?;
+    lower_block(&mut lowering_ctx, &f.body)
 }
 
 /// Lower any function to a `Prog.ofList` entry: `("name", ⟨[params],
@@ -948,14 +1264,15 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
 /// machine (arrays are owned values; `&mut` reflection back to the
 /// caller has no machine analog yet).
 pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
-    let ctx = LowerCtx::for_function(program, f)?;
     validate_program_option_positions(program)?;
-    validate_fn_payloads(&ctx, f)?;
+    let mut validation_ctx = LowerCtx::for_function(program, f)?;
+    validate_fn_payloads(&mut validation_ctx, f)?;
+    let mut lowering_ctx = LowerCtx::for_function(program, f)?;
     for p in &f.params {
         match p.ty {
             Ty::Int(_) | Ty::Bool => {}
             Ty::Record(ri) | Ty::RawRecord(ri) | Ty::OptionRaw(ri) => {
-                ctx.record(ri)?;
+                lowering_ctx.record(ri)?;
             }
             _ => {
                 return Err(format!(
@@ -970,7 +1287,7 @@ pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
         "(\"{}\", ⟨[{}], {}⟩)",
         f.name,
         params.join(", "),
-        lower_block(&ctx, &f.body)?
+        lower_block(&mut lowering_ctx, &f.body)?
     ))
 }
 
@@ -982,81 +1299,88 @@ fn next_loan() -> usize {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
-fn lower_block(ctx: &LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
-    lower_block_erasing(ctx, stmts, &[])
+fn lower_block(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
+    lower_block_erasing(ctx, stmts)
 }
 
-fn lower_block_erasing(
-    ctx: &LowerCtx<'_>,
-    stmts: &[Stmt],
-    erased_resources: &[&str],
-) -> Result<String, String> {
-    let mut block_resources = erased_resources.to_vec();
-    for stmt in stmts {
-        match stmt {
-            Stmt::Decl { ty, name, .. } if ty.is_resource() => {
-                block_resources.push(name.as_str());
-            }
-            Stmt::VarDecl {
-                name, ty: Some(ty), ..
-            } if ty.is_resource() => {
-                block_resources.push(name.as_str());
-            }
-            Stmt::StaticAlloc { res, .. } => block_resources.push(res.as_str()),
-            Stmt::SystemAlloc { res, release, .. } => {
-                block_resources.push(res.as_str());
-                block_resources.push(release.as_str());
-            }
-            _ => {}
-        }
-    }
+fn lower_block_erasing(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
     let mut out = Vec::new();
     for s in stmts {
-        if let Some(t) = lower_stmt_erasing(ctx, s, &block_resources)? {
+        if let Some(t) = lower_stmt_erasing(ctx, s)? {
             out.push(t);
         }
     }
     Ok(format!("[{}]", out.join(", ")))
 }
 
-fn lower_stmt_erasing(
-    ctx: &LowerCtx<'_>,
-    s: &Stmt,
-    erased_resources: &[&str],
-) -> Result<Option<String>, String> {
+fn lower_scoped_block(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
+    let mut child = ctx.clone();
+    let result = lower_block_erasing(&mut child, stmts);
+    ctx.declared = child.declared;
+    result
+}
+
+fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>, String> {
     Ok(match s {
         // A ⊥ slot: the machine conflates "undeclared" with ⊥, and
         // definite initialization guarantees assignment-before-read.
-        Stmt::Decl { init: None, .. } => None,
         Stmt::Decl {
             name,
             ty,
+            mutable,
+            init: None,
+            ..
+        } => {
+            ctx.insert_local(name, *ty, *mutable, false)?;
+            None
+        }
+        Stmt::Decl {
+            name,
+            ty,
+            mutable,
             init: Some(e),
             ..
-        } if ty.is_resource() => lower_erased_resource_bind(ctx, name, e)?,
+        } if ty.is_resource() => {
+            validate_sink_type(ctx, *ty, e, &format!("initializer of `{name}`"))?;
+            let lowered = lower_erased_resource_bind(ctx, name, e)?;
+            ctx.insert_local(name, *ty, *mutable, true)?;
+            lowered
+        }
         Stmt::Decl {
             name,
             ty,
+            mutable,
             init: Some(e),
             ..
         } => {
-            validate_array_binding(*ty, name, e)?;
-            Some(lower_bind(ctx, name, e)?)
+            validate_sink_type(ctx, *ty, e, &format!("initializer of `{name}`"))?;
+            let lowered = lower_bind(ctx, name, e)?;
+            ctx.insert_local(name, *ty, *mutable, true)?;
+            Some(lowered)
         }
         Stmt::VarDecl {
             name,
             init,
             ty: Some(ty),
+            mutable,
             ..
-        } if ty.is_resource() => lower_erased_resource_bind(ctx, name, init)?,
+        } if ty.is_resource() => {
+            validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+            let lowered = lower_erased_resource_bind(ctx, name, init)?;
+            ctx.insert_local(name, *ty, *mutable, true)?;
+            lowered
+        }
         Stmt::VarDecl {
             name,
             init,
             ty: Some(ty),
+            mutable,
             ..
         } => {
-            validate_array_binding(*ty, name, init)?;
-            Some(lower_bind(ctx, name, init)?)
+            validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+            let lowered = lower_bind(ctx, name, init)?;
+            ctx.insert_local(name, *ty, *mutable, true)?;
+            Some(lowered)
         }
         Stmt::VarDecl { name, ty: None, .. } => {
             return Err(format!(
@@ -1065,7 +1389,7 @@ fn lower_stmt_erasing(
         }
         // `unsafe { ... }` is a marker with no machine step of its own.
         Stmt::Unsafe { body, .. } => {
-            let inner = lower_block_erasing(ctx, body, erased_resources)?;
+            let inner = lower_block_erasing(ctx, body)?;
             // Splice the body in place: the block does not scope.
             Some(
                 inner
@@ -1074,13 +1398,31 @@ fn lower_stmt_erasing(
                     .to_string(),
             )
         }
-        Stmt::StaticAlloc { size, ptr, .. } => {
-            Some(format!("(.rawAlloc \"{ptr}\" {})", lower_expr(ctx, size)?))
+        Stmt::StaticAlloc { size, ptr, res, .. } => {
+            let lowered = format!("(.rawAlloc \"{ptr}\" {})", lower_expr(ctx, size)?);
+            ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
+            ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
+            Some(lowered)
         }
-        Stmt::SystemAlloc { size, ptr, .. } => {
-            Some(format!("(.rawAlloc \"{ptr}\" {})", lower_expr(ctx, size)?))
+        Stmt::SystemAlloc {
+            size,
+            ptr,
+            res,
+            release,
+            ..
+        } => {
+            let lowered = format!("(.rawAlloc \"{ptr}\" {})", lower_expr(ctx, size)?);
+            ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
+            ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
+            ctx.insert_local(release, Ty::Res(ResKind::SystemDealloc), false, true)?;
+            Some(lowered)
         }
-        Stmt::SystemDealloc { ptr, .. } => Some(format!("(.rawFree {})", lower_expr(ctx, ptr)?)),
+        Stmt::SystemDealloc {
+            ptr, res, release, ..
+        } => {
+            validate_system_dealloc(ctx, ptr, res, release)?;
+            Some(format!("(.rawFree {})", lower_expr(ctx, ptr)?))
+        }
         // The machine has no exposure primitive: the construct *is* the
         // loan-allocation model, so lowering spells it out — allocate,
         // copy the bytes in, run the body, copy the final bytes back,
@@ -1096,15 +1438,26 @@ fn lower_stmt_erasing(
             ..
         } => {
             validate_array_exposure(ctx, array, *mutable)?;
+            if contains_return(body) {
+                return Err(
+                    "svm.expose_return: return inside array exposure would bypass generated copyback and release"
+                        .into(),
+                );
+            }
             let id = next_loan();
             let loan = format!("_loan{id}");
             let i = format!("_li{id}");
             let t = format!("_lb{id}");
             let n = format!("(.len \"{array}\")");
             let at = format!("(.ptrAdd (.var \"{loan}\") (.var \"{i}\"))");
-            let mut inner_erased = erased_resources.to_vec();
-            inner_erased.push(res);
-            let inner = lower_block_erasing(ctx, body, &inner_erased)?;
+            let before = ctx.locals.clone();
+            let mut child = ctx.clone();
+            child.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
+            child.insert_local(res, Ty::Res(ResKind::RawSpan), *mutable, true)?;
+            let inner_result = lower_block_erasing(&mut child, body);
+            ctx.declared = child.declared.clone();
+            let inner = inner_result?;
+            merge_executed_scope_initialization(ctx, &before, &child.locals);
             let inner = inner.trim_start_matches('[').trim_end_matches(']');
             let mut parts: Vec<String> = Vec::new();
             parts.push(format!("(.rawAlloc \"{loan}\" {n})"));
@@ -1132,12 +1485,29 @@ fn lower_stmt_erasing(
             parts.push(format!("(.rawFree (.var \"{loan}\"))"));
             Some(parts.join(", "))
         }
-        Stmt::Assign { name, value, .. } if erased_resources.contains(&name.as_str()) => {
-            lower_erased_resource_bind(ctx, name, value)?
-        }
         Stmt::Assign { name, value, .. } => {
+            let Some(binding) = ctx.local(name) else {
+                return Err(format!(
+                    "svm.local_type: assignment names unknown or out-of-scope local `{name}`"
+                ));
+            };
+            if !binding.mutable {
+                return Err(format!(
+                    "svm.local_type: assignment targets immutable local `{name}`"
+                ));
+            }
+            validate_sink_type(ctx, binding.ty, value, &format!("assignment to `{name}`"))?;
             validate_array_rebind(ctx, name)?;
-            Some(lower_bind(ctx, name, value)?)
+            let lowered = if binding.ty.is_resource() {
+                lower_erased_resource_bind(ctx, name, value)?
+            } else {
+                Some(lower_bind(ctx, name, value)?)
+            };
+            ctx.locals
+                .get_mut(name)
+                .expect("resolved assignment")
+                .initialized = true;
+            lowered
         }
         Stmt::Store {
             array,
@@ -1157,16 +1527,29 @@ fn lower_stmt_erasing(
             then_block,
             else_block,
         } => {
+            let condition = lower_expr(ctx, cond)?;
+            let before = ctx.locals.clone();
+
+            let mut then_ctx = ctx.clone();
+            let then = lower_block_erasing(&mut then_ctx, then_block)?;
+            ctx.declared = then_ctx.declared.clone();
+
+            let mut else_ctx = ctx.clone();
+            else_ctx.locals = before.clone();
             let els = match else_block {
-                Some(b) => lower_block_erasing(ctx, b, erased_resources)?,
+                Some(block) => lower_block_erasing(&mut else_ctx, block)?,
                 None => "[]".into(),
             };
-            Some(format!(
-                "(.ite {} {} {})",
-                lower_expr(ctx, cond)?,
-                lower_block_erasing(ctx, then_block, erased_resources)?,
-                els
-            ))
+            ctx.declared = else_ctx.declared.clone();
+            merge_if_initialization(
+                ctx,
+                &before,
+                &then_ctx.locals,
+                block_definitely_returns(then_block),
+                &else_ctx.locals,
+                else_block.as_deref().is_some_and(block_definitely_returns),
+            );
+            Some(format!("(.ite {condition} {then} {els})"))
         }
         Stmt::While {
             cond,
@@ -1181,14 +1564,12 @@ fn lower_stmt_erasing(
                         .into(),
                 );
             }
-            Some(format!(
-                "(.while {} {})",
-                lower_expr(ctx, cond)?,
-                lower_block_erasing(ctx, body, erased_resources)?
-            ))
+            let condition = lower_expr(ctx, cond)?;
+            let body = lower_scoped_block(ctx, body)?;
+            Some(format!("(.while {condition} {body})"))
         }
         Stmt::Return { value: Some(e), .. } => {
-            validate_array_return(ctx, e)?;
+            validate_return(ctx, e)?;
             Some(format!("(.ret {})", lower_expr(ctx, e)?))
         }
         Stmt::Return { value: None, .. } => {
@@ -1200,64 +1581,94 @@ fn lower_stmt_erasing(
             // Raw operations are statements in the machine (ADR 0025).
             // Resource arguments are erased: authority has no runtime
             // representation, so only the pointer and value lower.
-            ExprKind::RawOp { op, args, .. } => Some(match op {
-                RawOp::Store8 => format!(
-                    "(.rawStore8 {} {})",
-                    lower_expr(ctx, &args[0])?,
-                    lower_expr(ctx, &args[1])?
-                ),
-                RawOp::CellInitU64 => format!(
-                    "(.rawCellInitU64 {} {})",
-                    lower_expr(ctx, &args[0])?,
-                    lower_expr(ctx, &args[1])?
-                ),
-                RawOp::CellDropU64 => {
-                    format!("(.rawCellDropU64 {})", lower_expr(ctx, &args[0])?)
+            ExprKind::RawOp { op, args, .. } => {
+                let result = validate_raw_op(ctx, *op, args)?;
+                if e.ty != Some(result) {
+                    return Err(format!(
+                        "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
+                        op.name(),
+                        result.name(),
+                        e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                    ));
                 }
-                RawOp::CellInitRecord(ri) => {
-                    ctx.record(*ri)?;
-                    format!(
-                        "(.rawCellInitRecord {ri} {} {})",
+                Some(match op {
+                    RawOp::Store8 => format!(
+                        "(.rawStore8 {} {})",
                         lower_expr(ctx, &args[0])?,
                         lower_expr(ctx, &args[1])?
-                    )
-                }
-                RawOp::CellDropRecord(ri) => {
-                    ctx.record(*ri)?;
-                    format!("(.rawCellDropRecord {ri} {})", lower_expr(ctx, &args[0])?)
-                }
-                RawOp::HeaderInit => {
-                    let p = lower_expr(ctx, &args[0])?;
-                    let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
-                    format!(
-                        "(.rawCellInitU64 {p} {}), (.rawCellInitU64 {next_p} {})",
-                        lower_expr(ctx, &args[1])?,
-                        lower_expr(ctx, &args[2])?
-                    )
-                }
-                RawOp::HeaderClear => {
-                    let p = lower_expr(ctx, &args[0])?;
-                    let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
-                    format!("(.rawCellDropU64 {p}), (.rawCellDropU64 {next_p})")
-                }
-                RawOp::Copy => {
-                    return Err("`raw_copy_nonoverlapping` has no single machine step: \
+                    ),
+                    RawOp::CellInitU64 => format!(
+                        "(.rawCellInitU64 {} {})",
+                        lower_expr(ctx, &args[0])?,
+                        lower_expr(ctx, &args[1])?
+                    ),
+                    RawOp::CellDropU64 => {
+                        format!("(.rawCellDropU64 {})", lower_expr(ctx, &args[0])?)
+                    }
+                    RawOp::CellInitRecord(ri) => {
+                        ctx.record(*ri)?;
+                        format!(
+                            "(.rawCellInitRecord {ri} {} {})",
+                            lower_expr(ctx, &args[0])?,
+                            lower_expr(ctx, &args[1])?
+                        )
+                    }
+                    RawOp::CellDropRecord(ri) => {
+                        ctx.record(*ri)?;
+                        format!("(.rawCellDropRecord {ri} {})", lower_expr(ctx, &args[0])?)
+                    }
+                    RawOp::HeaderInit => {
+                        let p = lower_expr(ctx, &args[0])?;
+                        let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                        format!(
+                            "(.rawCellInitU64 {p} {}), (.rawCellInitU64 {next_p} {})",
+                            lower_expr(ctx, &args[1])?,
+                            lower_expr(ctx, &args[2])?
+                        )
+                    }
+                    RawOp::HeaderClear => {
+                        let p = lower_expr(ctx, &args[0])?;
+                        let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                        format!("(.rawCellDropU64 {p}), (.rawCellDropU64 {next_p})")
+                    }
+                    RawOp::Copy => {
+                        return Err("`raw_copy_nonoverlapping` has no single machine step: \
                                 the machine copies a byte at a time, and lowering it \
                                 would invent a loop the source did not write"
-                        .into());
+                            .into());
+                    }
+                    _ => return Err(format!("`{}` produces a value", op.name())),
+                })
+            }
+            ExprKind::DeviceOp { op, args, .. } => {
+                let result = validate_device_op(ctx, *op, args)?;
+                if e.ty != Some(result) {
+                    return Err(format!(
+                        "svm.device_result_type: `{}` produces `{}` but is annotated `{}`",
+                        op.name(),
+                        result.name(),
+                        e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                    ));
                 }
-                _ => return Err(format!("`{}` produces a value", op.name())),
-            }),
-            ExprKind::DeviceOp { op, args, .. } => Some(match op {
-                DeviceOp::UartWrite => {
-                    format!("(.uartWrite {})", lower_expr(ctx, &args[0])?)
-                }
-                DeviceOp::UartStatus => {
-                    return Err("`uart_status` produces a value".into());
-                }
-            }),
+                Some(match op {
+                    DeviceOp::UartWrite => {
+                        format!("(.uartWrite {})", lower_expr(ctx, &args[0])?)
+                    }
+                    DeviceOp::UartStatus => {
+                        return Err("`uart_status` produces a value".into());
+                    }
+                })
+            }
             ExprKind::Call { .. } => Some(lower_call(ctx, &None, e)?),
-            ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args)?,
+            ExprKind::ResOp { op, args, .. } => {
+                semantic_expr_ty(
+                    ctx,
+                    e,
+                    e.ty.unwrap_or(Ty::Unit),
+                    "sealed resource expression statement",
+                )?;
+                lower_resource_op_stmt(ctx, *op, args)?
+            }
             _ => {
                 return Err("expression statements are outside the SVM core subset".into());
             }
@@ -1282,10 +1693,10 @@ fn lower_resource_op_stmt(
     args: &[Expr],
 ) -> Result<Option<String>, String> {
     match op {
-        ResOp::TestUart => Ok(Some(format!(
-            "(.testUartProfile {})",
+        ResOp::TestUart => Ok(Some(format!("(.testUartProfile {})", {
+            validate_sealed_resource_operands(ctx, op, args)?;
             lower_expr(ctx, &args[0])?
-        ))),
+        }))),
         ResOp::TestWorld
         | ResOp::OpenFileOf
         | ResOp::ResourceMapEmpty
@@ -1295,10 +1706,499 @@ fn lower_resource_op_stmt(
             op.name()
         )),
         _ => {
-            ensure_erased_resource_operands_inert(op, args)?;
+            ensure_erased_resource_operands_inert(ctx, op, args)?;
             Ok(None)
         }
     }
+}
+
+fn resolved_resource_place_ty(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    operation: &str,
+) -> Result<Ty, String> {
+    let actual = match &expr.kind {
+        ExprKind::Var(name) => {
+            let binding = ctx.initialized_local(name, operation)?;
+            if !binding.ty.is_resource() {
+                return Err(format!(
+                    "svm.resource_operand_type: {operation} names `{name}` of non-resource type `{}`",
+                    binding.ty.name()
+                ));
+            }
+            binding.ty
+        }
+        ExprKind::Borrow {
+            array,
+            field: None,
+            mutable,
+        } => {
+            let binding = ctx.initialized_local(array, operation)?;
+            let requested = if *mutable {
+                Mutability::Mut
+            } else {
+                Mutability::Shared
+            };
+            let kind = match binding.ty {
+                Ty::Res(kind) => {
+                    if *mutable && !binding.mutable {
+                        return Err(format!(
+                            "svm.resource_operand_type: {operation} mutably borrows immutable resource local `{array}`"
+                        ));
+                    }
+                    kind
+                }
+                Ty::ResRef(kind, source_mutability) => {
+                    if *mutable && source_mutability != Mutability::Mut {
+                        return Err(format!(
+                            "svm.resource_operand_type: {operation} mutably reborrows shared resource local `{array}`"
+                        ));
+                    }
+                    kind
+                }
+                actual => {
+                    return Err(format!(
+                        "svm.resource_operand_type: {operation} borrows `{array}` of non-resource type `{}`",
+                        actual.name()
+                    ));
+                }
+            };
+            Ty::ResRef(kind, requested)
+        }
+        ExprKind::Borrow { field: Some(_), .. } | ExprKind::SelfField { .. } => {
+            return Err(format!(
+                "svm.resource_operand_place: {operation} uses a resource field; class members are outside the SVM local environment"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "svm.resource_operand_place: {operation} requires a local resource variable or local resource borrow"
+            ));
+        }
+    };
+    if let Some(annotation) = expr.ty {
+        if annotation != actual {
+            return Err(format!(
+                "svm.resource_operand_type: {operation} is semantically `{}` but annotated `{}`",
+                actual.name(),
+                annotation.name()
+            ));
+        }
+    }
+    Ok(actual)
+}
+
+fn sealed_resource_operand_types(
+    ctx: &LowerCtx<'_>,
+    op: ResOp,
+    args: &[Expr],
+) -> Result<Vec<Ty>, String> {
+    let arity = match op {
+        ResOp::AllocatorStepHeader | ResOp::ResourceMapPut => 3,
+        ResOp::SplitOff
+        | ResOp::Join
+        | ResOp::OpenFileOf
+        | ResOp::AllocatorTake
+        | ResOp::AllocatorPut
+        | ResOp::AllocatorTakeFree
+        | ResOp::AllocatorPutFree
+        | ResOp::AllocatorTakeHeader
+        | ResOp::AllocatorPutHeader
+        | ResOp::FreeBlockSplit
+        | ResOp::FreeBlockJoin
+        | ResOp::ResourceMapTake => 2,
+        ResOp::TestWorld
+        | ResOp::TestUart
+        | ResOp::AllocatorCreate
+        | ResOp::AllocatorDestroy
+        | ResOp::FreeBlockLease
+        | ResOp::BlockLeaseFree => 1,
+        ResOp::ResourceMapEmpty => 0,
+    };
+    if args.len() != arity {
+        return Err(format!(
+            "svm.resource_operand_arity: `{}` expects {arity} operands, found {}",
+            op.name(),
+            args.len()
+        ));
+    }
+
+    let mutable_ref = |kind| Ty::ResRef(kind, Mutability::Mut);
+    let owned = Ty::Res;
+    let u64_ty = Ty::Int(IntTy::U64);
+    let result = match op {
+        ResOp::SplitOff => vec![mutable_ref(ResKind::RawSpan), u64_ty],
+        ResOp::Join => vec![owned(ResKind::RawSpan), owned(ResKind::RawSpan)],
+        ResOp::OpenFileOf => vec![mutable_ref(ResKind::PosixWorld), Ty::Int(IntTy::I32)],
+        ResOp::TestWorld | ResOp::TestUart => vec![u64_ty],
+        ResOp::AllocatorCreate => vec![owned(ResKind::RawSpan)],
+        ResOp::AllocatorDestroy => vec![owned(ResKind::AllocatorState)],
+        ResOp::AllocatorTake | ResOp::AllocatorTakeFree | ResOp::AllocatorTakeHeader => {
+            vec![mutable_ref(ResKind::AllocatorState), u64_ty]
+        }
+        ResOp::AllocatorStepHeader => {
+            vec![mutable_ref(ResKind::AllocatorState), u64_ty, u64_ty]
+        }
+        ResOp::AllocatorPut => vec![
+            mutable_ref(ResKind::AllocatorState),
+            owned(ResKind::BlockLease),
+        ],
+        ResOp::AllocatorPutFree => vec![
+            mutable_ref(ResKind::AllocatorState),
+            owned(ResKind::FreeBlock),
+        ],
+        ResOp::AllocatorPutHeader => vec![
+            mutable_ref(ResKind::AllocatorState),
+            owned(ResKind::FreeHeader),
+        ],
+        ResOp::FreeBlockSplit => vec![mutable_ref(ResKind::FreeBlock), u64_ty],
+        ResOp::FreeBlockJoin => vec![owned(ResKind::FreeBlock), owned(ResKind::FreeBlock)],
+        ResOp::FreeBlockLease => vec![owned(ResKind::FreeBlock)],
+        ResOp::BlockLeaseFree => vec![owned(ResKind::BlockLease)],
+        ResOp::ResourceMapEmpty => Vec::new(),
+        ResOp::ResourceMapTake | ResOp::ResourceMapPut => {
+            let map_ty =
+                resolved_resource_place_ty(ctx, &args[0], &format!("`{}` operand 1", op.name()))?;
+            let Ty::ResRef(
+                map_kind
+                @ (ResKind::ResourceMapPointsToU64 | ResKind::ResourceMapPointsToRecord(_)),
+                Mutability::Mut,
+            ) = map_ty
+            else {
+                return Err(format!(
+                    "svm.resource_operand_type: `{}` operand 1 must be a mutable supported resource-map borrow",
+                    op.name()
+                ));
+            };
+            if op == ResOp::ResourceMapTake {
+                vec![map_ty, u64_ty]
+            } else {
+                let cell = match map_kind {
+                    ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
+                    ResKind::ResourceMapPointsToRecord(record) => ResKind::PointsToRecord(record),
+                    _ => unreachable!(),
+                };
+                vec![map_ty, u64_ty, owned(cell)]
+            }
+        }
+    };
+    Ok(result)
+}
+
+fn validate_sealed_resource_operands(
+    ctx: &LowerCtx<'_>,
+    op: ResOp,
+    args: &[Expr],
+) -> Result<(), String> {
+    let expected = sealed_resource_operand_types(ctx, op, args)?;
+    for (index, (arg, expected)) in args.iter().zip(expected).enumerate() {
+        let context = format!("`{}` operand {}", op.name(), index + 1);
+        if expected.is_resource() {
+            let actual = resolved_resource_place_ty(ctx, arg, &context)?;
+            if actual != expected {
+                return Err(format!(
+                    "svm.resource_operand_type: {context} supplies `{}`; expected `{}`",
+                    actual.name(),
+                    expected.name()
+                ));
+            }
+        } else {
+            validate_sink_type(ctx, expected, arg, &context)?;
+        }
+    }
+    Ok(())
+}
+
+fn semantic_res_op_ty(
+    ctx: &LowerCtx<'_>,
+    op: ResOp,
+    args: &[Expr],
+    expected: Ty,
+) -> Result<Ty, String> {
+    validate_sealed_resource_operands(ctx, op, args)?;
+    Ok(match op {
+        ResOp::SplitOff | ResOp::Join | ResOp::AllocatorDestroy => Ty::Res(ResKind::RawSpan),
+        ResOp::OpenFileOf => Ty::Res(ResKind::OpenFile),
+        ResOp::TestWorld => Ty::Res(ResKind::PosixWorld),
+        ResOp::TestUart => Ty::Res(ResKind::Uart),
+        ResOp::AllocatorCreate => Ty::Res(ResKind::AllocatorState),
+        ResOp::AllocatorTake | ResOp::FreeBlockLease => Ty::Res(ResKind::BlockLease),
+        ResOp::AllocatorPut | ResOp::AllocatorPutFree | ResOp::AllocatorPutHeader => Ty::Unit,
+        ResOp::AllocatorTakeFree | ResOp::FreeBlockSplit | ResOp::FreeBlockJoin => {
+            Ty::Res(ResKind::FreeBlock)
+        }
+        ResOp::AllocatorTakeHeader | ResOp::AllocatorStepHeader => Ty::Res(ResKind::FreeHeader),
+        ResOp::BlockLeaseFree => Ty::Res(ResKind::FreeBlock),
+        ResOp::ResourceMapEmpty => match expected {
+            Ty::Res(kind @ ResKind::ResourceMapPointsToU64)
+            | Ty::Res(kind @ ResKind::ResourceMapPointsToRecord(_)) => Ty::Res(kind),
+            _ => Ty::Res(ResKind::ResourceMapPointsToU64),
+        },
+        ResOp::ResourceMapTake => {
+            let map = resolved_resource_place_ty(ctx, &args[0], "resource_map_take operand 1")?;
+            match map {
+                Ty::ResRef(ResKind::ResourceMapPointsToU64, Mutability::Mut) => {
+                    Ty::Res(ResKind::PointsToU64)
+                }
+                Ty::ResRef(ResKind::ResourceMapPointsToRecord(record), Mutability::Mut) => {
+                    Ty::Res(ResKind::PointsToRecord(record))
+                }
+                _ => unreachable!("sealed resource operand validation checked map kind"),
+            }
+        }
+        ResOp::ResourceMapPut => Ty::Unit,
+    })
+}
+
+fn validate_typed_operand(
+    ctx: &LowerCtx<'_>,
+    value: &Expr,
+    expected: Ty,
+    context: &str,
+) -> Result<(), String> {
+    if expected.is_resource() {
+        let actual = resolved_resource_place_ty(ctx, value, context)?;
+        if actual != expected {
+            return Err(format!(
+                "svm.resource_operand_type: {context} supplies `{}`; expected `{}`",
+                actual.name(),
+                expected.name()
+            ));
+        }
+        Ok(())
+    } else {
+        validate_sink_type(ctx, expected, value, context)
+    }
+}
+
+fn raw_op_signature(ctx: &LowerCtx<'_>, op: RawOp, args: &[Expr]) -> Result<(Vec<Ty>, Ty), String> {
+    if args.len() != op.arity() {
+        return Err(format!(
+            "svm.raw_operand_arity: `{}` expects {} operands, found {}",
+            op.name(),
+            op.arity(),
+            args.len()
+        ));
+    }
+    let raw = Ty::Raw(IntTy::U8);
+    let u8_ty = Ty::Int(IntTy::U8);
+    let u64_ty = Ty::Int(IntTy::U64);
+    let shared = |kind| Ty::ResRef(kind, Mutability::Shared);
+    let mutable = |kind| Ty::ResRef(kind, Mutability::Mut);
+    let owned = Ty::Res;
+    let resource_kind = |index: usize| -> Option<ResKind> {
+        resolved_resource_place_ty(
+            ctx,
+            &args[index],
+            &format!("`{}` operand {}", op.name(), index + 1),
+        )
+        .ok()
+        .and_then(|ty| match ty {
+            Ty::Res(kind) | Ty::ResRef(kind, _) => Some(kind),
+            _ => None,
+        })
+    };
+    let leased = match op {
+        RawOp::IntoCellU64 | RawOp::FromCellU64 => resource_kind(1),
+        RawOp::CellInitU64 => resource_kind(2),
+        RawOp::CellReadU64 | RawOp::CellTakeU64 | RawOp::CellDropU64 => resource_kind(1),
+        _ => None,
+    }
+    .is_some_and(|kind| matches!(kind, ResKind::BlockLease | ResKind::LeasedPointsToU64));
+
+    let signature = match op {
+        RawOp::Offset => (vec![raw, u64_ty], raw),
+        RawOp::Load8 => (vec![raw, shared(ResKind::RawSpan)], u8_ty),
+        RawOp::Store8 => (vec![raw, u8_ty, mutable(ResKind::RawSpan)], Ty::Unit),
+        RawOp::Copy => (
+            vec![
+                raw,
+                raw,
+                u64_ty,
+                shared(ResKind::RawSpan),
+                mutable(ResKind::RawSpan),
+            ],
+            Ty::Unit,
+        ),
+        RawOp::IntoCellU64 => (
+            vec![
+                raw,
+                owned(if leased {
+                    ResKind::BlockLease
+                } else {
+                    ResKind::RawSpan
+                }),
+            ],
+            owned(if leased {
+                ResKind::LeasedPointsToU64
+            } else {
+                ResKind::PointsToU64
+            }),
+        ),
+        RawOp::FromCellU64 => (
+            vec![
+                raw,
+                owned(if leased {
+                    ResKind::LeasedPointsToU64
+                } else {
+                    ResKind::PointsToU64
+                }),
+            ],
+            owned(if leased {
+                ResKind::BlockLease
+            } else {
+                ResKind::RawSpan
+            }),
+        ),
+        RawOp::CellInitU64 => (
+            vec![
+                raw,
+                u64_ty,
+                mutable(if leased {
+                    ResKind::LeasedPointsToU64
+                } else {
+                    ResKind::PointsToU64
+                }),
+            ],
+            Ty::Unit,
+        ),
+        RawOp::CellReadU64 => (
+            vec![
+                raw,
+                shared(if leased {
+                    ResKind::LeasedPointsToU64
+                } else {
+                    ResKind::PointsToU64
+                }),
+            ],
+            u64_ty,
+        ),
+        RawOp::CellTakeU64 => (
+            vec![
+                raw,
+                mutable(if leased {
+                    ResKind::LeasedPointsToU64
+                } else {
+                    ResKind::PointsToU64
+                }),
+            ],
+            u64_ty,
+        ),
+        RawOp::CellDropU64 => (
+            vec![
+                raw,
+                mutable(if leased {
+                    ResKind::LeasedPointsToU64
+                } else {
+                    ResKind::PointsToU64
+                }),
+            ],
+            Ty::Unit,
+        ),
+        RawOp::IntoCellRecord(record) => (
+            vec![Ty::RawRecord(record), owned(ResKind::RawSpan)],
+            owned(ResKind::PointsToRecord(record)),
+        ),
+        RawOp::FromCellRecord(record) => (
+            vec![
+                Ty::RawRecord(record),
+                owned(ResKind::PointsToRecord(record)),
+            ],
+            owned(ResKind::RawSpan),
+        ),
+        RawOp::CellInitRecord(record) => (
+            vec![
+                Ty::RawRecord(record),
+                Ty::Record(record),
+                mutable(ResKind::PointsToRecord(record)),
+            ],
+            Ty::Unit,
+        ),
+        RawOp::CellReadRecord(record) => (
+            vec![
+                Ty::RawRecord(record),
+                shared(ResKind::PointsToRecord(record)),
+            ],
+            Ty::Record(record),
+        ),
+        RawOp::CellTakeRecord(record) => (
+            vec![
+                Ty::RawRecord(record),
+                mutable(ResKind::PointsToRecord(record)),
+            ],
+            Ty::Record(record),
+        ),
+        RawOp::CellDropRecord(record) => (
+            vec![
+                Ty::RawRecord(record),
+                mutable(ResKind::PointsToRecord(record)),
+            ],
+            Ty::Unit,
+        ),
+        RawOp::CastRecord(record) => (vec![raw], Ty::RawRecord(record)),
+        RawOp::PointerOffsetRecord(record) => (vec![Ty::RawRecord(record)], u64_ty),
+        RawOp::IntoFreeHeader => (
+            vec![raw, owned(ResKind::FreeBlock)],
+            owned(ResKind::FreeHeader),
+        ),
+        RawOp::FromFreeHeader => (
+            vec![raw, owned(ResKind::FreeHeader)],
+            owned(ResKind::FreeBlock),
+        ),
+        RawOp::HeaderInit => (
+            vec![raw, u64_ty, u64_ty, mutable(ResKind::FreeHeader)],
+            Ty::Unit,
+        ),
+        RawOp::HeaderSize | RawOp::HeaderNext => (vec![raw, shared(ResKind::FreeHeader)], u64_ty),
+        RawOp::HeaderClear => (vec![raw, mutable(ResKind::FreeHeader)], Ty::Unit),
+    };
+    Ok(signature)
+}
+
+fn validate_raw_op(ctx: &LowerCtx<'_>, op: RawOp, args: &[Expr]) -> Result<Ty, String> {
+    let (expected, result) = raw_op_signature(ctx, op, args)?;
+    for (index, (value, expected)) in args.iter().zip(expected).enumerate() {
+        validate_typed_operand(
+            ctx,
+            value,
+            expected,
+            &format!("`{}` operand {}", op.name(), index + 1),
+        )?;
+    }
+    Ok(result)
+}
+
+fn validate_device_op(ctx: &LowerCtx<'_>, op: DeviceOp, args: &[Expr]) -> Result<Ty, String> {
+    let (expected, result) = match op {
+        DeviceOp::UartStatus => (
+            vec![Ty::ResRef(ResKind::Uart, Mutability::Mut)],
+            Ty::Int(IntTy::U8),
+        ),
+        DeviceOp::UartWrite => (
+            vec![
+                Ty::Int(IntTy::U8),
+                Ty::ResRef(ResKind::Uart, Mutability::Mut),
+            ],
+            Ty::Unit,
+        ),
+    };
+    if args.len() != expected.len() {
+        return Err(format!(
+            "svm.device_operand_arity: `{}` expects {} operands, found {}",
+            op.name(),
+            expected.len(),
+            args.len()
+        ));
+    }
+    for (index, (value, expected)) in args.iter().zip(expected).enumerate() {
+        validate_typed_operand(
+            ctx,
+            value,
+            expected,
+            &format!("`{}` operand {}", op.name(), index + 1),
+        )?;
+    }
+    Ok(result)
 }
 
 /// An authority-only operation has no SVM statement, but source operands are
@@ -1307,20 +2207,34 @@ fn lower_resource_op_stmt(
 /// no trap. Anything richer must either gain an explicit discard/effect
 /// lowering or remain outside the differential subset; silently dropping it
 /// would make the harness compare a different program.
-fn ensure_erased_resource_operands_inert(op: ResOp, args: &[Expr]) -> Result<(), String> {
+fn ensure_erased_resource_operands_inert(
+    ctx: &LowerCtx<'_>,
+    op: ResOp,
+    args: &[Expr],
+) -> Result<(), String> {
+    let expected = sealed_resource_operand_types(ctx, op, args)?;
     for (index, arg) in args.iter().enumerate() {
+        let expected = expected[index];
         let inert = match &arg.kind {
             // Checked literals are in range and cannot trap.
             ExprKind::IntLit(_) | ExprKind::BoolLit(_) => true,
-            // Reading or borrowing an erased authority place performs no
-            // runtime access. Resource variables deliberately have no cached
-            // `Expr::ty`: the checker returns as soon as it validates their
-            // expected affine type. The sealed primitive's operand position is
-            // therefore the authority for erasedness when that annotation is
-            // absent; a present annotation must still agree. This positional
-            // guard also keeps an ordinary machine value from being discarded.
-            ExprKind::Var(_) | ExprKind::SelfField { .. } | ExprKind::Borrow { .. } => {
-                resource_operand_position(op, index) && arg.ty.map_or(true, Ty::is_resource)
+            // A scalar local read and a checked local resource place are both
+            // side-effect-free. Resource variables deliberately may lack a
+            // cached annotation, so resolve them through the active context.
+            ExprKind::Var(_) if expected.is_resource() => {
+                resolved_resource_place_ty(
+                    ctx,
+                    arg,
+                    &format!("`{}` operand {}", op.name(), index + 1),
+                )? == expected
+            }
+            ExprKind::Var(_) => true,
+            ExprKind::Borrow { .. } if expected.is_resource() => {
+                resolved_resource_place_ty(
+                    ctx,
+                    arg,
+                    &format!("`{}` operand {}", op.name(), index + 1),
+                )? == expected
             }
             // Calls, arithmetic (including division), raw/device operations,
             // and nested resource transformations may trap or mutate runtime
@@ -1336,34 +2250,7 @@ fn ensure_erased_resource_operands_inert(op: ResOp, args: &[Expr]) -> Result<(),
             ));
         }
     }
-    Ok(())
-}
-
-/// The resource-typed operands of each compiler-sealed primitive. Unlike an
-/// ordinary call, these positions cannot be changed by user declarations and
-/// exactly mirror the type rules in `check::infer_expr`.
-fn resource_operand_position(op: ResOp, index: usize) -> bool {
-    match op {
-        ResOp::Join
-        | ResOp::AllocatorPut
-        | ResOp::AllocatorPutFree
-        | ResOp::AllocatorPutHeader
-        | ResOp::FreeBlockJoin => index < 2,
-        ResOp::ResourceMapPut => index == 0 || index == 2,
-        ResOp::SplitOff
-        | ResOp::OpenFileOf
-        | ResOp::AllocatorCreate
-        | ResOp::AllocatorDestroy
-        | ResOp::AllocatorTake
-        | ResOp::AllocatorTakeFree
-        | ResOp::AllocatorTakeHeader
-        | ResOp::AllocatorStepHeader
-        | ResOp::FreeBlockSplit
-        | ResOp::FreeBlockLease
-        | ResOp::BlockLeaseFree
-        | ResOp::ResourceMapTake => index == 0,
-        ResOp::TestWorld | ResOp::TestUart | ResOp::ResourceMapEmpty => false,
-    }
+    validate_sealed_resource_operands(ctx, op, args)
 }
 
 /// Resource locals themselves are erased, but evaluating their initializer or
@@ -1391,8 +2278,15 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
         ExprKind::Call { .. } => lower_call(ctx, &Some(name.to_string()), e),
         ExprKind::DeviceOp {
             op: DeviceOp::UartStatus,
+            args,
             ..
-        } => Ok(format!("(.uartStatus \"{name}\")")),
+        } => {
+            let result = validate_device_op(ctx, DeviceOp::UartStatus, args)?;
+            if e.ty != Some(result) {
+                return Err("svm.device_result_type: forged `uart_status` result type".into());
+            }
+            Ok(format!("(.uartStatus \"{name}\")"))
+        }
         ExprKind::DeviceOp {
             op: DeviceOp::UartWrite,
             ..
@@ -1438,77 +2332,98 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
             op: RawOp::Load8,
             args,
             ..
-        } => Ok(format!(
-            "(.rawLoad8 \"{name}\" {})",
-            lower_expr(ctx, &args[0])?
-        )),
-        ExprKind::RawOp { op, args, .. } => match op {
-            // Resource destinations are erased; the role-changing machine
-            // instruction is nevertheless observable in the heap.
-            RawOp::IntoCellU64 => Ok(format!("(.rawIntoCellU64 {})", lower_expr(ctx, &args[0])?)),
-            RawOp::FromCellU64 => Ok(format!("(.rawFromCellU64 {})", lower_expr(ctx, &args[0])?)),
-            RawOp::IntoCellRecord(ri) => {
-                let decl = ctx.record(*ri)?;
-                Ok(format!(
-                    "(.rawIntoCellRecord {ri} {} {} {})",
-                    decl.layout.size,
-                    decl.layout.align,
-                    lower_expr(ctx, &args[0])?
-                ))
+        } => {
+            let result = validate_raw_op(ctx, RawOp::Load8, args)?;
+            if e.ty != Some(result) {
+                return Err("svm.raw_result_type: forged `raw_load8` result type".into());
             }
-            RawOp::FromCellRecord(ri) => {
-                // Resolve the index even though this instruction needs no
-                // geometry, so malformed checked ASTs still fail strictly.
-                ctx.record(*ri)?;
-                Ok(format!(
-                    "(.rawFromCellRecord {ri} {})",
-                    lower_expr(ctx, &args[0])?
-                ))
-            }
-            RawOp::IntoFreeHeader => {
-                let p = lower_expr(ctx, &args[0])?;
-                let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
-                Ok(format!("(.rawIntoCellU64 {p}), (.rawIntoCellU64 {next_p})"))
-            }
-            RawOp::FromFreeHeader => {
-                let p = lower_expr(ctx, &args[0])?;
-                let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
-                Ok(format!("(.rawFromCellU64 {p}), (.rawFromCellU64 {next_p})"))
-            }
-            RawOp::CellReadU64 => Ok(format!(
-                "(.rawCellReadU64 \"{name}\" {})",
+            Ok(format!(
+                "(.rawLoad8 \"{name}\" {})",
                 lower_expr(ctx, &args[0])?
-            )),
-            RawOp::CellTakeU64 => Ok(format!(
-                "(.rawCellTakeU64 \"{name}\" {})",
-                lower_expr(ctx, &args[0])?
-            )),
-            RawOp::CellReadRecord(ri) => {
-                ctx.record(*ri)?;
-                Ok(format!(
-                    "(.rawCellReadRecord {ri} \"{name}\" {})",
+            ))
+        }
+        ExprKind::RawOp { op, args, .. } => {
+            let result = validate_raw_op(ctx, *op, args)?;
+            if e.ty != Some(result) {
+                return Err(format!(
+                    "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
+                    op.name(),
+                    result.name(),
+                    e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                ));
+            }
+            match op {
+                // Resource destinations are erased; the role-changing machine
+                // instruction is nevertheless observable in the heap.
+                RawOp::IntoCellU64 => {
+                    Ok(format!("(.rawIntoCellU64 {})", lower_expr(ctx, &args[0])?))
+                }
+                RawOp::FromCellU64 => {
+                    Ok(format!("(.rawFromCellU64 {})", lower_expr(ctx, &args[0])?))
+                }
+                RawOp::IntoCellRecord(ri) => {
+                    let decl = ctx.record(*ri)?;
+                    Ok(format!(
+                        "(.rawIntoCellRecord {ri} {} {} {})",
+                        decl.layout.size,
+                        decl.layout.align,
+                        lower_expr(ctx, &args[0])?
+                    ))
+                }
+                RawOp::FromCellRecord(ri) => {
+                    // Resolve the index even though this instruction needs no
+                    // geometry, so malformed checked ASTs still fail strictly.
+                    ctx.record(*ri)?;
+                    Ok(format!(
+                        "(.rawFromCellRecord {ri} {})",
+                        lower_expr(ctx, &args[0])?
+                    ))
+                }
+                RawOp::IntoFreeHeader => {
+                    let p = lower_expr(ctx, &args[0])?;
+                    let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                    Ok(format!("(.rawIntoCellU64 {p}), (.rawIntoCellU64 {next_p})"))
+                }
+                RawOp::FromFreeHeader => {
+                    let p = lower_expr(ctx, &args[0])?;
+                    let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                    Ok(format!("(.rawFromCellU64 {p}), (.rawFromCellU64 {next_p})"))
+                }
+                RawOp::CellReadU64 => Ok(format!(
+                    "(.rawCellReadU64 \"{name}\" {})",
                     lower_expr(ctx, &args[0])?
-                ))
-            }
-            RawOp::CellTakeRecord(ri) => {
-                ctx.record(*ri)?;
-                Ok(format!(
-                    "(.rawCellTakeRecord {ri} \"{name}\" {})",
+                )),
+                RawOp::CellTakeU64 => Ok(format!(
+                    "(.rawCellTakeU64 \"{name}\" {})",
                     lower_expr(ctx, &args[0])?
-                ))
+                )),
+                RawOp::CellReadRecord(ri) => {
+                    ctx.record(*ri)?;
+                    Ok(format!(
+                        "(.rawCellReadRecord {ri} \"{name}\" {})",
+                        lower_expr(ctx, &args[0])?
+                    ))
+                }
+                RawOp::CellTakeRecord(ri) => {
+                    ctx.record(*ri)?;
+                    Ok(format!(
+                        "(.rawCellTakeRecord {ri} \"{name}\" {})",
+                        lower_expr(ctx, &args[0])?
+                    ))
+                }
+                RawOp::HeaderSize => Ok(format!(
+                    "(.rawCellReadU64 \"{name}\" {})",
+                    lower_expr(ctx, &args[0])?
+                )),
+                RawOp::HeaderNext => {
+                    let p = lower_expr(ctx, &args[0])?;
+                    Ok(format!(
+                        "(.rawCellReadU64 \"{name}\" (.ptrAdd {p} (.intLit .u64 8)))"
+                    ))
+                }
+                _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(ctx, e)?)),
             }
-            RawOp::HeaderSize => Ok(format!(
-                "(.rawCellReadU64 \"{name}\" {})",
-                lower_expr(ctx, &args[0])?
-            )),
-            RawOp::HeaderNext => {
-                let p = lower_expr(ctx, &args[0])?;
-                Ok(format!(
-                    "(.rawCellReadU64 \"{name}\" (.ptrAdd {p} (.intLit .u64 8)))"
-                ))
-            }
-            _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(ctx, e)?)),
-        },
+        }
         _ => Ok(format!("(.assign \"{name}\" {})", lower_expr(ctx, e)?)),
     }
 }
@@ -1536,8 +2451,20 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
             format!("(.intLit {} {})", lean_ty(expr_int_ty(e)?)?, int_lit(*n))
         }
         ExprKind::BoolLit(b) => format!("(.boolLit {b})"),
-        ExprKind::Var(x) => format!("(.var \"{x}\")"),
-        ExprKind::DeviceOp { op, .. } => {
+        ExprKind::Var(x) => {
+            validate_local_var(ctx, e, x, "variable expression")?;
+            format!("(.var \"{x}\")")
+        }
+        ExprKind::DeviceOp { op, args, .. } => {
+            let result = validate_device_op(ctx, *op, args)?;
+            if e.ty != Some(result) {
+                return Err(format!(
+                    "svm.device_result_type: `{}` produces `{}` but is annotated `{}`",
+                    op.name(),
+                    result.name(),
+                    e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                ));
+            }
             return Err(format!(
                 "`{}` is a statement in the profile machine, not an expression",
                 op.name()
@@ -1554,6 +2481,15 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
             ));
         }
         ExprKind::RawOp { op, args, .. } => {
+            let result = validate_raw_op(ctx, *op, args)?;
+            if e.ty != Some(result) {
+                return Err(format!(
+                    "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
+                    op.name(),
+                    result.name(),
+                    e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                ));
+            }
             let lowered: Result<Vec<String>, String> =
                 args.iter().map(|arg| lower_expr(ctx, arg)).collect();
             let lowered = lowered?;
@@ -1941,8 +2877,10 @@ mod tests {
     #[test]
     fn lowering_supports_boolean_option_construction_and_accessors() {
         let program = empty_program();
-        let ctx = LowerCtx::bare(&program);
         let bool_option = Ty::Option(ValueTy::Bool);
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("choice", bool_option, false, true)
+            .unwrap();
 
         let some_false = expr(
             ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
@@ -1983,7 +2921,9 @@ mod tests {
     #[test]
     fn option_constructors_require_coherent_checked_annotations() {
         let program = empty_program();
-        let ctx = LowerCtx::bare(&program);
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("pointer", Ty::RawRecord(0), false, true)
+            .unwrap();
         let bool_option = Ty::Option(ValueTy::Bool);
 
         let wrong_payload = expr(
@@ -2064,9 +3004,14 @@ mod tests {
     #[test]
     fn option_accessors_require_coherent_checked_annotations() {
         let program = empty_program();
-        let ctx = LowerCtx::bare(&program);
         let bool_option = Ty::Option(ValueTy::Bool);
         let int_option = Ty::Option(ValueTy::Int(IntTy::I32));
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("choice", bool_option, false, true)
+            .unwrap();
+        ctx.insert_local("number", int_option, false, true).unwrap();
+        ctx.insert_local("pointer", Ty::OptionRaw(0), false, true)
+            .unwrap();
         let bool_operand = || expr(ExprKind::Var("choice".into()), bool_option);
         let int_operand = || expr(ExprKind::Var("number".into()), int_option);
 
@@ -2303,7 +3248,10 @@ mod tests {
             consumes: false,
         });
         resource_program.fns.push(consume);
-        let resource_ctx = LowerCtx::bare(&resource_program);
+        let mut resource_ctx = LowerCtx::bare(&resource_program);
+        resource_ctx
+            .insert_local("uart", Ty::Res(ResKind::Uart), false, true)
+            .unwrap();
         let erased_resource_call = Expr {
             kind: ExprKind::Call {
                 callee: "consume".into(),
@@ -2485,7 +3433,14 @@ mod tests {
                     ty: Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
                     name: "values".into(),
                     name_span: Span::new(0, 0),
-                    init: None,
+                    init: Some(expr(
+                        ExprKind::AllocArray {
+                            elem: ValueTy::Int(IntTy::U8),
+                            len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                            init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+                        },
+                        Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+                    )),
                     mutable: false,
                 },
                 Stmt::Decl {
@@ -2598,17 +3553,8 @@ mod tests {
     fn named_array_operations_resolve_their_checked_local_type() {
         let program = empty_program();
         let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
-        let function = checked_fn(
-            Ty::Unit,
-            vec![Stmt::Decl {
-                ty: array_ty,
-                name: "bytes".into(),
-                name_span: Span::new(0, 0),
-                init: None,
-                mutable: true,
-            }],
-        );
-        let ctx = LowerCtx::for_function(&program, &function).unwrap();
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("bytes", array_ty, true, true).unwrap();
         let index_operand = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64));
         let index = |array: &str, operand: Expr, ty: Option<Ty>| Expr {
             kind: ExprKind::Index {
@@ -2642,7 +3588,7 @@ mod tests {
             ),
             (
                 index("missing", index_operand(), Some(Ty::Int(IntTy::U8))),
-                "svm.array_place_type:",
+                "svm.local_type:",
             ),
         ];
         for (value, diagnostic) in &malformed_indices {
@@ -2721,9 +3667,10 @@ mod tests {
             ],
         );
         lower_fn(&program, &valid_function).expect("existing integer-array lowering remains valid");
-        let ctx = LowerCtx::for_function(&program, &valid_function).unwrap();
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("bytes", array_ty, true, true).unwrap();
         assert_eq!(
-            lower_stmt_erasing(&ctx, &valid_store, &[]).unwrap(),
+            lower_stmt_erasing(&mut ctx, &valid_store).unwrap(),
             Some("(.store \"bytes\" (.intLit .u64 0) (.intLit .u8 9))".into())
         );
 
@@ -2739,10 +3686,13 @@ mod tests {
             (&bad_index, "svm.array_store_index_type:"),
             (&bad_value, "svm.array_store_value_type:"),
         ] {
-            let preflight = validate_stmt_payloads(&ctx, std::slice::from_ref(statement))
-                .expect_err("malformed store must fail SVM preflight");
+            let mut preflight_ctx = ctx.clone();
+            let preflight =
+                validate_stmt_payloads(&mut preflight_ctx, std::slice::from_ref(statement))
+                    .expect_err("malformed store must fail SVM preflight");
             assert!(preflight.starts_with(diagnostic), "{preflight}");
-            let lowering = lower_stmt_erasing(&ctx, statement, &[])
+            let mut lowering_ctx = ctx.clone();
+            let lowering = lower_stmt_erasing(&mut lowering_ctx, statement)
                 .expect_err("direct store lowering must re-check operands");
             assert!(lowering.starts_with(diagnostic), "{lowering}");
         }
@@ -2766,7 +3716,7 @@ mod tests {
         );
         let error = lower_fn(&program, &mismatched_binding)
             .expect_err("array declaration and initializer must agree exactly");
-        assert!(error.starts_with("svm.array_binding_type:"), "{error}");
+        assert!(error.starts_with("svm.sink_type:"), "{error}");
 
         let array_return = |returned_ty: Ty| {
             checked_fn(
@@ -2791,11 +3741,540 @@ mod tests {
         let wrong_return = array_return(Ty::Array(ValueTy::Int(IntTy::I32), Mutability::Owned));
         let error = lower_fn(&program, &wrong_return)
             .expect_err("array result annotations must match the function return type");
-        assert!(error.starts_with("svm.array_return_type:"), "{error}");
+        assert!(error.starts_with("svm.local_type:"), "{error}");
+    }
+
+    #[test]
+    fn array_sinks_reject_forged_scalar_array_crossings() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let allocation = || {
+            expr(
+                ExprKind::AllocArray {
+                    elem: ValueTy::Int(IntTy::U8),
+                    len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                    init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+                },
+                array_ty,
+            )
+        };
+        let rejects = |function: &Fn| {
+            let preflight = lower_fn(&program, function)
+                .expect_err("a forged scalar/array sink must fail preflight");
+            assert!(preflight.starts_with("svm.sink_type:"), "{preflight}");
+            let mut ctx = LowerCtx::for_function(&program, function).unwrap();
+            let direct = lower_block(&mut ctx, &function.body)
+                .expect_err("direct lowering must re-check scalar/array sinks");
+            assert!(direct.starts_with("svm.sink_type:"), "{direct}");
+        };
+
+        rejects(&checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: Ty::Int(IntTy::I32),
+                name: "scalar".into(),
+                name_span: Span::new(0, 0),
+                init: Some(allocation()),
+                mutable: false,
+            }],
+        ));
+        rejects(&checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: Ty::Int(IntTy::I32),
+                    name: "scalar".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
+                    mutable: true,
+                },
+                Stmt::Assign {
+                    name: "scalar".into(),
+                    name_span: Span::new(0, 0),
+                    value: allocation(),
+                },
+            ],
+        ));
+        rejects(&checked_fn(
+            Ty::Int(IntTy::I32),
+            vec![Stmt::Return {
+                value: Some(allocation()),
+                span: Span::new(0, 0),
+            }],
+        ));
+        let forged_array_var = checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: array_ty,
+                    name: "bytes".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(allocation()),
+                    mutable: false,
+                },
+                Stmt::Decl {
+                    ty: Ty::Int(IntTy::I32),
+                    name: "scalar".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(ExprKind::Var("bytes".into()), Ty::Int(IntTy::I32))),
+                    mutable: false,
+                },
+            ],
+        );
+        let preflight = lower_fn(&program, &forged_array_var)
+            .expect_err("a forged array variable annotation must fail preflight");
+        assert!(preflight.starts_with("svm.local_type:"), "{preflight}");
+        let mut ctx = LowerCtx::for_function(&program, &forged_array_var).unwrap();
+        let direct = lower_block(&mut ctx, &forged_array_var.body)
+            .expect_err("direct lowering must resolve the variable annotation");
+        assert!(direct.starts_with("svm.sink_type:"), "{direct}");
+    }
+
+    #[test]
+    fn array_places_follow_source_order_and_scopes() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let allocation = || {
+            expr(
+                ExprKind::AllocArray {
+                    elem: ValueTy::Int(IntTy::U8),
+                    len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                    init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+                },
+                array_ty,
+            )
+        };
+        let length_decl = |name: &str, array: &str| Stmt::Decl {
+            ty: Ty::Int(IntTy::U64),
+            name: name.into(),
+            name_span: Span::new(0, 0),
+            init: Some(expr(
+                ExprKind::Len {
+                    array: array.into(),
+                },
+                Ty::Int(IntTy::U64),
+            )),
+            mutable: false,
+        };
+        let array_decl = |name: &str| Stmt::Decl {
+            ty: array_ty,
+            name: name.into(),
+            name_span: Span::new(0, 0),
+            init: Some(allocation()),
+            mutable: false,
+        };
+        let rejects = |function: &Fn| {
+            let preflight = lower_fn(&program, function)
+                .expect_err("a future or out-of-scope array place must be rejected");
+            assert!(preflight.starts_with("svm.local_type:"), "{preflight}");
+            let mut ctx = LowerCtx::for_function(&program, function).unwrap();
+            let direct = lower_block(&mut ctx, &function.body)
+                .expect_err("direct lowering must preserve array place scope");
+            assert!(direct.starts_with("svm.local_type:"), "{direct}");
+        };
+
+        rejects(&checked_fn(
+            Ty::Unit,
+            vec![length_decl("n", "later"), array_decl("later")],
+        ));
+        rejects(&checked_fn(
+            Ty::Unit,
+            vec![Stmt::If {
+                cond: expr(ExprKind::BoolLit(true), Ty::Bool),
+                then_block: vec![array_decl("branch_bytes")],
+                else_block: Some(vec![length_decl("n", "branch_bytes")]),
+            }],
+        ));
+        rejects(&checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::If {
+                    cond: expr(ExprKind::BoolLit(true), Ty::Bool),
+                    then_block: vec![array_decl("branch_bytes")],
+                    else_block: None,
+                },
+                length_decl("n", "branch_bytes"),
+            ],
+        ));
+        rejects(&checked_fn(
+            Ty::Unit,
+            vec![
+                array_decl("outer"),
+                Stmt::Expose {
+                    kw_span: Span::new(0, 0),
+                    array: "outer".into(),
+                    array_span: Span::new(0, 0),
+                    mutable: false,
+                    ptr: "ptr".into(),
+                    ptr_span: Span::new(0, 0),
+                    res: "mem".into(),
+                    res_span: Span::new(0, 0),
+                    body: vec![array_decl("loan_local")],
+                },
+                length_decl("n", "loan_local"),
+            ],
+        ));
+    }
+
+    #[test]
+    fn local_names_remain_reserved_across_sibling_scopes() {
+        let program = empty_program();
+        let scalar = |name: &str| Stmt::Decl {
+            ty: Ty::Int(IntTy::I32),
+            name: name.into(),
+            name_span: Span::new(0, 0),
+            init: Some(expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
+            mutable: false,
+        };
+        let function = checked_fn(
+            Ty::Unit,
+            vec![Stmt::If {
+                cond: expr(ExprKind::BoolLit(true), Ty::Bool),
+                then_block: vec![scalar("duplicate")],
+                else_block: Some(vec![scalar("duplicate")]),
+            }],
+        );
+
+        let error = lower_fn(&program, &function)
+            .expect_err("function-wide unique names include sibling scopes");
+        assert!(error.starts_with("svm.local_type: duplicate"), "{error}");
+        let mut ctx = LowerCtx::for_function(&program, &function).unwrap();
+        let direct = lower_block(&mut ctx, &function.body)
+            .expect_err("direct lowering must reserve sibling-scope names");
+        assert!(direct.starts_with("svm.local_type: duplicate"), "{direct}");
+    }
+
+    #[test]
+    fn unsafe_array_local_remains_in_the_enclosing_scope() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Int(IntTy::U8),
+                len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+            },
+            array_ty,
+        );
+        let function = checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Unsafe {
+                    kw_span: Span::new(0, 0),
+                    body: vec![Stmt::Decl {
+                        ty: array_ty,
+                        name: "bytes".into(),
+                        name_span: Span::new(0, 0),
+                        init: Some(allocation),
+                        mutable: false,
+                    }],
+                },
+                Stmt::Decl {
+                    ty: Ty::Int(IntTy::U64),
+                    name: "n".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(
+                        ExprKind::Len {
+                            array: "bytes".into(),
+                        },
+                        Ty::Int(IntTy::U64),
+                    )),
+                    mutable: false,
+                },
+            ],
+        );
+
+        lower_fn(&program, &function)
+            .expect("unsafe is a marker, so its valid array local remains active afterward");
+    }
+
+    #[test]
+    fn branch_and_exposure_flow_preserve_definite_initialization() {
+        let program = empty_program();
+        let scalar_decl = || Stmt::Decl {
+            ty: Ty::Int(IntTy::I32),
+            name: "value".into(),
+            name_span: Span::new(0, 0),
+            init: None,
+            mutable: true,
+        };
+        let assign = |value| Stmt::Assign {
+            name: "value".into(),
+            name_span: Span::new(0, 0),
+            value: expr(ExprKind::IntLit(value), Ty::Int(IntTy::I32)),
+        };
+        let return_value = || Stmt::Return {
+            value: Some(expr(ExprKind::Var("value".into()), Ty::Int(IntTy::I32))),
+            span: Span::new(0, 0),
+        };
+        let branch = |else_block| Stmt::If {
+            cond: expr(ExprKind::BoolLit(true), Ty::Bool),
+            then_block: vec![assign(1)],
+            else_block,
+        };
+
+        lower_fn(
+            &program,
+            &checked_fn(
+                Ty::Int(IntTy::I32),
+                vec![scalar_decl(), branch(Some(vec![assign(2)])), return_value()],
+            ),
+        )
+        .expect("both fallthrough arms initialize the outer scalar");
+
+        lower_fn(
+            &program,
+            &checked_fn(
+                Ty::Int(IntTy::I32),
+                vec![
+                    scalar_decl(),
+                    Stmt::If {
+                        cond: expr(ExprKind::BoolLit(true), Ty::Bool),
+                        then_block: vec![Stmt::Return {
+                            value: Some(expr(ExprKind::IntLit(7), Ty::Int(IntTy::I32))),
+                            span: Span::new(0, 0),
+                        }],
+                        else_block: Some(vec![assign(2)]),
+                    },
+                    return_value(),
+                ],
+            ),
+        )
+        .expect("only the arm reaching the merge must initialize the scalar");
+
+        let one_arm = checked_fn(
+            Ty::Int(IntTy::I32),
+            vec![scalar_decl(), branch(None), return_value()],
+        );
+        assert!(
+            lower_fn(&program, &one_arm)
+                .expect_err("an implicit fallthrough arm preserves uninitialized state")
+                .contains("uninitialized")
+        );
+
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Int(IntTy::U8),
+                len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+            },
+            array_ty,
+        );
+        let expose = Stmt::Expose {
+            kw_span: Span::new(0, 0),
+            array: "bytes".into(),
+            array_span: Span::new(0, 0),
+            mutable: false,
+            ptr: "ptr".into(),
+            ptr_span: Span::new(0, 0),
+            res: "mem".into(),
+            res_span: Span::new(0, 0),
+            body: vec![assign(3)],
+        };
+        lower_fn(
+            &program,
+            &checked_fn(
+                Ty::Int(IntTy::I32),
+                vec![
+                    scalar_decl(),
+                    Stmt::Decl {
+                        ty: array_ty,
+                        name: "bytes".into(),
+                        name_span: Span::new(0, 0),
+                        init: Some(allocation),
+                        mutable: false,
+                    },
+                    expose,
+                    return_value(),
+                ],
+            ),
+        )
+        .expect("an exposure body executes exactly once and initializes outer locals");
+    }
+
+    #[test]
+    fn exposure_rejects_nested_return_before_generated_cleanup() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let function = checked_fn(
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::Decl {
+                    ty: array_ty,
+                    name: "bytes".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(
+                        ExprKind::AllocArray {
+                            elem: ValueTy::Int(IntTy::U8),
+                            len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                            init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+                        },
+                        array_ty,
+                    )),
+                    mutable: false,
+                },
+                Stmt::Expose {
+                    kw_span: Span::new(0, 0),
+                    array: "bytes".into(),
+                    array_span: Span::new(0, 0),
+                    mutable: false,
+                    ptr: "ptr".into(),
+                    ptr_span: Span::new(0, 0),
+                    res: "mem".into(),
+                    res_span: Span::new(0, 0),
+                    body: vec![Stmt::Unsafe {
+                        kw_span: Span::new(0, 0),
+                        body: vec![Stmt::Return {
+                            value: Some(expr(ExprKind::IntLit(1), Ty::Int(IntTy::I32))),
+                            span: Span::new(0, 0),
+                        }],
+                    }],
+                },
+            ],
+        );
+        assert!(
+            lower_fn(&program, &function)
+                .expect_err("return cannot bypass exposure copyback/free")
+                .starts_with("svm.expose_return:")
+        );
+    }
+
+    #[test]
+    fn nested_scalar_vars_follow_source_order() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let function = checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: array_ty,
+                    name: "bytes".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(
+                        ExprKind::AllocArray {
+                            elem: ValueTy::Int(IntTy::U8),
+                            len: Box::new(expr(ExprKind::Var("later".into()), Ty::Int(IntTy::U64))),
+                            init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
+                        },
+                        array_ty,
+                    )),
+                    mutable: false,
+                },
+                Stmt::Decl {
+                    ty: Ty::Int(IntTy::U64),
+                    name: "later".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+                    mutable: false,
+                },
+            ],
+        );
+        for error in [
+            lower_fn(&program, &function).unwrap_err(),
+            lower_block(
+                &mut LowerCtx::for_function(&program, &function).unwrap(),
+                &function.body,
+            )
+            .unwrap_err(),
+        ] {
+            assert!(error.starts_with("svm.local_type:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn sealed_operation_arity_scope_and_result_types_fail_closed() {
+        let program = empty_program();
+        let empty_raw = expr(
+            ExprKind::RawOp {
+                op: RawOp::Store8,
+                op_span: Span::new(0, 0),
+                args: Vec::new(),
+            },
+            Ty::Unit,
+        );
+        let empty_device = expr(
+            ExprKind::DeviceOp {
+                op: DeviceOp::UartWrite,
+                op_span: Span::new(0, 0),
+                args: Vec::new(),
+            },
+            Ty::Unit,
+        );
+        for malformed in [empty_raw, empty_device] {
+            let function = checked_fn(Ty::Unit, vec![Stmt::ExprStmt(malformed)]);
+            lower_fn(&program, &function).expect_err("empty sealed call must not panic");
+            lower_block(
+                &mut LowerCtx::for_function(&program, &function).unwrap(),
+                &function.body,
+            )
+            .expect_err("direct empty sealed call lowering must not panic");
+        }
+
+        let forged_profile = expr(
+            ExprKind::ResOp {
+                op: ResOp::TestUart,
+                op_span: Span::new(0, 0),
+                args: vec![expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64))],
+            },
+            Ty::Unit,
+        );
+        let function = checked_fn(Ty::Unit, vec![Stmt::ExprStmt(forged_profile)]);
+        for error in [
+            lower_fn(&program, &function).unwrap_err(),
+            lower_block(
+                &mut LowerCtx::for_function(&program, &function).unwrap(),
+                &function.body,
+            )
+            .unwrap_err(),
+        ] {
+            assert!(error.starts_with("svm.sink_type:"), "{error}");
+        }
+
+        let forged_release = checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::StaticAlloc {
+                    kw_span: Span::new(0, 0),
+                    size: expr(ExprKind::IntLit(8), Ty::Int(IntTy::U64)),
+                    ptr: "ptr".into(),
+                    ptr_span: Span::new(0, 0),
+                    res: "mem".into(),
+                    res_span: Span::new(0, 0),
+                },
+                Stmt::Decl {
+                    ty: Ty::Res(ResKind::SystemDealloc),
+                    name: "release".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(
+                        ExprKind::ResOp {
+                            op: ResOp::AllocatorCreate,
+                            op_span: Span::new(0, 0),
+                            args: vec![Expr {
+                                kind: ExprKind::Var("mem".into()),
+                                span: Span::new(0, 0),
+                                ty: None,
+                            }],
+                        },
+                        Ty::Res(ResKind::SystemDealloc),
+                    )),
+                    mutable: false,
+                },
+            ],
+        );
+        assert!(
+            lower_fn(&program, &forged_release)
+                .expect_err("allocator_create cannot forge release authority")
+                .starts_with("svm.sink_type:")
+        );
     }
 
     #[test]
     fn erased_resource_op_accepts_unannotated_resource_place() {
+        let program = empty_program();
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("mem", Ty::Res(ResKind::RawSpan), true, true)
+            .unwrap();
         let mem = Expr {
             kind: ExprKind::Var("mem".into()),
             span: Span::new(0, 0),
@@ -2803,7 +4282,7 @@ mod tests {
             // successfully checked operand intentionally has no cached type.
             ty: None,
         };
-        ensure_erased_resource_operands_inert(ResOp::AllocatorCreate, &[mem])
+        ensure_erased_resource_operands_inert(&ctx, ResOp::AllocatorCreate, &[mem])
             .expect("allocator_create(resource_place) is runtime-inert");
     }
 
@@ -2830,12 +4309,11 @@ mod tests {
         );
 
         let program = empty_program();
-        let error = lower_resource_op_stmt(
-            &LowerCtx::bare(&program),
-            ResOp::SplitOff,
-            &[span, division],
-        )
-        .expect_err("split_off(&mut mem, 1 / 0) must not disappear");
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("mem", Ty::Res(ResKind::RawSpan), true, true)
+            .unwrap();
+        let error = lower_resource_op_stmt(&ctx, ResOp::SplitOff, &[span, division])
+            .expect_err("split_off(&mut mem, 1 / 0) must not disappear");
         assert!(error.contains("`split_off` operand 2"), "{error}");
     }
 }
