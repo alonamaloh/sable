@@ -194,15 +194,32 @@ fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
 fn affine_option_unsupported(ty: Ty, context: &str) -> String {
     debug_assert!(matches!(ty, Ty::AffineOption(_)));
     format!(
-        "svm.affine_option_unsupported: {context} has type `{}`; affine options require atomic ownership semantics that are not yet modeled by the formal SVM",
+        "svm.affine_option_unsupported: {context} has type `{}`; the formal SVM admits only explicit mutable local `option<[bool]>` construction, named `.is_some`, and atomic `.take` into a fresh owned Boolean-array local",
         ty.name()
     )
 }
 
-fn affine_option_take_unsupported(option: &str) -> String {
+fn affine_option_take_position(option: &str) -> String {
     format!(
-        "svm.affine_option_unsupported: `.take` of affine option local `{option}` requires an atomic ownership transition that is not yet modeled by the formal SVM"
+        "svm.affine_option_take_position: `.take` of affine option local `{option}` must directly initialize an explicit owned Boolean-array local"
     )
+}
+
+fn affine_bool_option_ty() -> Ty {
+    Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+}
+
+fn is_affine_bool_option(ty: Ty) -> bool {
+    ty == affine_bool_option_ty()
+}
+
+fn reject_named_affine_option(ctx: &LowerCtx<'_>, name: &str, context: &str) -> Result<(), String> {
+    if let Some(binding) = ctx.local(name) {
+        if matches!(binding.ty, Ty::AffineOption(_)) {
+            return Err(affine_option_unsupported(binding.ty, context));
+        }
+    }
+    Ok(())
 }
 
 fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
@@ -260,6 +277,12 @@ fn resolve_array(
     operation: &str,
 ) -> Result<(ValueTy, Mutability, bool), String> {
     let binding = ctx.initialized_local(array, operation)?;
+    if matches!(binding.ty, Ty::AffineOption(_)) {
+        return Err(affine_option_unsupported(
+            binding.ty,
+            &format!("{operation} source `{array}`"),
+        ));
+    }
     let Ty::Array(payload, mutability) = binding.ty else {
         return Err(format!(
             "svm.array_place_type: {operation} names `{array}` of type `{}`; expected an array",
@@ -362,6 +385,115 @@ fn validate_array_literal(
     Ok(())
 }
 
+fn validate_affine_bool_option_initializer(
+    ctx: &LowerCtx<'_>,
+    initializer: &Expr,
+    local: &str,
+) -> Result<(), String> {
+    require_expr_annotation(
+        initializer,
+        affine_bool_option_ty(),
+        "svm.affine_option_initializer_type",
+        &format!("initializer of affine option `{local}`"),
+    )?;
+    match &initializer.kind {
+        ExprKind::NoneE => Ok(()),
+        ExprKind::SomeE(payload) => {
+            let ExprKind::AllocArray { elem, len, init } = &payload.kind else {
+                return Err(format!(
+                    "svm.affine_option_initializer: affine option local `{local}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
+                ));
+            };
+            if *elem != ValueTy::Bool {
+                return Err(format!(
+                    "svm.affine_option_payload: affine option local `{local}` wraps `{}`; only a freshly allocated Boolean array is supported",
+                    elem.name()
+                ));
+            }
+            validate_alloc_array(ctx, payload, *elem, len, init)?;
+            require_expr_annotation(
+                payload,
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                "svm.affine_option_payload_type",
+                &format!("payload of affine option `{local}`"),
+            )
+        }
+        _ => Err(format!(
+            "svm.affine_option_initializer: affine option local `{local}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
+        )),
+    }
+}
+
+fn validate_affine_bool_option_decl(
+    ctx: &LowerCtx<'_>,
+    local: &str,
+    ty: Ty,
+    mutable: bool,
+    initializer: Option<&Expr>,
+) -> Result<(), String> {
+    if !is_affine_bool_option(ty) {
+        return Err(affine_option_unsupported(
+            ty,
+            &format!("declaration `{local}`"),
+        ));
+    }
+    if !mutable {
+        return Err(format!(
+            "svm.affine_option_immutable: affine option local `{local}` must be mutable"
+        ));
+    }
+    let Some(initializer) = initializer else {
+        return Err(format!(
+            "svm.affine_option_initializer: affine option local `{local}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
+        ));
+    };
+    validate_affine_bool_option_initializer(ctx, initializer, local)
+}
+
+fn validate_affine_option_take(
+    ctx: &LowerCtx<'_>,
+    destination: &str,
+    initializer: &Expr,
+    option: &str,
+) -> Result<(), String> {
+    require_expr_annotation(
+        initializer,
+        Ty::Array(ValueTy::Bool, Mutability::Owned),
+        "svm.affine_option_take_result",
+        &format!("`.take` initializer of `{destination}`"),
+    )?;
+    if destination == option {
+        return Err(format!(
+            "svm.affine_option_take_alias: `.take` destination `{destination}` cannot also be its source"
+        ));
+    }
+    if ctx.local(destination).is_some() || ctx.declared.contains(destination) {
+        return Err(format!(
+            "svm.local_type: duplicate checked local `{destination}`; local types are ambiguous"
+        ));
+    }
+    let source = ctx.initialized_local(option, "affine-option take")?;
+    if !is_affine_bool_option(source.ty) {
+        return if matches!(source.ty, Ty::AffineOption(_)) {
+            Err(affine_option_unsupported(
+                source.ty,
+                &format!("`.take` source `{option}`"),
+            ))
+        } else {
+            Err(format!(
+                "svm.affine_option_take_source: `.take` source `{option}` has type `{}`; expected `option<[bool]>`",
+                source.ty.name()
+            ))
+        };
+    }
+    if !source.mutable {
+        return Err(format!(
+            "svm.affine_option_immutable: `.take` source `{option}` must be mutable"
+        ));
+    }
+    Ok(())
+}
+
 /// Boolean arrays have no call ABI or general first-class transport in G1.5.
 /// Their sole producer position is the initializer of a fresh owned local.
 /// Keep that positional rule separate from payload classification: the latter
@@ -390,7 +522,7 @@ fn validate_fresh_bool_array_initializer(
         }
         ExprKind::ArrayLit(elements) => validate_array_literal(ctx, initializer, elements)?,
         ExprKind::OptTake { option, .. } => {
-            return Err(affine_option_take_unsupported(option));
+            return validate_affine_option_take(ctx, local, initializer, option);
         }
         _ => {
             return Err(format!(
@@ -509,7 +641,7 @@ fn semantic_expr_ty(
         },
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::OptTake { option, .. } => {
-            return Err(affine_option_take_unsupported(option));
+            return Err(affine_option_take_position(option));
         }
         ExprKind::Unary { op, operand } => match op {
             UnOp::Not => {
@@ -613,6 +745,11 @@ fn semantic_expr_ty(
             let payload = match repr {
                 SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
                 SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
+                SvmOptionRepr::AffineBoolArray => {
+                    unreachable!(
+                        "general option constructor classification excludes affine options"
+                    )
+                }
             };
             validate_sink_type(ctx, payload, inner, &format!("{context} option payload"))?;
             expr.ty.expect("classified option result")
@@ -621,24 +758,16 @@ fn semantic_expr_ty(
             svm_option_repr(expr, "none")?;
             expr.ty.expect("classified option result")
         }
-        ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
-            let operand_ty = semantic_expr_ty(
-                ctx,
-                operand,
-                operand.ty.unwrap_or(Ty::Unit),
-                &format!("{context} option operand"),
-            )?;
-            match (&expr.kind, operand_ty) {
-                (ExprKind::IsSome { .. }, Ty::Option(_) | Ty::OptionRaw(_)) => Ty::Bool,
-                (ExprKind::OptValue { .. }, Ty::Option(payload)) => {
-                    ordinary_option_payload_ty(payload)?
-                }
-                (ExprKind::OptValue { .. }, Ty::OptionRaw(record)) => Ty::RawRecord(record),
-                _ => {
-                    return Err(format!(
-                        "svm.option_accessor_operand: {context} operand is `{}`; expected an option",
-                        operand_ty.name()
-                    ));
+        ExprKind::IsSome { operand } => {
+            validate_option_accessor(ctx, expr, operand, false)?;
+            Ty::Bool
+        }
+        ExprKind::OptValue { operand } => {
+            match validate_option_accessor(ctx, expr, operand, true)? {
+                SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+                SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
+                SvmOptionRepr::AffineBoolArray => {
+                    unreachable!("affine options have no copying `.value` accessor")
                 }
             }
         }
@@ -907,6 +1036,7 @@ fn validate_option_payload(payload: ValueTy, context: &str) -> Result<(), String
 enum SvmOptionRepr {
     Ordinary(ValueTy),
     RawRecord(usize),
+    AffineBoolArray,
 }
 
 /// Classify an option constructor from its checked outer annotation.  The
@@ -953,6 +1083,9 @@ fn validate_some_constructor(expr: &Expr, inner: &Expr) -> Result<SvmOptionRepr,
     let expected = match repr {
         SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
         SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
+        SvmOptionRepr::AffineBoolArray => {
+            unreachable!("general option constructor classification excludes affine options")
+        }
     };
     match inner.ty {
         Some(actual) if actual == expected => Ok(repr),
@@ -971,6 +1104,7 @@ fn validate_some_constructor(expr: &Expr, inner: &Expr) -> Result<SvmOptionRepr,
 }
 
 fn validate_option_accessor(
+    ctx: &LowerCtx<'_>,
     expr: &Expr,
     operand: &Expr,
     value: bool,
@@ -982,6 +1116,34 @@ fn validate_option_accessor(
             SvmOptionRepr::Ordinary(payload)
         }
         Some(Ty::OptionRaw(record)) => SvmOptionRepr::RawRecord(record),
+        Some(ty @ Ty::AffineOption(_)) if value => {
+            return Err(affine_option_unsupported(
+                ty,
+                "copying `.value` accessor operand",
+            ));
+        }
+        Some(ty @ Ty::AffineOption(_)) if is_affine_bool_option(ty) => {
+            let ExprKind::Var(name) = &operand.kind else {
+                return Err(
+                    "svm.affine_option_temporary: `.is_some` requires a named affine-option local"
+                        .into(),
+                );
+            };
+            let binding = ctx.initialized_local(name, "affine-option `.is_some`")?;
+            if binding.ty != ty {
+                return Err(format!(
+                    "svm.local_type: affine-option `.is_some` names `{name}` of type `{}` but its operand is annotated `{}`",
+                    binding.ty.name(),
+                    ty.name()
+                ));
+            }
+            if !binding.mutable {
+                return Err(format!(
+                    "svm.affine_option_immutable: affine option local `{name}` must be mutable"
+                ));
+            }
+            SvmOptionRepr::AffineBoolArray
+        }
         Some(ty @ Ty::AffineOption(_)) => {
             return Err(affine_option_unsupported(
                 ty,
@@ -1006,6 +1168,9 @@ fn validate_option_accessor(
         match repr {
             SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
             SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
+            SvmOptionRepr::AffineBoolArray => {
+                unreachable!("affine options have no copying `.value` accessor")
+            }
         }
     } else {
         Ty::Bool
@@ -1319,13 +1484,8 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 ..
             } => {
                 if matches!(ty, Ty::AffineOption(_)) {
-                    return Err(affine_option_unsupported(
-                        *ty,
-                        &format!("declaration `{name}`"),
-                    ));
-                }
-                validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
-                if bool_array_ty(*ty) {
+                    validate_affine_bool_option_decl(ctx, name, *ty, *mutable, init.as_ref())?;
+                } else if bool_array_ty(*ty) {
                     let Some(init) = init else {
                         return Err(format!(
                             "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
@@ -1333,8 +1493,11 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                     };
                     validate_fresh_bool_array_initializer(ctx, *ty, init, name)?;
                 } else if let Some(init) = init {
+                    validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
                     validate_expr_payloads(ctx, init)?;
                     validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+                } else {
+                    validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
                 }
                 ctx.insert_local(name, *ty, *mutable, init.is_some())?;
             }
@@ -1347,6 +1510,12 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 if !binding.mutable {
                     return Err(format!(
                         "svm.local_type: assignment targets immutable local `{name}`"
+                    ));
+                }
+                if matches!(binding.ty, Ty::AffineOption(_)) {
+                    return Err(affine_option_unsupported(
+                        binding.ty,
+                        &format!("whole-option assignment to `{name}`"),
                     ));
                 }
                 validate_expr_payloads(ctx, value)?;
@@ -1402,6 +1571,11 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 mutable,
                 ..
             } => {
+                if matches!(init.kind, ExprKind::OptTake { .. }) {
+                    return Err(format!(
+                        "svm.affine_option_take_position: inferred declaration `{name}` cannot receive `.take`; use an explicit owned `[bool]` declaration"
+                    ));
+                }
                 if matches!(ty, Ty::AffineOption(_)) {
                     return Err(affine_option_unsupported(
                         *ty,
@@ -1582,7 +1756,12 @@ fn validate_call_signature(
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
     if let Some(ty) = expr.ty {
         validate_ty_payload(ty, "expression annotation")?;
-        if bool_array_ty(ty) && !matches!(&expr.kind, ExprKind::OptTake { .. }) {
+        if bool_array_ty(ty)
+            && !matches!(
+                &expr.kind,
+                ExprKind::OptTake { .. } | ExprKind::OptValue { .. }
+            )
+        {
             return Err(
                 "svm.bool_array_position_unsupported: a Boolean-array-valued expression is only supported as the initializer of a fresh owned local"
                     .into(),
@@ -1657,12 +1836,14 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             svm_option_repr(expr, "none")?;
         }
         ExprKind::IsSome { operand } => {
-            validate_option_accessor(expr, operand, false)?;
+            let repr = validate_option_accessor(ctx, expr, operand, false)?;
             semantic_expr_ty(ctx, expr, Ty::Bool, "option is_some accessor")?;
-            validate_expr_payloads(ctx, operand)?;
+            if !matches!(repr, SvmOptionRepr::AffineBoolArray) {
+                validate_expr_payloads(ctx, operand)?;
+            }
         }
         ExprKind::OptValue { operand } => {
-            validate_option_accessor(expr, operand, true)?;
+            validate_option_accessor(ctx, expr, operand, true)?;
             semantic_expr_ty(
                 ctx,
                 expr,
@@ -1672,7 +1853,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             validate_expr_payloads(ctx, operand)?;
         }
         ExprKind::OptTake { option, .. } => {
-            return Err(affine_option_take_unsupported(option));
+            return Err(affine_option_take_position(option));
         }
         ExprKind::Unary { operand, .. } => {
             semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "unary expression")?;
@@ -1722,12 +1903,22 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
                 validate_expr_payloads(ctx, arg)?;
             }
         }
-        ExprKind::TraitCall { args, .. } | ExprKind::MethodCall { args, .. } => {
+        ExprKind::TraitCall { args, .. } => {
             for arg in args {
                 validate_expr_payloads(ctx, arg)?;
             }
         }
-        ExprKind::SelfFieldIndex { index, .. } | ExprKind::ClassFieldIndex { index, .. } => {
+        ExprKind::MethodCall { recv, args, .. } => {
+            reject_named_affine_option(ctx, recv, "a method receiver")?;
+            for arg in args {
+                validate_expr_payloads(ctx, arg)?;
+            }
+        }
+        ExprKind::SelfFieldIndex { index, .. } => {
+            validate_expr_payloads(ctx, index)?;
+        }
+        ExprKind::ClassFieldIndex { obj, index, .. } => {
+            reject_named_affine_option(ctx, obj, "a class-field index receiver")?;
             validate_expr_payloads(ctx, index)?;
         }
         ExprKind::Var(name) => {
@@ -1740,6 +1931,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "Boolean literal")?;
         }
         ExprKind::Borrow { array, .. } => {
+            reject_named_affine_option(ctx, array, "a borrow source")?;
             if ctx
                 .local(array)
                 .is_some_and(|binding| bool_array_ty(binding.ty))
@@ -1749,11 +1941,12 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
                 ));
             }
         }
-        ExprKind::SelfField { .. }
-        | ExprKind::SelfFieldLen { .. }
-        | ExprKind::ClassField { .. }
-        | ExprKind::ClassFieldLen { .. } => {}
+        ExprKind::SelfField { .. } | ExprKind::SelfFieldLen { .. } => {}
+        ExprKind::ClassField { obj, .. } | ExprKind::ClassFieldLen { obj, .. } => {
+            reject_named_affine_option(ctx, obj, "a class-field receiver")?;
+        }
         ExprKind::RecordField { obj, field, .. } => {
+            reject_named_affine_option(ctx, obj, "a record-field receiver")?;
             semantic_record_field_ty(ctx, expr, obj, field)?;
         }
     }
@@ -1857,6 +2050,18 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             mutable,
             init,
             ..
+        } if matches!(ty, Ty::AffineOption(_)) => {
+            validate_affine_bool_option_decl(ctx, name, *ty, *mutable, init.as_ref())?;
+            let lowered = lower_affine_bool_option_bind(ctx, name, *ty, *mutable, init.as_ref())?;
+            ctx.insert_local(name, *ty, *mutable, true)?;
+            Some(lowered)
+        }
+        Stmt::Decl {
+            name,
+            ty,
+            mutable,
+            init,
+            ..
         } if bool_array_ty(*ty) => {
             let Some(initializer) = init else {
                 return Err(format!(
@@ -1902,6 +2107,27 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             let lowered = lower_bind(ctx, name, e)?;
             ctx.insert_local(name, *ty, *mutable, true)?;
             Some(lowered)
+        }
+        Stmt::VarDecl {
+            name,
+            init,
+            ty: Some(_),
+            ..
+        } if matches!(init.kind, ExprKind::OptTake { .. }) => {
+            return Err(format!(
+                "svm.affine_option_take_position: inferred declaration `{name}` cannot receive `.take`; use an explicit owned `[bool]` declaration"
+            ));
+        }
+        Stmt::VarDecl {
+            name,
+            init: _,
+            ty: Some(ty),
+            ..
+        } if matches!(ty, Ty::AffineOption(_)) => {
+            return Err(affine_option_unsupported(
+                *ty,
+                &format!("inferred declaration `{name}`"),
+            ));
         }
         Stmt::VarDecl {
             name,
@@ -2052,6 +2278,12 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             if !binding.mutable {
                 return Err(format!(
                     "svm.local_type: assignment targets immutable local `{name}`"
+                ));
+            }
+            if matches!(binding.ty, Ty::AffineOption(_)) {
+                return Err(affine_option_unsupported(
+                    binding.ty,
+                    &format!("whole-option assignment to `{name}`"),
                 ));
             }
             validate_sink_type(ctx, binding.ty, value, &format!("assignment to `{name}`"))?;
@@ -2230,7 +2462,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                 lower_resource_op_stmt(ctx, *op, args)?
             }
             ExprKind::OptTake { option, .. } => {
-                return Err(affine_option_take_unsupported(option));
+                return Err(affine_option_take_position(option));
             }
             _ => {
                 return Err("expression statements are outside the SVM core subset".into());
@@ -2334,7 +2566,7 @@ fn resolved_resource_place_ty(
             ));
         }
         ExprKind::OptTake { option, .. } => {
-            return Err(affine_option_take_unsupported(option));
+            return Err(affine_option_take_position(option));
         }
         _ => {
             return Err(format!(
@@ -2803,7 +3035,7 @@ fn ensure_erased_resource_operands_inert(
                 )? == expected
             }
             ExprKind::OptTake { option, .. } => {
-                return Err(affine_option_take_unsupported(option));
+                return Err(affine_option_take_position(option));
             }
             // Calls, arithmetic (including division), raw/device operations,
             // and nested resource transformations may trap or mutate runtime
@@ -2836,8 +3068,36 @@ fn lower_erased_resource_bind(
         ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args),
         ExprKind::RawOp { .. } => Ok(Some(lower_bind(ctx, name, e)?)),
         ExprKind::Call { .. } => Ok(Some(lower_call(ctx, &None, e)?)),
-        ExprKind::OptTake { option, .. } => Err(affine_option_take_unsupported(option)),
+        ExprKind::OptTake { option, .. } => Err(affine_option_take_position(option)),
         _ => Err("resource-valued expression is outside the SVM core subset".into()),
+    }
+}
+
+/// Materialize the exact local affine-option construction surface. The Lean
+/// value representation deliberately remains the recursive `.opt`, but the
+/// Rust bridge admits only a freshly allocated Boolean array as its payload.
+fn lower_affine_bool_option_bind(
+    ctx: &LowerCtx<'_>,
+    name: &str,
+    declared_ty: Ty,
+    mutable: bool,
+    initializer: Option<&Expr>,
+) -> Result<String, String> {
+    validate_affine_bool_option_decl(ctx, name, declared_ty, mutable, initializer)?;
+    let initializer = initializer.expect("validated affine option initializer");
+    match &initializer.kind {
+        ExprKind::NoneE => Ok(format!("(.assign \"{name}\" (.noneE))")),
+        ExprKind::SomeE(payload) => {
+            let ExprKind::AllocArray { len, init, .. } = &payload.kind else {
+                unreachable!("validated affine-option payload")
+            };
+            Ok(format!(
+                "(.assign \"{name}\" (.someE (.allocArray {} {})))",
+                lower_expr(ctx, len)?,
+                lower_expr(ctx, init)?
+            ))
+        }
+        _ => unreachable!("validated affine-option initializer"),
     }
 }
 
@@ -2895,7 +3155,10 @@ fn lower_fresh_bool_array_bind(
             }
             Ok(statements.join(", "))
         }
-        ExprKind::OptTake { option, .. } => Err(affine_option_take_unsupported(option)),
+        ExprKind::OptTake { option, .. } => {
+            validate_affine_option_take(ctx, name, initializer, option)?;
+            Ok(format!("(.optTake \"{name}\" \"{option}\")"))
+        }
         _ => unreachable!("fresh Boolean array validation accepted a transport"),
     }
 }
@@ -2904,7 +3167,7 @@ fn lower_fresh_bool_array_bind(
 /// is exactly a call; calls nested deeper stay outside the subset.
 fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String> {
     match &e.kind {
-        ExprKind::OptTake { option, .. } => Err(affine_option_take_unsupported(option)),
+        ExprKind::OptTake { option, .. } => Err(affine_option_take_position(option)),
         ExprKind::Call { .. } => lower_call(ctx, &Some(name.to_string()), e),
         ExprKind::DeviceOp {
             op: DeviceOp::UartStatus,
@@ -3179,6 +3442,9 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
             SvmOptionRepr::Ordinary(_) => {
                 format!("(.someE {})", lower_expr(ctx, inner)?)
             }
+            SvmOptionRepr::AffineBoolArray => {
+                unreachable!("affine construction lowers only through an explicit declaration")
+            }
         },
         ExprKind::NoneE => match svm_option_repr(e, "none")? {
             SvmOptionRepr::RawRecord(record) => {
@@ -3186,8 +3452,11 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
                 "(.ptrNoneE)".into()
             }
             SvmOptionRepr::Ordinary(_) => "(.noneE)".into(),
+            SvmOptionRepr::AffineBoolArray => {
+                unreachable!("affine construction lowers only through an explicit declaration")
+            }
         },
-        ExprKind::IsSome { operand } => match validate_option_accessor(e, operand, false)? {
+        ExprKind::IsSome { operand } => match validate_option_accessor(ctx, e, operand, false)? {
             SvmOptionRepr::Ordinary(_) => {
                 format!("(.optIsSome {})", lower_expr(ctx, operand)?)
             }
@@ -3195,8 +3464,14 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
                 ctx.record(record)?;
                 format!("(.ptrIsSome {})", lower_expr(ctx, operand)?)
             }
+            SvmOptionRepr::AffineBoolArray => {
+                let ExprKind::Var(name) = &operand.kind else {
+                    unreachable!("validated named affine-option accessor")
+                };
+                format!("(.optIsSome (.var \"{name}\"))")
+            }
         },
-        ExprKind::OptValue { operand } => match validate_option_accessor(e, operand, true)? {
+        ExprKind::OptValue { operand } => match validate_option_accessor(ctx, e, operand, true)? {
             SvmOptionRepr::Ordinary(_) => {
                 format!("(.optValue {})", lower_expr(ctx, operand)?)
             }
@@ -3204,10 +3479,11 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
                 ctx.record(record)?;
                 format!("(.ptrValue {})", lower_expr(ctx, operand)?)
             }
+            SvmOptionRepr::AffineBoolArray => {
+                unreachable!("affine options have no copying `.value` accessor")
+            }
         },
-        ExprKind::OptTake { option, .. } => {
-            return Err(affine_option_take_unsupported(option));
-        }
+        ExprKind::OptTake { option, .. } => return Err(affine_option_take_position(option)),
         ExprKind::RecordField { obj, field, .. } => {
             format!("(.recordField (.var \"{obj}\") \"{field}\")")
         }
@@ -3346,7 +3622,16 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
             RtVal::Bool(b) => format!("opt some {b}"),
             value => format!("opt some {}", render_rt_val(program, value)),
         },
-        RtVal::AffineOptBoolArray(_) => "unclassified affine Boolean-array option".into(),
+        RtVal::AffineOptBoolArray(None) => "opt none".into(),
+        RtVal::AffineOptBoolArray(Some(array)) => format!(
+            "opt some arr [{}]",
+            array
+                .borrow()
+                .iter()
+                .map(|element| element.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         RtVal::PtrOpt(None) => "ptrOpt none".into(),
         RtVal::PtrOpt(Some((a, o))) => format!("ptrOpt some {a}+{o}"),
         RtVal::Record { record, fields } => {
@@ -3380,6 +3665,9 @@ fn classify_trap(msg: &str) -> String {
         return "trap divByZero".into();
     }
     if msg == "`.value` of an empty option" {
+        return "trap optionNone".into();
+    }
+    if msg == "`.take` of an empty affine option" {
         return "trap optionNone".into();
     }
     if let Some(rest) = msg.strip_prefix("Euclidean quotient overflows: ") {
@@ -3490,10 +3778,11 @@ mod tests {
     }
 
     #[test]
-    fn lowering_rejects_affine_options_before_copy_option_classification() {
+    fn affine_option_lowering_is_local_atomic_and_fail_closed() {
         let program = empty_program();
         let affine_bool = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool));
         let affine_integer = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)));
+        let bool_array = Ty::Array(ValueTy::Bool, Mutability::Owned);
 
         for ty in [affine_bool, affine_integer] {
             let error = lower_fn(&program, &checked_fn(ty, Vec::new()))
@@ -3518,7 +3807,7 @@ mod tests {
             "{error}"
         );
 
-        let local = checked_fn(
+        let none_local = checked_fn(
             Ty::Unit,
             vec![Stmt::Decl {
                 ty: affine_bool,
@@ -3528,11 +3817,9 @@ mod tests {
                 mutable: true,
             }],
         );
-        let error = lower_fn(&program, &local)
-            .expect_err("an affine-option local must remain outside the formal SVM");
-        assert!(
-            error.starts_with("svm.affine_option_unsupported:"),
-            "{error}"
+        assert_eq!(
+            lower_fn(&program, &none_local).unwrap(),
+            "[(.assign \"pending\" (.noneE))]"
         );
 
         let mut ctx = LowerCtx::bare(&program);
@@ -3544,11 +3831,9 @@ mod tests {
             },
             Ty::Bool,
         );
-        let error = validate_expr_payloads(&ctx, &accessor)
-            .expect_err("a forged accessor must not classify an affine option as copyable");
-        assert!(
-            error.starts_with("svm.affine_option_unsupported:"),
-            "{error}"
+        assert_eq!(
+            lower_expr(&ctx, &accessor).unwrap(),
+            "(.optIsSome (.var \"pending\"))"
         );
 
         let take = expr(
@@ -3556,27 +3841,77 @@ mod tests {
                 option: "pending".into(),
                 option_span: Span::new(0, 0),
             },
-            Ty::Array(ValueTy::Bool, Mutability::Owned),
-        );
-        let expected = "svm.affine_option_unsupported: `.take` of affine option local `pending` requires an atomic ownership transition that is not yet modeled by the formal SVM";
-        assert_eq!(
-            validate_expr_payloads(&ctx, &take)
-                .expect_err("affine take must not inherit general array lowering"),
-            expected
+            bool_array,
         );
         assert_eq!(
-            validate_fresh_bool_array_initializer(
-                &ctx,
-                Ty::Array(ValueTy::Bool, Mutability::Owned),
-                &take,
-                "bytes",
-            )
-            .expect_err("affine take must not inherit fresh-array lowering"),
-            expected
+            lower_fresh_bool_array_bind(&ctx, "bytes", bool_array, &take).unwrap(),
+            "(.optTake \"bytes\" \"pending\")"
         );
-        assert_eq!(
-            lower_expr(&ctx, &take).expect_err("affine take has no formal SVM expression"),
-            expected
+        assert!(
+            lower_expr(&ctx, &take)
+                .unwrap_err()
+                .starts_with("svm.affine_option_take_position:")
+        );
+
+        let value = expr(
+            ExprKind::OptValue {
+                operand: Box::new(expr(ExprKind::Var("pending".into()), affine_bool)),
+            },
+            bool_array,
+        );
+        assert!(
+            validate_expr_payloads(&ctx, &value)
+                .unwrap_err()
+                .starts_with("svm.affine_option_unsupported:")
+        );
+
+        let inferred_take = checked_fn(
+            Ty::Unit,
+            vec![Stmt::VarDecl {
+                name: "bytes".into(),
+                name_span: Span::new(0, 0),
+                init: take.clone(),
+                mutable: false,
+                ty: Some(bool_array),
+            }],
+        );
+        assert!(
+            lower_fn(&program, &inferred_take)
+                .unwrap_err()
+                .starts_with("svm.affine_option_take_position:")
+        );
+
+        let alias = expr(
+            ExprKind::OptTake {
+                option: "pending".into(),
+                option_span: Span::new(0, 0),
+            },
+            bool_array,
+        );
+        assert!(
+            validate_affine_option_take(&ctx, "pending", &alias, "pending")
+                .unwrap_err()
+                .starts_with("svm.affine_option_take_alias:")
+        );
+
+        let mut immutable = LowerCtx::bare(&program);
+        immutable
+            .insert_local("pending", affine_bool, false, true)
+            .unwrap();
+        assert!(
+            validate_affine_option_take(&immutable, "bytes", &take, "pending")
+                .unwrap_err()
+                .starts_with("svm.affine_option_immutable:")
+        );
+
+        let mut wrong_payload = LowerCtx::bare(&program);
+        wrong_payload
+            .insert_local("pending", affine_integer, true, true)
+            .unwrap();
+        assert!(
+            validate_affine_option_take(&wrong_payload, "bytes", &take, "pending")
+                .unwrap_err()
+                .starts_with("svm.affine_option_unsupported:")
         );
     }
 
@@ -3872,14 +4207,26 @@ mod tests {
             payload: ValueTy::Bool,
             value: Some(Box::new(RtVal::Bool(true))),
         };
-        let affine_value = RtVal::AffineOptBoolArray(None);
+        let affine_none = RtVal::AffineOptBoolArray(None);
+        let affine_empty = RtVal::AffineOptBoolArray(Some(std::rc::Rc::new(
+            std::cell::RefCell::new(crate::interp::RtArray::Bool(Vec::new())),
+        )));
+        let affine_values = RtVal::AffineOptBoolArray(Some(std::rc::Rc::new(
+            std::cell::RefCell::new(crate::interp::RtArray::Bool(vec![true, false])),
+        )));
 
         assert_eq!(render_rt_val(&program, &absent), "opt none");
         assert_eq!(render_rt_val(&program, &false_value), "opt some false");
         assert_eq!(render_rt_val(&program, &true_value), "opt some true");
+        assert_eq!(render_rt_val(&program, &affine_none), "opt none");
+        assert_eq!(render_rt_val(&program, &affine_empty), "opt some arr []");
         assert_eq!(
-            render_rt_val(&program, &affine_value),
-            "unclassified affine Boolean-array option"
+            render_rt_val(&program, &affine_values),
+            "opt some arr [true, false]"
+        );
+        assert_eq!(
+            classify_trap("`.take` of an empty affine option"),
+            "trap optionNone"
         );
     }
 

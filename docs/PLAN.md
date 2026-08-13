@@ -671,8 +671,9 @@ Boolean-array proof/runtime slice are complete. G1.5's closure of that exact
 local slice in the formal SVM and differential lowerer is also complete. G1.6's
 native storage and lexical cleanup for that same local slice are complete. The broader
 aggregate-generics/backend track continues at M46+; G2.0's affine-option
-representation/fail-closed checkpoint is closed. The order remains a working
-hypothesis, not a promise that evidence cannot reorder it:
+representation/fail-closed checkpoint and G2.1's local semantic slice are
+closed, as is G2.2's formal-SVM slice. The order remains a working hypothesis,
+not a promise that evidence cannot reorder it:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
    interpreter/native differentials and end-to-end trap tests as later work
@@ -1004,7 +1005,7 @@ hypothesis, not a promise that evidence cannot reorder it:
      differential passed 1/1 over six subjects at both levels; and SVM stayed
      green at 86/86. Randomized allocator, grind-budget, LSP, documentation,
      diff-check, and static-audit gates were green. G1.6 is closed.
-   - **G2 — affine options (staged; G2.0–G2.1 complete):** carry ownership and
+   - **G2 — affine options (staged; G2.0–G2.2 complete):** carry ownership and
      destruction correctly through present/absent aggregate values without
      widening the existing copy-option family by accident.
 
@@ -1077,12 +1078,37 @@ hypothesis, not a promise that evidence cannot reorder it:
      allocator, grind-budget, LSP, documentation, rustfmt, diff-check, and
      static-audit gates were green. G2.1 is closed.
 
-     **G2.2 — formal machine (next):** add an atomic statement-level `optTake`
-     to the relational SVM and proved evaluator, then carry the exact slice
-     through differential lowering. A pure extraction followed by assignment
-     is not an acceptable model because its intermediate state has two owners.
+     **G2.2 — formal machine (complete):** the
+     relational SVM and proved evaluator now carry atomic statement-level
+     `Stmt.optTake dst src` over the existing recursive `Val.opt`; the formal
+     core is intentionally generic, while Rust lowering admits only the exact
+     `option<[bool]>` source and owned `[bool]` destination from G2.1. A pure
+     extraction followed by assignment is not an acceptable model because its
+     intermediate state has two owners.
 
-     **G2.3 — native local lowering (later):** add an internal tag/live bit plus
+     For distinct names, present transfers the payload in one step while
+     clearing the source to `none`; absent traps `optionNone`; and a missing or
+     wrong outer source is `undef`. Aliasing source and destination is
+     immediately `undef`. Destination absence is not required because the flat
+     machine environment reuses lexical-local names across loop iterations;
+     the take overwrites that stale binding. The tagged Boolean-array payload,
+     including an empty array, is retained exactly. Parameters, returns, calls,
+     fields, traits, generics, borrows, exposure, whole-option movement, and all
+     affine-option ABIs remain fenced. LLVM remains closed for G2.3.
+
+     G2.2 closed under the exact one-worker command
+     `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. `cargo check` and the standalone Lake build
+     were green; Lake built 22/22 targets with only the existing warnings.
+     Focused SVM units passed 35/35, Rust library tests 211/211, and the
+     recursive corpus all 416 subjects (84 verifies, 263 must-fail, 49 tests,
+     20 test-fails) in 270.58s. LLVM CLI passed 7/7; the native differential
+     passed 1/1 over six subjects at `-O0` and `-O2`; and SVM differential
+     passed 92/92. Free-list allocator, grind-budget, LSP, documentation,
+     rustfmt, diff-check, and static-audit gates were green. G2.2 is closed.
+
+     **G2.3 — native local lowering (next):** add an internal tag/live bit plus
      the Boolean-array descriptor, source clearing, and conditional lexical
      destruction. This remains local lowering and does not define an
      affine-option ABI.
@@ -1105,7 +1131,8 @@ hypothesis, not a promise that evidence cannot reorder it:
 ## Parallel track (low intensity)
 
 The SVM semantic oracle — **checkpoint reached, with the first profile
-composition and G1.5 Boolean arrays complete**. `lean/Sable/SVM.lean` is the
+composition and G1.5 Boolean arrays complete and G2.2 affine-option take
+complete**. `lean/Sable/SVM.lean` is the
 machine as inductive relations, now *total*: `undef` is the third terminal
 outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range
 literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the
@@ -1114,8 +1141,14 @@ determinism, totality, and progress are kernel-checked corollaries. Calls and
 frames, byte raw memory, abstract `u64`/POD cells, recursive ordinary options,
 and tagged `ArrayVal.ints`/`ArrayVal.bools` arrays all live in both core
 presentations. G1.5 generalizes length/index/allocation/store, preserves empty
-tags and trap precedence, and adds direct Boolean-array guards. ADR 0057's
-`SVMUart` wrapper remains byte-for-byte compatible for bare executions.
+tags and trap precedence, and adds direct Boolean-array guards. G2.2 adds the
+generic atomic core `optTake` transition and an exact Boolean-array affine
+option bridge. Its full serial gate is green: `cargo check`; Lake 22/22;
+focused SVM units 35/35; Rust library tests 211/211; the 416-subject recursive
+corpus in 270.58s; LLVM CLI 7/7; six-subject O0/O2 native differential 1/1;
+SVM differential 92/92; and the free-list, grind, LSP, docs, formatting,
+diff-check, and static-audit gates. ADR 0057's `SVMUart` wrapper remains
+byte-for-byte compatible for bare executions.
 
 The full G1.5 serial closure is green: `cargo check`; the 22-target one-job
 Lake build; 175/175 Rust library tests; all 394 corpus subjects (83 verifies,

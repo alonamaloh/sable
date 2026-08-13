@@ -1,6 +1,6 @@
 # ADR 0060 — affine options use an explicit ownership-bearing type
 
-**Decided 2026-08-13; G2.0 closed; amended for the closed G2.1 slice.** Existing
+**Decided 2026-08-13; G2.0–G2.2 closed.** Existing
 `Ty::Option(ValueTy)` describes a copyable value option. Its payload identity
 is deliberately flat, and checker, verifier, interpreter, SVM, and LLVM code
 all rely on that copy boundary. Making one of those payloads affine by
@@ -84,12 +84,25 @@ mutates the named frame entry directly, and lexical destruction recursively
 drops a present payload exactly once. Trap paths do not unwind, matching the
 existing owned-value rule.
 
-G2.2 keeps the formal SVM's `Val.opt (Option Val)` representation and adds an
-atomic statement-level `optTake` transition. Lowering take to `optValue`
-followed by a separate assignment would create an intermediate state with two
-owners and therefore is not an acceptable ownership model, even if its final
-rendered result happened to match. The relational and executable semantics
-must agree on present, absent, and wrong-shape cases.
+G2.2 keeps the formal SVM's recursive `Val.opt (Option Val)` representation and
+adds atomic statement-level `Stmt.optTake dst src` to both the relational and
+executable semantics. The untyped formal core deliberately transfers a generic
+`Val` payload; the Rust bridge is the exact supported-subset gate and emits the
+statement only for a G2.1 `option<[bool]>` source and owned `[bool]`
+destination. Lowering take to `optValue` followed by a separate assignment
+would create an intermediate state with two owners and therefore is not an
+acceptable ownership model, even if its final rendered result happened to
+match.
+
+For distinct names, present clears the source to `.opt none` and installs the
+payload in the destination in one transition. A distinct `.opt none` traps
+`optionNone`; a missing or wrong outer source is `undef`; and `dst = src` is
+immediately `undef`. The destination need not be absent: the flat SVM
+environment reuses lexical-local names across loop iterations, and the new
+declaration must overwrite that stale binding. Moving the payload preserves
+its `ArrayVal.bools` tag even at length zero. Parameters, returns, calls,
+fields, traits, generics, borrows, exposure, whole-option movement, and every
+affine-option ABI remain outside this bridge.
 
 Native lowering follows only after the semantic/SVM slice closes. Its planned
 internal form is a canonical tag plus the existing Boolean-array descriptor;
@@ -111,11 +124,11 @@ representation.
    `interp`, `svm`, and `backend` `affine_option_unsupported` diagnostics; an
    already-unsupported enclosing construct may diagnose its outer fence first.
 2. **G2.1 — local construction and take (complete):** checker, VC generator,
-   interpreter, and dynamic monitor implement the exact local slice. The formal
-   SVM and LLVM backend remain fail closed.
-3. **G2.2 — formal machine (next):** add atomic SVM `optTake` and differential
-   lowering.
-4. **G2.3 — native local lowering (later):** conditional destruction and source
+   interpreter, and dynamic monitor implement the exact local slice.
+3. **G2.2 — formal machine (complete):** atomic SVM `optTake` and the exact
+   Boolean-array differential bridge are present; all other machine transport
+   remains fail closed.
+4. **G2.3 — native local lowering (next):** conditional destruction and source
    clearing, without transport or ABI widening.
 5. Parameters, returns, calls, and fields remain later independent decisions.
 
@@ -143,5 +156,17 @@ recursive corpus passed all 416 subjects (84 verifies, 263 must-fail, 49 tests,
 20 test-fails) in 193.06s; LLVM CLI passed 7/7; the native differential passed
 1/1 spanning six subjects at `-O0` and `-O2`; and SVM differential remained
 86/86. Randomized free-list allocator, grind-budget, LSP, documentation,
-rustfmt, diff-check, and static-audit gates were green. G2.1 is closed; G2.2's
-atomic formal-SVM `optTake` transition is next.
+rustfmt, diff-check, and static-audit gates were green. G2.1 is closed.
+
+G2.2 closed under the exact one-worker command
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` and the standalone Lake build were green; Lake built 22/22
+targets with only the existing warnings. Focused SVM units passed 35/35, Rust
+library tests 211/211, and the recursive corpus all 416 subjects (84 verifies,
+263 must-fail, 49 tests, 20 test-fails) in 270.58s. LLVM CLI passed 7/7; the
+native differential passed 1/1 over six subjects at `-O0` and `-O2`; and SVM
+differential passed 92/92. Free-list allocator, grind-budget, LSP,
+documentation, rustfmt, diff-check, and static-audit gates were green. G2.2 is
+closed. LLVM retains the `backend.affine_option_unsupported` fence for G2.3,
+the next stage.

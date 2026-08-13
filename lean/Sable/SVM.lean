@@ -502,6 +502,13 @@ only at statement level — `x = f(args)`, or `f(args)` for a discarded
 result — so expressions stay pure and big-step. -/
 inductive Stmt where
   | assign (x : String) (e : Expr)
+  /-- `dst = src.take()` for an affine option. Unlike `optValue`, this is
+  a statement-level, direct-local operation: a successful step installs
+  `none` in `src` and the former payload in `dst` in one transition. The
+  untyped core transfers the recursively represented `Val` payload; the
+  compiler's supported-subset gate admits only owned Boolean arrays. A
+  non-option source or `dst = src` has the explicit `undef` outcome. -/
+  | optTake (dst src : String)
   /-- Direct POD construction. Field names and argument expressions are
   parallel lists; a length mismatch is `undef` (checker duty). -/
   | recordMake (dst : String) (tag : Int) (fields : List String) (args : List Expr)
@@ -1079,6 +1086,28 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
   | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
       Step P cap (.run (.assign x e :: k) ρ σ μ) a.toConfig
+  -- Affine option extraction is atomic. The source is cleared before the
+  -- destination is installed, and distinct names ensure the latter update
+  -- cannot recreate the option owner. Destination freshness is deliberately
+  -- not required: flat machine environments reuse lexical-local names across
+  -- loop iterations.
+  | optTake_ok {ρ : Env} {dst src : String} {value : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ src) (hs : ρ src = some (.opt (some value))) :
+      Step P cap (.run (.optTake dst src :: k) ρ σ μ)
+        (.run k ((ρ.update src (.opt none)).update dst value) σ μ)
+  | optTake_none {ρ : Env} {dst src : String}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ src) (hs : ρ src = some (.opt none)) :
+      Step P cap (.run (.optTake dst src :: k) ρ σ μ) (.trapped .optionNone)
+  | optTake_undef_alias {ρ : Env} {dst src : String}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (heq : dst = src) :
+      Step P cap (.run (.optTake dst src :: k) ρ σ μ) .undef
+  | optTake_undef_src {ρ : Env} {dst src : String}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ src) (hs : ∀ value, ρ src ≠ some (.opt value)) :
+      Step P cap (.run (.optTake dst src :: k) ρ σ μ) .undef
   | recordMake_ok {ρ : Env} {dst : String} {tag : Int}
       {fields : List String} {args : List Expr} {values : List Val}
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}

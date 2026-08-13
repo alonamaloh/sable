@@ -517,7 +517,8 @@ foreign, or cross-module array ABI.
   and static-audit gates are green. G1.6 is closed.
 - **Affine options have a checked ownership identity and a fenced local
   semantic slice.** G2.0 is the closed representation/fail-closed checkpoint;
-  G2.1's checker/proof/interpreter/monitor slice is also closed.
+  G2.1's checker/proof/interpreter/monitor slice and G2.2's formal-SVM slice
+  are also closed.
   The existing `Ty::Option(ValueTy)` remains the copyable option family;
   `option<[T]>` parses to the distinct
   `Ty::AffineOption(AffineOptionTy::Array(ValueTy))`. This keeps every legacy
@@ -558,11 +559,26 @@ foreign, or cross-module array ABI.
 
   Parameters, returns, calls, fields, traits, generics, borrows, exposure,
   inferred option bindings, whole-option assignment, nested or non-Boolean
-  affine options, and discarded affine temporaries remain closed. The formal
-  SVM and LLVM backend retain explicit `svm.affine_option_unsupported` and
-  `backend.affine_option_unsupported` fences. G2.2 adds one atomic formal-SVM
-  `optTake` transition; G2.3 adds the local native tag/live-bit representation
-  and conditional destruction. Neither stage implies an aggregate ABI.
+  affine options, and discarded affine temporaries remain closed. G2.2 opens
+  only the exact local Rust-to-SVM bridge. All other SVM ingresses retain the
+  `svm.affine_option_unsupported` fence, and LLVM retains
+  `backend.affine_option_unsupported` for the entire affine-option slice.
+  G2.3 adds the local native tag/live-bit representation and conditional
+  destruction. Neither stage implies an aggregate ABI.
+
+  The formal core uses the existing recursive `Val.opt` and adds
+  `Stmt.optTake dst src`, deliberately generic at the untyped machine layer.
+  The Rust bridge is the exact supported-subset gate: its source must be the
+  G2.1 local `option<[bool]>`, its destination an owned `[bool]`, and every
+  ABI, call, field, trait, generic, borrow, exposure, and whole-option path
+  remains rejected. For distinct names, a present value steps atomically to
+  an environment with the source set to `.opt none` and the destination set
+  to the former payload. A distinct empty option traps `optionNone`; a missing
+  or wrong outer source is `undef`; and source/destination aliasing is
+  immediately `undef`. No destination-absence premise is imposed because the
+  flat SVM environment reuses lexical-local names across loop iterations and
+  must overwrite the stale binding. The tagged `.arr (.bools ...)` payload is
+  transferred intact, including the empty-array tag.
 
   G2.0 closed under the exact one-worker command
   `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
@@ -586,8 +602,20 @@ foreign, or cross-module array ABI.
   passed 7/7; the native differential passed 1/1 spanning six subjects at
   `-O0` and `-O2`; and SVM differential remained 86/86. Randomized free-list
   allocator, grind-budget, LSP, documentation, rustfmt, diff-check, and
-  static-audit gates were green. G2.1 is closed; G2.2's atomic formal-SVM
-  `optTake` transition is next.
+  static-audit gates were green. G2.1 is closed.
+
+  G2.2 closed under the exact one-worker command
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+  SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`. `cargo check` and the standalone Lake build
+  were green; Lake built 22/22 targets with only the existing warnings.
+  Focused SVM units passed 35/35, Rust library tests 211/211, and the recursive
+  corpus all 416 subjects (84 verifies, 263 must-fail, 49 tests, 20 test-fails)
+  in 270.58s. LLVM CLI passed 7/7; the native differential passed 1/1 over six
+  subjects at `-O0` and `-O2`; and SVM differential passed 92/92. Free-list
+  allocator, grind-budget, LSP, documentation, rustfmt, diff-check, and
+  static-audit gates were green. G2.2 is closed; G2.3's local native lowering
+  is next, with LLVM fenced until then.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

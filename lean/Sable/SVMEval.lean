@@ -876,6 +876,13 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
       some (match evalE cap ρ e with
         | .ok v => .run k (ρ.update x v) σ μ
         | .abort a => a.toConfig)
+  | .run (.optTake dst src :: k) ρ σ μ =>
+      some (if dst = src then .undef else
+        match ρ src with
+        | some (.opt (some value)) =>
+            .run k ((ρ.update src (.opt none)).update dst value) σ μ
+        | some (.opt none) => .trapped .optionNone
+        | _ => .undef)
   | .run (.recordMake dst tag fields args :: k) ρ σ μ =>
       some (match evalArgs cap ρ args with
         | .abort ab => ab.toConfig
@@ -1025,6 +1032,14 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   cases h with
   | assign_ok h => simp [stepF, h.evalE_eq]
   | assign_abort h => simp [stepF, h.evalE_eq]
+  | optTake_ok hne hs => simp [stepF, hne, hs]
+  | optTake_none hne hs => simp [stepF, hne, hs]
+  | optTake_undef_alias heq => simp [stepF, heq]
+  | @optTake_undef_src ρ _ src _ _ _ hne hs =>
+      cases hsrc : ρ src with
+      | none => simp [stepF, hne, hsrc]
+      | some v =>
+          cases v <;> simp_all [stepF]
   | recordMake_ok ha hn => simp [stepF, ha.evalArgs_eq, hn]
   | recordMake_undef_arity ha hn => simp [stepF, ha.evalArgs_eq, hn]
   | recordMake_abort ha => simp [stepF, ha.evalArgs_eq]
@@ -1284,6 +1299,58 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           cases ho : evalE cap ρ e with
           | ok v => exact .assign_ok (ho ▸ evalE_eval cap ρ e)
           | abort a => exact .assign_abort (ho ▸ evalE_eval cap ρ e)
+      | optTake dst src =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          by_cases heq : dst = src
+          · rw [if_pos heq]
+            exact .optTake_undef_alias heq
+          · rw [if_neg heq]
+            cases hs : ρ src with
+            | none =>
+                simpa [hs] using
+                  Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                    heq (by simp [hs])
+            | some value =>
+                cases value with
+                | opt payload =>
+                    cases payload with
+                    | none =>
+                        simpa [hs] using
+                          Step.optTake_none (P := P) (k := k) (σ := σ) (μ := μ)
+                            heq hs
+                    | some value =>
+                        simpa [hs] using
+                          Step.optTake_ok (P := P) (k := k) (σ := σ) (μ := μ)
+                            heq hs
+                | unit =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
+                | int n =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
+                | bool b =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
+                | arr a =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
+                | ptr a offset =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
+                | ptrOpt p =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
+                | record tag fields =>
+                    simpa [hs] using
+                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq (by simp [hs])
       | recordMake dst tag fields args =>
           simp only [stepF, Option.some.injEq] at h
           subst h

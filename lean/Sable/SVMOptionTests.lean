@@ -35,5 +35,36 @@ private def u64 (n : Int) : Expr := .intLit .u64 n
 #guard outcome [ .ret (.optIsSome (u64 7)) ] = "undef"
 #guard outcome [ .ret (.optValue (.boolLit true)) ] = "undef"
 
+/- Affine take is statement-level and atomic. A stale destination binding is
+overwritten (as it is when a lexical local name is reused by a loop), while
+the source is observably `none` before the following statement runs. -/
+#guard outcome [
+  .assign "src" (.someE (.allocArray (u64 2) (.boolLit false))),
+  .assign "dst" (.boolLit true),
+  .optTake "dst" "src",
+  .check "sourceCleared" (.not (.optIsSome (.var "src"))),
+  .ret (.var "dst")
+] = "done arr [false, false]"
+
+/- Even at length zero the Boolean-array tag survives the move. A mismatched
+integer store is rejected by the tag check before the bounds trap; if the
+empty array had silently become an integer array this would instead trap OOB. -/
+#guard outcome [
+  .assign "src" (.someE (.allocArray (u64 0) (.boolLit false))),
+  .optTake "dst" "src",
+  .store "dst" (u64 0) (u64 1)
+] = "undef"
+
+/- Taking an absent payload is the same language trap as projecting `none`;
+missing/wrong-shaped sources and destination/source aliasing are fail-closed. -/
+#guard outcome [ .assign "src" .noneE, .optTake "dst" "src" ] =
+  "trap optionNone"
+#guard outcome [ .optTake "dst" "missing" ] = "undef"
+#guard outcome [ .assign "src" (.boolLit true), .optTake "dst" "src" ] = "undef"
+#guard outcome [
+  .assign "src" (.someE (.allocArray (u64 1) (.boolLit true))),
+  .optTake "src" "src"
+] = "undef"
+
 end SVM
 end Sable

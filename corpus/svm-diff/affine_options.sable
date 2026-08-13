@@ -1,0 +1,43 @@
+// G2.2 differential subjects: local affine Boolean-array options lower to the
+// formal SVM's recursive option value, while `.take` remains one atomic
+// statement that clears the source before the destination owns its payload.
+
+fn affine_none_presence() -> bool {
+    mut option<[bool]> pending = none;
+    return pending.is_some;
+}
+
+fn affine_some_presence() -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(0, true));
+    return pending.is_some;
+}
+
+fn affine_take_empty_payload_tag() -> u64 {
+    mut option<[bool]> pending = some(alloc_array<bool>(0, true));
+    [bool] flags = pending.take;
+    return flags.len;
+}
+
+fn affine_take_payload_and_clear() -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(3, false));
+    mut [bool] flags = pending.take;
+    flags[1] = true;
+    return !pending.is_some && flags.len == 3 && flags[1];
+}
+
+fn affine_take_none_traps() -> bool {
+    mut option<[bool]> pending = none;
+    [bool] flags = pending.take;
+    return flags.len == 0;
+}
+
+fn affine_second_take_traps_with_stale_destination() -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(1, true));
+    mut u64 iteration = 0;
+    /// variant 2 - iteration
+    while (iteration < 2) {
+        [bool] flags = pending.take;
+        iteration = iteration + 1;
+    }
+    return false;
+}
