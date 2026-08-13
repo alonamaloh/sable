@@ -1,7 +1,8 @@
 # ADR 0059 — native owned Boolean arrays use runtime hooks and lexical cleanup
 
 **Decided and implemented 2026-08-13; G1.6, the G2.3 affine-option amendment,
-and N0–N4's `u32`/fixed-`Nat` amendments are closed.** G1.5 gives owned-local
+and N0–N5's `u32`/fixed-`Nat`/nested-`Integer` amendments are closed.** G1.5
+gives owned-local
 Boolean arrays a checked, verified,
 interpreted, monitored, and formal-SVM meaning. LLVM remained the only
 execution boundary that rejected that exact slice at the G1.5 checkpoint. This
@@ -154,7 +155,7 @@ checked mutability are admitted. Owned-array call transport, returns, entries,
 fields, classes, methods, externs, Boolean borrows, other payloads, exposure,
 and public or cross-module ABI positions stay closed.
 
-## N1a–N4 amendment: nested `Nat` cleanup and arithmetic scratch storage
+## N1a–N5 amendment: nested class cleanup and arithmetic scratch storage
 
 N1a embeds one `%sable.array.u32` descriptor in the exact fixed native `Nat`
 class. Normal class destruction projects that descriptor and applies the same
@@ -209,11 +210,48 @@ small hand discharges, covers division by one, exact/inexact quotient and
 remainder, multi-limb correction, and basic/zero/coprime gcd, and returns 42
 under direct Clang `-O0` and `-O2` builds.
 
-This still does not admit owned class parameters, class fields beyond the exact
-N1a shape, methods, mutable class borrows, discarded class results, field moves,
-extern transport, or any public/cross-module class ABI. Nested `Integer`,
-by-value class constructor/function arguments, class-field borrows, mutable
-outer borrows/methods, and recursive reverse destruction remain N5.
+N5 keeps the same runtime hooks and makes destruction recursive for the one
+additional supported shape `Integer { Nat mag; u64 neg; }`. Reverse field order
+visits scalar `neg` as a no-op and then descends through `mag` to `Nat.limbs`,
+where the existing null bypass and `__sable_rt_array_free_v1` call apply. No
+new allocator, free function, descriptor, or unwind rule is introduced.
+
+The exact owned-`Nat` take convention preserves single ownership across
+constructor and function parameters. A caller passes the aggregate by value
+and zeros a named source; a class-returning argument first uses a unique
+entry-hoisted, unregistered scratch destination. The completed aggregate is
+loaded by value and the scratch is zeroed immediately before the call. The
+callee registers its parameter slot for cleanup, and moving that value into
+`Integer.mag` zeros the slot. Therefore an unconsumed parameter is freed by the
+callee, a consumed one is eventually freed through the outer `Integer`, and no
+path registers two live cleanup owners for one allocation. There is no
+caller-side post-call drop.
+
+Per-field initializer tracking ensures that `mag` and scalar `neg` are each
+initialized exactly once. Shared borrows of `Integer.mag` and `Nat.limbs`, and
+the exact mutable `&mut Integer` receiver used by private
+`Integer::flip_sign`, are non-owning and never enter the cleanup registry.
+Scalar sign reads and stores likewise acquire no cleanup action.
+
+The N5 fixture verifies 237/237 obligations across 39 selected functions and
+returns 42 under direct Clang `-O0` and `-O2` builds. A dedicated strong
+allocator-hook test is green at both optimization levels with exit 42 and
+`live = 0`; it aborts on a leak, unknown free, or double free. The exact
+`VerifiedProgram` differential is green 1/1 over 13 subjects at `-O0` and
+`-O2`, including `Integer` exit 42.
+
+N5 closed under
+`SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1`. The gentle serial
+run passed 223/223 library tests; corpus 1/1 in 93.64s; randomized allocator
+1/1; grind-budget 1/1; LLVM CLI 10/10; differential 1/1 in 31.35s; LSP 1/1;
+SVM differential 1/1; and documentation tests. `cargo check -j1` and rustfmt
+were green as well.
+
+This still does not admit owned `Integer` parameters, arbitrary owned class
+parameters, methods beyond the exact `flip_sign` closure, mutable borrows of
+other classes, discarded class results, field moves, class fields beyond the
+exact `Nat` and `Integer` declarations, nonempty destructors, extern transport,
+or any public/cross-module class ABI.
 
 N0 closed under the exact one-worker command
 `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
@@ -262,5 +300,6 @@ destination-pointer returns and single-use named moves, N2 closed the real
 imported `add` closure, and N3 now closes the imported `sub` and schoolbook
 `mul` closures without changing the hook contract. N4 closes the imported
 `div`, `rem`, and `gcd` closures through scratch-before-drop reassignment and
-the same lexical cleanup protocol. Nested ownership and broader class transport
-remain N5 work.
+the same lexical cleanup protocol. N5 implements the exact nested signed
+`Integer` closure with recursive reverse drop and closes under its
+differential/lifetime evidence; broader class transport stays fenced.

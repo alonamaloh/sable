@@ -131,7 +131,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (through N4 fixed-owner `Nat` arithmetic)
+## Native lowering boundary (through the closed N5 `Integer` closure)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -770,13 +770,59 @@ foreign, or cross-module array ABI.
   a multi-limb quotient-estimate correction, and basic, zero-input, and coprime
   gcd cases. N4 adds no representation, hook, proof rule, or aggregate ABI.
 
-  N5 remains the nested `Integer` sign/magnitude checkpoint, including
-  by-value class constructor/function arguments, class-field borrows, mutable
-  outer borrows and methods, and recursive reverse destruction. At N4, owned
-  class parameters, mutable class borrows, methods, discarded class results,
-  field moves, broader or generic class shapes, nonempty destructors, and every
-  public, extern, or cross-module class ABI stay closed. Generic owner slots
-  and `Vec` remain a separate later design.
+  N5 implements exactly `Integer { Nat mag; u64 neg; }`. Its internal LLVM
+  aggregate nests the already-supported `Nat` representation and an `i64`;
+  this does not infer layouts for arbitrary recursive classes. Constructor
+  validation keeps an initialization bit per field, so owned `mag` and scalar
+  `neg` must each be written exactly once on every reaching path. Class-field
+  lowering now supports the scalar reads/stores and exact nested borrows used
+  by the imported implementation: `&x.mag` yields a shared pointer to the
+  nested owner, while `&a.limbs` yields the established non-owning array
+  descriptor pointer.
+
+  The only new owned-parameter convention is an exact `Nat` take. Internal
+  calls pass its aggregate by value; named caller owners are zeroed when taken,
+  while a class-returning argument is first materialized in a unique
+  entry-hoisted, unregistered scratch slot. The completed aggregate is loaded
+  by value and the scratch is zeroed immediately before the call. The callee
+  installs the aggregate in an owning stack slot and registers it for lexical
+  cleanup. Moving that parameter into `Integer.mag` zeros the slot, so either
+  the field or the unconsumed parameter—never both—owns the nested allocation
+  at cleanup; there is no caller-side post-call drop.
+
+  Mutable `&mut Integer` is a non-owning pointer and is admitted only through
+  the exact checked mutable borrow. Method dependency discovery, internal
+  mangling, validation, and emission are opened for the private unit-returning
+  `Integer::flip_sign(&mut self)` reached by `negate_in_place`; its scalar field
+  update does not imply general method lowering. Recursive drop walks supported
+  class fields in reverse declaration order: `Integer.neg` is a scalar no-op,
+  then `Integer.mag` drops its `Nat.limbs` array through the existing null-safe
+  free path. Registered named-owner and parameter slots become cleanup no-ops
+  after they are zeroed; the unregistered argument scratch is empty before the
+  callee runs.
+
+  The N5 fixture verifies 237/237 obligations across 39 selected functions and
+  directly returns 42 under Clang `-O0` and `-O2`. It covers construction,
+  unary and in-place sign operations, addition, subtraction, multiplication,
+  and Euclidean division/remainder across all operand-sign combinations. A
+  strong allocator-hook test is green at both optimization levels with exit 42
+  and `live = 0`, and aborts on a leak, unknown free, or double free. The exact
+  `VerifiedProgram` differential is green 1/1 over 13 subjects at `-O0` and
+  `-O2`, including `Integer` exit 42.
+
+  N5 closed under
+  `SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1`. The gentle serial
+  run passed 223/223 library tests; corpus 1/1 in 93.64s; randomized allocator
+  1/1; grind-budget 1/1; LLVM CLI 10/10; differential 1/1 in 31.35s; LSP 1/1;
+  SVM differential 1/1; and documentation tests. `cargo check -j1` and rustfmt
+  were green as well. N5 is closed.
+
+  Owned `Integer` parameters, arbitrary owned class parameters, methods beyond
+  this exact `flip_sign` closure, mutable borrows of other classes, discarded
+  class results, field moves, additional or generic class shapes, nonempty
+  destructors, array whole-value transport, and every public, extern, or
+  cross-module class ABI stay closed. Generic owner slots and `Vec` remain a
+  separate later design.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

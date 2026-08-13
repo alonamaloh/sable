@@ -80,6 +80,11 @@ const CASES: &[Case] = &[
         source: "../verifies/bignum_div_native.sable",
         entry: "bignum_div_native_entry",
     },
+    Case {
+        label: "integer-native",
+        source: "../verifies/integer_native.sable",
+        entry: "integer_native_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {

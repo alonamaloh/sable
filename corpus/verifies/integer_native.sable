@@ -1,0 +1,183 @@
+// N5 native Integer subject. Small case functions keep verification contexts
+// bounded while selecting nested Nat ownership, sign mutation, and every real
+// signed arithmetic closure.
+
+use bignum::{Nat};
+use integer::{Integer, of_nat, zero, abs, negate, negate_in_place,
+             int_cmp, int_add, int_sub, int_mul, int_div, int_rem};
+
+/// pre 1 ≤ d
+/// pre s ≤ 1
+/// post result.mag.limbs.len = 1
+/// post natVal result.mag.limbs ≥ 1
+fn small(u32 d, u64 s) -> Integer {
+    mut [u32] xs = alloc_array<u32>(1, 0);
+    xs[0] = d;
+    var m = Nat::from_prefix(&xs, 1);
+    var r = Integer::make(m, s);
+    return r;
+}
+
+fn construction_case() -> i32 {
+    var positive = small(5, 0);
+    var negative = small(5, 1);
+    if (int_cmp(&negative, &positive) != -1) {
+        return 1;
+    }
+
+    mut [u32] limbs = alloc_array<u32>(1, 0);
+    limbs[0] = 6;
+    var magnitude = Nat::from_prefix(&limbs, 1);
+    var from_nat = of_nat(magnitude);
+    var expected = small(6, 0);
+    if (int_cmp(&from_nat, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn unary_case() -> i32 {
+    var positive = small(5, 0);
+    var negative = small(5, 1);
+    var z = zero();
+    if (int_cmp(&z, &positive) != -1) {
+        return 1;
+    }
+    var absolute = abs(&negative);
+    if (int_cmp(&absolute, &positive) != 0) {
+        return 1;
+    }
+    var negated = negate(&positive);
+    if (int_cmp(&negated, &negative) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn in_place_case() -> i32 {
+    var mut value = small(8, 1);
+    var expected = small(8, 0);
+    negate_in_place(&mut value);
+    if (int_cmp(&value, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn add_case() -> i32 {
+    var a = small(7, 1);
+    var b = small(2, 0);
+    var expected = small(5, 1);
+    var sum = int_add(&a, &b);
+    if (int_cmp(&sum, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn sub_case() -> i32 {
+    var a = small(2, 0);
+    var b = small(7, 1);
+    var expected = small(9, 0);
+    var difference = int_sub(&a, &b);
+    if (int_cmp(&difference, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn mul_case() -> i32 {
+    var a = small(7, 1);
+    var b = small(2, 0);
+    var expected = small(14, 1);
+    var product = int_mul(&a, &b);
+    if (int_cmp(&product, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn negative_dividend_case() -> i32 {
+    // Euclidean division keeps the remainder nonnegative: -7 = -4*2 + 1.
+    var a = small(7, 1);
+    var b = small(2, 0);
+    var quotient_expected = small(4, 1);
+    var remainder_expected = small(1, 0);
+    var quotient = int_div(&a, &b);
+    var remainder = int_rem(&a, &b);
+    if (int_cmp(&quotient, &quotient_expected) != 0) {
+        return 1;
+    }
+    if (int_cmp(&remainder, &remainder_expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn negative_divisor_case() -> i32 {
+    var a = small(7, 0);
+    var b = small(2, 1);
+    var quotient_expected = small(3, 1);
+    var remainder_expected = small(1, 0);
+    var quotient = int_div(&a, &b);
+    var remainder = int_rem(&a, &b);
+    if (int_cmp(&quotient, &quotient_expected) != 0) {
+        return 1;
+    }
+    if (int_cmp(&remainder, &remainder_expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn both_negative_case() -> i32 {
+    var a = small(7, 1);
+    var b = small(2, 1);
+    var quotient_expected = small(4, 0);
+    var remainder_expected = small(1, 0);
+    var quotient = int_div(&a, &b);
+    var remainder = int_rem(&a, &b);
+    if (int_cmp(&quotient, &quotient_expected) != 0) {
+        return 1;
+    }
+    if (int_cmp(&remainder, &remainder_expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn integer_native_entry() -> i32 {
+    if (construction_case() != 0) { return 1; }
+    if (unary_case() != 0) { return 2; }
+    if (in_place_case() != 0) { return 3; }
+    if (add_case() != 0) { return 4; }
+    if (sub_case() != 0) { return 5; }
+    if (mul_case() != 0) { return 6; }
+    if (negative_dividend_case() != 0) { return 7; }
+    if (negative_divisor_case() != 0) { return 8; }
+    if (both_negative_case() != 0) { return 9; }
+    return 42;
+}
+
+/// discharge small.call_pre.Integer_make.s_0_natval_m_limbs_1 by
+///   by_cases hs : s = 0
+///   · left; exact hs
+///   · right
+///     rw [h_Nat_from_prefix_post_value]
+///     rw [valIn, if_pos (by omega), valIn_nil (xs.set 0 d) (0 + 1) 1 (by omega)]
+///     rw [Sable.Seq.get_set, if_pos rfl]
+///     omega
+
+/// discharge small.post.natval_result_mag_limbs_1 by
+///   subst result
+///   have hlen : r.mag.limbs.len = 1 := by omega
+///   rcases h_cinv_limbs_len_0_limbs_get_li_2 with h | h
+///   · omega
+///   · rw [hlen] at h
+///     have hz : r.mag.limbs.get 0 ≥ 1 := by
+///       have hi : (1 : Int) - 1 = 0 := by omega
+///       rw [hi] at h
+///       exact h
+///     simp only [natVal]
+///     rw [valIn, if_pos (by omega), valIn_nil r.mag.limbs (0 + 1) r.mag.limbs.len (by omega)]
+///     simpa using hz

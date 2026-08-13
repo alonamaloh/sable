@@ -11,7 +11,7 @@
 use crate::VerifiedProgram;
 use crate::ast::{
     AffineOptionTy, BinOp, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl,
-    Stmt, Ty, UnOp, ValueTy,
+    SelfKind, Stmt, Ty, UnOp, ValueTy,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -82,6 +82,15 @@ fn emit_program(
             root_span_end,
         )?;
     }
+    for &(class, method) in &selected.methods {
+        validate_method(
+            program,
+            class,
+            method,
+            &program.classes[class].methods[method],
+            root_span_end,
+        )?;
+    }
 
     let selected_set: HashSet<usize> = selected.functions.iter().copied().collect();
     let mut out = String::from(
@@ -100,6 +109,10 @@ fn emit_program(
     for &(class, initializer) in &selected.initializers {
         FunctionEmitter::new_initializer(program, class, initializer, &mut support)
             .emit(&mut definitions)?;
+        definitions.push('\n');
+    }
+    for &(class, method) in &selected.methods {
+        FunctionEmitter::new_method(program, class, method, &mut support).emit(&mut definitions)?;
         definitions.push('\n');
     }
     for (index, function) in program.fns.iter().enumerate() {
@@ -126,12 +139,14 @@ fn emit_program(
 enum Callable {
     Function(usize),
     Initializer(usize, usize),
+    Method(usize, usize),
 }
 
 #[derive(Default)]
 struct SelectedCallables {
     functions: Vec<usize>,
     initializers: Vec<(usize, usize)>,
+    methods: Vec<(usize, usize)>,
 }
 
 fn select_callables(
@@ -241,10 +256,12 @@ fn select_callables(
             Callable::Initializer(class, initializer) => {
                 result.initializers.push((class, initializer));
             }
+            Callable::Method(class, method) => result.methods.push((class, method)),
         }
     }
     result.functions.sort_unstable();
     result.initializers.sort_unstable();
+    result.methods.sort_unstable();
     Ok(result)
 }
 
@@ -254,6 +271,15 @@ fn callable_body<'a>(program: &'a Program, callable: Callable) -> &'a [Stmt] {
         Callable::Initializer(class, initializer) => {
             &program.classes[class].inits[initializer].body
         }
+        Callable::Method(class, method) => &program.classes[class].methods[method].f.body,
+    }
+}
+
+fn callable_function(program: &Program, callable: Callable) -> &Fn {
+    match callable {
+        Callable::Function(index) => &program.fns[index],
+        Callable::Initializer(class, initializer) => &program.classes[class].inits[initializer],
+        Callable::Method(class, method) => &program.classes[class].methods[method].f,
     }
 }
 
@@ -264,6 +290,10 @@ fn callable_name(program: &Program, callable: Callable) -> String {
             "{}::{}",
             program.classes[class].name, program.classes[class].inits[initializer].name
         ),
+        Callable::Method(class, method) => format!(
+            "{}::{}",
+            program.classes[class].name, program.classes[class].methods[method].f.name
+        ),
     }
 }
 
@@ -273,6 +303,7 @@ fn callable_span(program: &Program, callable: Callable) -> Span {
         Callable::Initializer(class, initializer) => {
             program.classes[class].inits[initializer].name_span
         }
+        Callable::Method(class, method) => program.classes[class].methods[method].f.name_span,
     }
 }
 
@@ -310,20 +341,35 @@ fn callable_dependencies(
 
     let mut constructors = Vec::new();
     collect_constructors_block(body, &mut constructors);
-    for (class_name, initializer_name, span) in constructors {
-        let Some(class) = program
-            .classes
-            .iter()
-            .position(|declaration| declaration.name == class_name)
-        else {
+    for (class_name, initializer_name, checked_class, span) in constructors {
+        let Some(class) = checked_class else {
             return Err(vec![diag(
                 "backend.constructor_missing",
-                "LLVM lowering could not resolve a constructor",
+                "constructor result has no checked class identity",
                 span,
-                format!("no checked class named `{class_name}`"),
+                format!("`{class_name}::{initializer_name}` is not typed as a class"),
             )]);
         };
-        let Some(initializer) = program.classes[class]
+        let Some(declaration) = program.classes.get(class) else {
+            return Err(vec![diag(
+                "backend.constructor_missing",
+                "constructor result carries an invalid checked class index",
+                span,
+                format!("`{class_name}::{initializer_name}` carries class index {class}"),
+            )]);
+        };
+        if declaration.name != class_name {
+            return Err(vec![diag(
+                "backend.constructor_missing",
+                "constructor spelling disagrees with its checked class identity",
+                span,
+                format!(
+                    "constructor spells `{class_name}`, but its result names `{}`",
+                    declaration.name
+                ),
+            )]);
+        }
+        let Some(initializer) = declaration
             .inits
             .iter()
             .position(|declaration| declaration.name == initializer_name)
@@ -336,6 +382,76 @@ fn callable_dependencies(
             )]);
         };
         result.push(Callable::Initializer(class, initializer));
+    }
+    let mut methods = Vec::new();
+    collect_method_calls_block(body, &mut methods);
+    for (receiver, method_name, span) in methods {
+        let receiver_ty = if receiver == "self" {
+            match callable {
+                Callable::Initializer(class, _) | Callable::Method(class, _) => Ty::Class(class),
+                Callable::Function(_) => {
+                    return Err(vec![diag(
+                        "backend.class_unsupported",
+                        "method receiver `self` is outside a class member",
+                        span,
+                        "a free function has no implicit receiver",
+                    )]);
+                }
+            }
+        } else {
+            callable_function(program, callable)
+                .params
+                .iter()
+                .find(|parameter| parameter.name == receiver)
+                .map(|parameter| parameter.ty)
+                .or_else(|| find_declared_type(body, &receiver))
+                .ok_or_else(|| {
+                    vec![diag(
+                        "backend.class_unsupported",
+                        "method receiver is not a checked local",
+                        span,
+                        format!("`{receiver}` has no declaration in this callable"),
+                    )]
+                })?
+        };
+        let class = match receiver_ty {
+            Ty::Class(class) | Ty::ClassRef(class, _) => class,
+            other => {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "method receiver has a non-class checked type",
+                    span,
+                    format!("`{receiver}` has type `{}`", other.name()),
+                )]);
+            }
+        };
+        let Some(receiver_class) = program.classes.get(class) else {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "method receiver carries an invalid checked class index",
+                span,
+                format!("`{receiver}` carries class index {class}, outside the checked program"),
+            )]);
+        };
+        let candidates = receiver_class
+            .methods
+            .iter()
+            .enumerate()
+            .filter(|(_, method)| method.f.name == method_name)
+            .map(|(method, _)| method)
+            .collect::<Vec<_>>();
+        let [method] = candidates.as_slice() else {
+            return Err(vec![diag(
+                "backend.method_missing",
+                "LLVM lowering could not resolve a unique method",
+                span,
+                format!(
+                    "method `{method_name}` has {} checked candidate(s)",
+                    candidates.len()
+                ),
+            )]);
+        };
+        result.push(Callable::Method(class, *method));
     }
     Ok(result)
 }
@@ -445,6 +561,13 @@ fn validate_acyclic(
                 .copied()
                 .map(|(class, initializer)| Callable::Initializer(class, initializer)),
         )
+        .chain(
+            selected
+                .methods
+                .iter()
+                .copied()
+                .map(|(class, method)| Callable::Method(class, method)),
+        )
         .collect();
     let mut states = HashMap::new();
     for &callable in &selected_set {
@@ -506,7 +629,7 @@ fn validate_function(
         )?;
     }
     if let Ty::Class(class) = function.ret {
-        require_fixed_u32_class(program, class, function.name_span, "function return type")?;
+        require_fixed_class(program, class, function.name_span, "function return type")?;
     } else {
         require_runtime_type(
             program,
@@ -534,6 +657,7 @@ fn validate_function(
         &mut locals,
         function.ret,
         None,
+        None,
     )
     .map(|_| ())
 }
@@ -541,7 +665,7 @@ fn validate_function(
 #[derive(Clone, PartialEq, Eq)]
 struct InitializerValidation {
     class: usize,
-    field_initialized: bool,
+    fields_initialized: Vec<bool>,
 }
 
 fn validate_initializer(
@@ -550,7 +674,7 @@ fn validate_initializer(
     initializer: &Fn,
     root_span_end: usize,
 ) -> Result<(), Vec<BackendError>> {
-    require_fixed_u32_class(
+    let declaration = require_fixed_class(
         program,
         class,
         initializer.name_span,
@@ -583,7 +707,7 @@ fn validate_initializer(
     }
     let mut context = InitializerValidation {
         class,
-        field_initialized: false,
+        fields_initialized: vec![false; declaration.fields.len()],
     };
     validate_block(
         program,
@@ -592,17 +716,68 @@ fn validate_initializer(
         &mut locals,
         Ty::Unit,
         Some(&mut context),
+        None,
     )?;
-    if !context.field_initialized {
+    if context
+        .fields_initialized
+        .iter()
+        .any(|initialized| !initialized)
+    {
         return Err(vec![unsupported(
             initializer.name_span,
             format!(
-                "initializer `{}::{}` does not initialize its owned `u32` array field",
+                "initializer `{}::{}` does not initialize every native field exactly once",
                 program.classes[class].name, initializer.name
             ),
         )]);
     }
     Ok(())
+}
+
+fn validate_method(
+    program: &Program,
+    class: usize,
+    method_index: usize,
+    method: &crate::ast::Method,
+    root_span_end: usize,
+) -> Result<(), Vec<BackendError>> {
+    let declaration = require_fixed_class(program, class, method.f.name_span, "selected method")?;
+    if declaration.name != "Integer"
+        || method_index != 0
+        || method.f.name != "flip_sign"
+        || method.self_kind != SelfKind::Mut
+        || !method.f.params.is_empty()
+        || method.f.ret != Ty::Unit
+        || method.f.extern_info.is_some()
+        || !method.f.type_params.is_empty()
+        || !method.f.type_bounds.is_empty()
+    {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "method is outside the exact native Integer slice",
+            method.f.name_span,
+            "N5 admits only `Integer::flip_sign(&mut self) -> ()` with no explicit arguments",
+        )]);
+    }
+    let mut locals = ValidationLocals::new();
+    locals.insert(
+        "self".into(),
+        ValidationLocal {
+            ty: Ty::ClassRef(class, Mutability::Mut),
+            mutable: true,
+        },
+        method.f.name_span,
+    )?;
+    validate_block(
+        program,
+        &method.f.body,
+        root_span_end,
+        &mut locals,
+        Ty::Unit,
+        None,
+        Some((class, method.self_kind)),
+    )
+    .map(|_| ())
 }
 
 #[derive(Clone, Copy)]
@@ -697,6 +872,7 @@ fn validate_block(
     locals: &mut ValidationLocals,
     ret_ty: Ty,
     mut initializer: Option<&mut InitializerValidation>,
+    method: Option<(usize, SelfKind)>,
 ) -> Result<bool, Vec<BackendError>> {
     let mut returned = false;
     for statement in statements {
@@ -909,6 +1085,7 @@ fn validate_block(
                     locals,
                     ret_ty,
                     initializer.as_deref_mut(),
+                    method,
                 )?;
             }
             Stmt::If {
@@ -928,6 +1105,7 @@ fn validate_block(
                     locals,
                     ret_ty,
                     then_initializer.as_mut(),
+                    method,
                 )?;
                 locals.pop_scope();
                 let then_moved = locals.moved_classes.clone();
@@ -942,6 +1120,7 @@ fn validate_block(
                         locals,
                         ret_ty,
                         else_initializer.as_mut(),
+                        method,
                     )?;
                     locals.pop_scope();
                     (else_returned, locals.moved_classes.clone())
@@ -987,6 +1166,7 @@ fn validate_block(
                     locals,
                     ret_ty,
                     body_initializer.as_mut(),
+                    method,
                 )?;
                 locals.pop_scope();
                 if body_initializer != before {
@@ -1017,6 +1197,7 @@ fn validate_block(
                 root_span_end,
                 locals,
                 initializer.as_deref_mut(),
+                method,
             )?,
             Stmt::FieldStore {
                 field,
@@ -1088,7 +1269,7 @@ fn is_owned_native_array(ty: Ty) -> bool {
     is_owned_bool_array(ty) || is_owned_u32_array(ty)
 }
 
-fn require_fixed_u32_class<'a>(
+fn require_fixed_class<'a>(
     program: &'a Program,
     class: usize,
     span: Span,
@@ -1100,32 +1281,80 @@ fn require_fixed_u32_class<'a>(
             format!("{role} carries class index {class}, outside the checked program"),
         )]);
     };
-    let supported_field = declaration.fields.len() == 1
+    let common_supported = declaration.type_params.is_empty()
+        && declaration.type_bounds.is_empty()
+        && declaration.proof_reuse.is_none()
+        && declaration.fields.iter().all(|field| !field.must_consume);
+    let nat_supported = declaration.name == "Nat"
+        && declaration.fields.len() == 1
+        && declaration.fields[0].name == "limbs"
         && declaration.fields[0].ty == Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned)
-        && !declaration.fields[0].must_consume;
-    if !declaration.type_params.is_empty()
-        || !declaration.type_bounds.is_empty()
-        || !declaration.proof_reuse.is_none()
-        || !supported_field
-        || !declaration.methods.is_empty()
-        || !matches!(declaration.deinit.as_deref(), Some([]))
-    {
+        && declaration.methods.is_empty()
+        && matches!(declaration.deinit.as_deref(), Some([]));
+    let integer_supported = declaration.name == "Integer"
+        && declaration.fields.len() == 2
+        && declaration.fields[0].name == "mag"
+        && matches!(declaration.fields[0].ty, Ty::Class(child) if child != class)
+        && declaration.fields[1].name == "neg"
+        && declaration.fields[1].ty == Ty::Int(IntTy::U64)
+        && declaration.methods.len() == 1
+        && declaration.methods[0].f.name == "flip_sign"
+        && declaration.methods[0].self_kind == SelfKind::Mut
+        && declaration.methods[0].f.params.is_empty()
+        && declaration.methods[0].f.ret == Ty::Unit
+        && matches!(declaration.deinit.as_deref(), None | Some([]));
+    if !common_supported || (!nat_supported && !integer_supported) {
         return Err(vec![diag(
             "backend.class_unsupported",
             "class is outside the fixed-owner native slice",
             span,
             format!(
-                "{role} uses `{}`; N1a admits only one concrete class with one owned `[u32]` field, no methods, and an explicit empty destructor",
+                "{role} uses `{}`; N5 admits only exact concrete `Nat {{ [u32] limbs }}` and `Integer {{ Nat mag; u64 neg }}` shapes with the selected empty destruction/method surface",
                 declaration.name
             ),
         )]);
+    }
+    if integer_supported {
+        let Ty::Class(child) = declaration.fields[0].ty else {
+            unreachable!("checked Integer magnitude field")
+        };
+        let Some(child_declaration) = program.classes.get(child) else {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "Integer magnitude carries an invalid class index",
+                span,
+                format!("`{}.mag` carries class index {child}", declaration.name),
+            )]);
+        };
+        let child_is_nat = child_declaration.name == "Nat"
+            && child_declaration.type_params.is_empty()
+            && child_declaration.type_bounds.is_empty()
+            && child_declaration.proof_reuse.is_none()
+            && child_declaration.fields.len() == 1
+            && child_declaration.fields[0].name == "limbs"
+            && child_declaration.fields[0].ty
+                == Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned)
+            && !child_declaration.fields[0].must_consume
+            && child_declaration.methods.is_empty()
+            && matches!(child_declaration.deinit.as_deref(), Some([]));
+        if !child_is_nat {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "Integer magnitude does not use the exact native Nat shape",
+                span,
+                format!(
+                    "`{}.mag` names `{}`",
+                    declaration.name, child_declaration.name
+                ),
+            )]);
+        }
     }
     Ok(declaration)
 }
 
 fn require_initializer_parameter(
     program: &Program,
-    root_span_end: usize,
+    _root_span_end: usize,
     ty: Ty,
     span: Span,
 ) -> Result<(), Vec<BackendError>> {
@@ -1133,18 +1362,26 @@ fn require_initializer_parameter(
         Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) => Ok(()),
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
-        _ => {
-            require_parameter_value(program, root_span_end, ty, span, "initializer parameter")?;
-            Err(vec![diag(
-                "backend.class_unsupported",
-                "initializer parameter is outside the fixed-owner native slice",
-                span,
-                format!(
-                    "initializer parameter type `{}` is not scalar or shared `[u32]`",
-                    ty.name()
-                ),
-            )])
+        Ty::Class(class) => {
+            let declaration = require_fixed_class(program, class, span, "initializer parameter")?;
+            if declaration.name == "Nat" {
+                Ok(())
+            } else {
+                Err(vec![diag(
+                    "backend.class_unsupported",
+                    "initializer owned parameter is outside the exact native take ABI",
+                    span,
+                    "N5 admits only owned `Nat` initializer parameters",
+                )])
+            }
         }
+        _ => Err(vec![unsupported(
+            span,
+            format!(
+                "initializer parameter type `{}` is outside the exact native constructor ABI",
+                ty.name()
+            ),
+        )]),
     }
 }
 
@@ -1156,7 +1393,7 @@ fn validate_fixed_class_initializer(
     locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     let declaration =
-        require_fixed_u32_class(program, class, expression.span, "class local initializer")?;
+        require_fixed_class(program, class, expression.span, "class local initializer")?;
     require_expr_type(expression, Ty::Class(class), "class constructor result")?;
     match &expression.kind {
         ExprKind::CtorCall {
@@ -1199,21 +1436,15 @@ fn validate_fixed_class_initializer(
                     ),
                 )]);
             }
-            for (argument, parameter) in args.iter().zip(&initializer.params) {
-                require_initializer_parameter(
-                    program,
-                    root_span_end,
-                    parameter.ty,
-                    parameter.span,
-                )?;
-                if parameter.ty == Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) {
-                    validate_u32_array_borrow_argument(argument, parameter.ty, locals)?;
-                } else {
-                    validate_expr(program, argument, root_span_end, locals)?;
-                    require_expr_type(argument, parameter.ty, "constructor argument")?;
-                }
-            }
-            validate_u32_borrow_aliases(args, &initializer.params)
+            validate_moving_arguments(
+                program,
+                &initializer.params,
+                args,
+                root_span_end,
+                locals,
+                true,
+                "constructor",
+            )
         }
         ExprKind::Call {
             callee,
@@ -1244,7 +1475,15 @@ fn validate_fixed_class_initializer(
                     format!("`{callee}` does not return the checked fixed-owner class"),
                 )]);
             }
-            validate_call_arguments(program, function, args, root_span_end, locals)
+            validate_moving_arguments(
+                program,
+                &function.params,
+                args,
+                root_span_end,
+                locals,
+                false,
+                "class-returning call",
+            )
         }
         ExprKind::Var(source) => {
             let Some(local) = locals.get(source) else {
@@ -1274,6 +1513,91 @@ fn validate_fixed_class_initializer(
     }
 }
 
+fn validate_moving_arguments(
+    program: &Program,
+    params: &[crate::ast::Param],
+    args: &[Expr],
+    root_span_end: usize,
+    locals: &mut ValidationLocals,
+    initializer_parameters: bool,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    if args.len() != params.len() {
+        return Err(vec![unsupported(
+            args.first()
+                .map_or(Span::new(0, 0), |argument| argument.span),
+            format!(
+                "{role} has {} argument(s), expected {}",
+                args.len(),
+                params.len()
+            ),
+        )]);
+    }
+    validate_owned_argument_aliases(args, params, locals)?;
+    for (argument, parameter) in args.iter().zip(params) {
+        if initializer_parameters {
+            require_initializer_parameter(program, root_span_end, parameter.ty, parameter.span)?;
+        } else {
+            require_parameter_value(
+                program,
+                root_span_end,
+                parameter.ty,
+                parameter.span,
+                "class-returning function parameter",
+            )?;
+        }
+        match parameter.ty {
+            Ty::Class(class) => {
+                validate_fixed_class_initializer(program, class, argument, root_span_end, locals)?;
+            }
+            Ty::ClassRef(..) => {
+                validate_class_borrow_argument(program, argument, parameter.ty, locals)?;
+            }
+            Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared | Mutability::Mut) => {
+                validate_u32_array_borrow_argument(program, argument, parameter.ty, locals)?
+            }
+            _ => {
+                validate_expr(program, argument, root_span_end, locals)?;
+                require_expr_type(argument, parameter.ty, "moving call argument")?;
+            }
+        }
+    }
+    validate_borrow_aliases(args, params, locals)
+}
+
+fn validate_owned_argument_aliases(
+    args: &[Expr],
+    params: &[crate::ast::Param],
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    for (owned_index, (owned_argument, owned_parameter)) in args.iter().zip(params).enumerate() {
+        if !matches!(owned_parameter.ty, Ty::Class(_)) {
+            continue;
+        }
+        let ExprKind::Var(owner) = &owned_argument.kind else {
+            continue;
+        };
+        for (borrow_index, borrow_argument) in args.iter().enumerate() {
+            if owned_index == borrow_index {
+                continue;
+            }
+            let mut places = Vec::new();
+            collect_argument_borrow_places(borrow_argument, locals, &mut places);
+            if places.iter().any(|(place, _, _)| place == owner) {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "owned class argument overlaps a borrow in the same call",
+                    borrow_argument.span,
+                    format!(
+                        "`{owner}` is both borrowed and moved by value; moving it would invalidate the callee's borrow"
+                    ),
+                )]);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_call_arguments(
     program: &Program,
     function: &Fn,
@@ -1293,7 +1617,10 @@ fn validate_call_arguments(
         )]);
     }
     for (argument, parameter) in args.iter().zip(&function.params) {
-        if matches!(parameter.ty, Ty::ClassRef(_, Mutability::Shared)) {
+        if matches!(
+            parameter.ty,
+            Ty::ClassRef(_, Mutability::Shared | Mutability::Mut)
+        ) {
             validate_class_borrow_argument(program, argument, parameter.ty, locals)?;
         } else if matches!(
             parameter.ty,
@@ -1302,13 +1629,13 @@ fn validate_call_arguments(
                 Mutability::Shared | Mutability::Mut
             )
         ) {
-            validate_u32_array_borrow_argument(argument, parameter.ty, locals)?;
+            validate_u32_array_borrow_argument(program, argument, parameter.ty, locals)?;
         } else {
             validate_expr(program, argument, root_span_end, locals)?;
             require_expr_type(argument, parameter.ty, "call argument")?;
         }
     }
-    validate_u32_borrow_aliases(args, &function.params)
+    validate_borrow_aliases(args, &function.params, locals)
 }
 
 fn validate_initializer_field_assign(
@@ -1317,35 +1644,92 @@ fn validate_initializer_field_assign(
     field_span: Span,
     value: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
     initializer: Option<&mut InitializerValidation>,
+    method: Option<(usize, SelfKind)>,
 ) -> Result<(), Vec<BackendError>> {
-    let Some(initializer) = initializer else {
+    let class = initializer
+        .as_ref()
+        .map(|context| context.class)
+        .or_else(|| method.map(|m| m.0));
+    let Some(class) = class else {
         return Err(vec![unsupported(
             field_span,
-            "class field assignment is outside a supported initializer",
+            "class field assignment is outside a supported member",
         )]);
     };
-    let declaration = require_fixed_u32_class(
-        program,
-        initializer.class,
-        field_span,
-        "initializer field assignment",
-    )?;
-    if field != declaration.fields[0].name || initializer.field_initialized {
+    let declaration = require_fixed_class(program, class, field_span, "member field assignment")?;
+    let Some((field_index, declaration_field)) = declaration
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, declaration_field)| declaration_field.name == field)
+    else {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "fixed-owner class field initialization is incoherent",
+            "fixed-owner class field assignment names an unknown field",
             field_span,
-            format!(
-                "field `{field}` is not the unique uninitialized owned field of `{}`",
-                declaration.name
-            ),
+            format!("class `{}` has no field `{field}`", declaration.name),
         )]);
+    };
+    if let Some(initializer) = initializer {
+        if initializer.fields_initialized[field_index] {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "fixed-owner class field is initialized more than once",
+                field_span,
+                format!(
+                    "field `{}.{field}` was already initialized",
+                    declaration.name
+                ),
+            )]);
+        }
+        match declaration_field.ty {
+            Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+                validate_fresh_u32_array_initializer(program, value, root_span_end, locals)?;
+            }
+            Ty::Class(child) => {
+                validate_fixed_class_initializer(program, child, value, root_span_end, locals)?;
+            }
+            Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => {
+                validate_expr(program, value, root_span_end, locals)?;
+                require_expr_type(value, declaration_field.ty, "initializer scalar field")?;
+            }
+            other => {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "field type is outside the exact native class layout",
+                    field_span,
+                    format!("`{}.{field}` has type `{}`", declaration.name, other.name()),
+                )]);
+            }
+        }
+        initializer.fields_initialized[field_index] = true;
+        return Ok(());
     }
-    validate_fresh_u32_array_initializer(program, value, root_span_end, locals)?;
-    initializer.field_initialized = true;
-    Ok(())
+    let Some((_, SelfKind::Mut)) = method else {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "shared method cannot assign a class field",
+            field_span,
+            "N5 field mutation requires `&mut self`",
+        )]);
+    };
+    let Ty::Int(integer) = declaration_field.ty else {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "method field replacement is outside the exact native Integer slice",
+            field_span,
+            "N5 methods may assign only the scalar `Integer.neg` field",
+        )]);
+    };
+    require_concrete_integer(integer, field_span, "method scalar field")?;
+    validate_expr(program, value, root_span_end, locals)?;
+    require_expr_type(
+        value,
+        declaration_field.ty,
+        "method scalar field assignment",
+    )
 }
 
 fn validate_initializer_field_store(
@@ -1364,13 +1748,28 @@ fn validate_initializer_field_store(
             "class field store is outside a supported initializer",
         )]);
     };
-    let declaration = require_fixed_u32_class(
+    let declaration = require_fixed_class(
         program,
         initializer.class,
         field_span,
         "initializer field store",
     )?;
-    if field != declaration.fields[0].name || !initializer.field_initialized {
+    let Some((field_index, declaration_field)) = declaration
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, declaration_field)| declaration_field.name == field)
+    else {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "fixed-owner class field store names an unknown field",
+            field_span,
+            format!("class `{}` has no field `{field}`", declaration.name),
+        )]);
+    };
+    if declaration_field.ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned)
+        || !initializer.fields_initialized[field_index]
+    {
         return Err(vec![diag(
             "backend.class_unsupported",
             "fixed-owner class field store has no initialized destination",
@@ -1393,7 +1792,7 @@ fn validate_fixed_class_field_base(
     object: &str,
     field: &str,
     span: Span,
-) -> Result<usize, Vec<BackendError>> {
+) -> Result<(usize, usize, Ty), Vec<BackendError>> {
     let Some(local) = locals.get(object) else {
         return Err(vec![unsupported(
             span,
@@ -1404,7 +1803,7 @@ fn validate_fixed_class_field_base(
         locals.require_live_class(object, span, "class field access")?;
     }
     let class = match local.ty {
-        Ty::Class(class) | Ty::ClassRef(class, Mutability::Shared) => class,
+        Ty::Class(class) | Ty::ClassRef(class, Mutability::Shared | Mutability::Mut) => class,
         _ => {
             return Err(vec![diag(
                 "backend.class_unsupported",
@@ -1414,16 +1813,21 @@ fn validate_fixed_class_field_base(
             )]);
         }
     };
-    let declaration = require_fixed_u32_class(program, class, span, "class field access")?;
-    if declaration.fields[0].name != field {
+    let declaration = require_fixed_class(program, class, span, "class field access")?;
+    let Some((field_index, declaration_field)) = declaration
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, declaration_field)| declaration_field.name == field)
+    else {
         return Err(vec![diag(
             "backend.class_unsupported",
             "class field access names an unsupported field",
             span,
             format!("class `{}` has no native field `{field}`", declaration.name),
         )]);
-    }
-    Ok(class)
+    };
+    Ok((class, field_index, declaration_field.ty))
 }
 
 fn affine_bool_option_ty() -> Ty {
@@ -1728,6 +2132,7 @@ fn validate_native_array_store(
 }
 
 fn validate_u32_array_borrow_argument(
+    program: &Program,
     argument: &Expr,
     expected: Ty,
     locals: &ValidationLocals,
@@ -1753,12 +2158,6 @@ fn validate_u32_array_borrow_argument(
             "borrowed `u32` array parameters require an explicit named borrow",
         )]);
     };
-    if field.is_some() {
-        return Err(vec![unsupported(
-            argument.span,
-            "N0 does not lower array borrows from class fields",
-        )]);
-    }
     let requested = if *mutable {
         Mutability::Mut
     } else {
@@ -1776,6 +2175,27 @@ fn validate_u32_array_borrow_argument(
             format!("array borrow names unknown or out-of-scope local `{array}`"),
         )]);
     };
+    if let Some(field) = field {
+        if *mutable {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "mutable class-field borrow is outside the native Integer slice",
+                argument.span,
+                "N5 admits shared `u32` field borrows only",
+            )]);
+        }
+        let (_, _, field_ty) =
+            validate_fixed_class_field_base(program, locals, array, field, argument.span)?;
+        if field_ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "array field borrow has the wrong native type",
+                argument.span,
+                format!("`{array}.{field}` has type `{}`", field_ty.name()),
+            )]);
+        }
+        return Ok(());
+    }
     let Ty::Array(ValueTy::Int(IntTy::U32), source_mutability) = source.ty else {
         return Err(vec![unsupported(
             argument.span,
@@ -1800,27 +2220,54 @@ fn validate_class_borrow_argument(
     expected: Ty,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let Ty::ClassRef(class, Mutability::Shared) = expected else {
+    let Ty::ClassRef(class, expected_mutability @ (Mutability::Shared | Mutability::Mut)) =
+        expected
+    else {
         return Err(vec![diag(
             "backend.class_unsupported",
             "class borrow is outside the fixed-owner native slice",
             argument.span,
-            format!("class borrow parameter `{}` is not shared", expected.name()),
+            format!(
+                "class borrow parameter `{}` has no native reference representation",
+                expected.name()
+            ),
         )]);
     };
-    require_fixed_u32_class(program, class, argument.span, "class borrow parameter")?;
+    require_fixed_class(program, class, argument.span, "class borrow parameter")?;
     require_expr_type(argument, expected, "class borrow argument")?;
+    if let ExprKind::Var(name) = &argument.kind {
+        let Some(source) = locals.get(name) else {
+            return Err(vec![unsupported(
+                argument.span,
+                format!("class reference names unknown local `{name}`"),
+            )]);
+        };
+        if !matches!(source.ty, Ty::ClassRef(source_class, source_mutability)
+            if source_class == class
+                && (source_mutability == expected_mutability
+                    || (source_mutability == Mutability::Mut
+                        && expected_mutability == Mutability::Shared)))
+        {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "forwarded class reference has the wrong nominal type or mutability",
+                argument.span,
+                format!("`{name}` has type `{}`", source.ty.name()),
+            )]);
+        }
+        return Ok(());
+    }
     let ExprKind::Borrow {
         array,
-        field: None,
-        mutable: false,
+        field,
+        mutable,
     } = &argument.kind
     else {
         return Err(vec![diag(
             "backend.class_unsupported",
             "class borrow argument is outside the fixed-owner native slice",
             argument.span,
-            "a shared class parameter requires an explicit fieldless named shared borrow",
+            "a class parameter requires an explicit named borrow with matching mutability",
         )]);
     };
     let Some(source) = locals.get(array) else {
@@ -1832,11 +2279,42 @@ fn validate_class_borrow_argument(
     if matches!(source.ty, Ty::Class(_)) {
         locals.require_live_class(array, argument.span, "class borrow")?;
     }
-    if !matches!(
-        source.ty,
-        Ty::Class(source_class) | Ty::ClassRef(source_class, Mutability::Shared)
-            if source_class == class
-    ) {
+    let requested_mutability = if *mutable {
+        Mutability::Mut
+    } else {
+        Mutability::Shared
+    };
+    if requested_mutability != expected_mutability {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "class borrow syntax has the wrong mutability",
+            argument.span,
+            format!("expected `{}`", expected.name()),
+        )]);
+    }
+    if let Some(field) = field {
+        if *mutable {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "mutable class-field borrow is outside the native Integer slice",
+                argument.span,
+                "borrow the whole Integer mutably and mutate through its method",
+            )]);
+        }
+        let (_, _, field_ty) =
+            validate_fixed_class_field_base(program, locals, array, field, argument.span)?;
+        if field_ty != Ty::Class(class) {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "class field borrow has the wrong nominal type",
+                argument.span,
+                format!("`{array}.{field}` has type `{}`", field_ty.name()),
+            )]);
+        }
+        return Ok(());
+    }
+    if !matches!(source.ty, Ty::Class(source_class) | Ty::ClassRef(source_class, _) if source_class == class)
+    {
         return Err(vec![diag(
             "backend.class_unsupported",
             "class borrow source has the wrong nominal type",
@@ -1848,47 +2326,206 @@ fn validate_class_borrow_argument(
             ),
         )]);
     }
+    let mutable_source = match source.ty {
+        Ty::Class(_) => source.mutable,
+        Ty::ClassRef(_, Mutability::Mut) => true,
+        _ => false,
+    };
+    if expected_mutability == Mutability::Mut && !mutable_source {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "mutable class borrow needs a mutable owner or reference",
+            argument.span,
+            format!("`{array}` cannot be borrowed mutably"),
+        )]);
+    }
     Ok(())
 }
 
-fn validate_u32_borrow_aliases(
+fn validate_borrow_aliases(
     args: &[Expr],
     params: &[crate::ast::Param],
+    locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let mut borrows: Vec<(&str, bool, Span)> = Vec::new();
+    let mut prior_places: Vec<(String, bool, Span)> = Vec::new();
     for (argument, parameter) in args.iter().zip(params) {
-        if !matches!(
-            parameter.ty,
-            Ty::Array(
-                ValueTy::Int(IntTy::U32),
-                Mutability::Shared | Mutability::Mut
-            )
-        ) {
-            continue;
+        let mut places = Vec::new();
+        collect_argument_borrow_places(argument, locals, &mut places);
+        if matches!(parameter.ty, Ty::ClassRef(_, Mutability::Mut)) {
+            if let Some((_, mutable, _)) = places.first_mut() {
+                *mutable = true;
+            }
         }
-        let ExprKind::Borrow {
-            array,
-            field: None,
-            mutable,
-        } = &argument.kind
-        else {
-            continue;
-        };
-        if let Some((_, _, prior_span)) = borrows
-            .iter()
-            .find(|(prior, prior_mutable, _)| *prior == array && (*prior_mutable || *mutable))
-        {
-            return Err(vec![unsupported(
-                argument.span,
-                format!(
-                    "call aliases array `{array}` through mutable and overlapping borrows (first borrow at byte {})",
-                    prior_span.start
-                ),
-            )]);
+        for (place, mutable, span) in &places {
+            if let Some((_, _, prior_span)) = prior_places
+                .iter()
+                .find(|(prior, prior_mutable, _)| prior == place && (*prior_mutable || *mutable))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "call aliases `{place}` through mutable and overlapping borrows during argument evaluation (first borrow at byte {})",
+                        prior_span.start
+                    ),
+                )]);
+            }
         }
-        borrows.push((array, *mutable, argument.span));
+        prior_places.extend(places);
     }
     Ok(())
+}
+
+fn collect_argument_borrow_places(
+    expression: &Expr,
+    locals: &ValidationLocals,
+    places: &mut Vec<(String, bool, Span)>,
+) {
+    match &expression.kind {
+        ExprKind::Borrow { array, mutable, .. } => {
+            places.push((array.clone(), *mutable, expression.span));
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            // The only admitted native method has a mutable receiver. Keeping
+            // that receiver visible here also fences a retained outer borrow
+            // from overlapping a nested method evaluation.
+            places.push((recv.clone(), true, expression.span));
+            for argument in args {
+                collect_argument_borrow_places(argument, locals, places);
+            }
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::TraitCall { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::ArrayLit(args) => {
+            for argument in args {
+                collect_argument_borrow_places(argument, locals, places);
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Widen { arg: operand, .. }
+        | ExprKind::Narrow { arg: operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => collect_argument_borrow_places(operand, locals, places),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_argument_borrow_places(lhs, locals, places);
+            collect_argument_borrow_places(rhs, locals, places);
+        }
+        ExprKind::Index { array, index, .. } => {
+            places.push((array.clone(), false, expression.span));
+            collect_argument_borrow_places(index, locals, places);
+        }
+        ExprKind::Len { array } => {
+            places.push((array.clone(), false, expression.span));
+        }
+        ExprKind::SelfFieldIndex { index, .. } => {
+            places.push(("self".into(), false, expression.span));
+            collect_argument_borrow_places(index, locals, places);
+        }
+        ExprKind::SelfField { .. } | ExprKind::SelfFieldLen { .. } => {
+            places.push(("self".into(), false, expression.span));
+        }
+        ExprKind::ClassFieldIndex { obj, index, .. } => {
+            places.push((obj.clone(), false, expression.span));
+            collect_argument_borrow_places(index, locals, places);
+        }
+        ExprKind::ClassField { obj, .. } | ExprKind::ClassFieldLen { obj, .. } => {
+            places.push((obj.clone(), false, expression.span));
+        }
+        ExprKind::AllocArray { len, init, .. } => {
+            collect_argument_borrow_places(len, locals, places);
+            collect_argument_borrow_places(init, locals, places);
+        }
+        ExprKind::Var(name) => match locals.get(name).map(|local| local.ty) {
+            Some(Ty::Class(_)) | Some(Ty::ClassRef(_, Mutability::Mut)) => {
+                places.push((name.clone(), true, expression.span));
+            }
+            Some(Ty::ClassRef(_, Mutability::Shared)) => {
+                places.push((name.clone(), false, expression.span));
+            }
+            _ => {}
+        },
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::NoneE
+        | ExprKind::RecordField { .. }
+        | ExprKind::OptTake { .. } => {}
+    }
+}
+
+fn validate_native_method_call(
+    program: &Program,
+    expression: &Expr,
+    receiver: &str,
+    receiver_span: Span,
+    method_name: &str,
+    args: &[Expr],
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    let Some(local) = locals.get(receiver) else {
+        return Err(vec![unsupported(
+            receiver_span,
+            format!("method receiver names unknown local `{receiver}`"),
+        )]);
+    };
+    if matches!(local.ty, Ty::Class(_)) {
+        locals.require_live_class(receiver, receiver_span, "method receiver")?;
+    }
+    let class = match local.ty {
+        Ty::Class(class) | Ty::ClassRef(class, _) => class,
+        other => {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "native method receiver is not a class",
+                receiver_span,
+                format!("`{receiver}` has type `{}`", other.name()),
+            )]);
+        }
+    };
+    let declaration = require_fixed_class(program, class, receiver_span, "method receiver")?;
+    let Some(method) = declaration
+        .methods
+        .iter()
+        .find(|candidate| candidate.f.name == method_name)
+    else {
+        return Err(vec![diag(
+            "backend.method_missing",
+            "native method was not found on its receiver",
+            expression.span,
+            format!("class `{}` has no method `{method_name}`", declaration.name),
+        )]);
+    };
+    if method.f.name != "flip_sign"
+        || method.self_kind != SelfKind::Mut
+        || !method.f.params.is_empty()
+        || method.f.ret != Ty::Unit
+        || !args.is_empty()
+    {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "method call is outside the exact native Integer slice",
+            expression.span,
+            "N5 admits only the zero-argument unit method `Integer::flip_sign`",
+        )]);
+    }
+    let receiver_is_mutable = match local.ty {
+        Ty::Class(_) => local.mutable,
+        Ty::ClassRef(_, Mutability::Mut) => true,
+        _ => false,
+    };
+    if !receiver_is_mutable {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "mutable method receiver is not mutable",
+            receiver_span,
+            format!("`{receiver}` cannot receive `&mut self`"),
+        )]);
+    }
+    require_expr_type(expression, Ty::Unit, "native method result")
 }
 
 fn validate_expr(
@@ -2311,13 +2948,13 @@ fn validate_expr(
             )])
         }
         ExprKind::MethodCall {
-            recv, recv_span, ..
+            recv,
+            recv_span,
+            method,
+            args,
+            ..
         } => {
-            reject_named_affine_option(locals, recv, *recv_span, "method receiver")?;
-            Err(vec![unsupported(
-                expression.span,
-                "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
-            )])
+            validate_native_method_call(program, expression, recv, *recv_span, method, args, locals)
         }
         ExprKind::ClassFieldIndex {
             obj,
@@ -2325,21 +2962,64 @@ fn validate_expr(
             field,
             index,
         } => {
-            validate_fixed_class_field_base(program, locals, obj, field, *obj_span)?;
+            let (_, _, field_ty) =
+                validate_fixed_class_field_base(program, locals, obj, field, *obj_span)?;
+            if field_ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "indexed class field is not the native `u32` array",
+                    expression.span,
+                    format!("`{obj}.{field}` has type `{}`", field_ty.name()),
+                )]);
+            }
             validate_expr(program, index, root_span_end, locals)?;
             require_expr_type(index, Ty::Int(IntTy::U64), "class array-field index")?;
             require_expr_type(expression, Ty::Int(IntTy::U32), "class array-field element")
         }
         ExprKind::ClassFieldLen { obj, field } => {
-            validate_fixed_class_field_base(program, locals, obj, field, expression.span)?;
+            let (_, _, field_ty) =
+                validate_fixed_class_field_base(program, locals, obj, field, expression.span)?;
+            if field_ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "class `.len` field is not the native `u32` array",
+                    expression.span,
+                    format!("`{obj}.{field}` has type `{}`", field_ty.name()),
+                )]);
+            }
             require_expr_type(expression, Ty::Int(IntTy::U64), "class array-field length")
         }
-        ExprKind::ClassField { obj, obj_span, .. } => {
-            reject_named_affine_option(locals, obj, *obj_span, "class field base")?;
-            Err(vec![unsupported(
-                expression.span,
-                "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
-            )])
+        ExprKind::ClassField {
+            obj,
+            obj_span,
+            field,
+        } => {
+            let (_, _, field_ty) =
+                validate_fixed_class_field_base(program, locals, obj, field, *obj_span)?;
+            let Ty::Int(integer) = field_ty else {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "class field value is outside the exact native Integer slice",
+                    expression.span,
+                    format!("`{obj}.{field}` has non-scalar type `{}`", field_ty.name()),
+                )]);
+            };
+            require_concrete_integer(integer, expression.span, "class scalar field")?;
+            require_expr_type(expression, field_ty, "class scalar field")
+        }
+        ExprKind::SelfField { field } => {
+            let (_, _, field_ty) =
+                validate_fixed_class_field_base(program, locals, "self", field, expression.span)?;
+            let Ty::Int(integer) = field_ty else {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "method field read is outside the exact native Integer slice",
+                    expression.span,
+                    format!("`self.{field}` has type `{}`", field_ty.name()),
+                )]);
+            };
+            require_concrete_integer(integer, expression.span, "method scalar field")?;
+            require_expr_type(expression, field_ty, "method scalar field")
         }
         _ => Err(vec![unsupported(
             expression.span,
@@ -2533,8 +3213,34 @@ fn require_parameter_value(
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
         Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared | Mutability::Mut) => Ok(()),
+        Ty::Class(class) => {
+            let declaration = require_fixed_class(program, class, span, role)?;
+            if declaration.name == "Nat" {
+                Ok(())
+            } else {
+                Err(vec![diag(
+                    "backend.class_unsupported",
+                    "owned class parameter is outside the exact native take ABI",
+                    span,
+                    "N5 admits owned `Nat` parameters only",
+                )])
+            }
+        }
         Ty::ClassRef(class, Mutability::Shared) => {
-            require_fixed_u32_class(program, class, span, role).map(|_| ())
+            require_fixed_class(program, class, span, role).map(|_| ())
+        }
+        Ty::ClassRef(class, Mutability::Mut) => {
+            let declaration = require_fixed_class(program, class, span, role)?;
+            if declaration.name == "Integer" {
+                Ok(())
+            } else {
+                Err(vec![diag(
+                    "backend.class_unsupported",
+                    "mutable class reference is outside the exact native method ABI",
+                    span,
+                    "N5 admits mutable `Integer` references only",
+                )])
+            }
         }
         Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
@@ -2713,9 +3419,19 @@ impl ModuleSupport {
         self.require_array_bool();
     }
 
-    fn require_class(&mut self, class: usize) {
-        self.classes.insert(class);
-        self.require_array_u32();
+    fn require_class(&mut self, program: &Program, class: usize) {
+        if !self.classes.insert(class) {
+            return;
+        }
+        for field in &program.classes[class].fields {
+            match field.ty {
+                Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+                    self.require_array_u32();
+                }
+                Ty::Class(child) => self.require_class(program, child),
+                _ => {}
+            }
+        }
     }
 
     fn require_record(&mut self, record: usize) {
@@ -2773,10 +3489,15 @@ impl ModuleSupport {
                 "; internal fixed-owner semantic value for class `{}`; not a public ABI\n",
                 program.classes[*class].name
             ));
+            let fields = program.classes[*class]
+                .fields
+                .iter()
+                .map(|field| llvm_ty(field.ty))
+                .collect::<Vec<_>>()
+                .join(", ");
             out.push_str(&format!(
-                "{} = type {{ {} }}\n\n",
-                llvm_class_ty(*class),
-                LLVM_ARRAY_U32
+                "{} = type {{ {fields} }}\n\n",
+                llvm_class_ty(*class)
             ));
         }
         for record in &self.records {
@@ -2842,11 +3563,13 @@ struct FunctionEmitter<'a, 'support> {
     function: &'a Fn,
     support: &'support mut ModuleSupport,
     initializer_class: Option<usize>,
+    method: Option<(usize, usize)>,
     locals: HashMap<String, Local>,
     /// Entry-block scratch owners for class reassignment. Each RHS is fully
     /// evaluated here before the old destination is destroyed, preserving
     /// expressions that borrow their own assignment target.
     class_reassignment_slots: HashMap<String, String>,
+    late_entry_allocas: Vec<String>,
     next_local: usize,
     next_temp: usize,
     next_block: usize,
@@ -2868,8 +3591,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             function,
             support,
             initializer_class: None,
+            method: None,
             locals: HashMap::new(),
             class_reassignment_slots: HashMap::new(),
+            late_entry_allocas: Vec::new(),
             next_local: 0,
             next_temp: 0,
             next_block: 0,
@@ -2890,9 +3615,23 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         emitter
     }
 
+    fn new_method(
+        program: &'a Program,
+        class: usize,
+        method: usize,
+        support: &'support mut ModuleSupport,
+    ) -> Self {
+        let mut emitter = Self::new(program, &program.classes[class].methods[method].f, support);
+        emitter.method = Some((class, method));
+        emitter
+    }
+
     fn emit(mut self, out: &mut String) -> Result<(), Vec<BackendError>> {
-        if let Some(class) = self.initializer_class {
-            self.support.require_class(class);
+        if let Some(class) = self
+            .initializer_class
+            .or(self.method.map(|(class, _)| class))
+        {
+            self.support.require_class(self.program, class);
         }
         self.require_type_support(self.function.ret);
         let parameter_types = self
@@ -2913,6 +3652,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .collect::<Vec<_>>();
         let implicit_parameter = self
             .initializer_class
+            .or(self.method.map(|(class, _)| class))
             .map(|_| "ptr %self".to_string())
             .or_else(|| {
                 matches!(self.function.ret, Ty::Class(_)).then(|| "ptr %result".to_string())
@@ -2928,6 +3668,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let symbol = self
             .initializer_class
             .map(|class| mangle_initializer(class, self.function))
+            .or_else(|| {
+                self.method
+                    .map(|(class, _)| mangle_method(class, self.function))
+            })
             .unwrap_or_else(|| mangle(self.function));
         let return_ty = if matches!(self.function.ret, Ty::Class(_)) {
             "void".to_string()
@@ -2978,6 +3722,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 .slot
                 .clone();
             self.instruction(format!("store {} %p{index}, ptr {slot}", llvm_ty(*ty)));
+            if let Ty::Class(class) = ty {
+                self.cleanup_scopes[0].push(OwnedCleanup::FixedClass(name.clone(), *class));
+            }
         }
 
         self.emit_block(&self.function.body)?;
@@ -2997,6 +3744,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 )]);
             }
         }
+        for line in &self.late_entry_allocas {
+            out.push_str(line);
+            out.push('\n');
+        }
         for line in &self.lines {
             out.push_str(line);
             out.push('\n');
@@ -3012,7 +3763,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ty if is_u32_array(ty) => self.support.require_array_u32(),
             ty if is_affine_bool_option(ty) => self.support.require_affine_option_bool_array(),
             Ty::Record(record) => self.support.require_record(record),
-            Ty::Class(class) | Ty::ClassRef(class, _) => self.support.require_class(class),
+            Ty::Class(class) | Ty::ClassRef(class, _) => {
+                self.support.require_class(self.program, class)
+            }
             Ty::AffineOption(_) => {
                 unreachable!("affine option escaped LLVM validation into support collection")
             }
@@ -3131,19 +3884,42 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     value,
                     ..
                 } => self.emit_native_array_store(array, index, value)?,
-                Stmt::FieldAssign { value, .. } => {
+                Stmt::FieldAssign { field, value, .. } => {
                     let class = self
                         .initializer_class
-                        .expect("validated field assignment is in an initializer");
-                    let value = self.emit_fresh_u32_array(value)?;
-                    let field_slot = self.emit_self_u32_field_slot(class);
-                    self.instruction(format!(
-                        "store {LLVM_ARRAY_U32} {}, ptr {field_slot}",
-                        value.operand.expect("owned class field initializer")
-                    ));
+                        .or(self.method.map(|(class, _)| class))
+                        .expect("validated field assignment is in a class member");
+                    let (field_index, field_ty) = self.class_field(class, field);
+                    let field_slot = self.emit_class_field_slot(class, "%self", field_index);
+                    match field_ty {
+                        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+                            let value = self.emit_fresh_u32_array(value)?;
+                            self.instruction(format!(
+                                "store {LLVM_ARRAY_U32} {}, ptr {field_slot}",
+                                value.operand.expect("owned class field initializer")
+                            ));
+                        }
+                        Ty::Class(child) => {
+                            self.emit_fixed_class_into(child, &field_slot, value)?;
+                        }
+                        Ty::Int(_) => {
+                            let value = self.emit_expr(value)?;
+                            self.instruction(format!(
+                                "store {} {}, ptr {field_slot}",
+                                llvm_ty(field_ty),
+                                value.operand.expect("scalar class field assignment")
+                            ));
+                        }
+                        _ => unreachable!("validated native class field type"),
+                    }
                 }
-                Stmt::FieldStore { index, value, .. } => {
-                    self.emit_self_u32_field_store(index, value)?;
+                Stmt::FieldStore {
+                    field,
+                    index,
+                    value,
+                    ..
+                } => {
+                    self.emit_self_u32_field_store(field, index, value)?;
                 }
                 _ => unreachable!("validated before lowering"),
             }
@@ -3299,7 +4075,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let ExprKind::CtorCall { init, args, .. } = &expression.kind else {
             unreachable!("validated fixed-owner class initializer")
         };
-        self.support.require_class(class);
+        self.support.require_class(self.program, class);
         let initializer = self.program.classes[class]
             .inits
             .iter()
@@ -3307,14 +4083,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .expect("validated constructor exists");
         let mut lowered = Vec::with_capacity(args.len() + 1);
         lowered.push(format!("ptr {destination}"));
-        for argument in args {
-            let value = self.emit_expr(argument)?;
-            lowered.push(format!(
-                "{} {}",
-                llvm_ty(value.ty),
-                value.operand.expect("constructor argument is non-unit")
-            ));
-        }
+        lowered.extend(self.emit_call_arguments(&initializer.params, args)?);
         self.instruction(format!(
             "call void @{}({})",
             mangle_initializer(class, initializer),
@@ -3340,14 +4109,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .expect("validated class-returning callee");
                 let mut lowered = Vec::with_capacity(args.len() + 1);
                 lowered.push(format!("ptr {destination}"));
-                for argument in args {
-                    let value = self.emit_expr(argument)?;
-                    lowered.push(format!(
-                        "{} {}",
-                        llvm_ty(value.ty),
-                        value.operand.expect("class-returning call argument")
-                    ));
-                }
+                lowered.extend(self.emit_call_arguments(&function.params, args)?);
                 self.instruction(format!(
                     "call void @{}({})",
                     mangle(function),
@@ -3385,16 +4147,91 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         ));
     }
 
-    fn emit_self_u32_field_slot(&mut self, class: usize) -> String {
+    fn emit_call_arguments(
+        &mut self,
+        parameters: &[crate::ast::Param],
+        arguments: &[Expr],
+    ) -> Result<Vec<String>, Vec<BackendError>> {
+        let mut lowered = Vec::with_capacity(arguments.len());
+        for (parameter, argument) in parameters.iter().zip(arguments) {
+            let value = if let Ty::Class(class) = parameter.ty {
+                self.emit_owned_class_argument(class, argument)?
+            } else {
+                self.emit_expr(argument)?
+            };
+            lowered.push(format!(
+                "{} {}",
+                llvm_ty(parameter.ty),
+                value.operand.expect("call argument is non-unit")
+            ));
+        }
+        Ok(lowered)
+    }
+
+    fn emit_owned_class_argument(
+        &mut self,
+        class: usize,
+        expression: &Expr,
+    ) -> Result<Value, Vec<BackendError>> {
+        let source = match &expression.kind {
+            ExprKind::Var(name) => self
+                .locals
+                .get(name)
+                .expect("validated owned class argument")
+                .slot
+                .clone(),
+            ExprKind::CtorCall { .. } | ExprKind::Call { .. } => {
+                let slot = self.new_slot();
+                self.late_entry_allocas
+                    .push(format!("  {slot} = alloca {}", llvm_class_ty(class)));
+                self.emit_fixed_class_into(class, &slot, expression)?;
+                slot
+            }
+            _ => unreachable!("validated owned class call argument"),
+        };
+        let moved = self.new_temp();
+        self.instruction(format!(
+            "{moved} = load {}, ptr {source}",
+            llvm_class_ty(class)
+        ));
+        self.instruction(format!(
+            "store {} zeroinitializer, ptr {source}",
+            llvm_class_ty(class)
+        ));
+        Ok(Value {
+            ty: Ty::Class(class),
+            operand: Some(moved),
+        })
+    }
+
+    fn class_field(&self, class: usize, field: &str) -> (usize, Ty) {
+        self.program.classes[class]
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, declaration_field)| declaration_field.name == field)
+            .map(|(index, declaration_field)| (index, declaration_field.ty))
+            .expect("validated native class field")
+    }
+
+    fn emit_class_field_slot(&mut self, class: usize, base: &str, field: usize) -> String {
         let field_slot = self.new_temp();
         self.instruction(format!(
-            "{field_slot} = getelementptr {}, ptr %self, i32 0, i32 0",
+            "{field_slot} = getelementptr {}, ptr {base}, i32 0, i32 {field}",
             llvm_class_ty(class)
         ));
         field_slot
     }
 
     fn class_base_pointer(&mut self, object: &str) -> (usize, String) {
+        if object == "self" {
+            if let Some(class) = self
+                .initializer_class
+                .or(self.method.map(|(class, _)| class))
+            {
+                return (class, "%self".into());
+            }
+        }
         let local = self
             .locals
             .get(object)
@@ -3403,7 +4240,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let slot = local.slot.clone();
         match ty {
             Ty::Class(class) => (class, slot),
-            Ty::ClassRef(class, Mutability::Shared) => {
+            Ty::ClassRef(class, Mutability::Shared | Mutability::Mut) => {
                 let pointer = self.new_temp();
                 self.instruction(format!("{pointer} = load ptr, ptr {slot}"));
                 (class, pointer)
@@ -3412,26 +4249,21 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         }
     }
 
-    fn load_class_u32_array_parts(&mut self, object: &str) -> (String, String) {
+    fn class_field_slot(&mut self, object: &str, field: &str) -> (Ty, String) {
         let (class, base) = self.class_base_pointer(object);
-        let field_slot = self.new_temp();
-        self.instruction(format!(
-            "{field_slot} = getelementptr {}, ptr {base}, i32 0, i32 0",
-            llvm_class_ty(class)
-        ));
-        self.load_u32_array_parts_from_slot(&field_slot)
+        let (field_index, field_ty) = self.class_field(class, field);
+        let field_slot = self.emit_class_field_slot(class, &base, field_index);
+        (field_ty, field_slot)
     }
 
-    fn load_self_u32_array_parts(&mut self) -> (String, String) {
-        let class = self
-            .initializer_class
-            .expect("validated self field access is in an initializer");
-        let field_slot = self.emit_self_u32_field_slot(class);
+    fn load_class_u32_array_parts(&mut self, object: &str, field: &str) -> (String, String) {
+        let (_, field_slot) = self.class_field_slot(object, field);
         self.load_u32_array_parts_from_slot(&field_slot)
     }
 
     fn emit_self_u32_field_store(
         &mut self,
+        field: &str,
         index: &Expr,
         value: &Expr,
     ) -> Result<(), Vec<BackendError>> {
@@ -3443,7 +4275,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .emit_expr(value)?
             .operand
             .expect("validated class array-field store value");
-        let (ptr, len) = self.load_self_u32_array_parts();
+        let class = self
+            .initializer_class
+            .expect("validated array field store is in an initializer");
+        let (field_index, _) = self.class_field(class, field);
+        let field_slot = self.emit_class_field_slot(class, "%self", field_index);
+        let (ptr, len) = self.load_u32_array_parts_from_slot(&field_slot);
         self.emit_bool_array_bounds_guard(&index, &len);
         let address = self.new_temp();
         self.instruction(format!(
@@ -4014,11 +4851,34 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .expect("validated fixed-owner class local")
             .slot
             .clone();
-        let field_slot = self.new_temp();
+        self.emit_fixed_class_drop_from_slot(&slot, class);
+    }
+
+    fn emit_fixed_class_drop_from_slot(&mut self, slot: &str, class: usize) {
+        let fields = self.program.classes[class]
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| (index, field.ty))
+            .collect::<Vec<_>>();
+        for (field_index, field_ty) in fields.into_iter().rev() {
+            let field_slot = self.emit_class_field_slot(class, slot, field_index);
+            match field_ty {
+                Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+                    self.emit_u32_array_drop_from_slot(&field_slot);
+                }
+                Ty::Class(child) => self.emit_fixed_class_drop_from_slot(&field_slot, child),
+                Ty::Int(_) => {}
+                _ => unreachable!("validated native class cleanup field"),
+            }
+        }
         self.instruction(format!(
-            "{field_slot} = getelementptr {}, ptr {slot}, i32 0, i32 0",
+            "store {} zeroinitializer, ptr {slot}",
             llvm_class_ty(class)
         ));
+    }
+
+    fn emit_u32_array_drop_from_slot(&mut self, field_slot: &str) {
         let (ptr, _) = self.load_u32_array_parts_from_slot(&field_slot);
         let empty = self.new_temp();
         self.instruction(format!("{empty} = icmp eq ptr {ptr}, null"));
@@ -4031,6 +4891,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.instruction(format!("call void @__sable_rt_array_free_v1(ptr {ptr})"));
         self.terminate(format!("br label %{done_label}"));
         self.start_block(done_label);
+        self.instruction(format!(
+            "store {LLVM_ARRAY_U32} zeroinitializer, ptr {field_slot}"
+        ));
     }
 
     fn emit_affine_bool_option_drop(&mut self, option: &str) {
@@ -4154,19 +5017,21 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     operand: Some(len),
                 })
             }
-            ExprKind::ClassFieldLen { obj, .. } => {
-                let (_, len) = self.load_class_u32_array_parts(obj);
+            ExprKind::ClassFieldLen { obj, field } => {
+                let (_, len) = self.load_class_u32_array_parts(obj, field);
                 Ok(Value {
                     ty: Ty::Int(IntTy::U64),
                     operand: Some(len),
                 })
             }
-            ExprKind::ClassFieldIndex { obj, index, .. } => {
+            ExprKind::ClassFieldIndex {
+                obj, field, index, ..
+            } => {
                 let index = self
                     .emit_expr(index)?
                     .operand
                     .expect("validated class array-field index");
-                let (ptr, len) = self.load_class_u32_array_parts(obj);
+                let (ptr, len) = self.load_class_u32_array_parts(obj, field);
                 self.emit_bool_array_bounds_guard(&index, &len);
                 let address = self.new_temp();
                 self.instruction(format!(
@@ -4176,6 +5041,30 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 self.instruction(format!("{value} = load i32, ptr {address}, align 1"));
                 Ok(Value {
                     ty: Ty::Int(IntTy::U32),
+                    operand: Some(value),
+                })
+            }
+            ExprKind::ClassField { obj, field, .. } => {
+                let (field_ty, field_slot) = self.class_field_slot(obj, field);
+                let value = self.new_temp();
+                self.instruction(format!(
+                    "{value} = load {}, ptr {field_slot}",
+                    llvm_ty(field_ty)
+                ));
+                Ok(Value {
+                    ty: field_ty,
+                    operand: Some(value),
+                })
+            }
+            ExprKind::SelfField { field } => {
+                let (field_ty, field_slot) = self.class_field_slot("self", field);
+                let value = self.new_temp();
+                self.instruction(format!(
+                    "{value} = load {}, ptr {field_slot}",
+                    llvm_ty(field_ty)
+                ));
+                Ok(Value {
+                    ty: field_ty,
                     operand: Some(value),
                 })
             }
@@ -4382,15 +5271,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .iter()
                     .find(|function| function.name == *callee)
                     .expect("validated callee");
-                let mut lowered = Vec::with_capacity(args.len());
-                for argument in args {
-                    let value = self.emit_expr(argument)?;
-                    lowered.push(format!(
-                        "{} {}",
-                        llvm_ty(value.ty),
-                        value.operand.expect("call arguments are non-unit")
-                    ));
-                }
+                let lowered = self.emit_call_arguments(&function.params, args)?;
                 let call = format!(
                     "call {} @{}({})",
                     llvm_ty(function.ret),
@@ -4412,21 +5293,53 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     })
                 }
             }
-            ExprKind::Borrow { array, .. }
-                if matches!(expression.ty, Some(Ty::ClassRef(_, Mutability::Shared))) =>
+            ExprKind::MethodCall {
+                recv, method, args, ..
+            } => {
+                debug_assert!(args.is_empty());
+                let (class, receiver) = self.class_base_pointer(recv);
+                let declaration = &self.program.classes[class];
+                let method = declaration
+                    .methods
+                    .iter()
+                    .find(|candidate| candidate.f.name == *method)
+                    .expect("validated native method");
+                self.instruction(format!(
+                    "call void @{}(ptr {receiver})",
+                    mangle_method(class, &method.f)
+                ));
+                Ok(Value {
+                    ty: Ty::Unit,
+                    operand: None,
+                })
+            }
+            ExprKind::Borrow { array, field, .. }
+                if matches!(expression.ty, Some(Ty::ClassRef(_, _))) =>
             {
-                let (_, pointer) = self.class_base_pointer(array);
+                let (_, pointer) = if let Some(field) = field {
+                    let (field_ty, slot) = self.class_field_slot(array, field);
+                    let Ty::Class(class) = field_ty else {
+                        unreachable!("validated class-valued field borrow")
+                    };
+                    (class, slot)
+                } else {
+                    self.class_base_pointer(array)
+                };
                 Ok(Value {
                     ty: expression.ty.expect("validated class borrow type"),
                     operand: Some(pointer),
                 })
             }
-            ExprKind::Borrow { array, .. } => {
-                let local = self
-                    .locals
-                    .get(array)
-                    .expect("validated named `u32` array borrow");
-                let slot = local.slot.clone();
+            ExprKind::Borrow { array, field, .. } => {
+                let slot = if let Some(field) = field {
+                    self.class_field_slot(array, field).1
+                } else {
+                    self.locals
+                        .get(array)
+                        .expect("validated named `u32` array borrow")
+                        .slot
+                        .clone()
+                };
                 let descriptor = self.new_temp();
                 self.instruction(format!("{descriptor} = load {LLVM_ARRAY_U32}, ptr {slot}"));
                 Ok(Value {
@@ -5023,6 +5936,37 @@ fn collect_local_declarations(statements: &[Stmt], declarations: &mut Vec<(Strin
     }
 }
 
+fn find_declared_type(statements: &[Stmt], target: &str) -> Option<Ty> {
+    for statement in statements {
+        match statement {
+            Stmt::Decl { name, ty, .. } if name == target => return Some(*ty),
+            Stmt::VarDecl { name, ty, .. } if name == target => return *ty,
+            Stmt::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                if let Some(ty) = find_declared_type(then_block, target) {
+                    return Some(ty);
+                }
+                if let Some(ty) = else_block
+                    .as_deref()
+                    .and_then(|block| find_declared_type(block, target))
+                {
+                    return Some(ty);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Unsafe { body, .. } => {
+                if let Some(ty) = find_declared_type(body, target) {
+                    return Some(ty);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn collect_assignment_targets(statements: &[Stmt], targets: &mut BTreeSet<String>) {
     for statement in statements {
         match statement {
@@ -5073,7 +6017,7 @@ fn llvm_ty(ty: Ty) -> String {
         ty if is_u32_array(ty) => LLVM_ARRAY_U32.into(),
         ty if is_affine_bool_option(ty) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
         Ty::Class(class) => llvm_class_ty(class),
-        Ty::ClassRef(_, Mutability::Shared) => "ptr".into(),
+        Ty::ClassRef(_, Mutability::Shared | Mutability::Mut) => "ptr".into(),
         Ty::Record(record) => llvm_record_ty(record),
         Ty::AffineOption(_) => {
             unreachable!("affine option escaped LLVM validation into type lowering")
@@ -5118,6 +6062,7 @@ fn type_code(ty: Ty) -> String {
         Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) => "au32s".into(),
         Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Mut) => "au32m".into(),
         Ty::ClassRef(class, Mutability::Shared) => format!("c{class}s"),
+        Ty::ClassRef(class, Mutability::Mut) => format!("c{class}m"),
         Ty::Class(class) => format!("c{class}o"),
         Ty::Record(record) => format!("r{record}"),
         Ty::AffineOption(_) => {
@@ -5154,6 +6099,21 @@ fn mangle_initializer(class: usize, initializer: &Fn) -> String {
         "__sable_v0_c{class}_i_{}_{}__p_{params}",
         initializer.name.len(),
         initializer.name
+    )
+}
+
+fn mangle_method(class: usize, method: &Fn) -> String {
+    let params = method
+        .params
+        .iter()
+        .map(|parameter| type_code(parameter.ty))
+        .collect::<Vec<_>>()
+        .join("_");
+    format!(
+        "__sable_v0_c{class}_m_{}_{}__p_{params}__r_{}",
+        method.name.len(),
+        method.name,
+        type_code(method.ret)
     )
 }
 
@@ -5266,7 +6226,120 @@ fn collect_calls_expr(expression: &Expr, calls: &mut Vec<(String, Span)>) {
     }
 }
 
-fn collect_constructors_block(statements: &[Stmt], constructors: &mut Vec<(String, String, Span)>) {
+fn collect_method_calls_block(statements: &[Stmt], methods: &mut Vec<(String, String, Span)>) {
+    for statement in statements {
+        match statement {
+            Stmt::Decl { init, .. } => {
+                if let Some(init) = init {
+                    collect_method_calls_expr(init, methods);
+                }
+            }
+            Stmt::Assign { value, .. }
+            | Stmt::ExprStmt(value)
+            | Stmt::Return {
+                value: Some(value), ..
+            }
+            | Stmt::VarDecl { init: value, .. }
+            | Stmt::FieldAssign { value, .. } => collect_method_calls_expr(value, methods),
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                collect_method_calls_expr(cond, methods);
+                collect_method_calls_block(then_block, methods);
+                if let Some(block) = else_block {
+                    collect_method_calls_block(block, methods);
+                }
+            }
+            Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                collect_method_calls_expr(index, methods);
+                collect_method_calls_expr(value, methods);
+            }
+            Stmt::While { cond, body, .. } => {
+                collect_method_calls_expr(cond, methods);
+                collect_method_calls_block(body, methods);
+            }
+            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                collect_method_calls_block(body, methods)
+            }
+            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                collect_method_calls_expr(size, methods)
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                collect_method_calls_expr(ptr, methods);
+                collect_method_calls_expr(res, methods);
+                collect_method_calls_expr(release, methods);
+            }
+            Stmt::Return { value: None, .. } | Stmt::Assert(_) => {}
+        }
+    }
+}
+
+fn collect_method_calls_expr(expression: &Expr, methods: &mut Vec<(String, String, Span)>) {
+    match &expression.kind {
+        ExprKind::MethodCall {
+            recv,
+            method,
+            method_span,
+            args,
+            ..
+        } => {
+            methods.push((recv.clone(), method.clone(), *method_span));
+            for argument in args {
+                collect_method_calls_expr(argument, methods);
+            }
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::TraitCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::ArrayLit(args) => {
+            for argument in args {
+                collect_method_calls_expr(argument, methods);
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Widen { arg: operand, .. }
+        | ExprKind::Narrow { arg: operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => collect_method_calls_expr(operand, methods),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_method_calls_expr(lhs, methods);
+            collect_method_calls_expr(rhs, methods);
+        }
+        ExprKind::Index { index, .. }
+        | ExprKind::SelfFieldIndex { index, .. }
+        | ExprKind::ClassFieldIndex { index, .. } => collect_method_calls_expr(index, methods),
+        ExprKind::AllocArray { len, init, .. } => {
+            collect_method_calls_expr(len, methods);
+            collect_method_calls_expr(init, methods);
+        }
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Len { .. }
+        | ExprKind::NoneE
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::Borrow { .. } => {}
+    }
+}
+
+fn collect_constructors_block(
+    statements: &[Stmt],
+    constructors: &mut Vec<(String, String, Option<usize>, Span)>,
+) {
     for statement in statements {
         match statement {
             Stmt::Decl { init, .. } => {
@@ -5320,7 +6393,10 @@ fn collect_constructors_block(statements: &[Stmt], constructors: &mut Vec<(Strin
     }
 }
 
-fn collect_constructors_expr(expression: &Expr, constructors: &mut Vec<(String, String, Span)>) {
+fn collect_constructors_expr(
+    expression: &Expr,
+    constructors: &mut Vec<(String, String, Option<usize>, Span)>,
+) {
     match &expression.kind {
         ExprKind::CtorCall {
             class,
@@ -5329,7 +6405,11 @@ fn collect_constructors_expr(expression: &Expr, constructors: &mut Vec<(String, 
             args,
             ..
         } => {
-            constructors.push((class.clone(), init.clone(), *class_span));
+            let checked_class = match expression.ty {
+                Some(Ty::Class(class)) => Some(class),
+                _ => None,
+            };
+            constructors.push((class.clone(), init.clone(), checked_class, *class_span));
             for argument in args {
                 collect_constructors_expr(argument, constructors);
             }
@@ -8245,7 +9325,7 @@ mod tests {
         assert!(
             error[0]
                 .label
-                .contains("does not initialize its owned `u32` array field")
+                .contains("does not initialize every native field exactly once")
         );
 
         let mut duplicate_field = fixed_class_program();
@@ -8253,13 +9333,13 @@ mod tests {
         duplicate_field.classes[0].inits[0].body.push(duplicate);
         let error = emit_program(&duplicate_field, 1, &options).unwrap_err();
         assert_eq!(error[0].name, "backend.class_unsupported");
-        assert!(error[0].label.contains("unique uninitialized owned field"));
+        assert!(error[0].label.contains("was already initialized"));
 
-        let mut moved_argument = fixed_class_program();
+        let mut ordinary_owned_argument = fixed_class_program();
         let mut sink = function("sink", Ty::Unit, Vec::new());
         sink.params = vec![parameter("owned", Ty::Class(0))];
-        moved_argument.fns.push(sink);
-        moved_argument.fns[1].body.insert(
+        ordinary_owned_argument.fns.push(sink);
+        ordinary_owned_argument.fns[1].body.insert(
             1,
             Stmt::ExprStmt(call_with(
                 "sink",
@@ -8267,9 +9347,218 @@ mod tests {
                 vec![typed_variable("value", Ty::Class(0))],
             )),
         );
-        let error = emit_program(&moved_argument, 1, &options).unwrap_err();
+        let error = emit_program(&ordinary_owned_argument, 1, &options).unwrap_err();
         assert_eq!(error[0].name, "backend.class_unsupported");
-        assert!(error[0].label.contains("owned class"));
+        assert!(error[0].title.contains("destination-passing position"));
+
+        let mut overlapping_move = fixed_class_program();
+        let mut overlap = function(
+            "overlap",
+            Ty::Class(0),
+            vec![Stmt::Return {
+                value: Some(typed_variable("owned", Ty::Class(0))),
+                span: Span::new(0, 1),
+            }],
+        );
+        overlap.params = vec![
+            parameter("borrowed", Ty::ClassRef(0, Mutability::Shared)),
+            parameter("owned", Ty::Class(0)),
+        ];
+        overlapping_move.fns.push(overlap);
+        overlapping_move.fns[1].body.insert(
+            1,
+            Stmt::VarDecl {
+                ty: Some(Ty::Class(0)),
+                name: "replacement".into(),
+                name_span: Span::new(0, 1),
+                init: call_with(
+                    "overlap",
+                    Ty::Class(0),
+                    vec![
+                        fixed_class_borrow("value"),
+                        typed_variable("value", Ty::Class(0)),
+                    ],
+                ),
+                mutable: false,
+            },
+        );
+        let error = emit_program(&overlapping_move, 1, &options).unwrap_err();
+        assert_eq!(error[0].name, "backend.class_unsupported");
+        assert!(error[0].label.contains("both borrowed and moved by value"));
+
+        let mut forwarded_alias = fixed_class_program();
+        let mut integer_initializer = function(
+            "make",
+            Ty::Unit,
+            vec![
+                Stmt::FieldAssign {
+                    field: "mag".into(),
+                    field_span: Span::new(0, 1),
+                    value: typed_variable("magnitude", Ty::Class(0)),
+                },
+                Stmt::FieldAssign {
+                    field: "neg".into(),
+                    field_span: Span::new(0, 1),
+                    value: typed_variable("sign", Ty::Int(IntTy::U64)),
+                },
+            ],
+        );
+        integer_initializer.params = vec![
+            parameter("magnitude", Ty::Class(0)),
+            parameter("sign", Ty::Int(IntTy::U64)),
+        ];
+        forwarded_alias.classes.push(ClassDecl {
+            is_pub: false,
+            name: "Integer".into(),
+            name_span: Span::new(0, 1),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            fields: vec![
+                Field {
+                    name: "mag".into(),
+                    ty: Ty::Class(0),
+                    span: Span::new(0, 1),
+                    must_consume: false,
+                },
+                Field {
+                    name: "neg".into(),
+                    ty: Ty::Int(IntTy::U64),
+                    span: Span::new(0, 1),
+                    must_consume: false,
+                },
+            ],
+            invariants: Vec::new(),
+            inits: vec![integer_initializer],
+            methods: vec![Method {
+                self_kind: SelfKind::Mut,
+                f: function("flip_sign", Ty::Unit, Vec::new()),
+            }],
+            deinit: None,
+            span: Span::new(0, 1),
+        });
+        let mut alias = function(
+            "alias",
+            Ty::Unit,
+            vec![Stmt::Return {
+                value: None,
+                span: Span::new(0, 1),
+            }],
+        );
+        alias.params = vec![
+            parameter("left", Ty::ClassRef(1, Mutability::Mut)),
+            parameter("right", Ty::ClassRef(1, Mutability::Mut)),
+        ];
+        let mutable_reference = Ty::ClassRef(1, Mutability::Mut);
+        let mut forward = function(
+            "forward_alias",
+            Ty::Unit,
+            vec![
+                Stmt::ExprStmt(call_with(
+                    "alias",
+                    Ty::Unit,
+                    vec![
+                        typed_variable("reference", mutable_reference),
+                        typed_variable("reference", mutable_reference),
+                    ],
+                )),
+                Stmt::Return {
+                    value: None,
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        forward.params = vec![parameter("reference", mutable_reference)];
+        forwarded_alias.fns.push(alias);
+        forwarded_alias.fns.push(forward);
+        forwarded_alias.fns.push(function(
+            "integer_alias_entry",
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(1)),
+                    name: "value".into(),
+                    name_span: Span::new(0, 1),
+                    init: expression(
+                        ExprKind::CtorCall {
+                            class: "Integer".into(),
+                            class_span: Span::new(0, 1),
+                            type_args: Vec::new(),
+                            init: "make".into(),
+                            args: vec![
+                                fixed_class_constructor(),
+                                expression(ExprKind::IntLit(0), Ty::Int(IntTy::U64)),
+                            ],
+                        },
+                        Ty::Class(1),
+                    ),
+                    mutable: true,
+                },
+                Stmt::ExprStmt(call_with(
+                    "forward_alias",
+                    Ty::Unit,
+                    vec![expression(
+                        ExprKind::Borrow {
+                            array: "value".into(),
+                            field: None,
+                            mutable: true,
+                        },
+                        mutable_reference,
+                    )],
+                )),
+                Stmt::Return {
+                    value: Some(expression(ExprKind::IntLit(42), Ty::Int(IntTy::I32))),
+                    span: Span::new(0, 1),
+                },
+            ],
+        ));
+        let error = emit_program(
+            &forwarded_alias,
+            1,
+            &EmitOptions {
+                entry: Some("integer_alias_entry".into()),
+            },
+        );
+        let error = error.unwrap_err();
+        assert_eq!(error[0].name, "backend.unsupported");
+        assert!(error[0].label.contains("overlapping borrows"));
+
+        let alias = forwarded_alias
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "alias")
+            .unwrap();
+        alias.params[1] = parameter("sign", Ty::Int(IntTy::U64));
+        let forward = forwarded_alias
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "forward_alias")
+            .unwrap();
+        let Stmt::ExprStmt(Expr {
+            kind: ExprKind::Call { args, .. },
+            ..
+        }) = &mut forward.body[0]
+        else {
+            unreachable!()
+        };
+        args[1] = expression(
+            ExprKind::ClassField {
+                obj: "reference".into(),
+                obj_span: Span::new(0, 1),
+                field: "neg".into(),
+            },
+            Ty::Int(IntTy::U64),
+        );
+        let error = emit_program(
+            &forwarded_alias,
+            1,
+            &EmitOptions {
+                entry: Some("integer_alias_entry".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error[0].name, "backend.unsupported");
+        assert!(error[0].label.contains("overlapping borrows"));
 
         let mut discarded_result = fixed_class_program();
         discarded_result.fns.push(function(
@@ -8286,5 +9575,136 @@ mod tests {
         let error = emit_program(&discarded_result, 1, &options).unwrap_err();
         assert_eq!(error[0].name, "backend.class_unsupported");
         assert!(error[0].label.contains("bind or return"));
+    }
+
+    #[test]
+    fn constructor_dependencies_follow_the_checked_nominal_class() {
+        let mut result = fixed_class_program();
+        result.classes.push(result.classes[0].clone());
+        result.fns.push(function(
+            "duplicate_constructor_entry",
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(1)),
+                    name: "value".into(),
+                    name_span: Span::new(0, 1),
+                    init: expression(
+                        ExprKind::CtorCall {
+                            class: "Nat".into(),
+                            class_span: Span::new(0, 1),
+                            type_args: Vec::new(),
+                            init: "new".into(),
+                            args: Vec::new(),
+                        },
+                        Ty::Class(1),
+                    ),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::IntLit(42), Ty::Int(IntTy::I32))),
+                    span: Span::new(0, 1),
+                },
+            ],
+        ));
+
+        let ir = emit_program(
+            &result,
+            1,
+            &EmitOptions {
+                entry: Some("duplicate_constructor_entry".into()),
+            },
+        )
+        .unwrap();
+        assert!(ir.contains("define internal void @__sable_v0_c1_i_3_new__p_(ptr %self)"));
+        assert!(ir.contains("call void @__sable_v0_c1_i_3_new__p_(ptr %v0)"));
+    }
+
+    #[test]
+    fn fixed_owner_validation_fails_closed_without_recursive_or_self_name_panics() {
+        let mut cyclic = fixed_class_program();
+        let integer = |child| ClassDecl {
+            is_pub: false,
+            name: "Integer".into(),
+            name_span: Span::new(0, 1),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            fields: vec![
+                Field {
+                    name: "mag".into(),
+                    ty: Ty::Class(child),
+                    span: Span::new(0, 1),
+                    must_consume: false,
+                },
+                Field {
+                    name: "neg".into(),
+                    ty: Ty::Int(IntTy::U64),
+                    span: Span::new(0, 1),
+                    must_consume: false,
+                },
+            ],
+            invariants: Vec::new(),
+            inits: Vec::new(),
+            methods: vec![Method {
+                self_kind: SelfKind::Mut,
+                f: function("flip_sign", Ty::Unit, Vec::new()),
+            }],
+            deinit: None,
+            span: Span::new(0, 1),
+        };
+        cyclic.classes = vec![integer(1), integer(0)];
+        let error = require_fixed_class(&cyclic, 0, Span::new(0, 1), "cycle probe")
+            .expect_err("cyclic forged Integer declarations must fail closed");
+        assert_eq!(error[0].name, "backend.class_unsupported");
+        assert!(error[0].title.contains("exact native Nat shape"));
+
+        let mut invalid_receiver = fixed_class_program();
+        let mut bad_method = function(
+            "bad_method",
+            Ty::Unit,
+            vec![Stmt::ExprStmt(expression(
+                ExprKind::MethodCall {
+                    recv: "receiver".into(),
+                    recv_span: Span::new(0, 1),
+                    method: "flip_sign".into(),
+                    method_span: Span::new(0, 1),
+                    args: Vec::new(),
+                },
+                Ty::Unit,
+            ))],
+        );
+        bad_method.params = vec![parameter("receiver", Ty::ClassRef(99, Mutability::Mut))];
+        invalid_receiver.fns.push(bad_method);
+        let error = callable_dependencies(&invalid_receiver, Callable::Function(2))
+            .expect_err("invalid receiver class indices must diagnose before emission");
+        assert_eq!(error[0].name, "backend.class_unsupported");
+        assert!(error[0].title.contains("invalid checked class index"));
+
+        let mut free_self = fixed_class_program();
+        let entry = &mut free_self.fns[1];
+        let Stmt::VarDecl { name, .. } = &mut entry.body[0] else {
+            unreachable!()
+        };
+        *name = "self".into();
+        let Stmt::ExprStmt(Expr {
+            kind: ExprKind::Call { args, .. },
+            ..
+        }) = &mut entry.body[1]
+        else {
+            unreachable!()
+        };
+        let ExprKind::Borrow { array, .. } = &mut args[0].kind else {
+            unreachable!()
+        };
+        *array = "self".into();
+        emit_program(
+            &free_self,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .expect("a free-function owner named self uses its ordinary local slot");
     }
 }

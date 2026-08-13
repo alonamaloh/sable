@@ -556,6 +556,36 @@ fn u32_arrays_use_byte_hooks_unaligned_access_and_nonowning_internal_borrows() {
 }
 
 #[test]
+fn integer_native_balances_nested_array_ownership_at_o0_and_o2() {
+    let source = repo_root().join("corpus/verifies/integer_native.sable");
+    let output = build_command()
+        .args([
+            "build",
+            "--emit-llvm",
+            "--entry",
+            "integer_native_entry",
+            "-o",
+            "-",
+        ])
+        .arg(&source)
+        .output()
+        .expect("run the Sable Integer LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM Integer build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
+    assert!(report.contains("status: fully verified"));
+    assert!(ir.contains("define i32 @main()"));
+    assert!(ir.contains("@__sable_rt_array_alloc_v1"));
+    assert!(ir.contains("@__sable_rt_array_free_v1"));
+
+    assert_clang_integer_lifetime("integer-native-lifetime", &ir);
+}
+
+#[test]
 fn failed_verification_preserves_an_existing_output() {
     let temp = temp_dir("atomic");
     let destination = temp.join("program.ll");
@@ -1389,6 +1419,133 @@ void __sable_rt_trap_v1(
         }
     }
     fs::remove_dir_all(&temp).expect("remove isolated LLVM u32-array test directory");
+}
+
+fn assert_clang_integer_lifetime(label: &str, ir: &str) {
+    let Some(clang) = find_clang() else {
+        assert_ne!(
+            std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
+            Ok("1"),
+            "SABLE_REQUIRE_CLANG=1 but no clang executable was found"
+        );
+        return;
+    };
+    let temp = temp_dir(label);
+    let ir_path = temp.join(format!("{label}.ll"));
+    let hook_path = temp.join("integer-lifetime-hooks.c");
+    fs::write(&ir_path, ir).expect("write emitted Integer IR fixture");
+    fs::write(
+        &hook_path,
+        br#"#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    void *storage;
+    unsigned char *base;
+    uint64_t bytes;
+} SableAllocation;
+
+static SableAllocation live_allocations[4096];
+static size_t live_count = 0;
+static int exit_check_registered = 0;
+
+static void check_balanced_at_exit(void) {
+    if (live_count != 0) {
+        fprintf(stderr, "SABLE_ARRAY_LIFETIME_V1 live=%zu\n", live_count);
+        fflush(stderr);
+        abort();
+    }
+    fprintf(stderr, "SABLE_ARRAY_LIFETIME_V1 live=0\n");
+    fflush(stderr);
+}
+
+void *__sable_rt_array_alloc_v1(uint64_t bytes) {
+    if (!exit_check_registered) {
+        if (atexit(check_balanced_at_exit) != 0) {
+            abort();
+        }
+        exit_check_registered = 1;
+    }
+    if (bytes > SIZE_MAX - 1 || live_count == 4096) {
+        return NULL;
+    }
+    unsigned char *base = malloc((size_t)bytes + 1);
+    if (base == NULL) {
+        return NULL;
+    }
+
+    // Return a deliberately unaligned address so nested Nat cleanup cannot
+    // accidentally rely on stronger alignment than the byte-hook ABI gives.
+    void *storage = base + 1;
+    live_allocations[live_count].storage = storage;
+    live_allocations[live_count].base = base;
+    live_allocations[live_count].bytes = bytes;
+    live_count += 1;
+    memset(storage, 0, (size_t)bytes);
+    return storage;
+}
+
+void __sable_rt_array_free_v1(void *storage) {
+    for (size_t i = 0; i < live_count; i += 1) {
+        if (live_allocations[i].storage == storage) {
+            unsigned char *base = live_allocations[i].base;
+            uint64_t bytes = live_allocations[i].bytes;
+            live_count -= 1;
+            live_allocations[i] = live_allocations[live_count];
+            memset(storage, 0xa5, (size_t)bytes);
+            free(base);
+            return;
+        }
+    }
+
+    // A second free is unknown after the first removal, so both invalid and
+    // duplicate frees fail through the same strict ownership check.
+    fprintf(stderr, "SABLE_ARRAY_LIFETIME_V1 unknown-free=%p\n", storage);
+    fflush(stderr);
+    abort();
+}
+"#,
+    )
+    .expect("write strong Integer lifetime hooks");
+
+    for optimization in ["-O0", "-O2"] {
+        let executable = temp.join(format!("{label}-{}", &optimization[1..]));
+        let compile = Command::new(&clang)
+            .args([optimization, "-x", "ir"])
+            .arg(&ir_path)
+            .args(["-x", "c"])
+            .arg(&hook_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("run clang over emitted Integer IR and lifetime hooks");
+        assert!(
+            compile.status.success(),
+            "clang {optimization} rejected Integer lifetime fixture:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let output = Command::new(&executable)
+            .output()
+            .expect("run the compiled Integer lifetime case");
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "Integer lifetime case diverged at {optimization}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| line == "SABLE_ARRAY_LIFETIME_V1 live=0"),
+            "Integer ownership did not reach a balanced exit at {optimization}:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fs::remove_dir_all(&temp).expect("remove isolated LLVM Integer test directory");
 }
 
 fn internal_function_symbol(ir: &str, source_name: &str) -> String {

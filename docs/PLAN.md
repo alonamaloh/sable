@@ -30,7 +30,10 @@ destination-pointer returns and single-use named-owner moves for that exact
 shape. N2 closes the real imported `add` closure, N3 closes the real imported
 `sub` and schoolbook `mul` closures, and N4 closes the real imported `div`,
 `rem`, and `gcd` closures through safe mutable-owner reassignment and existing
-lexical loop cleanup, while broader class transport remains fenced.
+lexical loop cleanup. N5 closes the exact nested signed-`Integer` call closure
+with owned-`Nat` take parameters, per-field construction, nested field borrows,
+`&mut Integer`, the private `flip_sign` method, and recursive destruction;
+broader class transport remains fenced.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -683,8 +686,8 @@ native storage and lexical cleanup for that same local slice are complete. The b
 aggregate-generics/backend track continues at M46+; G2.0's affine-option
 representation/fail-closed checkpoint and G2.1's local semantic slice are
 closed, as is G2.2's formal-SVM slice. G2.3's exact local native slice is
-closed as well. N0's local `u32`-array foundation is closed. The order remains
-a working hypothesis, not a promise that evidence cannot reorder it:
+closed as well. N0–N5's native `Nat`/`Integer` ladder is closed. The order
+remains a working hypothesis, not a promise that evidence cannot reorder it:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
    interpreter/native differentials and end-to-end trap tests as later work
@@ -1318,13 +1321,71 @@ a working hypothesis, not a promise that evidence cannot reorder it:
      cases. Its emitted program returns 42 when compiled directly with Clang
      at both `-O0` and `-O2`.
 
-     N5 remains the separate full `Integer` step: nested `Nat` ownership,
-     by-value class constructor/function arguments, class-field borrows,
-     `&mut Integer`, methods, and recursive reverse destruction. At N4, owned
-     class parameters, mutable class borrows, methods, discarded class results,
-     field moves, broader or generic shapes, nonempty destructors, and every
-     public, extern, or cross-module class ABI remain rejected. Both checkpoints
-     retain internal-only representations and scalar process wrappers.
+     The separate N5 checkpoint below adds only the exact nested `Integer`
+     closure. Both checkpoints retain internal-only representations and scalar
+     process wrappers.
+
+   - **N5 — native signed `Integer` (closed):** admit exactly
+     `Integer { Nat mag; u64 neg; }`, represented
+     internally as the already-supported `Nat` aggregate followed by an `i64`.
+     This is a declaration-specific widening, not recursive class-layout
+     inference. Initializer validation tracks `mag` and `neg` independently,
+     requires each field to be initialized exactly once on every reaching path,
+     and distinguishes scalar initialization from ownership transfer into
+     `mag`.
+
+     The internal take convention now accepts an exact owned `Nat` parameter
+     for `Integer::make` and `of_nat`. The caller passes the aggregate by value
+     and neutralizes a named source. A class-returning argument is first
+     produced into a unique entry-hoisted, unregistered scratch destination;
+     the completed aggregate is loaded by value and the scratch is zeroed
+     immediately before the call. The callee stores the value in an owning slot
+     registered for lexical cleanup, and moving that slot into `Integer.mag`
+     zeros it. This gives by-value ownership transfer its real callee-drop
+     behavior without a caller-side post-call drop or a C, platform, or
+     cross-module class ABI.
+
+     Field projection admits the real implementation's scalar reads and exact
+     borrows: `x.neg` reads the `u64` field, `&x.mag` borrows the nested `Nat`,
+     and `&a.limbs` borrows its array descriptor. Mutable `&mut Integer` lowers
+     as a non-owning pointer. Method dependency selection, mangling, validation,
+     and emission are opened only for the private unit-returning
+     `Integer::flip_sign(&mut self)` reached by `negate_in_place`; its store
+     updates scalar `neg` in place while the source verifier remains responsible
+     for re-establishing the class invariant.
+
+     Class destruction is recursive and follows reverse declaration order.
+     Dropping an `Integer` visits `neg` as a scalar no-op, then drops `mag`,
+     which in turn projects `limbs` and uses the established null-checked array
+     free. Named moves and owned parameters consumed into fields are zeroed
+     before their registered cleanup; the unregistered argument scratch is
+     zeroed before the call. Together these preserve one eventual free for each
+     nonempty magnitude.
+
+     `corpus/verifies/integer_native.sable` verifies 237/237 obligations across
+     39 selected functions. Its small cases cover construction, unary and
+     in-place sign operations, addition, subtraction, multiplication, and
+     Euclidean division/remainder for positive and negative dividend/divisor
+     combinations. The emitted program returns 42 when compiled directly with
+     Clang at both `-O0` and `-O2`.
+
+     The dedicated strong allocator-hook test is green under Clang `-O0` and
+     `-O2`: it exits 42 with `live = 0`, and aborts on a leak, unknown free, or
+     double free. The exact `VerifiedProgram` differential is green 1/1 over
+     13 subjects at both optimization levels, including `Integer` exit 42.
+
+     N5 closed under
+     `SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1`. The gentle
+     serial run passed 223/223 library tests; corpus 1/1 in 93.64s; randomized
+     allocator 1/1; grind-budget 1/1; LLVM CLI 10/10; differential 1/1 in
+     31.35s; LSP 1/1; SVM differential 1/1; and documentation tests.
+     `cargo check -j1` and rustfmt were green as well.
+
+     Owned `Integer` parameters, other owned class parameters, methods beyond
+     the exact `flip_sign` call closure, mutable borrows of other classes,
+     discarded class results, field moves, additional nongeneric or generic
+     class shapes, nonempty destructors, array whole-value transport, and every
+     public, extern, or cross-module class ABI remain rejected.
 
    - **G3 — slots and `Vec` (later planning target):** make generic element
      storage and movement real for the existing growable-vector benchmark;

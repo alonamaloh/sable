@@ -6,7 +6,7 @@ formal Boolean-array extension is closed. G1.6's owned-local native-array
 extension is implemented and closed 2026-08-13; ADR 0059 pins its runtime and
 lifetime contract. N0–N4's exact native-`Nat` foundation, fixed-owner,
 internal-return, and arithmetic-through-division-and-gcd extensions are
-closed.** Unsafe
+closed; N5's exact nested-`Integer` extension is implemented and closed.** Unsafe
 Sable v1 had a defensible formal stopping point but no native-code path. This
 backend makes verified
 programs in its deliberately narrow runtime subset runnable without making LLVM
@@ -558,12 +558,74 @@ coprime gcd cases. Its emitted program returns 42 when compiled directly by
 Clang at both `-O0` and `-O2`.
 
 This remains an internal call-closure and local-lifetime widening, not a class
-ABI. N5 retains nested `Integer` ownership, by-value class constructor/function
-arguments, class-field borrows, mutable outer borrows and methods, and recursive
-reverse destruction. At N4, owned class parameters, mutable class borrows,
-methods, discarded class results, field moves, broader or generic class shapes,
-nonempty destructors, extern transport, and public/cross-module class ABIs
-remain rejected.
+ABI. The N5 amendment below adds only the exact nested `Integer` closure. At
+N4, owned class parameters, mutable class borrows, methods, discarded class
+results, field moves, broader or generic class shapes, nonempty destructors,
+extern transport, and public/cross-module class ABIs remain rejected.
+
+## N5 amendment: the exact nested signed-`Integer` closure
+
+N5 admits one additional concrete declaration:
+`Integer { Nat mag; u64 neg; }`. Its internal aggregate contains the already
+fixed internal `Nat` aggregate followed by `i64`. Support is selected from the
+checked nominal declarations; this amendment does not recursively bless an
+arbitrary class layout. Initializer validation is correspondingly per field:
+each of `mag` and `neg` must be initialized exactly once on every reaching
+path, with ownership transfer into the former distinct from a scalar store into
+the latter.
+
+An exact owned `Nat` parameter now has an internal take convention. The caller
+passes the complete aggregate by value and zeroes a named source immediately;
+when the argument is itself class-returning, its hidden destination is a unique
+entry-hoisted, unregistered scratch slot. The completed aggregate is loaded by
+value and that scratch is zeroed immediately before the call. The callee stores
+the aggregate into an owning slot registered in its lexical cleanup scope.
+Moving the parameter into `Integer.mag` transfers the aggregate and zeros that
+slot, so an early return or normal fallthrough drops exactly whichever place
+still owns the nested array. There is no caller-side post-call drop. This is an
+internal, versionable convention rather than a platform or C class ABI.
+
+Class projection widens only as required by the real imported `Integer`
+implementation. Scalar `u64` fields may be loaded and stored; `&x.mag` borrows
+the nested `Nat`; and `&a.limbs` borrows the nested array descriptor. These
+borrows remain non-owning and retain the checked shared/mutable type. Exact
+`&mut Integer` arguments lower as non-owning pointers. Method closure discovery,
+mangling, validation, and emission are enabled only for the private
+unit-returning `Integer::flip_sign(&mut self)` reached by
+`negate_in_place`; its scalar sign store is not a general method ABI.
+
+Destruction is structural for these two admitted classes and proceeds in
+reverse declaration order. Dropping `Integer` treats scalar `neg` as a no-op,
+then recursively drops `mag`; dropping `Nat` projects `limbs` and reaches the
+existing null-checked free hook. Named moves, owned-parameter transfers, and
+registered parameter slots are zeroed at the source, preserving a single
+eventual free and making their later cleanup a no-op. The unregistered argument
+scratch is empty before control enters the callee.
+
+The dedicated `corpus/verifies/integer_native.sable` subject discharges
+237/237 verifier obligations across 39 selected functions. It covers
+construction, unary and in-place sign operations, addition, subtraction,
+multiplication, and Euclidean division/remainder across positive and negative
+dividend/divisor combinations. Its emitted program returns 42 when compiled
+directly by Clang at both `-O0` and `-O2`.
+
+A dedicated strong allocator-hook test is green under Clang `-O0` and `-O2`:
+it exits 42 with `live = 0`, and aborts on a leak, unknown free, or double free.
+The exact `VerifiedProgram` differential is green 1/1 over 13 subjects at both
+optimization levels, including `Integer` exit 42.
+
+N5 closed under
+`SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1`. The gentle serial
+run passed 223/223 library tests; corpus 1/1 in 93.64s; randomized allocator
+1/1; grind-budget 1/1; LLVM CLI 10/10; differential 1/1 in 31.35s; LSP 1/1;
+SVM differential 1/1; and documentation tests. `cargo check -j1` and rustfmt
+were green as well.
+
+Owned `Integer` parameters, other owned class parameters, methods beyond the
+exact `flip_sign` closure, mutable borrows of other classes, discarded class
+results, field moves, additional or generic class shapes, nonempty destructors,
+array whole-value transport, extern transport, and public/cross-module class
+ABIs remain rejected.
 
 ## Consequences
 
@@ -572,11 +634,10 @@ base: Lean still checks contracts, while the new emitter is an additional
 compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
 The cost is a backend intentionally limited to scalar, Boolean-option,
-internal integer-POD values, the fenced local array/affine-option slices, and
-one internal fixed-owner `Nat` convention through its imported arithmetic
-closures from construction and comparison through division and gcd, with
-aggregate ABIs still rejected, plus explicit traps/control flow where less
-careful LLVM frontends often rely on poison. Broader aggregate representations
-and every aggregate ABI, extern interoperability, optimization, debug
-information, object emission, and stable cross-module symbols remain separate
-decisions.
+internal integer-POD values, the fenced local array/affine-option slices, the
+internal fixed-owner `Nat` convention through its imported arithmetic closure,
+and one exact nested signed-`Integer` closure, with aggregate ABIs still
+rejected, plus explicit traps/control flow where less careful LLVM frontends
+often rely on poison. Broader aggregate representations and every aggregate
+ABI, extern interoperability, optimization, debug information, object
+emission, and stable cross-module symbols remain separate decisions.
