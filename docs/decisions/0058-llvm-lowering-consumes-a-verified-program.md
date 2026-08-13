@@ -4,8 +4,9 @@
 and G1.4a POD-record extensions implemented and closed 2026-08-13; G1.5's
 formal Boolean-array extension is closed. G1.6's owned-local native-array
 extension is implemented and closed 2026-08-13; ADR 0059 pins its runtime and
-lifetime contract. N0, N1a, and N1b's exact native-`Nat` foundation,
-fixed-owner, and internal-return extensions are closed.** Unsafe
+lifetime contract. N0–N4's exact native-`Nat` foundation, fixed-owner,
+internal-return, and arithmetic-through-division-and-gcd extensions are
+closed.** Unsafe
 Sable v1 had a defensible formal stopping point but no native-code path. This
 backend makes verified
 programs in its deliberately narrow runtime subset runnable without making LLVM
@@ -469,6 +470,101 @@ class borrows, moves from fields or arbitrary expressions, multiple or nested
 class fields, generic classes, nonempty destructors, extern transport, and
 public/cross-module class ABIs remain rejected.
 
+## N2 amendment: the real imported `Nat` addition closure
+
+N2 reuses N0–N1b rather than defining another representation or calling
+convention. The selected closure for the real imported bignum `add` contains
+shared `&Nat` inputs and reborrows, scalar length and limb helpers, one fresh
+owned `[u32]` scratch buffer, a carry loop, prefix trimming, and
+`Nat::from_prefix`. The inputs remain non-owning pointers. The scratch buffer
+uses N0's descriptor, unaligned accesses, bounds traps, and lexical cleanup;
+the constructed `Nat` uses N1a's fixed aggregate and nested destruction; and
+N1b's destination pointer and named-move neutralization carry the result back
+without fabricating a second live owner.
+
+The dedicated `corpus/verifies/bignum_add_native.sable` subject discharges
+40/40 verifier obligations and covers zero identity, `1 + 2`, a full-width
+carry, and unequal operand lengths. Its emitted program returns 42 when
+compiled directly by Clang at both `-O0` and `-O2`.
+
+This remains an internal call-closure widening, not a class ABI. Mutable class
+owners and reassignment stay closed until N4. The subsequent N3 amendment
+below closes `sub` and schoolbook `mul`; `div`/`rem`/`gcd` remain N4, and
+nested `Integer` ownership remains N5.
+Owned class parameters, methods, mutable class borrows, discarded class
+results, field moves, broader or generic class shapes, nonempty destructors,
+extern transport, and public/cross-module class ABIs remain rejected.
+
+## N3 amendment: the real imported `Nat` subtraction and multiplication closures
+
+N3 admits the selected closures of the real verified `sub` and schoolbook
+`mul` without adding a representation, calling convention, ownership rule, or
+runtime hook. Both functions receive shared non-owning `&Nat` inputs, allocate
+one fresh local `[u32]` scratch array, trim its completed prefix, construct the
+fixed N1a result with `Nat::from_prefix`, and return it through N1b's hidden
+destination and named-local move neutralization.
+
+The arithmetic remains ordinary scalar lowering. `sub` performs its checked
+base-2^32 borrow calculation in one loop. `mul` uses nested scalar loops with
+checked widened limb products, scratch accumulation, and carry propagation.
+N0's checked indexing and unaligned limb accesses apply throughout. Normal
+reverse lexical cleanup frees scratch storage and the eventual destination
+frees the constructed result; the zeroed moved-from local is a null-safe no-op.
+
+The dedicated `corpus/verifies/bignum_sub_mul_native.sable` subject discharges
+51/51 verifier obligations across 19 functions. It covers subtraction to zero,
+a borrow chain across two zero limbs, multiplication by zero, a maximum limb
+squared, and cross-limb carry. Its emitted program returns 42 when compiled
+directly by Clang at both `-O0` and `-O2`.
+
+This remains an internal call-closure widening, not a class ABI. Mutable class
+owners, reassignment, and `div`/`rem`/`gcd` remain N4. Nested `Integer`
+ownership, by-value class constructor/function arguments, class-field borrows,
+mutable outer borrows and methods, and nested destruction remain N5. At N3,
+owned class parameters, methods, mutable class borrows, discarded class
+results, field moves, broader or generic class shapes, nonempty destructors,
+extern transport, and public/cross-module class ABIs remain rejected.
+
+## N4 amendment: the real imported `Nat` division, remainder, and gcd closures
+
+N4 admits the selected closures of the real verified `div`, `rem`, and `gcd`
+without changing N1a's exact fixed `Nat { [u32] limbs; }` representation. Its
+new ownership surface is limited to mutable locals of that same class and
+whole-local reassignment from an admitted constructor, internal class-returning
+call, or live named move. Shared `&Nat` inputs and reborrows remain non-owning.
+
+Every reassignment target receives one scratch slot allocated in the function
+entry. Lowering evaluates the complete right-hand side into that scratch before
+dropping the target's old value. This ordering is load-bearing for expressions
+such as `dd = dd - vn` and `q = shift_in(&q, d)`: the producing call may borrow
+the destination until it has finished constructing the replacement. After the
+call returns, native cleanup destroys the old owner, the replacement aggregate
+moves from scratch into the target, and the scratch is zeroed. No loop executes
+a new stack allocation, no transient descriptor becomes a second registered
+owner, and reassignment can safely revive a moved mutable target.
+
+N4 needs no new loop lifetime mechanism. Existing lexical cleanup destroys
+class owners declared inside a loop body in reverse order before the backedge;
+outer mutable owners retain their function-scope cleanup; and zeroed move or
+scratch carriers are null-safe no-ops. Path-sensitive validation continues to
+reject reads and borrows of moved owners, mismatched reaching branch states,
+and any loop backedge that fails to restore the same outer owner-liveness shape.
+
+The dedicated `corpus/verifies/bignum_div_native.sable` subject discharges
+109/109 verifier obligations across 21 selected functions with six small hand
+discharges. It covers division by one, exact and inexact quotient/remainder
+pairs, the multi-limb quotient-estimate correction, and basic, zero-input, and
+coprime gcd cases. Its emitted program returns 42 when compiled directly by
+Clang at both `-O0` and `-O2`.
+
+This remains an internal call-closure and local-lifetime widening, not a class
+ABI. N5 retains nested `Integer` ownership, by-value class constructor/function
+arguments, class-field borrows, mutable outer borrows and methods, and recursive
+reverse destruction. At N4, owned class parameters, mutable class borrows,
+methods, discarded class results, field moves, broader or generic class shapes,
+nonempty destructors, extern transport, and public/cross-module class ABIs
+remain rejected.
+
 ## Consequences
 
 This path gets Sable to native toolchains without expanding the trusted proof
@@ -477,8 +573,10 @@ compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
 The cost is a backend intentionally limited to scalar, Boolean-option,
 internal integer-POD values, the fenced local array/affine-option slices, and
-one internal fixed-owner `Nat` convention, with aggregate ABIs still rejected,
-plus explicit traps/control flow where less careful LLVM frontends often rely
-on poison. Broader aggregate representations and every aggregate ABI, extern
-interoperability, optimization, debug information, object emission, and stable
-cross-module symbols remain separate decisions.
+one internal fixed-owner `Nat` convention through its imported arithmetic
+closures from construction and comparison through division and gcd, with
+aggregate ABIs still rejected, plus explicit traps/control flow where less
+careful LLVM frontends often rely on poison. Broader aggregate representations
+and every aggregate ABI, extern interoperability, optimization, debug
+information, object emission, and stable cross-module symbols remain separate
+decisions.

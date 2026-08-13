@@ -776,18 +776,13 @@ fn validate_block(
                     )]);
                 };
                 if let Ty::Class(class) = ty {
-                    if *mutable {
-                        return Err(vec![unsupported(
-                            *name_span,
-                            format!(
-                                "fixed-owner class local `{name}` may not be mutable or reassigned"
-                            ),
-                        )]);
-                    }
                     validate_fixed_class_initializer(program, class, init, root_span_end, locals)?;
                     locals.insert(
                         name.clone(),
-                        ValidationLocal { ty, mutable: false },
+                        ValidationLocal {
+                            ty,
+                            mutable: *mutable,
+                        },
                         *name_span,
                     )?;
                     continue;
@@ -855,11 +850,14 @@ fn validate_block(
                         format!("owned array local `{name}` cannot be rebound"),
                     )]);
                 }
-                if matches!(local.ty, Ty::Class(_)) {
-                    return Err(vec![unsupported(
-                        *name_span,
-                        format!("fixed-owner class local `{name}` cannot be reassigned or moved"),
-                    )]);
+                if let Ty::Class(class) = local.ty {
+                    validate_fixed_class_initializer(program, class, value, root_span_end, locals)?;
+                    // Assignment installs a fresh owner even when the old
+                    // destination had already been moved from. The RHS was
+                    // validated first so self-borrows still require the old
+                    // destination to be live.
+                    locals.moved_classes.remove(name);
+                    continue;
                 }
                 if matches!(local.ty, Ty::AffineOption(_)) {
                     return Err(vec![affine_option_unsupported(
@@ -2845,6 +2843,10 @@ struct FunctionEmitter<'a, 'support> {
     support: &'support mut ModuleSupport,
     initializer_class: Option<usize>,
     locals: HashMap<String, Local>,
+    /// Entry-block scratch owners for class reassignment. Each RHS is fully
+    /// evaluated here before the old destination is destroyed, preserving
+    /// expressions that borrow their own assignment target.
+    class_reassignment_slots: HashMap<String, String>,
     next_local: usize,
     next_temp: usize,
     next_block: usize,
@@ -2867,6 +2869,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             support,
             initializer_class: None,
             locals: HashMap::new(),
+            class_reassignment_slots: HashMap::new(),
             next_local: 0,
             next_temp: 0,
             next_block: 0,
@@ -2953,6 +2956,20 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             self.instruction(format!("{slot} = alloca {}", llvm_ty(*ty)));
             self.locals.insert(name.clone(), Local { ty: *ty, slot });
         }
+        let mut assignment_targets = BTreeSet::new();
+        collect_assignment_targets(&self.function.body, &mut assignment_targets);
+        for name in assignment_targets {
+            let ty = self
+                .locals
+                .get(&name)
+                .expect("validated assignment target was preallocated")
+                .ty;
+            if let Ty::Class(class) = ty {
+                let slot = self.new_slot();
+                self.instruction(format!("{slot} = alloca {}", llvm_class_ty(class)));
+                self.class_reassignment_slots.insert(name, slot);
+            }
+        }
         for (index, (name, ty)) in parameters.iter().enumerate() {
             let slot = self
                 .locals
@@ -3020,7 +3037,6 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     name_span,
                     value,
                 } => {
-                    let emitted = self.emit_expr(value)?;
                     let Some(local) = self.locals.get(name) else {
                         return Err(vec![unsupported(
                             *name_span,
@@ -3029,6 +3045,20 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     };
                     let ty = local.ty;
                     let slot = local.slot.clone();
+                    if let Ty::Class(class) = ty {
+                        let scratch = self
+                            .class_reassignment_slots
+                            .get(name)
+                            .expect("validated class assignment has entry scratch")
+                            .clone();
+                        // Evaluate completely before destroying the old value:
+                        // real Nat assignments borrow their own destination.
+                        self.emit_fixed_class_into(class, &scratch, value)?;
+                        self.emit_fixed_class_drop(name, class);
+                        self.emit_fixed_class_move(class, &slot, &scratch);
+                        continue;
+                    }
+                    let emitted = self.emit_expr(value)?;
                     self.instruction(format!(
                         "store {} {}, ptr {}",
                         llvm_ty(ty),
@@ -3332,23 +3362,27 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .expect("validated class move source")
                     .slot
                     .clone();
-                let moved = self.new_temp();
-                self.instruction(format!(
-                    "{moved} = load {}, ptr {source_slot}",
-                    llvm_class_ty(class)
-                ));
-                self.instruction(format!(
-                    "store {} {moved}, ptr {destination}",
-                    llvm_class_ty(class)
-                ));
-                self.instruction(format!(
-                    "store {} zeroinitializer, ptr {source_slot}",
-                    llvm_class_ty(class)
-                ));
+                self.emit_fixed_class_move(class, destination, &source_slot);
                 Ok(())
             }
             _ => unreachable!("validated fixed-owner class destination source"),
         }
+    }
+
+    fn emit_fixed_class_move(&mut self, class: usize, destination: &str, source: &str) {
+        let moved = self.new_temp();
+        self.instruction(format!(
+            "{moved} = load {}, ptr {source}",
+            llvm_class_ty(class)
+        ));
+        self.instruction(format!(
+            "store {} {moved}, ptr {destination}",
+            llvm_class_ty(class)
+        ));
+        self.instruction(format!(
+            "store {} zeroinitializer, ptr {source}",
+            llvm_class_ty(class)
+        ));
     }
 
     fn emit_self_u32_field_slot(&mut self, class: usize) -> String {
@@ -4983,6 +5017,30 @@ fn collect_local_declarations(statements: &[Stmt], declarations: &mut Vec<(Strin
             }
             Stmt::While { body, .. } | Stmt::Unsafe { body, .. } => {
                 collect_local_declarations(body, declarations);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_assignment_targets(statements: &[Stmt], targets: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement {
+            Stmt::Assign { name, .. } => {
+                targets.insert(name.clone());
+            }
+            Stmt::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_assignment_targets(then_block, targets);
+                if let Some(else_block) = else_block {
+                    collect_assignment_targets(else_block, targets);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::Unsafe { body, .. } => {
+                collect_assignment_targets(body, targets);
             }
             _ => {}
         }
@@ -8117,18 +8175,61 @@ mod tests {
     }
 
     #[test]
+    fn mutable_fixed_owner_reassignment_uses_scratch_before_dropping_the_old_value() {
+        let mut result = fixed_class_program();
+        let mut refresh = function(
+            "refresh",
+            Ty::Class(0),
+            vec![Stmt::Return {
+                value: Some(fixed_class_constructor()),
+                span: Span::new(0, 1),
+            }],
+        );
+        refresh.params = vec![parameter("old", Ty::ClassRef(0, Mutability::Shared))];
+        result.fns.push(refresh);
+
+        let entry = &mut result.fns[1];
+        let Stmt::VarDecl { mutable, .. } = &mut entry.body[0] else {
+            unreachable!()
+        };
+        *mutable = true;
+        entry.body.insert(
+            1,
+            Stmt::Assign {
+                name: "value".into(),
+                name_span: Span::new(0, 1),
+                value: call_with("refresh", Ty::Class(0), vec![fixed_class_borrow("value")]),
+            },
+        );
+
+        let ir = emit_program(
+            &result,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .unwrap();
+        let call = ir
+            .find("call void @__sable_v0_f_7_refresh__p_c0s__r_c0o(ptr %v1, ptr %v0)")
+            .expect("replacement is evaluated into the entry scratch");
+        let drop = ir[call..]
+            .find("call void @__sable_rt_array_free_v1")
+            .map(|offset| call + offset)
+            .expect("the old owner is dropped after replacement evaluation");
+        let transfer = ir[drop..]
+            .find("store %sable.class.0 zeroinitializer, ptr %v1")
+            .map(|offset| drop + offset)
+            .expect("scratch is transferred and neutralized after the drop");
+        assert!(call < drop && drop < transfer);
+        assert_eq!(ir.matches("%v1 = alloca %sable.class.0").count(), 1);
+    }
+
+    #[test]
     fn fixed_owner_class_reassignment_parameters_methods_and_discarded_results_stay_closed() {
         let options = EmitOptions {
             entry: Some("entry".into()),
         };
-
-        let mut mutable_owner = fixed_class_program();
-        let Stmt::VarDecl { mutable, .. } = &mut mutable_owner.fns[1].body[0] else {
-            unreachable!()
-        };
-        *mutable = true;
-        let error = emit_program(&mutable_owner, 1, &options).unwrap_err();
-        assert!(error[0].label.contains("may not be mutable or reassigned"));
 
         let mut method_class = fixed_class_program();
         method_class.classes[0].methods.push(Method {

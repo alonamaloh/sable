@@ -65,6 +65,21 @@ const CASES: &[Case] = &[
         source: "../verifies/bignum_native.sable",
         entry: "bignum_native_entry",
     },
+    Case {
+        label: "bignum-add-native",
+        source: "../verifies/bignum_add_native.sable",
+        entry: "bignum_add_native_entry",
+    },
+    Case {
+        label: "bignum-sub-mul-native",
+        source: "../verifies/bignum_sub_mul_native.sable",
+        entry: "bignum_sub_mul_native_entry",
+    },
+    Case {
+        label: "bignum-div-native",
+        source: "../verifies/bignum_div_native.sable",
+        entry: "bignum_div_native_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {

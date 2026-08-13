@@ -1,0 +1,91 @@
+// N3 native Nat subtraction-and-multiplication subject. Each case lives in a
+// small wrapper so constructor facts stay local while the entry still selects
+// the real verified operation closures.
+
+use bignum::{Nat, cmp, sub, mul};
+
+fn subtraction_to_zero() -> i32 {
+    [u32] same_source = [17, 3];
+    [u32] zero_source = [1];
+    var same = Nat::from_prefix(&same_source, 2);
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var difference = sub(&same, &same);
+    if (cmp(&difference, &zero) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn subtraction_borrow_chain() -> i32 {
+    [u32] borrow_source = [0, 0, 1];
+    [u32] one_source = [1];
+    [u32] expected_source = [4294967295, 4294967295];
+    var value = Nat::from_prefix(&borrow_source, 3);
+    var one = Nat::from_prefix(&one_source, 1);
+    var expected = Nat::from_prefix(&expected_source, 2);
+    if (cmp(&one, &value) == 1) {
+        return 1;
+    }
+    var difference = sub(&value, &one);
+    if (cmp(&difference, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn multiplication_by_zero() -> i32 {
+    [u32] value_source = [17, 3];
+    [u32] zero_source = [1];
+    var value = Nat::from_prefix(&value_source, 2);
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var product = mul(&value, &zero);
+    if (cmp(&product, &zero) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn multiplication_max_square() -> i32 {
+    [u32] max_source = [4294967295];
+    [u32] expected_source = [1, 4294967294];
+    var max_value = Nat::from_prefix(&max_source, 1);
+    var expected = Nat::from_prefix(&expected_source, 2);
+    var square = mul(&max_value, &max_value);
+    if (cmp(&square, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn multiplication_cross_limb_carry() -> i32 {
+    [u32] value_source = [4294967295, 1];
+    [u32] two_source = [2];
+    [u32] expected_source = [4294967294, 3];
+    var value = Nat::from_prefix(&value_source, 2);
+    var two = Nat::from_prefix(&two_source, 1);
+    var expected = Nat::from_prefix(&expected_source, 2);
+    var product = mul(&value, &two);
+    if (cmp(&product, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn bignum_sub_mul_native_entry() -> i32 {
+    if (subtraction_to_zero() != 0) {
+        return 1;
+    }
+    if (subtraction_borrow_chain() != 0) {
+        return 2;
+    }
+    if (multiplication_by_zero() != 0) {
+        return 3;
+    }
+    if (multiplication_max_square() != 0) {
+        return 4;
+    }
+    if (multiplication_cross_limb_carry() != 0) {
+        return 5;
+    }
+    return 42;
+}

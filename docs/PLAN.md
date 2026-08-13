@@ -27,7 +27,10 @@ N0's exact local `[u32]` LLVM storage and internal borrowed-array call slice is
 closed as the native `Nat` foundation. N1a closes the fixed-owner class slice
 needed by the real imported `Nat::from_prefix` and `cmp`. N1b closes internal
 destination-pointer returns and single-use named-owner moves for that exact
-shape while broader class transport remains fenced.
+shape. N2 closes the real imported `add` closure, N3 closes the real imported
+`sub` and schoolbook `mul` closures, and N4 closes the real imported `div`,
+`rem`, and `gcd` closures through safe mutable-owner reassignment and existing
+lexical loop cleanup, while broader class transport remains fenced.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -1237,13 +1240,91 @@ a working hypothesis, not a promise that evidence cannot reorder it:
      broader/nested/generic shapes, nonempty destructors, extern transport,
      and public/cross-module class ABIs remain rejected.
 
-   - **N2–N5 — remaining native bignum ladder:** N2 lowers `add` (`cmp` is
-     already in N1a); N3 adds `sub` and
-     schoolbook `mul`; N4 adds `div`, `rem`, and `gcd` with mutable class
-     reassignment and loop cleanup. N5 is the separate full `Integer` step:
-     nested `Nat` ownership, by-value class constructor arguments, class-field
-     borrows, `&mut Integer`, and nested reverse destruction. Each checkpoint
-     retains internal-only representations and scalar process wrappers.
+   - **N2 — native `Nat` addition (closed):** admit the real imported bignum
+     `add` call closure using the representation and lifetime mechanisms
+     already closed by N0–N1b. Shared `&Nat` inputs and reborrows remain
+     non-owning; scalar length/limb helpers drive a fresh local `[u32]` scratch
+     buffer through a carry loop; trimming and `Nat::from_prefix` construct the
+     result; and the existing hidden destination convention carries that
+     result through a return or one named move. The scratch buffer and nested
+     result allocation retain reverse lexical cleanup, while neutralized move
+     sources remain null-safe.
+
+     `corpus/verifies/bignum_add_native.sable` verifies all 40/40 obligations
+     and covers zero identity, `1 + 2`, a full-width carry, and unequal operand
+     lengths. Its emitted program returns 42 when compiled directly with Clang
+     at both `-O0` and `-O2`. This checkpoint adds no proof rule, runtime hook,
+     class representation, or aggregate ABI.
+
+     Mutable class owners and reassignment remain reserved for N4. The
+     subsequent N3 checkpoint below closes `sub` and schoolbook `mul`;
+     `div`, `rem`, and `gcd` remain N4, and nested `Integer` ownership remains
+     N5. Owned class parameters, methods, mutable class borrows, discarded
+     class results, field moves, broader or generic class shapes, nonempty
+     destructors, and every public, extern, or cross-module class ABI remain
+     rejected.
+
+   - **N3 — native `Nat` subtraction and multiplication (closed):** admit the
+     real imported `sub` and schoolbook `mul` closures using only N0–N2's
+     representation, call, and lifetime machinery. `sub` borrows both inputs,
+     performs checked borrow arithmetic into one fresh `[u32]` scratch array,
+     trims the prefix, constructs the result, and returns it through N1b's
+     destination convention and named local move. `mul` uses the same pattern
+     with nested scalar loops, checked carry/product arithmetic, and one fresh
+     output scratch array. Reverse lexical cleanup frees scratch arrays and
+     neutralized move sources remain null-safe; no new hook, representation,
+     ownership rule, or ABI is introduced.
+
+     `corpus/verifies/bignum_sub_mul_native.sable` verifies all 51/51
+     obligations across 19 selected functions. It covers subtraction to zero,
+     a borrow chain across two zero limbs, multiplication by zero, a maximum
+     limb squared, and a cross-limb carry. Its emitted program returns 42 when
+     compiled directly with Clang at both `-O0` and `-O2`.
+
+     Mutable class owners and reassignment remain reserved for N4, together
+     with `div`, `rem`, and `gcd` and their loop-carried ownership cleanup.
+     Nested `Integer` ownership, by-value class constructor/function arguments,
+     class-field borrows, `&mut Integer`, methods, and nested reverse
+     destruction remain N5. Owned class parameters, discarded class results,
+     field moves, broader or generic shapes, nonempty destructors, and every
+     public, extern, or cross-module class ABI remain rejected.
+
+   - **N4 — native `Nat` division, remainder, and gcd (closed):** admit the
+     selected closures of the real verified `div`, `rem`, and `gcd` while
+     retaining the exact N1a `Nat { [u32] limbs; }` representation. N4 adds
+     mutable locals of that shape and class-local reassignment; it does not
+     add a class ABI, new runtime hook, or proof rule.
+
+     Each reassignment target receives one scratch slot hoisted to the function
+     entry. Lowering evaluates the complete right-hand side into that scratch
+     before destroying the old target, so self-borrowing forms such as
+     `dd = dd - vn` and `q = shift_in(&q, d)` keep the borrowed owner valid
+     until the producing call returns. The old owner is then dropped, the
+     replacement aggregate is transferred into its target, and the scratch is
+     zeroed. Reassigning a moved mutable target revives it; ordinary moved-value
+     checks still reject a read or borrow before that revival.
+
+     Existing lexical cleanup supplies the loop lifetime rule. Owners declared
+     in a loop body are destroyed in reverse order before each backedge, outer
+     mutable owners keep their function-scope cleanup, and zeroed named-move
+     carriers make later null-safe cleanup a no-op. Reassignment scratch slots
+     are unregistered and empty after transfer. Reaching `if` arms and loop
+     backedges must still agree on which outer owners are live.
+
+     `corpus/verifies/bignum_div_native.sable` verifies all 109/109 obligations
+     across 21 selected functions with six small hand discharges. It covers
+     division by one, exact and inexact quotient/remainder pairs, a multi-limb
+     quotient-estimate correction, and basic, zero-input, and coprime gcd
+     cases. Its emitted program returns 42 when compiled directly with Clang
+     at both `-O0` and `-O2`.
+
+     N5 remains the separate full `Integer` step: nested `Nat` ownership,
+     by-value class constructor/function arguments, class-field borrows,
+     `&mut Integer`, methods, and recursive reverse destruction. At N4, owned
+     class parameters, mutable class borrows, methods, discarded class results,
+     field moves, broader or generic shapes, nonempty destructors, and every
+     public, extern, or cross-module class ABI remain rejected. Both checkpoints
+     retain internal-only representations and scalar process wrappers.
 
    - **G3 — slots and `Vec` (later planning target):** make generic element
      storage and movement real for the existing growable-vector benchmark;

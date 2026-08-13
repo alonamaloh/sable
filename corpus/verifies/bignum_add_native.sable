@@ -1,0 +1,50 @@
+// N2 native Nat-addition subject. This imports the real verified add closure
+// and keeps each result owned while comparison observes it through shared
+// borrows. The cases cover normalization, carry propagation, and mixed
+// operand lengths.
+
+use bignum::{Nat, cmp, add};
+
+fn bignum_add_native_entry() -> i32 {
+    [u32] identity_source = [123456789, 42];
+    [u32] zero_source = [1];
+    var identity = Nat::from_prefix(&identity_source, 2);
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var identity_sum = add(&identity, &zero);
+    if (cmp(&identity_sum, &identity) != 0) {
+        return 1;
+    }
+
+    [u32] one_source = [1];
+    [u32] two_source = [2];
+    [u32] three_source = [3];
+    var one = Nat::from_prefix(&one_source, 1);
+    var two = Nat::from_prefix(&two_source, 1);
+    var three = Nat::from_prefix(&three_source, 1);
+    var small_sum = add(&one, &two);
+    if (cmp(&small_sum, &three) != 0) {
+        return 2;
+    }
+
+    [u32] carry_source = [4294967295, 4294967295];
+    [u32] carry_expected_source = [0, 0, 1];
+    var carry_value = Nat::from_prefix(&carry_source, 2);
+    var carry_expected = Nat::from_prefix(&carry_expected_source, 3);
+    var carry_sum = add(&carry_value, &one);
+    if (cmp(&carry_sum, &carry_expected) != 0) {
+        return 3;
+    }
+
+    [u32] long_source = [5, 1, 2];
+    [u32] short_source = [7, 8];
+    [u32] mixed_expected_source = [12, 9, 2];
+    var long_value = Nat::from_prefix(&long_source, 3);
+    var short_value = Nat::from_prefix(&short_source, 2);
+    var mixed_expected = Nat::from_prefix(&mixed_expected_source, 3);
+    var mixed_sum = add(&long_value, &short_value);
+    if (cmp(&mixed_sum, &mixed_expected) != 0) {
+        return 4;
+    }
+
+    return 42;
+}

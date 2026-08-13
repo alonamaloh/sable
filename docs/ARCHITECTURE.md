@@ -131,7 +131,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (through N0 local `u32` arrays)
+## Native lowering boundary (through N4 fixed-owner `Nat` arithmetic)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -722,13 +722,61 @@ foreign, or cross-module array ABI.
   backedge. The imported fixture exercises constructor returns, return-call
   forwarding, local moves, moved-local returns, and an early-return branch.
 
-  Mutable owners, reassignment, owned class parameters, methods, mutable
-  borrows, discarded class results, broader or nested class shapes, nonempty
-  destructors, and every public, extern, or cross-module class ABI stay closed.
-  The remaining ladder is N2 `add`; N3 `sub` plus schoolbook `mul`; N4
-  `div`/`rem`/`gcd` with class reassignment and loop cleanup; and N5 the nested
-  `Integer` sign/magnitude class. Generic owner slots and `Vec` remain a
-  separate later design.
+  N2 admits the real imported `add` call closure without adding another native
+  representation or lifetime rule. Shared `&Nat` inputs and their reborrows
+  are non-owning pointers; scalar helpers select limb values and lengths; one
+  fresh local `[u32]` scratch buffer is filled by the carry loop; and trimming
+  plus `Nat::from_prefix` constructs the fixed-shape result. N1b's hidden
+  destination and named-move rules carry that result to its caller, while the
+  existing cleanup registry destroys scratch and nested allocations in reverse
+  lexical order. The fixture verifies 40/40 obligations across zero identity,
+  `1 + 2`, full carry, and unequal-length cases, and its direct Clang builds
+  return 42 at both `-O0` and `-O2`.
+
+  N3 carries the real imported `sub` and schoolbook `mul` closures through the
+  same boundary. `sub` fills one fresh `[u32]` scratch array with checked
+  borrow arithmetic. `mul` fills one fresh output array using nested scalar
+  loops and checked limb-product/carry arithmetic. Both trim the scratch
+  prefix, construct the fixed-shape result with `Nat::from_prefix`, return it
+  through N1b's hidden destination, and consume the named result local through
+  the existing move-neutralization path. Scratch descriptors and nested result
+  storage remain ordinary reverse-lexical cleanup entries.
+
+  The N3 fixture verifies 51/51 obligations across 19 functions and directly
+  returns 42 under Clang `-O0` and `-O2`. Its cases cover subtraction to zero,
+  a borrow chain across two zero limbs, zero multiplication, a maximum limb
+  squared, and cross-limb carry. N3 adds no representation, runtime hook,
+  ownership rule, or ABI.
+
+  N4 carries the real imported `div`, `rem`, and `gcd` closures through mutable
+  locals of the same exact fixed `Nat` type. Every reassignment target has one
+  scratch slot allocated in the function entry. The complete right-hand side
+  is produced into that slot before the old target is dropped, preserving
+  self-borrows in `dd = dd - vn` and `q = shift_in(&q, d)`. Lowering then
+  transfers the replacement aggregate to its target and zeros the scratch, so
+  ownership remains singular and loops do not execute new stack allocations.
+
+  The existing cleanup scopes already express N4's loop lifetimes: body-local
+  owners are destroyed in reverse lexical order before a backedge, outer
+  mutable owners remain function-scoped, and zeroed named-move carriers are
+  null-safe cleanup no-ops. Reassignment scratch slots are unregistered and
+  empty after transfer. Validation permits reassignment to revive a moved
+  mutable target while retaining exact reaching-branch and loop-backedge
+  owner-liveness agreement.
+
+  The N4 fixture verifies 109/109 obligations across 21 selected functions
+  with six small hand discharges and directly returns 42 under Clang `-O0` and
+  `-O2`. It covers division by one, exact and inexact quotient/remainder pairs,
+  a multi-limb quotient-estimate correction, and basic, zero-input, and coprime
+  gcd cases. N4 adds no representation, hook, proof rule, or aggregate ABI.
+
+  N5 remains the nested `Integer` sign/magnitude checkpoint, including
+  by-value class constructor/function arguments, class-field borrows, mutable
+  outer borrows and methods, and recursive reverse destruction. At N4, owned
+  class parameters, mutable class borrows, methods, discarded class results,
+  field moves, broader or generic class shapes, nonempty destructors, and every
+  public, extern, or cross-module class ABI stay closed. Generic owner slots
+  and `Vec` remain a separate later design.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

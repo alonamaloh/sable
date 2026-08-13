@@ -1,0 +1,193 @@
+// N4 native Nat division subject. Cases are isolated so their proof contexts
+// stay bounded while they still select the real div/rem/gcd implementation.
+
+use bignum::{Nat, cmp, div, rem, gcd};
+
+fn divide_by_one_case() -> i32 {
+    [u32] zero_source = [1];
+    [u32] one_source = [1];
+    [u32] dividend_source = [37, 2];
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var one = Nat::from_prefix(&one_source, 1);
+    var dividend = Nat::from_prefix(&dividend_source, 2);
+    if (cmp(&zero, &one) != -1) {
+        return 1;
+    }
+    var quotient = div(&dividend, &one);
+    if (cmp(&quotient, &dividend) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn exact_division_case() -> i32 {
+    [u32] zero_source = [1];
+    [u32] dividend_source = [84];
+    [u32] divisor_source = [7];
+    [u32] expected_source = [12];
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var dividend = Nat::from_prefix(&dividend_source, 1);
+    var divisor = Nat::from_prefix(&divisor_source, 1);
+    var expected = Nat::from_prefix(&expected_source, 1);
+    if (cmp(&zero, &divisor) != -1) {
+        return 1;
+    }
+    var quotient = div(&dividend, &divisor);
+    if (cmp(&quotient, &expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn inexact_division_case() -> i32 {
+    [u32] zero_source = [1];
+    [u32] one_source = [1];
+    [u32] dividend_source = [100];
+    [u32] divisor_source = [9];
+    [u32] quotient_source = [11];
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var one = Nat::from_prefix(&one_source, 1);
+    var dividend = Nat::from_prefix(&dividend_source, 1);
+    var divisor = Nat::from_prefix(&divisor_source, 1);
+    var quotient_expected = Nat::from_prefix(&quotient_source, 1);
+    if (cmp(&zero, &divisor) != -1) {
+        return 1;
+    }
+    var quotient = div(&dividend, &divisor);
+    var remainder = rem(&dividend, &divisor);
+    if (cmp(&quotient, &quotient_expected) != 0) {
+        return 1;
+    }
+    if (cmp(&remainder, &one) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn correction_case() -> i32 {
+    // B = 2^32. With v = [B-1, B/2] and a = 2*v-1, the top two
+    // dividend limbs estimate quotient digit 2 although the true digit is 1.
+    [u32] zero_source = [1];
+    [u32] one_source = [1];
+    [u32] dividend_source = [4294967293, 1, 1];
+    [u32] divisor_source = [4294967295, 2147483648];
+    [u32] remainder_source = [4294967294, 2147483648];
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var one = Nat::from_prefix(&one_source, 1);
+    var dividend = Nat::from_prefix(&dividend_source, 3);
+    var divisor = Nat::from_prefix(&divisor_source, 2);
+    var remainder_expected = Nat::from_prefix(&remainder_source, 2);
+    if (cmp(&zero, &divisor) != -1) {
+        return 1;
+    }
+    var quotient = div(&dividend, &divisor);
+    var remainder = rem(&dividend, &divisor);
+    if (cmp(&quotient, &one) != 0) {
+        return 1;
+    }
+    if (cmp(&remainder, &remainder_expected) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn gcd_basic_case() -> i32 {
+    [u32] twelve_source = [12];
+    [u32] eighteen_source = [18];
+    [u32] six_source = [6];
+    var twelve = Nat::from_prefix(&twelve_source, 1);
+    var eighteen = Nat::from_prefix(&eighteen_source, 1);
+    var six = Nat::from_prefix(&six_source, 1);
+    var common = gcd(&twelve, &eighteen);
+    if (cmp(&common, &six) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn gcd_zero_case() -> i32 {
+    [u32] zero_source = [1];
+    [u32] eighteen_source = [18];
+    var zero = Nat::from_prefix(&zero_source, 0);
+    var eighteen = Nat::from_prefix(&eighteen_source, 1);
+    var common = gcd(&zero, &eighteen);
+    if (cmp(&common, &eighteen) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn gcd_coprime_case() -> i32 {
+    [u32] one_source = [1];
+    [u32] thirty_five_source = [35];
+    [u32] sixty_four_source = [64];
+    var one = Nat::from_prefix(&one_source, 1);
+    var thirty_five = Nat::from_prefix(&thirty_five_source, 1);
+    var sixty_four = Nat::from_prefix(&sixty_four_source, 1);
+    var common = gcd(&thirty_five, &sixty_four);
+    if (cmp(&common, &one) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+fn bignum_div_native_entry() -> i32 {
+    if (divide_by_one_case() != 0) {
+        return 1;
+    }
+    if (exact_division_case() != 0) {
+        return 2;
+    }
+    if (inexact_division_case() != 0) {
+        return 3;
+    }
+    if (correction_case() != 0) {
+        return 4;
+    }
+    if (gcd_basic_case() != 0) {
+        return 5;
+    }
+    if (gcd_zero_case() != 0) {
+        return 6;
+    }
+    if (gcd_coprime_case() != 0) {
+        return 7;
+    }
+    return 42;
+}
+
+/// discharge divide_by_one_case.call_pre.div.natval_b_limbs_1 by
+///   have hz := valIn_nil zero_source 0 0 (by omega)
+///   have hzero : natVal zero.limbs = 0 := by omega
+///   have hlt : natVal zero.limbs < natVal one.limbs := h_cmp_post_lt.mp (by omega)
+///   omega
+
+/// discharge exact_division_case.call_pre.div.natval_b_limbs_1 by
+///   have hz := valIn_nil zero_source 0 0 (by omega)
+///   have hzero : natVal zero.limbs = 0 := by omega
+///   have hlt : natVal zero.limbs < natVal divisor.limbs := h_cmp_post_lt.mp (by omega)
+///   omega
+
+/// discharge inexact_division_case.call_pre.div.natval_b_limbs_1 by
+///   have hz := valIn_nil zero_source 0 0 (by omega)
+///   have hzero : natVal zero.limbs = 0 := by omega
+///   have hlt : natVal zero.limbs < natVal divisor.limbs := h_cmp_post_lt.mp (by omega)
+///   omega
+
+/// discharge inexact_division_case.call_pre.rem.natval_b_limbs_1 by
+///   have hz := valIn_nil zero_source 0 0 (by omega)
+///   have hzero : natVal zero.limbs = 0 := by omega
+///   have hlt : natVal zero.limbs < natVal divisor.limbs := h_cmp_post_lt.mp (by omega)
+///   omega
+
+/// discharge correction_case.call_pre.div.natval_b_limbs_1 by
+///   have hz := valIn_nil zero_source 0 0 (by omega)
+///   have hzero : natVal zero.limbs = 0 := by omega
+///   have hlt : natVal zero.limbs < natVal divisor.limbs := h_cmp_post_lt.mp (by omega)
+///   omega
+
+/// discharge correction_case.call_pre.rem.natval_b_limbs_1 by
+///   have hz := valIn_nil zero_source 0 0 (by omega)
+///   have hzero : natVal zero.limbs = 0 := by omega
+///   have hlt : natVal zero.limbs < natVal divisor.limbs := h_cmp_post_lt.mp (by omega)
+///   omega

@@ -1,8 +1,8 @@
 # ADR 0059 — native owned Boolean arrays use runtime hooks and lexical cleanup
 
 **Decided and implemented 2026-08-13; G1.6, the G2.3 affine-option amendment,
-and N0–N1b's `u32`/fixed-`Nat` amendments are closed.** G1.5 gives owned-local Boolean arrays a
-checked, verified,
+and N0–N4's `u32`/fixed-`Nat` amendments are closed.** G1.5 gives owned-local
+Boolean arrays a checked, verified,
 interpreted, monitored, and formal-SVM meaning. LLVM remained the only
 execution boundary that rejected that exact slice at the G1.5 checkpoint. This
 decision adds native lowering without declaring an array ABI or widening the
@@ -154,7 +154,7 @@ checked mutability are admitted. Owned-array call transport, returns, entries,
 fields, classes, methods, externs, Boolean borrows, other payloads, exposure,
 and public or cross-module ABI positions stay closed.
 
-## N1a/N1b amendment: nested `Nat` cleanup and move neutralization
+## N1a–N4 amendment: nested `Nat` cleanup and arithmetic scratch storage
 
 N1a embeds one `%sable.array.u32` descriptor in the exact fixed native `Nat`
 class. Normal class destruction projects that descriptor and applies the same
@@ -173,9 +173,47 @@ eventual free for a nonempty magnitude. Validation rejects reuse of that moved
 source and rejects reaching branch or loop shapes that could make cleanup
 liveness ambiguous.
 
-This does not admit mutable owners, class reassignment, owned class parameters,
-class fields beyond the exact N1a shape, methods, extern transport, or any
-public/cross-module class ABI.
+N2 changes neither hook nor cleanup protocol. The real imported `add` closure
+borrows both input classes, allocates one fresh local `[u32]` scratch
+descriptor, fills it in a carry loop, and passes its trimmed prefix to
+`Nat::from_prefix`. The constructor creates the result's separately owned
+nested descriptor; normal reverse lexical cleanup frees the scratch allocation,
+and the destination owner eventually frees the result allocation. Shared input
+borrows and reborrows never enter the cleanup registry, while any intervening
+named move still zeros its source before that source's registered cleanup.
+
+N3 likewise changes neither hook nor cleanup protocol. The real imported
+`sub` and schoolbook `mul` closures each allocate one fresh `[u32]` scratch
+descriptor. Subtraction fills it in one checked borrow loop; multiplication
+fills it with nested checked product/carry loops. Each function trims the
+scratch prefix, constructs a separate result descriptor with
+`Nat::from_prefix`, and moves the named result into its hidden return
+destination. Reverse lexical cleanup frees the scratch allocation, the zeroed
+moved-from result local is a null-safe no-op, and the destination remains the
+sole owner of the result allocation.
+
+N4 also changes neither runtime hook nor the registered-cleanup model. For each
+mutable fixed-`Nat` reassignment target, one unregistered scratch slot is
+allocated in the function entry. The complete replacement is constructed there
+before the old target is destroyed, keeping self-borrows valid while the RHS
+runs. Cleanup then frees the old nested descriptor, the replacement aggregate
+moves into the target, and the scratch is zeroed. The target's existing cleanup
+entry remains the sole eventual owner of the replacement allocation.
+
+Loop-carried ownership continues to use lexical cleanup rather than a new
+runtime mechanism. Body-local class owners are destroyed in reverse order
+before each backedge, outer mutable owners retain function-scope cleanup, and
+zeroed named-move or reassignment scratch carriers bypass the free hook. The
+N4 fixture verifies 109/109 obligations across 21 selected functions with six
+small hand discharges, covers division by one, exact/inexact quotient and
+remainder, multi-limb correction, and basic/zero/coprime gcd, and returns 42
+under direct Clang `-O0` and `-O2` builds.
+
+This still does not admit owned class parameters, class fields beyond the exact
+N1a shape, methods, mutable class borrows, discarded class results, field moves,
+extern transport, or any public/cross-module class ABI. Nested `Integer`,
+by-value class constructor/function arguments, class-field borrows, mutable
+outer borrows/methods, and recursive reverse destruction remain N5.
 
 N0 closed under the exact one-worker command
 `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
@@ -218,8 +256,11 @@ grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
 were green. G2.3 is closed. At that checkpoint generic slots and `Vec`
 ownership were recorded as the next aggregate design, not an affine-option ABI
 widening. The subsequently implemented N0 amendment above begins an independent
-native `Nat` ladder; its next checkpoint is local-only `Nat` class construction
-and destruction. N1a subsequently closed that fixed-owner construction slice
-and the real imported `cmp`; N1b now closes its internal destination-pointer
-returns and single-use named moves. Reassignment and broader class transport
-remain later work.
+native `Nat` ladder; N1a subsequently closed local-only fixed-owner
+construction and the real imported `cmp`, N1b closed internal
+destination-pointer returns and single-use named moves, N2 closed the real
+imported `add` closure, and N3 now closes the imported `sub` and schoolbook
+`mul` closures without changing the hook contract. N4 closes the imported
+`div`, `rem`, and `gcd` closures through scratch-before-drop reassignment and
+the same lexical cleanup protocol. Nested ownership and broader class transport
+remain N5 work.
