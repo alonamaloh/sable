@@ -688,6 +688,12 @@ fn validate_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
     let Some(expected) = ctx.return_ty else {
         return Err("svm.sink_type: return lowering has no function result type".into());
     };
+    if expected.is_resource() {
+        return Err(
+            "svm.resource_return_unsupported: erased authority has no SVM result representation"
+                .into(),
+        );
+    }
     validate_sink_type(ctx, expected, value, "return value")
 }
 
@@ -954,7 +960,17 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         }
     }
     for record in &program.records {
+        if record.layout.size <= 0
+            || record.layout.align <= 0
+            || (record.layout.align & (record.layout.align - 1)) != 0
+        {
+            return Err(format!(
+                "svm.record_schema_layout: record `{}` has size {} and alignment {}; size must be positive and alignment a positive power of two",
+                record.name, record.layout.size, record.layout.align
+            ));
+        }
         let mut field_names = HashSet::new();
+        let mut extents: Vec<(i128, i128, &str)> = Vec::new();
         for field in &record.fields {
             if !field_names.insert(field.name.as_str()) {
                 return Err(format!(
@@ -962,9 +978,9 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                     record.name, field.name
                 ));
             }
-            match field.ty {
-                Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => {}
-                Ty::RawRecord(_) | Ty::OptionRaw(_) => {}
+            let field_layout = match field.ty {
+                Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => integer.layout(),
+                Ty::RawRecord(_) | Ty::OptionRaw(_) => StorageLayout { size: 8, align: 8 },
                 unsupported => {
                     return Err(format!(
                         "svm.record_schema_type: record `{}.{}` has unsupported field type `{}`",
@@ -973,15 +989,43 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                         unsupported.name()
                     ));
                 }
-            }
-            if let Ty::Option(payload) = field.ty {
-                validate_option_payload(payload, &format!("record `{}`", record.name))?;
+            };
+            let Some(end) = field.offset.checked_add(field_layout.size) else {
                 return Err(format!(
-                    "svm.option_position_unsupported: record `{}.{}` has an option-typed field; \
-                     option-valued fields are not in the SVM model",
+                    "svm.record_schema_geometry: record `{}.{}` extent overflows",
+                    record.name, field.name
+                ));
+            };
+            if record.layout.align % field_layout.align != 0 {
+                return Err(format!(
+                    "svm.record_schema_geometry: record `{}.{}` needs field alignment {}, but outer alignment is {}",
+                    record.name, field.name, field_layout.align, record.layout.align
+                ));
+            }
+            if field.offset < 0
+                || field.offset % field_layout.align != 0
+                || end > record.layout.size
+            {
+                return Err(format!(
+                    "svm.record_schema_geometry: record `{}.{}` offset {} and {}-byte extent do not fit size {} at alignment {}",
+                    record.name,
+                    field.name,
+                    field.offset,
+                    field_layout.size,
+                    record.layout.size,
+                    field_layout.align
+                ));
+            }
+            if let Some((_, _, previous)) = extents
+                .iter()
+                .find(|(lo, hi, _)| field.offset < *hi && *lo < end)
+            {
+                return Err(format!(
+                    "svm.record_schema_geometry: record `{}` fields `{previous}` and `{}` overlap",
                     record.name, field.name
                 ));
             }
+            extents.push((field.offset, end, field.name.as_str()));
         }
     }
     for trait_ in &program.traits {
@@ -1480,8 +1524,10 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         ExprKind::IntLit(_) => {
             semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "integer literal")?;
         }
-        ExprKind::BoolLit(_)
-        | ExprKind::SelfField { .. }
+        ExprKind::BoolLit(_) => {
+            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "Boolean literal")?;
+        }
+        ExprKind::SelfField { .. }
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::ClassField { .. }
         | ExprKind::ClassFieldLen { .. }
@@ -3103,6 +3149,36 @@ mod tests {
                 "{payload:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn lowering_rejects_invalid_record_layout_before_raw_use() {
+        let mut program = empty_program();
+        program.records.push(RecordDecl {
+            is_pub: false,
+            name: "BadLayout".into(),
+            name_span: Span::new(0, 0),
+            layout: StorageLayout { size: 1, align: 0 },
+            layout_span: Span::new(0, 0),
+            fields: Vec::new(),
+            span: Span::new(0, 0),
+        });
+
+        let error = validate_program_option_positions(&program)
+            .expect_err("zero alignment must be rejected before any raw record operation");
+        assert!(error.starts_with("svm.record_schema_layout:"), "{error}");
+
+        program.records[0].layout = StorageLayout { size: 8, align: 8 };
+        program.records[0].fields.push(RecordField {
+            name: "word".into(),
+            ty: Ty::Int(IntTy::U64),
+            offset: 1,
+            span: Span::new(0, 0),
+            offset_span: Span::new(0, 0),
+        });
+        let error = validate_program_option_positions(&program)
+            .expect_err("misaligned record field geometry must fail SVM preflight");
+        assert!(error.starts_with("svm.record_schema_geometry:"), "{error}");
     }
 
     #[test]
