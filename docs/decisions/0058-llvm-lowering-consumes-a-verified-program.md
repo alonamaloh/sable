@@ -4,7 +4,8 @@
 and G1.4a POD-record extensions implemented and closed 2026-08-13; G1.5's
 formal Boolean-array extension is closed. G1.6's owned-local native-array
 extension is implemented and closed 2026-08-13; ADR 0059 pins its runtime and
-lifetime contract.** Unsafe
+lifetime contract. N0, N1a, and N1b's exact native-`Nat` foundation,
+fixed-owner, and internal-return extensions are closed.** Unsafe
 Sable v1 had a defensible formal stopping point but no native-code path. This
 backend makes verified
 programs in its deliberately narrow runtime subset runnable without making LLVM
@@ -434,6 +435,40 @@ LLVM CLI passed 9/9; the exact interpreter/native differential agreed over nine
 subjects at Clang `-O0` and `-O2`; and SVM remained 92/92. Randomized allocator,
 grind-budget, LSP, documentation, and diff-check gates were green.
 
+## N1b amendment: internal fixed-owner returns and named moves
+
+N1b extends only N1a's exact concrete shape. An internal free function that
+returns the class lowers as `void` with a hidden caller-supplied destination
+pointer before its ordinary arguments. Direct constructor returns initialize
+that pointer through the existing destination-pointer initializer, and a
+class-returning internal call forwards an explicit destination. This convention
+is module-private and versionable; it declares no source, platform, or C ABI.
+
+A class local or return destination may also consume one live named class local.
+Emission loads the fixed aggregate, stores it into the destination, then zeros
+the complete source aggregate. The source remains registered for reverse
+lexical cleanup, but its nested descriptor is now null/zero, so the existing
+null-safe cleanup emits no second free. Direct destination construction and call
+forwarding never install a second owner.
+
+Backend validation treats this as affine movement, not an unrestricted class
+expression. It rejects any subsequent read or borrow of the moved source. The
+moved-owner set follows lexical scopes; reaching `if` arms must agree exactly,
+a returning arm has no successor state, and a reaching loop body must restore
+the same state at its backedge. Class-returning calls are accepted only where a
+local or return destination is available; discarded results remain rejected.
+
+The end-to-end subject still imports the real verified `Nat::from_prefix` and
+`cmp`. Its wrappers mirror the constructor preconditions and cover a direct
+constructor return, a tail class-returning call, local-to-local movement,
+moved-local return, and both the early-return and fallthrough paths. Interpreter
+and native success retain exit value 42.
+
+Mutable class owners, reassignment, owned class parameters, methods, mutable
+class borrows, moves from fields or arbitrary expressions, multiple or nested
+class fields, generic classes, nonempty destructors, extern transport, and
+public/cross-module class ABIs remain rejected.
+
 ## Consequences
 
 This path gets Sable to native toolchains without expanding the trusted proof
@@ -441,9 +476,9 @@ base: Lean still checks contracts, while the new emitter is an additional
 compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
 The cost is a backend intentionally limited to scalar, Boolean-option,
-internal integer-POD values, and one owned-local Boolean-array slice, with all
-array transport still rejected, plus explicit traps/control flow where less
-careful LLVM frontends often rely on poison. Broader aggregate representations
-and every aggregate ABI, extern
+internal integer-POD values, the fenced local array/affine-option slices, and
+one internal fixed-owner `Nat` convention, with aggregate ABIs still rejected,
+plus explicit traps/control flow where less careful LLVM frontends often rely
+on poison. Broader aggregate representations and every aggregate ABI, extern
 interoperability, optimization, debug information, object emission, and stable
 cross-module symbols remain separate decisions.

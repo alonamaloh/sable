@@ -25,8 +25,9 @@ and atomic formal-machine take; G2.3 closes the exact local LLVM lowering. No
 array, affine-option, or record ABI, and no generic-class widening, is claimed.
 N0's exact local `[u32]` LLVM storage and internal borrowed-array call slice is
 closed as the native `Nat` foundation. N1a closes the fixed-owner class slice
-needed by the real imported `Nat::from_prefix` and `cmp` while general class
-transport remains fenced.
+needed by the real imported `Nat::from_prefix` and `cmp`. N1b closes internal
+destination-pointer returns and single-use named-owner moves for that exact
+shape while broader class transport remains fenced.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -1213,8 +1214,31 @@ a working hypothesis, not a promise that evidence cannot reorder it:
      differential remained 92/92; and randomized allocator, grind-budget, LSP,
      documentation, and diff-check gates were green.
 
-   - **N1b–N5 — remaining native bignum ladder:** N1b adds class returns and
-     moves. N2 lowers `add` (`cmp` is already in N1a); N3 adds `sub` and
+   - **N1b — internal fixed-owner returns and moves (closed):** lower an
+     internal class-returning free function as `void` with a caller-supplied
+     destination pointer. A return or final local declaration may initialize
+     that destination from the existing constructor path, another internal
+     class-returning call, or one live named local owner. A named move copies
+     the aggregate and zeros its source before lexical cleanup, so the existing
+     null-safe nested-array destructor remains the single cleanup mechanism.
+
+     Move validation is path-sensitive and fail closed. Later reads or borrows
+     of a moved owner are rejected; two reaching `if` arms must have identical
+     move state; a terminating arm contributes no successor state; and a
+     reaching loop backedge may not change the owner-liveness shape. The real
+     imported bignum fixture mirrors `Nat::from_prefix`'s preconditions and
+     verifies direct construction return, tail return calls, local-to-local
+     movement, moved-local return, and early-return/fallthrough selection while
+     preserving exit 42.
+
+     This remains an internal exact-shape convention, not a Sable or C class
+     ABI. Mutable owners, reassignment, owned class parameters, methods,
+     mutable class borrows, discarded class results, moves from fields,
+     broader/nested/generic shapes, nonempty destructors, extern transport,
+     and public/cross-module class ABIs remain rejected.
+
+   - **N2–N5 — remaining native bignum ladder:** N2 lowers `add` (`cmp` is
+     already in N1a); N3 adds `sub` and
      schoolbook `mul`; N4 adds `div`, `rem`, and `gcd` with mutable class
      reassignment and loop cleanup. N5 is the separate full `Integer` step:
      nested `Nat` ownership, by-value class constructor arguments, class-field

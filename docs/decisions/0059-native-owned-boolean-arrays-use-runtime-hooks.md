@@ -1,7 +1,7 @@
 # ADR 0059 — native owned Boolean arrays use runtime hooks and lexical cleanup
 
 **Decided and implemented 2026-08-13; G1.6, the G2.3 affine-option amendment,
-and N0's `u32` amendment are closed.** G1.5 gives owned-local Boolean arrays a
+and N0–N1b's `u32`/fixed-`Nat` amendments are closed.** G1.5 gives owned-local Boolean arrays a
 checked, verified,
 interpreted, monitored, and formal-SVM meaning. LLVM remained the only
 execution boundary that rejected that exact slice at the G1.5 checkpoint. This
@@ -154,6 +154,29 @@ checked mutability are admitted. Owned-array call transport, returns, entries,
 fields, classes, methods, externs, Boolean borrows, other payloads, exposure,
 and public or cross-module ABI positions stay closed.
 
+## N1a/N1b amendment: nested `Nat` cleanup and move neutralization
+
+N1a embeds one `%sable.array.u32` descriptor in the exact fixed native `Nat`
+class. Normal class destruction projects that descriptor and applies the same
+null bypass and free hook used by an owning local array. The class owner joins
+the existing cleanup registry, so reverse lexical order, early-return unwind,
+loop-iteration cleanup, and the no-unwind trap rule do not acquire a parallel
+lifetime mechanism.
+
+N1b adds internal class returns and named local moves without changing the hook
+contract. Direct construction and class-returning calls write into a unique
+destination pointer. A named move stores the complete aggregate into its
+destination and immediately replaces the source aggregate with zero. Its
+already-registered cleanup therefore sees a null descriptor and performs no
+free; the destination remains the sole live owner and performs exactly one
+eventual free for a nonempty magnitude. Validation rejects reuse of that moved
+source and rejects reaching branch or loop shapes that could make cleanup
+liveness ambiguous.
+
+This does not admit mutable owners, class reassignment, owned class parameters,
+class fields beyond the exact N1a shape, methods, extern transport, or any
+public/cross-module class ABI.
+
 N0 closed under the exact one-worker command
 `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
@@ -197,4 +220,6 @@ ownership were recorded as the next aggregate design, not an affine-option ABI
 widening. The subsequently implemented N0 amendment above begins an independent
 native `Nat` ladder; its next checkpoint is local-only `Nat` class construction
 and destruction. N1a subsequently closed that fixed-owner construction slice
-and the real imported `cmp`, while class moves and returns remain later work.
+and the real imported `cmp`; N1b now closes its internal destination-pointer
+returns and single-use named moves. Reassignment and broader class transport
+remain later work.

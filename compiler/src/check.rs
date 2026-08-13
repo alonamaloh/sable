@@ -3292,6 +3292,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                                 notes: vec![],
                             });
                         }
+                        e.ty = Some(v.ty);
                         return Ok(v.ty);
                     }
                     return Err(Diagnostic {
@@ -3324,6 +3325,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                                 notes: vec![],
                             });
                         }
+                        e.ty = Some(v.ty);
                         return Ok(v.ty);
                     }
                     return Err(Diagnostic {
@@ -6395,6 +6397,41 @@ fn consume(i32 value) -> bool {
         assert_eq!(option_record.name, "type.option_payload_unsupported");
         let array_record = array_payload_ty(ValueTy::Record(0), Span::new(0, 1)).unwrap_err();
         assert_eq!(array_record.name, "type.array_payload_unsupported");
+    }
+
+    #[test]
+    fn inferred_class_moves_cache_the_source_expression_type() {
+        let mut program = monomorphized_program(
+            r#"
+class Box {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+}
+
+fn move_box() -> Box {
+    var first = Box::new(7);
+    var second = first;
+    return second;
+}
+"#,
+        );
+
+        check(&mut program).expect("an inferred class move should typecheck");
+        let Stmt::VarDecl { init, ty, .. } = &program.fns[0].body[1] else {
+            panic!("expected the moved inferred declaration");
+        };
+        assert_eq!(*ty, Some(Ty::Class(0)));
+        assert_eq!(init.ty, Some(Ty::Class(0)));
+        let Stmt::Return {
+            value: Some(value), ..
+        } = &program.fns[0].body[2]
+        else {
+            panic!("expected the moved-local return");
+        };
+        assert_eq!(value.ty, Some(Ty::Class(0)));
     }
 
     #[test]

@@ -16,6 +16,7 @@ G2.3's matching local-only LLVM representation, atomic take, and conditional
 destruction are closed.
 N0's exact native `[u32]` local and internal borrowed-call slice is closed.
 N1a's fixed-owner native `Nat::from_prefix` and `cmp` slice is closed.
+N1b's internal `Nat` return and single-use named-move slice is closed.
 
 ## The idea in thirty seconds
 
@@ -553,12 +554,27 @@ differential passed 1/1 over nine subjects at Clang `-O0` and `-O2`; and SVM
 differential remained 92/92. Randomized allocator, grind-budget, LSP, doc, and
 diff-check gates were green.
 
-The remaining native checkpoints stay incremental: N1b adds class
-returns/moves; N2 adds `add`; N3 adds `sub` and schoolbook `mul`; N4 carries
-`div`, `rem`, and `gcd` through class reassignment and loop cleanup; and only
-then does N5 lower nested `Integer { Nat mag; u64 neg; }` ownership, mutable
-class borrows, and sign/magnitude operations. Generic owner slots and `Vec`
-remain a separate later design.
+N1b extends that exact owner with internal class returns. A class-returning
+function receives a hidden destination pointer, and direct construction,
+another internal class-returning call, or a named live owner may initialize
+that destination. Named moves zero the source before normal lexical cleanup;
+path-sensitive validation rejects later use, mismatched reaching branch
+liveness, and loop-backedge ownership changes. The real imported fixture now
+covers a direct constructor return, a tail return call, a local-to-local move,
+a moved-local return, and early-return/fallthrough branches while preserving
+the native exit value 42.
+
+This is still internal fixed-shape lowering, not a class ABI. Mutable owners,
+reassignment, owned class parameters, methods, mutable class borrows, discarded
+class results, broader or nested class shapes, nonempty destructors, extern
+transport, and public/cross-module class ABIs remain fenced.
+
+The remaining native checkpoints stay incremental: N2 adds `add`; N3 adds
+`sub` and schoolbook `mul`; N4 carries `div`, `rem`, and `gcd` through class
+reassignment and loop cleanup; and only then does N5 lower nested
+`Integer { Nat mag; u64 neg; }` ownership, mutable class borrows, and
+sign/magnitude operations. Generic owner slots and `Vec` remain a separate
+later design.
 
 The complete G0 gate ran with one Cargo job, one Sable test job, one Lean job,
 and one Rust test thread. It passed 82/82 library tests, all 368 verifier,

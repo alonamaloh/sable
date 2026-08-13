@@ -1,6 +1,6 @@
 //! Strict textual LLVM IR lowering for the verified scalar, Boolean-option,
 //! bounded POD-record, owned-local Boolean-array, N0 local `u32`-array, and
-//! N1a fixed-owner class core with internal borrowed-array/class calls
+//! N1b fixed-owner class core with internal borrows, returns, and named moves
 //! (ADRs 0058--0059).
 //!
 //! This first slice handles scalar storage, calls, comparisons, and structured
@@ -505,13 +505,17 @@ fn validate_function(
             "function parameter",
         )?;
     }
-    require_runtime_type(
-        program,
-        root_span_end,
-        function.ret,
-        function.name_span,
-        "function return type",
-    )?;
+    if let Ty::Class(class) = function.ret {
+        require_fixed_u32_class(program, class, function.name_span, "function return type")?;
+    } else {
+        require_runtime_type(
+            program,
+            root_span_end,
+            function.ret,
+            function.name_span,
+            "function return type",
+        )?;
+    }
     let mut locals = ValidationLocals::new();
     for parameter in &function.params {
         locals.insert(
@@ -523,7 +527,15 @@ fn validate_function(
             parameter.span,
         )?;
     }
-    validate_block(program, &function.body, root_span_end, &mut locals, None)
+    validate_block(
+        program,
+        &function.body,
+        root_span_end,
+        &mut locals,
+        function.ret,
+        None,
+    )
+    .map(|_| ())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -578,6 +590,7 @@ fn validate_initializer(
         &initializer.body,
         root_span_end,
         &mut locals,
+        Ty::Unit,
         Some(&mut context),
     )?;
     if !context.field_initialized {
@@ -604,6 +617,7 @@ struct ValidationLocal {
 struct ValidationLocals {
     scopes: Vec<HashMap<String, ValidationLocal>>,
     declared: HashSet<String>,
+    moved_classes: HashSet<String>,
 }
 
 impl ValidationLocals {
@@ -611,6 +625,7 @@ impl ValidationLocals {
         Self {
             scopes: vec![HashMap::new()],
             declared: HashSet::new(),
+            moved_classes: HashSet::new(),
         }
     }
 
@@ -629,7 +644,8 @@ impl ValidationLocals {
         self.scopes
             .last_mut()
             .expect("validation has a function scope")
-            .insert(name, local);
+            .insert(name.clone(), local);
+        self.moved_classes.remove(&name);
         Ok(())
     }
 
@@ -646,7 +662,31 @@ impl ValidationLocals {
 
     fn pop_scope(&mut self) {
         assert!(self.scopes.len() > 1, "cannot pop the function scope");
-        self.scopes.pop();
+        let removed = self.scopes.pop().expect("validated lexical scope");
+        for name in removed.keys() {
+            self.moved_classes.remove(name);
+        }
+    }
+
+    fn require_live_class(
+        &self,
+        name: &str,
+        span: Span,
+        role: &str,
+    ) -> Result<(), Vec<BackendError>> {
+        if self.moved_classes.contains(name) {
+            return Err(vec![diag(
+                "backend.class_moved",
+                "fixed-owner class value was already moved",
+                span,
+                format!("{role} uses moved-from class local `{name}`"),
+            )]);
+        }
+        Ok(())
+    }
+
+    fn mark_class_moved(&mut self, name: &str) {
+        self.moved_classes.insert(name.to_owned());
     }
 }
 
@@ -655,9 +695,14 @@ fn validate_block(
     statements: &[Stmt],
     root_span_end: usize,
     locals: &mut ValidationLocals,
+    ret_ty: Ty,
     mut initializer: Option<&mut InitializerValidation>,
-) -> Result<(), Vec<BackendError>> {
+) -> Result<bool, Vec<BackendError>> {
+    let mut returned = false;
     for statement in statements {
+        if returned {
+            break;
+        }
         match statement {
             Stmt::Decl {
                 ty,
@@ -834,16 +879,40 @@ fn validate_block(
                 )]);
             }
             Stmt::Return {
-                value: Some(value), ..
-            } => validate_expr(program, value, root_span_end, locals)?,
-            Stmt::Return { value: None, .. } | Stmt::Assert(_) => {}
-            Stmt::Unsafe { body, .. } => validate_block(
-                program,
-                body,
-                root_span_end,
-                locals,
-                initializer.as_deref_mut(),
-            )?,
+                value: Some(value),
+                span: _,
+            } => {
+                require_expr_type(value, ret_ty, "return value")?;
+                if let Ty::Class(class) = ret_ty {
+                    validate_fixed_class_initializer(program, class, value, root_span_end, locals)?;
+                } else {
+                    validate_expr(program, value, root_span_end, locals)?;
+                }
+                returned = true;
+            }
+            Stmt::Return { value: None, span } => {
+                if ret_ty != Ty::Unit {
+                    return Err(vec![unsupported(
+                        *span,
+                        format!(
+                            "value-less return in function returning `{}`",
+                            ret_ty.name()
+                        ),
+                    )]);
+                }
+                returned = true;
+            }
+            Stmt::Assert(_) => {}
+            Stmt::Unsafe { body, .. } => {
+                returned = validate_block(
+                    program,
+                    body,
+                    root_span_end,
+                    locals,
+                    ret_ty,
+                    initializer.as_deref_mut(),
+                )?;
+            }
             Stmt::If {
                 cond,
                 then_block,
@@ -851,30 +920,36 @@ fn validate_block(
             } => {
                 validate_bool_expr(program, cond, "`if` condition", root_span_end, locals)?;
                 let base_initializer = initializer.as_deref().cloned();
+                let before_moved = locals.moved_classes.clone();
                 locals.push_scope();
                 let mut then_initializer = base_initializer.clone();
-                let then_result = validate_block(
+                let then_returned = validate_block(
                     program,
                     then_block,
                     root_span_end,
                     locals,
+                    ret_ty,
                     then_initializer.as_mut(),
-                );
+                )?;
                 locals.pop_scope();
-                then_result?;
+                let then_moved = locals.moved_classes.clone();
+                locals.moved_classes = before_moved.clone();
                 let mut else_initializer = base_initializer.clone();
-                if let Some(else_block) = else_block {
+                let (else_returned, else_moved) = if let Some(else_block) = else_block {
                     locals.push_scope();
-                    let else_result = validate_block(
+                    let else_returned = validate_block(
                         program,
                         else_block,
                         root_span_end,
                         locals,
+                        ret_ty,
                         else_initializer.as_mut(),
-                    );
+                    )?;
                     locals.pop_scope();
-                    else_result?;
-                }
+                    (else_returned, locals.moved_classes.clone())
+                } else {
+                    (false, before_moved.clone())
+                };
                 if then_initializer != else_initializer {
                     return Err(vec![unsupported(
                         cond.span,
@@ -885,27 +960,52 @@ fn validate_block(
                 {
                     *target = merged;
                 }
+                if !then_returned && !else_returned && then_moved != else_moved {
+                    return Err(vec![diag(
+                        "backend.class_branch_shape",
+                        "fixed-owner class state differs across branch paths",
+                        cond.span,
+                        "every reaching branch must leave the same class owners live",
+                    )]);
+                }
+                locals.moved_classes = match (then_returned, else_returned) {
+                    (true, true) => before_moved,
+                    (true, false) => else_moved,
+                    (false, true) => then_moved,
+                    (false, false) => then_moved,
+                };
+                returned = then_returned && else_returned;
             }
             Stmt::While { cond, body, .. } => {
                 validate_bool_expr(program, cond, "`while` condition", root_span_end, locals)?;
                 let before = initializer.as_deref().cloned();
+                let before_moved = locals.moved_classes.clone();
                 let mut body_initializer = before.clone();
                 locals.push_scope();
-                let body_result = validate_block(
+                let body_returned = validate_block(
                     program,
                     body,
                     root_span_end,
                     locals,
+                    ret_ty,
                     body_initializer.as_mut(),
-                );
+                )?;
                 locals.pop_scope();
-                body_result?;
                 if body_initializer != before {
                     return Err(vec![unsupported(
                         cond.span,
                         "fixed-owner class field initialization may not occur in a loop",
                     )]);
                 }
+                if !body_returned && locals.moved_classes != before_moved {
+                    return Err(vec![diag(
+                        "backend.class_loop_shape",
+                        "fixed-owner class state changes across a loop backedge",
+                        cond.span,
+                        "every reaching iteration must restore the same live class owners",
+                    )]);
+                }
+                locals.moved_classes = before_moved;
             }
             Stmt::FieldAssign {
                 field,
@@ -971,7 +1071,7 @@ fn validate_block(
             }
         }
     }
-    Ok(())
+    Ok(returned)
 }
 
 fn is_owned_bool_array(ty: Ty) -> bool {
@@ -1055,69 +1155,162 @@ fn validate_fixed_class_initializer(
     class: usize,
     expression: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     let declaration =
         require_fixed_u32_class(program, class, expression.span, "class local initializer")?;
     require_expr_type(expression, Ty::Class(class), "class constructor result")?;
-    let ExprKind::CtorCall {
-        class: class_name,
-        type_args,
-        init,
-        args,
-        ..
-    } = &expression.kind
-    else {
-        return Err(vec![diag(
+    match &expression.kind {
+        ExprKind::CtorCall {
+            class: class_name,
+            type_args,
+            init,
+            args,
+            ..
+        } => {
+            if !type_args.is_empty() || *class_name != declaration.name {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "class constructor identity is incoherent",
+                    expression.span,
+                    format!(
+                        "checked class `{}` does not match constructor spelling `{class_name}` or retains type arguments",
+                        declaration.name
+                    ),
+                )]);
+            }
+            let Some(initializer) = declaration
+                .inits
+                .iter()
+                .find(|candidate| candidate.name == *init)
+            else {
+                return Err(vec![diag(
+                    "backend.constructor_missing",
+                    "LLVM lowering could not resolve a constructor",
+                    expression.span,
+                    format!("class `{class_name}` has no initializer `{init}`"),
+                )]);
+            };
+            if args.len() != initializer.params.len() {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "constructor `{class_name}::{init}` has {} argument(s), expected {}",
+                        args.len(),
+                        initializer.params.len()
+                    ),
+                )]);
+            }
+            for (argument, parameter) in args.iter().zip(&initializer.params) {
+                require_initializer_parameter(
+                    program,
+                    root_span_end,
+                    parameter.ty,
+                    parameter.span,
+                )?;
+                if parameter.ty == Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) {
+                    validate_u32_array_borrow_argument(argument, parameter.ty, locals)?;
+                } else {
+                    validate_expr(program, argument, root_span_end, locals)?;
+                    require_expr_type(argument, parameter.ty, "constructor argument")?;
+                }
+            }
+            validate_u32_borrow_aliases(args, &initializer.params)
+        }
+        ExprKind::Call {
+            callee,
+            type_args,
+            args,
+            ..
+        } => {
+            if !type_args.is_empty() {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!("class-returning call to `{callee}` retains type arguments"),
+                )]);
+            }
+            let Some(function) = program.fns.iter().find(|function| function.name == *callee)
+            else {
+                return Err(vec![diag(
+                    "backend.call_missing",
+                    "LLVM lowering could not resolve a class-returning call",
+                    expression.span,
+                    format!("no checked function named `{callee}`"),
+                )]);
+            };
+            if function.extern_info.is_some() || function.ret != Ty::Class(class) {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "class-returning call is outside the fixed-owner native slice",
+                    expression.span,
+                    format!("`{callee}` does not return the checked fixed-owner class"),
+                )]);
+            }
+            validate_call_arguments(program, function, args, root_span_end, locals)
+        }
+        ExprKind::Var(source) => {
+            let Some(local) = locals.get(source) else {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!("class move names unknown or out-of-scope local `{source}`"),
+                )]);
+            };
+            if local.ty != Ty::Class(class) {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "class move source has the wrong nominal type",
+                    expression.span,
+                    format!("`{source}` has checked type `{}`", local.ty.name()),
+                )]);
+            }
+            locals.require_live_class(source, expression.span, "class move")?;
+            locals.mark_class_moved(source);
+            Ok(())
+        }
+        _ => Err(vec![diag(
             "backend.class_unsupported",
-            "class local is outside the fixed-owner native slice",
+            "class value source is outside the fixed-owner native slice",
             expression.span,
-            "a fixed-owner class local must be initialized directly by its constructor",
-        )]);
-    };
-    if !type_args.is_empty() || *class_name != declaration.name {
-        return Err(vec![diag(
-            "backend.class_unsupported",
-            "class constructor identity is incoherent",
-            expression.span,
-            format!(
-                "checked class `{}` does not match constructor spelling `{class_name}` or retains type arguments",
-                declaration.name
-            ),
-        )]);
+            "expected a direct constructor, internal class-returning call, or named owner move",
+        )]),
     }
-    let Some(initializer) = declaration
-        .inits
-        .iter()
-        .find(|candidate| candidate.name == *init)
-    else {
-        return Err(vec![diag(
-            "backend.constructor_missing",
-            "LLVM lowering could not resolve a constructor",
-            expression.span,
-            format!("class `{class_name}` has no initializer `{init}`"),
-        )]);
-    };
-    if args.len() != initializer.params.len() {
+}
+
+fn validate_call_arguments(
+    program: &Program,
+    function: &Fn,
+    args: &[Expr],
+    root_span_end: usize,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    if args.len() != function.params.len() {
         return Err(vec![unsupported(
-            expression.span,
+            function.name_span,
             format!(
-                "constructor `{class_name}::{init}` has {} argument(s), expected {}",
+                "call to `{}` has {} argument(s), but its checked signature has {}",
+                function.name,
                 args.len(),
-                initializer.params.len()
+                function.params.len()
             ),
         )]);
     }
-    for (argument, parameter) in args.iter().zip(&initializer.params) {
-        require_initializer_parameter(program, root_span_end, parameter.ty, parameter.span)?;
-        if parameter.ty == Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) {
+    for (argument, parameter) in args.iter().zip(&function.params) {
+        if matches!(parameter.ty, Ty::ClassRef(_, Mutability::Shared)) {
+            validate_class_borrow_argument(program, argument, parameter.ty, locals)?;
+        } else if matches!(
+            parameter.ty,
+            Ty::Array(
+                ValueTy::Int(IntTy::U32),
+                Mutability::Shared | Mutability::Mut
+            )
+        ) {
             validate_u32_array_borrow_argument(argument, parameter.ty, locals)?;
         } else {
             validate_expr(program, argument, root_span_end, locals)?;
-            require_expr_type(argument, parameter.ty, "constructor argument")?;
+            require_expr_type(argument, parameter.ty, "call argument")?;
         }
     }
-    validate_u32_borrow_aliases(args, &initializer.params)
+    validate_u32_borrow_aliases(args, &function.params)
 }
 
 fn validate_initializer_field_assign(
@@ -1209,6 +1402,9 @@ fn validate_fixed_class_field_base(
             format!("class field access names unknown or out-of-scope local `{object}`"),
         )]);
     };
+    if matches!(local.ty, Ty::Class(_)) {
+        locals.require_live_class(object, span, "class field access")?;
+    }
     let class = match local.ty {
         Ty::Class(class) | Ty::ClassRef(class, Mutability::Shared) => class,
         _ => {
@@ -1635,6 +1831,9 @@ fn validate_class_borrow_argument(
             format!("class borrow names unknown or out-of-scope local `{array}`"),
         )]);
     };
+    if matches!(source.ty, Ty::Class(_)) {
+        locals.require_live_class(array, argument.span, "class borrow")?;
+    }
     if !matches!(
         source.ty,
         Ty::Class(source_class) | Ty::ClassRef(source_class, Mutability::Shared)
@@ -1736,6 +1935,15 @@ fn validate_expr(
                     format!("array local `{name}` cannot be transported as a value"),
                 )]);
             }
+            if matches!(local.ty, Ty::Class(_)) {
+                locals.require_live_class(name, expression.span, "class expression")?;
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "class value is outside a destination-passing position",
+                    expression.span,
+                    "owned classes may only initialize another owner, return, or cross an admitted by-value boundary",
+                )]);
+            }
             let ty = expression.ty.ok_or_else(|| {
                 vec![unsupported(
                     expression.span,
@@ -1780,33 +1988,15 @@ fn validate_expr(
                     format!("call to audited extern `{callee}`"),
                 )]);
             }
-            if args.len() != function.params.len() {
-                return Err(vec![unsupported(
+            if matches!(function.ret, Ty::Class(_)) {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "class-returning call is outside a destination-passing position",
                     expression.span,
-                    format!(
-                        "call to `{callee}` has {} argument(s), but its checked signature has {}",
-                        args.len(),
-                        function.params.len()
-                    ),
+                    "bind or return the owned class result directly",
                 )]);
             }
-            for (argument, parameter) in args.iter().zip(&function.params) {
-                if matches!(parameter.ty, Ty::ClassRef(_, Mutability::Shared)) {
-                    validate_class_borrow_argument(program, argument, parameter.ty, locals)?;
-                } else if matches!(
-                    parameter.ty,
-                    Ty::Array(
-                        ValueTy::Int(IntTy::U32),
-                        Mutability::Shared | Mutability::Mut
-                    )
-                ) {
-                    validate_u32_array_borrow_argument(argument, parameter.ty, locals)?;
-                } else {
-                    validate_expr(program, argument, root_span_end, locals)?;
-                    require_expr_type(argument, parameter.ty, "call argument")?;
-                }
-            }
-            validate_u32_borrow_aliases(args, &function.params)?;
+            validate_call_arguments(program, function, args, root_span_end, locals)?;
             require_runtime_type(
                 program,
                 root_span_end,
@@ -2718,8 +2908,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .enumerate()
             .map(|(index, parameter)| format!("{} %p{index}", llvm_ty(parameter.ty)))
             .collect::<Vec<_>>();
-        let parameters = if self.initializer_class.is_some() {
-            std::iter::once("ptr %self".to_string())
+        let implicit_parameter = self
+            .initializer_class
+            .map(|_| "ptr %self".to_string())
+            .or_else(|| {
+                matches!(self.function.ret, Ty::Class(_)).then(|| "ptr %result".to_string())
+            });
+        let parameters = if let Some(implicit_parameter) = implicit_parameter {
+            std::iter::once(implicit_parameter)
                 .chain(explicit_parameters)
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -2730,9 +2926,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .initializer_class
             .map(|class| mangle_initializer(class, self.function))
             .unwrap_or_else(|| mangle(self.function));
+        let return_ty = if matches!(self.function.ret, Ty::Class(_)) {
+            "void".to_string()
+        } else {
+            llvm_ty(self.function.ret)
+        };
         out.push_str(&format!(
             "define internal {} @{symbol}({parameters}) {{\nentry:\n",
-            llvm_ty(self.function.ret),
+            return_ty,
         ));
 
         // LLVM permits allocas elsewhere, but keeping every stack slot in the
@@ -2840,6 +3041,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 }
                 Stmt::Return { value, .. } => {
                     if let Some(value) = value {
+                        if let Ty::Class(class) = self.function.ret {
+                            self.emit_fixed_class_into(class, "%result", value)?;
+                            self.emit_all_cleanups();
+                            self.terminate("ret void");
+                            continue;
+                        }
                         let emitted = self.emit_expr(value)?;
                         if emitted.ty != self.function.ret {
                             return Err(vec![unsupported(
@@ -2929,7 +3136,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let slot = local.slot.clone();
         if let Some(init) = init {
             if let Ty::Class(class) = ty {
-                self.emit_constructor_into(class, &slot, init)?;
+                self.emit_fixed_class_into(class, &slot, init)?;
                 self.cleanup_scopes
                     .last_mut()
                     .expect("class declaration has a lexical cleanup scope")
@@ -3084,6 +3291,64 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             lowered.join(", ")
         ));
         Ok(())
+    }
+
+    fn emit_fixed_class_into(
+        &mut self,
+        class: usize,
+        destination: &str,
+        expression: &Expr,
+    ) -> Result<(), Vec<BackendError>> {
+        match &expression.kind {
+            ExprKind::CtorCall { .. } => self.emit_constructor_into(class, destination, expression),
+            ExprKind::Call { callee, args, .. } => {
+                let function = self
+                    .program
+                    .fns
+                    .iter()
+                    .find(|function| function.name == *callee)
+                    .expect("validated class-returning callee");
+                let mut lowered = Vec::with_capacity(args.len() + 1);
+                lowered.push(format!("ptr {destination}"));
+                for argument in args {
+                    let value = self.emit_expr(argument)?;
+                    lowered.push(format!(
+                        "{} {}",
+                        llvm_ty(value.ty),
+                        value.operand.expect("class-returning call argument")
+                    ));
+                }
+                self.instruction(format!(
+                    "call void @{}({})",
+                    mangle(function),
+                    lowered.join(", ")
+                ));
+                Ok(())
+            }
+            ExprKind::Var(source) => {
+                let source_slot = self
+                    .locals
+                    .get(source)
+                    .expect("validated class move source")
+                    .slot
+                    .clone();
+                let moved = self.new_temp();
+                self.instruction(format!(
+                    "{moved} = load {}, ptr {source_slot}",
+                    llvm_class_ty(class)
+                ));
+                self.instruction(format!(
+                    "store {} {moved}, ptr {destination}",
+                    llvm_class_ty(class)
+                ));
+                self.instruction(format!(
+                    "store {} zeroinitializer, ptr {source_slot}",
+                    llvm_class_ty(class)
+                ));
+                Ok(())
+            }
+            _ => unreachable!("validated fixed-owner class destination source"),
+        }
     }
 
     fn emit_self_u32_field_slot(&mut self, class: usize) -> String {
@@ -4795,6 +5060,7 @@ fn type_code(ty: Ty) -> String {
         Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) => "au32s".into(),
         Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Mut) => "au32m".into(),
         Ty::ClassRef(class, Mutability::Shared) => format!("c{class}s"),
+        Ty::Class(class) => format!("c{class}o"),
         Ty::Record(record) => format!("r{record}"),
         Ty::AffineOption(_) => {
             unreachable!("affine option escaped LLVM validation into symbol mangling")
@@ -7677,7 +7943,181 @@ mod tests {
     }
 
     #[test]
-    fn fixed_owner_class_moves_returns_reassignment_and_methods_stay_closed() {
+    fn fixed_owner_class_returns_and_named_moves_use_destination_passing() {
+        let mut result = fixed_class_program();
+        result.fns.push(function(
+            "make",
+            Ty::Class(0),
+            vec![Stmt::Return {
+                value: Some(fixed_class_constructor()),
+                span: Span::new(0, 1),
+            }],
+        ));
+        result.fns.push(function(
+            "forward",
+            Ty::Class(0),
+            vec![Stmt::Return {
+                value: Some(call("make", Ty::Class(0))),
+                span: Span::new(0, 1),
+            }],
+        ));
+        result.fns.push(function(
+            "move_local",
+            Ty::Class(0),
+            vec![
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "first".into(),
+                    name_span: Span::new(0, 1),
+                    init: call("forward", Ty::Class(0)),
+                    mutable: false,
+                },
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "second".into(),
+                    name_span: Span::new(0, 1),
+                    init: typed_variable("first", Ty::Class(0)),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(typed_variable("second", Ty::Class(0))),
+                    span: Span::new(0, 1),
+                },
+            ],
+        ));
+        let mut branch_move = function(
+            "branch_move",
+            Ty::Class(0),
+            vec![
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "owner".into(),
+                    name_span: Span::new(0, 1),
+                    init: call("move_local", Ty::Class(0)),
+                    mutable: false,
+                },
+                Stmt::If {
+                    cond: typed_variable("early", Ty::Bool),
+                    then_block: vec![Stmt::Return {
+                        value: Some(typed_variable("owner", Ty::Class(0))),
+                        span: Span::new(0, 1),
+                    }],
+                    else_block: None,
+                },
+                Stmt::Return {
+                    value: Some(typed_variable("owner", Ty::Class(0))),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        branch_move.params = vec![parameter("early", Ty::Bool)];
+        result.fns.push(branch_move);
+        let entry = &mut result.fns[1];
+        entry.body[0] = Stmt::VarDecl {
+            ty: Some(Ty::Class(0)),
+            name: "value".into(),
+            name_span: Span::new(0, 1),
+            init: call_with(
+                "branch_move",
+                Ty::Class(0),
+                vec![expression(ExprKind::BoolLit(true), Ty::Bool)],
+            ),
+            mutable: false,
+        };
+
+        let ir = emit_program(
+            &result,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .unwrap();
+        assert!(ir.contains("define internal void @__sable_v0_f_4_make__p___r_c0o(ptr %result)"));
+        assert!(
+            ir.contains("define internal void @__sable_v0_f_7_forward__p___r_c0o(ptr %result)")
+        );
+        assert!(ir.contains("call void @__sable_v0_f_4_make__p___r_c0o(ptr %result)"));
+        assert!(ir.contains("call void @__sable_v0_f_10_move_local__p___r_c0o(ptr "));
+        assert!(ir.contains("call void @__sable_v0_f_11_branch_move__p_b__r_c0o(ptr %v0, i1 1)"));
+        assert!(ir.contains("store %sable.class.0 zeroinitializer, ptr"));
+    }
+
+    #[test]
+    fn fixed_owner_class_move_validation_rejects_stale_borrows_and_cfg_shape_mismatches() {
+        let options = |entry: &str| EmitOptions {
+            entry: Some(entry.into()),
+        };
+
+        let mut stale_borrow = fixed_class_program();
+        stale_borrow.fns.push(function(
+            "stale_borrow",
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "first".into(),
+                    name_span: Span::new(0, 1),
+                    init: fixed_class_constructor(),
+                    mutable: false,
+                },
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "second".into(),
+                    name_span: Span::new(0, 1),
+                    init: typed_variable("first", Ty::Class(0)),
+                    mutable: false,
+                },
+                Stmt::ExprStmt(call_with(
+                    "inspect",
+                    Ty::Unit,
+                    vec![fixed_class_borrow("first")],
+                )),
+                Stmt::Return {
+                    value: Some(expression(ExprKind::IntLit(0.into()), Ty::Int(IntTy::I32))),
+                    span: Span::new(0, 1),
+                },
+            ],
+        ));
+        let error = emit_program(&stale_borrow, 1, &options("stale_borrow")).unwrap_err();
+        assert_eq!(error[0].name, "backend.class_moved");
+
+        let mut mismatched_branches = fixed_class_program();
+        mismatched_branches.fns.push(function(
+            "mismatched_branches",
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "first".into(),
+                    name_span: Span::new(0, 1),
+                    init: fixed_class_constructor(),
+                    mutable: false,
+                },
+                Stmt::If {
+                    cond: expression(ExprKind::BoolLit(true), Ty::Bool),
+                    then_block: vec![Stmt::VarDecl {
+                        ty: Some(Ty::Class(0)),
+                        name: "second".into(),
+                        name_span: Span::new(0, 1),
+                        init: typed_variable("first", Ty::Class(0)),
+                        mutable: false,
+                    }],
+                    else_block: None,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::IntLit(0.into()), Ty::Int(IntTy::I32))),
+                    span: Span::new(0, 1),
+                },
+            ],
+        ));
+        let error =
+            emit_program(&mismatched_branches, 1, &options("mismatched_branches")).unwrap_err();
+        assert_eq!(error[0].name, "backend.class_branch_shape");
+    }
+
+    #[test]
+    fn fixed_owner_class_reassignment_parameters_methods_and_discarded_results_stay_closed() {
         let options = EmitOptions {
             entry: Some("entry".into()),
         };
@@ -7727,11 +8167,11 @@ mod tests {
             )),
         );
         let error = emit_program(&moved_argument, 1, &options).unwrap_err();
-        assert_eq!(error[0].name, "backend.unsupported");
-        assert!(error[0].label.contains("type `class`"));
+        assert_eq!(error[0].name, "backend.class_unsupported");
+        assert!(error[0].label.contains("owned class"));
 
-        let mut class_return = fixed_class_program();
-        class_return.fns.push(function(
+        let mut discarded_result = fixed_class_program();
+        discarded_result.fns.push(function(
             "make",
             Ty::Class(0),
             vec![Stmt::Return {
@@ -7739,11 +8179,11 @@ mod tests {
                 span: Span::new(0, 1),
             }],
         ));
-        class_return.fns[1]
+        discarded_result.fns[1]
             .body
             .insert(1, Stmt::ExprStmt(call("make", Ty::Class(0))));
-        let error = emit_program(&class_return, 1, &options).unwrap_err();
-        assert_eq!(error[0].name, "backend.unsupported");
-        assert!(error[0].label.contains("call result type `class`"));
+        let error = emit_program(&discarded_result, 1, &options).unwrap_err();
+        assert_eq!(error[0].name, "backend.class_unsupported");
+        assert!(error[0].label.contains("bind or return"));
     }
 }

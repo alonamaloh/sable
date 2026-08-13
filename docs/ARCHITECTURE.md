@@ -708,16 +708,27 @@ foreign, or cross-module array ABI.
 
   Shared `&Nat` parameters are non-owning internal pointers. Together with
   class-field length/index lowering, this compiles the real imported
-  `Nat::from_prefix` and `cmp`. Mutable owners, reassignment, moves, returns,
-  owned class parameters, methods, mutable borrows, broader class shapes, and
-  every class ABI stay closed. The standard gate passed 217/217 library tests,
+  `Nat::from_prefix` and `cmp`. The standard gate passed 217/217 library tests,
   33/33 focused LLVM units, all 417 corpus subjects, LLVM CLI 9/9, nine-subject
   interpreter/native comparison at `-O0`/`-O2`, and SVM 92/92.
 
-  The remaining ladder is N1b class return/movement; N2 `add`; N3 `sub` plus
-  schoolbook `mul`; N4 `div`/`rem`/`gcd` with class reassignment and loop
-  cleanup; and N5 the nested `Integer` sign/magnitude class. Generic owner slots
-  and `Vec` remain a separate later design.
+  N1b adds internal destination-passing returns for that same exact shape.
+  A class-returning free function receives a caller-owned result pointer;
+  direct construction and tail calls write there without an intermediate
+  owner. A named local move transfers the aggregate and zeros its source, so
+  normal reverse lexical cleanup remains safe. Validation tracks moved owners
+  through scopes and control flow: reaching branches must agree exactly, early
+  returns terminate a path, and loops may not change owner liveness across a
+  backedge. The imported fixture exercises constructor returns, return-call
+  forwarding, local moves, moved-local returns, and an early-return branch.
+
+  Mutable owners, reassignment, owned class parameters, methods, mutable
+  borrows, discarded class results, broader or nested class shapes, nonempty
+  destructors, and every public, extern, or cross-module class ABI stay closed.
+  The remaining ladder is N2 `add`; N3 `sub` plus schoolbook `mul`; N4
+  `div`/`rem`/`gcd` with class reassignment and loop cleanup; and N5 the nested
+  `Integer` sign/magnitude class. Generic owner slots and `Vec` remain a
+  separate later design.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

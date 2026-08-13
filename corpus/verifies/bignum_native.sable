@@ -1,19 +1,50 @@
-// N1a native fixed-owner class subject. This imports the real verified Nat
-// implementation rather than copying a backend-shaped facsimile. Constructors
-// initialize their final local owner directly; only shared Nat borrows cross
-// calls, and general class moves/returns remain outside this checkpoint.
+// N1b native fixed-owner class subject. This imports the real verified Nat
+// implementation rather than copying a backend-shaped facsimile. In addition
+// to direct local construction and shared borrows, the wrappers below exercise
+// internal destination-pointer returns and single-use named-owner movement.
 
 use bignum::{Nat, cmp};
+
+/// pre n ≤ xs.len
+/// pre n = 0 ∨ xs.get (n - 1) ≥ 1
+fn direct_prefix(&[u32] xs, u64 n) -> Nat {
+    return Nat::from_prefix(&xs, n);
+}
+
+/// pre n ≤ xs.len
+/// pre n = 0 ∨ xs.get (n - 1) ≥ 1
+fn tail_prefix(&[u32] xs, u64 n) -> Nat {
+    return direct_prefix(&xs, n);
+}
+
+/// pre n ≤ xs.len
+/// pre n = 0 ∨ xs.get (n - 1) ≥ 1
+fn moved_prefix(&[u32] xs, u64 n) -> Nat {
+    var first = tail_prefix(&xs, n);
+    var second = first;
+    return second;
+}
+
+/// pre n ≤ xs.len
+/// pre n = 0 ∨ xs.get (n - 1) ≥ 1
+fn branch_prefix(&[u32] xs, u64 n, bool direct) -> Nat {
+    if (direct) {
+        return Nat::from_prefix(&xs, n);
+    }
+    return moved_prefix(&xs, n);
+}
 
 fn bignum_native_entry() -> i32 {
     mut [u32] left_source = [1];
     [u32] right_source = [2];
     [u32] same_source = [1, 99];
 
-    var left = Nat::from_prefix(&left_source, 1);
-    var right = Nat::from_prefix(&right_source, 1);
-    var same = Nat::from_prefix(&same_source, 1);
-    var zero = Nat::from_prefix(&left_source, 0);
+    var left = direct_prefix(&left_source, 1);
+    var right = tail_prefix(&right_source, 1);
+    var same = moved_prefix(&same_source, 1);
+    var same_early = branch_prefix(&same_source, 1, true);
+    var same_fallthrough = branch_prefix(&same_source, 1, false);
+    var zero = branch_prefix(&left_source, 0, true);
 
     // Construction copies the requested prefix; it does not alias the source.
     left_source[0] = 9;
@@ -26,6 +57,12 @@ fn bignum_native_entry() -> i32 {
     }
     if (cmp(&left, &same) != 0) {
         return 3;
+    }
+    if (cmp(&same, &same_early) != 0) {
+        return 6;
+    }
+    if (cmp(&same, &same_fallthrough) != 0) {
+        return 7;
     }
     if (cmp(&zero, &left) != -1) {
         return 4;
