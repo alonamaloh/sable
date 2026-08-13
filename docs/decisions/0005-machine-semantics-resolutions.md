@@ -16,7 +16,10 @@ Writing the first 73 rules of the SVM (`lean/Sable/SVM.lean`) forced eleven deci
 10. **Trap payloads**: machine traps carry structural data (index, length, operand); which of it is *observable* is deferred to the FFI/native story. `defer`'s obligation names must survive into machine syntax (`check name` statements).
 11. **Minor batch**: out-of-range literals are checker duty; unary minus on unsigned is a type error; `alloc_array` lengths are `u64` (nonnegative by typing); `bool ==` and mixed-width comparisons are checker restrictions, the machine compares on ℤ; `a.len` is `u64`-typed with `len ≤ u64.max` as a machine axiom.
 
-Next SVM-track steps (unchanged): determinism proof, functional evaluator + agreement proof (the differential-testing oracle), then calls/frames under resolution 4. The formalization must be updated to add the `undef` outcome.
+The immediate follow-through from this audit was the determinism proof,
+functional evaluator and agreement proof (the differential-testing oracle),
+calls/frames under resolution 4, and the `undef` outcome. Those steps have all
+since landed; the amendments below record later value-domain extensions.
 
 ## G1.2 amendment: ordinary option shape and failure outcomes (2026-08-13)
 
@@ -65,10 +68,59 @@ value, allocation rule, index rule, store rule, or observation spelling. The
 existing 76/76 differential remaining green therefore demonstrates boundary
 preservation, not formal-machine coverage of the new source feature.
 
-This stage still gives out-of-bounds indexing defined language behavior: the
-Rust interpreter uses the established array trap. That executable behavior is
-not yet a claim that the formal SVM models Boolean-array allocation or traps.
-A dedicated formal-machine stage must add the value representation, relational
-and executable rules, their two-directional agreement proof, direct guards,
-and Rust↔Lean differential subjects before the lowerer may accept `[bool]`.
-That stage is G1.5; LLVM array lowering remains independently deferred.
+At the G1.4b checkpoint, out-of-bounds indexing already had defined language
+behavior through the Rust interpreter's established array trap, while formal
+SVM coverage remained outside that checkpoint. G1.5 subsequently added the
+value representation, relational and executable rules, their
+two-directional agreement proof, direct guards, and Rust↔Lean differential
+subjects before admitting `[bool]` to the lowerer. LLVM array lowering remains
+independently deferred.
+
+## G1.5 amendment: tagged array payloads and store precedence (2026-08-13)
+
+G1.5 discharges the formal-machine work identified above. `Val.arr` now holds
+an explicit `ArrayVal`:
+
+```lean
+inductive ArrayVal where
+  | ints  (values : Seq Int)
+  | bools (values : Seq Bool)
+```
+
+The tag is part of the machine value even when `len = 0`. Length, index,
+allocation, and store are generalized over the two homogeneous scalar domains
+in both the inductive relations and the proved functional evaluator. Existing
+expression/statement constructors and canonical `arr [...]` observations are
+retained; Boolean elements render as lowercase `true`/`false`. Evaluator
+agreement continues to imply determinism, totality, and progress.
+
+Resolution 5's store order is refined, not changed: evaluate the index; evaluate
+the value and require an integer or Boolean scalar; resolve the array; require
+the scalar to match its payload tag; then check bounds. A tag mismatch is type
+confusion and reaches `undef` before the bounds question. Thus storing an
+integer into an empty Boolean array is `undef`, while storing a Boolean at the
+same index traps with `indexOOB 0 0`. Allocation similarly evaluates length and
+initializer before negative-length/capacity geometry, so an initializer trap
+wins over OOM. Direct `SVMArrayTests` guards pin Boolean allocation, read,
+store, length, empty-tag retention, OOB, OOM, invalid initializers, and these
+precedence rules.
+
+The formal value remains wider than source authorization. Rust lowering admits
+only a fresh owned-local `[bool]` produced by `alloc_array<bool>` or a contextual
+literal, followed by index/length/store operations. No parameter, return,
+field, borrow, exposure, whole-array rebinding, or other transport is added. A
+literal evaluates its elements into reserved temporaries in source order
+*before* allocating a false-filled Boolean array and applying ordered stores;
+therefore an element trap precedes allocation/OOM. Literal expansion is bounded
+by the SVM profile cap of 50,000,000 elements, and an empty literal still
+constructs the `.bools` tag. LLVM array representation and ABI remain deferred.
+
+G1.5 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1
+--nocapture`. `cargo check` and the full 22-target one-job Lake build were
+green; Rust library tests passed 175/175; all 394 corpus subjects (83 verifies,
+244 must-fail, 48 tests, 19 test-fails) passed in 266.78s; LLVM CLI passed 6/6
+with required Clang; the exact `VerifiedProgram`↔Clang differential passed 1/1
+over five subjects at `-O0` and `-O2`; and the exact Rust↔Lean SVM
+differential passed 86/86. `free_list_return_random`, grind-budget, LSP, and
+doc-tests were green. G1.5 is closed.

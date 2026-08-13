@@ -89,6 +89,9 @@ vcgen (compiler/src/vcgen.rs)         forward symbolic execution over the AST;
   │                                   G1.4b models owned-local Boolean arrays as
   │                                   `Sable.Seq Bool`: writes cross Prop→Bool and
   │                                   reads cross back through `get ... = true`;
+  │                                   G1.5 gives the formal SVM a separate tagged
+  │                                   `Seq Int`/`Seq Bool` array value while keeping
+  │                                   the Rust source bridge owned-local-only;
   │                                   path-splitting at `if`; per-operation VCs;
   │                                   call sites: callee pres become obligations,
   │                                   callee posts become hypotheses on a fresh symbol;
@@ -206,6 +209,8 @@ now verify and interpret owned-local Boolean arrays, the emitter rejects their
 declarations and every expression that would carry them before selecting a
 representation. No LLVM element layout, allocation strategy, lifetime rule,
 trap extension, mangling, or array ABI is implied by the source-level slice.
+G1.5 widens the formal SVM and its Rust differential lowerer only; the same
+LLVM rejection remains in force.
 
 ## Key invariants
 
@@ -396,10 +401,10 @@ trap extension, mangling, or array ABI is implied by the source-level slice.
   unmonitorable rather than a coercion. Integer-only sequence helpers likewise
   do not reinterpret Boolean elements.
 
-  The Rust SVM lowerer rejects the new local value and the formal SVM remains
-  unchanged; LLVM independently rejects it as described above. G1.5 adds the
-  formal-machine representation next, while native lowering remains a later
-  independent stage.
+  At the G1.4b checkpoint the Rust SVM lowerer rejected the new local value and
+  the formal SVM remained unchanged; LLVM independently rejected it as
+  described above. G1.5 changes only that formal-machine boundary, while native
+  lowering remains a later independent stage.
 
   G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
   SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
@@ -411,6 +416,45 @@ trap extension, mangling, or array ABI is implied by the source-level slice.
   five subjects at `-O0` and `-O2`; and SVM differential 76/76. A standalone
   corpus repeat was green in 195.71s. Randomized allocator, grind-budget, LSP,
   and documentation gates were green. G1.4b is closed.
+
+- **The formal array value is tagged; the source bridge remains local.** G1.5
+  replaces the integer-specialized `Val.arr` payload with
+  `ArrayVal.ints (Seq Int) | ArrayVal.bools (Seq Bool)`. The tag is retained at
+  length zero. Relational rules and the proved evaluator generalize length,
+  index, allocation, and store without permitting heterogeneous values; all
+  evaluator-agreement, determinism, totality, and progress proofs remain
+  theorem-backed. Canonical rendering stays `arr [...]`, using the historical
+  integer spellings and lowercase Boolean spellings.
+
+  Store order is index evaluation, value evaluation and scalar-shape check,
+  array lookup, payload-tag compatibility, then bounds. Consequently an
+  integer write to an empty Boolean array is `undef`, while a Boolean write to
+  the same empty array reaches `indexOOB`; a payload mismatch likewise beats an
+  OOB trap at a nonempty array. Allocation evaluates length and initializer
+  before negative-length/OOM geometry, so initializer traps retain precedence.
+  Direct formal guards pin Boolean allocation/read/store/length, empty tags,
+  OOB, OOM, invalid initializers, and these precedence cases.
+
+  Rust lowering admits only fresh owned-local Boolean-array declarations from
+  `alloc_array<bool>` or contextual literals, plus index/length/store uses. It
+  independently rejects parameters, returns, fields, borrows, exposure,
+  whole-array movement, and other transport. A literal first evaluates its
+  elements into reserved temporaries in source order, then allocates a
+  false-filled Boolean array and emits ordered stores; an element trap
+  therefore precedes allocation/OOM. Expansion is capped at 50,000,000
+  elements, and even an empty literal allocates a Boolean-tagged empty value.
+  LLVM remains fail closed.
+
+  G1.5 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+  SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`. `cargo check` and the full 22-target one-job
+  Lake build were green; Rust library tests passed 175/175; all 394 corpus
+  subjects (83 verifies, 244 must-fail, 48 tests, 19 test-fails) passed in
+  266.78s; LLVM CLI passed 6/6 with Clang required; the exact
+  `VerifiedProgram`↔Clang O0/O2 differential passed 1/1 over five subjects;
+  and the SVM differential passed 86/86.
+  `free_list_return_random`, grind-budget, LSP, and doc-tests were
+  green. G1.5 is closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across
@@ -506,6 +550,13 @@ payload value, while outer-shape confusion is `undef` and extracting absence is
 `Trap.optionNone`. Nullable raw-pointer options remain a distinct value form,
 so an accessor cannot cross the ordinary/raw option boundary accidentally.
 
+Arrays likewise occupy one tagged form: `Val.arr` contains either
+`ArrayVal.ints (Seq Int)` or `ArrayVal.bools (Seq Bool)`. Empty arrays retain
+that constructor, so later stores still know which scalar domain is legal.
+Length, index, allocation, and store share one formal rule family over the tag;
+wrong-domain stores are `undef`, whereas matching out-of-bounds stores produce
+`Trap.indexOOB`.
+
 The harness (`compiler/tests/svm_diff.rs`, ADR 0017) lowers every function in
 `corpus/svm-diff/` to Lean terms (`compiler/src/svm.rs`), runs each on both
 `interp.rs` and the appropriate Lean evaluator, and compares those canonical
@@ -515,18 +566,19 @@ machine's supported subset is a hard failure, never a skip. `test_uart`
 selection remains a machine statement through explicit and inferred
 declarations, assignment, and discard. Authority-only resource operations erase
 only when every operand is syntactically runtime-inert; a potentially trapping
-or effectful operand is rejected instead of silently dropped. The one-worker
-differential run currently covers 76/76 subjects, including Boolean option
-absence/presence, local assignment, accessor results, and A-normal call
-transport, plus UART success, budget exhaustion, readiness clearing, ordered
+or effectful operand is rejected instead of silently dropped. The focused
+differential now covers 86/86 subjects, including Boolean option
+absence/presence, local assignment, accessor results, A-normal call transport,
+and owned-local Boolean-array allocation, literal construction (including
+empty), length, reads, stores, loops, OOB/OOM outcomes, and store trap
+precedence. UART success, budget exhaustion, readiness clearing, ordered
 traces, invalid writes, profile reselection (including its precedence over
-script-expression traps), and all three selection contexts.
-The same boundary now checks integer-array expression annotations, element
-types, constructor shape, and call coherence on public AST input; this is
-hardening of the existing integer-array lowering path, not Boolean-array
-acceptance. G1.4b preserves that fence even though the verifier/interpreter now
-accept owned-local Boolean arrays; G1.5 is the stage that will extend the
-formal value, rules, evaluator, lowerer, and differential together.
+script-expression traps), and all three selection contexts remain covered.
+The lowerer treats the formal array representation as an owned-local bridge,
+not a call/storage ABI. G1.5's complete one-worker closure is green: 175/175
+Rust library tests, the 394-subject corpus, LLVM CLI 6/6, exact native
+differential 1/1, SVM differential 86/86, and the allocator, grind-budget, LSP,
+and documentation gates.
 
 ## Repo layout
 

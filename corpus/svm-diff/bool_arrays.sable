@@ -1,0 +1,68 @@
+// G1.5 SVM differential subjects: owned local Boolean arrays keep a distinct
+// payload through allocation and empty/nonempty literals. Loads, stores,
+// length, loops, bounds traps, and store evaluation order match interp.rs.
+
+fn bool_alloc_store_read() -> bool {
+    mut [bool] bits = alloc_array<bool>(3, false);
+    bits[1] = true;
+    bits[2] = bits[1];
+    return !bits[0] && bits[1] && bits[2];
+}
+
+fn bool_literal_read() -> bool {
+    [bool] bits = [true, false, true];
+    return bits[0] && !bits[1] && bits[2];
+}
+
+fn bool_empty_literal_len() -> u64 {
+    [bool] bits = [];
+    return bits.len;
+}
+
+fn bool_empty_alloc_len() -> u64 {
+    [bool] bits = alloc_array<bool>(0, true);
+    return bits.len;
+}
+
+fn bool_loop_fill() -> bool {
+    mut [bool] bits = alloc_array<bool>(4, false);
+    mut u64 i = 0;
+    /// variant 4 - i
+    while (i < bits.len) {
+        bits[i] = true;
+        i = i + 1;
+    }
+    return bits[0] && bits[3];
+}
+
+fn bool_oob_load() -> bool {
+    [bool] bits = [true];
+    return bits[7];
+}
+
+fn bool_oob_store() -> bool {
+    mut [bool] bits = [false];
+    bits[7] = true;
+    return false;
+}
+
+fn bool_literal_element_oob() -> bool {
+    [bool] source = [true];
+    [bool] copy = [source[7]];
+    return copy[0];
+}
+
+fn bool_store_value_trap_beats_destination_oob() -> bool {
+    mut [bool] destination = [false];
+    [bool] source = [true];
+    destination[99] = source[7];
+    return false;
+}
+
+fn bool_store_index_trap_beats_value_trap() -> bool {
+    mut [bool] destination = [false];
+    [bool] source = [true];
+    u64 largest = 18446744073709551615;
+    destination[largest + 1] = source[7];
+    return false;
+}

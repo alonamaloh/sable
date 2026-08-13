@@ -18,10 +18,9 @@ ordinary-function intersection through the formal SVM and native LLVM, and
 G1.4a closes ordinary Boolean argument transport plus verified, interpreted,
 and natively lowered internal integer-field POD record calls. G1.4b closes
 owned-local Boolean arrays through checking, verification, interpretation, and
-dynamic monitoring, while deliberately leaving the formal SVM and LLVM
-boundaries closed. Its full serial closure gate is green; no array ABI, record
-ABI, or generic-class widening is claimed. G1.5 carries Boolean arrays into the
-formal SVM next; LLVM remains a later independent stage.
+dynamic monitoring. G1.5 is closed across the formal SVM and its owned-local
+Rust differential bridge, while LLVM remains independently closed. No array
+ABI, record ABI, or generic-class widening is claimed.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -668,8 +667,9 @@ backend support belongs to M46 and later.
 
 Unsafe Sable v1, the scalar LLVM v0 boundary, the first end-to-end Boolean
 option slice, G1.4a's internal POD record-value slice, and G1.4b's owned-local
-Boolean-array proof/runtime slice are now complete. G1.5 next carries that exact
-local slice through the formal SVM; native lowering remains later. The broader
+Boolean-array proof/runtime slice are complete. G1.5's closure of that exact
+local slice in the formal SVM and differential lowerer is also complete. Native
+lowering remains later. The broader
 aggregate-generics/backend track continues at M46+. The order remains a working
 hypothesis, not a promise that evidence cannot reorder it:
 
@@ -708,7 +708,7 @@ hypothesis, not a promise that evidence cannot reorder it:
      subjects in 424.42s; LLVM CLI 6/6; exact-`VerifiedProgram`
      interpreter↔Clang differential at `-O0` and `-O2`; SVM 69/69; allocator,
      grind-budget, and LSP gates green.
-   - **G1 — Boolean/POD aggregates (through G1.4b complete; broader work in
+   - **G1 — Boolean/POD aggregates (through G1.5 complete; broader work in
      progress):** establish non-integer aggregate storage, value, verification,
      interpreter, and LLVM paths one fenced representation at a time.
 
@@ -881,9 +881,10 @@ hypothesis, not a promise that evidence cannot reorder it:
      and extern), Boolean-array returns, class/record fields, borrows, exposure,
      whole-array rebinding, Boolean `for` indices, and generic Boolean-array
      arguments remain rejected.
-     The Rust SVM lowerer rejects Boolean arrays and the formal machine remains
-     unchanged; the LLVM emitter independently rejects them, so neither a
-     machine value nor a native storage/lifetime/ABI policy has been introduced.
+     At the G1.4b checkpoint the Rust SVM lowerer rejected Boolean arrays and
+     the formal machine remained unchanged; the LLVM emitter independently
+     rejected them, so no machine value or native storage/lifetime/ABI policy
+     had yet been introduced.
 
      G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
      SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
@@ -902,11 +903,45 @@ hypothesis, not a promise that evidence cannot reorder it:
      parser cannot spell that form, but the public checked-AST boundary still
      rejects a forged instance rather than relying on the surface grammar.
 
-     **G1.5 — formal SVM Boolean arrays (next):** give the formal value plane,
-     relational semantics, proved evaluator, renderer, Rust lowerer, and
-     differential harness the same owned-local Boolean-array intersection.
-     Preserve the source position fence, and leave LLVM storage/lifetime
-     lowering to its own later stage.
+     **G1.5 — formal SVM Boolean arrays (complete):** the machine value is now
+     `Val.arr ArrayVal`, where
+     `ArrayVal := ints (Seq Int) | bools (Seq Bool)`. This tag remains present
+     at length zero. Length, checked index, allocation, and store are
+     generalized over the two homogeneous domains in both the relational
+     semantics and functional evaluator; evaluator agreement, determinism,
+     totality, and progress remain proved without deferred axioms. Rendering
+     preserves `arr [...]` and adds lowercase Boolean elements.
+
+     Evaluation and trap precedence are explicit. Allocation evaluates length,
+     then its scalar initializer, then negative-length/capacity geometry. Store
+     evaluates index, then value and scalar shape, then resolves the array,
+     checks payload compatibility, and finally checks bounds. A mismatched
+     scalar store is therefore `undef` even when the index is OOB; a matching
+     store to the same empty array produces `indexOOB`. Direct guards cover
+     Boolean allocation/read/store/length, empty-tag retention, OOB, OOM,
+     invalid initializers, and precedence.
+
+     The Rust bridge preserves G1.4b's source fence. Only a fresh owned local
+     initialized by `alloc_array<bool>` or a contextual Boolean literal may
+     acquire the formal value; parameters, returns, fields, borrows, exposure,
+     whole-array movement, and other transport are rejected. Literal lowering
+     evaluates every element into a compiler-reserved temporary in source order
+     before allocating a false-filled array and emitting ordered stores, so an
+     element trap beats allocation/OOM. Expansion is limited to the SVM profile
+     cap of 50,000,000 elements, and an empty literal still constructs a tagged
+     Boolean array. LLVM storage, lifetime, and ABI lowering remain out of
+     scope.
+
+     G1.5 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
+     SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. `cargo check` and the full 22-target one-job
+     Lake build were green; Rust library tests passed 175/175; all 394 corpus
+     subjects (83 verifies, 244 must-fail, 48 tests, 19 test-fails) passed
+     in 266.78s; LLVM CLI passed 6/6 with required Clang; the exact
+     `VerifiedProgram`↔Clang O0/O2 differential passed 1/1 over five subjects;
+     and the SVM differential passed 86/86.
+     `free_list_return_random`, grind-budget, LSP, and doc-tests were
+     green. G1.5 is closed.
    - **G2 — affine options:** carry ownership and destruction correctly through
      present/absent aggregate values.
    - **G3 — slots and `Vec`:** make generic element storage and movement real
@@ -927,7 +962,27 @@ hypothesis, not a promise that evidence cannot reorder it:
 
 ## Parallel track (low intensity)
 
-The SVM semantic oracle — **checkpoint reached, with the first profile composition complete**. `lean/Sable/SVM.lean` is the machine as inductive relations, now *total*: `undef` is the third terminal outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the functional evaluator/stepper with two-directional agreement proofs; determinism, totality, and progress are kernel-checked corollaries — the agreement proofs are the standing regression test of the rule system (an overlapping or missing rule makes a direction unprovable). The differential harness (ADR 0017) lowers checked Sable through `compiler/src/svm.rs` and compares `interp.rs` against the Lean evaluator. Calls/frames, byte raw memory, abstract `u64` cells, and abstract POD record cells all live in both core presentations. ADR 0056 adds nullable pointers, record construction/projection, tag-checked record storage, and per-byte extent exclusion without adding a byte representation. Forty-seven direct raw/record guards pin those outcomes independently of agreement. G1.2 adds recursive ordinary options (`Val.opt : Option Val`) and direct guards for Boolean payloads, option access, wrong-shape `undef`, absent-value `optionNone`, and integer wire compatibility. ADR 0057 composes `SVMUart` around the core: bare executions remain byte-for-byte compatible, while selected executions add an oracle cursor and ordered MMIO observation. The closure differential is green at 76/76 subjects, including Boolean option absence/presence, assignment, accessors, and call transport as well as profile reselection precedence and profile selection through assignment, discard, and inferred declaration. The older ghost-transition erasure theorem and class track remain separate future work.
+The SVM semantic oracle — **checkpoint reached, with the first profile
+composition and G1.5 Boolean arrays complete**. `lean/Sable/SVM.lean` is the
+machine as inductive relations, now *total*: `undef` is the third terminal
+outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range
+literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the
+functional evaluator/stepper with two-directional agreement proofs;
+determinism, totality, and progress are kernel-checked corollaries. Calls and
+frames, byte raw memory, abstract `u64`/POD cells, recursive ordinary options,
+and tagged `ArrayVal.ints`/`ArrayVal.bools` arrays all live in both core
+presentations. G1.5 generalizes length/index/allocation/store, preserves empty
+tags and trap precedence, and adds direct Boolean-array guards. ADR 0057's
+`SVMUart` wrapper remains byte-for-byte compatible for bare executions.
+
+The full G1.5 serial closure is green: `cargo check`; the 22-target one-job
+Lake build; 175/175 Rust library tests; all 394 corpus subjects (83 verifies,
+244 must-fail, 48 tests, 19 test-fails) in 266.78s; LLVM CLI 6/6 with
+required Clang; exact `VerifiedProgram`↔Clang O0/O2 differential 1/1 over five
+subjects; SVM differential 86/86; and
+`free_list_return_random`, grind-budget, LSP, and doc-tests. The
+older ghost-transition erasure theorem and class track remain separate future
+work.
 
 ## Testing strategy
 

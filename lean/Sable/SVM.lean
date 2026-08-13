@@ -104,18 +104,51 @@ def IntTy.wrap (t : IntTy) (n : Int) : Int :=
 
 /-! ## Values, traps, and abnormal outcomes -/
 
+/-- The scalar payloads supported by owned SVM arrays. Keeping the tag
+outside `Val` lets allocation retain the element type even at length zero. -/
+inductive ArrayElem where
+  | int (n : Int)
+  | bool (b : Bool)
+  deriving DecidableEq, Repr
+
+/-- A homogeneously typed owned array. The constructor is semantically
+observable at length zero: an empty integer array and an empty Boolean array
+accept different stores. -/
+inductive ArrayVal where
+  | ints (a : Seq Int)
+  | bools (a : Seq Bool)
+
+def ArrayVal.len : ArrayVal → Int
+  | .ints a => a.len
+  | .bools a => a.len
+
+def ArrayVal.get : ArrayVal → Int → ArrayElem
+  | .ints a, i => .int (a.get i)
+  | .bools a, i => .bool (a.get i)
+
+/-- Type-preserving update. `none` is payload-tag confusion; bounds are
+checked separately so a mismatched store wins over an OOB trap, just as the
+value-shape check did in the integer-only machine. -/
+def ArrayVal.set? : ArrayVal → Int → ArrayElem → Option ArrayVal
+  | .ints a, i, .int n => some (.ints (a.set i n))
+  | .bools a, i, .bool b => some (.bools (a.set i b))
+  | _, _, _ => none
+
+def ArrayVal.replicate (len : Int) : ArrayElem → ArrayVal
+  | .int n => .ints ⟨len, fun _ => n⟩
+  | .bool b => .bools ⟨len, fun _ => b⟩
+
 /-- Machine values. Integers are exact (`Int`); their widths live in the
 typed syntax, and per-operation rules enforce representability — the
-value plane never wraps. Arrays are `Sable.Seq Int` (owned `[T]` of a
-scalar element type; the ghost lift is then the identity). Ordinary options
-contain machine values recursively, so integer and Boolean payloads share
-one semantics; nullable raw pointers and POD records remain distinct
-abstract values with no byte representation (ADR 0054). -/
+value plane never wraps. Arrays carry a homogeneous integer/Boolean payload
+tag. Ordinary options contain machine values recursively, so integer and
+Boolean payloads share one semantics; nullable raw pointers and POD records
+remain distinct abstract values with no byte representation (ADR 0054). -/
 inductive Val where
   | unit
   | int  (n : Int)
   | bool (b : Bool)
-  | arr  (a : Seq Int)
+  | arr  (a : ArrayVal)
   | opt  (o : Option Val)
   /-- A raw pointer: provenance plus a byte offset, never a machine
   address. Two live pointers may name the same address only if they name
@@ -127,6 +160,15 @@ inductive Val where
   projection independent of compiler-local record indices; the tag still
   prevents typed-cell confusion. -/
   | record (tag : Int) (fields : List (String × Val))
+
+def ArrayElem.toVal : ArrayElem → Val
+  | .int n => .int n
+  | .bool b => .bool b
+
+def Val.arrayElem? : Val → Option ArrayElem
+  | .int n => some (.int n)
+  | .bool b => some (.bool b)
+  | _ => none
 
 def Val.recordField? : Val → String → Option Val
   | .record _ fields, name =>
@@ -785,17 +827,17 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   -- arrays: length and load; `a.get` is total-with-junk (Sable.Seq) but
   -- the machine only reads it under the bounds check. The index
   -- expression is evaluated before the array lookup (matching stores).
-  | len {ρ : Env} {x : String} {a : Seq Int}
+  | len {ρ : Env} {x : String} {a : ArrayVal}
       (h : ρ x = some (.arr a)) :
       Eval cap ρ (.len x) (.ok (.int a.len))
   | len_undef {ρ : Env} {x : String}
-      (h : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
+      (h : ∀ a : ArrayVal, ρ x ≠ some (.arr a)) :
       Eval cap ρ (.len x) (.abort .undef)
-  | index_ok {ρ : Env} {x : String} {e : Expr} {a : Seq Int} {n : Int}
+  | index_ok {ρ : Env} {x : String} {e : Expr} {a : ArrayVal} {n : Int}
       (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr a))
       (h₀ : 0 ≤ n) (h₁ : n < a.len) :
-      Eval cap ρ (.index x e) (.ok (.int (a.get n)))
-  | index_oob {ρ : Env} {x : String} {e : Expr} {a : Seq Int} {n : Int}
+      Eval cap ρ (.index x e) (.ok ((a.get n).toVal))
+  | index_oob {ρ : Env} {x : String} {e : Expr} {a : ArrayVal} {n : Int}
       (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr a))
       (h : n < 0 ∨ a.len ≤ n) :
       Eval cap ρ (.index x e) (.abort (.trap (.indexOOB n a.len)))
@@ -807,7 +849,7 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
       Eval cap ρ (.index x e) (.abort a)
   | index_undef_arr {ρ : Env} {x : String} {e : Expr} {n : Int}
       (hi : Eval cap ρ e (.ok (.int n)))
-      (ha : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
+      (ha : ∀ a : ArrayVal, ρ x ≠ some (.arr a)) :
       Eval cap ρ (.index x e) (.abort .undef)
   -- widen: total and, on the exact-Int value plane, the identity
   | widen_ok {ρ : Env} {dst : IntTy} {e : Expr} {n : Int}
@@ -903,16 +945,16 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | recordField_abort {ρ : Env} {e : Expr} {field : String} {ab : Abort}
       (h : Eval cap ρ e (.abort ab)) :
       Eval cap ρ (.recordField e field) (.abort ab)
-  | alloc_ok {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
-      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
+  | alloc_ok {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : ArrayElem}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v.toVal))
       (h₀ : 0 ≤ n) (hc : n ≤ cap) :
-      Eval cap ρ (.allocArray e₁ e₂) (.ok (.arr ⟨n, fun _ => v⟩))
-  | alloc_oom {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
-      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
+      Eval cap ρ (.allocArray e₁ e₂) (.ok (.arr (ArrayVal.replicate n v)))
+  | alloc_oom {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : ArrayElem}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v.toVal))
       (h₀ : 0 ≤ n) (hc : cap < n) :
       Eval cap ρ (.allocArray e₁ e₂) (.abort (.trap (.oom n)))
-  | alloc_neg {ρ : Env} {e₁ e₂ : Expr} {n v : Int}
-      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok (.int v)))
+  | alloc_neg {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : ArrayElem}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v.toVal))
       (h₀ : n < 0) :
       Eval cap ρ (.allocArray e₁ e₂) (.abort .undef)
   | alloc_undef₁ {ρ : Env} {e₁ e₂ : Expr} {v : Val}
@@ -923,7 +965,7 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
       Eval cap ρ (.allocArray e₁ e₂) (.abort a)
   | alloc_undef₂ {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : Val}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
-      (hv : ∀ m, v ≠ .int m) :
+      (hv : v.arrayElem? = none) :
       Eval cap ρ (.allocArray e₁ e₂) (.abort .undef)
   | alloc_abort₂ {ρ : Env} {e₁ e₂ : Expr} {n : Int} {a : Abort}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
@@ -1055,13 +1097,18 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (ha : EvalArgs cap ρ args (.abort ab)) :
       Step P cap (.run (.recordMake dst tag fields args :: k) ρ σ μ) ab.toConfig
-  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
-      (ha : ρ x = some (.arr a)) (h₀ : 0 ≤ n) (h₁ : n < a.len) :
-      Step P cap (.run (.store x ei ev :: k) ρ σ μ) (.run k (ρ.update x (.arr (a.set n w))) σ μ)
-  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {a : Seq Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
-      (ha : ρ x = some (.arr a)) (h : n < 0 ∨ a.len ≤ n) :
+  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
+      {a a' : ArrayVal} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
+      (ha : ρ x = some (.arr a)) (hs : a.set? n w = some a')
+      (h₀ : 0 ≤ n) (h₁ : n < a.len) :
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ)
+        (.run k (ρ.update x (.arr a')) σ μ)
+  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
+      {a a' : ArrayVal} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
+      (ha : ρ x = some (.arr a)) (hs : a.set? n w = some a')
+      (h : n < 0 ∨ a.len ≤ n) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) (.trapped (.indexOOB n a.len))
   | store_abort_idx {ρ : Env} {x : String} {ei ev : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.abort a)) :
@@ -1074,11 +1121,17 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) a.toConfig
   | store_undef_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok v))
-      (hw : ∀ m, v ≠ .int m) :
+      (hw : v.arrayElem? = none) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
-  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n w : Int} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok (.int w)))
-      (ha : ∀ a : Seq Int, ρ x ≠ some (.arr a)) :
+  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
+      (ha : ∀ a : ArrayVal, ρ x ≠ some (.arr a)) :
+      Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
+  | store_undef_tag {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
+      {a : ArrayVal} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
+      (ha : ρ x = some (.arr a)) (hs : a.set? n w = none) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
   | ite_true {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool true))) :

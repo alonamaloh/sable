@@ -1,8 +1,9 @@
 # ADR 0058 — LLVM lowering consumes the verified program
 
 **Decided and implemented 2026-08-12; scalar v0 complete. G1.3 Boolean-option
-and G1.4a POD-record extensions implemented and closed 2026-08-13; G1.4b
-owned-local Boolean arrays remain explicitly rejected.** Unsafe
+and G1.4a POD-record extensions implemented and closed 2026-08-13; G1.5's
+formal Boolean-array extension is closed while owned-local Boolean arrays remain
+explicitly rejected by LLVM.** Unsafe
 Sable v1 had a defensible formal stopping point but no native-code path. This
 backend makes verified
 programs in its deliberately narrow runtime subset runnable without making LLVM
@@ -200,7 +201,7 @@ G1.3 are closed.
 
 ## G1.4a amendment: internal semantic POD records
 
-The next backend aggregate is a root-owned POD record whose fields are all
+G1.4a's backend aggregate is a root-owned POD record whose fields are all
 fixed-width integers. Each supported declaration has an internal named LLVM
 aggregate, and internal functions may construct it, project its fields, keep it
 in local slots across branches, and transport it through parameters, direct
@@ -259,8 +260,36 @@ the 1/1 exact-`VerifiedProgram` interpreter↔Clang differential over five
 subjects at `-O0` and `-O2`; and the unchanged SVM differential at 76/76. A
 standalone corpus repeat was green in 195.71s; randomized allocator,
 grind-budget, LSP, and documentation gates were green. This closes G1.4b but
-claims no LLVM Boolean-array support. G1.5 adds formal SVM semantics next;
-native array lowering remains later.
+claims no LLVM Boolean-array support. G1.5 has since closed the formal SVM
+semantics; native array lowering remains a separate later stage.
+
+## G1.5 boundary: formal arrays are not LLVM arrays
+
+G1.5 adds tagged `ArrayVal.ints` and `ArrayVal.bools` payloads to the formal SVM
+and admits the already-authorized owned-local Boolean-array slice to the Rust
+differential bridge. It does not amend this ADR's representation decision. The
+LLVM emitter still rejects Boolean arrays, including empty values whose formal
+machine tag is observable. No native allocation, storage, lifetime, trap, or
+ABI policy follows from the formal value.
+
+The Rust bridge likewise stays smaller than a native aggregate ABI: only a
+fresh owned local from `alloc_array<bool>` or a contextual literal, followed by
+index, length, and store operations, is admitted. Literal elements are first
+evaluated into reserved temporaries in source order, before false-fill
+allocation and ordered stores, so an element trap precedes allocation/OOM.
+Expansion is capped at 50,000,000 elements and an empty literal retains its
+Boolean payload tag.
+
+G1.5 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1
+--nocapture`. `cargo check` and the full 22-target one-job Lake build were
+green; Rust library tests passed 175/175; all 394 corpus subjects (83 verifies,
+244 must-fail, 48 tests, 19 test-fails) passed in 266.78s; LLVM CLI passed 6/6
+with required Clang; the exact `VerifiedProgram`↔Clang differential passed 1/1
+over five subjects at `-O0` and `-O2`; and the exact Rust↔Lean SVM
+differential passed 86/86. `free_list_return_random`, grind-budget, LSP, and
+doc-tests were green. This closes G1.5 while the LLVM Boolean-array boundary
+remains closed.
 
 ## Consequences
 

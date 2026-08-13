@@ -239,10 +239,10 @@ class and record fields, borrows, exposure, whole-array rebinding, Boolean `for`
 indices, and generic Boolean-array arguments remain rejected. The interpreter and
 dynamic monitor carry a typed Boolean-array variant, including at length zero;
 same-domain equality is monitorable while integer/Boolean-array equality is
-unmonitorable. The formal SVM and LLVM emitter independently reject the type.
-Thus a concrete non-integer local has landed without making a non-integer
-concept, template proof, machine representation, or native ABI available by
-accident.
+unmonitorable. At the G1.4b checkpoint the formal SVM and LLVM emitter
+independently rejected the type. Thus a concrete non-integer local landed
+without making a non-integer concept, template proof, machine representation,
+or native ABI available by accident.
 
 G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1
@@ -254,3 +254,33 @@ exact-`VerifiedProgram` interpreter↔Clang differential 1/1 over five subjects 
 `-O0` and `-O2`; and SVM differential 76/76. A standalone corpus repeat was
 green in 195.71s. Randomized allocator, grind-budget, LSP, and documentation
 gates were green. G1.4b is closed without widening concepts.
+
+## G1.5 amendment: a machine array tag is not template authorization (2026-08-13)
+
+G1.5 gives the formal SVM a payload-generic array value,
+`ArrayVal.ints (Seq Int) | ArrayVal.bools (Seq Bool)`, and changes `Val.arr` to
+contain it. This is a machine-model factorization like G1.2's recursive option,
+not an extension of ADR 0009's template domain. It creates no
+`Sable.IntModel` for `Bool`, licenses no Boolean or Boolean-array type argument,
+and cannot mint `ProofReuse::Adr0009IntModel`.
+
+The Rust bridge checks the smaller, already-authorized G1.4b position: a fresh
+owned local initialized by `alloc_array<bool>` or a contextual literal, with
+index/length/store operations only. Parameters, returns, fields, borrows,
+exposure, whole-array transport, and generic Boolean-array arguments remain
+hard errors. Literal lowering through source-ordered temporaries, a false-fill
+allocation, and ordered stores is an executable implementation of that local
+producer; its 50,000,000-element cap is a machine-profile bound, not a concept
+constraint. The retained tag on an empty literal likewise describes runtime
+shape and grants no proof reuse.
+
+LLVM remains independently closed. G1.5 closed under
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` and the full 22-target one-job Lake build were green; Rust library
+tests passed 175/175; all 394 corpus subjects (83 verifies, 244 must-fail, 48
+tests, 19 test-fails) passed in 266.78s; LLVM CLI passed 6/6 with required
+Clang; the exact `VerifiedProgram`↔Clang differential passed 1/1 over five
+subjects at `-O0` and `-O2`; and the exact Rust↔Lean SVM differential passed
+86/86. `free_list_return_random`, grind-budget, LSP, and doc-tests were green.
+This closes G1.5 without widening concepts.

@@ -4,7 +4,7 @@
 
 Sable is an imperative, C-flavored language in which **every function carries a machine-checked proof of its contract**. One source file interleaves two languages: a C-like program language with no undefined behavior and an ownership-based memory model, and a Lean 4 proof language that lives entirely on lines beginning with `///`.
 
-**Status: milestones M0–M45 are complete. Unsafe Sable v1 has reached a defensible stopping point, the LLVM IR backend now covers the scalar core, Boolean options, and internal integer-field POD record values, M46/G0's recursive generic-type foundation is complete, and G1.0–G1.4b are closed.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; M45 adds verified-to-native scalar LLVM lowering. G0 completes recursive parsing and structural identity; G1.0 separates parameter/payload representation from the integer proof model; G1.1 admits only the first Boolean aggregate path; G1.2 carries its ordinary-function intersection through the formal SVM; G1.3 carries the same intersection into LLVM; G1.4a adds ordinary Boolean argument transport and verified/interpreted/native internal POD record calls without declaring a record ABI; G1.4b adds verified and dynamically monitored owned-local Boolean arrays while keeping both backend boundaries closed. Broader devices, ISA work, and broader aggregate backend support remain deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
+**Status: milestones M0–M45 are complete. Unsafe Sable v1 has reached a defensible stopping point, the LLVM IR backend now covers the scalar core, Boolean options, and internal integer-field POD record values, M46/G0's recursive generic-type foundation is complete, G1.0–G1.5 are closed.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; M45 adds verified-to-native scalar LLVM lowering. G0 completes recursive parsing and structural identity; G1.0 separates parameter/payload representation from the integer proof model; G1.1 admits only the first Boolean aggregate path; G1.2 carries its ordinary-function intersection through the formal SVM; G1.3 carries the same intersection into LLVM; G1.4a adds ordinary Boolean argument transport and verified/interpreted/native internal POD record calls without declaring a record ABI; G1.4b adds verified and dynamically monitored owned-local Boolean arrays while keeping both backend boundaries closed; G1.5 carries that exact local slice through the formal SVM and Rust differential bridge while LLVM remains closed. Broader devices, ISA work, and broader aggregate backend support remain deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
 
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
 - [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
@@ -250,11 +250,11 @@ monitorable within one payload domain; an integer/Boolean-array comparison is
 unmonitorable rather than coerced. Indexing still has the ordinary proof
 obligation and executable out-of-bounds trap.
 
-This is a source-verification/interpreter slice, not backend support. The Rust
-SVM lowerer and LLVM emitter independently reject Boolean arrays; the formal
-SVM has not acquired Boolean-array machine semantics, and no native storage or
-lifetime policy is implied. G1.5 adds the formal SVM representation next;
-native LLVM array lowering remains a later independent stage.
+At the G1.4b checkpoint this was a source-verification/interpreter slice, not
+backend support: the Rust SVM lowerer, formal SVM, and LLVM emitter all rejected
+Boolean arrays. No native storage or lifetime policy was implied. G1.5 widens
+only the formal-machine boundary; native LLVM array lowering remains a later
+independent stage.
 
 G1.4b closed under
 `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
@@ -267,6 +267,40 @@ exact-`VerifiedProgram` interpreter↔Clang differential over five subjects at
 `-O0` and `-O2`; and the unchanged SVM differential at 76/76. A separate
 standalone corpus repeat was green in 195.71s. Randomized allocator,
 grind-budget, LSP, and documentation gates were green. G1.4b is closed.
+
+G1.5 implements the same owned-local intersection in the formal SVM. Machine
+arrays are explicitly tagged as `ArrayVal.ints (Seq Int)` or
+`ArrayVal.bools (Seq Bool)`, and `Val.arr` contains that tagged value. Length,
+index, allocation, and store are payload-generic while remaining homogeneous;
+the tag survives at length zero. An indexed read returns the corresponding
+integer or Boolean scalar. A store of the wrong scalar domain is `undef`, and
+that mismatch is decided before bounds: a wrong-domain write to an empty or
+otherwise out-of-bounds array is `undef`, while a matching write traps with
+`indexOOB`. Index and value evaluation retain their established left-to-right
+precedence, and allocation evaluates length then initializer before
+negative-length/OOM geometry.
+
+The Rust bridge is deliberately narrower than the formal value. It admits only
+a fresh owned-local Boolean array produced by `alloc_array<bool>` or a
+contextual literal, then length/index/store uses; parameters, returns, fields,
+borrows, exposure, whole-array rebinding, and other transport remain rejected.
+A literal evaluates every element into compiler-reserved temporaries in source
+order before allocating a false-filled Boolean array and applying ordered
+stores. Thus an element trap wins over allocation/OOM. Literal expansion is
+bounded by the SVM profile cap of 50,000,000 elements, and an empty literal
+still allocates a Boolean-tagged empty value. Canonical observations retain the
+existing `arr [...]` spelling, with lowercase `true`/`false` elements.
+
+G1.5 closed under
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` and the full 22-target one-job Lake build were green; Rust library
+tests passed 175/175; all 394 corpus subjects (83 verifies, 244 must-fail, 48
+tests, 19 test-fails) passed in 266.78s; LLVM CLI passed 6/6 with Clang
+required; the exact `VerifiedProgram`↔Clang O0/O2 differential passed 1/1 over
+five subjects; and the SVM differential passed
+86/86. `free_list_return_random`, grind-budget, LSP, and doc-tests
+were green. G1.5 is closed.
 
 The complete G0 gate ran with one Cargo job, one Sable test job, one Lean job,
 and one Rust test thread. It passed 82/82 library tests, all 368 verifier,
@@ -312,7 +346,7 @@ Architecture in one sentence: the Rust compiler (`compiler/`) owns the program l
 
 ## Where this is headed
 
-The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1, scalar LLVM v0, G0, and **G1.0–G1.4b closed**, the first `option<bool>` slice reaches verification, interpretation, the formal SVM, and native LLVM, root-owned integer-field POD records cross ordinary verified/interpreted/native calls internally, and owned-local Boolean arrays reach verification, interpretation, and dynamic monitoring. G1.5 carries those arrays into the formal SVM next; native lowering remains a later independent stage before broader affine options, generic slots/`Vec`, and `HashMap`. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
+The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1, scalar LLVM v0, G0, **G1.0–G1.5 closed**, the first `option<bool>` slice reaches verification, interpretation, the formal SVM, and native LLVM, root-owned integer-field POD records cross ordinary verified/interpreted/native calls internally, and owned-local Boolean arrays now reach verification, interpretation, dynamic monitoring, and the formal SVM differential. Native lowering remains a later independent stage before broader affine options, generic slots/`Vec`, and `HashMap`. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
 
 ## Provenance
 

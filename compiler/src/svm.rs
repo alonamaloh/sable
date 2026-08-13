@@ -5,7 +5,7 @@
 //! `Config.render` on the Lean side character for character.
 //!
 //! Lowering is deliberately strict: anything outside the formalized
-//! subset — class members, option-valued parameters/storage, array literals,
+//! subset — class members, option-valued parameters/storage, transported arrays,
 //! loop invariants — is a hard error, never a silent skip, so the harness
 //! cannot compare less than it claims to. The mandatory loop `variant`
 //! is the one asymmetry: erased here (ghost, design §4) but monitored
@@ -110,10 +110,11 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
-/// Keep the G1.2 representation boundary explicit: arrays remain concrete-
-/// integer-only, while ordinary options additionally admit `bool`.  The Lean
-/// constructors are intentionally untyped, so every checked payload must be
-/// classified here instead of inheriting lowering by accident.
+/// Keep the aggregate representation boundary explicit. Arrays admit concrete
+/// integers and, in the narrowly checked owned-local position, `bool`;
+/// ordinary options admit both as well. The Lean constructors are intentionally
+/// untyped, so every checked payload must be classified here instead of
+/// inheriting lowering by accident.
 fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
     if !f.type_params.is_empty() {
         return Err(format!(
@@ -123,6 +124,12 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
     }
     for param in &f.params {
         validate_ty_payload(param.ty, &format!("parameter `{}`", param.name))?;
+        if bool_array_ty(param.ty) {
+            return Err(format!(
+                "svm.bool_array_position_unsupported: parameter `{}` is Boolean-array-typed; Boolean arrays are owned locals only",
+                param.name
+            ));
+        }
         if matches!(param.ty, Ty::Option(_)) {
             return Err(format!(
                 "svm.option_position_unsupported: parameter `{}` is option-typed; \
@@ -132,6 +139,12 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
         }
     }
     validate_ty_payload(f.ret, &format!("return type of `{}`", f.name))?;
+    if bool_array_ty(f.ret) {
+        return Err(format!(
+            "svm.bool_array_position_unsupported: `{}` returns a Boolean array; Boolean arrays are owned locals only",
+            f.name
+        ));
+    }
     if f.ret.is_resource() {
         return Err(format!(
             "svm.resource_return_unsupported: `{}` returns erased authority, which has no SVM value representation",
@@ -168,20 +181,30 @@ fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
 fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
     match payload {
         ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        ValueTy::Bool => Ok(()),
         _ => Err(format!(
             "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
-             the SVM currently lowers only concrete integer payloads",
+             the SVM currently lowers only concrete integer and Boolean payloads",
             payload.name()
         )),
     }
 }
 
-fn integer_array_element_ty(payload: ValueTy, context: &str) -> Result<Ty, String> {
+fn array_element_ty(payload: ValueTy, context: &str) -> Result<Ty, String> {
     validate_array_payload(payload, context)?;
     match payload {
         ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
-        _ => unreachable!("validate_array_payload accepted a non-integer payload"),
+        ValueTy::Bool => Ok(Ty::Bool),
+        _ => unreachable!("validate_array_payload accepted an unsupported payload"),
     }
+}
+
+fn bool_array_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Array(ValueTy::Bool, _))
+}
+
+fn owned_bool_array_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Array(ValueTy::Bool, Mutability::Owned))
 }
 
 fn require_expr_annotation(
@@ -204,7 +227,7 @@ fn require_expr_annotation(
     }
 }
 
-fn resolve_integer_array(
+fn resolve_array(
     ctx: &LowerCtx<'_>,
     array: &str,
     operation: &str,
@@ -226,8 +249,8 @@ fn validate_array_index(
     array: &str,
     index: &Expr,
 ) -> Result<(), String> {
-    let (payload, _, _) = resolve_integer_array(ctx, array, "array index")?;
-    let element = integer_array_element_ty(payload, "array index result")?;
+    let (payload, _, _) = resolve_array(ctx, array, "array index")?;
+    let element = array_element_ty(payload, "array index result")?;
     require_expr_annotation(
         expr,
         element,
@@ -239,7 +262,7 @@ fn validate_array_index(
 }
 
 fn validate_array_len(ctx: &LowerCtx<'_>, expr: &Expr, array: &str) -> Result<(), String> {
-    resolve_integer_array(ctx, array, "array length")?;
+    resolve_array(ctx, array, "array length")?;
     require_expr_annotation(
         expr,
         Ty::Int(IntTy::U64),
@@ -255,7 +278,7 @@ fn validate_alloc_array(
     len: &Expr,
     init: &Expr,
 ) -> Result<(), String> {
-    let element = integer_array_element_ty(elem, "alloc_array")?;
+    let element = array_element_ty(elem, "alloc_array")?;
     require_expr_annotation(
         expr,
         Ty::Array(elem, Mutability::Owned),
@@ -268,6 +291,16 @@ fn validate_alloc_array(
     validate_expr_payloads(ctx, init)
 }
 
+fn validate_array_literal_len(payload: ValueTy, len: usize) -> Result<(), String> {
+    if payload == ValueTy::Bool && len > 50_000_000 {
+        return Err(format!(
+            "svm.array_literal_capacity: Boolean array literal has {len} elements; \
+             literal expansion is supported only through the SVM allocation cap of 50000000"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_array_literal(
     ctx: &LowerCtx<'_>,
     expr: &Expr,
@@ -277,18 +310,19 @@ fn validate_array_literal(
         Some(Ty::Array(payload, Mutability::Owned)) => payload,
         Some(actual) => {
             return Err(format!(
-                "svm.array_literal_result_type: array literal is annotated `{}`; expected an owned integer array",
+                "svm.array_literal_result_type: array literal is annotated `{}`; expected a supported owned array",
                 actual.name()
             ));
         }
         None => {
             return Err(
-                "svm.array_literal_result_type: array literal carries no checked type; expected an owned integer array"
+                "svm.array_literal_result_type: array literal carries no checked type; expected a supported owned array"
                     .into(),
             );
         }
     };
-    let element = integer_array_element_ty(payload, "array literal")?;
+    let element = array_element_ty(payload, "array literal")?;
+    validate_array_literal_len(payload, elements.len())?;
     for (index, value) in elements.iter().enumerate() {
         validate_sink_type(
             ctx,
@@ -301,13 +335,54 @@ fn validate_array_literal(
     Ok(())
 }
 
+/// Boolean arrays have no call ABI or general first-class transport in G1.5.
+/// Their sole producer position is the initializer of a fresh owned local.
+/// Keep that positional rule separate from payload classification: the latter
+/// describes the machine representation, while this function describes the
+/// intentionally smaller source-to-machine bridge.
+fn validate_fresh_bool_array_initializer(
+    ctx: &LowerCtx<'_>,
+    declared_ty: Ty,
+    initializer: &Expr,
+    local: &str,
+) -> Result<(), String> {
+    if !owned_bool_array_ty(declared_ty) {
+        return Err(format!(
+            "svm.bool_array_position_unsupported: local `{local}` has type `{}`; \
+             Boolean arrays must be fresh owned locals",
+            declared_ty.name()
+        ));
+    }
+    match &initializer.kind {
+        ExprKind::AllocArray {
+            elem,
+            len,
+            init: value,
+        } => {
+            validate_alloc_array(ctx, initializer, *elem, len, value)?;
+        }
+        ExprKind::ArrayLit(elements) => validate_array_literal(ctx, initializer, elements)?,
+        _ => {
+            return Err(format!(
+                "svm.bool_array_transport_unsupported: initializer of `{local}` is not a fresh Boolean array literal or allocation"
+            ));
+        }
+    }
+    validate_sink_type(
+        ctx,
+        declared_ty,
+        initializer,
+        &format!("initializer of `{local}`"),
+    )
+}
+
 fn validate_array_store(
     ctx: &LowerCtx<'_>,
     array: &str,
     index: &Expr,
     value: &Expr,
 ) -> Result<(), String> {
-    let (payload, mutability, declared_mutable) = resolve_integer_array(ctx, array, "array store")?;
+    let (payload, mutability, declared_mutable) = resolve_array(ctx, array, "array store")?;
     if mutability == Mutability::Shared || (mutability == Mutability::Owned && !declared_mutable) {
         return Err(format!(
             "svm.array_store_place: array store targets non-writable `{array}` of type `{}`",
@@ -317,7 +392,7 @@ fn validate_array_store(
     validate_sink_type(ctx, Ty::Int(IntTy::U64), index, "array store index")?;
     validate_sink_type(
         ctx,
-        integer_array_element_ty(payload, "array store value")?,
+        array_element_ty(payload, "array store value")?,
         value,
         "array store value",
     )?;
@@ -353,7 +428,15 @@ fn semantic_expr_ty(
     context: &str,
 ) -> Result<Ty, String> {
     let semantic = match &expr.kind {
-        ExprKind::Var(name) => ctx.initialized_local(name, context)?.ty,
+        ExprKind::Var(name) => {
+            let ty = ctx.initialized_local(name, context)?.ty;
+            if bool_array_ty(ty) {
+                return Err(format!(
+                    "svm.bool_array_transport_unsupported: {context} moves Boolean array local `{name}`; Boolean arrays may only be accessed by index or length"
+                ));
+            }
+            ty
+        }
         ExprKind::AllocArray { elem, .. } => Ty::Array(*elem, Mutability::Owned),
         ExprKind::ArrayLit(_) => match expr.ty {
             Some(ty @ Ty::Array(_, Mutability::Owned)) => ty,
@@ -479,11 +562,11 @@ fn semantic_expr_ty(
         }
         ExprKind::Index { array, index, .. } => {
             validate_array_index(ctx, expr, array, index)?;
-            let (payload, _, _) = resolve_integer_array(ctx, array, "array index")?;
-            integer_array_element_ty(payload, "array index result")?
+            let (payload, _, _) = resolve_array(ctx, array, "array index")?;
+            array_element_ty(payload, "array index result")?
         }
         ExprKind::Len { array } => {
-            resolve_integer_array(ctx, array, "array length")?;
+            resolve_array(ctx, array, "array length")?;
             Ty::Int(IntTy::U64)
         }
         ExprKind::RecordField { obj, field, .. } => {
@@ -571,6 +654,11 @@ fn validate_local_var(
     operation: &str,
 ) -> Result<LocalBinding, String> {
     let binding = ctx.initialized_local(name, operation)?;
+    if bool_array_ty(binding.ty) {
+        return Err(format!(
+            "svm.bool_array_transport_unsupported: {operation} moves Boolean array local `{name}`; Boolean arrays may only be accessed by index or length"
+        ));
+    }
     match expr.ty {
         Some(annotation) if annotation != binding.ty => Err(format!(
             "svm.local_type: {operation} names `{name}` of type `{}` but is annotated `{}`",
@@ -698,8 +786,7 @@ fn validate_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
 }
 
 fn validate_array_exposure(ctx: &LowerCtx<'_>, array: &str, mutable: bool) -> Result<(), String> {
-    let (payload, mutability, declared_mutable) =
-        resolve_integer_array(ctx, array, "array exposure")?;
+    let (payload, mutability, declared_mutable) = resolve_array(ctx, array, "array exposure")?;
     if payload != ValueTy::Int(IntTy::U8) {
         return Err(format!(
             "svm.array_expose_type: exposure names `{array}` of type `{}`; only byte arrays have SVM exposure semantics",
@@ -903,6 +990,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         trait_member: bool,
     ) -> Result<(), String> {
         for parameter in &function.params {
+            if bool_array_ty(parameter.ty) {
+                return Err(format!(
+                    "svm.bool_array_position_unsupported: {context} parameter `{}` is Boolean-array-typed; Boolean arrays are owned locals only",
+                    parameter.name
+                ));
+            }
             if let Ty::Option(payload) = parameter.ty {
                 validate_option_payload(payload, context)?;
                 return Err(format!(
@@ -911,6 +1004,11 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                     parameter.name
                 ));
             }
+        }
+        if bool_array_ty(function.ret) {
+            return Err(format!(
+                "svm.bool_array_position_unsupported: {context} returns a Boolean array; Boolean arrays are owned locals only"
+            ));
         }
         if trait_member {
             if let Ty::Option(payload) = function.ret {
@@ -935,6 +1033,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
     }
     for class in program.classes.iter().chain(&program.class_templates) {
         for field in &class.fields {
+            if bool_array_ty(field.ty) {
+                return Err(format!(
+                    "svm.bool_array_position_unsupported: class `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
+                    class.name, field.name
+                ));
+            }
             if let Ty::Option(payload) = field.ty {
                 validate_option_payload(payload, &format!("class `{}`", class.name))?;
                 return Err(format!(
@@ -972,6 +1076,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         let mut field_names = HashSet::new();
         let mut extents: Vec<(i128, i128, &str)> = Vec::new();
         for field in &record.fields {
+            if bool_array_ty(field.ty) {
+                return Err(format!(
+                    "svm.bool_array_position_unsupported: record `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
+                    record.name, field.name
+                ));
+            }
             if !field_names.insert(field.name.as_str()) {
                 return Err(format!(
                     "svm.record_schema_duplicate: record `{}` repeats field `{}`",
@@ -1139,7 +1249,14 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 ..
             } => {
                 validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
-                if let Some(init) = init {
+                if bool_array_ty(*ty) {
+                    let Some(init) = init else {
+                        return Err(format!(
+                            "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
+                        ));
+                    };
+                    validate_fresh_bool_array_initializer(ctx, *ty, init, name)?;
+                } else if let Some(init) = init {
                     validate_expr_payloads(ctx, init)?;
                     validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
                 }
@@ -1210,8 +1327,12 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 ..
             } => {
                 validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
-                validate_expr_payloads(ctx, init)?;
-                validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+                if bool_array_ty(*ty) {
+                    validate_fresh_bool_array_initializer(ctx, *ty, init, name)?;
+                } else {
+                    validate_expr_payloads(ctx, init)?;
+                    validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+                }
                 ctx.insert_local(name, *ty, *mutable, true)?;
             }
             Stmt::VarDecl { name, ty: None, .. } => {
@@ -1379,6 +1500,12 @@ fn validate_call_signature(
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
     if let Some(ty) = expr.ty {
         validate_ty_payload(ty, "expression annotation")?;
+        if bool_array_ty(ty) {
+            return Err(
+                "svm.bool_array_position_unsupported: a Boolean-array-valued expression is only supported as the initializer of a fresh owned local"
+                    .into(),
+            );
+        }
     }
 
     match &expr.kind {
@@ -1527,11 +1654,20 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         ExprKind::BoolLit(_) => {
             semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "Boolean literal")?;
         }
+        ExprKind::Borrow { array, .. } => {
+            if ctx
+                .local(array)
+                .is_some_and(|binding| bool_array_ty(binding.ty))
+            {
+                return Err(format!(
+                    "svm.bool_array_borrow_unsupported: Boolean array local `{array}` cannot be borrowed or transported"
+                ));
+            }
+        }
         ExprKind::SelfField { .. }
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::ClassField { .. }
-        | ExprKind::ClassFieldLen { .. }
-        | ExprKind::Borrow { .. } => {}
+        | ExprKind::ClassFieldLen { .. } => {}
         ExprKind::RecordField { obj, field, .. } => {
             semantic_record_field_ty(ctx, expr, obj, field)?;
         }
@@ -1614,6 +1750,22 @@ fn lower_scoped_block(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, 
 
 fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>, String> {
     Ok(match s {
+        Stmt::Decl {
+            name,
+            ty,
+            mutable,
+            init,
+            ..
+        } if bool_array_ty(*ty) => {
+            let Some(initializer) = init else {
+                return Err(format!(
+                    "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
+                ));
+            };
+            let lowered = lower_fresh_bool_array_bind(ctx, name, *ty, initializer)?;
+            ctx.insert_local(name, *ty, *mutable, true)?;
+            Some(lowered)
+        }
         // A ⊥ slot: the machine conflates "undeclared" with ⊥, and
         // definite initialization guarantees assignment-before-read.
         Stmt::Decl {
@@ -1647,6 +1799,17 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
         } => {
             validate_sink_type(ctx, *ty, e, &format!("initializer of `{name}`"))?;
             let lowered = lower_bind(ctx, name, e)?;
+            ctx.insert_local(name, *ty, *mutable, true)?;
+            Some(lowered)
+        }
+        Stmt::VarDecl {
+            name,
+            init,
+            ty: Some(ty),
+            mutable,
+            ..
+        } if bool_array_ty(*ty) => {
+            let lowered = lower_fresh_bool_array_bind(ctx, name, *ty, init)?;
             ctx.insert_local(name, *ty, *mutable, true)?;
             Some(lowered)
         }
@@ -2567,6 +2730,64 @@ fn lower_erased_resource_bind(
     }
 }
 
+/// Materialize the one Boolean-array producer position admitted by the SVM
+/// bridge. A literal first evaluates its elements into compiler-reserved
+/// temporaries in source order, then expands to a false-filled allocation and
+/// ordered stores. Evaluating the elements before the allocation is material:
+/// an element trap must beat construction, just as it does in `interp.rs`.
+/// Empty literals still get an unambiguous Boolean payload without adding a
+/// second array-literal expression to the Lean core.
+fn lower_fresh_bool_array_bind(
+    ctx: &LowerCtx<'_>,
+    name: &str,
+    declared_ty: Ty,
+    initializer: &Expr,
+) -> Result<String, String> {
+    validate_fresh_bool_array_initializer(ctx, declared_ty, initializer, name)?;
+    match &initializer.kind {
+        ExprKind::AllocArray { len, init, .. } => Ok(format!(
+            "(.assign \"{name}\" (.allocArray {} {}))",
+            lower_expr(ctx, len)?,
+            lower_expr(ctx, init)?
+        )),
+        ExprKind::ArrayLit(elements) => {
+            let temporaries: Result<Vec<(String, String)>, String> = elements
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    // Source identifiers beginning with `_` are reserved by
+                    // the lexer, and checked local names are function-unique.
+                    // The explicit lookup keeps the public lowerer fail-closed
+                    // if a forged checked AST bypasses those front-end rules.
+                    let temporary = format!("_bool_lit_{name}_{index}");
+                    if ctx.local(&temporary).is_some() {
+                        return Err(format!(
+                            "svm.bool_array_temp_collision: compiler Boolean-literal temporary `{temporary}` collides with a forged checked local"
+                        ));
+                    }
+                    Ok((temporary, lower_expr(ctx, value)?))
+                })
+                .collect();
+            let temporaries = temporaries?;
+            let mut statements: Vec<String> = temporaries
+                .iter()
+                .map(|(temporary, value)| format!("(.assign \"{temporary}\" {value})"))
+                .collect();
+            statements.push(format!(
+                "(.assign \"{name}\" (.allocArray (.intLit .u64 {}) (.boolLit false)))",
+                elements.len()
+            ));
+            for (index, (temporary, _)) in temporaries.iter().enumerate() {
+                statements.push(format!(
+                    "(.store \"{name}\" (.intLit .u64 {index}) (.var \"{temporary}\"))"
+                ));
+            }
+            Ok(statements.join(", "))
+        }
+        _ => unreachable!("fresh Boolean array validation accepted a transport"),
+    }
+}
+
 /// `x = e;` — an assign, or (A-normalized, ADR 0005) a call when `e`
 /// is exactly a call; calls nested deeper stay outside the subset.
 fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String> {
@@ -3469,6 +3690,61 @@ mod tests {
     }
 
     #[test]
+    fn lowering_rejects_boolean_arrays_outside_fresh_owned_locals() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+
+        let mut parameter = checked_fn(Ty::Bool, Vec::new());
+        parameter.params.push(Param {
+            name: "bits".into(),
+            ty: array_ty,
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+        let error = lower_fn_entry(&program, &parameter)
+            .expect_err("Boolean arrays have no SVM parameter ABI");
+        assert!(
+            error.starts_with("svm.bool_array_position_unsupported:"),
+            "{error}"
+        );
+
+        let returned = checked_fn(array_ty, Vec::new());
+        let error =
+            lower_fn_entry(&program, &returned).expect_err("Boolean arrays have no SVM result ABI");
+        assert!(
+            error.starts_with("svm.bool_array_position_unsupported:"),
+            "{error}"
+        );
+
+        let mut field_program = empty_program();
+        field_program.classes.push(ClassDecl {
+            is_pub: false,
+            name: "Holder".into(),
+            name_span: Span::new(0, 0),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            fields: vec![Field {
+                name: "bits".into(),
+                ty: array_ty,
+                span: Span::new(0, 0),
+                must_consume: false,
+            }],
+            invariants: Vec::new(),
+            inits: Vec::new(),
+            methods: Vec::new(),
+            deinit: None,
+            span: Span::new(0, 0),
+        });
+        let error = validate_program_option_positions(&field_program)
+            .expect_err("Boolean arrays cannot enter class storage");
+        assert!(
+            error.starts_with("svm.bool_array_position_unsupported:"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn lowering_rejects_residual_generic_declarations() {
         let program = empty_program();
         let mut function = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
@@ -3691,26 +3967,171 @@ mod tests {
     }
 
     #[test]
-    fn lowering_rejects_non_integer_array_declaration() {
+    fn lowering_materializes_fresh_boolean_array_allocations_and_literals() {
         let program = empty_program();
-        let function = checked_fn(
-            Ty::Unit,
-            vec![Stmt::Decl {
-                ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
-                name: "values".into(),
-                name_span: Span::new(0, 0),
-                init: None,
-                mutable: false,
-            }],
+        let ctx = LowerCtx::bare(&program);
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(expr(ExprKind::IntLit(3), Ty::Int(IntTy::U64))),
+                init: Box::new(expr(ExprKind::BoolLit(true), Ty::Bool)),
+            },
+            array_ty,
+        );
+        assert_eq!(
+            lower_fresh_bool_array_bind(&ctx, "allocated", array_ty, &allocation).unwrap(),
+            "(.assign \"allocated\" (.allocArray (.intLit .u64 3) (.boolLit true)))"
         );
 
-        let error = lower_fn(&program, &function)
-            .expect_err("a Boolean array must not inherit integer SVM lowering");
-        assert_eq!(
-            error,
-            "svm.aggregate_payload_unsupported: declaration `values` has array payload `bool`; \
-             the SVM currently lowers only concrete integer payloads"
+        let literal = expr(
+            ExprKind::ArrayLit(vec![
+                expr(ExprKind::BoolLit(true), Ty::Bool),
+                expr(ExprKind::BoolLit(false), Ty::Bool),
+            ]),
+            array_ty,
         );
+        assert_eq!(
+            lower_fresh_bool_array_bind(&ctx, "literal", array_ty, &literal).unwrap(),
+            "(.assign \"_bool_lit_literal_0\" (.boolLit true)), \
+             (.assign \"_bool_lit_literal_1\" (.boolLit false)), \
+             (.assign \"literal\" (.allocArray (.intLit .u64 2) (.boolLit false))), \
+             (.store \"literal\" (.intLit .u64 0) (.var \"_bool_lit_literal_0\")), \
+             (.store \"literal\" (.intLit .u64 1) (.var \"_bool_lit_literal_1\"))"
+        );
+        let empty = expr(ExprKind::ArrayLit(Vec::new()), array_ty);
+        assert_eq!(
+            lower_fresh_bool_array_bind(&ctx, "empty", array_ty, &empty).unwrap(),
+            "(.assign \"empty\" (.allocArray (.intLit .u64 0) (.boolLit false)))"
+        );
+
+        let error = validate_array_literal_len(ValueTy::Bool, 50_000_001)
+            .expect_err("literal expansion must remain inside the formal allocation cap");
+        assert!(error.starts_with("svm.array_literal_capacity:"), "{error}");
+        validate_array_literal_len(ValueTy::Bool, 50_000_000)
+            .expect("the exact formal allocation cap remains lowerable");
+
+        let mut forged_ctx = LowerCtx::bare(&program);
+        forged_ctx
+            .insert_local("_bool_lit_literal_0", Ty::Bool, false, true)
+            .unwrap();
+        let error = lower_fresh_bool_array_bind(&forged_ctx, "literal", array_ty, &literal)
+            .expect_err("forged compiler-reserved locals cannot capture literal temporaries");
+        assert!(
+            error.starts_with("svm.bool_array_temp_collision:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn boolean_arrays_reject_uninitialized_alias_rebind_borrow_and_exposure() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let literal = || {
+            expr(
+                ExprKind::ArrayLit(vec![expr(ExprKind::BoolLit(true), Ty::Bool)]),
+                array_ty,
+            )
+        };
+        let declaration = |name: &str, mutable: bool| Stmt::Decl {
+            ty: array_ty,
+            name: name.into(),
+            name_span: Span::new(0, 0),
+            init: Some(literal()),
+            mutable,
+        };
+
+        let uninitialized = checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: array_ty,
+                name: "bits".into(),
+                name_span: Span::new(0, 0),
+                init: None,
+                mutable: true,
+            }],
+        );
+        let error = lower_fn(&program, &uninitialized)
+            .expect_err("Boolean arrays must always be fresh and initialized");
+        assert!(error.starts_with("svm.bool_array_fresh_local:"), "{error}");
+
+        let aliased = checked_fn(
+            Ty::Unit,
+            vec![
+                declaration("source", false),
+                Stmt::Decl {
+                    ty: array_ty,
+                    name: "alias".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(ExprKind::Var("source".into()), array_ty)),
+                    mutable: false,
+                },
+            ],
+        );
+        let error =
+            lower_fn(&program, &aliased).expect_err("Boolean array locals cannot be aliased");
+        assert!(
+            error.starts_with("svm.bool_array_transport_unsupported:"),
+            "{error}"
+        );
+
+        let rebound = checked_fn(
+            Ty::Unit,
+            vec![
+                declaration("bits", true),
+                Stmt::Assign {
+                    name: "bits".into(),
+                    name_span: Span::new(0, 0),
+                    value: literal(),
+                },
+            ],
+        );
+        let error =
+            lower_fn(&program, &rebound).expect_err("Boolean array locals cannot be rebound");
+        assert!(
+            error.starts_with("svm.bool_array_position_unsupported:")
+                || error.starts_with("svm.array_rebind_unsupported:"),
+            "{error}"
+        );
+
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("bits", array_ty, true, true).unwrap();
+        let borrow = Expr {
+            kind: ExprKind::Borrow {
+                array: "bits".into(),
+                field: None,
+                mutable: false,
+            },
+            span: Span::new(0, 0),
+            ty: None,
+        };
+        let error = validate_expr_payloads(&ctx, &borrow)
+            .expect_err("Boolean array locals cannot be borrowed");
+        assert!(
+            error.starts_with("svm.bool_array_borrow_unsupported:"),
+            "{error}"
+        );
+
+        let exposure = checked_fn(
+            Ty::Unit,
+            vec![
+                declaration("bits", true),
+                Stmt::Expose {
+                    kw_span: Span::new(0, 0),
+                    array: "bits".into(),
+                    array_span: Span::new(0, 0),
+                    mutable: true,
+                    ptr: "ptr".into(),
+                    ptr_span: Span::new(0, 0),
+                    res: "memory".into(),
+                    res_span: Span::new(0, 0),
+                    body: Vec::new(),
+                },
+            ],
+        );
+        let error = lower_fn(&program, &exposure)
+            .expect_err("Boolean array locals cannot cross the exposure bridge");
+        assert!(error.starts_with("svm.array_expose_type:"), "{error}");
     }
 
     #[test]
@@ -3740,7 +4161,7 @@ mod tests {
         assert_eq!(
             error,
             "svm.aggregate_payload_unsupported: alloc_array has array payload `record`; \
-             the SVM currently lowers only concrete integer payloads"
+             the SVM currently lowers only concrete integer and Boolean payloads"
         );
     }
 
@@ -3965,6 +4386,122 @@ mod tests {
                 assert!(error.contains(context), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn boolean_array_operands_require_exact_boolean_types() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("bits", array_ty, true, true).unwrap();
+        let length = || expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64));
+        let boolean = || expr(ExprKind::BoolLit(false), Ty::Bool);
+
+        let allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(length()),
+                init: Box::new(boolean()),
+            },
+            array_ty,
+        );
+        validate_alloc_array(
+            &ctx,
+            &allocation,
+            ValueTy::Bool,
+            match &allocation.kind {
+                ExprKind::AllocArray { len, .. } => len,
+                _ => unreachable!(),
+            },
+            match &allocation.kind {
+                ExprKind::AllocArray { init, .. } => init,
+                _ => unreachable!(),
+            },
+        )
+        .expect("coherent Boolean allocation");
+
+        let bad_allocation = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(length()),
+                init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
+            },
+            array_ty,
+        );
+        let ExprKind::AllocArray { len, init, .. } = &bad_allocation.kind else {
+            unreachable!()
+        };
+        let error = validate_alloc_array(&ctx, &bad_allocation, ValueTy::Bool, len, init)
+            .expect_err("Boolean allocations cannot inherit integer initializers");
+        assert!(error.starts_with("svm.sink_type:"), "{error}");
+
+        let index = expr(
+            ExprKind::Index {
+                array: "bits".into(),
+                array_span: Span::new(0, 0),
+                index: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
+            },
+            Ty::Bool,
+        );
+        assert_eq!(
+            lower_expr(&ctx, &index).unwrap(),
+            "(.index \"bits\" (.intLit .u64 1))"
+        );
+        let wrong_index = Expr {
+            ty: Some(Ty::Int(IntTy::U8)),
+            ..index.clone()
+        };
+        let error = validate_expr_payloads(&ctx, &wrong_index)
+            .expect_err("Boolean array reads cannot be forged into integers");
+        assert!(error.starts_with("svm.array_index_result_type:"), "{error}");
+
+        let store = Stmt::Store {
+            array: "bits".into(),
+            array_span: Span::new(0, 0),
+            index: expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64)),
+            value: expr(ExprKind::BoolLit(true), Ty::Bool),
+        };
+        assert_eq!(
+            lower_stmt_erasing(&mut ctx, &store).unwrap(),
+            Some("(.store \"bits\" (.intLit .u64 0) (.boolLit true))".into())
+        );
+        let wrong_store = Stmt::Store {
+            array: "bits".into(),
+            array_span: Span::new(0, 0),
+            index: expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64)),
+            value: expr(ExprKind::IntLit(1), Ty::Int(IntTy::U8)),
+        };
+        let error = lower_stmt_erasing(&mut ctx, &wrong_store)
+            .expect_err("Boolean array stores require Boolean values");
+        assert!(error.starts_with("svm.sink_type:"), "{error}");
+    }
+
+    #[test]
+    fn boolean_literal_evaluates_trapping_elements_before_allocation() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("source", array_ty, false, true).unwrap();
+        let trapping_read = expr(
+            ExprKind::Index {
+                array: "source".into(),
+                array_span: Span::new(0, 0),
+                index: Box::new(expr(ExprKind::IntLit(7), Ty::Int(IntTy::U64))),
+            },
+            Ty::Bool,
+        );
+        let literal = expr(ExprKind::ArrayLit(vec![trapping_read]), array_ty);
+        let lowered = lower_fresh_bool_array_bind(&ctx, "copy", array_ty, &literal).unwrap();
+        let element = lowered
+            .find("(.assign \"_bool_lit_copy_0\" (.index \"source\"")
+            .expect("element read must be materialized");
+        let allocation = lowered
+            .find("(.assign \"copy\" (.allocArray")
+            .expect("literal allocation must be materialized");
+        assert!(
+            element < allocation,
+            "a trapping literal element must execute before allocation: {lowered}"
+        );
     }
 
     #[test]

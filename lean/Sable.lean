@@ -11,6 +11,7 @@ import Sable.Perm
 import Sable.Specs
 import Sable.SVM
 import Sable.SVMEval
+import Sable.SVMArrayTests
 import Sable.SVMOptionTests
 import Sable.SVMRawTests
 import Sable.MMIO
