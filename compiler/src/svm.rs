@@ -132,13 +132,26 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
         }
     }
     validate_ty_payload(f.ret, &format!("return type of `{}`", f.name))?;
+    if f.ret.is_resource() {
+        return Err(format!(
+            "svm.resource_return_unsupported: `{}` returns erased authority, which has no SVM value representation",
+            f.name
+        ));
+    }
     if f.extern_info.is_some() {
         return Err(format!(
             "`{}` is an audited extern: the machine has no semantics for a foreign call",
             f.name
         ));
     }
-    validate_stmt_payloads(ctx, &f.body)
+    validate_stmt_payloads(ctx, &f.body)?;
+    if f.ret != Ty::Unit && !block_definitely_returns(&f.body) {
+        return Err(format!(
+            "svm.missing_return: non-unit function `{}` can fall through without an SVM value",
+            f.name
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
@@ -221,12 +234,7 @@ fn validate_array_index(
         "svm.array_index_result_type",
         "array index result",
     )?;
-    require_expr_annotation(
-        index,
-        Ty::Int(IntTy::U64),
-        "svm.array_index_operand_type",
-        "array index operand",
-    )?;
+    validate_sink_type(ctx, Ty::Int(IntTy::U64), index, "array index operand")?;
     validate_expr_payloads(ctx, index)
 }
 
@@ -254,18 +262,8 @@ fn validate_alloc_array(
         "svm.array_alloc_result_type",
         "alloc_array result",
     )?;
-    require_expr_annotation(
-        len,
-        Ty::Int(IntTy::U64),
-        "svm.array_alloc_length_type",
-        "alloc_array length",
-    )?;
-    require_expr_annotation(
-        init,
-        element,
-        "svm.array_alloc_init_type",
-        "alloc_array initializer",
-    )?;
+    validate_sink_type(ctx, Ty::Int(IntTy::U64), len, "alloc_array length")?;
+    validate_sink_type(ctx, element, init, "alloc_array initializer")?;
     validate_expr_payloads(ctx, len)?;
     validate_expr_payloads(ctx, init)
 }
@@ -292,10 +290,10 @@ fn validate_array_literal(
     };
     let element = integer_array_element_ty(payload, "array literal")?;
     for (index, value) in elements.iter().enumerate() {
-        require_expr_annotation(
-            value,
+        validate_sink_type(
+            ctx,
             element,
-            "svm.array_literal_element_type",
+            value,
             &format!("array literal element {}", index + 1),
         )?;
         validate_expr_payloads(ctx, value)?;
@@ -316,16 +314,11 @@ fn validate_array_store(
             Ty::Array(payload, mutability).name()
         ));
     }
-    require_expr_annotation(
-        index,
-        Ty::Int(IntTy::U64),
-        "svm.array_store_index_type",
-        "array store index",
-    )?;
-    require_expr_annotation(
-        value,
+    validate_sink_type(ctx, Ty::Int(IntTy::U64), index, "array store index")?;
+    validate_sink_type(
+        ctx,
         integer_array_element_ty(payload, "array store value")?,
-        "svm.array_store_value_type",
+        value,
         "array store value",
     )?;
     validate_expr_payloads(ctx, index)?;
@@ -380,8 +373,18 @@ fn semantic_expr_ty(
         ExprKind::ResOp { op, args, .. } => semantic_res_op_ty(ctx, *op, args, expected)?,
         ExprKind::RawOp { op, args, .. } => validate_raw_op(ctx, *op, args)?,
         ExprKind::DeviceOp { op, args, .. } => validate_device_op(ctx, *op, args)?,
-        ExprKind::IntLit(_) => match expr.ty {
-            Some(actual @ Ty::Int(_)) => actual,
+        ExprKind::IntLit(value) => match expr.ty {
+            Some(actual @ Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_)) => {
+                if *value < integer.min() || *value > integer.max() {
+                    return Err(format!(
+                        "svm.sink_type: {context} has literal `{value}` outside `{}` range {}..={}",
+                        integer.name(),
+                        integer.min(),
+                        integer.max()
+                    ));
+                }
+                actual
+            }
             _ => {
                 return Err(format!(
                     "svm.sink_type: {context} has an integer literal with a non-integer annotation"
@@ -389,6 +392,137 @@ fn semantic_expr_ty(
             }
         },
         ExprKind::BoolLit(_) => Ty::Bool,
+        ExprKind::Unary { op, operand } => match op {
+            UnOp::Not => {
+                validate_sink_type(ctx, Ty::Bool, operand, &format!("{context} operand"))?;
+                Ty::Bool
+            }
+            UnOp::Neg => {
+                let operand_ty = semantic_expr_ty(
+                    ctx,
+                    operand,
+                    operand.ty.unwrap_or(expected),
+                    &format!("{context} operand"),
+                )?;
+                match operand_ty {
+                    Ty::Int(integer) if integer.signed() => operand_ty,
+                    Ty::Int(_) => {
+                        return Err(format!(
+                            "svm.sink_type: {context} negates an unsigned integer"
+                        ));
+                    }
+                    actual => {
+                        return Err(format!(
+                            "svm.sink_type: {context} negates non-integer `{}`",
+                            actual.name()
+                        ));
+                    }
+                }
+            }
+        },
+        ExprKind::Binary { op, lhs, rhs, .. } => {
+            if matches!(op, BinOp::And | BinOp::Or) {
+                validate_sink_type(ctx, Ty::Bool, lhs, &format!("{context} left operand"))?;
+                validate_sink_type(ctx, Ty::Bool, rhs, &format!("{context} right operand"))?;
+                Ty::Bool
+            } else {
+                let left = semantic_expr_ty(
+                    ctx,
+                    lhs,
+                    lhs.ty.unwrap_or(expected),
+                    &format!("{context} left operand"),
+                )?;
+                let right = semantic_expr_ty(
+                    ctx,
+                    rhs,
+                    rhs.ty.unwrap_or(left),
+                    &format!("{context} right operand"),
+                )?;
+                if left != right || !matches!(left, Ty::Int(_)) {
+                    return Err(format!(
+                        "svm.sink_type: {context} has incompatible operands `{}` and `{}`",
+                        left.name(),
+                        right.name()
+                    ));
+                }
+                if op.is_comparison() { Ty::Bool } else { left }
+            }
+        }
+        ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
+            if matches!(target, IntTy::TParam(_)) {
+                return Err(format!(
+                    "svm.type_parameter_unsupported: {context} conversion target is unresolved"
+                ));
+            }
+            let source = semantic_expr_ty(
+                ctx,
+                arg,
+                arg.ty.unwrap_or(Ty::Int(*target)),
+                &format!("{context} conversion operand"),
+            )?;
+            let Ty::Int(source_integer) = source else {
+                return Err(format!(
+                    "svm.sink_type: {context} converts non-integer `{}`",
+                    source.name()
+                ));
+            };
+            if matches!(&expr.kind, ExprKind::Widen { .. })
+                && (source_integer.min() < target.min() || source_integer.max() > target.max())
+            {
+                return Err(format!(
+                    "svm.sink_type: {context} uses non-value-preserving widen from `{}` to `{}`",
+                    source_integer.name(),
+                    target.name()
+                ));
+            }
+            Ty::Int(*target)
+        }
+        ExprKind::Index { array, index, .. } => {
+            validate_array_index(ctx, expr, array, index)?;
+            let (payload, _, _) = resolve_integer_array(ctx, array, "array index")?;
+            integer_array_element_ty(payload, "array index result")?
+        }
+        ExprKind::Len { array } => {
+            resolve_integer_array(ctx, array, "array length")?;
+            Ty::Int(IntTy::U64)
+        }
+        ExprKind::RecordField { obj, field, .. } => {
+            semantic_record_field_ty(ctx, expr, obj, field)?
+        }
+        ExprKind::SomeE(inner) => {
+            let repr = svm_option_repr(expr, "some")?;
+            let payload = match repr {
+                SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+                SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
+            };
+            validate_sink_type(ctx, payload, inner, &format!("{context} option payload"))?;
+            expr.ty.expect("classified option result")
+        }
+        ExprKind::NoneE => {
+            svm_option_repr(expr, "none")?;
+            expr.ty.expect("classified option result")
+        }
+        ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
+            let operand_ty = semantic_expr_ty(
+                ctx,
+                operand,
+                operand.ty.unwrap_or(Ty::Unit),
+                &format!("{context} option operand"),
+            )?;
+            match (&expr.kind, operand_ty) {
+                (ExprKind::IsSome { .. }, Ty::Option(_) | Ty::OptionRaw(_)) => Ty::Bool,
+                (ExprKind::OptValue { .. }, Ty::Option(payload)) => {
+                    ordinary_option_payload_ty(payload)?
+                }
+                (ExprKind::OptValue { .. }, Ty::OptionRaw(record)) => Ty::RawRecord(record),
+                _ => {
+                    return Err(format!(
+                        "svm.option_accessor_operand: {context} operand is `{}`; expected an option",
+                        operand_ty.name()
+                    ));
+                }
+            }
+        }
         _ => {
             if matches!(expr.ty, Some(Ty::Array(..))) {
                 return Err(format!(
@@ -448,6 +582,77 @@ fn validate_local_var(
         )),
         _ => Ok(binding),
     }
+}
+
+fn semantic_record_field_ty(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    obj: &str,
+    field: &str,
+) -> Result<Ty, String> {
+    let binding = ctx.initialized_local(obj, "record field access")?;
+    let Ty::Record(record_index) = binding.ty else {
+        return Err(format!(
+            "svm.record_field_place: `{obj}` has type `{}`; expected a record",
+            binding.ty.name()
+        ));
+    };
+    let record = ctx.record(record_index)?;
+    let Some(declared_field) = record
+        .fields
+        .iter()
+        .find(|candidate| candidate.name == field)
+    else {
+        return Err(format!(
+            "svm.record_field_name: record `{}` has no field `{field}`",
+            record.name
+        ));
+    };
+    if expr.ty != Some(declared_field.ty) {
+        return Err(format!(
+            "svm.record_field_type: `{}.{field}` has type `{}` but is annotated `{}`",
+            record.name,
+            declared_field.ty.name(),
+            expr.ty.map_or_else(|| "<missing>".into(), Ty::name)
+        ));
+    }
+    Ok(declared_field.ty)
+}
+
+fn validate_record_literal(
+    ctx: &LowerCtx<'_>,
+    expr: &Expr,
+    record_name: &str,
+    args: &[Expr],
+) -> Result<usize, String> {
+    let Some(Ty::Record(record_index)) = expr.ty else {
+        return Err(format!(
+            "svm.record_literal_type: `{record_name}(...)` carries no record type"
+        ));
+    };
+    let record = ctx.record(record_index)?;
+    if record.name != record_name {
+        return Err(format!(
+            "svm.record_literal_type: literal names `{record_name}` but tag names `{}`",
+            record.name
+        ));
+    }
+    if args.len() != record.fields.len() {
+        return Err(format!(
+            "svm.record_literal_arity: `{record_name}` has {} arguments for {} fields",
+            args.len(),
+            record.fields.len()
+        ));
+    }
+    for (argument, field) in args.iter().zip(&record.fields) {
+        validate_sink_type(
+            ctx,
+            field.ty,
+            argument,
+            &format!("record literal `{record_name}.{}`", field.name),
+        )?;
+    }
+    Ok(record_index)
 }
 
 fn validate_sink_type(
@@ -538,6 +743,21 @@ fn validate_system_dealloc(
                 expected.name()
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_allocation_size(ctx: &LowerCtx<'_>, size: &Expr, context: &str) -> Result<(), String> {
+    validate_sink_type(ctx, Ty::Int(IntTy::U64), size, context)?;
+    let ExprKind::IntLit(value) = size.kind else {
+        return Err(format!(
+            "svm.allocation_size_literal: {context} must be a compile-time literal"
+        ));
+    };
+    if !(1..=50_000_000).contains(&value) {
+        return Err(format!(
+            "svm.allocation_size_range: {context} `{value}` is outside 1..=50000000"
+        ));
     }
     Ok(())
 }
@@ -734,7 +954,26 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         }
     }
     for record in &program.records {
+        let mut field_names = HashSet::new();
         for field in &record.fields {
+            if !field_names.insert(field.name.as_str()) {
+                return Err(format!(
+                    "svm.record_schema_duplicate: record `{}` repeats field `{}`",
+                    record.name, field.name
+                ));
+            }
+            match field.ty {
+                Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => {}
+                Ty::RawRecord(_) | Ty::OptionRaw(_) => {}
+                unsupported => {
+                    return Err(format!(
+                        "svm.record_schema_type: record `{}.{}` has unsupported field type `{}`",
+                        record.name,
+                        field.name,
+                        unsupported.name()
+                    ));
+                }
+            }
             if let Ty::Option(payload) = field.ty {
                 validate_option_payload(payload, &format!("record `{}`", record.name))?;
                 return Err(format!(
@@ -890,6 +1129,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 else_block,
             } => {
                 validate_expr_payloads(ctx, cond)?;
+                validate_sink_type(ctx, Ty::Bool, cond, "if condition")?;
                 let before = ctx.locals.clone();
                 let mut then_ctx = ctx.clone();
                 validate_stmt_payloads(&mut then_ctx, then_block)?;
@@ -947,6 +1187,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
             } => validate_array_store(ctx, array, index, value)?,
             Stmt::While { cond, body, .. } => {
                 validate_expr_payloads(ctx, cond)?;
+                validate_sink_type(ctx, Ty::Bool, cond, "while condition")?;
                 validate_scoped_stmts(ctx, body)?;
             }
             Stmt::Unsafe { body, .. } => validate_stmt_payloads(ctx, body)?,
@@ -975,12 +1216,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 merge_executed_scope_initialization(ctx, &before, &child.locals);
             }
             Stmt::StaticAlloc { size, ptr, res, .. } => {
-                require_expr_annotation(
-                    size,
-                    Ty::Int(IntTy::U64),
-                    "svm.allocation_size_type",
-                    "static allocation size",
-                )?;
+                validate_allocation_size(ctx, size, "static allocation size")?;
                 validate_expr_payloads(ctx, size)?;
                 ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
                 ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
@@ -992,12 +1228,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 release,
                 ..
             } => {
-                require_expr_annotation(
-                    size,
-                    Ty::Int(IntTy::U64),
-                    "svm.allocation_size_type",
-                    "system allocation size",
-                )?;
+                validate_allocation_size(ctx, size, "system allocation size")?;
                 validate_expr_payloads(ctx, size)?;
                 ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
                 ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
@@ -1073,41 +1304,30 @@ fn validate_call_signature(
             function.params.len()
         ));
     }
+    if function.ret.is_resource()
+        || function
+            .params
+            .iter()
+            .any(|parameter| parameter.ty.is_resource())
+    {
+        return Err(format!(
+            "svm.call_resource_unsupported: `{callee}` has resource parameters or result; erased authority has no SVM call ABI"
+        ));
+    }
     for (index, (arg, parameter)) in args.iter().zip(&function.params).enumerate() {
-        // Resource authority is erased from the machine. A checked resource
-        // place intentionally may have no cached expression type; when one is
-        // present it must still agree with the formal slot.
-        let erased_resource_place = parameter.ty.is_resource()
-            && arg.ty.is_none()
-            && matches!(
-                arg.kind,
-                ExprKind::Var(_) | ExprKind::SelfField { .. } | ExprKind::Borrow { .. }
-            );
-        if erased_resource_place {
-            continue;
-        }
-        match arg.ty {
-            Some(actual) if actual == parameter.ty => {}
-            Some(actual) => {
-                return Err(format!(
-                    "svm.call_argument_type: argument {} to `{callee}` is annotated `{}`; \
-                     parameter `{}` has type `{}`",
-                    index + 1,
-                    actual.name(),
-                    parameter.name,
-                    parameter.ty.name()
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "svm.call_argument_type: argument {} to `{callee}` carries no type; \
-                     parameter `{}` has type `{}`",
-                    index + 1,
-                    parameter.name,
-                    parameter.ty.name()
-                ));
-            }
-        }
+        validate_sink_type(
+            ctx,
+            parameter.ty,
+            arg,
+            &format!("argument {} to `{callee}`", index + 1),
+        )
+        .map_err(|error| {
+            format!(
+                "svm.call_argument_type: argument {} to `{callee}` does not match parameter `{}`: {error}",
+                index + 1,
+                parameter.name
+            )
+        })?;
     }
     Ok(())
 }
@@ -1137,6 +1357,12 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
                         .into(),
                 );
             }
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.unwrap_or(Ty::Int(*target)),
+                "conversion expression",
+            )?;
             validate_expr_payloads(ctx, arg)?;
         }
         ExprKind::Call {
@@ -1171,6 +1397,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         }
         ExprKind::SomeE(operand) => {
             validate_some_constructor(expr, operand)?;
+            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "option constructor")?;
             validate_expr_payloads(ctx, operand)?;
         }
         ExprKind::NoneE => {
@@ -1178,14 +1405,25 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         }
         ExprKind::IsSome { operand } => {
             validate_option_accessor(expr, operand, false)?;
+            semantic_expr_ty(ctx, expr, Ty::Bool, "option is_some accessor")?;
             validate_expr_payloads(ctx, operand)?;
         }
         ExprKind::OptValue { operand } => {
             validate_option_accessor(expr, operand, true)?;
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.unwrap_or(Ty::Unit),
+                "option value accessor",
+            )?;
             validate_expr_payloads(ctx, operand)?;
         }
-        ExprKind::Unary { operand, .. } => validate_expr_payloads(ctx, operand)?,
+        ExprKind::Unary { operand, .. } => {
+            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "unary expression")?;
+            validate_expr_payloads(ctx, operand)?;
+        }
         ExprKind::Binary { lhs, rhs, .. } => {
+            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "binary expression")?;
             validate_expr_payloads(ctx, lhs)?;
             validate_expr_payloads(ctx, rhs)?;
         }
@@ -1222,9 +1460,13 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
                 validate_expr_payloads(ctx, arg)?;
             }
         }
-        ExprKind::TraitCall { args, .. }
-        | ExprKind::MethodCall { args, .. }
-        | ExprKind::RecordLit { args, .. } => {
+        ExprKind::RecordLit { record, args, .. } => {
+            validate_record_literal(ctx, expr, record, args)?;
+            for arg in args {
+                validate_expr_payloads(ctx, arg)?;
+            }
+        }
+        ExprKind::TraitCall { args, .. } | ExprKind::MethodCall { args, .. } => {
             for arg in args {
                 validate_expr_payloads(ctx, arg)?;
             }
@@ -1235,14 +1477,18 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         ExprKind::Var(name) => {
             validate_local_var(ctx, expr, name, "variable expression")?;
         }
-        ExprKind::IntLit(_)
-        | ExprKind::BoolLit(_)
+        ExprKind::IntLit(_) => {
+            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "integer literal")?;
+        }
+        ExprKind::BoolLit(_)
         | ExprKind::SelfField { .. }
         | ExprKind::SelfFieldLen { .. }
         | ExprKind::ClassField { .. }
-        | ExprKind::RecordField { .. }
         | ExprKind::ClassFieldLen { .. }
         | ExprKind::Borrow { .. } => {}
+        ExprKind::RecordField { obj, field, .. } => {
+            semantic_record_field_ty(ctx, expr, obj, field)?;
+        }
     }
     Ok(())
 }
@@ -1399,6 +1645,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             )
         }
         Stmt::StaticAlloc { size, ptr, res, .. } => {
+            validate_allocation_size(ctx, size, "static allocation size")?;
             let lowered = format!("(.rawAlloc \"{ptr}\" {})", lower_expr(ctx, size)?);
             ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
             ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
@@ -1411,6 +1658,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             release,
             ..
         } => {
+            validate_allocation_size(ctx, size, "system allocation size")?;
             let lowered = format!("(.rawAlloc \"{ptr}\" {})", lower_expr(ctx, size)?);
             ctx.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
             ctx.insert_local(res, Ty::Res(ResKind::RawSpan), true, true)?;
@@ -1527,6 +1775,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             then_block,
             else_block,
         } => {
+            validate_sink_type(ctx, Ty::Bool, cond, "if condition")?;
             let condition = lower_expr(ctx, cond)?;
             let before = ctx.locals.clone();
 
@@ -1564,6 +1813,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                         .into(),
                 );
             }
+            validate_sink_type(ctx, Ty::Bool, cond, "while condition")?;
             let condition = lower_expr(ctx, cond)?;
             let body = lower_scoped_block(ctx, body)?;
             Some(format!("(.while {condition} {body})"))
@@ -2292,28 +2542,8 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
             ..
         } => Err("`uart_write` produces no value".into()),
         ExprKind::RecordLit { record, args, .. } => {
-            let ri = match e.ty {
-                Some(Ty::Record(ri)) => ri,
-                _ => {
-                    return Err(format!(
-                        "record literal `{record}(...)` carries no record type (unchecked program?)"
-                    ));
-                }
-            };
+            let ri = validate_record_literal(ctx, e, record, args)?;
             let decl = ctx.record(ri)?;
-            if decl.name != *record {
-                return Err(format!(
-                    "record literal names `{record}` but carries tag for `{}` (lowering bug?)",
-                    decl.name
-                ));
-            }
-            if decl.fields.len() != args.len() {
-                return Err(format!(
-                    "record literal `{record}` has {} arguments for {} fields (unchecked program?)",
-                    args.len(),
-                    decl.fields.len()
-                ));
-            }
             let fields = decl
                 .fields
                 .iter()
@@ -2446,6 +2676,7 @@ fn lower_call(ctx: &LowerCtx<'_>, dst: &Option<String>, call: &Expr) -> Result<S
 }
 
 fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
+    validate_expr_payloads(ctx, e)?;
     Ok(match &e.kind {
         ExprKind::IntLit(n) => {
             format!("(.intLit {} {})", lean_ty(expr_int_ty(e)?)?, int_lit(*n))
@@ -3177,6 +3408,24 @@ mod tests {
     }
 
     #[test]
+    fn lowering_rejects_nonunit_fallthrough_and_resource_results() {
+        let program = empty_program();
+        let fallthrough = checked_fn(Ty::Int(IntTy::U64), Vec::new());
+        assert!(
+            lower_fn_entry(&program, &fallthrough)
+                .expect_err("a non-unit entry must return on every path")
+                .starts_with("svm.missing_return:")
+        );
+
+        let resource_result = checked_fn(Ty::Res(ResKind::RawSpan), Vec::new());
+        assert!(
+            lower_fn_entry(&program, &resource_result)
+                .expect_err("erased authority has no SVM result representation")
+                .starts_with("svm.resource_return_unsupported:")
+        );
+    }
+
+    #[test]
     fn a_normal_calls_require_coherent_executable_signatures() {
         let mut program = empty_program();
         let mut choose = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
@@ -3266,8 +3515,12 @@ mod tests {
             span: Span::new(0, 0),
             ty: Some(Ty::Unit),
         };
-        validate_expr_payloads(&resource_ctx, &erased_resource_call)
-            .expect("erased resource places intentionally need no cached value type");
+        let error = validate_expr_payloads(&resource_ctx, &erased_resource_call)
+            .expect_err("erased resource authority has no ordinary SVM call ABI");
+        assert!(
+            error.starts_with("svm.call_resource_unsupported:"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3504,7 +3757,7 @@ mod tests {
                     byte(),
                     Some(u8_array),
                 ),
-                "svm.array_alloc_length_type:",
+                "svm.sink_type:",
             ),
             (
                 allocation(
@@ -3512,7 +3765,7 @@ mod tests {
                     expr(ExprKind::IntLit(7), Ty::Int(IntTy::I32)),
                     Some(u8_array),
                 ),
-                "svm.array_alloc_init_type:",
+                "svm.sink_type:",
             ),
         ];
         for (value, diagnostic) in &malformed {
@@ -3542,10 +3795,99 @@ mod tests {
             validate_expr_payloads(&ctx, &wrong_literal_element).unwrap_err(),
             lower_expr(&ctx, &wrong_literal_element).unwrap_err(),
         ] {
-            assert!(
-                error.starts_with("svm.array_literal_element_type:"),
-                "{error}"
-            );
+            assert!(error.starts_with("svm.sink_type:"), "{error}");
+        }
+    }
+
+    #[test]
+    fn array_integer_operands_reject_forged_boolean_annotations() {
+        let program = empty_program();
+        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let forged_bool = |ty| expr(ExprKind::BoolLit(true), ty);
+        let length = || expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64));
+        let byte = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8));
+        let allocation = |len: Expr, init: Expr| {
+            expr(
+                ExprKind::AllocArray {
+                    elem: ValueTy::Int(IntTy::U8),
+                    len: Box::new(len),
+                    init: Box::new(init),
+                },
+                array_ty,
+            )
+        };
+
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("bytes", array_ty, true, true).unwrap();
+        let malformed_exprs = [
+            (
+                allocation(forged_bool(Ty::Int(IntTy::U64)), byte()),
+                "alloc_array length",
+            ),
+            (
+                allocation(length(), forged_bool(Ty::Int(IntTy::U8))),
+                "alloc_array initializer",
+            ),
+            (
+                expr(
+                    ExprKind::ArrayLit(vec![forged_bool(Ty::Int(IntTy::U8))]),
+                    array_ty,
+                ),
+                "array literal element 1",
+            ),
+            (
+                expr(
+                    ExprKind::Index {
+                        array: "bytes".into(),
+                        array_span: Span::new(0, 0),
+                        index: Box::new(forged_bool(Ty::Int(IntTy::U64))),
+                    },
+                    Ty::Int(IntTy::U8),
+                ),
+                "array index operand",
+            ),
+        ];
+        for (malformed, context) in &malformed_exprs {
+            for error in [
+                validate_expr_payloads(&ctx, malformed).unwrap_err(),
+                lower_expr(&ctx, malformed).unwrap_err(),
+            ] {
+                assert!(error.starts_with("svm.sink_type:"), "{error}");
+                assert!(error.contains(context), "{error}");
+            }
+        }
+
+        let malformed_stores = [
+            (
+                Stmt::Store {
+                    array: "bytes".into(),
+                    array_span: Span::new(0, 0),
+                    index: forged_bool(Ty::Int(IntTy::U64)),
+                    value: byte(),
+                },
+                "array store index",
+            ),
+            (
+                Stmt::Store {
+                    array: "bytes".into(),
+                    array_span: Span::new(0, 0),
+                    index: length(),
+                    value: forged_bool(Ty::Int(IntTy::U8)),
+                },
+                "array store value",
+            ),
+        ];
+        for (malformed, context) in &malformed_stores {
+            let mut preflight_ctx = ctx.clone();
+            let preflight =
+                validate_stmt_payloads(&mut preflight_ctx, std::slice::from_ref(malformed))
+                    .unwrap_err();
+            let mut lowering_ctx = ctx.clone();
+            let direct = lower_stmt_erasing(&mut lowering_ctx, malformed).unwrap_err();
+            for error in [preflight, direct] {
+                assert!(error.starts_with("svm.sink_type:"), "{error}");
+                assert!(error.contains(context), "{error}");
+            }
         }
     }
 
@@ -3584,7 +3926,7 @@ mod tests {
                     expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32)),
                     Some(Ty::Int(IntTy::U8)),
                 ),
-                "svm.array_index_operand_type:",
+                "svm.sink_type:",
             ),
             (
                 index("missing", index_operand(), Some(Ty::Int(IntTy::U8))),
@@ -3683,8 +4025,8 @@ mod tests {
             expr(ExprKind::IntLit(9), Ty::Int(IntTy::I32)),
         );
         for (statement, diagnostic) in [
-            (&bad_index, "svm.array_store_index_type:"),
-            (&bad_value, "svm.array_store_value_type:"),
+            (&bad_index, "svm.sink_type:"),
+            (&bad_value, "svm.sink_type:"),
         ] {
             let mut preflight_ctx = ctx.clone();
             let preflight =
