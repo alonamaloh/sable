@@ -472,8 +472,8 @@ impl From<IntTy> for ValueTy {
 ///
 /// This is deliberately distinct from [`ValueTy`]: ordinary `option<T>` is a
 /// copyable scalar/POD value, while `option<[T]>` conditionally owns array
-/// storage and therefore needs move, take, join, and destruction rules. G2.0
-/// records that recursive ownership shape without enabling those semantics.
+/// storage and therefore needs move, take, join, and destruction rules. G2.1
+/// enables one concrete local shape without weakening that separation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AffineOptionTy {
     Array(ValueTy),
@@ -517,9 +517,10 @@ pub enum Ty {
     /// `option<u64>` etc. Return types only. As with arrays, G1 represents the
     /// future bool/POD cases before enabling their semantics.
     Option(ValueTy),
-    /// An option whose present case owns an affine aggregate. G2.0 represents
-    /// the recursive type shape; later G2 slices define construction,
-    /// movement, extraction, joins, destruction, and runtime encodings.
+    /// An option whose present case owns an affine aggregate. G2.1 admits the
+    /// first concrete local form, `option<[bool]>`, with fresh construction,
+    /// presence inspection, and atomic named-place extraction. It remains a
+    /// separate type family so no ordinary copy-option rule can reach it.
     AffineOption(AffineOptionTy),
     /// `option<raw<R>>` for an explicitly laid-out record. This is an
     /// abstract nullable pointer value, not a byte representation.
@@ -1146,7 +1147,17 @@ pub enum ExprKind {
     OptValue {
         operand: Box<Expr>,
     },
-    /// `some(e)` / `none` — return position only for now.
+    /// `name.take` — atomically extract an owned payload from a named
+    /// mutable affine-option local and leave `none` behind. The checker only
+    /// admits this as the direct initializer of an explicit owned local; a
+    /// name-shaped node keeps that ownership transfer visible to every later
+    /// stage instead of disguising it as an ordinary option projection.
+    OptTake {
+        option: String,
+        option_span: Span,
+    },
+    /// `some(e)` / `none` — contextual option construction. Affine-option
+    /// checking admits only `none` and a freshly allocated Boolean array.
     SomeE(Box<Expr>),
     NoneE,
     /// `[e1, e2, ...]` — test functions only.

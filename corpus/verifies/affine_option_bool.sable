@@ -1,0 +1,34 @@
+// G2.1 proof coverage for local affine options. The logic sees
+// `Option (Sable.Seq Bool)`, while ownership remains a checked-language
+// discipline: observation is non-consuming and take clears the source.
+
+fn affine_option_branch(u64 n) {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, false));
+    /// assert #[label(present_before_take)] pending.is_some
+    if (pending.is_some) {
+        [bool] flags = pending.take;
+        /// assert #[label(absent_after_take)] ¬pending.is_some
+        /// assert #[label(payload_length)] flags.len = n
+    }
+}
+
+fn affine_option_none() {
+    mut option<[bool]> pending = none;
+    /// assert #[label(none_is_absent)] ¬pending.is_some
+}
+
+fn affine_option_loop(u64 n) {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, true));
+    mut u64 remaining = 1;
+    /// invariant remaining ≤ 1
+    /// invariant remaining = 1 → pending ≠ none
+    /// invariant match pending with | some payload => payload.len = n | none => True
+    /// invariant remaining = 0 → ¬pending.is_some
+    /// variant remaining
+    while (remaining == 1) {
+        [bool] flags = pending.take;
+        /// assert #[label(loop_payload_length)] flags.len = n
+        remaining = 0;
+    }
+    /// assert #[label(loop_option_empty)] ¬pending.is_some
+}

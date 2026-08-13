@@ -1,0 +1,16 @@
+// Dynamic G2.1 coverage: an affine option retains one owned Boolean-array
+// payload, presence inspection is non-consuming, and `.take` clears the
+// source place while transferring the original array.
+
+fn test_affine_option_take() {
+    mut option<[bool]> pending = some(alloc_array<bool>(3, false));
+    /// assert #[label(present_before_take)] pending.is_some
+    [bool] flags = pending.take;
+    /// assert #[label(absent_after_take)] ¬pending.is_some
+    /// assert #[label(taken_payload)] flags.len = 3 ∧ flags.get 0 = false
+}
+
+fn test_affine_option_none_presence() {
+    mut option<[bool]> pending = none;
+    /// assert #[label(none_presence)] ¬pending.is_some
+}

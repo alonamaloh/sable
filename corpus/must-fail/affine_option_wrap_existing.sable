@@ -1,0 +1,8 @@
+// expect-error: option.affine_initializer
+// The first construction slice only wraps a fresh `alloc_array<bool>` result;
+// wrapping an existing owner needs a separate atomic move operation.
+
+fn wrap_existing() {
+    [bool] values = [true];
+    mut option<[bool]> pending = some(values);
+}

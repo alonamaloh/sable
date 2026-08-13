@@ -1,0 +1,7 @@
+// expect-error: option.take_not_local
+// Atomic extraction needs a named mutable source place to overwrite with
+// `none`; a temporary has no persistent ownership state.
+
+fn take_temporary(u64 count) {
+    [bool] values = some(alloc_array<bool>(count, false)).take;
+}

@@ -1,0 +1,8 @@
+// expect-error: option.take_position
+// Extraction is visible as a direct owned-local initializer, never a hidden
+// temporary inside another expression or transport boundary.
+
+fn hidden_take() -> bool {
+    mut option<[bool]> pending = none;
+    return pending.take;
+}

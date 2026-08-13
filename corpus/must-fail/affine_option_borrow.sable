@@ -1,0 +1,8 @@
+// expect-error: option.affine_borrow
+// There is no borrowed conditional-owner representation. Inspect presence or
+// take the concrete array before borrowing in a later supported slice.
+
+fn borrow_option() {
+    mut option<[bool]> pending = none;
+    var borrowed = &pending;
+}

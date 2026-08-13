@@ -1,0 +1,7 @@
+// expect-error: option.affine_initializer
+// G2.1 wraps only a fresh allocation. Array-literal wrapping follows after
+// its move and destruction behavior is part of every execution model.
+
+fn wrap_literal() {
+    mut option<[bool]> pending = some([true, false]);
+}

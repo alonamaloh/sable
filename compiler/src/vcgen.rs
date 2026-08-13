@@ -170,6 +170,7 @@ fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
             | ExprKind::BoolLit(_)
             | ExprKind::Var(_)
             | ExprKind::Len { .. }
+            | ExprKind::OptTake { .. }
             | ExprKind::NoneE
             | ExprKind::SelfField { .. }
             | ExprKind::SelfFieldLen { .. }
@@ -341,6 +342,15 @@ fn lean_option_ty(element: ValueTy) -> String {
     }
 }
 
+fn lean_affine_option_ty(payload: AffineOptionTy) -> String {
+    match payload {
+        AffineOptionTy::Array(ValueTy::Bool) => "Option (Sable.Seq Bool)".into(),
+        AffineOptionTy::Array(_) => {
+            unreachable!("VC preflight admits only owned Boolean-array options")
+        }
+    }
+}
+
 /// The symbolic evaluator carries source booleans as propositions. Whenever
 /// one crosses back into a source `Bool` position, use an explicit local
 /// decidability witness and parenthesize the complete application so it stays
@@ -379,8 +389,9 @@ fn validate_vc_value_ty(
 
 fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
     match ty {
+        Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool)) => Ok(()),
         Ty::AffineOption(_) => Err(format!(
-            "vc.affine_option_unsupported: `{}` is represented but has no move, take, join, destruction, or proof semantics in {context}",
+            "vc.affine_option_payload: `{}` has no affine-option proof semantics in {context}; only `option<[bool]>` is admitted",
             ty.name()
         )),
         Ty::Param(_) if !allow_param => Err(format!(
@@ -435,6 +446,22 @@ fn validate_vc_type_position(
     // position that the checked language currently forbids.
     validate_vc_ty(ty, allow_param, context)?;
 
+    if matches!(ty, Ty::AffineOption(_)) {
+        let position = match position {
+            VcTypePosition::Expression | VcTypePosition::Local => return Ok(()),
+            VcTypePosition::Parameter => "a function parameter",
+            VcTypePosition::TraitParameter => "a trait parameter",
+            VcTypePosition::Return => "a function return",
+            VcTypePosition::TraitReturn => "a trait return",
+            VcTypePosition::ClassField => "a class field",
+            VcTypePosition::RecordField => "a record field",
+            VcTypePosition::Borrow => "a borrow",
+        };
+        return Err(format!(
+            "vc.affine_option_position: `option<[bool]>` is owned-local only; {position} is not supported in {context}"
+        ));
+    }
+
     if let Ty::Array(ValueTy::Bool, mutability) = ty {
         if matches!(position, VcTypePosition::Expression | VcTypePosition::Local)
             && mutability == Mutability::Owned
@@ -480,6 +507,10 @@ fn is_bool_array(ty: Ty) -> bool {
     matches!(ty, Ty::Array(ValueTy::Bool, _))
 }
 
+fn is_affine_bool_option(ty: Ty) -> bool {
+    ty == Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+}
+
 fn expr_is_bool_array(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
     expr.ty.is_some_and(is_bool_array)
         || matches!(
@@ -489,12 +520,25 @@ fn expr_is_bool_array(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
         )
 }
 
+fn expr_is_affine_option(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
+    expr.ty.is_some_and(is_affine_bool_option)
+        || matches!(
+            &expr.kind,
+            ExprKind::Var(name) if locals.get(name).is_some_and(|ty| is_affine_bool_option(*ty))
+        )
+}
+
 fn is_fresh_bool_array_value(expr: &Expr) -> bool {
     expr.ty == Some(Ty::Array(ValueTy::Bool, Mutability::Owned))
         && matches!(
             expr.kind,
             ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. }
         )
+}
+
+fn is_affine_option_take(expr: &Expr) -> bool {
+    expr.ty == Some(Ty::Array(ValueTy::Bool, Mutability::Owned))
+        && matches!(expr.kind, ExprKind::OptTake { .. })
 }
 
 fn reject_bool_array_value(
@@ -507,6 +551,50 @@ fn reject_bool_array_value(
         return Err(format!(
             "internal G1.4 VC type error: Boolean arrays cannot cross {boundary} in {context}"
         ));
+    }
+    Ok(())
+}
+
+fn reject_affine_option_value(
+    expr: &Expr,
+    locals: &HashMap<String, Ty>,
+    boundary: &str,
+    context: &str,
+) -> Result<(), String> {
+    if expr_is_affine_option(expr, locals) {
+        return Err(format!(
+            "vc.affine_option_boundary: affine options cannot cross {boundary} in {context}"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_affine_option_named_source(
+    name: &str,
+    locals: &HashMap<String, Ty>,
+    boundary: &str,
+    context: &str,
+) -> Result<(), String> {
+    if matches!(locals.get(name), Some(Ty::AffineOption(_))) {
+        return Err(format!(
+            "vc.affine_option_boundary: affine-option local `{name}` cannot be used as {boundary} in {context}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_fresh_vc_bindings(
+    names: &[&str],
+    locals: &HashMap<String, Ty>,
+    context: &str,
+) -> Result<(), String> {
+    let mut fresh = HashSet::new();
+    for name in names {
+        if locals.contains_key(*name) || !fresh.insert(*name) {
+            return Err(format!(
+                "vc.duplicate_local: generated binding `{name}` would replace an active or sibling local in {context}"
+            ));
+        }
     }
     Ok(())
 }
@@ -655,7 +743,11 @@ fn validate_vc_option_operator(
     match &expr.kind {
         ExprKind::IsSome { operand } => {
             let operand = vc_semantic_expr_ty(operand, locals, context)?;
-            if !matches!(operand, Ty::Option(_) | Ty::OptionRaw(_)) || result != Ty::Bool {
+            if !matches!(
+                operand,
+                Ty::Option(_) | Ty::OptionRaw(_) | Ty::AffineOption(_)
+            ) || result != Ty::Bool
+            {
                 return Err(format!(
                     "internal VC type error: inconsistent `.is_some` operand/result types in {context}"
                 ));
@@ -682,6 +774,9 @@ fn validate_vc_option_operator(
             let expected = match result {
                 Ty::Option(payload) => vc_option_payload_ty(payload),
                 Ty::OptionRaw(record) => Ty::RawRecord(record),
+                Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool)) => {
+                    Ty::Array(ValueTy::Bool, Mutability::Owned)
+                }
                 _ => {
                     return Err(format!(
                         "internal VC type error: `some` requires an option result in {context}"
@@ -693,9 +788,25 @@ fn validate_vc_option_operator(
                     "internal VC type error: inconsistent `some` payload type in {context}"
                 ));
             }
+            if matches!(result, Ty::AffineOption(_))
+                && !matches!(
+                    inner.kind,
+                    ExprKind::AllocArray {
+                        elem: ValueTy::Bool,
+                        ..
+                    }
+                )
+            {
+                return Err(format!(
+                    "vc.affine_option_initializer: `some` for `option<[bool]>` must directly wrap a fresh Boolean-array allocation in {context}"
+                ));
+            }
         }
         ExprKind::NoneE => {
-            if !matches!(result, Ty::Option(_) | Ty::OptionRaw(_)) {
+            if !matches!(
+                result,
+                Ty::Option(_) | Ty::OptionRaw(_) | Ty::AffineOption(_)
+            ) {
                 return Err(format!(
                     "internal VC type error: `none` requires an option result in {context}"
                 ));
@@ -712,25 +823,6 @@ fn validate_vc_expr(
     context: &str,
     locals: &HashMap<String, Ty>,
 ) -> Result<(), String> {
-    // Resolve named operands from the checked environment before consulting
-    // cached expression metadata.  This prevents a forged annotation from
-    // disguising an affine option as an ordinary copy option (or scalar).
-    let named_source = match &expr.kind {
-        ExprKind::Var(name)
-        | ExprKind::Index { array: name, .. }
-        | ExprKind::Len { array: name }
-        | ExprKind::Borrow { array: name, .. }
-        | ExprKind::MethodCall { recv: name, .. }
-        | ExprKind::ClassField { obj: name, .. }
-        | ExprKind::RecordField { obj: name, .. }
-        | ExprKind::ClassFieldLen { obj: name, .. }
-        | ExprKind::ClassFieldIndex { obj: name, .. } => Some(name),
-        _ => None,
-    };
-    if let Some(ty @ Ty::AffineOption(_)) = named_source.and_then(|name| locals.get(name)).copied()
-    {
-        return validate_vc_ty(ty, allow_param, context);
-    }
     if let Some(ty) = expr.ty {
         let position = if matches!(expr.kind, ExprKind::Borrow { .. }) {
             VcTypePosition::Borrow
@@ -767,13 +859,38 @@ fn validate_vc_expr(
             validate_vc_expr(rhs, allow_param, context, locals)?;
             validate_vc_scalar_operator(expr, allow_param, context, locals)
         }
-        ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
+        ExprKind::IsSome { operand } => {
+            let operand_ty = vc_semantic_expr_ty(operand, locals, context)?;
+            if matches!(operand_ty, Ty::AffineOption(_)) {
+                validate_vc_ty(operand_ty, allow_param, context)?;
+                let ExprKind::Var(option) = &operand.kind else {
+                    return Err(format!(
+                        "vc.affine_option_temporary: `.is_some` requires a named affine-option local in {context}"
+                    ));
+                };
+                if !matches!(locals.get(option), Some(Ty::AffineOption(_))) {
+                    return Err(format!(
+                        "internal VC type error: `.is_some` affine-option place is not an active local in {context}"
+                    ));
+                }
+                validate_vc_option_operator(expr, context, locals)
+            } else {
+                validate_vc_expr(operand, allow_param, context, locals)?;
+                validate_vc_option_operator(expr, context, locals)
+            }
+        }
+        ExprKind::OptValue { operand } => {
             validate_vc_expr(operand, allow_param, context, locals)?;
             validate_vc_option_operator(expr, context, locals)
         }
         ExprKind::SomeE(operand) => {
-            validate_vc_expr(operand, allow_param, context, locals)?;
-            validate_vc_option_operator(expr, context, locals)
+            if matches!(expr.ty, Some(Ty::AffineOption(_))) {
+                validate_vc_option_operator(expr, context, locals)?;
+                validate_vc_expr(operand, allow_param, context, locals)
+            } else {
+                validate_vc_expr(operand, allow_param, context, locals)?;
+                validate_vc_option_operator(expr, context, locals)
+            }
         }
         ExprKind::Call { args, .. }
         | ExprKind::CtorCall { args, .. }
@@ -781,11 +898,13 @@ fn validate_vc_expr(
         | ExprKind::TraitCall { args, .. } => {
             for arg in args {
                 reject_bool_array_value(arg, locals, "a call boundary", context)?;
+                reject_affine_option_value(arg, locals, "a call boundary", context)?;
                 validate_vc_expr(arg, allow_param, context, locals)?;
             }
             Ok(())
         }
         ExprKind::MethodCall { recv, args, .. } => {
+            reject_affine_option_named_source(recv, locals, "a method receiver", context)?;
             if matches!(locals.get(recv), Some(Ty::Array(ValueTy::Bool, _))) {
                 return Err(format!(
                     "internal G1.4 VC type error: Boolean arrays cannot be method receivers in {context}"
@@ -793,6 +912,7 @@ fn validate_vc_expr(
             }
             for arg in args {
                 reject_bool_array_value(arg, locals, "a call boundary", context)?;
+                reject_affine_option_value(arg, locals, "a call boundary", context)?;
                 validate_vc_expr(arg, allow_param, context, locals)?;
             }
             Ok(())
@@ -802,6 +922,7 @@ fn validate_vc_expr(
         | ExprKind::ResOp { args, .. } => {
             for arg in args {
                 reject_bool_array_value(arg, locals, "an intrinsic boundary", context)?;
+                reject_affine_option_value(arg, locals, "an intrinsic boundary", context)?;
                 validate_vc_expr(arg, allow_param, context, locals)?;
             }
             Ok(())
@@ -851,6 +972,7 @@ fn validate_vc_expr(
             )
         }
         ExprKind::ClassFieldIndex { obj, index, .. } => {
+            reject_affine_option_named_source(obj, locals, "a class-field receiver", context)?;
             if matches!(locals.get(obj), Some(Ty::Array(ValueTy::Bool, _))) {
                 return Err(format!(
                     "internal G1.4 VC type error: Boolean arrays cannot be class-field receivers in {context}"
@@ -891,6 +1013,7 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::Borrow { array, .. } => {
+            reject_affine_option_named_source(array, locals, "a borrow source", context)?;
             if matches!(locals.get(array), Some(Ty::Array(ValueTy::Bool, _))) {
                 return Err(format!(
                     "internal G1.4 VC type error: Boolean array borrows are not supported in {context}"
@@ -899,6 +1022,11 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::Var(name) => {
+            if matches!(locals.get(name), Some(Ty::AffineOption(_))) {
+                return Err(format!(
+                    "vc.affine_option_value: affine-option local `{name}` cannot be copied as a value in {context}"
+                ));
+            }
             if matches!(locals.get(name), Some(Ty::Array(ValueTy::Bool, _)))
                 && expr.ty != locals.get(name).copied()
             {
@@ -908,6 +1036,9 @@ fn validate_vc_expr(
             }
             Ok(())
         }
+        ExprKind::OptTake { .. } => Err(format!(
+            "vc.option_take_position: `.take` is only admitted as the direct initializer of an explicit owned Boolean-array local in {context}"
+        )),
         ExprKind::NoneE => validate_vc_option_operator(expr, context, locals),
         ExprKind::IntLit(_)
         | ExprKind::BoolLit(_)
@@ -916,6 +1047,7 @@ fn validate_vc_expr(
         ExprKind::ClassField { obj, .. }
         | ExprKind::RecordField { obj, .. }
         | ExprKind::ClassFieldLen { obj, .. } => {
+            reject_affine_option_named_source(obj, locals, "an aggregate-field receiver", context)?;
             if matches!(locals.get(obj), Some(Ty::Array(ValueTy::Bool, _))) {
                 return Err(format!(
                     "internal G1.4 VC type error: Boolean arrays cannot be aggregate-field receivers in {context}"
@@ -924,6 +1056,11 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::Len { array } => {
+            let Some(Ty::Array(_, _)) = locals.get(array) else {
+                return Err(format!(
+                    "internal VC type error: length source `{array}` is not an active array in {context}"
+                ));
+            };
             if matches!(locals.get(array), Some(Ty::Array(ValueTy::Bool, _)))
                 && expr.ty != Some(Ty::Int(IntTy::U64))
             {
@@ -936,23 +1073,84 @@ fn validate_vc_expr(
     }
 }
 
-fn validate_vc_block(
+fn validate_vc_take_initializer(
+    expr: &Expr,
+    locals: &HashMap<String, Ty>,
+    mutable_locals: &HashSet<String>,
+    context: &str,
+) -> Result<(), String> {
+    let ExprKind::OptTake { option, .. } = &expr.kind else {
+        return Err(format!(
+            "internal VC type error: expected an affine-option take initializer in {context}"
+        ));
+    };
+    if expr.ty != Some(Ty::Array(ValueTy::Bool, Mutability::Owned)) {
+        return Err(format!(
+            "internal VC type error: `.take` has an inconsistent owned Boolean-array result in {context}"
+        ));
+    }
+    if locals.get(option) != Some(&Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))) {
+        return Err(format!(
+            "vc.option_take_not_local: `.take` source `{option}` is not an active `option<[bool]>` local in {context}"
+        ));
+    }
+    if !mutable_locals.contains(option) {
+        return Err(format!(
+            "vc.option_take_immutable: `.take` source `{option}` is not mutable in {context}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vc_block_with_mutability(
     block: &[Stmt],
     allow_param: bool,
     context: &str,
     locals: &mut HashMap<String, Ty>,
+    mutable_locals: &mut HashSet<String>,
 ) -> Result<(), String> {
     for statement in block {
         match statement {
-            Stmt::Decl { ty, name, init, .. } => {
+            Stmt::Decl {
+                ty,
+                name,
+                init,
+                mutable,
+                ..
+            } => {
+                if locals.contains_key(name) {
+                    return Err(format!(
+                        "vc.duplicate_local: declaration `{name}` would replace an active local in {context}"
+                    ));
+                }
                 validate_vc_type_position(*ty, allow_param, VcTypePosition::Local, context)?;
                 if *ty == Ty::Array(ValueTy::Bool, Mutability::Owned) && init.is_none() {
                     return Err(format!(
                         "internal G1.4 VC type error: owned Boolean array local `{name}` must be initialized in {context}"
                     ));
                 }
+                if matches!(ty, Ty::AffineOption(_)) && init.is_none() {
+                    return Err(format!(
+                        "vc.affine_option_initializer: affine-option local `{name}` must be initialized in {context}"
+                    ));
+                }
+                if matches!(ty, Ty::AffineOption(_)) && !*mutable {
+                    return Err(format!(
+                        "vc.affine_option_immutable: affine-option local `{name}` must be mutable in {context}"
+                    ));
+                }
                 if let Some(init) = init {
-                    validate_vc_expr(init, allow_param, context, locals)?;
+                    let is_take = matches!(init.kind, ExprKind::OptTake { .. });
+                    if is_take {
+                        if *ty != Ty::Array(ValueTy::Bool, Mutability::Owned) {
+                            return Err(format!(
+                                "vc.option_take_position: `.take` must initialize an explicit owned Boolean-array local in {context}"
+                            ));
+                        }
+                        validate_vc_take_initializer(init, locals, mutable_locals, context)?;
+                    } else {
+                        validate_vc_expr(init, allow_param, context, locals)?;
+                    }
                     let declaration_is_bool_array =
                         *ty == Ty::Array(ValueTy::Bool, Mutability::Owned);
                     let initializer_is_bool_array =
@@ -962,18 +1160,56 @@ fn validate_vc_block(
                             "internal G1.4 VC type error: Boolean array declaration has an incompatible initializer in {context}"
                         ));
                     }
-                    if declaration_is_bool_array && !is_fresh_bool_array_value(init) {
+                    if declaration_is_bool_array
+                        && !is_fresh_bool_array_value(init)
+                        && !is_affine_option_take(init)
+                    {
                         return Err(format!(
-                            "internal G1.4 VC type error: Boolean array local `{name}` must be initialized by a literal or allocation in {context}"
+                            "internal G1.4 VC type error: Boolean array local `{name}` must be initialized by a literal, allocation, or affine-option take in {context}"
+                        ));
+                    }
+                    let declaration_is_affine_option = is_affine_bool_option(*ty);
+                    let initializer_is_affine_option = init.ty.is_some_and(is_affine_bool_option);
+                    if declaration_is_affine_option != initializer_is_affine_option {
+                        return Err(format!(
+                            "vc.affine_option_initializer: affine-option declaration `{name}` has an incompatible initializer in {context}"
+                        ));
+                    }
+                    if declaration_is_affine_option
+                        && !matches!(init.kind, ExprKind::NoneE | ExprKind::SomeE(_))
+                    {
+                        return Err(format!(
+                            "vc.affine_option_initializer: affine-option local `{name}` must be initialized by `none` or `some(alloc_array<bool>(...))` in {context}"
                         ));
                     }
                 }
                 locals.insert(name.clone(), *ty);
+                if *mutable {
+                    mutable_locals.insert(name.clone());
+                } else {
+                    mutable_locals.remove(name);
+                }
             }
-            Stmt::VarDecl { name, init, ty, .. } => {
+            Stmt::VarDecl {
+                name,
+                init,
+                ty,
+                mutable,
+                ..
+            } => {
+                if locals.contains_key(name) {
+                    return Err(format!(
+                        "vc.duplicate_local: declaration `{name}` would replace an active local in {context}"
+                    ));
+                }
                 validate_vc_expr(init, allow_param, context, locals)?;
                 if let Some(ty) = ty {
                     validate_vc_type_position(*ty, allow_param, VcTypePosition::Local, context)?;
+                    if matches!(ty, Ty::AffineOption(_)) {
+                        return Err(format!(
+                            "vc.affine_option_inferred: affine-option local `{name}` requires an explicit type in {context}"
+                        ));
+                    }
                     let declaration_is_bool_array =
                         *ty == Ty::Array(ValueTy::Bool, Mutability::Owned);
                     let initializer_is_bool_array =
@@ -989,14 +1225,30 @@ fn validate_vc_block(
                         ));
                     }
                     locals.insert(name.clone(), *ty);
+                    if *mutable {
+                        mutable_locals.insert(name.clone());
+                    } else {
+                        mutable_locals.remove(name);
+                    }
                 } else if init.ty.is_some_and(is_bool_array) {
                     return Err(format!(
                         "internal G1.4 VC type error: inferred Boolean array local lacks its checked type in {context}"
+                    ));
+                } else if init.ty.is_some_and(is_affine_bool_option) {
+                    return Err(format!(
+                        "vc.affine_option_inferred: inferred affine-option local `{name}` lacks an explicit checked type in {context}"
                     ));
                 }
             }
             Stmt::Assign { name, value, .. } => {
                 validate_vc_expr(value, allow_param, context, locals)?;
+                if matches!(locals.get(name), Some(Ty::AffineOption(_)))
+                    || expr_is_affine_option(value, locals)
+                {
+                    return Err(format!(
+                        "vc.affine_option_assign: affine-option local `{name}` cannot be rebound in {context}"
+                    ));
+                }
                 let target_is_bool_array = matches!(
                     locals.get(name),
                     Some(Ty::Array(ValueTy::Bool, Mutability::Owned))
@@ -1016,10 +1268,12 @@ fn validate_vc_block(
             }
             Stmt::FieldAssign { value, .. } => {
                 reject_bool_array_value(value, locals, "a field boundary", context)?;
+                reject_affine_option_value(value, locals, "a field boundary", context)?;
                 validate_vc_expr(value, allow_param, context, locals)?;
             }
             Stmt::ExprStmt(value) => {
                 reject_bool_array_value(value, locals, "an expression statement", context)?;
+                reject_affine_option_value(value, locals, "an expression statement", context)?;
                 validate_vc_expr(value, allow_param, context, locals)?;
             }
             Stmt::If {
@@ -1030,14 +1284,30 @@ fn validate_vc_block(
                 validate_vc_expr(cond, allow_param, context, locals)?;
                 require_vc_expr_ty(cond, Ty::Bool, locals, "`if` condition", context)?;
                 let mut then_locals = locals.clone();
-                validate_vc_block(then_block, allow_param, context, &mut then_locals)?;
+                let mut then_mutable_locals = mutable_locals.clone();
+                validate_vc_block_with_mutability(
+                    then_block,
+                    allow_param,
+                    context,
+                    &mut then_locals,
+                    &mut then_mutable_locals,
+                )?;
                 if let Some(else_block) = else_block {
                     let mut else_locals = locals.clone();
-                    validate_vc_block(else_block, allow_param, context, &mut else_locals)?;
+                    let mut else_mutable_locals = mutable_locals.clone();
+                    validate_vc_block_with_mutability(
+                        else_block,
+                        allow_param,
+                        context,
+                        &mut else_locals,
+                        &mut else_mutable_locals,
+                    )?;
                 }
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
+                    reject_bool_array_value(value, locals, "a function return", context)?;
+                    reject_affine_option_value(value, locals, "a function return", context)?;
                     if let Some(ty) = value.ty {
                         validate_vc_type_position(
                             ty,
@@ -1060,6 +1330,7 @@ fn validate_vc_block(
                 )?;
                 validate_vc_expr(value, allow_param, context, locals)?;
                 reject_bool_array_value(value, locals, "a field-store value", context)?;
+                reject_affine_option_value(value, locals, "a field-store value", context)?;
             }
             Stmt::Store {
                 array,
@@ -1067,6 +1338,7 @@ fn validate_vc_block(
                 value,
                 ..
             } => {
+                reject_affine_option_value(index, locals, "an array-store index", context)?;
                 validate_vc_expr(index, allow_param, context, locals)?;
                 require_vc_expr_ty(
                     index,
@@ -1075,6 +1347,7 @@ fn validate_vc_block(
                     "array-store index",
                     context,
                 )?;
+                reject_affine_option_value(value, locals, "an array-store value", context)?;
                 validate_vc_expr(value, allow_param, context, locals)?;
                 let Some(Ty::Array(element, _)) = locals.get(array).copied() else {
                     return Err(format!(
@@ -1093,12 +1366,25 @@ fn validate_vc_block(
                 validate_vc_expr(cond, allow_param, context, locals)?;
                 require_vc_expr_ty(cond, Ty::Bool, locals, "`while` condition", context)?;
                 let mut body_locals = locals.clone();
-                validate_vc_block(body, allow_param, context, &mut body_locals)?;
+                let mut body_mutable_locals = mutable_locals.clone();
+                validate_vc_block_with_mutability(
+                    body,
+                    allow_param,
+                    context,
+                    &mut body_locals,
+                    &mut body_mutable_locals,
+                )?;
             }
             // Unsafe is a marker rather than a scope, so declarations made
             // inside it remain available to the following statements.
             Stmt::Unsafe { body, .. } => {
-                validate_vc_block(body, allow_param, context, locals)?;
+                validate_vc_block_with_mutability(
+                    body,
+                    allow_param,
+                    context,
+                    locals,
+                    mutable_locals,
+                )?;
             }
             Stmt::Expose {
                 array,
@@ -1107,15 +1393,33 @@ fn validate_vc_block(
                 body,
                 ..
             } => {
-                if matches!(locals.get(array), Some(Ty::Array(ValueTy::Bool, _))) {
-                    return Err(format!(
-                        "internal G1.4 VC type error: Boolean array exposure is not supported in {context}"
-                    ));
+                reject_affine_option_named_source(array, locals, "an exposure source", context)?;
+                match locals.get(array) {
+                    Some(Ty::Array(ValueTy::Bool, _)) => {
+                        return Err(format!(
+                            "internal G1.4 VC type error: Boolean array exposure is not supported in {context}"
+                        ));
+                    }
+                    Some(Ty::Array(ValueTy::Int(integer), _))
+                        if !matches!(integer, IntTy::TParam(_)) => {}
+                    _ => {
+                        return Err(format!(
+                            "internal VC type error: exposure source `{array}` is not an executable integer array in {context}"
+                        ));
+                    }
                 }
+                require_fresh_vc_bindings(&[ptr, res], locals, context)?;
                 let mut body_locals = locals.clone();
                 body_locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
                 body_locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
-                validate_vc_block(body, allow_param, context, &mut body_locals)?;
+                let mut body_mutable_locals = mutable_locals.clone();
+                validate_vc_block_with_mutability(
+                    body,
+                    allow_param,
+                    context,
+                    &mut body_locals,
+                    &mut body_mutable_locals,
+                )?;
             }
             Stmt::StaticAlloc { size, ptr, res, .. } => {
                 validate_vc_expr(size, allow_param, context, locals)?;
@@ -1126,6 +1430,7 @@ fn validate_vc_block(
                     "static-allocation size",
                     context,
                 )?;
+                require_fresh_vc_bindings(&[ptr, res], locals, context)?;
                 locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
                 locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
             }
@@ -1144,6 +1449,7 @@ fn validate_vc_block(
                     "system-allocation size",
                     context,
                 )?;
+                require_fresh_vc_bindings(&[ptr, res, release], locals, context)?;
                 locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
                 locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
                 locals.insert(release.clone(), Ty::Res(ResKind::SystemDealloc));
@@ -1182,6 +1488,20 @@ fn validate_vc_block(
     Ok(())
 }
 
+fn validate_vc_block(
+    block: &[Stmt],
+    allow_param: bool,
+    context: &str,
+    locals: &mut HashMap<String, Ty>,
+) -> Result<(), String> {
+    // This wrapper serves synthetic/unit callers that do not carry checked
+    // declaration mutability. Conservatively treat their pre-seeded locals
+    // as mutable; real functions enter through `validate_vc_fn`, which starts
+    // empty and records each declaration's actual `mut` bit.
+    let mut mutable_locals: HashSet<String> = locals.keys().cloned().collect();
+    validate_vc_block_with_mutability(block, allow_param, context, locals, &mut mutable_locals)
+}
+
 fn validate_vc_fn(
     function: &Fn,
     allow_param: bool,
@@ -1215,7 +1535,14 @@ fn validate_vc_fn(
         .iter()
         .map(|parameter| (parameter.name.clone(), parameter.ty))
         .collect();
-    validate_vc_block(&function.body, allow_param, context, &mut locals)
+    let mut mutable_locals = HashSet::new();
+    validate_vc_block_with_mutability(
+        &function.body,
+        allow_param,
+        context,
+        &mut locals,
+        &mut mutable_locals,
+    )
 }
 
 fn validate_vc_trait_fn(function: &Fn, context: &str) -> Result<(), String> {
@@ -1416,8 +1743,9 @@ fn emit_extern_clause_wfs(
             }
             Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
             Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-            // `generate` has already returned the stable G2.0 diagnostic.
-            Ty::AffineOption(_) => {}
+            Ty::AffineOption(_) => {
+                unreachable!("VC preflight rejects affine-option extern parameters")
+            }
             Ty::Unit => {}
         }
     }
@@ -2016,7 +2344,7 @@ impl<'a> Generator<'a> {
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             Some(Ty::Array(element, _)) => lean_array_ty(*element),
-            Some(Ty::AffineOption(_)) => "Sable.UnsupportedAffineOption".to_string(),
+            Some(Ty::AffineOption(payload)) => lean_affine_option_ty(*payload),
             Some(Ty::Unit) | None => unreachable!("checked: value has a Lean binder type"),
         }
     }
@@ -2054,8 +2382,7 @@ impl<'a> Generator<'a> {
                 Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
                 Ty::Option(element) => Some((name.clone(), lean_option_ty(*element))),
-                // Excluded by `validate_vc_type_domain` before emitter setup.
-                Ty::AffineOption(_) => None,
+                Ty::AffineOption(payload) => Some((name.clone(), lean_affine_option_ty(*payload))),
                 Ty::Unit => None,
             })
             .collect();
@@ -2403,8 +2730,11 @@ impl<'a> Generator<'a> {
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
                 Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-                // Excluded by `validate_vc_type_domain` before emitter setup.
-                Ty::AffineOption(_) => {}
+                // Affine options remain local-only, so parameter setup can
+                // only reach this arm through a forged post-preflight AST.
+                Ty::AffineOption(_) => {
+                    unreachable!("VC preflight rejects affine-option parameters")
+                }
                 Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
@@ -2475,7 +2805,7 @@ impl<'a> Generator<'a> {
             Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(k, self.records),
             Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
             Ty::Unit => "Unit".into(),
-            Ty::AffineOption(_) => "Sable.UnsupportedAffineOption".into(),
+            Ty::AffineOption(payload) => lean_affine_option_ty(payload),
             Ty::Array(..) | Ty::ClassRef(..) => {
                 unreachable!("checked: borrowed values and arrays are not return types")
             }
@@ -3382,6 +3712,11 @@ impl<'a> Generator<'a> {
                     self.binders.push((name.clone(), lean_option_ty(*element)));
                     self.env.insert(name.clone(), Val::Opt(name.clone()));
                 }
+                Some(Ty::AffineOption(payload)) => {
+                    self.binders
+                        .push((name.clone(), lean_affine_option_ty(*payload)));
+                    self.env.insert(name.clone(), Val::Opt(name.clone()));
+                }
                 // A record local assigned in the loop is an arbitrary
                 // checked value at the next head. Rebind it just like an
                 // integer local, retaining only the nominal type's implicit
@@ -3529,6 +3864,38 @@ impl<'a> Generator<'a> {
                     _ => Val::Int(value),
                 }
             }
+            ExprKind::OptTake {
+                option,
+                option_span,
+            } => {
+                // This is a single ownership transition in the symbolic
+                // state: snapshot the old option, require presence, then
+                // clear the source before handing the payload to the new
+                // owned-array local. There is no intermediate environment
+                // in which both names own the same sequence.
+                let Val::Opt(old_option) = self
+                    .env
+                    .get(option)
+                    .cloned()
+                    .expect("checked: affine-option take source is initialized")
+                else {
+                    unreachable!("checked: affine-option take source")
+                };
+                let goal = format!("({old_option}) ≠ none");
+                let ob = self.obligation(
+                    &format!("{}.option_take.{}", self.fname, slug(self.src(e.span))),
+                    format!("`{}.take` must hold an owned array here", option),
+                    option_span.join(e.span),
+                    goal.clone(),
+                );
+                self.push_obligation(ob);
+                self.assume_fact(&goal);
+                self.env.insert(
+                    option.clone(),
+                    Val::Opt("(none : Option (Sable.Seq Bool))".into()),
+                );
+                Val::Arr(format!("(({old_option}).getD ⟨0, fun _ => false⟩)"))
+            }
             ExprKind::Widen { arg, .. } => self.eval(arg),
             ExprKind::Narrow { target, arg } => {
                 let Val::Int(v) = self.eval(arg) else {
@@ -3551,7 +3918,7 @@ impl<'a> Generator<'a> {
             }
             ExprKind::SomeE(inner) => {
                 let value = match self.eval(inner) {
-                    Val::Int(v) | Val::Ptr(v) => v,
+                    Val::Int(v) | Val::Ptr(v) | Val::Arr(v) => v,
                     Val::Prop(p) => lean_bool_value(&p),
                     _ => unreachable!("checked: option payload"),
                 };
@@ -3561,6 +3928,7 @@ impl<'a> Generator<'a> {
                 let ty = match e.ty {
                     Some(Ty::Option(element)) => lean_option_ty(element),
                     Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".into(),
+                    Some(Ty::AffineOption(payload)) => lean_affine_option_ty(payload),
                     _ => unreachable!("checked: contextual none has an option type"),
                 };
                 Val::Opt(format!("(none : {ty})"))
@@ -6465,8 +6833,9 @@ impl<'a> Generator<'a> {
                     }
                 }
                 Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-                // Excluded by `validate_vc_type_domain` before emitter setup.
-                Ty::AffineOption(_) => {}
+                Ty::AffineOption(_) => {
+                    unreachable!("VC preflight rejects affine-option parameters")
+                }
                 Ty::Unit => {}
             }
         }
@@ -6802,6 +7171,9 @@ fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mu
         | ExprKind::Narrow { arg: operand, .. }
         | ExprKind::IsSome { operand }
         | ExprKind::OptValue { operand } => collect_mut_borrows(operand, out, mut_recv),
+        ExprKind::OptTake { option, .. } => {
+            out.insert(option.clone());
+        }
         ExprKind::TraitCall { args, .. } => {
             for a in args {
                 collect_mut_borrows(a, out, mut_recv);
@@ -7250,17 +7622,15 @@ mod g1_type_domain_tests {
     fn public_generate_error(program: &Program) -> String {
         match generate(program, &HashMap::new(), "", Path::new(".")) {
             Err(error) => error,
-            Ok(_) => panic!("synthetic affine-option program reached VC generation"),
+            Ok(_) => panic!("synthetic invalid affine-option program reached VC generation"),
         }
     }
 
     #[test]
-    fn affine_options_fail_closed_at_the_public_vc_boundary() {
+    fn affine_options_stay_local_only_at_the_public_vc_boundary() {
         let mut return_program = parsed_program("fn subject() {}");
         return_program.fns[0].ret = affine_bool_option();
-        assert!(
-            public_generate_error(&return_program).starts_with("vc.affine_option_unsupported:")
-        );
+        assert!(public_generate_error(&return_program).starts_with("vc.affine_option_position:"));
 
         let mut local_program = parsed_program("fn subject() {}");
         local_program.fns[0].body.push(Stmt::Decl {
@@ -7270,7 +7640,7 @@ mod g1_type_domain_tests {
             init: None,
             mutable: false,
         });
-        assert!(public_generate_error(&local_program).starts_with("vc.affine_option_unsupported:"));
+        assert!(public_generate_error(&local_program).starts_with("vc.affine_option_initializer:"));
 
         let mut expression_program = parsed_program("fn subject() {}");
         expression_program.fns[0].body.push(Stmt::ExprStmt(Expr {
@@ -7285,7 +7655,281 @@ mod g1_type_domain_tests {
             ty: Some(Ty::Bool),
         }));
         assert!(
-            public_generate_error(&expression_program).starts_with("vc.affine_option_unsupported:")
+            public_generate_error(&expression_program).starts_with("vc.affine_option_temporary:")
+        );
+    }
+
+    #[test]
+    fn affine_option_take_is_one_symbolic_transition_with_a_typed_default() {
+        let source = r#"
+fn affine_take(u64 n) {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, false));
+    if (pending.is_some) {
+        [bool] flags = pending.take;
+        /// assert #[label(absent)] ¬pending.is_some
+        /// assert #[label(length)] flags.len = n
+    }
+}
+"#;
+        let (program, sigs) = checked_program(source);
+        let generated = generate(&program, &sigs, source, Path::new("."))
+            .expect("checked affine-option locals must have VC semantics");
+
+        let take = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.starts_with("affine_take.option_take"))
+            .expect("take must emit a presence obligation");
+        assert!(take.goal.contains("≠ none"));
+        assert!(take.hyps.iter().any(|(name, proposition)| {
+            name.starts_with("h_path_") && proposition.contains("≠ none")
+        }));
+        assert!(take.binders.iter().any(|(_, ty)| ty == "Sable.Seq Bool"));
+
+        let absent = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("assert.absent"))
+            .expect("post-take absence assertion must be generated");
+        assert!(absent.goal.contains("none : Option (Sable.Seq Bool)"));
+
+        let length = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("assert.length"))
+            .expect("taken payload assertion must be generated");
+        assert!(length.goal.contains("getD ⟨0, fun _ => false⟩"));
+        assert!(generated.obligations.iter().all(|obligation| {
+            !obligation.goal.contains("Inhabited")
+                && obligation
+                    .binders
+                    .iter()
+                    .all(|(_, ty)| !ty.contains("Inhabited"))
+                && obligation
+                    .hyps
+                    .iter()
+                    .all(|(_, proposition)| !proposition.contains("Inhabited"))
+        }));
+    }
+
+    #[test]
+    fn affine_option_take_is_a_loop_havoc_effect() {
+        let source = r#"
+fn affine_loop(u64 n) {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, false));
+    mut u64 remaining = 1;
+    /// invariant remaining ≤ 1
+    /// invariant remaining = 1 → pending.is_some
+    /// invariant remaining = 0 → ¬pending.is_some
+    /// variant remaining
+    while (remaining > 0) {
+        [bool] flags = pending.take;
+        remaining = 0;
+    }
+}
+"#;
+        let (program, sigs) = checked_program(source);
+        let generated = generate(&program, &sigs, source, Path::new("."))
+            .expect("affine-option take must survive loop havoc");
+        let take = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.starts_with("affine_loop.option_take"))
+            .expect("loop body must retain the take obligation");
+        assert!(
+            take.binders
+                .iter()
+                .any(|(name, ty)| { name == "pending" && ty == "Option (Sable.Seq Bool)" })
+        );
+        assert!(take.hyps.iter().any(|(name, proposition)| {
+            name.starts_with("h_inv_") && proposition.contains("pending.is_some")
+        }));
+
+        let span = Span::new(0, 0);
+        let take_expr = Expr {
+            kind: ExprKind::OptTake {
+                option: "pending".into(),
+                option_span: span,
+            },
+            span,
+            ty: Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
+        };
+        let statement = Stmt::Decl {
+            ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+            name: "flags".into(),
+            name_span: span,
+            init: Some(take_expr),
+            mutable: false,
+        };
+        let mut assigned = HashSet::new();
+        collect_assigned(&[statement], &mut assigned, ANY_RECV_MUTATES);
+        assert!(assigned.contains("pending"));
+    }
+
+    #[test]
+    fn affine_option_vc_preflight_rejects_immutable_and_nonbool_locals() {
+        let span = Span::new(0, 0);
+        let mut immutable = parsed_program("fn subject() {}");
+        immutable.fns[0].body.push(Stmt::Decl {
+            ty: affine_bool_option(),
+            name: "pending".into(),
+            name_span: span,
+            init: Some(Expr {
+                kind: ExprKind::NoneE,
+                span,
+                ty: Some(affine_bool_option()),
+            }),
+            mutable: false,
+        });
+        assert!(public_generate_error(&immutable).starts_with("vc.affine_option_immutable:"));
+
+        let mut nonbool = parsed_program("fn subject() {}");
+        let nonbool_ty = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::U8)));
+        nonbool.fns[0].body.push(Stmt::Decl {
+            ty: nonbool_ty,
+            name: "pending".into(),
+            name_span: span,
+            init: Some(Expr {
+                kind: ExprKind::NoneE,
+                span,
+                ty: Some(nonbool_ty),
+            }),
+            mutable: true,
+        });
+        assert!(public_generate_error(&nonbool).starts_with("vc.affine_option_payload:"));
+    }
+
+    #[test]
+    fn affine_option_take_cannot_replace_its_source_place_in_forged_ast() {
+        let span = Span::new(0, 0);
+        let mut program = parsed_program("fn subject() {}");
+        program.fns[0].body.extend([
+            Stmt::Decl {
+                ty: affine_bool_option(),
+                name: "pending".into(),
+                name_span: span,
+                init: Some(Expr {
+                    kind: ExprKind::NoneE,
+                    span,
+                    ty: Some(affine_bool_option()),
+                }),
+                mutable: true,
+            },
+            Stmt::Decl {
+                ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+                name: "pending".into(),
+                name_span: span,
+                init: Some(Expr {
+                    kind: ExprKind::OptTake {
+                        option: "pending".into(),
+                        option_span: span,
+                    },
+                    span,
+                    ty: Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
+                }),
+                mutable: false,
+            },
+        ]);
+        assert!(public_generate_error(&program).starts_with("vc.duplicate_local:"));
+    }
+
+    #[test]
+    fn affine_option_cannot_launder_through_named_receivers_or_generated_bindings() {
+        let span = Span::new(0, 0);
+        let scalar = || Expr {
+            kind: ExprKind::IntLit(0),
+            span,
+            ty: Some(Ty::Int(IntTy::U64)),
+        };
+        let expressions = vec![
+            ExprKind::MethodCall {
+                recv: "pending".into(),
+                recv_span: span,
+                method: "m".into(),
+                method_span: span,
+                args: Vec::new(),
+            },
+            ExprKind::ClassField {
+                obj: "pending".into(),
+                obj_span: span,
+                field: "f".into(),
+            },
+            ExprKind::RecordField {
+                obj: "pending".into(),
+                obj_span: span,
+                field: "f".into(),
+            },
+            ExprKind::ClassFieldLen {
+                obj: "pending".into(),
+                field: "f".into(),
+            },
+            ExprKind::ClassFieldIndex {
+                obj: "pending".into(),
+                obj_span: span,
+                field: "f".into(),
+                index: Box::new(scalar()),
+            },
+            ExprKind::Borrow {
+                array: "pending".into(),
+                field: None,
+                mutable: false,
+            },
+            ExprKind::Len {
+                array: "pending".into(),
+            },
+        ];
+        for kind in expressions {
+            let expression = Expr {
+                kind,
+                span,
+                ty: Some(Ty::Int(IntTy::U64)),
+            };
+            let mut locals = HashMap::from([("pending".into(), affine_bool_option())]);
+            let error = validate_vc_block(
+                &[Stmt::ExprStmt(expression)],
+                false,
+                "forged affine receiver",
+                &mut locals,
+            )
+            .expect_err("affine named receiver must fail closed");
+            assert!(
+                error.starts_with("vc.affine_option_boundary:")
+                    || error.contains("is not an active array"),
+                "{error}"
+            );
+        }
+
+        let mut locals = HashMap::from([("pending".into(), affine_bool_option())]);
+        let expose = Stmt::Expose {
+            kw_span: span,
+            array: "pending".into(),
+            array_span: span,
+            mutable: false,
+            ptr: "p".into(),
+            ptr_span: span,
+            res: "r".into(),
+            res_span: span,
+            body: Vec::new(),
+        };
+        assert!(
+            validate_vc_block(&[expose], false, "forged expose", &mut locals)
+                .unwrap_err()
+                .starts_with("vc.affine_option_boundary:")
+        );
+
+        let mut locals = HashMap::from([("pending".into(), affine_bool_option())]);
+        let allocation = Stmt::StaticAlloc {
+            kw_span: span,
+            size: scalar(),
+            ptr: "pending".into(),
+            ptr_span: span,
+            res: "pending".into(),
+            res_span: span,
+        };
+        assert!(
+            validate_vc_block(&[allocation], false, "forged allocation", &mut locals)
+                .unwrap_err()
+                .starts_with("vc.duplicate_local:")
         );
     }
 
@@ -7524,7 +8168,7 @@ fn subject() {
         };
         let error = validate_vc_type_domain(&aliased)
             .expect_err("Boolean array alias initialization must fail closed");
-        assert!(error.contains("literal or allocation"));
+        assert!(error.contains("literal, allocation, or affine-option take"));
 
         let mut rebound = program;
         rebound.fns[0].body.push(Stmt::Assign {

@@ -1,0 +1,7 @@
+// expect-error: option.affine_inferred
+// The ownership-bearing category is written at its binding site and never
+// inferred through the ordinary copy-value path.
+
+fn inferred_option(u64 count) {
+    var pending = some(alloc_array<bool>(count, false));
+}

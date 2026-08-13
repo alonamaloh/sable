@@ -208,6 +208,7 @@ fn subst_expr(e: &mut Expr, values: &HashMap<String, i128>) {
         | ExprKind::ClassField { .. }
         | ExprKind::RecordField { .. }
         | ExprKind::ClassFieldLen { .. }
+        | ExprKind::OptTake { .. }
         | ExprKind::Borrow { .. } => {}
     }
 }

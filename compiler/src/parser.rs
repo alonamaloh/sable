@@ -582,6 +582,9 @@ impl<'a> Parser<'a> {
     fn peek2(&self) -> &Tok {
         &self.tokens[(self.pos + 1).min(self.tokens.len() - 1)].tok
     }
+    fn peek3(&self) -> &Tok {
+        &self.tokens[(self.pos + 2).min(self.tokens.len() - 1)].tok
+    }
     fn peek_span(&self) -> Span {
         self.tokens[self.pos].span
     }
@@ -3273,9 +3276,14 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::Ident(_) if self.peek2() == &Tok::Dot => {
-                // Method-call statement: `s.push(7);`
+                // Method-call statement: `s.push(7);`. A bare affine take is
+                // allowed through parsing solely so the checker can give its
+                // stable ownership-position diagnostic.
                 let e = self.expr()?;
-                if !matches!(e.kind, ExprKind::MethodCall { .. }) {
+                if !matches!(
+                    e.kind,
+                    ExprKind::MethodCall { .. } | ExprKind::OptTake { .. }
+                ) {
                     return Err(Diagnostic {
                         name: "parse.expr_stmt".into(),
                         title: "only calls can be used as statements".into(),
@@ -3615,8 +3623,15 @@ impl<'a> Parser<'a> {
                     };
                 }
                 Tok::Dot => {
-                    // Option accessors postfix any expression (ADR 0008).
-                    if matches!(self.peek2(), Tok::Ident(f) if f == "is_some" || f == "value") {
+                    // Copy-option accessors postfix any expression (ADR 0008).
+                    // Affine extraction is deliberately name-shaped: later
+                    // stages must atomically mutate the source local to none.
+                    let option_accessor = match self.peek2() {
+                        Tok::Ident(field) if field == "is_some" || field == "value" => true,
+                        Tok::Ident(field) if field == "take" => self.peek3() != &Tok::LParen,
+                        _ => false,
+                    };
+                    if option_accessor {
                         self.bump();
                         let (field, fspan) = self.ident()?;
                         let espan = e.span;
@@ -3625,9 +3640,26 @@ impl<'a> Parser<'a> {
                                 ExprKind::IsSome {
                                     operand: Box::new(e),
                                 }
-                            } else {
+                            } else if field == "value" {
                                 ExprKind::OptValue {
                                     operand: Box::new(e),
+                                }
+                            } else {
+                                let ExprKind::Var(option) = e.kind else {
+                                    return Err(Diagnostic {
+                                        name: "option.take_not_local".into(),
+                                        title: "`.take` requires a named local".into(),
+                                        span: espan.join(fspan),
+                                        label: "bind the option to an explicit mutable local before taking it".into(),
+                                        notes: vec![(
+                                            "note".into(),
+                                            "affine extraction mutates its source to `none`, so a temporary or compound expression has no place whose ownership state can be updated".into(),
+                                        )],
+                                    });
+                                };
+                                ExprKind::OptTake {
+                                    option,
+                                    option_span: espan,
                                 }
                             },
                             span: espan.join(fspan),
@@ -4348,6 +4380,9 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
         ExprKind::Unary { operand, .. } => expr_vars(operand, out),
         ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => expr_vars(arg, out),
         ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => expr_vars(operand, out),
+        ExprKind::OptTake { option, .. } => {
+            out.insert(option.clone());
+        }
         ExprKind::TraitCall { args, .. } => {
             for a in args {
                 expr_vars(a, out);
@@ -4904,6 +4939,78 @@ fn generic<T>(option<[T]> input) -> option<[T]> {
             generic.ret,
             Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)))
         );
+    }
+
+    #[test]
+    fn affine_option_take_is_a_named_source_operation() {
+        let source = r#"
+fn consume(u64 count) {
+    mut option<[bool]> pending = some(alloc_array<bool>(count, false));
+    [bool] values = pending.take;
+}
+"#;
+        let program = parse_source(source).unwrap();
+        let function = &program.fns[0];
+        let Stmt::Decl {
+            ty,
+            init: Some(initializer),
+            ..
+        } = &function.body[1]
+        else {
+            panic!("expected the owned array declaration");
+        };
+        assert_eq!(*ty, Ty::Array(ValueTy::Bool, Mutability::Owned));
+        let ExprKind::OptTake {
+            option,
+            option_span,
+        } = &initializer.kind
+        else {
+            panic!("expected a named affine-option take");
+        };
+        assert_eq!(option, "pending");
+        assert_eq!(&source[option_span.start..option_span.end], "pending");
+    }
+
+    #[test]
+    fn affine_option_take_rejects_a_temporary_source() {
+        let source = r#"
+fn consume(u64 count) {
+    [bool] values = some(alloc_array<bool>(count, false)).take;
+}
+"#;
+        let diagnostic = parse_source(source).unwrap_err();
+        assert_eq!(diagnostic.name, "option.take_not_local");
+    }
+
+    #[test]
+    fn take_with_parentheses_remains_a_method_call() {
+        let source = r#"
+class Holder {
+    u64 value;
+
+    init zero() {
+        self.value = 0;
+    }
+
+    fn take(&mut self) {
+        self.value = 0;
+    }
+}
+
+fn call_take() {
+    var mut holder = Holder::zero();
+    holder.take();
+}
+"#;
+        let program = parse_source(source).unwrap();
+        let Stmt::ExprStmt(call) = &program.fns[0].body[1] else {
+            panic!("expected a method call statement");
+        };
+        assert!(matches!(
+            &call.kind,
+            ExprKind::MethodCall { recv, method, .. }
+                if recv == "holder" && method == "take"
+        ));
     }
 
     #[test]

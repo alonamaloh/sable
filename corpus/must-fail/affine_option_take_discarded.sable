@@ -1,0 +1,8 @@
+// expect-error: option.take_position
+// A taken owner must be installed directly into an explicit owned-array
+// local; discarding it would erase the destination of the transfer.
+
+fn discard_take() {
+    mut option<[bool]> pending = none;
+    pending.take;
+}

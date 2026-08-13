@@ -1,0 +1,8 @@
+// expect-error: option.affine_assign
+// Whole-option replacement would need to drop the old conditional owner.
+// G2.1 constructs once and changes the source only through atomic `.take`.
+
+fn replace_option() {
+    mut option<[bool]> pending = none;
+    pending = none;
+}

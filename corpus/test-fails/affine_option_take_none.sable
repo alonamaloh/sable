@@ -1,0 +1,6 @@
+// expect-test-failure: `.take` of an empty affine option
+
+fn test_affine_option_take_none() {
+    mut option<[bool]> pending = none;
+    [bool] flags = pending.take;
+}

@@ -622,6 +622,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
                 walk_expr(operand, refs, const_names, record_externs)
             }
+            ExprKind::OptTake { .. } => {}
             ExprKind::SomeE(inner) => walk_expr(inner, refs, const_names, record_externs),
             ExprKind::ArrayLit(elems) => {
                 for el in elems {

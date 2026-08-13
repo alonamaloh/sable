@@ -1,0 +1,9 @@
+// expect-error: affine_option_take_unproven.option_take
+// Presence is a proof fact rather than checker typestate. Taking from a
+// statically empty option therefore reaches VC generation and fails its
+// someness obligation instead of being treated as undefined behavior.
+
+fn affine_option_take_unproven() {
+    mut option<[bool]> pending = none;
+    [bool] flags = pending.take;
+}

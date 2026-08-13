@@ -29,6 +29,13 @@ pub enum SpecVal {
         payload: Option<ValueTy>,
         value: Option<Box<SpecVal>>,
     },
+    /// An immutable proof snapshot of an ownership-bearing
+    /// `option<[bool]>`.  This is deliberately not folded into `Opt`:
+    /// ordinary options are copyable program values, while this variant is
+    /// only a detached monitor snapshot and carries no runtime authority.
+    AffineOptBoolArray {
+        value: Option<SpecArray>,
+    },
     /// A class value: field name → value.
     Obj(HashMap<String, SpecVal>),
 }
@@ -814,6 +821,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
         }
         S::IsSomeE(x) => match eval(x, env, depth + 1)? {
             SpecVal::Opt { value, .. } => Ok(SpecVal::Bool(value.is_some())),
+            SpecVal::AffineOptBoolArray { value } => Ok(SpecVal::Bool(value.is_some())),
             _ => Err(Unmonitorable("`.is_some` on a non-option".into())),
         },
         S::OptValE(x) => match eval(x, env, depth + 1)? {
@@ -827,6 +835,15 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                 payload,
                 value: None,
             } => option_default(payload),
+            // Source clauses still elaborate `.value` through OptionAcc,
+            // which deliberately requires `[Inhabited α]`. `Sable.Seq`
+            // has no such global instance: the verifier's internal take
+            // transition uses an explicit `getD` default instead.  Do not
+            // let the best-effort monitor accept a clause Lean would reject;
+            // affine payload clauses must use `match`.
+            SpecVal::AffineOptBoolArray { .. } => Err(Unmonitorable(
+                "affine-option `.value` is not a monitorable source clause; use `match`".into(),
+            )),
             _ => Err(Unmonitorable("`.value` on a non-option".into())),
         },
         S::Ite(c, a, b) => {
@@ -995,6 +1012,17 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                 eval(some_body, &inner, depth + 1)
             }
             SpecVal::Opt { value: None, .. } => eval(none_body, env, depth + 1),
+            SpecVal::AffineOptBoolArray { value: Some(array) } => {
+                let mut inner_vars = env.vars.clone();
+                inner_vars.insert(some_var.clone(), SpecVal::Arr(array));
+                let inner = SpecEnv {
+                    vars: inner_vars,
+                    olds: env.olds.clone(),
+                    ghosts: env.ghosts,
+                };
+                eval(some_body, &inner, depth + 1)
+            }
+            SpecVal::AffineOptBoolArray { value: None } => eval(none_body, env, depth + 1),
             _ => Err(Unmonitorable("`match` scrutinee is not an option".into())),
         },
     }
@@ -1160,8 +1188,42 @@ fn spec_eq(a: &SpecVal, b: &SpecVal) -> Option<bool> {
             (Some(_), None) | (None, Some(_)) => Some(false),
             (Some(x), Some(y)) => spec_eq(x, y),
         },
+        (SpecVal::AffineOptBoolArray { value: x }, SpecVal::AffineOptBoolArray { value: y }) => {
+            affine_option_eq(x.as_ref(), y.as_ref())
+        }
+        (
+            SpecVal::AffineOptBoolArray { value: affine },
+            SpecVal::Opt {
+                payload: None,
+                value: option,
+            },
+        )
+        | (
+            SpecVal::Opt {
+                payload: None,
+                value: option,
+            },
+            SpecVal::AffineOptBoolArray { value: affine },
+        ) => match (affine.as_ref(), option.as_deref()) {
+            (None, None) => Some(true),
+            (Some(_), None) | (None, Some(_)) => Some(false),
+            (Some(array), Some(SpecVal::Arr(other))) => {
+                spec_eq(&SpecVal::Arr(array.clone()), &SpecVal::Arr(other.clone()))
+            }
+            (Some(_), Some(_)) => None,
+        },
         (SpecVal::Obj(x), SpecVal::Obj(y)) => Some(x == y),
         _ => None,
+    }
+}
+
+fn affine_option_eq(left: Option<&SpecArray>, right: Option<&SpecArray>) -> Option<bool> {
+    match (left, right) {
+        (None, None) => Some(true),
+        (Some(_), None) | (None, Some(_)) => Some(false),
+        (Some(left), Some(right)) => {
+            spec_eq(&SpecVal::Arr(left.clone()), &SpecVal::Arr(right.clone()))
+        }
     }
 }
 
@@ -1219,6 +1281,59 @@ mod g1_option_monitor_tests {
             payload: Some(payload),
             value: value.map(Box::new),
         }
+    }
+
+    #[test]
+    fn affine_option_snapshots_support_presence_match_and_equality() {
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut vars = HashMap::new();
+        vars.insert(
+            "pending".into(),
+            SpecVal::AffineOptBoolArray {
+                value: Some(SpecArray::Bool(vec![true, false])),
+            },
+        );
+        vars.insert("empty".into(), SpecVal::AffineOptBoolArray { value: None });
+        let env = SpecEnv {
+            vars,
+            olds: HashMap::new(),
+            ghosts: &ghosts,
+        };
+
+        assert!(eval_clause("pending.is_some", &env).unwrap());
+        assert!(eval_clause("empty = none", &env).unwrap());
+        assert!(eval_clause("pending.value.len = 2", &env).is_err());
+        assert!(eval_clause("empty.value.len = 0", &env).is_err());
+        assert!(
+            eval_clause(
+                "match pending with | some flags => flags.get 1 = false | none => False",
+                &env,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn affine_option_equality_rejects_typed_copy_option_crossings() {
+        let affine_none = SpecVal::AffineOptBoolArray { value: None };
+        let affine_some = SpecVal::AffineOptBoolArray {
+            value: Some(SpecArray::Bool(vec![true])),
+        };
+        let typed_none = option(ValueTy::Bool, None);
+        let typed_some = option(ValueTy::Bool, Some(SpecVal::Bool(true)));
+        let literal_none = SpecVal::Opt {
+            payload: None,
+            value: None,
+        };
+        let literal_array_some = SpecVal::Opt {
+            payload: None,
+            value: Some(Box::new(SpecVal::Arr(SpecArray::Bool(vec![true])))),
+        };
+
+        assert_eq!(spec_eq(&affine_none, &typed_none), None);
+        assert_eq!(spec_eq(&affine_some, &typed_some), None);
+        assert_eq!(spec_eq(&affine_none, &literal_none), Some(true));
+        assert_eq!(spec_eq(&affine_some, &literal_array_some), Some(true));
     }
 
     #[test]

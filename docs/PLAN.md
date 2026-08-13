@@ -1004,7 +1004,7 @@ hypothesis, not a promise that evidence cannot reorder it:
      differential passed 1/1 over six subjects at both levels; and SVM stayed
      green at 86/86. Randomized allocator, grind-budget, LSP, documentation,
      diff-check, and static-audit gates were green. G1.6 is closed.
-   - **G2 — affine options (staged; G2.0 complete):** carry ownership and
+   - **G2 — affine options (staged; G2.0–G2.1 complete):** carry ownership and
      destruction correctly through present/absent aggregate values without
      widening the existing copy-option family by accident.
 
@@ -1019,16 +1019,15 @@ hypothesis, not a promise that evidence cannot reorder it:
      synthetic checked-AST inputs; the surface parser does not yet construct
      that case.
 
-     G2.0 deliberately has no construction, accessor, move, destruction,
+     G2.0 deliberately had no construction, accessor, move, destruction,
      proof, interpreter, machine, or native semantics. The checker, VC
-     generator, interpreter, Rust-to-SVM lowerer, and LLVM emitter each reject
-     `Ty::AffineOption` before any copy-option semantics can be selected. At an
-     otherwise-admissible direct ingress they use stable `type`, `vc`,
+     generator, interpreter, Rust-to-SVM lowerer, and LLVM emitter each rejected
+     `Ty::AffineOption` before copy-option semantics could be selected. At an
+     otherwise-admissible direct ingress they used stable `type`, `vc`,
      `interp`, `svm`, and `backend` `affine_option_unsupported` diagnostics
-     respectively. An already-unsupported enclosing template or class may
-     diagnose its outer boundary first, including in LLVM whole-module mode;
-     no affine value reaches lowering in either case. Existing copyable options
-     retain their current behavior.
+     respectively. That remains the G2.0 closure claim; G2.1 opens only the
+     local checker/proof/interpreter/monitor subset below. Existing copyable
+     options retain their current behavior.
 
      The exact closure command was
      `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
@@ -1043,17 +1042,43 @@ hypothesis, not a promise that evidence cannot reorder it:
      doc-tests, rustfmt, diff-check, and static-audit gates were green. G2.0 is
      closed.
 
-     **G2.1 — local construction and take (next):** admit only explicit local
-     `option<[bool]>` values initialized by `none` or `some` of a fresh Boolean
-     array allocation. `.is_some` observes without consuming; `.value` remains
-     forbidden for an affine payload; `.take` atomically checks presence,
-     transfers the payload into an explicit owned-array destination, and
-     clears the mutable named source. Parameters, returns, calls, fields,
-     borrows, generic transport, nested affine options, whole-option
-     assignment, and inferred bindings remain closed.
+     **G2.1 — local construction and take (complete):** admit only explicit
+     mutable local `option<[bool]>` values with
+     mandatory initialization by `none` or directly by
+     `some(alloc_array<bool>(len, init))`. Wrapping an existing owned array and
+     Boolean-array literals remain rejected. `.is_some` observes without
+     consuming or cloning; program `.value` remains forbidden. `.take` is a
+     named-place operation accepted only as the direct initializer of an
+     explicit owned `[bool]` local. It atomically checks presence, transfers the
+     payload, and leaves the mutable source initialized as `none`; it does not
+     move the option container or introduce a presence typestate lattice.
 
-     **G2.2 — formal machine (later):** add an atomic statement-level take to
-     the relational SVM and proved evaluator, then carry the exact slice
+     VC generation models the local as `Option (Sable.Seq Bool)`, discharges
+     someness against a pre-update snapshot, and updates the symbolic source to
+     typed `none`; take participates in loop mutation/havoc collection. The
+     interpreter uses a separate runtime affine-option value, mutates the named
+     slot atomically, and recursively drops a present payload exactly once.
+     The proof monitor observes immutable snapshots. Affine payload clauses
+     use option `match`; affine `.value` is unmonitorable because `Sable.Seq`
+     intentionally has no global `Inhabited` instance. Parameters, returns,
+     calls, fields, traits, generics, borrows, exposure, nested or non-Boolean
+     affine options, whole-option assignment, inferred bindings, and discarded
+     affine temporaries remain closed.
+
+     G2.1 closed under the exact one-worker command
+     `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. `cargo check -j1` was green, and standalone
+     Lake built 22/22 targets with only the same existing linter warnings. Rust
+     library tests passed 211/211; the recursive corpus passed all 416 subjects
+     (84 verifies, 263 must-fail, 49 tests, 20 test-fails) in 193.06s; LLVM CLI
+     passed 7/7; the native differential passed 1/1 spanning six subjects at
+     `-O0` and `-O2`; and SVM differential remained 86/86. Randomized free-list
+     allocator, grind-budget, LSP, documentation, rustfmt, diff-check, and
+     static-audit gates were green. G2.1 is closed.
+
+     **G2.2 — formal machine (next):** add an atomic statement-level `optTake`
+     to the relational SVM and proved evaluator, then carry the exact slice
      through differential lowering. A pure extraction followed by assignment
      is not an acceptable model because its intermediate state has two owners.
 

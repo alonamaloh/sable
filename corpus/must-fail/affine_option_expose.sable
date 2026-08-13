@@ -1,0 +1,8 @@
+// expect-error: option.affine_expose
+// An exposure requires a concrete live array. The option must first transfer
+// its payload into an owned local through `.take`.
+
+fn expose_option() {
+    mut option<[bool]> pending = none;
+    unsafe expose &pending as (pointer, resource bytes) {}
+}

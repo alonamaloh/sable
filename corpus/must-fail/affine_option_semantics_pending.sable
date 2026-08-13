@@ -1,7 +1,0 @@
-// expect-error: type.affine_option_unsupported
-// G2.0 preserves the ownership-bearing recursive type, but construction,
-// atomic take, destruction, and proof/runtime semantics land in later slices.
-
-fn represented_but_not_executable() {
-    mut option<[bool]> values = none;
-}

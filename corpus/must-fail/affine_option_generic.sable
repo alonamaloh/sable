@@ -1,0 +1,7 @@
+// expect-error: type.affine_option_generic
+// The first ownership-bearing option is concrete and local, not part of the
+// retained generic proof-substitution surface.
+
+fn generic<T>() {
+    mut option<[bool]> pending = none;
+}

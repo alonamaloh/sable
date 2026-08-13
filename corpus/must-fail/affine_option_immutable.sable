@@ -1,0 +1,7 @@
+// expect-error: mut.option_take_immutable
+// Taking changes the option to `none`, so every affine-option local is
+// explicitly mutable even when this example does not take it yet.
+
+fn immutable_affine_option() {
+    option<[bool]> pending = none;
+}

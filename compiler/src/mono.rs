@@ -575,6 +575,7 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
             ExprKind::IntLit(_)
             | ExprKind::BoolLit(_)
             | ExprKind::Var(_)
+            | ExprKind::OptTake { .. }
             | ExprKind::Len { .. }
             | ExprKind::NoneE
             | ExprKind::SelfField { .. }
@@ -786,6 +787,7 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
             ExprKind::IntLit(_)
             | ExprKind::BoolLit(_)
             | ExprKind::Var(_)
+            | ExprKind::OptTake { .. }
             | ExprKind::Len { .. }
             | ExprKind::NoneE
             | ExprKind::SelfField { .. }
@@ -1014,6 +1016,7 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
             ExprKind::IntLit(_)
             | ExprKind::BoolLit(_)
             | ExprKind::Var(_)
+            | ExprKind::OptTake { .. }
             | ExprKind::Len { .. }
             | ExprKind::NoneE
             | ExprKind::SelfField { .. }
@@ -1472,6 +1475,7 @@ fn prepare_expr(e: &mut Expr, bound_params: &HashSet<String>) {
             prepare_expr(len, bound_params);
             prepare_expr(init, bound_params);
         }
+        ExprKind::OptTake { .. } => {}
         _ => {}
     }
 }
@@ -1992,6 +1996,7 @@ impl Mono {
                     self.rewrite_expr(arg, depth)?;
                 }
             }
+            ExprKind::OptTake { .. } => {}
             _ => {}
         }
         Ok(())
@@ -2232,6 +2237,7 @@ fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult
                 subst_expr(field, args, bound_calls)?;
             }
         }
+        ExprKind::OptTake { .. } => {}
         _ => {}
     }
     Ok(())
@@ -3065,6 +3071,33 @@ fn root(option<[i32]> value) -> option<[i32]> {
         let abstract_ty = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)));
         assert_eq!(retained.params[0].ty, abstract_ty);
         assert_eq!(retained.ret, abstract_ty);
+    }
+
+    #[test]
+    fn named_affine_option_take_survives_monomorphization_unchanged() {
+        let program = parse_and_monomorphize(
+            r#"
+fn consume(u64 count) {
+    mut option<[bool]> pending = some(alloc_array<bool>(count, false));
+    [bool] values = pending.take;
+}
+"#,
+        );
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name == "consume")
+            .expect("ordinary function remains in output");
+        let Stmt::Decl {
+            init: Some(take), ..
+        } = &function.body[1]
+        else {
+            panic!("expected the take destination");
+        };
+        assert!(matches!(
+            &take.kind,
+            ExprKind::OptTake { option, .. } if option == "pending"
+        ));
     }
 
     #[test]

@@ -1,0 +1,6 @@
+// expect-error: type.affine_option_trait
+// Retained trait proof reuse does not transport ownership-bearing options.
+
+trait Inspect {
+    fn inspect(option<[bool]> pending) -> bool;
+}

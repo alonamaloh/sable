@@ -515,8 +515,9 @@ foreign, or cross-module array ABI.
   differential passes 1/1 over six subjects at both levels; and SVM remains
   86/86. Randomized allocator, grind-budget, LSP, documentation, diff-check,
   and static-audit gates are green. G1.6 is closed.
-- **Affine options get a checked ownership identity before they get
-  semantics.** G2.0 is the closed representation/fail-closed checkpoint.
+- **Affine options have a checked ownership identity and a fenced local
+  semantic slice.** G2.0 is the closed representation/fail-closed checkpoint;
+  G2.1's checker/proof/interpreter/monitor slice is also closed.
   The existing `Ty::Option(ValueTy)` remains the copyable option family;
   `option<[T]>` parses to the distinct
   `Ty::AffineOption(AffineOptionTy::Array(ValueTy))`. This keeps every legacy
@@ -529,21 +530,39 @@ foreign, or cross-module array ABI.
   concreteness. The checked representation can additionally carry
   `ValueTy::Record`; module traversal applies nominal visibility to that future
   or synthetic checked-AST case even though the surface parser does not yet
-  construct it. Those representation paths authorize no payload: every
-  semantic boundary remains fail closed, including for the eventual Boolean
-  case.
+  construct it. At G2.0 those representation paths authorized no payload and
+  every semantic boundary failed closed, including for the Boolean case.
 
-  At otherwise-admissible direct ingresses, the required fail-closed
-  diagnostics are
-  `type.affine_option_unsupported`, `vc.affine_option_unsupported`,
-  `interp.affine_option_unsupported`, `svm.affine_option_unsupported`, and
-  `backend.affine_option_unsupported`. They prevent checker, proof generation,
-  execution, formal lowering, or native lowering from accidentally sharing a
-  copy-option path. An enclosing unsupported template or class may report its
-  outer diagnostic first, including at LLVM's whole-module boundary; this
-  changes diagnostic precedence, not the no-lowering guarantee. G2.1 is the
-  next widening: explicit local `option<[bool]>` construction and an atomic
-  consuming `.take`, still without parameters, returns, fields, or an ABI.
+  G2.1 opens only explicit mutable local `option<[bool]>` values. Initialization
+  is mandatory and is either `none` or
+  `some(alloc_array<bool>(len, init))`; wrapping an existing owned array and
+  array-literal construction remain closed. `.is_some` reads the tag without
+  consuming the value. Program `.value` is forbidden because it would expose
+  the owned descriptor without clearing the container. `.take` is represented
+  as a named-place mutation and is accepted only as the direct initializer of
+  an explicit owned `[bool]` local. It checks presence and atomically transfers
+  the payload while leaving the mutable option container initialized as
+  `none`; presence is value state rather than checker typestate.
+
+  The proof value is `Option (Sable.Seq Bool)`. VC generation snapshots the
+  pre-take value, emits its someness obligation, returns the sequence payload,
+  and changes the source environment entry to typed `none`; loop effect
+  collection therefore treats take as a source assignment. The interpreter
+  keeps affine options distinct from copy options, atomically takes from the
+  named frame slot, and recursively drops a still-present payload exactly once
+  at lexical scope exit. The proof monitor operates on immutable snapshots, so
+  it never becomes an executable owner. Affine payload clauses use option
+  `match`; affine `.value` is deliberately unmonitorable because `Sable.Seq`
+  has no global `Inhabited` instance, and the monitor must not accept text that
+  Lean cannot elaborate.
+
+  Parameters, returns, calls, fields, traits, generics, borrows, exposure,
+  inferred option bindings, whole-option assignment, nested or non-Boolean
+  affine options, and discarded affine temporaries remain closed. The formal
+  SVM and LLVM backend retain explicit `svm.affine_option_unsupported` and
+  `backend.affine_option_unsupported` fences. G2.2 adds one atomic formal-SVM
+  `optTake` transition; G2.3 adds the local native tag/live-bit representation
+  and conditional destruction. Neither stage implies an aggregate ABI.
 
   G2.0 closed under the exact one-worker command
   `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
@@ -556,6 +575,19 @@ foreign, or cross-module array ABI.
   passed 1/1 over six subjects at `-O0` and `-O2`; and SVM differential stayed
   86/86. Randomized allocator, grind-budget, LSP, doc-tests, rustfmt,
   diff-check, and static-audit gates were green. G2.0 is closed.
+
+  G2.1 closed under the exact one-worker command
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+  SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`. `cargo check -j1` was green, and standalone
+  Lake built 22/22 targets with only the same existing linter warnings. Rust
+  library tests passed 211/211; the recursive corpus passed all 416 subjects
+  (84 verifies, 263 must-fail, 49 tests, 20 test-fails) in 193.06s; LLVM CLI
+  passed 7/7; the native differential passed 1/1 spanning six subjects at
+  `-O0` and `-O2`; and SVM differential remained 86/86. Randomized free-list
+  allocator, grind-budget, LSP, documentation, rustfmt, diff-check, and
+  static-audit gates were green. G2.1 is closed; G2.2's atomic formal-SVM
+  `optTake` transition is next.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

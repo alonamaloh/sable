@@ -1,0 +1,6 @@
+// expect-error: type.affine_option_param
+// G2.1 is local-only and defines no affine-option call ABI.
+
+fn inspect_parameter(option<[bool]> pending) -> bool {
+    return pending.is_some;
+}

@@ -1,0 +1,8 @@
+// expect-error: option.affine_value
+// `.value` is a copy-option projection. An ownership-bearing option must use
+// the atomic `.take` operation so the source becomes `none`.
+
+fn copy_affine_payload() {
+    mut option<[bool]> values = none;
+    [bool] copied_owner = values.value;
+}

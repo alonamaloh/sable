@@ -199,6 +199,12 @@ fn affine_option_unsupported(ty: Ty, context: &str) -> String {
     )
 }
 
+fn affine_option_take_unsupported(option: &str) -> String {
+    format!(
+        "svm.affine_option_unsupported: `.take` of affine option local `{option}` requires an atomic ownership transition that is not yet modeled by the formal SVM"
+    )
+}
+
 fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
     match payload {
         ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
@@ -383,6 +389,9 @@ fn validate_fresh_bool_array_initializer(
             validate_alloc_array(ctx, initializer, *elem, len, value)?;
         }
         ExprKind::ArrayLit(elements) => validate_array_literal(ctx, initializer, elements)?,
+        ExprKind::OptTake { option, .. } => {
+            return Err(affine_option_take_unsupported(option));
+        }
         _ => {
             return Err(format!(
                 "svm.bool_array_transport_unsupported: initializer of `{local}` is not a fresh Boolean array literal or allocation"
@@ -499,6 +508,9 @@ fn semantic_expr_ty(
             }
         },
         ExprKind::BoolLit(_) => Ty::Bool,
+        ExprKind::OptTake { option, .. } => {
+            return Err(affine_option_take_unsupported(option));
+        }
         ExprKind::Unary { op, operand } => match op {
             UnOp::Not => {
                 validate_sink_type(ctx, Ty::Bool, operand, &format!("{context} operand"))?;
@@ -1570,7 +1582,7 @@ fn validate_call_signature(
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
     if let Some(ty) = expr.ty {
         validate_ty_payload(ty, "expression annotation")?;
-        if bool_array_ty(ty) {
+        if bool_array_ty(ty) && !matches!(&expr.kind, ExprKind::OptTake { .. }) {
             return Err(
                 "svm.bool_array_position_unsupported: a Boolean-array-valued expression is only supported as the initializer of a fresh owned local"
                     .into(),
@@ -1658,6 +1670,9 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
                 "option value accessor",
             )?;
             validate_expr_payloads(ctx, operand)?;
+        }
+        ExprKind::OptTake { option, .. } => {
+            return Err(affine_option_take_unsupported(option));
         }
         ExprKind::Unary { operand, .. } => {
             semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "unary expression")?;
@@ -2214,6 +2229,9 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                 )?;
                 lower_resource_op_stmt(ctx, *op, args)?
             }
+            ExprKind::OptTake { option, .. } => {
+                return Err(affine_option_take_unsupported(option));
+            }
             _ => {
                 return Err("expression statements are outside the SVM core subset".into());
             }
@@ -2314,6 +2332,9 @@ fn resolved_resource_place_ty(
             return Err(format!(
                 "svm.resource_operand_place: {operation} uses a resource field; class members are outside the SVM local environment"
             ));
+        }
+        ExprKind::OptTake { option, .. } => {
+            return Err(affine_option_take_unsupported(option));
         }
         _ => {
             return Err(format!(
@@ -2781,6 +2802,9 @@ fn ensure_erased_resource_operands_inert(
                     &format!("`{}` operand {}", op.name(), index + 1),
                 )? == expected
             }
+            ExprKind::OptTake { option, .. } => {
+                return Err(affine_option_take_unsupported(option));
+            }
             // Calls, arithmetic (including division), raw/device operations,
             // and nested resource transformations may trap or mutate runtime
             // state. Reject them instead of trying to infer purity here.
@@ -2812,6 +2836,7 @@ fn lower_erased_resource_bind(
         ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args),
         ExprKind::RawOp { .. } => Ok(Some(lower_bind(ctx, name, e)?)),
         ExprKind::Call { .. } => Ok(Some(lower_call(ctx, &None, e)?)),
+        ExprKind::OptTake { option, .. } => Err(affine_option_take_unsupported(option)),
         _ => Err("resource-valued expression is outside the SVM core subset".into()),
     }
 }
@@ -2870,6 +2895,7 @@ fn lower_fresh_bool_array_bind(
             }
             Ok(statements.join(", "))
         }
+        ExprKind::OptTake { option, .. } => Err(affine_option_take_unsupported(option)),
         _ => unreachable!("fresh Boolean array validation accepted a transport"),
     }
 }
@@ -2878,6 +2904,7 @@ fn lower_fresh_bool_array_bind(
 /// is exactly a call; calls nested deeper stay outside the subset.
 fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String> {
     match &e.kind {
+        ExprKind::OptTake { option, .. } => Err(affine_option_take_unsupported(option)),
         ExprKind::Call { .. } => lower_call(ctx, &Some(name.to_string()), e),
         ExprKind::DeviceOp {
             op: DeviceOp::UartStatus,
@@ -3178,6 +3205,9 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
                 format!("(.ptrValue {})", lower_expr(ctx, operand)?)
             }
         },
+        ExprKind::OptTake { option, .. } => {
+            return Err(affine_option_take_unsupported(option));
+        }
         ExprKind::RecordField { obj, field, .. } => {
             format!("(.recordField (.var \"{obj}\") \"{field}\")")
         }
@@ -3316,6 +3346,7 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
             RtVal::Bool(b) => format!("opt some {b}"),
             value => format!("opt some {}", render_rt_val(program, value)),
         },
+        RtVal::AffineOptBoolArray(_) => "unclassified affine Boolean-array option".into(),
         RtVal::PtrOpt(None) => "ptrOpt none".into(),
         RtVal::PtrOpt(Some((a, o))) => format!("ptrOpt some {a}+{o}"),
         RtVal::Record { record, fields } => {
@@ -3518,6 +3549,34 @@ mod tests {
         assert!(
             error.starts_with("svm.affine_option_unsupported:"),
             "{error}"
+        );
+
+        let take = expr(
+            ExprKind::OptTake {
+                option: "pending".into(),
+                option_span: Span::new(0, 0),
+            },
+            Ty::Array(ValueTy::Bool, Mutability::Owned),
+        );
+        let expected = "svm.affine_option_unsupported: `.take` of affine option local `pending` requires an atomic ownership transition that is not yet modeled by the formal SVM";
+        assert_eq!(
+            validate_expr_payloads(&ctx, &take)
+                .expect_err("affine take must not inherit general array lowering"),
+            expected
+        );
+        assert_eq!(
+            validate_fresh_bool_array_initializer(
+                &ctx,
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                &take,
+                "bytes",
+            )
+            .expect_err("affine take must not inherit fresh-array lowering"),
+            expected
+        );
+        assert_eq!(
+            lower_expr(&ctx, &take).expect_err("affine take has no formal SVM expression"),
+            expected
         );
     }
 
@@ -3813,10 +3872,15 @@ mod tests {
             payload: ValueTy::Bool,
             value: Some(Box::new(RtVal::Bool(true))),
         };
+        let affine_value = RtVal::AffineOptBoolArray(None);
 
         assert_eq!(render_rt_val(&program, &absent), "opt none");
         assert_eq!(render_rt_val(&program, &false_value), "opt some false");
         assert_eq!(render_rt_val(&program, &true_value), "opt some true");
+        assert_eq!(
+            render_rt_val(&program, &affine_value),
+            "unclassified affine Boolean-array option"
+        );
     }
 
     #[test]

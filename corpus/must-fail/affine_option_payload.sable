@@ -1,0 +1,7 @@
+// expect-error: type.affine_option_payload
+// G2.1 closes over one exact owned payload kind instead of accidentally
+// granting every represented array element a runtime and proof model.
+
+fn non_boolean_payload() {
+    mut option<[u8]> pending = none;
+}

@@ -672,6 +672,10 @@ fn validate_fresh_bool_array_initializer(
                 locals,
             )
         }
+        ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
+            expression.span,
+            option,
+        )]),
         _ => Err(vec![unsupported(
             expression.span,
             "owned Boolean-array local must be initialized by a fresh literal or `alloc_array<bool>`",
@@ -996,6 +1000,10 @@ fn validate_expr(
             )?;
             require_expr_type(expression, Ty::Bool, "Boolean option payload")
         }
+        ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
+            expression.span,
+            option,
+        )]),
         ExprKind::Index {
             array,
             array_span,
@@ -1811,6 +1819,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         match &expression.kind {
             ExprKind::ArrayLit(elements) => self.emit_bool_array_literal(elements),
             ExprKind::AllocArray { len, init, .. } => self.emit_bool_array_allocation(len, init),
+            ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
+                expression.span,
+                option,
+            )]),
             _ => unreachable!("validated fresh Boolean-array initializer"),
         }
     }
@@ -2451,6 +2463,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     value.operand.expect("integer narrow operand"),
                 )
             }
+            ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
+                expression.span,
+                option,
+            )]),
             _ => unreachable!("validated before lowering"),
         }
     }
@@ -3111,6 +3127,7 @@ fn collect_calls_expr(expression: &Expr, calls: &mut Vec<(String, Span)>) {
         | ExprKind::ClassField { .. }
         | ExprKind::RecordField { .. }
         | ExprKind::ClassFieldLen { .. }
+        | ExprKind::OptTake { .. }
         | ExprKind::Borrow { .. } => {}
     }
 }
@@ -3133,6 +3150,17 @@ fn affine_option_unsupported(span: Span, role: &str, ty: Ty) -> BackendError {
         format!(
             "{role} has type `{}`; native lowering waits for atomic take and conditional destruction semantics",
             ty.name()
+        ),
+    )
+}
+
+fn affine_option_take_unsupported(span: Span, option: &str) -> BackendError {
+    diag(
+        "backend.affine_option_unsupported",
+        "affine options are not lowered by the LLVM backend",
+        span,
+        format!(
+            "`.take` of affine option local `{option}` requires an atomic ownership transition and conditional destruction"
         ),
     )
 }
@@ -3699,6 +3727,26 @@ mod tests {
             validate_expr(&empty, &accessor, 1, &locals)
                 .expect_err("a forged accessor must not treat an affine option as copyable"),
         );
+
+        let take = expression(
+            ExprKind::OptTake {
+                option: "pending".into(),
+                option_span: Span::new(0, 1),
+            },
+            bool_array_ty(),
+        );
+        for errors in [
+            validate_expr(&empty, &take, 1, &locals)
+                .expect_err("affine take must not inherit general array lowering"),
+            validate_fresh_bool_array_initializer(&empty, &take, 1, &locals)
+                .expect_err("affine take must not inherit fresh-array lowering"),
+        ] {
+            assert_eq!(errors[0].name, "backend.affine_option_unsupported");
+            assert_eq!(
+                errors[0].label,
+                "`.take` of affine option local `pending` requires an atomic ownership transition and conditional destruction"
+            );
+        }
 
         let mut record_program = program(Vec::new());
         let mut record = integer_pair_record();
