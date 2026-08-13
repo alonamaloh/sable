@@ -126,6 +126,24 @@ fn select_functions(
             )]);
         };
         let function = &program.fns[index];
+        if let Some(parameter) = function
+            .params
+            .iter()
+            .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+        {
+            return Err(vec![affine_option_unsupported(
+                parameter.span,
+                "LLVM entry parameter",
+                parameter.ty,
+            )]);
+        }
+        if matches!(function.ret, Ty::AffineOption(_)) {
+            return Err(vec![affine_option_unsupported(
+                function.name_span,
+                "LLVM entry return type",
+                function.ret,
+            )]);
+        }
         if function.name.starts_with("test_") {
             return Err(vec![diag(
                 "backend.test_unsupported",
@@ -335,6 +353,24 @@ fn validate_function(
             ),
         )]);
     }
+    if let Some(parameter) = function
+        .params
+        .iter()
+        .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+    {
+        return Err(vec![affine_option_unsupported(
+            parameter.span,
+            "function parameter",
+            parameter.ty,
+        )]);
+    }
+    if matches!(function.ret, Ty::AffineOption(_)) {
+        return Err(vec![affine_option_unsupported(
+            function.name_span,
+            "function return type",
+            function.ret,
+        )]);
+    }
     for parameter in &function.params {
         require_parameter_value(
             program,
@@ -438,6 +474,13 @@ fn validate_block(
                 init,
                 mutable,
             } => {
+                if matches!(ty, Ty::AffineOption(_)) {
+                    return Err(vec![affine_option_unsupported(
+                        *name_span,
+                        "local variable",
+                        *ty,
+                    )]);
+                }
                 require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
                 if is_owned_bool_array(*ty) {
                     let Some(value) = init else {
@@ -472,6 +515,13 @@ fn validate_block(
                         "inferred local is missing its checked type",
                     )]);
                 };
+                if matches!(ty, Ty::AffineOption(_)) {
+                    return Err(vec![affine_option_unsupported(
+                        *name_span,
+                        "inferred local",
+                        ty,
+                    )]);
+                }
                 require_local_value(program, root_span_end, ty, *name_span, "inferred local")?;
                 if is_owned_bool_array(ty) {
                     validate_fresh_bool_array_initializer(program, init, root_span_end, locals)?;
@@ -676,6 +726,13 @@ fn validate_expr(
     root_span_end: usize,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
+    if let Some(ty @ Ty::AffineOption(_)) = expression.ty {
+        return Err(vec![affine_option_unsupported(
+            expression.span,
+            "expression",
+            ty,
+        )]);
+    }
     match &expression.kind {
         ExprKind::IntLit(_) => {
             let Some(Ty::Int(integer)) = expression.ty else {
@@ -1096,6 +1153,13 @@ fn require_record_value(
         )]);
     }
     for field in &declaration.fields {
+        if matches!(field.ty, Ty::AffineOption(_)) {
+            return Err(vec![affine_option_unsupported(
+                field.span,
+                &format!("record `{}.{}` field", declaration.name, field.name),
+                field.ty,
+            )]);
+        }
         if !matches!(field.ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) {
             return Err(vec![unsupported(
                 field.span,
@@ -1121,6 +1185,7 @@ fn require_runtime_type(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool | Ty::Unit | Ty::Option(ValueTy::Bool) => Ok(()),
+        Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
             span,
@@ -1142,6 +1207,7 @@ fn require_local_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool | Ty::Option(ValueTy::Bool) => Ok(()),
+        Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
         ty if is_owned_bool_array(ty) => Ok(()),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
@@ -1164,6 +1230,7 @@ fn require_parameter_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
+        Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
             span,
@@ -1520,6 +1587,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             Ty::Option(ValueTy::Bool) => self.support.require_option_bool(),
             ty if is_owned_bool_array(ty) => self.support.require_array_bool(),
             Ty::Record(record) => self.support.require_record(record),
+            Ty::AffineOption(_) => {
+                unreachable!("affine option escaped LLVM validation into support collection")
+            }
             _ => {}
         }
     }
@@ -2873,6 +2943,9 @@ fn llvm_ty(ty: Ty) -> String {
         Ty::Option(ValueTy::Bool) => LLVM_OPTION_BOOL.into(),
         ty if is_owned_bool_array(ty) => LLVM_ARRAY_BOOL.into(),
         Ty::Record(record) => llvm_record_ty(record),
+        Ty::AffineOption(_) => {
+            unreachable!("affine option escaped LLVM validation into type lowering")
+        }
         _ => unreachable!("type without an LLVM runtime representation validated out"),
     }
 }
@@ -2911,6 +2984,9 @@ fn type_code(ty: Ty) -> String {
         Ty::Unit => "v".into(),
         Ty::Option(ValueTy::Bool) => "ob".into(),
         Ty::Record(record) => format!("r{record}"),
+        Ty::AffineOption(_) => {
+            unreachable!("affine option escaped LLVM validation into symbol mangling")
+        }
         _ => unreachable!("type without an LLVM runtime representation validated out"),
     }
 }
@@ -3048,6 +3124,19 @@ fn unsupported(span: Span, detail: impl Into<String>) -> BackendError {
     )
 }
 
+fn affine_option_unsupported(span: Span, role: &str, ty: Ty) -> BackendError {
+    debug_assert!(matches!(ty, Ty::AffineOption(_)));
+    diag(
+        "backend.affine_option_unsupported",
+        "affine options are not lowered by the LLVM backend",
+        span,
+        format!(
+            "{role} has type `{}`; native lowering waits for atomic take and conditional destruction semantics",
+            ty.name()
+        ),
+    )
+}
+
 fn diag(
     name: &str,
     title: impl Into<String>,
@@ -3067,8 +3156,8 @@ fn diag(
 mod tests {
     use super::*;
     use crate::ast::{
-        ExternInfo, GenericTy, Param, Program, ProofReuse, RecordField, StorageLayout, TypeArg,
-        ValueTy,
+        AffineOptionTy, ExternInfo, GenericTy, Param, Program, ProofReuse, RecordField,
+        StorageLayout, TypeArg, ValueTy,
     };
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
@@ -3527,6 +3616,98 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(entry_record_error[0].name, "backend.entry_signature");
+    }
+
+    #[test]
+    fn affine_options_are_rejected_before_copy_option_lowering() {
+        let affine_bool = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool));
+        let affine_integer = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)));
+        let assert_affine_error = |errors: Vec<BackendError>| {
+            assert_eq!(errors[0].name, "backend.affine_option_unsupported");
+            assert!(errors[0].label.contains("option<["), "{:?}", errors[0]);
+        };
+
+        for ty in [affine_bool, affine_integer] {
+            let errors = emit_program(
+                &program(vec![function("affine_return", ty, Vec::new())]),
+                1,
+                &EmitOptions::default(),
+            )
+            .expect_err("an affine option must not acquire a native return ABI");
+            assert_affine_error(errors);
+        }
+        assert_affine_error(
+            emit_program(
+                &program(vec![function("affine_entry", affine_bool, Vec::new())]),
+                1,
+                &EmitOptions {
+                    entry: Some("affine_entry".into()),
+                },
+            )
+            .expect_err("the entry signature gate must retain the affine diagnostic"),
+        );
+
+        let mut parameterized = function(
+            "affine_parameter",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        parameterized.params.push(parameter("pending", affine_bool));
+        assert_affine_error(
+            emit_program(&program(vec![parameterized]), 1, &EmitOptions::default())
+                .expect_err("an affine option must not acquire a native parameter ABI"),
+        );
+
+        let local = function(
+            "affine_local",
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: affine_bool,
+                name: "pending".into(),
+                name_span: Span::new(0, 1),
+                init: Some(expression(ExprKind::NoneE, affine_bool)),
+                mutable: true,
+            }],
+        );
+        assert_affine_error(
+            emit_program(&program(vec![local]), 1, &EmitOptions::default())
+                .expect_err("an affine option must not acquire native local storage"),
+        );
+
+        let empty = program(Vec::new());
+        let mut locals = ValidationLocals::new();
+        locals
+            .insert(
+                "pending".into(),
+                ValidationLocal {
+                    ty: affine_bool,
+                    mutable: true,
+                },
+                Span::new(0, 1),
+            )
+            .unwrap();
+        let accessor = expression(
+            ExprKind::IsSome {
+                operand: Box::new(typed_variable("pending", affine_bool)),
+            },
+            Ty::Bool,
+        );
+        assert_affine_error(
+            validate_expr(&empty, &accessor, 1, &locals)
+                .expect_err("a forged accessor must not treat an affine option as copyable"),
+        );
+
+        let mut record_program = program(Vec::new());
+        let mut record = integer_pair_record();
+        record.fields[0].ty = affine_bool;
+        record_program.records.push(record);
+        assert_affine_error(
+            emit_program(&record_program, 1, &EmitOptions::default())
+                .expect_err("an affine option must not inherit POD record layout"),
+        );
     }
 
     #[test]

@@ -379,6 +379,10 @@ fn validate_vc_value_ty(
 
 fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
     match ty {
+        Ty::AffineOption(_) => Err(format!(
+            "vc.affine_option_unsupported: `{}` is represented but has no move, take, join, destruction, or proof semantics in {context}",
+            ty.name()
+        )),
         Ty::Param(_) if !allow_param => Err(format!(
             "internal G1.1 VC type error: type parameter escaped monomorphization in {context}"
         )),
@@ -708,6 +712,25 @@ fn validate_vc_expr(
     context: &str,
     locals: &HashMap<String, Ty>,
 ) -> Result<(), String> {
+    // Resolve named operands from the checked environment before consulting
+    // cached expression metadata.  This prevents a forged annotation from
+    // disguising an affine option as an ordinary copy option (or scalar).
+    let named_source = match &expr.kind {
+        ExprKind::Var(name)
+        | ExprKind::Index { array: name, .. }
+        | ExprKind::Len { array: name }
+        | ExprKind::Borrow { array: name, .. }
+        | ExprKind::MethodCall { recv: name, .. }
+        | ExprKind::ClassField { obj: name, .. }
+        | ExprKind::RecordField { obj: name, .. }
+        | ExprKind::ClassFieldLen { obj: name, .. }
+        | ExprKind::ClassFieldIndex { obj: name, .. } => Some(name),
+        _ => None,
+    };
+    if let Some(ty @ Ty::AffineOption(_)) = named_source.and_then(|name| locals.get(name)).copied()
+    {
+        return validate_vc_ty(ty, allow_param, context);
+    }
     if let Some(ty) = expr.ty {
         let position = if matches!(expr.kind, ExprKind::Borrow { .. }) {
             VcTypePosition::Borrow
@@ -1393,6 +1416,8 @@ fn emit_extern_clause_wfs(
             }
             Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
             Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
+            // `generate` has already returned the stable G2.0 diagnostic.
+            Ty::AffineOption(_) => {}
             Ty::Unit => {}
         }
     }
@@ -1991,6 +2016,7 @@ impl<'a> Generator<'a> {
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             Some(Ty::Array(element, _)) => lean_array_ty(*element),
+            Some(Ty::AffineOption(_)) => "Sable.UnsupportedAffineOption".to_string(),
             Some(Ty::Unit) | None => unreachable!("checked: value has a Lean binder type"),
         }
     }
@@ -2028,6 +2054,8 @@ impl<'a> Generator<'a> {
                 Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
                 Ty::Option(element) => Some((name.clone(), lean_option_ty(*element))),
+                // Excluded by `validate_vc_type_domain` before emitter setup.
+                Ty::AffineOption(_) => None,
                 Ty::Unit => None,
             })
             .collect();
@@ -2375,6 +2403,8 @@ impl<'a> Generator<'a> {
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
                 Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
+                // Excluded by `validate_vc_type_domain` before emitter setup.
+                Ty::AffineOption(_) => {}
                 Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
@@ -2445,6 +2475,7 @@ impl<'a> Generator<'a> {
             Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(k, self.records),
             Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
             Ty::Unit => "Unit".into(),
+            Ty::AffineOption(_) => "Sable.UnsupportedAffineOption".into(),
             Ty::Array(..) | Ty::ClassRef(..) => {
                 unreachable!("checked: borrowed values and arrays are not return types")
             }
@@ -6434,6 +6465,8 @@ impl<'a> Generator<'a> {
                     }
                 }
                 Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
+                // Excluded by `validate_vc_type_domain` before emitter setup.
+                Ty::AffineOption(_) => {}
                 Ty::Unit => {}
             }
         }
@@ -7208,6 +7241,52 @@ mod g1_type_domain_tests {
         crate::mono::monomorphize(&mut program).expect("test source should monomorphize");
         let checked = crate::check::check(&mut program).expect("test source should typecheck");
         (program, checked.sigs)
+    }
+
+    fn affine_bool_option() -> Ty {
+        Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+    }
+
+    fn public_generate_error(program: &Program) -> String {
+        match generate(program, &HashMap::new(), "", Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("synthetic affine-option program reached VC generation"),
+        }
+    }
+
+    #[test]
+    fn affine_options_fail_closed_at_the_public_vc_boundary() {
+        let mut return_program = parsed_program("fn subject() {}");
+        return_program.fns[0].ret = affine_bool_option();
+        assert!(
+            public_generate_error(&return_program).starts_with("vc.affine_option_unsupported:")
+        );
+
+        let mut local_program = parsed_program("fn subject() {}");
+        local_program.fns[0].body.push(Stmt::Decl {
+            ty: affine_bool_option(),
+            name: "maybe_flags".into(),
+            name_span: Span::new(0, 0),
+            init: None,
+            mutable: false,
+        });
+        assert!(public_generate_error(&local_program).starts_with("vc.affine_option_unsupported:"));
+
+        let mut expression_program = parsed_program("fn subject() {}");
+        expression_program.fns[0].body.push(Stmt::ExprStmt(Expr {
+            kind: ExprKind::IsSome {
+                operand: Box::new(Expr {
+                    kind: ExprKind::NoneE,
+                    span: Span::new(0, 0),
+                    ty: Some(affine_bool_option()),
+                }),
+            },
+            span: Span::new(0, 0),
+            ty: Some(Ty::Bool),
+        }));
+        assert!(
+            public_generate_error(&expression_program).starts_with("vc.affine_option_unsupported:")
+        );
     }
 
     #[test]

@@ -9,6 +9,10 @@ Sable is an imperative, C-flavored language in which **every function carries a 
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
 - [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
 
+G2.0, the representation/fail-closed foundation for affine options, is closed.
+It deliberately adds no usable affine-option semantics; G2.1 is the next
+widening.
+
 ## The idea in thirty seconds
 
 ```sable
@@ -357,6 +361,42 @@ allocator, grind-budget, LSP, documentation, diff-check, and static-audit gates
 were green. G1.6 is closed. ADR 0059 records the native contract in
 [`docs/decisions/0059-native-owned-boolean-arrays-use-runtime-hooks.md`](docs/decisions/0059-native-owned-boolean-arrays-use-runtime-hooks.md).
 
+G2.0 closes the representation and fail-closed foundation for affine options.
+Existing copyable options remain `Ty::Option(ValueTy)`, while a
+conditionally owning option has the separate checked form
+`Ty::AffineOption(AffineOptionTy::Array(ValueTy))`. The parser accepts
+`option<[T]>` when the array payload is Boolean, integer, or an in-scope type
+parameter and preserves that identity; monomorphization follows it through
+validation, substitution, and concreteness checks. The checked representation
+can also name a record payload, and module visibility follows that nominal
+reference for future or synthetic checked-AST inputs even though the surface
+parser does not yet construct it. The type descriptor remains `Copy`; the
+runtime value it describes will not be.
+
+This checkpoint intentionally grants no source-level affine-option behavior.
+Checker, VC generator, interpreter, formal-SVM lowerer, and LLVM emitter must
+each reject the represented type before it can fall through a copy-option path.
+At otherwise-admissible direct ingresses they use stable
+`*.affine_option_unsupported` diagnostics; an already-unsupported enclosing
+template or class may diagnose its outer boundary first. In either order no
+affine option reaches semantic or native lowering. Construction, observation,
+movement, destruction, and native representation therefore remain deliberately
+unsupported at G2.0. G2.1 will implement the first explicit local-only
+`option<[bool]>` construction and atomic `.take` slice.
+
+G2.0 closed under
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` and the standalone `lake -Kjobs=1 build` were green; Lake built
+22/22 targets with only the same existing linter warnings. Rust library tests
+passed 192/192; all 396 corpus subjects (83 verifies, 246 must-fail, 48 tests,
+19 test-fails) passed in 192.03s; LLVM CLI passed 7/7; the exact
+interpreter/native differential passed 1/1 over six subjects at Clang `-O0`
+and `-O2`; and SVM differential remained 86/86. Randomized allocator,
+grind-budget, LSP, doc-tests, rustfmt, diff-check, and static-audit gates were
+green. ADR 0060 records the separation and staging in
+[`docs/decisions/0060-affine-options-use-an-explicit-ownership-bearing-type.md`](docs/decisions/0060-affine-options-use-an-explicit-ownership-bearing-type.md).
+
 The complete G0 gate ran with one Cargo job, one Sable test job, one Lean job,
 and one Rust test thread. It passed 82/82 library tests, all 368 verifier,
 must-fail, dynamic, and dynamic-failure corpus subjects (424.42s), LLVM CLI
@@ -401,7 +441,7 @@ Architecture in one sentence: the Rust compiler (`compiler/`) owns the program l
 
 ## Where this is headed
 
-The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1, scalar LLVM v0, G0, and **G1.0–G1.6 closed**, the first `option<bool>` slice reaches verification, interpretation, the formal SVM, and native LLVM, root-owned integer-field POD records cross ordinary verified/interpreted/native calls internally, and owned-local Boolean arrays reach verification, interpretation, dynamic monitoring, the formal SVM differential, and native LLVM with lexical cleanup. Broader affine options, generic slots/`Vec`, and `HashMap` follow. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
+The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1, scalar LLVM v0, G0, **G1.0–G1.6 closed**, and the G2.0 affine-option representation/fail-closed foundation closed, the first `option<bool>` slice reaches verification, interpretation, the formal SVM, and native LLVM, root-owned integer-field POD records cross ordinary verified/interpreted/native calls internally, and owned-local Boolean arrays reach verification, interpretation, dynamic monitoring, the formal SVM differential, and native LLVM with lexical cleanup. Affine-option semantics, generic slots/`Vec`, and `HashMap` follow. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
 
 ## Provenance
 

@@ -302,7 +302,9 @@ pub fn load(
 /// text) sees the whole DAG. Enforced on the per-module parses, before
 /// the flat merge erases ownership.
 fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
-    use crate::ast::{Expr, ExprKind, GenericTy, RawOp, ResKind, Stmt, Ty, TypeArg, ValueTy};
+    use crate::ast::{
+        AffineOptionTy, Expr, ExprKind, GenericTy, RawOp, ResKind, Stmt, Ty, TypeArg, ValueTy,
+    };
 
     // Each legal source namespace gets its own global index. Runtime items
     // deliberately share one table; traits and constants do not participate
@@ -497,6 +499,9 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             Ty::Array(element, _) | Ty::Option(element) => {
                 walk_value_ty(element, span, record_externs, refs)
             }
+            Ty::AffineOption(AffineOptionTy::Array(element)) => {
+                walk_value_ty(element, span, record_externs, refs)
+            }
             Ty::Int(_) | Ty::Param(_) | Ty::Bool | Ty::Raw(_) | Ty::Unit => {}
         }
     }
@@ -662,7 +667,17 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     }
                 }
                 Stmt::Assign { value, .. } => walk_expr(value, refs, const_names, record_externs),
-                Stmt::VarDecl { init, .. } => walk_expr(init, refs, const_names, record_externs),
+                Stmt::VarDecl {
+                    init,
+                    ty,
+                    name_span,
+                    ..
+                } => {
+                    if let Some(ty) = ty {
+                        walk_ty(ty, *name_span, externs, record_externs, refs);
+                    }
+                    walk_expr(init, refs, const_names, record_externs);
+                }
                 Stmt::ExprStmt(e) => walk_expr(e, refs, const_names, record_externs),
                 Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
                     walk_expr(size, refs, const_names, record_externs)
@@ -1204,7 +1219,7 @@ fn collision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ExprKind, Mutability, Stmt, Ty, ValueTy};
+    use crate::ast::{AffineOptionTy, ExprKind, Mutability, Stmt, Ty, ValueTy};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1274,6 +1289,8 @@ mod tests {
     enum AggregateRecordSite {
         ArrayParameter,
         OptionReturn,
+        AffineOptionReturn,
+        InferredAffineOptionLocal,
         AllocationElement,
     }
 
@@ -1309,6 +1326,35 @@ mod tests {
                     .find(|function| function.name == "aggregate")
                     .expect("aggregate function exists");
                 function.ret = Ty::Option(ValueTy::Record(record_index));
+            }
+            AggregateRecordSite::AffineOptionReturn => {
+                let function = root
+                    .fns
+                    .iter_mut()
+                    .find(|function| function.name == "aggregate")
+                    .expect("aggregate function exists");
+                function.ret =
+                    Ty::AffineOption(AffineOptionTy::Array(ValueTy::Record(record_index)));
+            }
+            AggregateRecordSite::InferredAffineOptionLocal => {
+                let function = root
+                    .fns
+                    .iter_mut()
+                    .find(|function| function.name == "allocation")
+                    .expect("allocation function exists");
+                function.body.push(Stmt::VarDecl {
+                    name: "optional".into(),
+                    name_span: function.name_span,
+                    mutable: false,
+                    init: crate::ast::Expr {
+                        kind: ExprKind::NoneE,
+                        span: function.name_span,
+                        ty: None,
+                    },
+                    ty: Some(Ty::AffineOption(AffineOptionTy::Array(ValueTy::Record(
+                        record_index,
+                    )))),
+                });
             }
             AggregateRecordSite::AllocationElement => {
                 let function = root
@@ -1452,6 +1498,8 @@ fn read() -> u64 {
         for site in [
             AggregateRecordSite::ArrayParameter,
             AggregateRecordSite::OptionReturn,
+            AggregateRecordSite::AffineOptionReturn,
+            AggregateRecordSite::InferredAffineOptionLocal,
             AggregateRecordSite::AllocationElement,
         ] {
             let fixture = FixtureDir::new(&[
@@ -1488,6 +1536,8 @@ fn allocation() {
         for site in [
             AggregateRecordSite::ArrayParameter,
             AggregateRecordSite::OptionReturn,
+            AggregateRecordSite::AffineOptionReturn,
+            AggregateRecordSite::InferredAffineOptionLocal,
             AggregateRecordSite::AllocationElement,
         ] {
             let fixture = FixtureDir::new(&[

@@ -670,7 +670,8 @@ option slice, G1.4a's internal POD record-value slice, and G1.4b's owned-local
 Boolean-array proof/runtime slice are complete. G1.5's closure of that exact
 local slice in the formal SVM and differential lowerer is also complete. G1.6's
 native storage and lexical cleanup for that same local slice are complete. The broader
-aggregate-generics/backend track continues at M46+. The order remains a working
+aggregate-generics/backend track continues at M46+; G2.0's affine-option
+representation/fail-closed checkpoint is closed. The order remains a working
 hypothesis, not a promise that evidence cannot reorder it:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
@@ -1003,8 +1004,63 @@ hypothesis, not a promise that evidence cannot reorder it:
      differential passed 1/1 over six subjects at both levels; and SVM stayed
      green at 86/86. Randomized allocator, grind-budget, LSP, documentation,
      diff-check, and static-audit gates were green. G1.6 is closed.
-   - **G2 — affine options:** carry ownership and destruction correctly through
-     present/absent aggregate values.
+   - **G2 — affine options (staged; G2.0 complete):** carry ownership and
+     destruction correctly through present/absent aggregate values without
+     widening the existing copy-option family by accident.
+
+     **G2.0 — representation/fail-closed foundation (complete):** preserve
+     `Ty::Option(ValueTy)` for copyable payloads
+     and represent a conditionally owning array option separately as
+     `Ty::AffineOption(AffineOptionTy::Array(ValueTy))`. The parser accepts
+     `option<[T]>` for Boolean, integer, or in-scope type-parameter payloads.
+     Monomorphization must validate, substitute, and recheck that identity. The
+     checked representation also has an honest `ValueTy::Record` case, and
+     module traversal must enforce its nominal visibility for future or
+     synthetic checked-AST inputs; the surface parser does not yet construct
+     that case.
+
+     G2.0 deliberately has no construction, accessor, move, destruction,
+     proof, interpreter, machine, or native semantics. The checker, VC
+     generator, interpreter, Rust-to-SVM lowerer, and LLVM emitter each reject
+     `Ty::AffineOption` before any copy-option semantics can be selected. At an
+     otherwise-admissible direct ingress they use stable `type`, `vc`,
+     `interp`, `svm`, and `backend` `affine_option_unsupported` diagnostics
+     respectively. An already-unsupported enclosing template or class may
+     diagnose its outer boundary first, including in LLVM whole-module mode;
+     no affine value reaches lowering in either case. Existing copyable options
+     retain their current behavior.
+
+     The exact closure command was
+     `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. `cargo check` and standalone
+     `lake -Kjobs=1 build` were green; Lake built 22/22 targets with only the
+     same existing linter warnings. Rust library tests passed 192/192; all 396
+     corpus subjects (83 verifies, 246 must-fail, 48 tests, 19 test-fails)
+     passed in 192.03s; LLVM CLI passed 7/7; exact interpreter/native
+     differential passed 1/1 over six subjects at `-O0` and `-O2`; and SVM
+     differential stayed 86/86. Randomized allocator, grind-budget, LSP,
+     doc-tests, rustfmt, diff-check, and static-audit gates were green. G2.0 is
+     closed.
+
+     **G2.1 — local construction and take (next):** admit only explicit local
+     `option<[bool]>` values initialized by `none` or `some` of a fresh Boolean
+     array allocation. `.is_some` observes without consuming; `.value` remains
+     forbidden for an affine payload; `.take` atomically checks presence,
+     transfers the payload into an explicit owned-array destination, and
+     clears the mutable named source. Parameters, returns, calls, fields,
+     borrows, generic transport, nested affine options, whole-option
+     assignment, and inferred bindings remain closed.
+
+     **G2.2 — formal machine (later):** add an atomic statement-level take to
+     the relational SVM and proved evaluator, then carry the exact slice
+     through differential lowering. A pure extraction followed by assignment
+     is not an acceptable model because its intermediate state has two owners.
+
+     **G2.3 — native local lowering (later):** add an internal tag/live bit plus
+     the Boolean-array descriptor, source clearing, and conditional lexical
+     destruction. This remains local lowering and does not define an
+     affine-option ABI.
    - **G3 — slots and `Vec`:** make generic element storage and movement real
      for the existing growable-vector benchmark.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with

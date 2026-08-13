@@ -305,8 +305,16 @@ fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(),
     validate_interp_ty(ty, context)
 }
 
+fn affine_option_interp_error(ty: Ty, context: &str) -> String {
+    format!(
+        "interp.affine_option_unsupported: `{}` is represented but has no move, take, join, destruction, or runtime semantics in {context}",
+        ty.name()
+    )
+}
+
 fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
+        Ty::AffineOption(_) => Err(affine_option_interp_error(ty, context)),
         Ty::Array(ValueTy::Bool, Mutability::Owned) => Ok(()),
         Ty::Array(ValueTy::Bool, _) => Err(format!(
             "interp.array_position_unsupported: {context} is a borrowed Boolean array; \
@@ -515,6 +523,25 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut HashMap<String, Ty>) -> Re
 }
 
 fn validate_interp_expr(expr: &Expr, locals: &HashMap<String, Ty>) -> Result<(), String> {
+    // Resolve source places independently of their cached annotations.  Raw
+    // AST callers must not be able to relabel an affine option and send it
+    // through the ordinary `RtVal::Opt` implementation.
+    let named_source = match &expr.kind {
+        ExprKind::Var(name)
+        | ExprKind::Index { array: name, .. }
+        | ExprKind::Len { array: name }
+        | ExprKind::Borrow { array: name, .. }
+        | ExprKind::MethodCall { recv: name, .. }
+        | ExprKind::ClassField { obj: name, .. }
+        | ExprKind::RecordField { obj: name, .. }
+        | ExprKind::ClassFieldLen { obj: name, .. }
+        | ExprKind::ClassFieldIndex { obj: name, .. } => Some(name),
+        _ => None,
+    };
+    if let Some(ty @ Ty::AffineOption(_)) = named_source.and_then(|name| locals.get(name)).copied()
+    {
+        return Err(affine_option_interp_error(ty, "expression source"));
+    }
     if let Some(ty) = expr.ty {
         validate_interp_ty(ty, "expression annotation")?;
     }
@@ -3519,6 +3546,59 @@ mod g1_payload_guard_tests {
 
     fn int_lit(value: i128) -> Expr {
         expr(ExprKind::IntLit(value), Some(Ty::Int(IntTy::U64)))
+    }
+
+    fn affine_bool_option() -> Ty {
+        Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+    }
+
+    fn public_interp_error(program: &Program) -> String {
+        let modules = crate::modules::ModuleSet::single("synthetic".into(), String::new());
+        run_fn(program, &modules, "subject")
+            .expect_err("synthetic affine-option program reached interpreter execution")
+    }
+
+    #[test]
+    fn affine_options_fail_closed_at_the_public_interpreter_boundary() {
+        let mut return_program = empty_program();
+        return_program
+            .fns
+            .push(function("subject", affine_bool_option(), Vec::new()));
+        assert!(
+            public_interp_error(&return_program).starts_with("interp.affine_option_unsupported:")
+        );
+
+        let mut local_program = empty_program();
+        local_program.fns.push(function(
+            "subject",
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: affine_bool_option(),
+                name: "maybe_flags".into(),
+                name_span: Span::new(0, 0),
+                init: None,
+                mutable: false,
+            }],
+        ));
+        assert!(
+            public_interp_error(&local_program).starts_with("interp.affine_option_unsupported:")
+        );
+
+        let mut expression_program = empty_program();
+        expression_program.fns.push(function(
+            "subject",
+            Ty::Unit,
+            vec![Stmt::ExprStmt(expr(
+                ExprKind::IsSome {
+                    operand: Box::new(expr(ExprKind::NoneE, Some(affine_bool_option()))),
+                },
+                Some(Ty::Bool),
+            ))],
+        ));
+        assert!(
+            public_interp_error(&expression_program)
+                .starts_with("interp.affine_option_unsupported:")
+        );
     }
 
     fn with_empty_interpreter<R>(run: impl FnOnce(&mut Interp<'_>) -> R) -> R {

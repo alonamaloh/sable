@@ -1167,10 +1167,11 @@ impl<'a> Parser<'a> {
             })
     }
 
-    /// Option payload parsing shares the concrete Boolean identity admitted by
-    /// arrays, and additionally represents visible POD records honestly so the
-    /// checker can reject them at its semantic boundary with a stable
-    /// diagnostic. Classes and nested aggregates are not value payloads here.
+    /// Copyable option payload parsing shares the concrete Boolean identity
+    /// admitted by arrays, and additionally represents visible POD records
+    /// honestly so the checker can reject them at its semantic boundary with a
+    /// stable diagnostic. Affine aggregate payloads are parsed separately by
+    /// `option_ty`; classes are not value payloads here.
     fn option_value_ty(&mut self) -> PResult<(ValueTy, Span)> {
         let (name, span) = self.ident()?;
         if name == "bool" {
@@ -1354,10 +1355,11 @@ impl<'a> Parser<'a> {
         Ok((Ty::Raw(elem), start.join(end)))
     }
 
-    /// The option families currently admitted by the parser: integer/Boolean
-    /// value options (plus retained declaration parameters), and nullable
-    /// pointers to explicit records. POD record values reach the checker only
-    /// to receive the G1 semantic-boundary diagnostic.
+    /// The option families represented by the parser: integer/Boolean value
+    /// options (plus retained declaration parameters), affine owned-array
+    /// options, and nullable pointers to explicit records. POD record values
+    /// and affine options reach later stages as honest types while their
+    /// respective semantic boundaries remain closed.
     fn option_ty(&mut self) -> PResult<(Ty, Span)> {
         let (name, start) = self.ident()?;
         debug_assert_eq!(name, "option");
@@ -1380,6 +1382,16 @@ impl<'a> Parser<'a> {
                     )],
                 }),
             };
+        }
+        if self.at(&Tok::LBracket) {
+            self.bump();
+            let (element, _) = self.array_payload_ty()?;
+            self.expect(Tok::RBracket)?;
+            let end = self.expect(Tok::Gt)?.span;
+            return Ok((
+                Ty::AffineOption(AffineOptionTy::Array(element)),
+                start.join(end),
+            ));
         }
         let (elem, _) = self.option_value_ty()?;
         let end = self.expect(Tok::Gt)?.span;
@@ -1616,8 +1628,8 @@ impl<'a> Parser<'a> {
             })
     }
 
-    /// A return type: scalar, `option<T>`, a class (ADR 0010), or an
-    /// owned resource (ADR 0024).
+    /// A return type: scalar, `option<T>` (including the represented affine
+    /// aggregate form), a class (ADR 0010), or an owned resource (ADR 0024).
     fn ret_ty(&mut self) -> PResult<Ty> {
         if self.at(&Tok::KwResource) {
             return Ok(self.resource_ty()?.0);
@@ -4833,6 +4845,65 @@ fn choose(i32 value) -> option<bool> {
             &payload.kind,
             ExprKind::Binary { op: BinOp::Gt, .. }
         ));
+    }
+
+    #[test]
+    fn affine_array_options_preserve_their_recursive_checked_type() {
+        let source = r#"
+record Header #[layout(size := 1, align := 1)] {
+    #[offset(0)] u8 tag;
+}
+
+fn surface(
+    option<[bool]> flags,
+    option<bool> scalar,
+    option<raw<Header>> pointer
+) -> option<[i32]> {
+    mut option<[bool]> output = none;
+    return none;
+}
+
+fn generic<T>(option<[T]> input) -> option<[T]> {
+    return input;
+}
+"#;
+        let program = parse_source(source).unwrap();
+        let surface = &program.fns[0];
+        assert_eq!(
+            surface.params[0].ty,
+            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+        );
+        assert_eq!(surface.params[1].ty, Ty::Option(ValueTy::Bool));
+        assert_eq!(surface.params[2].ty, Ty::OptionRaw(0));
+        assert_eq!(surface.params[0].ty.name(), "option<[bool]>");
+        assert_eq!(
+            surface.ret,
+            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)))
+        );
+
+        let Stmt::Decl {
+            ty,
+            init: Some(initializer),
+            mutable,
+            ..
+        } = &surface.body[0]
+        else {
+            panic!("expected the explicit affine-option local");
+        };
+        assert_eq!(*ty, Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool)));
+        assert!(*mutable);
+        assert!(matches!(&initializer.kind, ExprKind::NoneE));
+
+        let parameter = TypeParamId::from_legacy(0);
+        let generic = &program.fns[1];
+        assert_eq!(
+            generic.params[0].ty,
+            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)))
+        );
+        assert_eq!(
+            generic.ret,
+            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)))
+        );
     }
 
     #[test]

@@ -1851,6 +1851,14 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 mutable,
                 ty,
             } => {
+                // Parser-produced inferred bindings start with no cached
+                // type, but public/preconstructed ASTs may provide one.
+                // Validate it before inference can overwrite it, otherwise
+                // an affine aggregate could be relabelled as its scalar
+                // initializer and bypass the G2.0 boundary.
+                if let Some(cached) = *ty {
+                    validate_aggregate_ty(cached, *name_span)?;
+                }
                 if !ctx.declared.insert(name.clone()) {
                     return Err(Diagnostic {
                         name: "type.duplicate_name".into(),
@@ -2520,10 +2528,30 @@ fn option_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
     }
 }
 
+/// G2.0 records ownership-bearing option shapes in the AST, but deliberately
+/// does not give them copy-option semantics.  Keep one diagnostic identity at
+/// every checker entry so a forged/preconstructed AST fails the same way as a
+/// parsed declaration.
+fn affine_option_unsupported(ty: Ty, span: Span) -> Diagnostic {
+    Diagnostic {
+        name: "type.affine_option_unsupported".into(),
+        title: format!("affine option `{}` is not supported yet", ty.name()),
+        span,
+        label: "ownership-bearing options do not have move, take, join, or destruction rules yet"
+            .into(),
+        notes: vec![(
+            "note".into(),
+            "G2.0 represents this type without treating it as an ordinary copyable option; its checker, proof, interpreter, SVM, and LLVM semantics must land together"
+                .into(),
+        )],
+    }
+}
+
 fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
     match ty {
         Ty::Array(payload, _) => array_payload_ty(payload, span).map(|_| ()),
         Ty::Option(payload) => option_payload_ty(payload, span).map(|_| ()),
+        Ty::AffineOption(_) => Err(affine_option_unsupported(ty, span)),
         _ => Ok(()),
     }
 }
@@ -2736,6 +2764,12 @@ fn is_abstract_integer_ty(ty: Ty) -> bool {
 }
 
 fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
+    if let Some(ty @ Ty::AffineOption(_)) = expected {
+        return Err(affine_option_unsupported(ty, e.span));
+    }
+    if let Some(ty @ Ty::AffineOption(_)) = e.ty {
+        return Err(affine_option_unsupported(ty, e.span));
+    }
     let ty = infer_expr(ctx, e, expected)?;
     if let Some(exp) = expected {
         if ty != exp {
@@ -2809,6 +2843,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
+                if matches!(v.ty, Ty::AffineOption(_)) {
+                    return Err(affine_option_unsupported(v.ty, span));
+                }
                 if ctx.is_moved(&Place::local(name)) {
                     return Err(moved_out(ctx, &Place::local(name), span, "read"));
                 }
@@ -4870,13 +4907,14 @@ fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
     Ok(())
 }
 
-/// Values that can be transferred but not duplicated: class values and
-/// resources, and owned arrays, whose element storage is shared by every
-/// name that reaches it.
+/// Values that can be transferred but not duplicated: class values,
+/// resources, owned arrays, and options which conditionally own an affine
+/// payload. G2.0 rejects the latter before a transfer can occur, but its
+/// ownership identity must not depend on which checker entry observed it.
 fn is_affine(ty: Ty) -> bool {
     matches!(
         ty,
-        Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned)
+        Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned) | Ty::AffineOption(_)
     )
 }
 
@@ -5650,6 +5688,67 @@ mod g1_concrete_aggregate_tests {
             Err(error) => error,
             Ok(_) => panic!("test source unexpectedly typechecked"),
         }
+    }
+
+    fn affine_bool_option() -> Ty {
+        Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+    }
+
+    #[test]
+    fn affine_options_fail_closed_at_the_public_checker_boundary() {
+        let mut return_program = monomorphized_program("fn subject() {}");
+        return_program.fns[0].ret = affine_bool_option();
+        assert_eq!(
+            check_error(&mut return_program).name,
+            "type.affine_option_unsupported"
+        );
+
+        let mut local_program = monomorphized_program("fn subject() {}");
+        local_program.fns[0].body.push(Stmt::Decl {
+            ty: affine_bool_option(),
+            name: "maybe_flags".into(),
+            name_span: Span::new(0, 0),
+            init: None,
+            mutable: false,
+        });
+        assert_eq!(
+            check_error(&mut local_program).name,
+            "type.affine_option_unsupported"
+        );
+
+        let mut inferred_program = monomorphized_program("fn subject() {}");
+        inferred_program.fns[0].body.push(Stmt::VarDecl {
+            name: "forged".into(),
+            name_span: Span::new(0, 0),
+            mutable: false,
+            init: Expr {
+                kind: ExprKind::BoolLit(true),
+                span: Span::new(0, 0),
+                ty: Some(Ty::Bool),
+            },
+            ty: Some(affine_bool_option()),
+        });
+        assert_eq!(
+            check_error(&mut inferred_program).name,
+            "type.affine_option_unsupported"
+        );
+
+        let mut expression_program = monomorphized_program("fn subject() {}");
+        expression_program.fns[0].body.push(Stmt::ExprStmt(Expr {
+            kind: ExprKind::IsSome {
+                operand: Box::new(Expr {
+                    kind: ExprKind::NoneE,
+                    span: Span::new(0, 0),
+                    ty: Some(affine_bool_option()),
+                }),
+            },
+            span: Span::new(0, 0),
+            ty: Some(Ty::Bool),
+        }));
+        assert_eq!(
+            check_error(&mut expression_program).name,
+            "type.affine_option_unsupported"
+        );
     }
 
     #[test]

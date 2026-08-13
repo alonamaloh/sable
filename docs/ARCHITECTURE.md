@@ -515,6 +515,47 @@ foreign, or cross-module array ABI.
   differential passes 1/1 over six subjects at both levels; and SVM remains
   86/86. Randomized allocator, grind-budget, LSP, documentation, diff-check,
   and static-audit gates are green. G1.6 is closed.
+- **Affine options get a checked ownership identity before they get
+  semantics.** G2.0 is the closed representation/fail-closed checkpoint.
+  The existing `Ty::Option(ValueTy)` remains the copyable option family;
+  `option<[T]>` parses to the distinct
+  `Ty::AffineOption(AffineOptionTy::Array(ValueTy))`. This keeps every legacy
+  copy-option match honest and makes ownership visible in the checked type
+  without making the small type descriptor itself non-`Copy`.
+
+  The parser preserves Boolean, integer, or in-scope-parameter array payload
+  identity rather than pretending every future affine option is Boolean.
+  Monomorphization validates and substitutes parameter payloads and rechecks
+  concreteness. The checked representation can additionally carry
+  `ValueTy::Record`; module traversal applies nominal visibility to that future
+  or synthetic checked-AST case even though the surface parser does not yet
+  construct it. Those representation paths authorize no payload: every
+  semantic boundary remains fail closed, including for the eventual Boolean
+  case.
+
+  At otherwise-admissible direct ingresses, the required fail-closed
+  diagnostics are
+  `type.affine_option_unsupported`, `vc.affine_option_unsupported`,
+  `interp.affine_option_unsupported`, `svm.affine_option_unsupported`, and
+  `backend.affine_option_unsupported`. They prevent checker, proof generation,
+  execution, formal lowering, or native lowering from accidentally sharing a
+  copy-option path. An enclosing unsupported template or class may report its
+  outer diagnostic first, including at LLVM's whole-module boundary; this
+  changes diagnostic precedence, not the no-lowering guarantee. G2.1 is the
+  next widening: explicit local `option<[bool]>` construction and an atomic
+  consuming `.take`, still without parameters, returns, fields, or an ABI.
+
+  G2.0 closed under the exact one-worker command
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+  SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`. `cargo check` and standalone
+  `lake -Kjobs=1 build` were green; Lake built 22/22 targets with only the same
+  existing linter warnings. Rust library tests passed 192/192; all 396 corpus
+  subjects (83 verifies, 246 must-fail, 48 tests, 19 test-fails) passed in
+  192.03s; LLVM CLI passed 7/7; the exact interpreter/native differential
+  passed 1/1 over six subjects at `-O0` and `-O2`; and SVM differential stayed
+  86/86. Randomized allocator, grind-budget, LSP, doc-tests, rustfmt,
+  diff-check, and static-audit gates were green. G2.0 is closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

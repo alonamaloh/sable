@@ -468,6 +468,31 @@ impl From<IntTy> for ValueTy {
     }
 }
 
+/// The ownership-carrying payload shapes represented by an affine option.
+///
+/// This is deliberately distinct from [`ValueTy`]: ordinary `option<T>` is a
+/// copyable scalar/POD value, while `option<[T]>` conditionally owns array
+/// storage and therefore needs move, take, join, and destruction rules. G2.0
+/// records that recursive ownership shape without enabling those semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AffineOptionTy {
+    Array(ValueTy),
+}
+
+impl AffineOptionTy {
+    pub fn name(self) -> String {
+        match self {
+            AffineOptionTy::Array(element) => format!("[{}]", element.name()),
+        }
+    }
+
+    pub fn is_concrete(self) -> bool {
+        match self {
+            AffineOptionTy::Array(element) => element.is_concrete(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
     Int(IntTy),
@@ -492,6 +517,10 @@ pub enum Ty {
     /// `option<u64>` etc. Return types only. As with arrays, G1 represents the
     /// future bool/POD cases before enabling their semantics.
     Option(ValueTy),
+    /// An option whose present case owns an affine aggregate. G2.0 represents
+    /// the recursive type shape; later G2 slices define construction,
+    /// movement, extraction, joins, destruction, and runtime encodings.
+    AffineOption(AffineOptionTy),
     /// `option<raw<R>>` for an explicitly laid-out record. This is an
     /// abstract nullable pointer value, not a byte representation.
     OptionRaw(usize),
@@ -980,6 +1009,7 @@ impl Ty {
             Ty::ResRef(k, Mutability::Mut) => format!("resource &mut {}", k.name()),
             Ty::ResRef(k, _) => format!("resource &{}", k.name()),
             Ty::Option(t) => format!("option<{}>", t.name()),
+            Ty::AffineOption(payload) => format!("option<{}>", payload.name()),
             Ty::OptionRaw(_) => "option<raw<record>>".to_string(),
             Ty::Unit => "()".to_string(),
         }
@@ -1727,6 +1757,10 @@ mod generic_ty_tests {
         assert!(ValueTy::Bool.is_concrete());
         assert_eq!(Ty::Param(parameter).name(), "<T7>");
         assert_eq!(Ty::Option(ValueTy::Param(parameter)).name(), "option<<T7>>");
+        let affine = AffineOptionTy::Array(ValueTy::Param(parameter));
+        assert!(!affine.is_concrete());
+        assert_eq!(Ty::AffineOption(affine).name(), "option<[<T7>]>");
+        assert!(AffineOptionTy::Array(ValueTy::Bool).is_concrete());
     }
 
     #[test]

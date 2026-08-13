@@ -123,6 +123,12 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
         ));
     }
     for param in &f.params {
+        if matches!(param.ty, Ty::AffineOption(_)) {
+            return Err(affine_option_unsupported(
+                param.ty,
+                &format!("parameter `{}`", param.name),
+            ));
+        }
         validate_ty_payload(param.ty, &format!("parameter `{}`", param.name))?;
         if bool_array_ty(param.ty) {
             return Err(format!(
@@ -137,6 +143,12 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
                 param.name
             ));
         }
+    }
+    if matches!(f.ret, Ty::AffineOption(_)) {
+        return Err(affine_option_unsupported(
+            f.ret,
+            &format!("return type of `{}`", f.name),
+        ));
     }
     validate_ty_payload(f.ret, &format!("return type of `{}`", f.name))?;
     if bool_array_ty(f.ret) {
@@ -169,6 +181,7 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
 
 fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
+        Ty::AffineOption(_) => Err(affine_option_unsupported(ty, context)),
         Ty::Array(payload, _) => validate_array_payload(payload, context),
         Ty::Option(payload) => validate_option_payload(payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
@@ -176,6 +189,14 @@ fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
+}
+
+fn affine_option_unsupported(ty: Ty, context: &str) -> String {
+    debug_assert!(matches!(ty, Ty::AffineOption(_)));
+    format!(
+        "svm.affine_option_unsupported: {context} has type `{}`; affine options require atomic ownership semantics that are not yet modeled by the formal SVM",
+        ty.name()
+    )
 }
 
 fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
@@ -427,6 +448,9 @@ fn semantic_expr_ty(
     expected: Ty,
     context: &str,
 ) -> Result<Ty, String> {
+    if let Some(ty @ Ty::AffineOption(_)) = expr.ty {
+        return Err(affine_option_unsupported(ty, context));
+    }
     let semantic = match &expr.kind {
         ExprKind::Var(name) => {
             let ty = ctx.initialized_local(name, context)?.ty;
@@ -884,6 +908,10 @@ fn svm_option_repr(expr: &Expr, constructor: &str) -> Result<SvmOptionRepr, Stri
             Ok(SvmOptionRepr::Ordinary(payload))
         }
         Some(Ty::OptionRaw(record)) => Ok(SvmOptionRepr::RawRecord(record)),
+        Some(ty @ Ty::AffineOption(_)) => Err(affine_option_unsupported(
+            ty,
+            &format!("`{constructor}` result"),
+        )),
         Some(ty) => Err(format!(
             "svm.option_constructor_type: `{constructor}` result has type `{}`; \
              expected an ordinary or nullable-raw option annotation",
@@ -942,6 +970,12 @@ fn validate_option_accessor(
             SvmOptionRepr::Ordinary(payload)
         }
         Some(Ty::OptionRaw(record)) => SvmOptionRepr::RawRecord(record),
+        Some(ty @ Ty::AffineOption(_)) => {
+            return Err(affine_option_unsupported(
+                ty,
+                &format!("`{accessor}` operand"),
+            ));
+        }
         Some(ty) => {
             return Err(format!(
                 "svm.option_accessor_operand: `{accessor}` operand has type `{}`; \
@@ -990,6 +1024,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         trait_member: bool,
     ) -> Result<(), String> {
         for parameter in &function.params {
+            if matches!(parameter.ty, Ty::AffineOption(_)) {
+                return Err(affine_option_unsupported(
+                    parameter.ty,
+                    &format!("{context} parameter `{}`", parameter.name),
+                ));
+            }
             if bool_array_ty(parameter.ty) {
                 return Err(format!(
                     "svm.bool_array_position_unsupported: {context} parameter `{}` is Boolean-array-typed; Boolean arrays are owned locals only",
@@ -1004,6 +1044,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                     parameter.name
                 ));
             }
+        }
+        if matches!(function.ret, Ty::AffineOption(_)) {
+            return Err(affine_option_unsupported(
+                function.ret,
+                &format!("{context} return type"),
+            ));
         }
         if bool_array_ty(function.ret) {
             return Err(format!(
@@ -1033,6 +1079,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
     }
     for class in program.classes.iter().chain(&program.class_templates) {
         for field in &class.fields {
+            if matches!(field.ty, Ty::AffineOption(_)) {
+                return Err(affine_option_unsupported(
+                    field.ty,
+                    &format!("class `{}.{}` field", class.name, field.name),
+                ));
+            }
             if bool_array_ty(field.ty) {
                 return Err(format!(
                     "svm.bool_array_position_unsupported: class `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
@@ -1076,6 +1128,12 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         let mut field_names = HashSet::new();
         let mut extents: Vec<(i128, i128, &str)> = Vec::new();
         for field in &record.fields {
+            if matches!(field.ty, Ty::AffineOption(_)) {
+                return Err(affine_option_unsupported(
+                    field.ty,
+                    &format!("record `{}.{}` field", record.name, field.name),
+                ));
+            }
             if bool_array_ty(field.ty) {
                 return Err(format!(
                     "svm.bool_array_position_unsupported: record `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
@@ -1248,6 +1306,12 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 mutable,
                 ..
             } => {
+                if matches!(ty, Ty::AffineOption(_)) {
+                    return Err(affine_option_unsupported(
+                        *ty,
+                        &format!("declaration `{name}`"),
+                    ));
+                }
                 validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
                 if bool_array_ty(*ty) {
                     let Some(init) = init else {
@@ -1326,6 +1390,12 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 mutable,
                 ..
             } => {
+                if matches!(ty, Ty::AffineOption(_)) {
+                    return Err(affine_option_unsupported(
+                        *ty,
+                        &format!("inferred declaration `{name}`"),
+                    ));
+                }
                 validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
                 if bool_array_ty(*ty) {
                     validate_fresh_bool_array_initializer(ctx, *ty, init, name)?;
@@ -1677,6 +1747,22 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
 
 /// Lower a zero-argument function's body to a Lean `List Stmt` term.
 pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
+    if let Some(parameter) = f
+        .params
+        .iter()
+        .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+    {
+        return Err(affine_option_unsupported(
+            parameter.ty,
+            &format!("parameter `{}`", parameter.name),
+        ));
+    }
+    if matches!(f.ret, Ty::AffineOption(_)) {
+        return Err(affine_option_unsupported(
+            f.ret,
+            &format!("return type of `{}`", f.name),
+        ));
+    }
     if !f.params.is_empty() {
         return Err("differential subjects must take no parameters".into());
     }
@@ -3370,6 +3456,69 @@ mod tests {
                 "{payload:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn lowering_rejects_affine_options_before_copy_option_classification() {
+        let program = empty_program();
+        let affine_bool = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool));
+        let affine_integer = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)));
+
+        for ty in [affine_bool, affine_integer] {
+            let error = lower_fn(&program, &checked_fn(ty, Vec::new()))
+                .expect_err("an affine option must not inherit ordinary option lowering");
+            assert!(
+                error.starts_with("svm.affine_option_unsupported:"),
+                "{ty:?}: {error}"
+            );
+        }
+
+        let mut parameterized = checked_fn(Ty::Unit, Vec::new());
+        parameterized.params.push(Param {
+            name: "pending".into(),
+            ty: affine_bool,
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+        let error = lower_fn(&program, &parameterized)
+            .expect_err("the zero-argument harness gate must retain the affine diagnostic");
+        assert!(
+            error.starts_with("svm.affine_option_unsupported:"),
+            "{error}"
+        );
+
+        let local = checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: affine_bool,
+                name: "pending".into(),
+                name_span: Span::new(0, 0),
+                init: Some(expr(ExprKind::NoneE, affine_bool)),
+                mutable: true,
+            }],
+        );
+        let error = lower_fn(&program, &local)
+            .expect_err("an affine-option local must remain outside the formal SVM");
+        assert!(
+            error.starts_with("svm.affine_option_unsupported:"),
+            "{error}"
+        );
+
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("pending", affine_bool, true, true)
+            .unwrap();
+        let accessor = expr(
+            ExprKind::IsSome {
+                operand: Box::new(expr(ExprKind::Var("pending".into()), affine_bool)),
+            },
+            Ty::Bool,
+        );
+        let error = validate_expr_payloads(&ctx, &accessor)
+            .expect_err("a forged accessor must not classify an affine option as copyable");
+        assert!(
+            error.starts_with("svm.affine_option_unsupported:"),
+            "{error}"
+        );
     }
 
     #[test]
