@@ -50,6 +50,11 @@ const CASES: &[Case] = &[
         source: "bool_arrays.sable",
         entry: "bool_arrays_entry",
     },
+    Case {
+        label: "affine-options",
+        source: "affine_options.sable",
+        entry: "affine_options_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {

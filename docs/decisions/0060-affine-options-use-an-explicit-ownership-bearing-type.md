@@ -1,6 +1,6 @@
 # ADR 0060 — affine options use an explicit ownership-bearing type
 
-**Decided 2026-08-13; G2.0–G2.2 closed.** Existing
+**Decided 2026-08-13; G2.0–G2.3 closed.** Existing
 `Ty::Option(ValueTy)` describes a copyable value option. Its payload identity
 is deliberately flat, and checker, verifier, interpreter, SVM, and LLVM code
 all rely on that copy boundary. Making one of those payloads affine by
@@ -104,12 +104,21 @@ its `ArrayVal.bools` tag even at length zero. Parameters, returns, calls,
 fields, traits, generics, borrows, exposure, whole-option movement, and every
 affine-option ABI remain outside this bridge.
 
-Native lowering follows only after the semantic/SVM slice closes. Its planned
-internal form is a canonical tag plus the existing Boolean-array descriptor;
-the tag is also the payload-live bit. Taking clears the complete source before
-the destination owns the descriptor, while lexical destruction conditionally
-uses G1.6's array cleanup. No affine-option ABI follows from that internal
-representation.
+G2.3 lowers the exact same local slice natively as
+`%sable.option.array.bool = type { i8, %sable.array.bool }`. The canonical tag
+is also the payload-live bit: zero means the complete aggregate is zero; one
+owns the nested descriptor, including the null/zero descriptor of a present
+empty array. Take guards tag one with existing trap kind 8, extracts on the
+success edge, stores the full source as zero, and only then installs the
+destination. There is no native duplicate-owner state.
+
+LLVM's cleanup registry is typed over ordinary Boolean arrays and affine
+Boolean-array options and retains reverse declaration/scope order. Option drop
+requires both tag one and a nonnull nested pointer before calling the existing
+array-free hook. Absent, taken, and present-empty options call no free hook;
+trap edges call no cleanup. Construction reuses the existing allocation/free
+hooks, 50,000,000-element cap, zero bypass, and trap kinds 9 and 10. No
+affine-option ABI follows from this internal representation.
 
 ## Staging
 
@@ -128,8 +137,9 @@ representation.
 3. **G2.2 — formal machine (complete):** atomic SVM `optTake` and the exact
    Boolean-array differential bridge are present; all other machine transport
    remains fail closed.
-4. **G2.3 — native local lowering (next):** conditional destruction and source
-   clearing, without transport or ABI widening.
+4. **G2.3 — native local lowering (complete):** canonical local tag/live-bit
+   storage, atomic source clearing, and conditional typed destruction, without
+   transport or ABI widening.
 5. Parameters, returns, calls, and fields remain later independent decisions.
 
 Each stage must be independently fail closed and complete its single-worker
@@ -168,5 +178,18 @@ library tests 211/211, and the recursive corpus all 416 subjects (84 verifies,
 native differential passed 1/1 over six subjects at `-O0` and `-O2`; and SVM
 differential passed 92/92. Free-list allocator, grind-budget, LSP,
 documentation, rustfmt, diff-check, and static-audit gates were green. G2.2 is
-closed. LLVM retains the `backend.affine_option_unsupported` fence for G2.3,
-the next stage.
+closed.
+
+G2.3 closed under the exact standard command
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` was green; standalone Lake built 22/22 targets with only the
+existing warnings; focused LLVM units passed 29/29; and Rust library tests
+passed 213/213. The recursive corpus passed all 416 subjects (84 verifies, 263
+must-fail, 49 tests, 20 test-fails) in 194.43s. LLVM CLI passed 8/8; the exact
+interpreter/native differential passed 1/1 over seven subjects at Clang `-O0`
+and `-O2`; and SVM differential remained 92/92. Free-list allocator,
+grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
+were green. All nonlocal, non-Boolean, transport, field, generic, borrow,
+exposure, and ABI paths retain `backend.affine_option_unsupported`. G2.3 is
+closed; generic slots and `Vec` ownership are next, not option ABI widening.

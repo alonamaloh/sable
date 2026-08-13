@@ -332,6 +332,120 @@ fn boolean_arrays_use_versioned_host_hooks_and_pin_lifetime_and_traps() {
 }
 
 #[test]
+fn affine_options_use_atomic_take_and_conditional_native_cleanup() {
+    let source = repo_root().join("corpus/llvm-diff/affine_options.sable");
+    let output = build_command()
+        .args(["build", "--emit-llvm", "-o", "-"])
+        .arg(&source)
+        .output()
+        .expect("run the Sable affine-option LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM affine-option build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
+    assert!(report.contains("status: fully verified"));
+    assert!(!ir.contains("define i32 @main("));
+    assert!(ir.contains("%sable.option.array.bool = type { i8, %sable.array.bool }"));
+    assert!(ir.contains("@__sable_rt_array_alloc_v1"));
+    assert!(ir.contains("@__sable_rt_array_free_v1"));
+    assert!(ir.contains("@__sable_rt_trap_v1"));
+
+    // Discover internal symbols from their source-name component. This keeps
+    // the test independent of the private signature-code spelling while the
+    // injected main still calls the scalar-only helpers in the same module.
+    let entry = internal_function_symbol(&ir, "affine_options_entry");
+    let present = internal_function_symbol(&ir, "affine_option_present_drop");
+    let take = internal_function_symbol(&ir, "affine_option_take_drop");
+    let none = internal_function_symbol(&ir, "affine_option_none_drop");
+    let zero = internal_function_symbol(&ir, "affine_option_zero_drop");
+    let reverse = internal_function_symbol(&ir, "affine_option_reverse_cleanup");
+    let branch = internal_function_symbol(&ir, "affine_option_branch_cleanup");
+    let loop_cleanup = internal_function_symbol(&ir, "affine_option_loop_cleanup");
+    let unsafe_cleanup = internal_function_symbol(&ir, "affine_option_unsafe_cleanup");
+    let early_return = internal_function_symbol(&ir, "affine_option_early_return");
+    let take_none = internal_function_symbol(&ir, "affine_option_take_none_guard");
+    let alloc_guard = internal_function_symbol(&ir, "affine_option_alloc_guard");
+
+    let ir = format!(
+        "{ir}\n\
+         define i32 @main(i32 %argc, ptr %argv) {{\n\
+         entry:\n\
+           switch i32 %argc, label %unexpected [\n\
+             i32 1, label %all\n\
+             i32 2, label %present\n\
+             i32 3, label %take\n\
+             i32 4, label %none\n\
+             i32 5, label %zero\n\
+             i32 6, label %reverse\n\
+             i32 7, label %branch_true\n\
+             i32 8, label %branch_false\n\
+             i32 9, label %loop_cleanup\n\
+             i32 10, label %unsafe_cleanup\n\
+             i32 11, label %early_return\n\
+             i32 12, label %take_none\n\
+             i32 13, label %oom\n\
+           ]\n\
+         all:\n\
+           %all_result = call i32 @{entry}()\n\
+           ret i32 %all_result\n\
+         present:\n\
+           %present_result = call i1 @{present}()\n\
+           %present_status = select i1 %present_result, i32 42, i32 1\n\
+           ret i32 %present_status\n\
+         take:\n\
+           %take_result = call i1 @{take}()\n\
+           %take_status = select i1 %take_result, i32 42, i32 1\n\
+           ret i32 %take_status\n\
+         none:\n\
+           %none_result = call i1 @{none}()\n\
+           %none_status = select i1 %none_result, i32 42, i32 1\n\
+           ret i32 %none_status\n\
+         zero:\n\
+           %zero_result = call i1 @{zero}()\n\
+           %zero_status = select i1 %zero_result, i32 42, i32 1\n\
+           ret i32 %zero_status\n\
+         reverse:\n\
+           %reverse_result = call i1 @{reverse}()\n\
+           %reverse_status = select i1 %reverse_result, i32 42, i32 1\n\
+           ret i32 %reverse_status\n\
+         branch_true:\n\
+           %branch_true_result = call i1 @{branch}(i1 1)\n\
+           %branch_true_status = select i1 %branch_true_result, i32 42, i32 1\n\
+           ret i32 %branch_true_status\n\
+         branch_false:\n\
+           %branch_false_result = call i1 @{branch}(i1 0)\n\
+           %branch_false_status = select i1 %branch_false_result, i32 42, i32 1\n\
+           ret i32 %branch_false_status\n\
+         loop_cleanup:\n\
+           %loop_result = call i1 @{loop_cleanup}()\n\
+           %loop_status = select i1 %loop_result, i32 42, i32 1\n\
+           ret i32 %loop_status\n\
+         unsafe_cleanup:\n\
+           %unsafe_result = call i1 @{unsafe_cleanup}()\n\
+           %unsafe_status = select i1 %unsafe_result, i32 42, i32 1\n\
+           ret i32 %unsafe_status\n\
+         early_return:\n\
+           %early_result = call i1 @{early_return}()\n\
+           %early_status = select i1 %early_result, i32 42, i32 1\n\
+           ret i32 %early_status\n\
+         take_none:\n\
+           %take_none_result = call i1 @{take_none}()\n\
+           ret i32 0\n\
+         oom:\n\
+           %oom_result = call i1 @{alloc_guard}(i64 13)\n\
+           ret i32 0\n\
+         unexpected:\n\
+           ret i32 99\n\
+         }}\n"
+    );
+
+    assert_clang_affine_option_runtime("affine-options", &ir);
+}
+
+#[test]
 fn failed_verification_preserves_an_existing_output() {
     let temp = temp_dir("atomic");
     let destination = temp.join("program.ll");
@@ -631,6 +745,299 @@ void __sable_rt_trap_v1(
         }
     }
     fs::remove_dir_all(&temp).expect("remove isolated LLVM Boolean-array test directory");
+}
+
+fn assert_clang_affine_option_runtime(label: &str, ir: &str) {
+    let Some(clang) = find_clang() else {
+        assert_ne!(
+            std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
+            Ok("1"),
+            "SABLE_REQUIRE_CLANG=1 but no clang executable was found"
+        );
+        return;
+    };
+    let temp = temp_dir(label);
+    let ir_path = temp.join(format!("{label}.ll"));
+    let hook_path = temp.join("affine-option-hooks.c");
+    fs::write(&ir_path, ir).expect("write emitted affine-option IR fixture");
+    fs::write(
+        &hook_path,
+        br#"#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+    void *storage;
+    uint64_t bytes;
+} SableAllocation;
+
+static SableAllocation live_allocations[64];
+static size_t live_count = 0;
+
+void *__sable_rt_array_alloc_v1(uint64_t bytes) {
+    fprintf(stderr, "SABLE_ARRAY_ALLOC_V1 bytes=%" PRIu64 "\n", bytes);
+    fflush(stderr);
+    if (bytes == 13 || bytes > SIZE_MAX) {
+        return NULL;
+    }
+    void *storage = malloc((size_t)bytes);
+    if (storage != NULL) {
+        if (live_count == 64) {
+            abort();
+        }
+        live_allocations[live_count].storage = storage;
+        live_allocations[live_count].bytes = bytes;
+        live_count += 1;
+    }
+    return storage;
+}
+
+void __sable_rt_array_free_v1(void *storage) {
+    uint64_t bytes = UINT64_MAX;
+    for (size_t i = 0; i < live_count; i += 1) {
+        if (live_allocations[i].storage == storage) {
+            bytes = live_allocations[i].bytes;
+            live_count -= 1;
+            live_allocations[i] = live_allocations[live_count];
+            break;
+        }
+    }
+    fprintf(stderr, "SABLE_ARRAY_FREE_V1 bytes=%" PRIu64 "\n", bytes);
+    fflush(stderr);
+    free(storage);
+}
+
+void __sable_rt_trap_v1(
+    int32_t kind,
+    int32_t type_info,
+    uint64_t lhs_bits,
+    uint64_t rhs_bits
+) {
+    fprintf(
+        stderr,
+        "SABLE_TRAP_V1 kind=%" PRId32 " type_info=%" PRIu32
+        " lhs=%" PRIu64 " rhs=%" PRIu64 "\n",
+        kind,
+        (uint32_t)type_info,
+        lhs_bits,
+        rhs_bits
+    );
+    fflush(stderr);
+}
+"#,
+    )
+    .expect("write strong affine-option runtime hooks");
+
+    let cases: &[(&str, usize, &[&str])] = &[
+        (
+            "all",
+            1,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=1",
+                "SABLE_ARRAY_FREE_V1 bytes=1",
+                "SABLE_ARRAY_ALLOC_V1 bytes=2",
+                "SABLE_ARRAY_FREE_V1 bytes=2",
+                "SABLE_ARRAY_ALLOC_V1 bytes=8",
+                "SABLE_ARRAY_ALLOC_V1 bytes=9",
+                "SABLE_ARRAY_FREE_V1 bytes=9",
+                "SABLE_ARRAY_FREE_V1 bytes=8",
+                "SABLE_ARRAY_ALLOC_V1 bytes=3",
+                "SABLE_ARRAY_ALLOC_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=3",
+                "SABLE_ARRAY_ALLOC_V1 bytes=4",
+                "SABLE_ARRAY_ALLOC_V1 bytes=12",
+                "SABLE_ARRAY_FREE_V1 bytes=12",
+                "SABLE_ARRAY_FREE_V1 bytes=4",
+                "SABLE_ARRAY_ALLOC_V1 bytes=5",
+                "SABLE_ARRAY_ALLOC_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=5",
+                "SABLE_ARRAY_ALLOC_V1 bytes=5",
+                "SABLE_ARRAY_ALLOC_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=5",
+                "SABLE_ARRAY_ALLOC_V1 bytes=6",
+                "SABLE_ARRAY_ALLOC_V1 bytes=10",
+                "SABLE_ARRAY_FREE_V1 bytes=10",
+                "SABLE_ARRAY_FREE_V1 bytes=6",
+                "SABLE_ARRAY_ALLOC_V1 bytes=7",
+                "SABLE_ARRAY_FREE_V1 bytes=7",
+            ],
+        ),
+        (
+            "present option drops its payload",
+            2,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=1",
+                "SABLE_ARRAY_FREE_V1 bytes=1",
+            ],
+        ),
+        (
+            "taken source is empty and destination drops",
+            3,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=2",
+                "SABLE_ARRAY_FREE_V1 bytes=2",
+            ],
+        ),
+        ("none option has no payload", 4, &[]),
+        ("zero payload is allocation-free", 5, &[]),
+        (
+            "reverse declaration cleanup",
+            6,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=8",
+                "SABLE_ARRAY_ALLOC_V1 bytes=9",
+                "SABLE_ARRAY_FREE_V1 bytes=9",
+                "SABLE_ARRAY_FREE_V1 bytes=8",
+            ],
+        ),
+        (
+            "true branch cleanup",
+            7,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=3",
+                "SABLE_ARRAY_ALLOC_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=3",
+            ],
+        ),
+        (
+            "false branch cleanup",
+            8,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=4",
+                "SABLE_ARRAY_ALLOC_V1 bytes=12",
+                "SABLE_ARRAY_FREE_V1 bytes=12",
+                "SABLE_ARRAY_FREE_V1 bytes=4",
+            ],
+        ),
+        (
+            "loop iteration cleanup",
+            9,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=5",
+                "SABLE_ARRAY_ALLOC_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=5",
+                "SABLE_ARRAY_ALLOC_V1 bytes=5",
+                "SABLE_ARRAY_ALLOC_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=11",
+                "SABLE_ARRAY_FREE_V1 bytes=5",
+            ],
+        ),
+        (
+            "unsafe open-scope cleanup",
+            10,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=6",
+                "SABLE_ARRAY_ALLOC_V1 bytes=10",
+                "SABLE_ARRAY_FREE_V1 bytes=10",
+                "SABLE_ARRAY_FREE_V1 bytes=6",
+            ],
+        ),
+        (
+            "early return cleanup",
+            11,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=7",
+                "SABLE_ARRAY_FREE_V1 bytes=7",
+            ],
+        ),
+    ];
+
+    for optimization in ["-O0", "-O2"] {
+        let executable = temp.join(format!("{label}-{}", &optimization[1..]));
+        let compile = Command::new(&clang)
+            .args([optimization, "-x", "ir"])
+            .arg(&ir_path)
+            .args(["-x", "c"])
+            .arg(&hook_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("run clang over emitted affine-option IR and replacement hooks");
+        assert!(
+            compile.status.success(),
+            "clang {optimization} rejected affine-option fixture:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        for (case, argc, expected_events) in cases {
+            let output = Command::new(&executable)
+                .args((1..*argc).map(|_| "case"))
+                .output()
+                .expect("run a compiled affine-option lifetime case");
+            assert_eq!(
+                output.status.code(),
+                Some(42),
+                "{case} diverged at {optimization}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr.lines().collect::<Vec<_>>(),
+                expected_events.to_vec(),
+                "wrong {case} hook order at {optimization}"
+            );
+        }
+
+        let absent = Command::new(&executable)
+            .args((1..12).map(|_| "take-none"))
+            .output()
+            .expect("run an absent affine-option take");
+        assert!(
+            !absent.status.success(),
+            "absent take returned after its trap hook at {optimization}"
+        );
+        let absent_stderr = String::from_utf8_lossy(&absent.stderr);
+        assert!(absent_stderr.contains("SABLE_TRAP_V1 kind=8 type_info=0 lhs=0 rhs=0"));
+        assert_eq!(absent_stderr.matches("SABLE_ARRAY_ALLOC_V1").count(), 0);
+        assert_eq!(absent_stderr.matches("SABLE_ARRAY_FREE_V1").count(), 0);
+
+        let oom = Command::new(&executable)
+            .args((1..13).map(|_| "oom"))
+            .output()
+            .expect("run a forced affine-option allocation failure");
+        assert!(
+            !oom.status.success(),
+            "affine-option OOM returned after its trap hook at {optimization}"
+        );
+        let oom_stderr = String::from_utf8_lossy(&oom.stderr);
+        assert!(oom_stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=13"));
+        assert!(oom_stderr.contains("SABLE_TRAP_V1 kind=9 type_info=0 lhs=13 rhs=0"));
+        assert_eq!(oom_stderr.matches("SABLE_ARRAY_ALLOC_V1").count(), 1);
+        assert_eq!(oom_stderr.matches("SABLE_ARRAY_FREE_V1").count(), 0);
+        let allocation = oom_stderr
+            .find("SABLE_ARRAY_ALLOC_V1 bytes=13")
+            .expect("forced OOM calls the allocation hook");
+        let trap = oom_stderr
+            .find("SABLE_TRAP_V1 kind=9")
+            .expect("forced OOM reports trap kind 9");
+        assert!(
+            allocation < trap,
+            "the failed allocation precedes its OOM trap"
+        );
+    }
+    fs::remove_dir_all(&temp).expect("remove isolated LLVM affine-option test directory");
+}
+
+fn internal_function_symbol(ir: &str, source_name: &str) -> String {
+    let marker = format!("_{source_name}__p_");
+    let definition = ir
+        .lines()
+        .find(|line| line.starts_with("define internal ") && line.contains(&marker))
+        .unwrap_or_else(|| panic!("missing emitted definition for `{source_name}`"));
+    let after_at = definition
+        .split_once('@')
+        .map(|(_, suffix)| suffix)
+        .expect("internal definition has a symbol");
+    after_at
+        .split_once('(')
+        .map(|(symbol, _)| symbol.to_owned())
+        .expect("internal definition has a parameter list")
 }
 
 fn assert_clang_exit(label: &str, ir: &str, expected: i32) {

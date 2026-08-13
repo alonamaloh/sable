@@ -515,10 +515,10 @@ foreign, or cross-module array ABI.
   differential passes 1/1 over six subjects at both levels; and SVM remains
   86/86. Randomized allocator, grind-budget, LSP, documentation, diff-check,
   and static-audit gates are green. G1.6 is closed.
-- **Affine options have a checked ownership identity and a fenced local
-  semantic slice.** G2.0 is the closed representation/fail-closed checkpoint;
-  G2.1's checker/proof/interpreter/monitor slice and G2.2's formal-SVM slice
-  are also closed.
+- **Affine options have a checked ownership identity and an exact local native
+  slice.** G2.0 is the closed representation/fail-closed checkpoint; G2.1's
+  checker/proof/interpreter/monitor slice and G2.2's formal-SVM slice are also
+  closed. G2.3's matching LLVM slice is closed as well.
   The existing `Ty::Option(ValueTy)` remains the copyable option family;
   `option<[T]>` parses to the distinct
   `Ty::AffineOption(AffineOptionTy::Array(ValueTy))`. This keeps every legacy
@@ -560,11 +560,10 @@ foreign, or cross-module array ABI.
   Parameters, returns, calls, fields, traits, generics, borrows, exposure,
   inferred option bindings, whole-option assignment, nested or non-Boolean
   affine options, and discarded affine temporaries remain closed. G2.2 opens
-  only the exact local Rust-to-SVM bridge. All other SVM ingresses retain the
-  `svm.affine_option_unsupported` fence, and LLVM retains
-  `backend.affine_option_unsupported` for the entire affine-option slice.
-  G2.3 adds the local native tag/live-bit representation and conditional
-  destruction. Neither stage implies an aggregate ABI.
+  only the exact local Rust-to-SVM bridge; every other SVM ingress retains
+  `svm.affine_option_unsupported`. G2.3 opens only that same local Boolean-array
+  option slice in LLVM; every other native ingress retains
+  `backend.affine_option_unsupported`. Neither stage implies an aggregate ABI.
 
   The formal core uses the existing recursive `Val.opt` and adds
   `Stmt.optTake dst src`, deliberately generic at the untyped machine layer.
@@ -579,6 +578,33 @@ foreign, or cross-module array ABI.
   flat SVM environment reuses lexical-local names across loop iterations and
   must overwrite the stale binding. The tagged `.arr (.bools ...)` payload is
   transferred intact, including the empty-array tag.
+
+  LLVM represents the admitted local as
+  `%sable.option.array.bool = type { i8, %sable.array.bool }`. Tag zero is the
+  complete zero aggregate. Tag one owns the nested descriptor, including a
+  present empty Boolean array whose descriptor is null/zero. Construction is
+  still exactly `none` or `some(alloc_array<bool>(len, init))`; `.is_some`
+  compares the named local's tag with one. A native take loads and guards that
+  tag with trap kind 8, extracts the descriptor only on the success edge,
+  stores the full source as `zeroinitializer`, and then installs the
+  destination. The source therefore ceases to own before the destination slot
+  does.
+
+  The LLVM cleanup registry is typed: it records ordinary Boolean arrays and
+  affine Boolean-array options separately, then unwinds both in the established
+  reverse declaration and scope order. Option cleanup follows the tag-one edge,
+  extracts the payload, and calls `__sable_rt_array_free_v1` only when its data
+  pointer is nonnull. Absent, taken, and present-empty options call no free
+  hook. Construction reuses the existing allocation/free hooks, zero-length
+  bypass, 50,000,000-element cap, kind-9 OOM trap, and kind-10 payload bounds
+  trap. Every trap edge remains terminal and performs no cleanup.
+
+  The native bridge remains local-only. Option parameters and returns, calls,
+  entries, externs, fields, traits, classes, generics, borrows, exposure,
+  whole-option assignment or movement, inferred bindings, discarded affine
+  temporaries, non-Boolean payloads, and wrapping existing or literal arrays
+  remain rejected. The internal named type is versionable and establishes no
+  cross-module, Sable, or C ABI.
 
   G2.0 closed under the exact one-worker command
   `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
@@ -614,8 +640,20 @@ foreign, or cross-module array ABI.
   in 270.58s. LLVM CLI passed 7/7; the native differential passed 1/1 over six
   subjects at `-O0` and `-O2`; and SVM differential passed 92/92. Free-list
   allocator, grind-budget, LSP, documentation, rustfmt, diff-check, and
-  static-audit gates were green. G2.2 is closed; G2.3's local native lowering
-  is next, with LLVM fenced until then.
+  static-audit gates were green. G2.2 is closed.
+
+  G2.3 closed under the exact standard command
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+  SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`. `cargo check` was green; standalone Lake built
+  22/22 targets with only the existing warnings; focused LLVM units passed
+  29/29; and Rust library tests passed 213/213. The recursive corpus passed all
+  416 subjects (84 verifies, 263 must-fail, 49 tests, 20 test-fails) in
+  194.43s. LLVM CLI passed 8/8; the exact interpreter/native differential
+  passed 1/1 over seven subjects at Clang `-O0` and `-O2`; and SVM differential
+  remained 92/92. Free-list allocator, grind-budget, LSP, documentation,
+  rustfmt, diff-check, and static-audit gates were green. G2.3 is closed;
+  generic slots and `Vec` ownership come next, not a widened option ABI.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

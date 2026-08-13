@@ -7,7 +7,10 @@
 //! unchecked arithmetic.
 
 use crate::VerifiedProgram;
-use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, RecordDecl, Stmt, Ty, UnOp, ValueTy};
+use crate::ast::{
+    AffineOptionTy, BinOp, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl, Stmt, Ty,
+    UnOp, ValueTy,
+};
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -475,23 +478,37 @@ fn validate_block(
                 mutable,
             } => {
                 if matches!(ty, Ty::AffineOption(_)) {
-                    return Err(vec![affine_option_unsupported(
-                        *name_span,
-                        "local variable",
+                    validate_affine_bool_option_decl(
+                        program,
+                        name,
                         *ty,
-                    )]);
-                }
-                require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
-                if is_owned_bool_array(*ty) {
+                        *mutable,
+                        init.as_ref(),
+                        root_span_end,
+                        locals,
+                        *name_span,
+                    )?;
+                } else if is_owned_bool_array(*ty) {
+                    require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
                     let Some(value) = init else {
                         return Err(vec![unsupported(
                             *name_span,
                             format!("owned Boolean-array local `{name}` has no initializer"),
                         )]);
                     };
-                    validate_fresh_bool_array_initializer(program, value, root_span_end, locals)?;
-                } else if let Some(value) = init {
-                    validate_expr(program, value, root_span_end, locals)?;
+                    validate_fresh_bool_array_initializer(
+                        program,
+                        value,
+                        root_span_end,
+                        locals,
+                        name,
+                        true,
+                    )?;
+                } else {
+                    require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
+                    if let Some(value) = init {
+                        validate_expr(program, value, root_span_end, locals)?;
+                    }
                 }
                 locals.insert(
                     name.clone(),
@@ -522,9 +539,23 @@ fn validate_block(
                         ty,
                     )]);
                 }
+                if matches!(init.kind, ExprKind::OptTake { .. }) {
+                    return Err(vec![affine_option_take_position(
+                        init.span,
+                        name,
+                        "inferred declaration",
+                    )]);
+                }
                 require_local_value(program, root_span_end, ty, *name_span, "inferred local")?;
                 if is_owned_bool_array(ty) {
-                    validate_fresh_bool_array_initializer(program, init, root_span_end, locals)?;
+                    validate_fresh_bool_array_initializer(
+                        program,
+                        init,
+                        root_span_end,
+                        locals,
+                        name,
+                        false,
+                    )?;
                 } else {
                     validate_expr(program, init, root_span_end, locals)?;
                 }
@@ -558,6 +589,13 @@ fn validate_block(
                     return Err(vec![unsupported(
                         *name_span,
                         format!("owned Boolean-array local `{name}` cannot be rebound"),
+                    )]);
+                }
+                if matches!(local.ty, Ty::AffineOption(_)) {
+                    return Err(vec![affine_option_unsupported(
+                        *name_span,
+                        &format!("whole-option assignment to `{name}`"),
+                        local.ty,
                     )]);
                 }
                 validate_expr(program, value, root_span_end, locals)?;
@@ -613,10 +651,21 @@ fn validate_block(
                 root_span_end,
                 locals,
             )?,
+            Stmt::Expose {
+                kw_span,
+                array,
+                array_span,
+                ..
+            } => {
+                reject_named_affine_option(locals, array, *array_span, "array exposure source")?;
+                return Err(vec![unsupported(
+                    *kw_span,
+                    "raw/resource storage is outside the scalar LLVM subset",
+                )]);
+            }
             Stmt::StaticAlloc { kw_span, .. }
             | Stmt::SystemAlloc { kw_span, .. }
-            | Stmt::SystemDealloc { kw_span, .. }
-            | Stmt::Expose { kw_span, .. } => {
+            | Stmt::SystemDealloc { kw_span, .. } => {
                 return Err(vec![unsupported(
                     *kw_span,
                     "raw/resource storage is outside the scalar LLVM subset",
@@ -628,7 +677,157 @@ fn validate_block(
 }
 
 fn is_owned_bool_array(ty: Ty) -> bool {
-    matches!(ty, Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned))
+    matches!(ty, Ty::Array(ValueTy::Bool, Mutability::Owned))
+}
+
+fn affine_bool_option_ty() -> Ty {
+    Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+}
+
+fn is_affine_bool_option(ty: Ty) -> bool {
+    ty == affine_bool_option_ty()
+}
+
+fn reject_named_affine_option(
+    locals: &ValidationLocals,
+    name: &str,
+    span: Span,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    if let Some(local) = locals.get(name) {
+        if matches!(local.ty, Ty::AffineOption(_)) {
+            return Err(vec![affine_option_unsupported(span, role, local.ty)]);
+        }
+    }
+    Ok(())
+}
+
+fn validate_affine_bool_option_decl(
+    program: &Program,
+    name: &str,
+    ty: Ty,
+    mutable: bool,
+    init: Option<&Expr>,
+    root_span_end: usize,
+    locals: &ValidationLocals,
+    span: Span,
+) -> Result<(), Vec<BackendError>> {
+    if !is_affine_bool_option(ty) {
+        return Err(vec![affine_option_unsupported(
+            span,
+            &format!("declaration `{name}`"),
+            ty,
+        )]);
+    }
+    if !mutable {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            span,
+            format!("affine option local `{name}` must be mutable"),
+        )]);
+    }
+    let Some(init) = init else {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            span,
+            format!(
+                "affine option local `{name}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
+            ),
+        )]);
+    };
+    require_expr_type(init, affine_bool_option_ty(), "affine-option initializer")?;
+    match &init.kind {
+        ExprKind::NoneE => Ok(()),
+        ExprKind::SomeE(payload) => {
+            require_expr_type(
+                payload,
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                "affine-option payload",
+            )?;
+            let ExprKind::AllocArray { elem, len, init } = &payload.kind else {
+                return Err(vec![affine_option_initializer_unsupported(init.span, name)]);
+            };
+            if *elem != ValueTy::Bool {
+                return Err(vec![affine_option_initializer_unsupported(init.span, name)]);
+            }
+            validate_expr(program, len, root_span_end, locals)?;
+            require_expr_type(len, Ty::Int(IntTy::U64), "Boolean array allocation length")?;
+            validate_bool_expr(
+                program,
+                init,
+                "Boolean array allocation initializer",
+                root_span_end,
+                locals,
+            )
+        }
+        _ => Err(vec![affine_option_initializer_unsupported(init.span, name)]),
+    }
+}
+
+fn validate_affine_option_take(
+    expression: &Expr,
+    destination: &str,
+    option: &str,
+    option_span: Span,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    require_expr_type(
+        expression,
+        Ty::Array(ValueTy::Bool, Mutability::Owned),
+        "affine-option take result",
+    )?;
+    if destination == option {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            expression.span,
+            format!("`.take` destination `{destination}` cannot also be its source"),
+        )]);
+    }
+    if locals.declared.contains(destination) {
+        return Err(vec![unsupported(
+            expression.span,
+            format!("duplicate LLVM local `{destination}` escaped checking"),
+        )]);
+    }
+    let Some(source) = locals.get(option) else {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            option_span,
+            format!("`.take` names unknown or out-of-scope local `{option}`"),
+        )]);
+    };
+    if !is_affine_bool_option(source.ty) {
+        return if matches!(source.ty, Ty::AffineOption(_)) {
+            Err(vec![affine_option_unsupported(
+                option_span,
+                &format!("`.take` source `{option}`"),
+                source.ty,
+            )])
+        } else {
+            Err(vec![diag(
+                "backend.affine_option_unsupported",
+                "affine option is outside the admitted LLVM local slice",
+                option_span,
+                format!(
+                    "`.take` source `{option}` has type `{}`; expected `option<[bool]>`",
+                    source.ty.name()
+                ),
+            )])
+        };
+    }
+    if !source.mutable {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            option_span,
+            format!("`.take` source `{option}` must be mutable"),
+        )]);
+    }
+    Ok(())
 }
 
 fn validate_fresh_bool_array_initializer(
@@ -636,8 +835,10 @@ fn validate_fresh_bool_array_initializer(
     expression: &Expr,
     root_span_end: usize,
     locals: &ValidationLocals,
+    local: &str,
+    allow_take: bool,
 ) -> Result<(), Vec<BackendError>> {
-    let expected = Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned);
+    let expected = Ty::Array(ValueTy::Bool, Mutability::Owned);
     require_expr_type(expression, expected, "owned Boolean-array initializer")?;
     match &expression.kind {
         ExprKind::ArrayLit(elements) => {
@@ -672,9 +873,16 @@ fn validate_fresh_bool_array_initializer(
                 locals,
             )
         }
-        ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
+        ExprKind::OptTake {
+            option,
+            option_span,
+        } if allow_take => {
+            validate_affine_option_take(expression, local, option, *option_span, locals)
+        }
+        ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_position(
             expression.span,
             option,
+            "owned Boolean-array initializer",
         )]),
         _ => Err(vec![unsupported(
             expression.span,
@@ -730,6 +938,11 @@ fn validate_expr(
     root_span_end: usize,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
+    if let ExprKind::IsSome { operand } = &expression.kind {
+        if matches!(operand.ty, Some(Ty::AffineOption(_))) {
+            return validate_affine_option_is_some(expression, operand, locals);
+        }
+    }
     if let Some(ty @ Ty::AffineOption(_)) = expression.ty {
         return Err(vec![affine_option_unsupported(
             expression.span,
@@ -992,6 +1205,13 @@ fn validate_expr(
             require_expr_type(expression, Ty::Bool, "`.is_some` result")
         }
         ExprKind::OptValue { operand } => {
+            if let Some(ty @ Ty::AffineOption(_)) = operand.ty {
+                return Err(vec![affine_option_unsupported(
+                    operand.span,
+                    "copying `.value` accessor operand",
+                    ty,
+                )]);
+            }
             validate_expr(program, operand, root_span_end, locals)?;
             require_expr_type(
                 operand,
@@ -1000,9 +1220,10 @@ fn validate_expr(
             )?;
             require_expr_type(expression, Ty::Bool, "Boolean option payload")
         }
-        ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
+        ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_position(
             expression.span,
             option,
+            "expression",
         )]),
         ExprKind::Index {
             array,
@@ -1015,6 +1236,13 @@ fn validate_expr(
                     format!("array index names unknown or out-of-scope local `{array}`"),
                 )]);
             };
+            if matches!(local.ty, Ty::AffineOption(_)) {
+                return Err(vec![affine_option_unsupported(
+                    *array_span,
+                    "array index base",
+                    local.ty,
+                )]);
+            }
             if !is_owned_bool_array(local.ty) {
                 return Err(vec![unsupported(
                     *array_span,
@@ -1035,6 +1263,13 @@ fn validate_expr(
                     format!("array length names unknown or out-of-scope local `{array}`"),
                 )]);
             };
+            if matches!(local.ty, Ty::AffineOption(_)) {
+                return Err(vec![affine_option_unsupported(
+                    expression.span,
+                    "array length base",
+                    local.ty,
+                )]);
+            }
             if !is_owned_bool_array(local.ty) {
                 return Err(vec![unsupported(
                     expression.span,
@@ -1094,7 +1329,8 @@ fn validate_expr(
             }
             Ok(())
         }
-        ExprKind::RecordField { .. } => {
+        ExprKind::RecordField { obj, obj_span, .. } => {
+            reject_named_affine_option(locals, obj, *obj_span, "record field base")?;
             let Some(Ty::Int(integer)) = expression.ty else {
                 return Err(vec![unsupported(
                     expression.span,
@@ -1103,11 +1339,97 @@ fn validate_expr(
             };
             require_concrete_integer(integer, expression.span, "record field projection")
         }
+        ExprKind::Borrow { array, .. } => {
+            reject_named_affine_option(locals, array, expression.span, "borrow source")?;
+            Err(vec![unsupported(
+                expression.span,
+                "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
+            )])
+        }
+        ExprKind::MethodCall {
+            recv, recv_span, ..
+        } => {
+            reject_named_affine_option(locals, recv, *recv_span, "method receiver")?;
+            Err(vec![unsupported(
+                expression.span,
+                "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
+            )])
+        }
+        ExprKind::ClassField { obj, obj_span, .. }
+        | ExprKind::ClassFieldIndex { obj, obj_span, .. } => {
+            reject_named_affine_option(locals, obj, *obj_span, "class field base")?;
+            Err(vec![unsupported(
+                expression.span,
+                "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
+            )])
+        }
+        ExprKind::ClassFieldLen { obj, .. } => {
+            reject_named_affine_option(locals, obj, expression.span, "class field base")?;
+            Err(vec![unsupported(
+                expression.span,
+                "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
+            )])
+        }
         _ => Err(vec![unsupported(
             expression.span,
             "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
         )]),
     }
+}
+
+fn validate_affine_option_is_some(
+    expression: &Expr,
+    operand: &Expr,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    require_expr_type(expression, Ty::Bool, "affine-option `.is_some` result")?;
+    let Some(ty @ Ty::AffineOption(_)) = operand.ty else {
+        unreachable!("called only for an affine-option operand")
+    };
+    if !is_affine_bool_option(ty) {
+        return Err(vec![affine_option_unsupported(
+            operand.span,
+            "`.is_some` operand",
+            ty,
+        )]);
+    }
+    let ExprKind::Var(name) = &operand.kind else {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            operand.span,
+            "`.is_some` requires a named affine-option local",
+        )]);
+    };
+    let Some(local) = locals.get(name) else {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            operand.span,
+            format!("`.is_some` names unknown or out-of-scope local `{name}`"),
+        )]);
+    };
+    if local.ty != ty {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            operand.span,
+            format!(
+                "`.is_some` names `{name}` of type `{}` but is annotated `{}`",
+                local.ty.name(),
+                ty.name()
+            ),
+        )]);
+    }
+    if !local.mutable {
+        return Err(vec![diag(
+            "backend.affine_option_unsupported",
+            "affine option is outside the admitted LLVM local slice",
+            operand.span,
+            format!("affine option local `{name}` must be mutable"),
+        )]);
+    }
+    Ok(())
 }
 
 fn validate_bool_expr(
@@ -1215,6 +1537,7 @@ fn require_local_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool | Ty::Option(ValueTy::Bool) => Ok(()),
+        ty if is_affine_bool_option(ty) => Ok(()),
         Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
         ty if is_owned_bool_array(ty) => Ok(()),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
@@ -1288,6 +1611,11 @@ const LLVM_OPTION_BOOL: &str = "%sable.option.bool";
 /// empty array or a runtime-owned allocation containing one i8 byte per
 /// element; field 1 is the logical element count. This is not a source ABI.
 const LLVM_ARRAY_BOOL: &str = "%sable.array.bool";
+
+/// Internal affine Boolean-array option. The byte tag is canonical: zero is
+/// absent and one owns the nested array descriptor. This remains local-only;
+/// it is deliberately not a source or C ABI.
+const LLVM_AFFINE_OPTION_BOOL_ARRAY: &str = "%sable.option.array.bool";
 
 /// Nominal identity is the checked program's record tag, the same identity
 /// carried by interpreter/SVM values. Numeric names are deterministic and
@@ -1366,6 +1694,7 @@ struct ModuleSupport {
     needs_trap: bool,
     needs_option_bool: bool,
     needs_array_bool: bool,
+    needs_affine_option_bool_array: bool,
     records: BTreeSet<usize>,
 }
 
@@ -1386,6 +1715,11 @@ impl ModuleSupport {
     fn require_array_bool(&mut self) {
         self.needs_array_bool = true;
         self.needs_trap = true;
+    }
+
+    fn require_affine_option_bool_array(&mut self) {
+        self.needs_affine_option_bool_array = true;
+        self.require_array_bool();
     }
 
     fn require_record(&mut self, record: usize) {
@@ -1427,6 +1761,10 @@ impl ModuleSupport {
                  declare ptr @__sable_rt_array_alloc_v1(i64)\n\
                  declare void @__sable_rt_array_free_v1(ptr)\n\n",
             );
+        }
+        if self.needs_affine_option_bool_array {
+            out.push_str(LLVM_AFFINE_OPTION_BOOL_ARRAY);
+            out.push_str(" = type { i8, %sable.array.bool }\n\n");
         }
         for record in &self.records {
             Self::emit_record_type(*record, &program.records[*record], out);
@@ -1478,6 +1816,12 @@ struct Value {
     operand: Option<String>,
 }
 
+#[derive(Clone)]
+enum OwnedCleanup {
+    BoolArray(String),
+    AffineBoolOption(String),
+}
+
 struct FunctionEmitter<'a, 'support> {
     program: &'a Program,
     function: &'a Fn,
@@ -1491,10 +1835,10 @@ struct FunctionEmitter<'a, 'support> {
     /// that its terminator has been emitted; a sibling or merge may still be
     /// started afterwards.
     current_block: Option<String>,
-    /// Owned arrays initialized on the current structured path, grouped by
-    /// lexical lifetime. An `unsafe` block deliberately shares its caller's
-    /// scope; `if` branches and loop bodies push one of their own.
-    cleanup_scopes: Vec<Vec<String>>,
+    /// Ownership-bearing locals initialized on the current structured path,
+    /// grouped by lexical lifetime. An `unsafe` block deliberately shares its
+    /// caller's scope; `if` branches and loop bodies push one of their own.
+    cleanup_scopes: Vec<Vec<OwnedCleanup>>,
 }
 
 impl<'a, 'support> FunctionEmitter<'a, 'support> {
@@ -1594,6 +1938,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         match ty {
             Ty::Option(ValueTy::Bool) => self.support.require_option_bool(),
             ty if is_owned_bool_array(ty) => self.support.require_array_bool(),
+            ty if is_affine_bool_option(ty) => self.support.require_affine_option_bool_array(),
             Ty::Record(record) => self.support.require_record(record),
             Ty::AffineOption(_) => {
                 unreachable!("affine option escaped LLVM validation into support collection")
@@ -1715,7 +2060,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let slot = local.slot.clone();
         if let Some(init) = init {
             let value = if is_owned_bool_array(ty) {
-                self.emit_fresh_bool_array(init)?
+                match &init.kind {
+                    ExprKind::OptTake { option, .. } => self.emit_affine_option_take(option)?,
+                    _ => self.emit_fresh_bool_array(init)?,
+                }
+            } else if is_affine_bool_option(ty) {
+                self.emit_affine_bool_option_initializer(init)?
             } else {
                 self.emit_expr(init)?
             };
@@ -1728,7 +2078,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 self.cleanup_scopes
                     .last_mut()
                     .expect("array declaration has a lexical cleanup scope")
-                    .push(name.to_owned());
+                    .push(OwnedCleanup::BoolArray(name.to_owned()));
+            } else if is_affine_bool_option(ty) {
+                self.cleanup_scopes
+                    .last_mut()
+                    .expect("affine option declaration has a lexical cleanup scope")
+                    .push(OwnedCleanup::AffineBoolOption(name.to_owned()));
             }
         }
         Ok(())
@@ -1819,12 +2174,104 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         match &expression.kind {
             ExprKind::ArrayLit(elements) => self.emit_bool_array_literal(elements),
             ExprKind::AllocArray { len, init, .. } => self.emit_bool_array_allocation(len, init),
-            ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
-                expression.span,
-                option,
-            )]),
+            ExprKind::OptTake { option, .. } => self.emit_affine_option_take(option),
             _ => unreachable!("validated fresh Boolean-array initializer"),
         }
+    }
+
+    fn emit_affine_bool_option_initializer(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Value, Vec<BackendError>> {
+        self.support.require_affine_option_bool_array();
+        let operand = match &expression.kind {
+            ExprKind::NoneE => "zeroinitializer".to_string(),
+            ExprKind::SomeE(payload) => {
+                let payload = self
+                    .emit_fresh_bool_array(payload)?
+                    .operand
+                    .expect("validated affine option payload");
+                let with_payload = self.new_temp();
+                self.instruction(format!(
+                    "{with_payload} = insertvalue {LLVM_AFFINE_OPTION_BOOL_ARRAY} zeroinitializer, {LLVM_ARRAY_BOOL} {payload}, 1"
+                ));
+                let tagged = self.new_temp();
+                self.instruction(format!(
+                    "{tagged} = insertvalue {LLVM_AFFINE_OPTION_BOOL_ARRAY} {with_payload}, i8 1, 0"
+                ));
+                tagged
+            }
+            _ => unreachable!("validated affine-option initializer"),
+        };
+        Ok(Value {
+            ty: affine_bool_option_ty(),
+            operand: Some(operand),
+        })
+    }
+
+    fn emit_affine_option_take(&mut self, option: &str) -> Result<Value, Vec<BackendError>> {
+        self.support.require_affine_option_bool_array();
+        let Some(source) = self.locals.get(option) else {
+            return Err(vec![unsupported(
+                self.function.name_span,
+                format!("LLVM affine-option local `{option}` was not declared"),
+            )]);
+        };
+        let source_slot = source.slot.clone();
+        let aggregate = self.new_temp();
+        self.instruction(format!(
+            "{aggregate} = load {LLVM_AFFINE_OPTION_BOOL_ARRAY}, ptr {source_slot}"
+        ));
+        let tag = self.new_temp();
+        self.instruction(format!(
+            "{tag} = extractvalue {LLVM_AFFINE_OPTION_BOOL_ARRAY} {aggregate}, 0"
+        ));
+        let invalid = self.new_temp();
+        self.instruction(format!("{invalid} = icmp ne i8 {tag}, 1"));
+        self.emit_untyped_trap_guard(&invalid, TRAP_OPTION_NONE);
+
+        // Keep extraction and the destination store dominated by the tag
+        // guard. Clearing first makes the memory-state ownership transition
+        // atomic: no installed destination can coexist with a live source.
+        let payload = self.new_temp();
+        self.instruction(format!(
+            "{payload} = extractvalue {LLVM_AFFINE_OPTION_BOOL_ARRAY} {aggregate}, 1"
+        ));
+        self.instruction(format!(
+            "store {LLVM_AFFINE_OPTION_BOOL_ARRAY} zeroinitializer, ptr {source_slot}"
+        ));
+        Ok(Value {
+            ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+            operand: Some(payload),
+        })
+    }
+
+    fn emit_affine_option_is_some(&mut self, operand: &Expr) -> Result<Value, Vec<BackendError>> {
+        self.support.require_affine_option_bool_array();
+        let ExprKind::Var(name) = &operand.kind else {
+            unreachable!("validated affine-option `.is_some` place")
+        };
+        let Some(local) = self.locals.get(name) else {
+            return Err(vec![unsupported(
+                operand.span,
+                format!("LLVM affine-option local `{name}` was not declared"),
+            )]);
+        };
+        let slot = local.slot.clone();
+        let aggregate = self.new_temp();
+        self.instruction(format!(
+            "{aggregate} = load {LLVM_AFFINE_OPTION_BOOL_ARRAY}, ptr {slot}"
+        ));
+        let tag = self.new_temp();
+        self.instruction(format!(
+            "{tag} = extractvalue {LLVM_AFFINE_OPTION_BOOL_ARRAY} {aggregate}, 0"
+        ));
+        let present = self.new_temp();
+        self.instruction(format!("{present} = icmp eq i8 {tag}, 1"));
+        Ok(Value {
+            ty: Ty::Bool,
+            operand: Some(present),
+        })
     }
 
     fn emit_bool_array_literal(&mut self, elements: &[Expr]) -> Result<Value, Vec<BackendError>> {
@@ -2021,7 +2468,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit_current_scope_cleanups(&mut self) {
-        let names = self
+        let cleanups = self
             .cleanup_scopes
             .last()
             .expect("cleanup has a function scope")
@@ -2029,21 +2476,28 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .rev()
             .cloned()
             .collect::<Vec<_>>();
-        for name in names {
-            self.emit_bool_array_drop(&name);
+        for cleanup in cleanups {
+            self.emit_owned_cleanup(cleanup);
         }
     }
 
     fn emit_all_cleanups(&mut self) {
-        let names = self
+        let cleanups = self
             .cleanup_scopes
             .iter()
             .rev()
             .flat_map(|scope| scope.iter().rev())
             .cloned()
             .collect::<Vec<_>>();
-        for name in names {
-            self.emit_bool_array_drop(&name);
+        for cleanup in cleanups {
+            self.emit_owned_cleanup(cleanup);
+        }
+    }
+
+    fn emit_owned_cleanup(&mut self, cleanup: OwnedCleanup) {
+        match cleanup {
+            OwnedCleanup::BoolArray(name) => self.emit_bool_array_drop(&name),
+            OwnedCleanup::AffineBoolOption(name) => self.emit_affine_bool_option_drop(&name),
         }
     }
 
@@ -2056,6 +2510,51 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.terminate(format!(
             "br i1 {empty}, label %{done_label}, label %{free_label}"
         ));
+        self.start_block(free_label);
+        self.instruction(format!("call void @__sable_rt_array_free_v1(ptr {ptr})"));
+        self.terminate(format!("br label %{done_label}"));
+        self.start_block(done_label);
+    }
+
+    fn emit_affine_bool_option_drop(&mut self, option: &str) {
+        let slot = self
+            .locals
+            .get(option)
+            .expect("validated affine-option local")
+            .slot
+            .clone();
+        let aggregate = self.new_temp();
+        self.instruction(format!(
+            "{aggregate} = load {LLVM_AFFINE_OPTION_BOOL_ARRAY}, ptr {slot}"
+        ));
+        let tag = self.new_temp();
+        self.instruction(format!(
+            "{tag} = extractvalue {LLVM_AFFINE_OPTION_BOOL_ARRAY} {aggregate}, 0"
+        ));
+        let present = self.new_temp();
+        self.instruction(format!("{present} = icmp eq i8 {tag}, 1"));
+        let inspect_label = self.new_label("option.drop.present");
+        let free_label = self.new_label("option.drop.free");
+        let done_label = self.new_label("option.drop.done");
+        self.terminate(format!(
+            "br i1 {present}, label %{inspect_label}, label %{done_label}"
+        ));
+
+        self.start_block(inspect_label);
+        let payload = self.new_temp();
+        self.instruction(format!(
+            "{payload} = extractvalue {LLVM_AFFINE_OPTION_BOOL_ARRAY} {aggregate}, 1"
+        ));
+        let ptr = self.new_temp();
+        self.instruction(format!(
+            "{ptr} = extractvalue {LLVM_ARRAY_BOOL} {payload}, 0"
+        ));
+        let empty = self.new_temp();
+        self.instruction(format!("{empty} = icmp eq ptr {ptr}, null"));
+        self.terminate(format!(
+            "br i1 {empty}, label %{done_label}, label %{free_label}"
+        ));
+
         self.start_block(free_label);
         self.instruction(format!("call void @__sable_rt_array_free_v1(ptr {ptr})"));
         self.terminate(format!("br label %{done_label}"));
@@ -2238,6 +2737,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 })
             }
             ExprKind::IsSome { operand } => {
+                if matches!(operand.ty, Some(Ty::AffineOption(_))) {
+                    return self.emit_affine_option_is_some(operand);
+                }
                 self.support.require_option_bool();
                 let option = self.emit_expr(operand)?;
                 let option = option
@@ -2463,9 +2965,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     value.operand.expect("integer narrow operand"),
                 )
             }
-            ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_unsupported(
+            ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_position(
                 expression.span,
                 option,
+                "expression",
             )]),
             _ => unreachable!("validated before lowering"),
         }
@@ -2958,6 +3461,7 @@ fn llvm_ty(ty: Ty) -> String {
         Ty::Unit => "void".into(),
         Ty::Option(ValueTy::Bool) => LLVM_OPTION_BOOL.into(),
         ty if is_owned_bool_array(ty) => LLVM_ARRAY_BOOL.into(),
+        ty if is_affine_bool_option(ty) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
         Ty::Record(record) => llvm_record_ty(record),
         Ty::AffineOption(_) => {
             unreachable!("affine option escaped LLVM validation into type lowering")
@@ -3145,22 +3649,33 @@ fn affine_option_unsupported(span: Span, role: &str, ty: Ty) -> BackendError {
     debug_assert!(matches!(ty, Ty::AffineOption(_)));
     diag(
         "backend.affine_option_unsupported",
-        "affine options are not lowered by the LLVM backend",
+        "affine option is outside the admitted LLVM local slice",
         span,
         format!(
-            "{role} has type `{}`; native lowering waits for atomic take and conditional destruction semantics",
+            "{role} has type `{}`; native lowering admits only explicit mutable local `option<[bool]>` construction, named `.is_some`, and atomic `.take` into an explicit owned Boolean-array local",
             ty.name()
         ),
     )
 }
 
-fn affine_option_take_unsupported(span: Span, option: &str) -> BackendError {
+fn affine_option_take_position(span: Span, option: &str, role: &str) -> BackendError {
     diag(
         "backend.affine_option_unsupported",
-        "affine options are not lowered by the LLVM backend",
+        "affine option is outside the admitted LLVM local slice",
         span,
         format!(
-            "`.take` of affine option local `{option}` requires an atomic ownership transition and conditional destruction"
+            "{role} cannot receive `.take` of affine option local `{option}`; `.take` must directly initialize an explicit owned Boolean-array local"
+        ),
+    )
+}
+
+fn affine_option_initializer_unsupported(span: Span, local: &str) -> BackendError {
+    diag(
+        "backend.affine_option_unsupported",
+        "affine option is outside the admitted LLVM local slice",
+        span,
+        format!(
+            "affine option local `{local}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
         ),
     )
 }
@@ -3279,6 +3794,40 @@ mod tests {
                 elem: ValueTy::Bool,
                 len: Box::new(len),
                 init: Box::new(init),
+            },
+            bool_array_ty(),
+        )
+    }
+
+    fn affine_bool_option(kind: ExprKind) -> Expr {
+        expression(kind, affine_bool_option_ty())
+    }
+
+    fn affine_bool_option_variable(name: &str) -> Expr {
+        affine_bool_option(ExprKind::Var(name.into()))
+    }
+
+    fn affine_is_some(name: &str) -> Expr {
+        expression(
+            ExprKind::IsSome {
+                operand: Box::new(affine_bool_option_variable(name)),
+            },
+            Ty::Bool,
+        )
+    }
+
+    fn affine_some_alloc(len: u64, init: bool) -> Expr {
+        affine_bool_option(ExprKind::SomeE(Box::new(bool_array_alloc(
+            expression(ExprKind::IntLit(len.into()), Ty::Int(IntTy::U64)),
+            expression(ExprKind::BoolLit(init), Ty::Bool),
+        ))))
+    }
+
+    fn affine_take(name: &str) -> Expr {
+        expression(
+            ExprKind::OptTake {
+                option: name.into(),
+                option_span: Span::new(0, 1),
             },
             bool_array_ty(),
         )
@@ -3647,63 +4196,165 @@ mod tests {
     }
 
     #[test]
-    fn affine_options_are_rejected_before_copy_option_lowering() {
+    fn affine_options_lower_canonical_local_state_atomic_take_and_conditional_drop() {
         let affine_bool = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool));
+        let subject = function(
+            "affine_local",
+            Ty::Bool,
+            vec![
+                Stmt::Decl {
+                    ty: affine_bool,
+                    name: "pending".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(affine_some_alloc(2, false)),
+                    mutable: true,
+                },
+                Stmt::ExprStmt(affine_is_some("pending")),
+                Stmt::Decl {
+                    ty: bool_array_ty(),
+                    name: "values".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(affine_take("pending")),
+                    mutable: true,
+                },
+                Stmt::Decl {
+                    ty: affine_bool,
+                    name: "absent".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(affine_bool_option(ExprKind::NoneE)),
+                    mutable: true,
+                },
+                Stmt::Return {
+                    value: Some(expression(
+                        ExprKind::Unary {
+                            op: UnOp::Not,
+                            operand: Box::new(affine_is_some("pending")),
+                        },
+                        Ty::Bool,
+                    )),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        let ir = emit_program(&program(vec![subject]), 1, &EmitOptions::default()).unwrap();
+
+        assert_eq!(
+            ir.matches("%sable.option.array.bool = type { i8, %sable.array.bool }")
+                .count(),
+            1
+        );
+        assert!(
+            ir.find("%sable.array.bool = type { ptr, i64 }").unwrap()
+                < ir.find("%sable.option.array.bool = type").unwrap()
+        );
+        assert!(
+            ir.find("%sable.option.array.bool = type").unwrap()
+                < ir.find("define internal").unwrap()
+        );
+        assert!(ir.contains("alloca %sable.option.array.bool"));
+        assert!(
+            ir.contains("insertvalue %sable.option.array.bool zeroinitializer, %sable.array.bool")
+        );
+        assert!(ir.contains("insertvalue %sable.option.array.bool"));
+        assert!(ir.contains(", i8 1, 0"));
+        assert!(ir.contains("store %sable.option.array.bool zeroinitializer, ptr %v2"));
+        assert!(ir.contains("icmp eq i8"));
+        assert!(ir.contains(", 1"));
+
+        let take_load = ir.find("load %sable.option.array.bool, ptr %v0").unwrap();
+        let take_guard = ir[take_load..].find("icmp ne i8").unwrap() + take_load;
+        let trap = ir[take_guard..]
+            .find("call void @__sable_rt_fail_v1(i32 8, i32 0")
+            .unwrap()
+            + take_guard;
+        let clear = ir[trap..]
+            .find("store %sable.option.array.bool zeroinitializer, ptr %v0")
+            .unwrap()
+            + trap;
+        let destination = ir[clear..].find("store %sable.array.bool").unwrap() + clear;
+        assert!(take_load < take_guard && take_guard < trap && trap < clear && clear < destination);
+
+        // Both ownership carriers retain cleanup code. At runtime the cleared
+        // source follows the tag-zero edge, while `values` owns the sole free.
+        let cleanup = &ir[destination..];
+        assert!(cleanup.contains("icmp eq i8"));
+        assert!(cleanup.contains("icmp eq ptr"));
+        assert!(cleanup.contains("call void @__sable_rt_array_free_v1"));
+    }
+
+    #[test]
+    fn affine_option_abi_construction_transport_and_take_fences_stay_closed() {
+        let affine_bool = affine_bool_option_ty();
         let affine_integer = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)));
         let assert_affine_error = |errors: Vec<BackendError>| {
             assert_eq!(errors[0].name, "backend.affine_option_unsupported");
-            assert!(errors[0].label.contains("option<["), "{:?}", errors[0]);
         };
 
         for ty in [affine_bool, affine_integer] {
-            let errors = emit_program(
-                &program(vec![function("affine_return", ty, Vec::new())]),
-                1,
-                &EmitOptions::default(),
-            )
-            .expect_err("an affine option must not acquire a native return ABI");
-            assert_affine_error(errors);
+            assert_affine_error(
+                emit_program(
+                    &program(vec![function("affine_return", ty, Vec::new())]),
+                    1,
+                    &EmitOptions::default(),
+                )
+                .expect_err("affine options must not acquire a return ABI"),
+            );
         }
-        assert_affine_error(
-            emit_program(
-                &program(vec![function("affine_entry", affine_bool, Vec::new())]),
-                1,
-                &EmitOptions {
-                    entry: Some("affine_entry".into()),
-                },
-            )
-            .expect_err("the entry signature gate must retain the affine diagnostic"),
-        );
-
-        let mut parameterized = function(
-            "affine_parameter",
-            Ty::Bool,
-            vec![Stmt::Return {
-                value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
-                span: Span::new(0, 1),
-            }],
-        );
+        let mut parameterized = function("affine_parameter", Ty::Unit, Vec::new());
         parameterized.params.push(parameter("pending", affine_bool));
         assert_affine_error(
             emit_program(&program(vec![parameterized]), 1, &EmitOptions::default())
-                .expect_err("an affine option must not acquire a native parameter ABI"),
+                .expect_err("affine options must not acquire a parameter ABI"),
         );
 
-        let local = function(
-            "affine_local",
-            Ty::Unit,
-            vec![Stmt::Decl {
+        for invalid in [
+            Stmt::Decl {
                 ty: affine_bool,
-                name: "pending".into(),
+                name: "immutable".into(),
                 name_span: Span::new(0, 1),
-                init: Some(expression(ExprKind::NoneE, affine_bool)),
+                init: Some(affine_bool_option(ExprKind::NoneE)),
+                mutable: false,
+            },
+            Stmt::Decl {
+                ty: affine_bool,
+                name: "missing".into(),
+                name_span: Span::new(0, 1),
+                init: None,
                 mutable: true,
-            }],
-        );
-        assert_affine_error(
-            emit_program(&program(vec![local]), 1, &EmitOptions::default())
-                .expect_err("an affine option must not acquire native local storage"),
-        );
+            },
+            Stmt::Decl {
+                ty: affine_integer,
+                name: "nonbool".into(),
+                name_span: Span::new(0, 1),
+                init: Some(expression(ExprKind::NoneE, affine_integer)),
+                mutable: true,
+            },
+            Stmt::Decl {
+                ty: affine_bool,
+                name: "literal".into(),
+                name_span: Span::new(0, 1),
+                init: Some(affine_bool_option(ExprKind::SomeE(Box::new(
+                    bool_array_literal(&[true]),
+                )))),
+                mutable: true,
+            },
+            Stmt::VarDecl {
+                name: "inferred".into(),
+                name_span: Span::new(0, 1),
+                init: affine_bool_option(ExprKind::NoneE),
+                mutable: true,
+                ty: Some(affine_bool),
+            },
+        ] {
+            assert_affine_error(
+                emit_program(
+                    &program(vec![function("invalid_local", Ty::Unit, vec![invalid])]),
+                    1,
+                    &EmitOptions::default(),
+                )
+                .expect_err("forged construction must remain outside the exact local slice"),
+            );
+        }
 
         let empty = program(Vec::new());
         let mut locals = ValidationLocals::new();
@@ -3717,36 +4368,82 @@ mod tests {
                 Span::new(0, 1),
             )
             .unwrap();
-        let accessor = expression(
-            ExprKind::IsSome {
-                operand: Box::new(typed_variable("pending", affine_bool)),
-            },
-            Ty::Bool,
-        );
-        assert_affine_error(
-            validate_expr(&empty, &accessor, 1, &locals)
-                .expect_err("a forged accessor must not treat an affine option as copyable"),
-        );
+        locals
+            .insert(
+                "immutable".into(),
+                ValidationLocal {
+                    ty: affine_bool,
+                    mutable: false,
+                },
+                Span::new(0, 1),
+            )
+            .unwrap();
+        locals
+            .insert(
+                "scalar".into(),
+                ValidationLocal {
+                    ty: Ty::Bool,
+                    mutable: true,
+                },
+                Span::new(0, 1),
+            )
+            .unwrap();
 
-        let take = expression(
-            ExprKind::OptTake {
-                option: "pending".into(),
-                option_span: Span::new(0, 1),
-            },
-            bool_array_ty(),
-        );
-        for errors in [
-            validate_expr(&empty, &take, 1, &locals)
-                .expect_err("affine take must not inherit general array lowering"),
-            validate_fresh_bool_array_initializer(&empty, &take, 1, &locals)
-                .expect_err("affine take must not inherit fresh-array lowering"),
+        for (destination, take) in [
+            ("pending", affine_take("pending")),
+            ("values", affine_take("immutable")),
+            ("values", affine_take("scalar")),
+            ("values", affine_take("missing")),
         ] {
-            assert_eq!(errors[0].name, "backend.affine_option_unsupported");
-            assert_eq!(
-                errors[0].label,
-                "`.take` of affine option local `pending` requires an atomic ownership transition and conditional destruction"
+            assert_affine_error(
+                validate_fresh_bool_array_initializer(&empty, &take, 1, &locals, destination, true)
+                    .expect_err("forged take source/destination must be rejected"),
             );
         }
+
+        assert_affine_error(
+            validate_expr(&empty, &affine_take("pending"), 1, &locals)
+                .expect_err("take is not a general expression"),
+        );
+        assert_affine_error(
+            validate_expr(
+                &empty,
+                &expression(
+                    ExprKind::OptValue {
+                        operand: Box::new(affine_bool_option_variable("pending")),
+                    },
+                    bool_array_ty(),
+                ),
+                1,
+                &locals,
+            )
+            .expect_err("`.value` must not copy an affine payload"),
+        );
+
+        let inferred_take = function(
+            "inferred_take",
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: affine_bool,
+                    name: "pending".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(affine_bool_option(ExprKind::NoneE)),
+                    mutable: true,
+                },
+                Stmt::VarDecl {
+                    name: "values".into(),
+                    name_span: Span::new(0, 1),
+                    init: affine_take("pending"),
+                    mutable: false,
+                    ty: Some(bool_array_ty()),
+                },
+            ],
+        );
+        assert_affine_error(
+            emit_program(&program(vec![inferred_take]), 1, &EmitOptions::default())
+                .expect_err("take destination must be an explicit owned-array declaration"),
+        );
 
         let mut record_program = program(Vec::new());
         let mut record = integer_pair_record();
@@ -3754,8 +4451,87 @@ mod tests {
         record_program.records.push(record);
         assert_affine_error(
             emit_program(&record_program, 1, &EmitOptions::default())
-                .expect_err("an affine option must not inherit POD record layout"),
+                .expect_err("affine options must not acquire POD record layout"),
         );
+    }
+
+    #[test]
+    fn affine_option_cleanups_follow_branch_loop_unsafe_and_return_lifetimes() {
+        let affine = affine_bool_option_ty();
+        let option_decl = |name: &str, len: u64| Stmt::Decl {
+            ty: affine,
+            name: name.into(),
+            name_span: Span::new(0, 1),
+            init: Some(affine_some_alloc(len, true)),
+            mutable: true,
+        };
+        let subject = function(
+            "affine_cfg",
+            Ty::Bool,
+            vec![
+                option_decl("outer", 1),
+                Stmt::If {
+                    cond: expression(ExprKind::BoolLit(true), Ty::Bool),
+                    then_block: vec![option_decl("branch", 2)],
+                    else_block: None,
+                },
+                Stmt::While {
+                    cond: expression(ExprKind::BoolLit(false), Ty::Bool),
+                    invariants: Vec::new(),
+                    variant: None,
+                    kw_span: Span::new(0, 1),
+                    body: vec![
+                        option_decl("loop_option", 3),
+                        Stmt::Decl {
+                            ty: bool_array_ty(),
+                            name: "loop_values".into(),
+                            name_span: Span::new(0, 1),
+                            init: Some(affine_take("loop_option")),
+                            mutable: false,
+                        },
+                    ],
+                },
+                Stmt::Unsafe {
+                    kw_span: Span::new(0, 1),
+                    body: vec![option_decl("unsafe_option", 4)],
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        let ir = emit_program(&program(vec![subject]), 1, &EmitOptions::default()).unwrap();
+
+        assert!(ir.contains("if.then"));
+        assert!(ir.contains("while.body"));
+        assert!(ir.contains("option.drop.present"));
+        assert_eq!(ir.matches("call void @__sable_rt_array_free_v1").count(), 5);
+
+        let loop_body = ir.find("while.body").unwrap();
+        let loop_array_drop = ir[loop_body..]
+            .find("load %sable.array.bool, ptr %v3")
+            .unwrap()
+            + loop_body;
+        let loop_option_drop = ir[loop_array_drop..]
+            .find("load %sable.option.array.bool, ptr %v2")
+            .unwrap()
+            + loop_array_drop;
+        assert!(loop_array_drop < loop_option_drop);
+
+        let return_cleanup = ir.rfind("load %sable.option.array.bool, ptr %v4").unwrap();
+        let outer_cleanup = ir[return_cleanup..]
+            .find("load %sable.option.array.bool, ptr %v0")
+            .unwrap()
+            + return_cleanup;
+        let ret = ir.rfind("ret i1 1").unwrap();
+        assert!(return_cleanup < outer_cleanup && outer_cleanup < ret);
+
+        let take_trap = ir
+            .find("call void @__sable_rt_fail_v1(i32 8, i32 0")
+            .unwrap();
+        let trap_end = ir[take_trap..].find("unreachable").unwrap() + take_trap;
+        assert!(!ir[take_trap..trap_end].contains("@__sable_rt_array_free_v1"));
     }
 
     #[test]

@@ -19,8 +19,10 @@ G1.4a closes ordinary Boolean argument transport plus verified, interpreted,
 and natively lowered internal integer-field POD record calls. G1.4b closes
 owned-local Boolean arrays through checking, verification, interpretation, and
 dynamic monitoring. G1.5 is closed across the formal SVM and its owned-local
-Rust differential bridge, while LLVM remains independently closed. No array
-ABI, record ABI, or generic-class widening is claimed.
+Rust differential bridge, and G1.6 closes the matching local LLVM storage and
+cleanup slice. G2.0–G2.2 close affine-option representation, local semantics,
+and atomic formal-machine take; G2.3 closes the exact local LLVM lowering. No
+array, affine-option, or record ABI, and no generic-class widening, is claimed.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -672,8 +674,9 @@ local slice in the formal SVM and differential lowerer is also complete. G1.6's
 native storage and lexical cleanup for that same local slice are complete. The broader
 aggregate-generics/backend track continues at M46+; G2.0's affine-option
 representation/fail-closed checkpoint and G2.1's local semantic slice are
-closed, as is G2.2's formal-SVM slice. The order remains a working hypothesis,
-not a promise that evidence cannot reorder it:
+closed, as is G2.2's formal-SVM slice. G2.3's exact local native slice is
+closed as well. The order remains a working hypothesis, not a promise that
+evidence cannot reorder it:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
    interpreter/native differentials and end-to-end trap tests as later work
@@ -1005,9 +1008,9 @@ not a promise that evidence cannot reorder it:
      differential passed 1/1 over six subjects at both levels; and SVM stayed
      green at 86/86. Randomized allocator, grind-budget, LSP, documentation,
      diff-check, and static-audit gates were green. G1.6 is closed.
-   - **G2 — affine options (staged; G2.0–G2.2 complete):** carry ownership and
-     destruction correctly through present/absent aggregate values without
-     widening the existing copy-option family by accident.
+   - **G2 — affine options (staged; G2.0–G2.3 complete):**
+     carry ownership and destruction correctly through present/absent aggregate
+     values without widening the existing copy-option family by accident.
 
      **G2.0 — representation/fail-closed foundation (complete):** preserve
      `Ty::Option(ValueTy)` for copyable payloads
@@ -1094,7 +1097,8 @@ not a promise that evidence cannot reorder it:
      the take overwrites that stale binding. The tagged Boolean-array payload,
      including an empty array, is retained exactly. Parameters, returns, calls,
      fields, traits, generics, borrows, exposure, whole-option movement, and all
-     affine-option ABIs remain fenced. LLVM remains closed for G2.3.
+     affine-option ABIs remain fenced. At the G2.2 checkpoint LLVM still
+     rejected the type pending the separate G2.3 widening.
 
      G2.2 closed under the exact one-worker command
      `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
@@ -1108,12 +1112,45 @@ not a promise that evidence cannot reorder it:
      passed 92/92. Free-list allocator, grind-budget, LSP, documentation,
      rustfmt, diff-check, and static-audit gates were green. G2.2 is closed.
 
-     **G2.3 — native local lowering (next):** add an internal tag/live bit plus
-     the Boolean-array descriptor, source clearing, and conditional lexical
-     destruction. This remains local lowering and does not define an
-     affine-option ABI.
-   - **G3 — slots and `Vec`:** make generic element storage and movement real
-     for the existing growable-vector benchmark.
+     **G2.3 — native local lowering (complete):** the internal value is
+     `%sable.option.array.bool = type { i8, %sable.array.bool }`. Tag zero is the
+     full zero aggregate; tag one owns the nested descriptor, including the
+     null/zero descriptor of a present empty array. LLVM admits only explicit
+     mutable local `option<[bool]>` construction by `none` or direct
+     `some(alloc_array<bool>(...))`, named `.is_some`, and `.take` directly into
+     an explicit owned `[bool]` local.
+
+     Take guards tag one using existing option-none trap kind 8, extracts the
+     descriptor on the success edge, stores the complete source as zero, and
+     only then installs the destination. The cleanup registry is typed over
+     ordinary Boolean arrays and affine Boolean-array options and unwinds both
+     in reverse declaration/scope order. Option destruction calls the existing
+     free hook only after both a tag-one and nonnull-pointer check. Absent,
+     taken, and present-empty options perform no free; trap edges perform no
+     cleanup. Construction and payload access retain the existing allocation
+     and free hooks, 50,000,000-element cap, zero bypass, and trap kinds 9 and
+     10.
+
+     Parameters, returns, call transport, entries, externs, fields, traits,
+     classes, generics, borrows, exposure, inferred bindings, whole-option
+     assignment/movement, discarded affine temporaries, non-Boolean payloads,
+     and existing-array or literal wrapping stay fenced. The named type is
+     internal and versionable; no affine-option ABI follows. G2.3 closed under
+     the exact standard command
+     `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. `cargo check` was green; standalone Lake
+     built 22/22 targets with only the existing warnings; focused LLVM units
+     passed 29/29; and Rust library tests passed 213/213. The recursive corpus
+     passed all 416 subjects (84 verifies, 263 must-fail, 49 tests, 20
+     test-fails) in 194.43s. LLVM CLI passed 8/8; the exact interpreter/native
+     differential passed 1/1 over seven subjects at Clang `-O0` and `-O2`; and
+     SVM differential remained 92/92. Free-list allocator, grind-budget, LSP,
+     documentation, rustfmt, diff-check, and static-audit gates were green.
+     G2.3 is closed.
+   - **G3 — slots and `Vec` (next planning target):** make generic element
+     storage and movement real for the existing growable-vector benchmark;
+     this is not a plan to broaden the option ABI.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
      key/value storage, probing, and its existing verified contracts.
 

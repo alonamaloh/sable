@@ -1,0 +1,127 @@
+// G2.3 native affine-option subjects. Every ownership-bearing value remains
+// local: the entry and helpers expose only scalar signatures. Together they
+// cover construction, observation, atomic take, post-take source state,
+// payload mutation, empty payloads, and every lexical cleanup boundary.
+
+fn affine_option_present_drop() -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(1, true));
+    return pending.is_some;
+}
+
+fn affine_option_take_drop() -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(2, false));
+    mut [bool] values = pending.take;
+    values[0] = true;
+    values[1] = true;
+    return !pending.is_some && values[0] && values[1];
+}
+
+fn affine_option_none_drop() -> bool {
+    mut option<[bool]> pending = none;
+    return !pending.is_some;
+}
+
+fn affine_option_zero_drop() -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(0, false));
+    return pending.is_some;
+}
+
+fn affine_option_reverse_cleanup() -> bool {
+    mut option<[bool]> first = some(alloc_array<bool>(8, true));
+    mut option<[bool]> second = some(alloc_array<bool>(9, true));
+    return first.is_some && second.is_some;
+}
+
+fn affine_option_branch_cleanup(bool choose_first) -> bool {
+    if (choose_first) {
+        mut option<[bool]> true_first = some(alloc_array<bool>(3, true));
+        mut option<[bool]> true_second = some(alloc_array<bool>(11, true));
+        return true_first.is_some && true_second.is_some;
+    } else {
+        mut option<[bool]> false_first = some(alloc_array<bool>(4, true));
+        mut option<[bool]> false_second = some(alloc_array<bool>(12, true));
+        return false_first.is_some && false_second.is_some;
+    }
+}
+
+fn affine_option_loop_cleanup() -> bool {
+    mut u64 iteration = 0;
+    /// invariant iteration <= 2
+    /// variant 2 - iteration
+    while (iteration < 2) {
+        mut option<[bool]> pending = some(alloc_array<bool>(5, true));
+        [bool] values = pending.take;
+        mut option<[bool]> companion = some(alloc_array<bool>(11, true));
+        if (pending.is_some || !values[4] || !companion.is_some) {
+            return false;
+        }
+        iteration = iteration + 1;
+    }
+    return true;
+}
+
+fn affine_option_unsafe_cleanup() -> bool {
+    unsafe {
+        mut option<[bool]> pending = some(alloc_array<bool>(6, true));
+        if (!pending.is_some) {
+            return false;
+        }
+    }
+    mut option<[bool]> after_unsafe = some(alloc_array<bool>(10, true));
+    return after_unsafe.is_some;
+}
+
+fn affine_option_early_return() -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(7, true));
+    if (pending.is_some) {
+        return true;
+    }
+    return false;
+}
+
+/// pre False
+fn affine_option_take_none_guard() -> bool {
+    mut option<[bool]> pending = none;
+    [bool] values = pending.take;
+    return values.len == 0;
+}
+
+/// pre length = 0
+fn affine_option_alloc_guard(u64 length) -> bool {
+    mut option<[bool]> pending = some(alloc_array<bool>(length, false));
+    return pending.is_some;
+}
+
+fn affine_options_entry() -> i32 {
+    if (!affine_option_present_drop()) {
+        return 1;
+    }
+    if (!affine_option_take_drop()) {
+        return 2;
+    }
+    if (!affine_option_none_drop()) {
+        return 3;
+    }
+    if (!affine_option_zero_drop()) {
+        return 4;
+    }
+    if (!affine_option_reverse_cleanup()) {
+        return 5;
+    }
+    if (!affine_option_branch_cleanup(true)) {
+        return 6;
+    }
+    if (!affine_option_branch_cleanup(false)) {
+        return 7;
+    }
+    if (!affine_option_loop_cleanup()) {
+        return 8;
+    }
+    if (!affine_option_unsafe_cleanup()) {
+        return 9;
+    }
+    if (!affine_option_early_return()) {
+        return 10;
+    }
+    return 42;
+}

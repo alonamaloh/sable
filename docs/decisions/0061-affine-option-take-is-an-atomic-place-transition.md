@@ -1,6 +1,6 @@
 # ADR 0061 — affine-option take is an atomic place transition
 
-**Decided 2026-08-13; G2.1–G2.2 closed.** ADR 0060 gave ownership-bearing
+**Decided 2026-08-13; G2.1–G2.3 closed.** ADR 0060 gave ownership-bearing
 options a checked type distinct from ordinary copyable options. This decision
 defines the first operation which can transfer their payload without creating
 a second owner.
@@ -117,14 +117,27 @@ exactly, including the element tag of an empty array.
 
 Parameters, returns, calls, fields, traits, generics, borrows, exposure,
 whole-option movement, non-Boolean affine payloads, and every affine-option ABI
-remain rejected by the Rust bridge. LLVM remains entirely fail closed for this
-type until G2.3.
+remain rejected by the Rust bridge. G2.3 opens only the exact matching local
+LLVM path; the same transport and ABI fences remain.
 
-G2.3 then lowers the same transition natively as a canonical tag/live bit plus
-the G1.6 Boolean-array descriptor. A successful take clears the complete source
-representation before the destination is registered for cleanup. Lexical drop
-checks the live tag and conditionally invokes the existing array cleanup. No
-parameter, return, field, extern, entry, or cross-module ABI is implied.
+G2.3 lowers the transition as
+`%sable.option.array.bool = type { i8, %sable.array.bool }`. Tag zero is the
+complete zero aggregate; tag one owns the payload descriptor, including the
+null/zero descriptor of a present empty Boolean array. Take loads the source,
+guards tag one with existing trap kind 8, extracts the descriptor on the
+success edge, stores the complete source as `zeroinitializer`, and only then
+lets the destination declaration store the payload. The clear therefore
+precedes destination ownership in emitted memory state.
+
+The cleanup registry distinguishes owned arrays from affine Boolean-array
+options and unwinds both in reverse declaration/scope order. Option cleanup
+follows the tag-one edge and calls `__sable_rt_array_free_v1` only for a
+nonnull nested pointer. A taken, absent, or present-empty source does not free;
+the destination owns the sole nonempty payload after a successful take. Trap
+edges perform no cleanup. Construction and subsequent payload access reuse the
+existing hooks, 50,000,000-element cap, zero bypass, and trap kinds 9 and 10.
+No parameter, return, call, field, trait, class, generic, borrow, exposure,
+extern, entry, or cross-module ABI is implied.
 
 ## Closure evidence
 
@@ -152,5 +165,17 @@ library tests 211/211, and the recursive corpus all 416 subjects (84 verifies,
 native differential passed 1/1 over six subjects at `-O0` and `-O2`; and SVM
 differential passed 92/92. Free-list allocator, grind-budget, LSP,
 documentation, rustfmt, diff-check, and static-audit gates were green. G2.2 is
-closed. G2.3 closes its own native/runtime-hook gate independently and is next;
-LLVM remains fenced until then.
+closed.
+
+G2.3 closed under the exact standard command
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` was green; standalone Lake built 22/22 targets with only the
+existing warnings; focused LLVM units passed 29/29; and Rust library tests
+passed 213/213. The recursive corpus passed all 416 subjects (84 verifies, 263
+must-fail, 49 tests, 20 test-fails) in 194.43s. LLVM CLI passed 8/8; the exact
+interpreter/native differential passed 1/1 over seven subjects at Clang `-O0`
+and `-O2`; and SVM differential remained 92/92. Free-list allocator,
+grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
+were green. G2.3 is closed; generic slots and `Vec` ownership are next, not an
+affine-option ABI widening.
