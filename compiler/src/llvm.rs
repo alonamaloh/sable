@@ -1,5 +1,6 @@
 //! Strict textual LLVM IR lowering for the verified scalar, Boolean-option,
-//! bounded POD-record, and owned-local Boolean-array core (ADRs 0058--0059).
+//! bounded POD-record, owned-local Boolean-array, and N0 local `u32`-array
+//! core with internal borrowed-array calls (ADRs 0058--0059).
 //!
 //! This first slice handles scalar storage, calls, comparisons, and structured
 //! control flow.  A construct is either lowered with its Sable meaning or
@@ -15,7 +16,7 @@ use crate::diag::Diagnostic;
 use crate::span::Span;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-const BOOL_ARRAY_CAPACITY: u64 = 50_000_000;
+const ARRAY_CAPACITY: u64 = 50_000_000;
 
 pub type BackendError = Diagnostic;
 
@@ -488,22 +489,31 @@ fn validate_block(
                         locals,
                         *name_span,
                     )?;
-                } else if is_owned_bool_array(*ty) {
+                } else if is_owned_native_array(*ty) {
                     require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
                     let Some(value) = init else {
                         return Err(vec![unsupported(
                             *name_span,
-                            format!("owned Boolean-array local `{name}` has no initializer"),
+                            format!("owned array local `{name}` has no initializer"),
                         )]);
                     };
-                    validate_fresh_bool_array_initializer(
-                        program,
-                        value,
-                        root_span_end,
-                        locals,
-                        name,
-                        true,
-                    )?;
+                    if is_owned_bool_array(*ty) {
+                        validate_fresh_bool_array_initializer(
+                            program,
+                            value,
+                            root_span_end,
+                            locals,
+                            name,
+                            true,
+                        )?;
+                    } else {
+                        validate_fresh_u32_array_initializer(
+                            program,
+                            value,
+                            root_span_end,
+                            locals,
+                        )?;
+                    }
                 } else {
                     require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
                     if let Some(value) = init {
@@ -547,15 +557,19 @@ fn validate_block(
                     )]);
                 }
                 require_local_value(program, root_span_end, ty, *name_span, "inferred local")?;
-                if is_owned_bool_array(ty) {
-                    validate_fresh_bool_array_initializer(
-                        program,
-                        init,
-                        root_span_end,
-                        locals,
-                        name,
-                        false,
-                    )?;
+                if is_owned_native_array(ty) {
+                    if is_owned_bool_array(ty) {
+                        validate_fresh_bool_array_initializer(
+                            program,
+                            init,
+                            root_span_end,
+                            locals,
+                            name,
+                            false,
+                        )?;
+                    } else {
+                        validate_fresh_u32_array_initializer(program, init, root_span_end, locals)?;
+                    }
                 } else {
                     validate_expr(program, init, root_span_end, locals)?;
                 }
@@ -585,10 +599,10 @@ fn validate_block(
                         format!("assignment targets immutable local `{name}`"),
                     )]);
                 }
-                if is_owned_bool_array(local.ty) {
+                if is_owned_native_array(local.ty) {
                     return Err(vec![unsupported(
                         *name_span,
-                        format!("owned Boolean-array local `{name}` cannot be rebound"),
+                        format!("owned array local `{name}` cannot be rebound"),
                     )]);
                 }
                 if matches!(local.ty, Ty::AffineOption(_)) {
@@ -642,7 +656,7 @@ fn validate_block(
                 array_span,
                 index,
                 value,
-            } => validate_bool_array_store(
+            } => validate_native_array_store(
                 program,
                 array,
                 *array_span,
@@ -678,6 +692,18 @@ fn validate_block(
 
 fn is_owned_bool_array(ty: Ty) -> bool {
     matches!(ty, Ty::Array(ValueTy::Bool, Mutability::Owned))
+}
+
+fn is_owned_u32_array(ty: Ty) -> bool {
+    matches!(ty, Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned))
+}
+
+fn is_u32_array(ty: Ty) -> bool {
+    matches!(ty, Ty::Array(ValueTy::Int(IntTy::U32), _))
+}
+
+fn is_owned_native_array(ty: Ty) -> bool {
+    is_owned_bool_array(ty) || is_owned_u32_array(ty)
 }
 
 fn affine_bool_option_ty() -> Ty {
@@ -842,11 +868,11 @@ fn validate_fresh_bool_array_initializer(
     require_expr_type(expression, expected, "owned Boolean-array initializer")?;
     match &expression.kind {
         ExprKind::ArrayLit(elements) => {
-            if elements.len() as u64 > BOOL_ARRAY_CAPACITY {
+            if elements.len() as u64 > ARRAY_CAPACITY {
                 return Err(vec![unsupported(
                     expression.span,
                     format!(
-                        "Boolean array literal has {} elements; the native allocation cap is {BOOL_ARRAY_CAPACITY}",
+                        "Boolean array literal has {} elements; the native allocation cap is {ARRAY_CAPACITY}",
                         elements.len()
                     ),
                 )]);
@@ -891,7 +917,49 @@ fn validate_fresh_bool_array_initializer(
     }
 }
 
-fn validate_bool_array_store(
+fn validate_fresh_u32_array_initializer(
+    program: &Program,
+    expression: &Expr,
+    root_span_end: usize,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    let expected = Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned);
+    require_expr_type(expression, expected, "owned `u32`-array initializer")?;
+    match &expression.kind {
+        ExprKind::ArrayLit(elements) => {
+            if elements.len() as u64 > ARRAY_CAPACITY {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "`u32` array literal has {} elements; the native allocation cap is {ARRAY_CAPACITY}",
+                        elements.len()
+                    ),
+                )]);
+            }
+            for element in elements {
+                validate_expr(program, element, root_span_end, locals)?;
+                require_expr_type(element, Ty::Int(IntTy::U32), "`u32` array literal element")?;
+            }
+            Ok(())
+        }
+        ExprKind::AllocArray { elem, len, init } if *elem == ValueTy::Int(IntTy::U32) => {
+            validate_expr(program, len, root_span_end, locals)?;
+            require_expr_type(len, Ty::Int(IntTy::U64), "`u32` array allocation length")?;
+            validate_expr(program, init, root_span_end, locals)?;
+            require_expr_type(
+                init,
+                Ty::Int(IntTy::U32),
+                "`u32` array allocation initializer",
+            )
+        }
+        _ => Err(vec![unsupported(
+            expression.span,
+            "owned `u32` array local must be initialized by a fresh literal or `alloc_array<u32>`",
+        )]),
+    }
+}
+
+fn validate_native_array_store(
     program: &Program,
     array: &str,
     array_span: Span,
@@ -906,7 +974,9 @@ fn validate_bool_array_store(
             format!("array store names unknown or out-of-scope local `{array}`"),
         )]);
     };
-    if !is_owned_bool_array(local.ty) {
+    if !is_owned_native_array(local.ty)
+        && local.ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Mut)
+    {
         return Err(vec![unsupported(
             array_span,
             format!(
@@ -915,21 +985,133 @@ fn validate_bool_array_store(
             ),
         )]);
     }
-    if !local.mutable {
+    if is_owned_native_array(local.ty) && !local.mutable {
         return Err(vec![unsupported(
             array_span,
-            format!("array store targets immutable Boolean array `{array}`"),
+            format!("array store targets immutable owned array `{array}`"),
         )]);
     }
     validate_expr(program, index, root_span_end, locals)?;
-    require_expr_type(index, Ty::Int(IntTy::U64), "Boolean array store index")?;
-    validate_bool_expr(
-        program,
-        value,
-        "Boolean array store value",
-        root_span_end,
-        locals,
-    )
+    require_expr_type(index, Ty::Int(IntTy::U64), "array store index")?;
+    if is_owned_bool_array(local.ty) {
+        validate_bool_expr(
+            program,
+            value,
+            "Boolean array store value",
+            root_span_end,
+            locals,
+        )
+    } else {
+        validate_expr(program, value, root_span_end, locals)?;
+        require_expr_type(value, Ty::Int(IntTy::U32), "`u32` array store value")
+    }
+}
+
+fn validate_u32_array_borrow_argument(
+    argument: &Expr,
+    expected: Ty,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    let Ty::Array(ValueTy::Int(IntTy::U32), expected_mutability) = expected else {
+        unreachable!("called only for a checked `u32` array borrow parameter")
+    };
+    if !matches!(expected_mutability, Mutability::Shared | Mutability::Mut) {
+        return Err(vec![unsupported(
+            argument.span,
+            "owned arrays cannot cross an LLVM call boundary",
+        )]);
+    }
+    require_expr_type(argument, expected, "`u32` array borrow argument")?;
+    let ExprKind::Borrow {
+        array,
+        field,
+        mutable,
+    } = &argument.kind
+    else {
+        return Err(vec![unsupported(
+            argument.span,
+            "borrowed `u32` array parameters require an explicit named borrow",
+        )]);
+    };
+    if field.is_some() {
+        return Err(vec![unsupported(
+            argument.span,
+            "N0 does not lower array borrows from class fields",
+        )]);
+    }
+    let requested = if *mutable {
+        Mutability::Mut
+    } else {
+        Mutability::Shared
+    };
+    if requested != expected_mutability {
+        return Err(vec![unsupported(
+            argument.span,
+            "borrow syntax mutability does not match the checked call parameter",
+        )]);
+    }
+    let Some(source) = locals.get(array) else {
+        return Err(vec![unsupported(
+            argument.span,
+            format!("array borrow names unknown or out-of-scope local `{array}`"),
+        )]);
+    };
+    let Ty::Array(ValueTy::Int(IntTy::U32), source_mutability) = source.ty else {
+        return Err(vec![unsupported(
+            argument.span,
+            format!("array borrow source `{array}` is not a native `u32` array"),
+        )]);
+    };
+    if *mutable
+        && (source_mutability == Mutability::Shared
+            || (source_mutability == Mutability::Owned && !source.mutable))
+    {
+        return Err(vec![unsupported(
+            argument.span,
+            format!("cannot mutably borrow `{array}` through a non-mutable array place"),
+        )]);
+    }
+    Ok(())
+}
+
+fn validate_u32_borrow_aliases(
+    args: &[Expr],
+    params: &[crate::ast::Param],
+) -> Result<(), Vec<BackendError>> {
+    let mut borrows: Vec<(&str, bool, Span)> = Vec::new();
+    for (argument, parameter) in args.iter().zip(params) {
+        if !matches!(
+            parameter.ty,
+            Ty::Array(
+                ValueTy::Int(IntTy::U32),
+                Mutability::Shared | Mutability::Mut
+            )
+        ) {
+            continue;
+        }
+        let ExprKind::Borrow {
+            array,
+            field: None,
+            mutable,
+        } = &argument.kind
+        else {
+            continue;
+        };
+        if let Some((_, _, prior_span)) = borrows
+            .iter()
+            .find(|(prior, prior_mutable, _)| *prior == array && (*prior_mutable || *mutable))
+        {
+            return Err(vec![unsupported(
+                argument.span,
+                format!(
+                    "call aliases array `{array}` through mutable and overlapping borrows (first borrow at byte {})",
+                    prior_span.start
+                ),
+            )]);
+        }
+        borrows.push((array, *mutable, argument.span));
+    }
+    Ok(())
 }
 
 fn validate_expr(
@@ -968,10 +1150,10 @@ fn validate_expr(
                     format!("expression names unknown or out-of-scope local `{name}`"),
                 )]);
             };
-            if is_owned_bool_array(local.ty) {
+            if matches!(local.ty, Ty::Array(..)) {
                 return Err(vec![unsupported(
                     expression.span,
-                    format!("owned Boolean-array local `{name}` cannot be transported as a value"),
+                    format!("array local `{name}` cannot be transported as a value"),
                 )]);
             }
             let ty = expression.ty.ok_or_else(|| {
@@ -1029,9 +1211,20 @@ fn validate_expr(
                 )]);
             }
             for (argument, parameter) in args.iter().zip(&function.params) {
-                validate_expr(program, argument, root_span_end, locals)?;
-                require_expr_type(argument, parameter.ty, "call argument")?;
+                if matches!(
+                    parameter.ty,
+                    Ty::Array(
+                        ValueTy::Int(IntTy::U32),
+                        Mutability::Shared | Mutability::Mut
+                    )
+                ) {
+                    validate_u32_array_borrow_argument(argument, parameter.ty, locals)?;
+                } else {
+                    validate_expr(program, argument, root_span_end, locals)?;
+                    require_expr_type(argument, parameter.ty, "call argument")?;
+                }
             }
+            validate_u32_borrow_aliases(args, &function.params)?;
             require_runtime_type(
                 program,
                 root_span_end,
@@ -1243,7 +1436,7 @@ fn validate_expr(
                     local.ty,
                 )]);
             }
-            if !is_owned_bool_array(local.ty) {
+            if !is_owned_bool_array(local.ty) && !is_u32_array(local.ty) {
                 return Err(vec![unsupported(
                     *array_span,
                     format!(
@@ -1253,8 +1446,13 @@ fn validate_expr(
                 )]);
             }
             validate_expr(program, index, root_span_end, locals)?;
-            require_expr_type(index, Ty::Int(IntTy::U64), "Boolean array index")?;
-            require_expr_type(expression, Ty::Bool, "Boolean array index result")
+            require_expr_type(index, Ty::Int(IntTy::U64), "array index")?;
+            let element_ty = if is_owned_bool_array(local.ty) {
+                Ty::Bool
+            } else {
+                Ty::Int(IntTy::U32)
+            };
+            require_expr_type(expression, element_ty, "array index result")
         }
         ExprKind::Len { array } => {
             let Some(local) = locals.get(array) else {
@@ -1270,7 +1468,7 @@ fn validate_expr(
                     local.ty,
                 )]);
             }
-            if !is_owned_bool_array(local.ty) {
+            if !is_owned_bool_array(local.ty) && !is_u32_array(local.ty) {
                 return Err(vec![unsupported(
                     expression.span,
                     format!(
@@ -1279,11 +1477,7 @@ fn validate_expr(
                     ),
                 )]);
             }
-            require_expr_type(
-                expression,
-                Ty::Int(IntTy::U64),
-                "Boolean array length result",
-            )
+            require_expr_type(expression, Ty::Int(IntTy::U64), "array length result")
         }
         ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } => Err(vec![unsupported(
             expression.span,
@@ -1539,7 +1733,7 @@ fn require_local_value(
         Ty::Bool | Ty::Option(ValueTy::Bool) => Ok(()),
         ty if is_affine_bool_option(ty) => Ok(()),
         Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
-        ty if is_owned_bool_array(ty) => Ok(()),
+        ty if is_owned_native_array(ty) => Ok(()),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
             span,
@@ -1561,6 +1755,7 @@ fn require_parameter_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
+        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared | Mutability::Mut) => Ok(()),
         Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
@@ -1611,6 +1806,11 @@ const LLVM_OPTION_BOOL: &str = "%sable.option.bool";
 /// empty array or a runtime-owned allocation containing one i8 byte per
 /// element; field 1 is the logical element count. This is not a source ABI.
 const LLVM_ARRAY_BOOL: &str = "%sable.array.bool";
+
+/// Internal `u32`-array descriptor. The v1 allocation hook promises only a
+/// byte allocation, so every typed payload access is emitted with `align 1`.
+/// Field 1 remains the logical element count, not the allocation byte size.
+const LLVM_ARRAY_U32: &str = "%sable.array.u32";
 
 /// Internal affine Boolean-array option. The byte tag is canonical: zero is
 /// absent and one owns the nested array descriptor. This remains local-only;
@@ -1694,6 +1894,7 @@ struct ModuleSupport {
     needs_trap: bool,
     needs_option_bool: bool,
     needs_array_bool: bool,
+    needs_array_u32: bool,
     needs_affine_option_bool_array: bool,
     records: BTreeSet<usize>,
 }
@@ -1714,6 +1915,11 @@ impl ModuleSupport {
 
     fn require_array_bool(&mut self) {
         self.needs_array_bool = true;
+        self.needs_trap = true;
+    }
+
+    fn require_array_u32(&mut self) {
+        self.needs_array_u32 = true;
         self.needs_trap = true;
     }
 
@@ -1756,8 +1962,14 @@ impl ModuleSupport {
         if self.needs_array_bool {
             out.push_str(LLVM_ARRAY_BOOL);
             out.push_str(" = type { ptr, i64 }\n\n");
+        }
+        if self.needs_array_u32 {
+            out.push_str(LLVM_ARRAY_U32);
+            out.push_str(" = type { ptr, i64 }\n\n");
+        }
+        if self.needs_array_bool || self.needs_array_u32 {
             out.push_str(
-                "; target runtime hooks for owned Boolean-array storage; allocation size is bytes\n\
+                "; target runtime hooks for owned array storage; allocation size is bytes\n\
                  declare ptr @__sable_rt_array_alloc_v1(i64)\n\
                  declare void @__sable_rt_array_free_v1(ptr)\n\n",
             );
@@ -1819,6 +2031,7 @@ struct Value {
 #[derive(Clone)]
 enum OwnedCleanup {
     BoolArray(String),
+    U32Array(String),
     AffineBoolOption(String),
 }
 
@@ -1938,6 +2151,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         match ty {
             Ty::Option(ValueTy::Bool) => self.support.require_option_bool(),
             ty if is_owned_bool_array(ty) => self.support.require_array_bool(),
+            ty if is_u32_array(ty) => self.support.require_array_u32(),
             ty if is_affine_bool_option(ty) => self.support.require_affine_option_bool_array(),
             Ty::Record(record) => self.support.require_record(record),
             Ty::AffineOption(_) => {
@@ -2038,7 +2252,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     index,
                     value,
                     ..
-                } => self.emit_bool_array_store(array, index, value)?,
+                } => self.emit_native_array_store(array, index, value)?,
                 _ => unreachable!("validated before lowering"),
             }
         }
@@ -2064,6 +2278,8 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     ExprKind::OptTake { option, .. } => self.emit_affine_option_take(option)?,
                     _ => self.emit_fresh_bool_array(init)?,
                 }
+            } else if is_owned_u32_array(ty) {
+                self.emit_fresh_u32_array(init)?
             } else if is_affine_bool_option(ty) {
                 self.emit_affine_bool_option_initializer(init)?
             } else {
@@ -2079,6 +2295,11 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .last_mut()
                     .expect("array declaration has a lexical cleanup scope")
                     .push(OwnedCleanup::BoolArray(name.to_owned()));
+            } else if is_owned_u32_array(ty) {
+                self.cleanup_scopes
+                    .last_mut()
+                    .expect("array declaration has a lexical cleanup scope")
+                    .push(OwnedCleanup::U32Array(name.to_owned()));
             } else if is_affine_bool_option(ty) {
                 self.cleanup_scopes
                     .last_mut()
@@ -2176,6 +2397,15 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ExprKind::AllocArray { len, init, .. } => self.emit_bool_array_allocation(len, init),
             ExprKind::OptTake { option, .. } => self.emit_affine_option_take(option),
             _ => unreachable!("validated fresh Boolean-array initializer"),
+        }
+    }
+
+    fn emit_fresh_u32_array(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
+        self.support.require_array_u32();
+        match &expression.kind {
+            ExprKind::ArrayLit(elements) => self.emit_u32_array_literal(elements),
+            ExprKind::AllocArray { len, init, .. } => self.emit_u32_array_allocation(len, init),
+            _ => unreachable!("validated fresh `u32`-array initializer"),
         }
     }
 
@@ -2297,7 +2527,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             });
         }
 
-        let ptr = self.emit_array_alloc_call(&len.to_string());
+        let ptr = self.emit_array_alloc_call(&len.to_string(), &len.to_string());
         for (index, byte) in bytes.iter().enumerate() {
             let address = self.new_temp();
             self.instruction(format!(
@@ -2327,9 +2557,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.instruction(format!("{byte} = zext i1 {init} to i8"));
 
         let over_cap = self.new_temp();
-        self.instruction(format!(
-            "{over_cap} = icmp ugt i64 {len}, {BOOL_ARRAY_CAPACITY}"
-        ));
+        self.instruction(format!("{over_cap} = icmp ugt i64 {len}, {ARRAY_CAPACITY}"));
         self.emit_trap_branch(&over_cap, TRAP_ARRAY_OOM, 0, &len, "0");
 
         let empty = self.new_temp();
@@ -2345,7 +2573,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.terminate(format!("br label %{merge_label}"));
 
         self.start_block(alloc_label);
-        let ptr = self.emit_array_alloc_call(&len);
+        let ptr = self.emit_array_alloc_call(&len, &len);
         let fill_predecessor = self.current_label().to_owned();
         let fill_head = self.new_label("array.fill.head");
         let fill_body = self.new_label("array.fill.body");
@@ -2388,14 +2616,117 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         Ok(self.bool_array_descriptor(merged_ptr, len))
     }
 
-    fn emit_array_alloc_call(&mut self, bytes: &str) -> String {
+    fn emit_u32_array_literal(&mut self, elements: &[Expr]) -> Result<Value, Vec<BackendError>> {
+        // Array literal elements are fully evaluated left-to-right before the
+        // allocation attempt, matching the interpreter's observable order.
+        let mut values = Vec::with_capacity(elements.len());
+        for element in elements {
+            values.push(
+                self.emit_expr(element)?
+                    .operand
+                    .expect("validated `u32` literal element"),
+            );
+        }
+        let len = elements.len() as u64;
+        if len == 0 {
+            return Ok(Value {
+                ty: Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned),
+                operand: Some("zeroinitializer".into()),
+            });
+        }
+        let bytes = len * 4;
+        let ptr = self.emit_array_alloc_call(&bytes.to_string(), &len.to_string());
+        for (index, value) in values.iter().enumerate() {
+            let address = self.new_temp();
+            self.instruction(format!(
+                "{address} = getelementptr i32, ptr {ptr}, i64 {index}"
+            ));
+            self.instruction(format!("store i32 {value}, ptr {address}, align 1"));
+        }
+        Ok(self.u32_array_descriptor(ptr, len.to_string()))
+    }
+
+    fn emit_u32_array_allocation(
+        &mut self,
+        len: &Expr,
+        init: &Expr,
+    ) -> Result<Value, Vec<BackendError>> {
+        // Evaluate both operands before the defined OOM decision. The logical
+        // element cap proves the subsequent byte multiplication fits i64.
+        let len = self
+            .emit_expr(len)?
+            .operand
+            .expect("validated `u32` allocation length");
+        let init = self
+            .emit_expr(init)?
+            .operand
+            .expect("validated `u32` allocation initializer");
+        let over_cap = self.new_temp();
+        self.instruction(format!("{over_cap} = icmp ugt i64 {len}, {ARRAY_CAPACITY}"));
+        self.emit_trap_branch(&over_cap, TRAP_ARRAY_OOM, 0, &len, "0");
+
+        let empty = self.new_temp();
+        self.instruction(format!("{empty} = icmp eq i64 {len}, 0"));
+        let zero_label = self.new_label("array.u32.zero");
+        let alloc_label = self.new_label("array.u32.alloc");
+        let merge_label = self.new_label("array.u32.ready");
+        self.terminate(format!(
+            "br i1 {empty}, label %{zero_label}, label %{alloc_label}"
+        ));
+
+        self.start_block(zero_label.clone());
+        self.terminate(format!("br label %{merge_label}"));
+
+        self.start_block(alloc_label);
+        let bytes = self.new_temp();
+        self.instruction(format!("{bytes} = mul i64 {len}, 4"));
+        let ptr = self.emit_array_alloc_call(&bytes, &len);
+        let fill_predecessor = self.current_label().to_owned();
+        let fill_head = self.new_label("array.u32.fill.head");
+        let fill_body = self.new_label("array.u32.fill.body");
+        let fill_end = self.new_label("array.u32.fill.end");
+        self.terminate(format!("br label %{fill_head}"));
+
+        self.start_block(fill_head.clone());
+        let index = self.new_temp();
+        let next = format!("%array.u32.fill.next.{}", self.next_temp);
+        self.next_temp += 1;
+        self.instruction(format!(
+            "{index} = phi i64 [ 0, %{fill_predecessor} ], [ {next}, %{fill_body} ]"
+        ));
+        let more = self.new_temp();
+        self.instruction(format!("{more} = icmp ult i64 {index}, {len}"));
+        self.terminate(format!(
+            "br i1 {more}, label %{fill_body}, label %{fill_end}"
+        ));
+
+        self.start_block(fill_body.clone());
+        let address = self.new_temp();
+        self.instruction(format!(
+            "{address} = getelementptr i32, ptr {ptr}, i64 {index}"
+        ));
+        self.instruction(format!("store i32 {init}, ptr {address}, align 1"));
+        self.instruction(format!("{next} = add i64 {index}, 1"));
+        self.terminate(format!("br label %{fill_head}"));
+
+        self.start_block(fill_end.clone());
+        self.terminate(format!("br label %{merge_label}"));
+        self.start_block(merge_label);
+        let merged_ptr = self.new_temp();
+        self.instruction(format!(
+            "{merged_ptr} = phi ptr [ null, %{zero_label} ], [ {ptr}, %{fill_end} ]"
+        ));
+        Ok(self.u32_array_descriptor(merged_ptr, len))
+    }
+
+    fn emit_array_alloc_call(&mut self, bytes: &str, logical_len: &str) -> String {
         let ptr = self.new_temp();
         self.instruction(format!(
             "{ptr} = call ptr @__sable_rt_array_alloc_v1(i64 {bytes})"
         ));
         let failed = self.new_temp();
         self.instruction(format!("{failed} = icmp eq ptr {ptr}, null"));
-        self.emit_trap_branch(&failed, TRAP_ARRAY_OOM, 0, bytes, "0");
+        self.emit_trap_branch(&failed, TRAP_ARRAY_OOM, 0, logical_len, "0");
         ptr
     }
 
@@ -2412,6 +2743,38 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ty: Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned),
             operand: Some(descriptor),
         }
+    }
+
+    fn u32_array_descriptor(&mut self, ptr: String, len: String) -> Value {
+        let with_ptr = self.new_temp();
+        self.instruction(format!(
+            "{with_ptr} = insertvalue {LLVM_ARRAY_U32} zeroinitializer, ptr {ptr}, 0"
+        ));
+        let descriptor = self.new_temp();
+        self.instruction(format!(
+            "{descriptor} = insertvalue {LLVM_ARRAY_U32} {with_ptr}, i64 {len}, 1"
+        ));
+        Value {
+            ty: Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned),
+            operand: Some(descriptor),
+        }
+    }
+
+    fn emit_native_array_store(
+        &mut self,
+        array: &str,
+        index: &Expr,
+        value: &Expr,
+    ) -> Result<(), Vec<BackendError>> {
+        let ty = self
+            .locals
+            .get(array)
+            .expect("validated native array local")
+            .ty;
+        if is_owned_bool_array(ty) {
+            return self.emit_bool_array_store(array, index, value);
+        }
+        self.emit_u32_array_store(array, index, value)
     }
 
     fn emit_bool_array_store(
@@ -2441,6 +2804,30 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         Ok(())
     }
 
+    fn emit_u32_array_store(
+        &mut self,
+        array: &str,
+        index: &Expr,
+        value: &Expr,
+    ) -> Result<(), Vec<BackendError>> {
+        let index = self
+            .emit_expr(index)?
+            .operand
+            .expect("validated `u32` array store index");
+        let value = self
+            .emit_expr(value)?
+            .operand
+            .expect("validated `u32` array store value");
+        let (ptr, len) = self.load_u32_array_parts(array);
+        self.emit_bool_array_bounds_guard(&index, &len);
+        let address = self.new_temp();
+        self.instruction(format!(
+            "{address} = getelementptr i32, ptr {ptr}, i64 {index}"
+        ));
+        self.instruction(format!("store i32 {value}, ptr {address}, align 1"));
+        Ok(())
+    }
+
     fn load_bool_array_parts(&mut self, array: &str) -> (String, String) {
         let slot = self
             .locals
@@ -2457,6 +2844,26 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let len = self.new_temp();
         self.instruction(format!(
             "{len} = extractvalue {LLVM_ARRAY_BOOL} {descriptor}, 1"
+        ));
+        (ptr, len)
+    }
+
+    fn load_u32_array_parts(&mut self, array: &str) -> (String, String) {
+        let slot = self
+            .locals
+            .get(array)
+            .expect("validated `u32` array local")
+            .slot
+            .clone();
+        let descriptor = self.new_temp();
+        self.instruction(format!("{descriptor} = load {LLVM_ARRAY_U32}, ptr {slot}"));
+        let ptr = self.new_temp();
+        self.instruction(format!(
+            "{ptr} = extractvalue {LLVM_ARRAY_U32} {descriptor}, 0"
+        ));
+        let len = self.new_temp();
+        self.instruction(format!(
+            "{len} = extractvalue {LLVM_ARRAY_U32} {descriptor}, 1"
         ));
         (ptr, len)
     }
@@ -2497,6 +2904,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     fn emit_owned_cleanup(&mut self, cleanup: OwnedCleanup) {
         match cleanup {
             OwnedCleanup::BoolArray(name) => self.emit_bool_array_drop(&name),
+            OwnedCleanup::U32Array(name) => self.emit_u32_array_drop(&name),
             OwnedCleanup::AffineBoolOption(name) => self.emit_affine_bool_option_drop(&name),
         }
     }
@@ -2507,6 +2915,21 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.instruction(format!("{empty} = icmp eq ptr {ptr}, null"));
         let free_label = self.new_label("array.free");
         let done_label = self.new_label("array.free.done");
+        self.terminate(format!(
+            "br i1 {empty}, label %{done_label}, label %{free_label}"
+        ));
+        self.start_block(free_label);
+        self.instruction(format!("call void @__sable_rt_array_free_v1(ptr {ptr})"));
+        self.terminate(format!("br label %{done_label}"));
+        self.start_block(done_label);
+    }
+
+    fn emit_u32_array_drop(&mut self, array: &str) {
+        let (ptr, _) = self.load_u32_array_parts(array);
+        let empty = self.new_temp();
+        self.instruction(format!("{empty} = icmp eq ptr {ptr}, null"));
+        let free_label = self.new_label("array.u32.free");
+        let done_label = self.new_label("array.u32.free.done");
         self.terminate(format!(
             "br i1 {empty}, label %{done_label}, label %{free_label}"
         ));
@@ -2594,23 +3017,44 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .emit_expr(index)?
                     .operand
                     .expect("validated Boolean array index");
-                let (ptr, len) = self.load_bool_array_parts(array);
-                self.emit_bool_array_bounds_guard(&index, &len);
-                let address = self.new_temp();
-                self.instruction(format!(
-                    "{address} = getelementptr i8, ptr {ptr}, i64 {index}"
-                ));
-                let byte = self.new_temp();
-                self.instruction(format!("{byte} = load i8, ptr {address}"));
-                let value = self.new_temp();
-                self.instruction(format!("{value} = trunc i8 {byte} to i1"));
-                Ok(Value {
-                    ty: Ty::Bool,
-                    operand: Some(value),
-                })
+                let ty = self.locals[array].ty;
+                if is_owned_bool_array(ty) {
+                    let (ptr, len) = self.load_bool_array_parts(array);
+                    self.emit_bool_array_bounds_guard(&index, &len);
+                    let address = self.new_temp();
+                    self.instruction(format!(
+                        "{address} = getelementptr i8, ptr {ptr}, i64 {index}"
+                    ));
+                    let byte = self.new_temp();
+                    self.instruction(format!("{byte} = load i8, ptr {address}"));
+                    let value = self.new_temp();
+                    self.instruction(format!("{value} = trunc i8 {byte} to i1"));
+                    Ok(Value {
+                        ty: Ty::Bool,
+                        operand: Some(value),
+                    })
+                } else {
+                    let (ptr, len) = self.load_u32_array_parts(array);
+                    self.emit_bool_array_bounds_guard(&index, &len);
+                    let address = self.new_temp();
+                    self.instruction(format!(
+                        "{address} = getelementptr i32, ptr {ptr}, i64 {index}"
+                    ));
+                    let value = self.new_temp();
+                    self.instruction(format!("{value} = load i32, ptr {address}, align 1"));
+                    Ok(Value {
+                        ty: Ty::Int(IntTy::U32),
+                        operand: Some(value),
+                    })
+                }
             }
             ExprKind::Len { array } => {
-                let (_, len) = self.load_bool_array_parts(array);
+                let ty = self.locals[array].ty;
+                let (_, len) = if is_owned_bool_array(ty) {
+                    self.load_bool_array_parts(array)
+                } else {
+                    self.load_u32_array_parts(array)
+                };
                 Ok(Value {
                     ty: Ty::Int(IntTy::U64),
                     operand: Some(len),
@@ -2848,6 +3292,19 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         operand: Some(temp),
                     })
                 }
+            }
+            ExprKind::Borrow { array, .. } => {
+                let local = self
+                    .locals
+                    .get(array)
+                    .expect("validated named `u32` array borrow");
+                let slot = local.slot.clone();
+                let descriptor = self.new_temp();
+                self.instruction(format!("{descriptor} = load {LLVM_ARRAY_U32}, ptr {slot}"));
+                Ok(Value {
+                    ty: expression.ty.expect("validated borrow type"),
+                    operand: Some(descriptor),
+                })
             }
             ExprKind::Binary {
                 op: op @ (BinOp::And | BinOp::Or),
@@ -3461,6 +3918,7 @@ fn llvm_ty(ty: Ty) -> String {
         Ty::Unit => "void".into(),
         Ty::Option(ValueTy::Bool) => LLVM_OPTION_BOOL.into(),
         ty if is_owned_bool_array(ty) => LLVM_ARRAY_BOOL.into(),
+        ty if is_u32_array(ty) => LLVM_ARRAY_U32.into(),
         ty if is_affine_bool_option(ty) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
         Ty::Record(record) => llvm_record_ty(record),
         Ty::AffineOption(_) => {
@@ -3503,6 +3961,8 @@ fn type_code(ty: Ty) -> String {
         Ty::Bool => "b".into(),
         Ty::Unit => "v".into(),
         Ty::Option(ValueTy::Bool) => "ob".into(),
+        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) => "au32s".into(),
+        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Mut) => "au32m".into(),
         Ty::Record(record) => format!("r{record}"),
         Ty::AffineOption(_) => {
             unreachable!("affine option escaped LLVM validation into symbol mangling")
@@ -3796,6 +4256,44 @@ mod tests {
                 init: Box::new(init),
             },
             bool_array_ty(),
+        )
+    }
+
+    fn u32_array_ty(mutability: Mutability) -> Ty {
+        Ty::Array(ValueTy::Int(IntTy::U32), mutability)
+    }
+
+    fn u32_array_literal(values: &[u32]) -> Expr {
+        expression(
+            ExprKind::ArrayLit(
+                values
+                    .iter()
+                    .map(|value| expression(ExprKind::IntLit((*value).into()), Ty::Int(IntTy::U32)))
+                    .collect(),
+            ),
+            u32_array_ty(Mutability::Owned),
+        )
+    }
+
+    fn u32_array_alloc(len: Expr, init: Expr) -> Expr {
+        expression(
+            ExprKind::AllocArray {
+                elem: ValueTy::Int(IntTy::U32),
+                len: Box::new(len),
+                init: Box::new(init),
+            },
+            u32_array_ty(Mutability::Owned),
+        )
+    }
+
+    fn u32_array_borrow(name: &str, mutability: Mutability) -> Expr {
+        expression(
+            ExprKind::Borrow {
+                array: name.into(),
+                field: None,
+                mutable: mutability == Mutability::Mut,
+            },
+            u32_array_ty(mutability),
         )
     }
 
@@ -4772,6 +5270,297 @@ mod tests {
             emit_program(&program(vec![audited]), 1, &EmitOptions::default()).unwrap_err();
         assert_eq!(extern_error[0].name, "backend.unsupported");
         assert!(extern_error[0].label.contains("audited extern"));
+    }
+
+    #[test]
+    fn u32_arrays_lower_typed_unaligned_storage_borrows_and_logical_oom_payloads() {
+        let owned = u32_array_ty(Mutability::Owned);
+        let shared = u32_array_ty(Mutability::Shared);
+        let mutable = u32_array_ty(Mutability::Mut);
+        let u32_ty = Ty::Int(IntTy::U32);
+        let u64_ty = Ty::Int(IntTy::U64);
+
+        let mut shared_head = function(
+            "shared_head",
+            u32_ty,
+            vec![Stmt::Return {
+                value: Some(expression(
+                    ExprKind::Index {
+                        array: "values".into(),
+                        array_span: Span::new(0, 1),
+                        index: Box::new(expression(ExprKind::IntLit(0), u64_ty)),
+                    },
+                    u32_ty,
+                )),
+                span: Span::new(0, 1),
+            }],
+        );
+        shared_head.params = vec![parameter("values", shared)];
+
+        let mut mutate = function(
+            "mutate",
+            u32_ty,
+            vec![
+                Stmt::Store {
+                    array: "values".into(),
+                    array_span: Span::new(0, 1),
+                    index: expression(ExprKind::IntLit(1), u64_ty),
+                    value: typed_variable("replacement", u32_ty),
+                },
+                Stmt::Return {
+                    value: Some(expression(
+                        ExprKind::Index {
+                            array: "values".into(),
+                            array_span: Span::new(0, 1),
+                            index: Box::new(expression(ExprKind::IntLit(1), u64_ty)),
+                        },
+                        u32_ty,
+                    )),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        mutate.params = vec![
+            parameter("values", mutable),
+            parameter("replacement", u32_ty),
+        ];
+
+        let mut allocate = function(
+            "allocate",
+            u64_ty,
+            vec![
+                Stmt::Decl {
+                    ty: owned,
+                    name: "values".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(u32_array_alloc(
+                        typed_variable("length", u64_ty),
+                        expression(ExprKind::IntLit(17), u32_ty),
+                    )),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(expression(
+                        ExprKind::Len {
+                            array: "values".into(),
+                        },
+                        u64_ty,
+                    )),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        allocate.params = vec![parameter("length", u64_ty)];
+
+        let caller = function(
+            "caller",
+            u32_ty,
+            vec![
+                Stmt::Decl {
+                    ty: owned,
+                    name: "values".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(u32_array_literal(&[1, 2, 3])),
+                    mutable: true,
+                },
+                Stmt::Decl {
+                    ty: u32_ty,
+                    name: "changed".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(call_with(
+                        "mutate",
+                        u32_ty,
+                        vec![
+                            u32_array_borrow("values", Mutability::Mut),
+                            expression(ExprKind::IntLit(9), u32_ty),
+                        ],
+                    )),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(call_with(
+                        "shared_head",
+                        u32_ty,
+                        vec![u32_array_borrow("values", Mutability::Shared)],
+                    )),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+
+        let ir = emit_program(
+            &program(vec![shared_head, mutate, allocate, caller]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap();
+        assert!(ir.contains("%sable.array.u32 = type { ptr, i64 }"));
+        assert!(ir.contains("getelementptr i32"));
+        assert!(ir.contains("store i32 1, ptr"));
+        assert!(ir.contains("store i32 2, ptr"));
+        assert!(ir.contains("store i32 3, ptr"));
+        assert!(ir.contains("store i32 17, ptr"));
+        assert!(ir.contains("load i32, ptr"));
+        let payload_addresses = ir
+            .lines()
+            .filter(|line| line.contains(" = getelementptr i32, ptr "))
+            .filter_map(|line| line.trim().split_once(" = ").map(|(name, _)| name))
+            .collect::<Vec<_>>();
+        assert!(!payload_addresses.is_empty());
+        for address in payload_addresses {
+            let accesses = ir
+                .lines()
+                .filter(|line| {
+                    (line.contains("load i32, ptr") || line.contains("store i32"))
+                        && line.contains(&format!("ptr {address}"))
+                })
+                .collect::<Vec<_>>();
+            assert!(!accesses.is_empty(), "payload address {address} is unused");
+            for payload_access in accesses {
+                assert!(payload_access.ends_with(", align 1"), "{payload_access}");
+            }
+        }
+        assert!(ir.contains(" = mul i64 "));
+        assert!(ir.contains(", 4"));
+        assert!(!ir.contains("getelementptr inbounds"));
+        assert!(ir.contains("__p_au32s__r_u32"));
+        assert!(ir.contains("__p_au32m_u32__r_u32"));
+
+        let byte_temp = ir
+            .lines()
+            .find(|line| line.contains(" = mul i64 ") && line.ends_with(", 4"))
+            .and_then(|line| line.trim().split_once(" = ").map(|(name, _)| name))
+            .expect("dynamic `u32` allocation computes byte size");
+        assert!(
+            !ir.lines().any(|line| {
+                line.contains("@__sable_rt_fail_v1(i32 9")
+                    && line.contains(&format!("i64 {byte_temp}, i64 0"))
+            }),
+            "OOM payload must report logical element length, not byte size"
+        );
+
+        let shared_start = ir
+            .find("_shared_head__p_au32s__r_u32")
+            .expect("shared helper is emitted");
+        let shared_body = &ir[shared_start..];
+        let shared_end = shared_body.find("\n}\n").expect("helper definition ends");
+        assert!(!shared_body[..shared_end].contains("__sable_rt_array_free_v1"));
+        assert_eq!(ir.matches("call void @__sable_rt_array_free_v1").count(), 2);
+    }
+
+    #[test]
+    fn u32_array_backend_revalidates_borrow_positions_capabilities_and_aliases() {
+        let owned = u32_array_ty(Mutability::Owned);
+        let shared = u32_array_ty(Mutability::Shared);
+        let mutable = u32_array_ty(Mutability::Mut);
+        let u32_ty = Ty::Int(IntTy::U32);
+
+        let mut sink = function(
+            "sink",
+            Ty::Unit,
+            vec![Stmt::Return {
+                value: None,
+                span: Span::new(0, 1),
+            }],
+        );
+        sink.params = vec![parameter("left", mutable), parameter("right", shared)];
+
+        let caller_with = |first: Expr, second: Expr, source_mutable: bool| {
+            function(
+                "caller",
+                Ty::Unit,
+                vec![
+                    Stmt::Decl {
+                        ty: owned,
+                        name: "values".into(),
+                        name_span: Span::new(0, 1),
+                        init: Some(u32_array_literal(&[1])),
+                        mutable: source_mutable,
+                    },
+                    Stmt::ExprStmt(call_with("sink", Ty::Unit, vec![first, second])),
+                    Stmt::Return {
+                        value: None,
+                        span: Span::new(0, 1),
+                    },
+                ],
+            )
+        };
+
+        let alias = caller_with(
+            u32_array_borrow("values", Mutability::Mut),
+            u32_array_borrow("values", Mutability::Shared),
+            true,
+        );
+        let error = emit_program(
+            &program(vec![sink.clone(), alias]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error[0].label.contains("overlapping borrows"));
+
+        let immutable = caller_with(
+            u32_array_borrow("values", Mutability::Mut),
+            u32_array_borrow("values", Mutability::Shared),
+            false,
+        );
+        let error = emit_program(
+            &program(vec![sink.clone(), immutable]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error[0].label.contains("non-mutable array place"));
+
+        let forged_value = caller_with(
+            typed_variable("values", mutable),
+            u32_array_borrow("values", Mutability::Shared),
+            true,
+        );
+        let error = emit_program(
+            &program(vec![sink, forged_value]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert!(error[0].label.contains("explicit named borrow"));
+
+        let standalone = function(
+            "standalone",
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: owned,
+                    name: "values".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(u32_array_literal(&[1])),
+                    mutable: false,
+                },
+                Stmt::ExprStmt(u32_array_borrow("values", Mutability::Shared)),
+                Stmt::Return {
+                    value: None,
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        let error =
+            emit_program(&program(vec![standalone]), 1, &EmitOptions::default()).unwrap_err();
+        assert!(error[0].label.contains("outside the scalar"));
+
+        let mut shared_store = function(
+            "shared_store",
+            Ty::Unit,
+            vec![Stmt::Store {
+                array: "values".into(),
+                array_span: Span::new(0, 1),
+                index: expression(ExprKind::IntLit(0), Ty::Int(IntTy::U64)),
+                value: expression(ExprKind::IntLit(1), u32_ty),
+            }],
+        );
+        shared_store.params = vec![parameter("values", shared)];
+        let error =
+            emit_program(&program(vec![shared_store]), 1, &EmitOptions::default()).unwrap_err();
+        assert!(error[0].label.contains("unsupported LLVM type"));
     }
 
     #[test]

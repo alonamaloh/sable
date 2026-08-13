@@ -23,6 +23,8 @@ Rust differential bridge, and G1.6 closes the matching local LLVM storage and
 cleanup slice. G2.0–G2.2 close affine-option representation, local semantics,
 and atomic formal-machine take; G2.3 closes the exact local LLVM lowering. No
 array, affine-option, or record ABI, and no generic-class widening, is claimed.
+N0's exact local `[u32]` LLVM storage and internal borrowed-array call slice is
+closed as the native `Nat` foundation.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -675,8 +677,8 @@ native storage and lexical cleanup for that same local slice are complete. The b
 aggregate-generics/backend track continues at M46+; G2.0's affine-option
 representation/fail-closed checkpoint and G2.1's local semantic slice are
 closed, as is G2.2's formal-SVM slice. G2.3's exact local native slice is
-closed as well. The order remains a working hypothesis, not a promise that
-evidence cannot reorder it:
+closed as well. N0's local `u32`-array foundation is closed. The order remains
+a working hypothesis, not a promise that evidence cannot reorder it:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
    interpreter/native differentials and end-to-end trap tests as later work
@@ -1148,9 +1150,48 @@ evidence cannot reorder it:
      SVM differential remained 92/92. Free-list allocator, grind-budget, LSP,
      documentation, rustfmt, diff-check, and static-audit gates were green.
      G2.3 is closed.
-   - **G3 — slots and `Vec` (next planning target):** make generic element
+   - **N0 — native `u32`-array foundation (closed):** admit exactly fresh owned
+     local `[u32]` literals and
+     `alloc_array<u32>` values, length/index/store, and explicit named
+     `&[u32]`/`&mut [u32]` arguments to internal ordinary functions. The
+     internal descriptor is `%sable.array.u32 = type { ptr, i64 }`; allocation
+     scales logical length by four bytes while traps retain logical lengths.
+     The existing v1 hook promises byte storage only, so typed element loads
+     and stores are explicitly `align 1`. Zero bypass, the 50,000,000-element
+     cap, kinds 9/10, reverse lexical cleanup, no cleanup on traps, and the
+     existing versioned hooks are unchanged.
+
+     Borrow parameters are non-owning and accepted only through the exact
+     checked borrow node with matching mutability. Owned-array parameters and
+     returns, fields, classes, methods, entries, externs, other payloads,
+     whole-value transport, and every array ABI remain fenced. Verification,
+     interpretation, and the formal integer-array value predate N0; this is an
+     LLVM/runtime widening, not a new proof rule.
+
+     N0 closed under the exact one-worker command
+     `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+     SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`. `cargo check` was green; focused LLVM units
+     passed 31/31; Rust library tests passed 215/215; and all 416 recursive
+     corpus files (84 verifies, 263 must-fail, 49 tests, 20 test-fails) passed
+     in 213.51s. LLVM CLI passed 9/9; the exact interpreter/native differential
+     passed 1/1 over eight subjects at Clang `-O0` and `-O2`; and SVM
+     differential remained 92/92. Randomized allocator, grind-budget, LSP,
+     documentation, rustfmt, diff-check, and static-audit gates were green.
+
+   - **N1–N5 — native bignum ladder:** N1 adds the local-only `Nat` class,
+     `from_prefix`, shared class borrows, class returns/moves, and destruction.
+     N2 lowers `cmp` and `add`; N3 adds `sub` and schoolbook `mul`; N4 adds
+     `div`, `rem`, and `gcd` with mutable class reassignment and loop cleanup.
+     N5 is the separate full `Integer` step: nested `Nat` ownership, by-value
+     class constructor arguments, class-field borrows, `&mut Integer`, and
+     nested reverse destruction. Each checkpoint retains internal-only
+     representations and scalar process wrappers.
+
+   - **G3 — slots and `Vec` (later planning target):** make generic element
      storage and movement real for the existing growable-vector benchmark;
-     this is not a plan to broaden the option ABI.
+     neither N0 nor the bignum ladder broadens the option ABI or authorizes
+     generic owner storage.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
      key/value storage, probing, and its existing verified contracts.
 

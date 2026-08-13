@@ -1,7 +1,8 @@
 # ADR 0059 — native owned Boolean arrays use runtime hooks and lexical cleanup
 
-**Decided and implemented 2026-08-13; G1.6 and the G2.3 affine-option
-amendment closed.** G1.5 gives owned-local Boolean arrays a checked, verified,
+**Decided and implemented 2026-08-13; G1.6, the G2.3 affine-option amendment,
+and N0's `u32` amendment are closed.** G1.5 gives owned-local Boolean arrays a
+checked, verified,
 interpreted, monitored, and formal-SVM meaning. LLVM remained the only
 execution boundary that rejected that exact slice at the G1.5 checkpoint. This
 decision adds native lowering without declaring an array ABI or widening the
@@ -123,6 +124,47 @@ restores the already-promised semantics of legacy integer-array moves. The new
 `array.use_after_move`. It raises the corpus inventory from 394 to 395 subjects,
 with 245 must-fail files (83 verifies, 48 tests, and 19 test-fails unchanged).
 
+## N0 amendment: byte-backed local `u32` arrays
+
+N0 reuses these same v1 hooks and lexical cleanup rules for one exact additional
+payload: fresh owned local `[u32]`, plus non-owning internal ordinary-function
+borrows. Its named internal descriptor is
+`%sable.array.u32 = type { ptr, i64 }`. The length field is a logical element
+count; a nonempty allocation passes `len * 4` bytes to the allocation hook and
+cleanup passes only the returned pointer to the unchanged free hook. Zero
+length is null/zero and invokes neither hook.
+
+The v1 allocation declaration promises bytes, not alignment. Consequently all
+`u32` element loads and stores use `align 1`, including accesses through shared
+and mutable borrowed parameters. This preserves defined LLVM behavior even for
+a conforming hook that returns storage not aligned for native `u32`. A future
+typed/aligned hook may be a separate optimization decision; N0 does not amend
+the existing ABI implicitly.
+
+The element cap remains 50,000,000. Kind 9 continues to report logical length
+as `(type_info, lhs_bits, rhs_bits) = (0, len, 0)` even though the hook sees
+bytes, and kind 10 remains `(0, index, len)`. Cap rejection happens before the
+hook; a null result after a below-cap byte request also reports kind 9. Trap
+edges perform no cleanup. Normal branch, loop-iteration, and early-return paths
+destroy owning locals in the existing reverse lexical order. Borrow parameters
+are never owners and never free the caller's allocation.
+
+Only exact explicit named `&[u32]` and `&mut [u32]` call arguments with matching
+checked mutability are admitted. Owned-array call transport, returns, entries,
+fields, classes, methods, externs, Boolean borrows, other payloads, exposure,
+and public or cross-module ABI positions stay closed.
+
+N0 closed under the exact one-worker command
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` was green; focused LLVM units passed 31/31; Rust library tests
+passed 215/215; and all 416 recursive corpus files (84 verifies, 263 must-fail,
+49 tests, 20 test-fails) passed in 213.51s. LLVM CLI passed 9/9; the exact
+interpreter/native differential passed 1/1 over eight subjects at Clang `-O0`
+and `-O2`; and SVM differential remained 92/92. Randomized allocator,
+grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
+were green. N0 is closed.
+
 ## Evidence required for closure
 
 Structural IR coverage for representation, canonical bytes, guard dominance,
@@ -150,5 +192,8 @@ must-fail, 49 tests, 20 test-fails) in 194.43s. LLVM CLI passed 8/8; the exact
 interpreter/native differential passed 1/1 over seven subjects at Clang `-O0`
 and `-O2`; and SVM differential remained 92/92. Free-list allocator,
 grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
-were green. G2.3 is closed. The next aggregate step is generic slots and `Vec`
-ownership, not an affine-option ABI widening.
+were green. G2.3 is closed. At that checkpoint generic slots and `Vec`
+ownership were recorded as the next aggregate design, not an affine-option ABI
+widening. The subsequently implemented N0 amendment above begins an independent
+native `Nat` ladder; its next checkpoint is local-only `Nat` class construction
+and destruction.

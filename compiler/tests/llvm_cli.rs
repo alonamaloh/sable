@@ -446,6 +446,116 @@ fn affine_options_use_atomic_take_and_conditional_native_cleanup() {
 }
 
 #[test]
+fn u32_arrays_use_byte_hooks_unaligned_access_and_nonowning_internal_borrows() {
+    let source = repo_root().join("corpus/llvm-diff/u32_arrays.sable");
+    let output = build_command()
+        .args(["build", "--emit-llvm", "-o", "-"])
+        .arg(&source)
+        .output()
+        .expect("run the Sable u32-array LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM u32-array build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
+    assert!(report.contains("status: fully verified"));
+    assert!(!ir.contains("define i32 @main("));
+    assert!(ir.contains("%sable.array.u32 = type { ptr, i64 }"));
+    assert!(ir.contains("@__sable_rt_array_alloc_v1"));
+    assert!(ir.contains("@__sable_rt_array_free_v1"));
+    assert!(ir.contains("@__sable_rt_trap_v1"));
+    assert!(
+        ir.lines()
+            .any(|line| line.contains("load i32, ptr") && line.contains(", align 1")),
+        "the v1 byte-allocation hook does not promise u32 alignment"
+    );
+    assert!(
+        ir.lines().any(|line| {
+            line.contains("store i32 ") && line.contains(", ptr ") && line.contains(", align 1")
+        }),
+        "u32 element stores must use explicit align 1"
+    );
+    assert!(!ir.contains(" inbounds "));
+
+    // Borrow calls stay internal and non-owning. Discover every symbol from
+    // the private mangle rather than pinning an array signature as an ABI.
+    let entry = internal_function_symbol(&ir, "u32_arrays_entry");
+    let shared = internal_function_symbol(&ir, "u32_shared_sum");
+    let mutate = internal_function_symbol(&ir, "u32_mutate");
+    let zero = internal_function_symbol(&ir, "u32_array_zero");
+    let branch = internal_function_symbol(&ir, "u32_array_branch_cleanup");
+    let loop_cleanup = internal_function_symbol(&ir, "u32_array_loop_cleanup");
+    let early_return = internal_function_symbol(&ir, "u32_array_early_return");
+    let alloc_guard = internal_function_symbol(&ir, "u32_array_alloc_guard");
+    let load_guard = internal_function_symbol(&ir, "u32_array_load_guard");
+    let store_guard = internal_function_symbol(&ir, "u32_array_store_guard");
+    assert!(ir.contains(&format!("call i64 @{shared}(")));
+    assert!(ir.contains(&format!("call i1 @{mutate}(")));
+
+    // The injected main calls only scalar-signature helpers. It does not
+    // publish or reconstruct the internal borrowed-array convention.
+    let ir = format!(
+        "{ir}\n\
+         define i32 @main(i32 %argc, ptr %argv) {{\n\
+         entry:\n\
+           switch i32 %argc, label %unexpected [\n\
+             i32 1, label %all\n\
+             i32 2, label %zero\n\
+             i32 3, label %branch_true\n\
+             i32 4, label %branch_false\n\
+             i32 5, label %loop_cleanup\n\
+             i32 6, label %early_return\n\
+             i32 7, label %oom\n\
+             i32 8, label %over_cap\n\
+             i32 9, label %load_oob\n\
+             i32 10, label %store_oob\n\
+           ]\n\
+         all:\n\
+           %all_result = call i32 @{entry}()\n\
+           ret i32 %all_result\n\
+         zero:\n\
+           %zero_result = call i1 @{zero}()\n\
+           %zero_status = select i1 %zero_result, i32 42, i32 1\n\
+           ret i32 %zero_status\n\
+         branch_true:\n\
+           %branch_true_result = call i1 @{branch}(i1 1)\n\
+           %branch_true_status = select i1 %branch_true_result, i32 42, i32 1\n\
+           ret i32 %branch_true_status\n\
+         branch_false:\n\
+           %branch_false_result = call i1 @{branch}(i1 0)\n\
+           %branch_false_status = select i1 %branch_false_result, i32 42, i32 1\n\
+           ret i32 %branch_false_status\n\
+         loop_cleanup:\n\
+           %loop_result = call i1 @{loop_cleanup}()\n\
+           %loop_status = select i1 %loop_result, i32 42, i32 1\n\
+           ret i32 %loop_status\n\
+         early_return:\n\
+           %early_result = call i1 @{early_return}()\n\
+           %early_status = select i1 %early_result, i32 42, i32 1\n\
+           ret i32 %early_status\n\
+         oom:\n\
+           %oom_result = call i64 @{alloc_guard}(i64 13)\n\
+           ret i32 0\n\
+         over_cap:\n\
+           %over_cap_result = call i64 @{alloc_guard}(i64 50000001)\n\
+           ret i32 0\n\
+         load_oob:\n\
+           %load_result = call i32 @{load_guard}(i64 7)\n\
+           ret i32 0\n\
+         store_oob:\n\
+           %store_result = call i32 @{store_guard}(i64 9)\n\
+           ret i32 0\n\
+         unexpected:\n\
+           ret i32 99\n\
+         }}\n"
+    );
+
+    assert_clang_u32_array_runtime("u32-arrays", &ir);
+}
+
+#[test]
 fn failed_verification_preserves_an_existing_output() {
     let temp = temp_dir("atomic");
     let destination = temp.join("program.ll");
@@ -1022,6 +1132,263 @@ void __sable_rt_trap_v1(
         );
     }
     fs::remove_dir_all(&temp).expect("remove isolated LLVM affine-option test directory");
+}
+
+fn assert_clang_u32_array_runtime(label: &str, ir: &str) {
+    let Some(clang) = find_clang() else {
+        assert_ne!(
+            std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
+            Ok("1"),
+            "SABLE_REQUIRE_CLANG=1 but no clang executable was found"
+        );
+        return;
+    };
+    let temp = temp_dir(label);
+    let ir_path = temp.join(format!("{label}.ll"));
+    let hook_path = temp.join("u32-array-hooks.c");
+    fs::write(&ir_path, ir).expect("write emitted u32-array IR fixture");
+    fs::write(
+        &hook_path,
+        br#"#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    void *storage;
+    uint64_t bytes;
+} SableAllocation;
+
+static SableAllocation live_allocations[64];
+static size_t live_count = 0;
+
+void *__sable_rt_array_alloc_v1(uint64_t bytes) {
+    fprintf(stderr, "SABLE_ARRAY_ALLOC_V1 bytes=%" PRIu64 "\n", bytes);
+    fflush(stderr);
+    if (bytes == 52 || bytes > SIZE_MAX - 1) {
+        return NULL;
+    }
+    unsigned char *base = malloc((size_t)bytes + 1);
+    if (base == NULL) {
+        return NULL;
+    }
+    // Deliberately return a byte-aligned address. N0 must not strengthen the
+    // v1 hook into a native-u32-alignment promise.
+    void *storage = base + 1;
+    if (live_count == 64) {
+        abort();
+    }
+    live_allocations[live_count].storage = storage;
+    live_allocations[live_count].bytes = bytes;
+    live_count += 1;
+    memset(storage, 0, (size_t)bytes);
+    return storage;
+}
+
+void __sable_rt_array_free_v1(void *storage) {
+    uint64_t bytes = UINT64_MAX;
+    for (size_t i = 0; i < live_count; i += 1) {
+        if (live_allocations[i].storage == storage) {
+            bytes = live_allocations[i].bytes;
+            live_count -= 1;
+            live_allocations[i] = live_allocations[live_count];
+            break;
+        }
+    }
+    fprintf(stderr, "SABLE_ARRAY_FREE_V1 bytes=%" PRIu64 "\n", bytes);
+    fflush(stderr);
+    if (bytes == UINT64_MAX) {
+        abort();
+    }
+    free((unsigned char *)storage - 1);
+}
+
+void __sable_rt_trap_v1(
+    int32_t kind,
+    int32_t type_info,
+    uint64_t lhs_bits,
+    uint64_t rhs_bits
+) {
+    fprintf(
+        stderr,
+        "SABLE_TRAP_V1 kind=%" PRId32 " type_info=%" PRIu32
+        " lhs=%" PRIu64 " rhs=%" PRIu64 "\n",
+        kind,
+        (uint32_t)type_info,
+        lhs_bits,
+        rhs_bits
+    );
+    fflush(stderr);
+}
+"#,
+    )
+    .expect("write strong u32-array runtime hooks");
+
+    let cases: &[(&str, usize, &[&str])] = &[
+        (
+            "all",
+            1,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=16",
+                "SABLE_ARRAY_ALLOC_V1 bytes=12",
+                "SABLE_ARRAY_ALLOC_V1 bytes=20",
+                "SABLE_ARRAY_ALLOC_V1 bytes=28",
+                "SABLE_ARRAY_FREE_V1 bytes=28",
+                "SABLE_ARRAY_FREE_V1 bytes=20",
+                "SABLE_ARRAY_ALLOC_V1 bytes=24",
+                "SABLE_ARRAY_ALLOC_V1 bytes=32",
+                "SABLE_ARRAY_FREE_V1 bytes=32",
+                "SABLE_ARRAY_FREE_V1 bytes=24",
+                "SABLE_ARRAY_ALLOC_V1 bytes=36",
+                "SABLE_ARRAY_FREE_V1 bytes=36",
+                "SABLE_ARRAY_ALLOC_V1 bytes=36",
+                "SABLE_ARRAY_FREE_V1 bytes=36",
+                "SABLE_ARRAY_ALLOC_V1 bytes=40",
+                "SABLE_ARRAY_FREE_V1 bytes=40",
+                "SABLE_ARRAY_FREE_V1 bytes=12",
+                "SABLE_ARRAY_FREE_V1 bytes=16",
+            ],
+        ),
+        ("zero-length bypass", 2, &[]),
+        (
+            "true branch reverse cleanup",
+            3,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=20",
+                "SABLE_ARRAY_ALLOC_V1 bytes=28",
+                "SABLE_ARRAY_FREE_V1 bytes=28",
+                "SABLE_ARRAY_FREE_V1 bytes=20",
+            ],
+        ),
+        (
+            "false branch reverse cleanup",
+            4,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=24",
+                "SABLE_ARRAY_ALLOC_V1 bytes=32",
+                "SABLE_ARRAY_FREE_V1 bytes=32",
+                "SABLE_ARRAY_FREE_V1 bytes=24",
+            ],
+        ),
+        (
+            "loop iteration cleanup",
+            5,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=36",
+                "SABLE_ARRAY_FREE_V1 bytes=36",
+                "SABLE_ARRAY_ALLOC_V1 bytes=36",
+                "SABLE_ARRAY_FREE_V1 bytes=36",
+            ],
+        ),
+        (
+            "early return cleanup",
+            6,
+            &[
+                "SABLE_ARRAY_ALLOC_V1 bytes=40",
+                "SABLE_ARRAY_FREE_V1 bytes=40",
+            ],
+        ),
+    ];
+
+    for optimization in ["-O0", "-O2"] {
+        let executable = temp.join(format!("{label}-{}", &optimization[1..]));
+        let compile = Command::new(&clang)
+            .args([optimization, "-x", "ir"])
+            .arg(&ir_path)
+            .args(["-x", "c"])
+            .arg(&hook_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("run clang over emitted u32-array IR and replacement hooks");
+        assert!(
+            compile.status.success(),
+            "clang {optimization} rejected u32-array fixture:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        for (case, argc, expected_events) in cases {
+            let output = Command::new(&executable)
+                .args((1..*argc).map(|_| "case"))
+                .output()
+                .expect("run a compiled u32-array lifetime case");
+            assert_eq!(
+                output.status.code(),
+                Some(42),
+                "{case} diverged at {optimization}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr.lines().collect::<Vec<_>>(),
+                expected_events.to_vec(),
+                "wrong {case} hook order at {optimization}"
+            );
+        }
+
+        for (argc, expected_trap, expected_allocation) in [
+            (
+                7,
+                "SABLE_TRAP_V1 kind=9 type_info=0 lhs=13 rhs=0",
+                Some("SABLE_ARRAY_ALLOC_V1 bytes=52"),
+            ),
+            (
+                8,
+                "SABLE_TRAP_V1 kind=9 type_info=0 lhs=50000001 rhs=0",
+                None,
+            ),
+            (
+                9,
+                "SABLE_TRAP_V1 kind=10 type_info=0 lhs=7 rhs=2",
+                Some("SABLE_ARRAY_ALLOC_V1 bytes=8"),
+            ),
+            (
+                10,
+                "SABLE_TRAP_V1 kind=10 type_info=0 lhs=9 rhs=2",
+                Some("SABLE_ARRAY_ALLOC_V1 bytes=8"),
+            ),
+        ] {
+            let trapped = Command::new(&executable)
+                .args((1..argc).map(|_| "trap"))
+                .output()
+                .expect("run a compiled u32-array trap case");
+            assert!(
+                !trapped.status.success(),
+                "u32-array trap hook returned at {optimization}; llvm.trap must terminate"
+            );
+            let stderr = String::from_utf8_lossy(&trapped.stderr);
+            assert!(
+                stderr.contains(expected_trap),
+                "wrong u32-array trap at {optimization} (status {}):\n{stderr}",
+                trapped.status
+            );
+            assert_eq!(
+                stderr.matches("SABLE_ARRAY_FREE_V1").count(),
+                0,
+                "trap edges do not unwind owned u32 arrays"
+            );
+            match expected_allocation {
+                Some(allocation) => {
+                    assert_eq!(stderr.matches("SABLE_ARRAY_ALLOC_V1").count(), 1);
+                    assert!(stderr.contains(allocation));
+                    let allocation = stderr
+                        .find(allocation)
+                        .expect("expected allocation event is present");
+                    let trap = stderr
+                        .find("SABLE_TRAP_V1")
+                        .expect("expected trap event is present");
+                    assert!(allocation < trap, "allocation precedes its trap");
+                }
+                None => assert_eq!(
+                    stderr.matches("SABLE_ARRAY_ALLOC_V1").count(),
+                    0,
+                    "profile-cap rejection precedes the allocation hook"
+                ),
+            }
+        }
+    }
+    fs::remove_dir_all(&temp).expect("remove isolated LLVM u32-array test directory");
 }
 
 fn internal_function_symbol(ir: &str, source_name: &str) -> String {

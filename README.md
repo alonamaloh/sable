@@ -4,7 +4,7 @@
 
 Sable is an imperative, C-flavored language in which **every function carries a machine-checked proof of its contract**. One source file interleaves two languages: a C-like program language with no undefined behavior and an ownership-based memory model, and a Lean 4 proof language that lives entirely on lines beginning with `///`.
 
-**Status: milestones M0–M45 are complete. Unsafe Sable v1 has reached a defensible stopping point, the LLVM IR backend now covers the scalar core, Boolean options, internal integer-field POD record values, the owned-local Boolean-array slice, and the exact local affine Boolean-array-option slice, M46/G0's recursive generic-type foundation is complete, and G1.0–G1.6 and G2.0–G2.3 are closed.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; M45 adds verified-to-native scalar LLVM lowering. G0 completes recursive parsing and structural identity; G1.0 separates parameter/payload representation from the integer proof model; G1.1 admits only the first Boolean aggregate path; G1.2 carries its ordinary-function intersection through the formal SVM; G1.3 carries the same intersection into LLVM; G1.4a adds ordinary Boolean argument transport and verified/interpreted/native internal POD record calls without declaring a record ABI; G1.4b adds verified and dynamically monitored owned-local Boolean arrays while keeping both backend boundaries closed; G1.5 carries that exact local slice through the formal SVM and Rust differential bridge; G1.6 adds native storage and lexical destruction for the same fenced slice without defining an array ABI; G2.3 reuses that storage and cleanup substrate for exact local `option<[bool]>` without defining an affine-option ABI. Broader devices, ISA work, and broader aggregate backend support remain deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
+**Status: milestones M0–M45 are complete. Unsafe Sable v1 has reached a defensible stopping point, the LLVM IR backend now covers the scalar core, Boolean options, internal integer-field POD record values, the owned-local Boolean-array slice, and the exact local affine Boolean-array-option slice, M46/G0's recursive generic-type foundation is complete, and G1.0–G1.6, G2.0–G2.3, and N0 are closed.** Verified today: binary search, insertion sort, **quicksort and the merge kernel** (full `sorted ∧ permutation` specs with frame conditions), **hex and varint codecs** (pointwise specs plus kernel-checked round-trip theorems), classes with invariants (`BoundedStack`), a **generic growable `Vec<T>`** with its reallocation frame condition, a **hash map verified against the linear-probing contract** under a law-carrying `Hashable` trait bound, a **UTF-8 codec with a kernel-checked roundtrip**, a **JSON parser verified against the recursive RFC 8259 grammar** (tokenizer + structural validation), C++-`optional`-style **option accessors** whose syntax works identically in code and contracts, **the bignum pillar — arbitrary-precision `Nat` with cmp/add/sub, schoolbook multiplication, division, and gcd, every operation verified against a one-line spec over the abstraction function** (now written with operators: `q = q + m` under `while (r >= b)`), a **verified UTF-8 `String` with self-proving literals**, file-based **modules**, the escape-hatch assurance ladder, a **verified in-band free-list allocator with mandatory client leases, first-fit allocation, exact return, and proved local coalescing**, a **generic affine resource map** with sealed exact-entry transfer, and an **arena-backed intrusive list over explicitly laid-out typed records** — all in a corpus that doubles as the compiler's regression conscience. M44 adds the first formal UART machine profile; M45 adds verified-to-native scalar LLVM lowering. G0 completes recursive parsing and structural identity; G1.0 separates parameter/payload representation from the integer proof model; G1.1 admits only the first Boolean aggregate path; G1.2 carries its ordinary-function intersection through the formal SVM; G1.3 carries the same intersection into LLVM; G1.4a adds ordinary Boolean argument transport and verified/interpreted/native internal POD record calls without declaring a record ABI; G1.4b adds verified and dynamically monitored owned-local Boolean arrays while keeping both backend boundaries closed; G1.5 carries that exact local slice through the formal SVM and Rust differential bridge; G1.6 adds native storage and lexical destruction for the same fenced slice without defining an array ABI; G2.3 reuses that storage and cleanup substrate for exact local `option<[bool]>` without defining an affine-option ABI; N0 reuses the hooks without strengthening their byte-alignment contract and opens exactly `[u32]` locals plus non-owning internal borrows. Broader devices, ISA work, and broader aggregate backend support remain deliberately deferred rather than blocking the language's usability roadmap. See [`docs/PLAN.md`](docs/PLAN.md) for milestone-by-milestone detail. The normative design documents (working draft 0.4):
 
 - [`docs/design/sable-language-design.md`](docs/design/sable-language-design.md) — the language: syntax, contracts, ownership, ghost code, termination, escape hatches, the SVM machine model, and the staged trust story.
 - [`docs/design/sable-goals-and-roadmap.md`](docs/design/sable-goals-and-roadmap.md) — the benchmark-driven roadmap, from verified sorting through a GMP-style bignum library to the kernel horizon.
@@ -14,6 +14,7 @@ the local `option<[bool]>` checker/proof/interpreter/monitor slice, are closed.
 G2.2's atomic formal-SVM `optTake` transition and exact Rust bridge are closed.
 G2.3's matching local-only LLVM representation, atomic take, and conditional
 destruction are closed.
+N0's exact native `[u32]` local and internal borrowed-call slice is closed.
 
 ## The idea in thirty seconds
 
@@ -494,8 +495,46 @@ must-fail, 49 tests, 20 test-fails) in 194.43s. LLVM CLI passed 8/8; the exact
 interpreter/native differential passed 1/1 over seven subjects at Clang `-O0`
 and `-O2`; and SVM differential remained 92/92. Free-list allocator,
 grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
-were green. G2.3 is closed. Generic slots and `Vec` ownership are the next
-design/implementation step, not a widened option ABI.
+were green. G2.3 is closed.
+
+N0 begins the native `Nat` ladder without admitting classes. It adds the exact
+internal `%sable.array.u32 = type { ptr, i64 }` representation for fresh owned
+local `[u32]` literals and `alloc_array<u32>` values, with checked `.len`,
+index reads, and stores. Internal free functions may accept `&[u32]` and
+`&mut [u32]`; call sites must carry the exact explicit named borrow with matching
+mutability, and those parameters never own or free the caller's descriptor.
+Owned-array parameters and returns, fields, classes, externs, entries, and every
+other element type stay closed, so this is not an array ABI.
+
+N0 reuses the versioned array hooks, 50,000,000-element cap, zero-length hook
+bypass, reverse lexical cleanup, and trap kinds 9/10. Allocation passes
+`len * 4` bytes but reports logical element counts in traps. The v1 allocation
+hook promises only byte storage, so every native `u32` element load and store is
+explicitly `align 1`; N0 does not retroactively strengthen the runtime ABI.
+The interpreter and existing verification model already define this source
+slice, so no new VC or Lean rule is introduced. A verified interpreter/native
+fixture and a strong-hook Clang matrix cover literals, nonzero fill, shared and
+mutable borrows, zero, reverse branch and loop cleanup, early return, OOB, OOM,
+and profile-cap precedence at `-O0` and `-O2`.
+
+N0 closed under the exact one-worker command
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` was green; focused LLVM units passed 31/31; and Rust library
+tests passed 215/215. The recursive corpus remained green across all 416 files
+(84 verifies, 263 must-fail, 49 tests, 20 test-fails) in 213.51s. LLVM CLI
+passed 9/9; the exact interpreter/native differential passed 1/1 over eight
+subjects at Clang `-O0` and `-O2`; and SVM differential remained 92/92.
+Randomized allocator, grind-budget, LSP, documentation, rustfmt, diff-check,
+and static-audit gates were green. N0 is closed.
+
+The next native checkpoints are deliberately incremental: N1 adds a local-only
+`Nat` class representation, `from_prefix`, shared class borrows, class returns,
+and destruction; N2 admits `cmp` and `add`; N3 adds `sub` and schoolbook `mul`;
+N4 carries `div`, `rem`, and `gcd` through class reassignment and loop cleanup;
+and only then does N5 lower nested `Integer { Nat mag; u64 neg; }` ownership,
+mutable class borrows, and sign/magnitude operations. Generic owner slots and
+`Vec` remain a separate later design, not something N0 silently authorizes.
 
 The complete G0 gate ran with one Cargo job, one Sable test job, one Lean job,
 and one Rust test thread. It passed 82/82 library tests, all 368 verifier,
@@ -541,7 +580,7 @@ Architecture in one sentence: the Rust compiler (`compiler/`) owns the program l
 
 ## Where this is headed
 
-The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1, scalar LLVM v0, G0, and **G1.0–G1.6 and G2.0–G2.3 closed**, the first `option<bool>` slice reaches verification, interpretation, the formal SVM, and native LLVM, root-owned integer-field POD records cross ordinary verified/interpreted/native calls internally, owned-local Boolean arrays reach verification, interpretation, dynamic monitoring, the formal SVM differential, and native LLVM with lexical cleanup, and the exact local `option<[bool]>` slice now reaches those same stages through native atomic take and conditional destruction. Generic slots/`Vec` ownership design and implementation is next, followed by `HashMap`; this does not broaden the option ABI. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
+The roadmap is benchmark-driven: each goal stresses one design axis, has a spec statable in a few lines, and has precedent in the verification literature bounding its effort. The spine: sorting and codecs → `Vec` and a hash map (forcing the generics design) → UTF-8 / JSON / DEFLATE / crypto kernels → a verified allocator (forcing the `unsafe` design) → the two pillars: a **GMP-style bignum library** verified to implement ℤ (its core arithmetic — through multiplication and division — is done), and the **SVM interpreter written and verified in Sable itself**. With unsafe Sable v1, scalar LLVM v0, G0, and **G1.0–G1.6 and G2.0–G2.3 closed**, the first `option<bool>` slice reaches verification, interpretation, the formal SVM, and native LLVM, root-owned integer-field POD records cross ordinary verified/interpreted/native calls internally, owned-local Boolean arrays reach verification, interpretation, dynamic monitoring, the formal SVM differential, and native LLVM with lexical cleanup, and the exact local `option<[bool]>` slice now reaches those same stages through native atomic take and conditional destruction. N0 is the closed foundation for carrying the already-verified bignum `Nat` to native code: exact local `[u32]` storage plus non-owning internal array borrows. The next checkpoints add `Nat` classes and arithmetic before the nested signed `Integer`; generic owner slots/`Vec` remain a separate later track. Minimal formatting/`String`, `Result`-shaped errors, real module namespaces/mangling, and domain-forced floating point follow provisionally; [`docs/PLAN.md`](docs/PLAN.md#post-u10-usability-sequence) records the intended boundaries. The long-running horizon is a formally verified OS kernel; the metatheory track (mechanized soundness of the verifier) runs alongside once the language surface stabilizes.
 
 ## Provenance
 

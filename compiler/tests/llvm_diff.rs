@@ -55,6 +55,11 @@ const CASES: &[Case] = &[
         source: "affine_options.sable",
         entry: "affine_options_entry",
     },
+    Case {
+        label: "u32-arrays",
+        source: "u32_arrays.sable",
+        entry: "u32_arrays_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {

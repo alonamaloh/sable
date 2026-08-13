@@ -362,6 +362,48 @@ allocator, grind-budget, LSP, documentation, diff-check, and static-audit gates
 were green. G1.6 is closed. ADR 0059 is the detailed representation, runtime,
 and lifetime decision.
 
+## N0 amendment: exact local `u32` arrays and internal borrows
+
+N0 is closed. It admits fresh owned local `[u32]` values from a contextual
+literal or `alloc_array<u32>`, length, checked
+index reads, and stores. The internal descriptor is
+`%sable.array.u32 = type { ptr, i64 }`. Nonempty allocation uses the existing
+v1 hooks with a byte request of `len * 4`; the descriptor and trap observer
+continue to carry logical element counts. The 50,000,000-element cap makes the
+scale bounded in the native profile. Zero length remains the complete null/zero
+descriptor and bypasses both hooks.
+
+The hook is still specified as byte storage. It makes no `u32`-alignment
+promise, so every typed element load and store is emitted with explicit
+`align 1`; N0 does not strengthen an existing runtime interface by inference
+from a hosted allocator. Address formation remains non-`inbounds`. OOM uses
+kind 9 with `(0, len, 0)`, whether the profile cap or a null hook result causes
+the failure; OOB uses kind 10 with `(0, index, len)`. Trap edges do not unwind.
+
+Internal ordinary functions may take `&[u32]` and `&mut [u32]`. Calls must
+retain the exact explicit named borrow node with checked matching mutability;
+overlapping mutable aliases are rejected. These parameters are non-owning and
+never enter cleanup. Owned caller locals retain the established reverse
+declaration/scope cleanup across branches, loop iterations, and early returns.
+
+This does not define an array ABI. Owned-array parameters or returns,
+array-valued entries, fields, classes, methods, externs, public/cross-module
+transport, Boolean borrows, other integer widths, whole-array movement or
+rebinding, generic/option containment, and exposure remain rejected. Existing
+VC generation, interpreter semantics, and formal tagged integer-array values
+already cover the source behavior, so N0 changes no Lean proof model.
+
+N0 closed under the exact one-worker command
+`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1
+SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1 --nocapture`.
+`cargo check` was green; focused LLVM units passed 31/31; Rust library tests
+passed 215/215; and all 416 recursive corpus files (84 verifies, 263 must-fail,
+49 tests, 20 test-fails) passed in 213.51s. LLVM CLI passed 9/9; the exact
+interpreter/native differential passed 1/1 over eight subjects at Clang `-O0`
+and `-O2`; and SVM differential remained 92/92. Randomized allocator,
+grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
+were green.
+
 ## Consequences
 
 This path gets Sable to native toolchains without expanding the trusted proof

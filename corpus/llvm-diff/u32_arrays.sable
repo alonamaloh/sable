@@ -1,0 +1,108 @@
+// N0 native u32-array subjects. Ownership stays with fresh locals; explicit
+// shared and mutable borrows are admitted only across internal free-function
+// calls. Scalar helpers make lexical cleanup and otherwise unreachable native
+// trap paths observable without defining an array ABI.
+
+fn u32_shared_sum(&[u32] values) -> u64 {
+    if (values.len < 3) {
+        return 0;
+    }
+    return widen<u64>(values[0])
+         + widen<u64>(values[1])
+         + widen<u64>(values[2]);
+}
+
+fn u32_mutate(&mut [u32] values, u64 index, u32 value) -> bool {
+    if (index >= values.len) {
+        return false;
+    }
+    values[index] = value;
+    return values[index] == value;
+}
+
+fn u32_array_zero() -> bool {
+    [u32] empty_alloc = alloc_array<u32>(0, 17);
+    [u32] empty_literal = [];
+    return empty_alloc.len == 0 && empty_literal.len == 0;
+}
+
+fn u32_array_branch_cleanup(bool choose_first) -> bool {
+    if (choose_first) {
+        [u32] true_first = alloc_array<u32>(5, 21);
+        [u32] true_second = alloc_array<u32>(7, 22);
+        return true_first[4] == 21 && true_second[6] == 22;
+    } else {
+        [u32] false_first = alloc_array<u32>(6, 23);
+        [u32] false_second = alloc_array<u32>(8, 24);
+        return false_first[5] == 23 && false_second[7] == 24;
+    }
+}
+
+fn u32_array_loop_cleanup() -> bool {
+    mut u64 iteration = 0;
+    /// invariant iteration <= 2
+    /// variant 2 - iteration
+    while (iteration < 2) {
+        [u32] per_iteration = alloc_array<u32>(9, 31);
+        if (per_iteration[8] != 31) {
+            return false;
+        }
+        iteration = iteration + 1;
+    }
+    return true;
+}
+
+fn u32_array_early_return() -> bool {
+    [u32] before_return = alloc_array<u32>(10, 41);
+    return before_return[9] == 41;
+}
+
+/// pre length = 0
+fn u32_array_alloc_guard(u64 length) -> u64 {
+    [u32] values = alloc_array<u32>(length, 9);
+    return values.len;
+}
+
+/// pre index = 0
+fn u32_array_load_guard(u64 index) -> u32 {
+    [u32] values = [41, 42];
+    return values[index];
+}
+
+/// pre index = 0
+fn u32_array_store_guard(u64 index) -> u32 {
+    mut [u32] values = [0, 1];
+    values[index] = 42;
+    return values[0];
+}
+
+fn u32_arrays_entry() -> i32 {
+    mut [u32] allocated = alloc_array<u32>(4, 7);
+    [u32] literal = [2, 3, 5];
+
+    if (!u32_mutate(&mut allocated, 1, 11)) {
+        return 1;
+    }
+    if (u32_shared_sum(&allocated) != 25) {
+        return 2;
+    }
+    if (u32_shared_sum(&literal) != 10) {
+        return 3;
+    }
+    if (!u32_array_zero()) {
+        return 4;
+    }
+    if (!u32_array_branch_cleanup(true)) {
+        return 5;
+    }
+    if (!u32_array_branch_cleanup(false)) {
+        return 6;
+    }
+    if (!u32_array_loop_cleanup()) {
+        return 7;
+    }
+    if (!u32_array_early_return()) {
+        return 8;
+    }
+    return 42;
+}

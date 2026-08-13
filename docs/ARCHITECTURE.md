@@ -131,7 +131,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (through G1.6 owned-local Boolean arrays)
+## Native lowering boundary (through N0 local `u32` arrays)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -653,7 +653,57 @@ foreign, or cross-module array ABI.
   passed 1/1 over seven subjects at Clang `-O0` and `-O2`; and SVM differential
   remained 92/92. Free-list allocator, grind-budget, LSP, documentation,
   rustfmt, diff-check, and static-audit gates were green. G2.3 is closed;
-  generic slots and `Vec` ownership come next, not a widened option ABI.
+  no widened option ABI follows.
+
+- **N0 is the proof-neutral native `u32`-array foundation for `Nat`.** The
+  backend now admits fresh owned local `[u32]` values from a contextual literal
+  or `alloc_array<u32>`, followed by length, checked index reads, and stores.
+  `%sable.array.u32 = type { ptr, i64 }` retains the logical element count in
+  the descriptor. Nonempty allocation passes `len * 4` bytes to the existing
+  v1 allocation hook; zero length is the null/zero descriptor and calls neither
+  hook. The profile cap remains 50,000,000 elements. OOM kind 9 reports the
+  logical length, not the byte count, and OOB kind 10 reports index and logical
+  length.
+
+  The v1 hook contract is a byte-allocation contract and makes no promise of
+  alignment greater than one. Generated `u32` loads and stores therefore use
+  explicit `align 1`, and address formation remains non-`inbounds`. A future
+  aligned or typed hook may enable stronger access alignment, but N0 does not
+  change the existing runtime ABI to obtain that optimization.
+
+  Internal ordinary functions may take `&[u32]` or `&mut [u32]`. A call is
+  accepted only when its checked argument remains the exact explicit named
+  borrow node with matching mutability; overlapping mutable aliases remain
+  rejected. Both parameter forms borrow a descriptor and never enter the
+  cleanup registry. Owned callers retain responsibility for reverse lexical
+  cleanup across normal branch exits, each loop iteration, and early return;
+  traps still do not unwind.
+
+  N0 does not admit owned-array parameters or returns, array-valued entries,
+  fields, classes, methods, externs, public or cross-module ABI, other integer
+  widths, Boolean borrows, whole-array transport/rebinding, exposure, generic
+  containment, or option containment. Its source verification, interpreter,
+  and formal integer-array value already existed, so N0 changes no VC or Lean
+  semantics.
+
+  N0 closed under the exact one-worker command
+  `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+  SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`. `cargo check` was green; focused LLVM units
+  passed 31/31; Rust library tests passed 215/215; and the recursive corpus
+  remained green across 416 files (84 verifies, 263 must-fail, 49 tests, 20
+  test-fails) in 213.51s. LLVM CLI passed 9/9; the exact
+  interpreter/native differential passed 1/1 over eight subjects at Clang
+  `-O0` and `-O2`; and SVM differential remained 92/92. Randomized allocator,
+  grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
+  were green. N0 is closed.
+
+  The staged native bignum ladder is N1 `Nat` construction/shared borrows/class
+  return and destruction; N2 `cmp` plus `add`; N3 `sub` plus schoolbook `mul`;
+  N4 `div`/`rem`/`gcd` with class reassignment and loop cleanup; and N5 the
+  nested `Integer` sign/magnitude class, class-valued field ownership, and
+  mutable class borrows. Generic owner slots and `Vec` remain a separate later
+  design rather than an implication of N0.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across
