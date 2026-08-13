@@ -1,0 +1,10 @@
+// expect-error: type.trait_return_unsupported
+// POD records cross ordinary calls, not retained trait-call proof reuse.
+
+record Pair #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+trait Factory {
+    fn make(Self value) -> Pair;
+}

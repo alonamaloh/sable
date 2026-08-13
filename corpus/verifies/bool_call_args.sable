@@ -1,0 +1,62 @@
+// Ordinary verified calls accept Bool arguments as values.  The proof model
+// still carries program booleans as propositions, so these subjects exercise
+// the explicit Prop-to-Bool boundary in call-contract substitution.
+
+/// pre  b
+/// post result
+pub fn require_true(bool b) -> bool {
+    return b;
+}
+
+/// post result ↔ b = true
+pub fn echo_bool(bool b) -> bool {
+    return b;
+}
+
+/// post result ↔ b = false
+pub fn invert_bool(bool b) -> bool {
+    return !b;
+}
+
+/// post result
+pub fn bool_literal_arg() -> bool {
+    return require_true(true);
+}
+
+/// post result ↔ x > 0
+pub fn bool_comparison_arg(i32 x) -> bool {
+    return echo_bool(x > 0);
+}
+
+/// post result ↔ x ≤ 0
+pub fn bool_negated_arg(i32 x) -> bool {
+    return echo_bool(!(x > 0));
+}
+
+/// post result ↔ x ≤ 0
+pub fn bool_false_clause_arg(i32 x) -> bool {
+    return invert_bool(x > 0);
+}
+
+/// post result ↔ x > 0
+pub fn bool_call_result_arg(i32 x) -> bool {
+    return echo_bool(echo_bool(x > 0));
+}
+
+/// post result ↔ x > 0
+pub fn bool_guarded_pre_arg(i32 x) -> bool {
+    if (x > 0) {
+        return require_true(x > 0);
+    }
+    return false;
+}
+
+/// post result ↔ b = true
+pub fn bool_recursive_arg(u64 n, bool b) -> bool
+/// variant n
+{
+    if (n == 0) {
+        return b;
+    }
+    return bool_recursive_arg(n - 1, b);
+}

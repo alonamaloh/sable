@@ -1,0 +1,6 @@
+// expect-error: type.trait_param_unsupported
+// Retained trait calls still use ADR 0009's abstract integer call model.
+
+trait Select {
+    fn select(Self value, bool choose) -> Self;
+}

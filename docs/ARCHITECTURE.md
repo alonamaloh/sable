@@ -83,6 +83,9 @@ vcgen (compiler/src/vcgen.rs)         forward symbolic execution over the AST;
   │                                   G1.1 stores Boolean options as `Option Bool`,
   │                                   using explicit Prop↔Bool bridges at packing
   │                                   and extraction rather than conflating models;
+  │                                   G1.4a uses the same explicit Prop→Bool bridge
+  │                                   for ordinary Boolean call arguments and carries
+  │                                   nominal POD values across ordinary calls;
   │                                   path-splitting at `if`; per-operation VCs;
   │                                   call sites: callee pres become obligations,
   │                                   callee posts become hypotheses on a fresh symbol;
@@ -122,7 +125,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (scalar v0 and G1.3 Boolean options complete)
+## Native lowering boundary (through G1.4a internal POD records)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -184,6 +187,16 @@ entry, or extern ABI exists; option-valued fields and trait methods,
 classes/method calls, residual generic forms, and every non-Boolean option
 payload remain rejected. The combined closure evidence appears with G1.2/G1.3
 below.
+
+G1.4a adds a second internal aggregate family: each supported root-owned POD
+declaration with integer fields becomes a named LLVM aggregate. Construction,
+projection, locals, branches, direct internal parameters, calls, and returns
+transport that semantic value. The LLVM type intentionally ignores the
+record's explicit `#[layout]` and field offsets: those declarations describe
+raw-cell geometry in the abstract storage model, not the layout of an ordinary
+LLVM SSA value. Imported records, extern/entry/public ABIs, pointer and Boolean
+fields, nested and container records, and classes remain rejected. The named
+aggregate is versionable internal lowering, not a record ABI.
 
 ## Key invariants
 
@@ -322,6 +335,40 @@ below.
   at `-O0` and `-O2` and observes 42 from the option subject; and SVM
   differential 76/76. Randomized allocator, grind-budget, LSP, and
   documentation gates were green. G1.2 and G1.3 are closed.
+- **Ordinary call transport is wider than class and public ABIs.** G1.4a lets
+  ordinary calls consume Boolean arguments by explicitly reifying the
+  proposition-valued symbolic expression to a Lean `Bool` at the formal call
+  boundary. Ordinary POD record values may cross parameters and
+  returns as well; returned records regain their nominal `wf` fact, and loop
+  havoc preserves that nominal well-formedness rather than treating the value
+  as an untyped tuple. The interpreter and dynamic contract monitor follow the
+  same call transport. Class-method record returns and Boolean/record trait
+  signatures remain independently rejected.
+
+  LLVM admits only root-owned integer-field POD records as internal named
+  aggregates. It lowers construction/projection, locals, branches, internal
+  parameters, direct calls, and returns, but no imported record,
+  extern/entry/public ABI, pointer or Boolean field, nested/container record,
+  or class. Explicit raw layout and offset metadata do not determine this
+  semantic aggregate representation. Consequently G1.4a is neither a stable
+  record ABI nor true generic-class support.
+
+  The complete one-worker closure passed `cargo check`; 150/150 library tests;
+  all 382 corpus subjects (82 verifies, 235 must-fail, 47 dynamic, 18
+  dynamic-fail) in 218.30s; focused Boolean-call verification at 16/16
+  obligations across ten functions and record-call verification at 13/13
+  across four functions, with each dynamic subject at 1/1; LLVM CLI 6/6; and the 1/1
+  exact-`VerifiedProgram` interpreter↔Clang differential at `-O0` and `-O2`
+  over five subjects including POD records. SVM differential stayed green at
+  76/76; the SVM lowerer also hardened semantic operand, source-scope,
+  sealed-op, record-geometry, and integer-array coherence at its public AST
+  boundary, without admitting Boolean arrays. Randomized allocator,
+  grind-budget, LSP, and documentation gates were green. G1.4a is closed.
+
+  G1.4b is staged narrowly: owned-local Boolean arrays first reach the checker,
+  VC generator, interpreter, and dynamic monitor while SVM and LLVM reject
+  them. Dedicated formal-machine and native lowering stages follow before that
+  boundary widens.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across
@@ -432,6 +479,10 @@ absence/presence, local assignment, accessor results, and A-normal call
 transport, plus UART success, budget exhaustion, readiness clearing, ordered
 traces, invalid writes, profile reselection (including its precedence over
 script-expression traps), and all three selection contexts.
+The same boundary now checks integer-array expression annotations, element
+types, constructor shape, and call coherence on public AST input; this is
+hardening of the existing integer-array lowering path, not Boolean-array
+acceptance.
 
 ## Repo layout
 

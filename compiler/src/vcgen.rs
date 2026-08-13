@@ -574,6 +574,35 @@ fn validate_vc_fn(
     validate_vc_block(&function.body, allow_param, context)
 }
 
+fn validate_vc_trait_fn(function: &Fn, context: &str) -> Result<(), String> {
+    validate_vc_fn(function, true, true, context)?;
+    if function
+        .params
+        .iter()
+        .any(|parameter| matches!(parameter.ty, Ty::Bool | Ty::Record(_)))
+    {
+        return Err(format!(
+            "internal VC type error: Boolean and POD-record trait parameters are not supported in {context}"
+        ));
+    }
+    if matches!(function.ret, Ty::Bool | Ty::Record(_)) {
+        return Err(format!(
+            "internal VC type error: Boolean and POD-record trait returns are not supported in {context}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vc_method(function: &Fn, allow_param: bool, context: &str) -> Result<(), String> {
+    validate_vc_fn(function, allow_param, false, context)?;
+    if matches!(function.ret, Ty::Record(_)) {
+        return Err(format!(
+            "internal VC type error: POD-record method returns are not supported in {context}"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_vc_class(class: &ClassDecl, allow_param: bool) -> Result<(), String> {
     let context = format!("class `{}`", class.name);
     for field in &class.fields {
@@ -583,7 +612,7 @@ fn validate_vc_class(class: &ClassDecl, allow_param: bool) -> Result<(), String>
         validate_vc_fn(init, allow_param, false, &context)?;
     }
     for method in &class.methods {
-        validate_vc_fn(&method.f, allow_param, false, &context)?;
+        validate_vc_method(&method.f, allow_param, &context)?;
     }
     if let Some(deinit) = &class.deinit {
         validate_vc_block(deinit, allow_param, &context)?;
@@ -626,7 +655,7 @@ fn validate_vc_type_domain(program: &Program) -> Result<(), String> {
     }
     for trait_decl in &program.traits {
         for method in &trait_decl.methods {
-            validate_vc_fn(method, true, true, &format!("trait `{}`", trait_decl.name))?;
+            validate_vc_trait_fn(method, &format!("trait `{}`", trait_decl.name))?;
         }
     }
     for implementation in &program.impls {
@@ -2693,6 +2722,16 @@ impl<'a> Generator<'a> {
                 Some(Ty::Option(element)) => {
                     self.binders.push((name.clone(), lean_option_ty(*element)));
                     self.env.insert(name.clone(), Val::Opt(name.clone()));
+                }
+                // A record local assigned in the loop is an arbitrary
+                // checked value at the next head. Rebind it just like an
+                // integer local, retaining only the nominal type's implicit
+                // well-formedness postcondition.
+                Some(Ty::Record(ri)) => {
+                    let record = lean_record_name(&self.records[*ri].name);
+                    self.binders.push((name.clone(), record.clone()));
+                    self.push_hyp_unique(format!("h_{name}_wf"), format!("{record}.wf {name}"));
+                    self.env.insert(name.clone(), Val::Record(name.clone()));
                 }
                 // A loop body called &mut methods on this class value (or,
                 // for a local, reassigned it from a call result): fresh
@@ -5342,16 +5381,31 @@ impl<'a> Generator<'a> {
             }
             ExprKind::Call { callee, args, .. } => {
                 let hint = self.name_hint.take();
+                let params = self.sigs[callee.as_str()].params.clone();
                 let arg_vals: Vec<String> = args
                     .iter()
-                    .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) | Val::Ptr(v) => v,
-                        _ => unreachable!("checked: int/array/class/resource/pointer args"),
+                    .zip(&params)
+                    .map(|(a, parameter)| match self.eval(a) {
+                        Val::Int(v)
+                        | Val::Arr(v)
+                        | Val::Obj(v)
+                        | Val::Record(v)
+                        | Val::View(v)
+                        | Val::Ptr(v) => v,
+                        // Program booleans are propositions in symbolic
+                        // execution, while source parameters bind Lean Bool.
+                        // Reify at the exact call boundary before substituting
+                        // the callee's pre/post/variant clauses.
+                        Val::Prop(p) if parameter.ty == Ty::Bool => lean_bool_value(&p),
+                        Val::Prop(_) => {
+                            unreachable!("checked: a proposition argument has a Bool parameter")
+                        }
+                        _ => unreachable!(
+                            "checked: int/bool/array/class/record/resource/pointer args"
+                        ),
                     })
                     .collect();
                 let callee_fn = self.fn_map[callee.as_str()];
-                let sig = &self.sigs[callee.as_str()];
-                let params = sig.params.clone();
                 self.push_borrow_invs(&params, &arg_vals, e.span);
                 let sig = &self.sigs[callee.as_str()];
                 let mut subst_map: HashMap<String, String> = sig
@@ -5468,6 +5522,17 @@ impl<'a> Generator<'a> {
                         self.push_class_state_facts(cd, &ret_sym);
                         self.push_invariant_hyps(cd, &ret_sym);
                     }
+                    Ty::Record(ri) => {
+                        let record = lean_record_name(&self.records[ri].name);
+                        self.binders.push((ret_sym.clone(), record.clone()));
+                        // Like integer range facts, record well-formedness is
+                        // an implicit checked-type postcondition of the
+                        // verified callee, independent of its user posts.
+                        self.push_hyp_unique(
+                            format!("h_{}_wf", ret_sym.trim_start_matches('_')),
+                            format!("{record}.wf {ret_sym}"),
+                        );
+                    }
                     // A returned resource: a fresh view binder. The
                     // authority that came with it is the checker's
                     // business, and appears nowhere here (ADR 0024).
@@ -5508,6 +5573,7 @@ impl<'a> Generator<'a> {
                     Ty::Unit => Val::Unit,
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
+                    Ty::Record(_) => Val::Record(ret_sym),
                     Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
                     Ty::Raw(_) => Val::Ptr(ret_sym),
                     Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
@@ -6477,6 +6543,26 @@ pub fn slug(text: &str) -> String {
 #[cfg(test)]
 mod g1_type_domain_tests {
     use super::*;
+    use crate::span::LineMap;
+
+    fn parsed_program(source: &str) -> Program {
+        let scanned = crate::scan::scan(source);
+        let tokens = crate::lexer::lex(&scanned.program_text).expect("test source should lex");
+        crate::parser::parse(
+            &tokens,
+            &scanned.blocks,
+            &LineMap::new(source),
+            &scanned.program_text,
+        )
+        .expect("test source should parse")
+    }
+
+    fn checked_program(source: &str) -> (Program, HashMap<String, FnSig>) {
+        let mut program = parsed_program(source);
+        crate::mono::monomorphize(&mut program).expect("test source should monomorphize");
+        let checked = crate::check::check(&mut program).expect("test source should typecheck");
+        (program, checked.sigs)
+    }
 
     #[test]
     fn retained_templates_require_canonical_scalar_parameters() {
@@ -6530,5 +6616,90 @@ mod g1_type_domain_tests {
             .expect_err("unsupported option position must fail before VC generation");
             assert!(error.contains(expected));
         }
+    }
+
+    #[test]
+    fn trait_and_method_value_boundaries_fail_in_vc_preflight() {
+        let trait_program = parsed_program(
+            r#"
+trait Predicate {
+    fn test(Self value) -> bool;
+}
+"#,
+        );
+        let error = validate_vc_type_domain(&trait_program)
+            .expect_err("trait Bool results must fail before symbolic evaluation");
+        assert!(error.contains("Boolean and POD-record trait returns"));
+
+        let method_program = parsed_program(
+            r#"
+record Pair #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+class Holder {
+    u64 value;
+
+    init new() {
+        self.value = 1;
+    }
+
+    fn pair(&self) -> Pair {
+        return Pair(self.value);
+    }
+}
+"#,
+        );
+        let error = validate_vc_type_domain(&method_program)
+            .expect_err("method record results must fail before symbolic evaluation");
+        assert!(error.contains("POD-record method returns"));
+    }
+
+    #[test]
+    fn record_loop_havoc_rebinds_the_nominal_value_and_well_formedness() {
+        let source = r#"
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+fn make_pair(u64 left, u64 right) -> Pair {
+    return Pair(left, right);
+}
+
+fn loop_record(u64 count) -> u64 {
+    mut Pair pair = make_pair(1, 2);
+    mut u64 i = count;
+    /// invariant pair.left = 1
+    /// invariant pair.right = 2
+    /// variant i
+    while (i > 0) {
+        pair = make_pair(1, 2);
+        i = i - 1;
+    }
+    return pair.left;
+}
+"#;
+        let (program, sigs) = checked_program(source);
+        let generated = generate(&program, &sigs, source, std::path::Path::new("."))
+            .expect("record loop should stay inside the VC type domain");
+        let preservation = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.starts_with("loop_record.inv_preserved"))
+            .expect("loop should emit an invariant-preservation obligation");
+
+        assert!(
+            preservation
+                .binders
+                .iter()
+                .any(|(name, ty)| name == "pair" && ty == "SableR_Pair")
+        );
+        assert!(
+            preservation
+                .hyps
+                .iter()
+                .any(|(_, proposition)| proposition == "SableR_Pair.wf pair")
+        );
     }
 }

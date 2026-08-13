@@ -1,5 +1,5 @@
-//! Strict textual LLVM IR lowering for the verified scalar and Boolean-option
-//! core (ADR 0058).
+//! Strict textual LLVM IR lowering for the verified scalar, Boolean-option,
+//! and bounded POD-record core (ADR 0058).
 //!
 //! This first slice handles scalar storage, calls, comparisons, and structured
 //! control flow.  A construct is either lowered with its Sable meaning or
@@ -7,7 +7,7 @@
 //! unchecked arithmetic.
 
 use crate::VerifiedProgram;
-use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, Stmt, Ty, UnOp, ValueTy};
+use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, RecordDecl, Stmt, Ty, UnOp, ValueTy};
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -65,7 +65,7 @@ fn emit_program(
     let selected = select_functions(program, root_span_end, options)?;
     validate_acyclic(program, &selected)?;
     for &index in &selected {
-        validate_function(program, &program.fns[index])?;
+        validate_function(program, &program.fns[index], root_span_end)?;
     }
 
     let selected_set: HashSet<usize> = selected.iter().copied().collect();
@@ -74,6 +74,14 @@ fn emit_program(
     );
     let mut definitions = String::new();
     let mut support = ModuleSupport::default();
+    if options.entry.is_none() {
+        // Whole-module mode promises not to silently omit a supported type
+        // declaration. Entry mode remains closure-based and registers only
+        // records actually used by selected functions.
+        for record in 0..program.records.len() {
+            support.require_record(record);
+        }
+    }
     for (index, function) in program.fns.iter().enumerate() {
         if selected_set.contains(&index) {
             FunctionEmitter::new(program, function, &mut support).emit(&mut definitions)?;
@@ -89,7 +97,7 @@ fn emit_program(
             .expect("entry selection validated above");
         emit_main_bridge(function, &mut definitions);
     }
-    support.emit(&mut out);
+    support.emit(program, &mut out);
     out.push_str(&definitions);
     Ok(out)
 }
@@ -158,7 +166,7 @@ fn select_functions(
         }
         work.push(index);
     } else {
-        validate_whole_program_surface(program)?;
+        validate_whole_program_surface(program, root_span_end)?;
         work.extend(
             program
                 .fns
@@ -206,7 +214,10 @@ fn select_functions(
     Ok(ordered)
 }
 
-fn validate_whole_program_surface(program: &Program) -> Result<(), Vec<BackendError>> {
+fn validate_whole_program_surface(
+    program: &Program,
+    root_span_end: usize,
+) -> Result<(), Vec<BackendError>> {
     if let Some(template) = program.fn_templates.first() {
         return Err(vec![unsupported(
             template.name_span,
@@ -226,11 +237,14 @@ fn validate_whole_program_surface(program: &Program) -> Result<(), Vec<BackendEr
             format!("class `{}` is outside the scalar LLVM subset", class.name),
         )]);
     }
-    if let Some(record) = program.records.first() {
-        return Err(vec![unsupported(
-            record.name_span,
-            format!("record `{}` is outside the scalar LLVM subset", record.name),
-        )]);
+    for (record, declaration) in program.records.iter().enumerate() {
+        require_record_value(
+            program,
+            root_span_end,
+            record,
+            declaration.name_span,
+            "record declaration",
+        )?;
     }
     if let Some(trait_decl) = program.traits.first() {
         return Err(vec![unsupported(
@@ -296,7 +310,11 @@ fn validate_acyclic(program: &Program, selected: &[usize]) -> Result<(), Vec<Bac
     Ok(())
 }
 
-fn validate_function(program: &Program, function: &Fn) -> Result<(), Vec<BackendError>> {
+fn validate_function(
+    program: &Program,
+    function: &Fn,
+    root_span_end: usize,
+) -> Result<(), Vec<BackendError>> {
     if !function.type_params.is_empty() || !function.type_bounds.is_empty() {
         return Err(vec![unsupported(
             function.name_span,
@@ -316,13 +334,29 @@ fn validate_function(program: &Program, function: &Fn) -> Result<(), Vec<Backend
         )]);
     }
     for parameter in &function.params {
-        require_value_scalar(parameter.ty, parameter.span, "function parameter")?;
+        require_parameter_value(
+            program,
+            root_span_end,
+            parameter.ty,
+            parameter.span,
+            "function parameter",
+        )?;
     }
-    require_runtime_type(function.ret, function.name_span, "function return type")?;
-    validate_block(program, &function.body)
+    require_runtime_type(
+        program,
+        root_span_end,
+        function.ret,
+        function.name_span,
+        "function return type",
+    )?;
+    validate_block(program, &function.body, root_span_end)
 }
 
-fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<BackendError>> {
+fn validate_block(
+    program: &Program,
+    statements: &[Stmt],
+    root_span_end: usize,
+) -> Result<(), Vec<BackendError>> {
     for statement in statements {
         match statement {
             Stmt::Decl {
@@ -331,9 +365,9 @@ fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<Back
                 init,
                 ..
             } => {
-                require_local_value(*ty, *name_span, "local variable")?;
+                require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
                 if let Some(value) = init {
-                    validate_expr(program, value)?;
+                    validate_expr(program, value, root_span_end)?;
                 }
             }
             Stmt::VarDecl {
@@ -348,30 +382,30 @@ fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<Back
                         "inferred local is missing its checked type",
                     )]);
                 };
-                require_local_value(ty, *name_span, "inferred local")?;
-                validate_expr(program, init)?;
+                require_local_value(program, root_span_end, ty, *name_span, "inferred local")?;
+                validate_expr(program, init, root_span_end)?;
             }
             Stmt::Assign { value, .. }
             | Stmt::ExprStmt(value)
             | Stmt::Return {
                 value: Some(value), ..
-            } => validate_expr(program, value)?,
+            } => validate_expr(program, value, root_span_end)?,
             Stmt::Return { value: None, .. } | Stmt::Assert(_) => {}
-            Stmt::Unsafe { body, .. } => validate_block(program, body)?,
+            Stmt::Unsafe { body, .. } => validate_block(program, body, root_span_end)?,
             Stmt::If {
                 cond,
                 then_block,
                 else_block,
             } => {
-                validate_bool_expr(program, cond, "`if` condition")?;
-                validate_block(program, then_block)?;
+                validate_bool_expr(program, cond, "`if` condition", root_span_end)?;
+                validate_block(program, then_block, root_span_end)?;
                 if let Some(else_block) = else_block {
-                    validate_block(program, else_block)?;
+                    validate_block(program, else_block, root_span_end)?;
                 }
             }
             Stmt::While { cond, body, .. } => {
-                validate_bool_expr(program, cond, "`while` condition")?;
-                validate_block(program, body)?;
+                validate_bool_expr(program, cond, "`while` condition", root_span_end)?;
+                validate_block(program, body, root_span_end)?;
             }
             Stmt::FieldAssign { field_span, .. } | Stmt::FieldStore { field_span, .. } => {
                 return Err(vec![unsupported(
@@ -399,7 +433,11 @@ fn validate_block(program: &Program, statements: &[Stmt]) -> Result<(), Vec<Back
     Ok(())
 }
 
-fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<BackendError>> {
+fn validate_expr(
+    program: &Program,
+    expression: &Expr,
+    root_span_end: usize,
+) -> Result<(), Vec<BackendError>> {
     match &expression.kind {
         ExprKind::IntLit(_) => {
             let Some(Ty::Int(integer)) = expression.ty else {
@@ -418,7 +456,7 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
                     "expression is missing its checked type",
                 )]
             })?;
-            require_runtime_type(ty, expression.span, "expression")
+            require_runtime_type(program, root_span_end, ty, expression.span, "expression")
         }
         ExprKind::Call {
             callee,
@@ -445,21 +483,38 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
                     format!("call to audited extern `{callee}`"),
                 )]);
             }
-            for argument in args {
-                validate_expr(program, argument)?;
+            if args.len() != function.params.len() {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "call to `{callee}` has {} argument(s), but its checked signature has {}",
+                        args.len(),
+                        function.params.len()
+                    ),
+                )]);
             }
-            require_runtime_type(function.ret, expression.span, "call result")?;
+            for (argument, parameter) in args.iter().zip(&function.params) {
+                validate_expr(program, argument, root_span_end)?;
+                require_expr_type(argument, parameter.ty, "call argument")?;
+            }
+            require_runtime_type(
+                program,
+                root_span_end,
+                function.ret,
+                expression.span,
+                "call result",
+            )?;
             require_expr_type(expression, function.ret, "call result")
         }
         ExprKind::Unary {
             op: UnOp::Not,
             operand,
-        } => validate_bool_expr(program, operand, "logical-not operand"),
+        } => validate_bool_expr(program, operand, "logical-not operand", root_span_end),
         ExprKind::Unary {
             op: UnOp::Neg,
             operand,
         } => {
-            validate_expr(program, operand)?;
+            validate_expr(program, operand, root_span_end)?;
             let Some(Ty::Int(integer)) = operand.ty else {
                 return Err(vec![unsupported(
                     operand.span,
@@ -480,8 +535,8 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             rhs,
             ..
         } => {
-            validate_bool_expr(program, lhs, "short-circuit left operand")?;
-            validate_bool_expr(program, rhs, "short-circuit right operand")?;
+            validate_bool_expr(program, lhs, "short-circuit left operand", root_span_end)?;
+            validate_bool_expr(program, rhs, "short-circuit right operand", root_span_end)?;
             require_expr_type(expression, Ty::Bool, "short-circuit result")
         }
         ExprKind::Binary {
@@ -490,8 +545,8 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             rhs,
             ..
         } => {
-            validate_expr(program, lhs)?;
-            validate_expr(program, rhs)?;
+            validate_expr(program, lhs, root_span_end)?;
+            validate_expr(program, rhs, root_span_end)?;
             let Some(Ty::Int(lhs_ty)) = lhs.ty else {
                 return Err(vec![unsupported(
                     lhs.span,
@@ -516,8 +571,8 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             rhs,
             ..
         } => {
-            validate_expr(program, lhs)?;
-            validate_expr(program, rhs)?;
+            validate_expr(program, lhs, root_span_end)?;
+            validate_expr(program, rhs, root_span_end)?;
             let Some(Ty::Int(integer)) = lhs.ty else {
                 return Err(vec![unsupported(
                     lhs.span,
@@ -537,7 +592,7 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             require_expr_type(expression, Ty::Int(integer), "arithmetic result")
         }
         ExprKind::Widen { target, arg } => {
-            validate_expr(program, arg)?;
+            validate_expr(program, arg, root_span_end)?;
             require_concrete_integer(*target, expression.span, "widen target")?;
             let Some(Ty::Int(source)) = arg.ty else {
                 return Err(vec![unsupported(
@@ -558,7 +613,7 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             require_expr_type(expression, Ty::Int(*target), "widen result")
         }
         ExprKind::Narrow { target, arg } => {
-            validate_expr(program, arg)?;
+            validate_expr(program, arg, root_span_end)?;
             require_concrete_integer(*target, expression.span, "narrow target")?;
             if !matches!(arg.ty, Some(Ty::Int(_))) {
                 return Err(vec![unsupported(
@@ -574,7 +629,7 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
                 Ty::Option(ValueTy::Bool),
                 "Boolean option construction",
             )?;
-            validate_bool_expr(program, inner, "Boolean option payload")
+            validate_bool_expr(program, inner, "Boolean option payload", root_span_end)
         }
         ExprKind::NoneE => require_expr_type(
             expression,
@@ -582,7 +637,7 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             "Boolean option construction",
         ),
         ExprKind::IsSome { operand } => {
-            validate_expr(program, operand)?;
+            validate_expr(program, operand, root_span_end)?;
             require_expr_type(
                 operand,
                 Ty::Option(ValueTy::Bool),
@@ -591,7 +646,7 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             require_expr_type(expression, Ty::Bool, "`.is_some` result")
         }
         ExprKind::OptValue { operand } => {
-            validate_expr(program, operand)?;
+            validate_expr(program, operand, root_span_end)?;
             require_expr_type(
                 operand,
                 Ty::Option(ValueTy::Bool),
@@ -599,9 +654,58 @@ fn validate_expr(program: &Program, expression: &Expr) -> Result<(), Vec<Backend
             )?;
             require_expr_type(expression, Ty::Bool, "Boolean option payload")
         }
+        ExprKind::RecordLit { record, args, .. } => {
+            let Some(Ty::Record(record_index)) = expression.ty else {
+                return Err(vec![unsupported(
+                    expression.span,
+                    "POD record construction is missing its checked nominal type",
+                )]);
+            };
+            require_record_value(
+                program,
+                root_span_end,
+                record_index,
+                expression.span,
+                "record construction",
+            )?;
+            let declaration = &program.records[record_index];
+            if declaration.name != *record {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "record construction names `{record}` but carries checked type `{}`",
+                        declaration.name
+                    ),
+                )]);
+            }
+            if args.len() != declaration.fields.len() {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "record `{record}` construction has {} field value(s), but the declaration has {}",
+                        args.len(),
+                        declaration.fields.len()
+                    ),
+                )]);
+            }
+            for (argument, field) in args.iter().zip(&declaration.fields) {
+                validate_expr(program, argument, root_span_end)?;
+                require_expr_type(argument, field.ty, "record field initializer")?;
+            }
+            Ok(())
+        }
+        ExprKind::RecordField { .. } => {
+            let Some(Ty::Int(integer)) = expression.ty else {
+                return Err(vec![unsupported(
+                    expression.span,
+                    "G1.4a record projection must have a concrete integer field type",
+                )]);
+            };
+            require_concrete_integer(integer, expression.span, "record field projection")
+        }
         _ => Err(vec![unsupported(
             expression.span,
-            "expression is outside the scalar/Boolean-option LLVM subset",
+            "expression is outside the scalar/Boolean-option/POD-record LLVM subset",
         )]),
     }
 }
@@ -610,8 +714,9 @@ fn validate_bool_expr(
     program: &Program,
     expression: &Expr,
     role: &str,
+    root_span_end: usize,
 ) -> Result<(), Vec<BackendError>> {
-    validate_expr(program, expression)?;
+    validate_expr(program, expression, root_span_end)?;
     require_expr_type(expression, Ty::Bool, role)
 }
 
@@ -626,49 +731,110 @@ fn require_expr_type(expression: &Expr, expected: Ty, role: &str) -> Result<(), 
     }
 }
 
-fn require_runtime_type(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
-    if matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
-        || matches!(ty, Ty::Bool | Ty::Unit | Ty::Option(ValueTy::Bool))
-    {
-        Ok(())
-    } else {
-        Err(vec![unsupported(
+/// Authorize one nominal record for G1.4a's *value* representation.  The
+/// declaration's `#[layout]` and `#[offset]` metadata describes abstract raw
+/// typed storage (ADR 0054); it is intentionally irrelevant to this internal
+/// LLVM aggregate. Pointer-bearing records wait for a provenance-preserving
+/// native pointer representation, and imported records wait for module ABI
+/// identity rather than inheriting a flattened-program index by accident.
+fn require_record_value(
+    program: &Program,
+    root_span_end: usize,
+    record: usize,
+    span: Span,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    let Some(declaration) = program.records.get(record) else {
+        return Err(vec![unsupported(
+            span,
+            format!("{role} carries record index {record}, outside the checked program"),
+        )]);
+    };
+    if declaration.name_span.start >= root_span_end {
+        return Err(vec![unsupported(
+            span,
+            format!(
+                "{role} uses imported record `{}`; G1.4a has no cross-module record ABI",
+                declaration.name
+            ),
+        )]);
+    }
+    for field in &declaration.fields {
+        if !matches!(field.ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) {
+            return Err(vec![unsupported(
+                field.span,
+                format!(
+                    "record `{}.{}` has field type `{}`; G1.4a lowers integer-only POD values",
+                    declaration.name,
+                    field.name,
+                    field.ty.name()
+                ),
+            )]);
+        }
+    }
+    Ok(())
+}
+
+fn require_runtime_type(
+    program: &Program,
+    root_span_end: usize,
+    ty: Ty,
+    span: Span,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    match ty {
+        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        Ty::Bool | Ty::Unit | Ty::Option(ValueTy::Bool) => Ok(()),
+        Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
+        _ => Err(vec![unsupported(
             span,
             format!(
                 "{role} type `{}` has no supported LLVM runtime representation",
                 ty.name()
             ),
-        )])
+        )]),
     }
 }
 
-fn require_local_value(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
-    if matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
-        || matches!(ty, Ty::Bool | Ty::Option(ValueTy::Bool))
-    {
-        Ok(())
-    } else {
-        Err(vec![unsupported(
+fn require_local_value(
+    program: &Program,
+    root_span_end: usize,
+    ty: Ty,
+    span: Span,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    match ty {
+        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        Ty::Bool | Ty::Option(ValueTy::Bool) => Ok(()),
+        Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
+        _ => Err(vec![unsupported(
             span,
             format!(
                 "{role} type `{}` has no supported LLVM local representation",
                 ty.name()
             ),
-        )])
+        )]),
     }
 }
 
-fn require_value_scalar(ty: Ty, span: Span, role: &str) -> Result<(), Vec<BackendError>> {
-    if matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) || ty == Ty::Bool {
-        Ok(())
-    } else {
-        Err(vec![unsupported(
+fn require_parameter_value(
+    program: &Program,
+    root_span_end: usize,
+    ty: Ty,
+    span: Span,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    match ty {
+        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        Ty::Bool => Ok(()),
+        Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
+        _ => Err(vec![unsupported(
             span,
             format!(
                 "{role} type `{}` has no first-slice LLVM value representation",
                 ty.name()
             ),
-        )])
+        )]),
     }
 }
 
@@ -703,6 +869,14 @@ const TRAP_OPTION_NONE: u32 = 8;
 /// This is deliberately not a C ABI promise: byte fields make the layout
 /// unambiguous inside generated LLVM while ordinary Sable `bool` remains i1.
 const LLVM_OPTION_BOOL: &str = "%sable.option.bool";
+
+/// Nominal identity is the checked program's record tag, the same identity
+/// carried by interpreter/SVM values. Numeric names are deterministic and
+/// LLVM-safe without making source spelling or flattened indices a linkable
+/// ABI: every generated function and type remains module-internal.
+fn llvm_record_ty(record: usize) -> String {
+    format!("%sable.record.{record}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OverflowIntrinsic {
@@ -772,6 +946,7 @@ struct ModuleSupport {
     overflow_intrinsics: BTreeSet<OverflowIntrinsic>,
     needs_trap: bool,
     needs_option_bool: bool,
+    records: BTreeSet<usize>,
 }
 
 impl ModuleSupport {
@@ -788,10 +963,39 @@ impl ModuleSupport {
         self.needs_option_bool = true;
     }
 
-    fn emit(&self, out: &mut String) {
+    fn require_record(&mut self, record: usize) {
+        self.records.insert(record);
+    }
+
+    fn emit_record_type(record: usize, declaration: &RecordDecl, out: &mut String) {
+        let fields = declaration
+            .fields
+            .iter()
+            .map(|field| llvm_ty(field.ty))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // This is an ordinary-value carrier only. It does not encode the
+        // source record's explicit raw-storage offsets, padding, or pointer
+        // geometry and therefore grants no CRepr/BitwiseRepr promise.
+        out.push_str(&format!(
+            "; internal semantic value for record `{}`; not its raw-cell layout\n",
+            declaration.name
+        ));
+        let body = if fields.is_empty() {
+            "{}".to_string()
+        } else {
+            format!("{{ {fields} }}")
+        };
+        out.push_str(&format!("{} = type {body}\n\n", llvm_record_ty(record)));
+    }
+
+    fn emit(&self, program: &Program, out: &mut String) {
         if self.needs_option_bool {
             out.push_str(LLVM_OPTION_BOOL);
             out.push_str(" = type { i8, i8 }\n\n");
+        }
+        for record in &self.records {
+            Self::emit_record_type(*record, &program.records[*record], out);
         }
         for intrinsic in &self.overflow_intrinsics {
             out.push_str(&intrinsic.declaration());
@@ -869,8 +1073,15 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit(mut self, out: &mut String) -> Result<(), Vec<BackendError>> {
-        if self.function.ret == Ty::Option(ValueTy::Bool) {
-            self.support.require_option_bool();
+        self.require_type_support(self.function.ret);
+        let parameter_types = self
+            .function
+            .params
+            .iter()
+            .map(|parameter| parameter.ty)
+            .collect::<Vec<_>>();
+        for ty in parameter_types {
+            self.require_type_support(ty);
         }
         let parameters = self
             .function
@@ -898,9 +1109,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let mut declarations = Vec::new();
         collect_local_declarations(&self.function.body, &mut declarations);
         for (name, ty) in parameters.iter().chain(declarations.iter()) {
-            if *ty == Ty::Option(ValueTy::Bool) {
-                self.support.require_option_bool();
-            }
+            self.require_type_support(*ty);
             let slot = self.new_slot();
             self.instruction(format!("{slot} = alloca {}", llvm_ty(*ty)));
             self.locals.insert(name.clone(), Local { ty: *ty, slot });
@@ -937,6 +1146,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         }
         out.push_str("}\n");
         Ok(())
+    }
+
+    fn require_type_support(&mut self, ty: Ty) {
+        match ty {
+            Ty::Option(ValueTy::Bool) => self.support.require_option_bool(),
+            Ty::Record(record) => self.support.require_record(record),
+            _ => {}
+        }
     }
 
     fn emit_block(&mut self, statements: &[Stmt]) -> Result<(), Vec<BackendError>> {
@@ -1147,6 +1364,98 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 Ok(Value {
                     ty,
                     operand: Some(temp),
+                })
+            }
+            ExprKind::RecordLit { record, args, .. } => {
+                let Ty::Record(record_index) = expression
+                    .ty
+                    .expect("validated record construction has a nominal type")
+                else {
+                    unreachable!("validated record construction type")
+                };
+                self.support.require_record(record_index);
+                let declaration = self.program.records[record_index].clone();
+                debug_assert_eq!(declaration.name.as_str(), record.as_str());
+
+                // All G1.4a fields are integers, so zero is a valid defined
+                // seed. Every declared field is then overwritten in source
+                // order; evaluating each argument before the next preserves
+                // Sable's left-to-right call/trap order.
+                let record_ty = llvm_record_ty(record_index);
+                let mut aggregate = "zeroinitializer".to_string();
+                for (index, (argument, field)) in args.iter().zip(&declaration.fields).enumerate() {
+                    let value = self.emit_expr(argument)?;
+                    let next = self.new_temp();
+                    self.instruction(format!(
+                        "{next} = insertvalue {record_ty} {aggregate}, {} {}, {index}",
+                        llvm_ty(field.ty),
+                        value.operand.expect("validated record field value")
+                    ));
+                    aggregate = next;
+                }
+                Ok(Value {
+                    ty: Ty::Record(record_index),
+                    operand: Some(aggregate),
+                })
+            }
+            ExprKind::RecordField {
+                obj,
+                obj_span,
+                field,
+            } => {
+                let Some(local) = self.locals.get(obj) else {
+                    return Err(vec![unsupported(
+                        *obj_span,
+                        format!("LLVM record local `{obj}` was not declared"),
+                    )]);
+                };
+                let (record_index, slot) = match local.ty {
+                    Ty::Record(record_index) => (record_index, local.slot.clone()),
+                    other => {
+                        return Err(vec![unsupported(
+                            *obj_span,
+                            format!(
+                                "record projection base `{obj}` has checked LLVM type `{}`",
+                                other.name()
+                            ),
+                        )]);
+                    }
+                };
+                self.support.require_record(record_index);
+                let declaration = self.program.records[record_index].clone();
+                let Some((field_index, declaration_field)) = declaration
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .find(|(_, declaration_field)| declaration_field.name == *field)
+                    .map(|(index, field)| (index, field.clone()))
+                else {
+                    return Err(vec![unsupported(
+                        expression.span,
+                        format!("record `{}` has no field `{field}`", declaration.name),
+                    )]);
+                };
+                if expression.ty != Some(declaration_field.ty) {
+                    return Err(vec![unsupported(
+                        expression.span,
+                        format!(
+                            "record `{}.{field}` is annotated `{}` instead of `{}`",
+                            declaration.name,
+                            expression.ty.map_or_else(|| "<missing>".into(), Ty::name),
+                            declaration_field.ty.name()
+                        ),
+                    )]);
+                }
+                let record_ty = llvm_record_ty(record_index);
+                let aggregate = self.new_temp();
+                self.instruction(format!("{aggregate} = load {record_ty}, ptr {slot}"));
+                let value = self.new_temp();
+                self.instruction(format!(
+                    "{value} = extractvalue {record_ty} {aggregate}, {field_index}"
+                ));
+                Ok(Value {
+                    ty: declaration_field.ty,
+                    operand: Some(value),
                 })
             }
             ExprKind::SomeE(inner) => {
@@ -1893,6 +2202,7 @@ fn llvm_ty(ty: Ty) -> String {
         Ty::Bool => "i1".into(),
         Ty::Unit => "void".into(),
         Ty::Option(ValueTy::Bool) => LLVM_OPTION_BOOL.into(),
+        Ty::Record(record) => llvm_record_ty(record),
         _ => unreachable!("type without an LLVM runtime representation validated out"),
     }
 }
@@ -1917,19 +2227,20 @@ fn packed_type_info(result: IntTy, lhs: IntTy, rhs: Option<IntTy>) -> u32 {
         | (rhs.map(integer_type_code).unwrap_or(0) << 16)
 }
 
-fn type_code(ty: Ty) -> &'static str {
+fn type_code(ty: Ty) -> String {
     match ty {
-        Ty::Int(IntTy::U8) => "u8",
-        Ty::Int(IntTy::U16) => "u16",
-        Ty::Int(IntTy::U32) => "u32",
-        Ty::Int(IntTy::U64) => "u64",
-        Ty::Int(IntTy::I8) => "i8",
-        Ty::Int(IntTy::I16) => "i16",
-        Ty::Int(IntTy::I32) => "i32",
-        Ty::Int(IntTy::I64) => "i64",
-        Ty::Bool => "b",
-        Ty::Unit => "v",
-        Ty::Option(ValueTy::Bool) => "ob",
+        Ty::Int(IntTy::U8) => "u8".into(),
+        Ty::Int(IntTy::U16) => "u16".into(),
+        Ty::Int(IntTy::U32) => "u32".into(),
+        Ty::Int(IntTy::U64) => "u64".into(),
+        Ty::Int(IntTy::I8) => "i8".into(),
+        Ty::Int(IntTy::I16) => "i16".into(),
+        Ty::Int(IntTy::I32) => "i32".into(),
+        Ty::Int(IntTy::I64) => "i64".into(),
+        Ty::Bool => "b".into(),
+        Ty::Unit => "v".into(),
+        Ty::Option(ValueTy::Bool) => "ob".into(),
+        Ty::Record(record) => format!("r{record}"),
         _ => unreachable!("type without an LLVM runtime representation validated out"),
     }
 }
@@ -2085,7 +2396,10 @@ fn diag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{ExternInfo, GenericTy, Param, Program, ProofReuse, TypeArg, ValueTy};
+    use crate::ast::{
+        ExternInfo, GenericTy, Param, Program, ProofReuse, RecordField, StorageLayout, TypeArg,
+        ValueTy,
+    };
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
         Expr {
@@ -2125,19 +2439,27 @@ mod tests {
     }
 
     fn call(name: &str, ty: Ty) -> Expr {
+        call_with(name, ty, Vec::new())
+    }
+
+    fn call_with(name: &str, ty: Ty, args: Vec<Expr>) -> Expr {
         expression(
             ExprKind::Call {
                 callee: name.into(),
                 callee_span: Span::new(0, 1),
                 type_args: Vec::new(),
-                args: Vec::new(),
+                args,
             },
             ty,
         )
     }
 
     fn variable(name: &str, integer: IntTy) -> Expr {
-        expression(ExprKind::Var(name.into()), Ty::Int(integer))
+        typed_variable(name, Ty::Int(integer))
+    }
+
+    fn typed_variable(name: &str, ty: Ty) -> Expr {
+        expression(ExprKind::Var(name.into()), ty)
     }
 
     fn bool_option(kind: ExprKind) -> Expr {
@@ -2190,6 +2512,58 @@ mod tests {
         }
     }
 
+    fn integer_pair_record() -> RecordDecl {
+        RecordDecl {
+            is_pub: false,
+            name: "Pair".into(),
+            name_span: Span::new(0, 1),
+            // Deliberately not LLVM's natural `{ i32, i64 }` layout: the
+            // gap pins that raw-cell geometry and semantic values are
+            // separate representations.
+            layout: StorageLayout { size: 24, align: 8 },
+            layout_span: Span::new(0, 1),
+            fields: vec![
+                RecordField {
+                    name: "answer".into(),
+                    ty: Ty::Int(IntTy::I32),
+                    offset: 0,
+                    span: Span::new(0, 1),
+                    offset_span: Span::new(0, 1),
+                },
+                RecordField {
+                    name: "marker".into(),
+                    ty: Ty::Int(IntTy::U64),
+                    offset: 16,
+                    span: Span::new(0, 1),
+                    offset_span: Span::new(0, 1),
+                },
+            ],
+            span: Span::new(0, 1),
+        }
+    }
+
+    fn pair_literal(answer: Expr, marker: Expr) -> Expr {
+        expression(
+            ExprKind::RecordLit {
+                record: "Pair".into(),
+                record_span: Span::new(0, 1),
+                args: vec![answer, marker],
+            },
+            Ty::Record(0),
+        )
+    }
+
+    fn pair_answer(name: &str) -> Expr {
+        expression(
+            ExprKind::RecordField {
+                obj: name.into(),
+                obj_span: Span::new(0, 1),
+                field: "answer".into(),
+            },
+            Ty::Int(IntTy::I32),
+        )
+    }
+
     #[test]
     fn emits_literal_and_main_bridge_deterministically() {
         let f = function(
@@ -2214,6 +2588,248 @@ mod tests {
         assert!(!ir.contains("llvm.assume"));
         assert!(!ir.contains(" nsw "));
         assert!(!ir.contains(LLVM_OPTION_BOOL));
+    }
+
+    #[test]
+    fn integer_pod_record_is_nominal_and_transports_through_locals_calls_and_returns() {
+        let record = Ty::Record(0);
+        let i32_ty = Ty::Int(IntTy::I32);
+        let u64_ty = Ty::Int(IntTy::U64);
+
+        let mut make = function(
+            "make",
+            record,
+            vec![Stmt::Return {
+                value: Some(pair_literal(
+                    typed_variable("answer", i32_ty),
+                    typed_variable("marker", u64_ty),
+                )),
+                span: Span::new(0, 1),
+            }],
+        );
+        make.params = vec![parameter("answer", i32_ty), parameter("marker", u64_ty)];
+
+        let mut project = function(
+            "project",
+            i32_ty,
+            vec![
+                Stmt::Decl {
+                    ty: record,
+                    name: "copy".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(typed_variable("pair", record)),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(pair_answer("copy")),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        project.params = vec![parameter("pair", record)];
+
+        let forward = function(
+            "forward",
+            record,
+            vec![
+                Stmt::Decl {
+                    ty: record,
+                    name: "result".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(pair_literal(
+                        expression(ExprKind::IntLit(0), i32_ty),
+                        expression(ExprKind::IntLit(0), u64_ty),
+                    )),
+                    mutable: true,
+                },
+                Stmt::If {
+                    cond: expression(ExprKind::BoolLit(true), Ty::Bool),
+                    then_block: vec![Stmt::Assign {
+                        name: "result".into(),
+                        name_span: Span::new(0, 1),
+                        value: call_with(
+                            "make",
+                            record,
+                            vec![
+                                expression(ExprKind::IntLit(42), i32_ty),
+                                expression(ExprKind::IntLit(7), u64_ty),
+                            ],
+                        ),
+                    }],
+                    else_block: Some(vec![Stmt::Assign {
+                        name: "result".into(),
+                        name_span: Span::new(0, 1),
+                        value: pair_literal(
+                            expression(ExprKind::IntLit(1), i32_ty),
+                            expression(ExprKind::IntLit(2), u64_ty),
+                        ),
+                    }]),
+                },
+                Stmt::Return {
+                    value: Some(typed_variable("result", record)),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+
+        let consume = function(
+            "consume",
+            i32_ty,
+            vec![
+                Stmt::Decl {
+                    ty: record,
+                    name: "value".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(call("forward", record)),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(call_with(
+                        "project",
+                        i32_ty,
+                        vec![typed_variable("value", record)],
+                    )),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+
+        let mut checked = program(vec![make, project, forward, consume]);
+        checked.records.push(integer_pair_record());
+        let ir = emit_program(&checked, 1, &EmitOptions::default()).unwrap();
+
+        assert_eq!(ir.matches("%sable.record.0 = type { i32, i64 }").count(), 1);
+        assert!(ir.contains("not its raw-cell layout"));
+        let named_type = ir.find("%sable.record.0 = type").unwrap();
+        let first_definition = ir.find("define internal").unwrap();
+        assert!(named_type < first_definition);
+        assert!(
+            ir.contains("define internal %sable.record.0 @__sable_v0_f_4_make__p_i32_u64__r_r0")
+        );
+        assert!(ir.contains(
+            "define internal i32 @__sable_v0_f_7_project__p_r0__r_i32(%sable.record.0 %p0)"
+        ));
+        assert!(ir.contains("alloca %sable.record.0"));
+        assert!(ir.contains("store %sable.record.0 %p0"));
+        assert!(ir.contains("load %sable.record.0"));
+        assert!(ir.contains("insertvalue %sable.record.0 zeroinitializer, i32"));
+        assert!(ir.contains("insertvalue %sable.record.0"));
+        assert!(ir.contains("extractvalue %sable.record.0"));
+        assert!(
+            ir.contains(
+                "call %sable.record.0 @__sable_v0_f_4_make__p_i32_u64__r_r0(i32 42, i64 7)"
+            )
+        );
+        assert!(ir.contains("call i32 @__sable_v0_f_7_project__p_r0__r_i32(%sable.record.0"));
+        assert!(!ir.contains("getelementptr"));
+        assert!(!ir.contains(" inbounds "));
+    }
+
+    #[test]
+    fn pod_record_value_slice_rejects_pointer_fields_and_imported_identity() {
+        let mut pointer_record = integer_pair_record();
+        pointer_record.name = "Node".into();
+        pointer_record.fields[0].name = "next".into();
+        pointer_record.fields[0].ty = Ty::RawRecord(0);
+        let mut pointer_program = program(Vec::new());
+        pointer_program.records.push(pointer_record);
+        let pointer_error = emit_program(&pointer_program, 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(pointer_error[0].name, "backend.unsupported");
+        assert!(pointer_error[0].label.contains("integer-only POD values"));
+
+        let mut imported_record = integer_pair_record();
+        imported_record.name_span = Span::new(2, 3);
+        let mut imported_program = program(Vec::new());
+        imported_program.records.push(imported_record);
+        let imported_error =
+            emit_program(&imported_program, 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(imported_error[0].name, "backend.unsupported");
+        assert!(imported_error[0].label.contains("cross-module record ABI"));
+
+        let make_imported = function(
+            "make_imported",
+            Ty::Record(0),
+            vec![Stmt::Return {
+                value: Some(pair_literal(
+                    expression(ExprKind::IntLit(1), Ty::Int(IntTy::I32)),
+                    expression(ExprKind::IntLit(2), Ty::Int(IntTy::U64)),
+                )),
+                span: Span::new(0, 1),
+            }],
+        );
+        let entry = function(
+            "entry",
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::Decl {
+                    ty: Ty::Record(0),
+                    name: "imported".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(call("make_imported", Ty::Record(0))),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(pair_answer("imported")),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        imported_program.fns.extend([make_imported, entry]);
+        let selected_import = emit_program(
+            &imported_program,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(selected_import[0].name, "backend.unsupported");
+        assert!(selected_import[0].label.contains("cross-module record ABI"));
+
+        // Entry closure selection keeps an unrelated unsupported declaration
+        // outside the native artifact, matching the existing function gate.
+        let unrelated_entry = returning_function(
+            "unrelated_entry",
+            IntTy::I32,
+            expression(ExprKind::IntLit(42), Ty::Int(IntTy::I32)),
+        );
+        let mut unrelated_program = program(vec![unrelated_entry]);
+        unrelated_program.records.push({
+            let mut record = integer_pair_record();
+            record.name_span = Span::new(2, 3);
+            record
+        });
+        let selected = emit_program(
+            &unrelated_program,
+            1,
+            &EmitOptions {
+                entry: Some("unrelated_entry".into()),
+            },
+        )
+        .unwrap();
+        assert!(!selected.contains("%sable.record."));
+
+        let mut root_program = program(vec![function(
+            "record_entry",
+            Ty::Record(0),
+            vec![Stmt::Return {
+                value: Some(pair_literal(
+                    expression(ExprKind::IntLit(1), Ty::Int(IntTy::I32)),
+                    expression(ExprKind::IntLit(2), Ty::Int(IntTy::U64)),
+                )),
+                span: Span::new(0, 1),
+            }],
+        )]);
+        root_program.records.push(integer_pair_record());
+        let entry_record_error = emit_program(
+            &root_program,
+            1,
+            &EmitOptions {
+                entry: Some("record_entry".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(entry_record_error[0].name, "backend.entry_signature");
     }
 
     #[test]
@@ -2374,7 +2990,6 @@ mod tests {
             Ty::Option(ValueTy::Record(0)),
             Ty::Option(ValueTy::Param(crate::ast::TypeParamId::from_legacy(0))),
             Ty::OptionRaw(0),
-            Ty::Record(0),
         ] {
             let error = emit_program(
                 &program(vec![function(
@@ -2389,6 +3004,19 @@ mod tests {
             assert_eq!(error[0].name, "backend.unsupported");
             assert!(error[0].label.contains("runtime representation"));
         }
+
+        let forged_record = emit_program(
+            &program(vec![function("unsupported", Ty::Record(0), Vec::new())]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(forged_record[0].name, "backend.unsupported");
+        assert!(
+            forged_record[0]
+                .label
+                .contains("outside the checked program")
+        );
 
         let option_entry = function(
             "option_entry",

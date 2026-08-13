@@ -1,0 +1,5 @@
+// expect-error: extern.param_abi
+// Ordinary verified Bool calls do not create a foreign Bool ABI.
+
+extern "C" #[audit(id := "test.bool-param.v1", reason := "no Bool ABI")]
+fn c_take_bool(bool value);

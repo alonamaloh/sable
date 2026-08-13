@@ -1,0 +1,7 @@
+use record_calls;
+
+fn test_record_call_transport() {
+    record_call_transport();
+    record_loop_transport(0);
+    record_loop_transport(4);
+}

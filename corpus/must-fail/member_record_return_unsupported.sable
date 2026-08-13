@@ -1,0 +1,19 @@
+// expect-error: type.member_record_return
+// Ordinary functions transport POD records; method-call result transport is
+// still a distinct receiver-state proof boundary.
+
+record Pair #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+class Holder {
+    u64 value;
+
+    init new() {
+        self.value = 1;
+    }
+
+    fn pair(&self) -> Pair {
+        return Pair(self.value);
+    }
+}

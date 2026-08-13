@@ -1,0 +1,44 @@
+// POD records already have checked value semantics.  This subject pins their
+// ordinary-call VC transport in both directions: a call returns a record, the
+// caller binds it, and another call consumes it through substituted contracts.
+
+record CallPair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+/// post result.left = left
+/// post result.right = right
+pub fn make_call_pair(u64 left, u64 right) -> CallPair {
+    return CallPair(left, right);
+}
+
+/// pre  pair.left + pair.right ≤ u64.max
+/// post result = pair.left + pair.right
+pub fn sum_call_pair(CallPair pair) -> u64 {
+    return pair.left + pair.right;
+}
+
+/// discharge sum_call_pair.overflow.pair_left_pair_right by
+///   simp [SableR_CallPair.wf] at h_pair_wf
+///   constructor <;> omega
+
+/// post result = 16
+pub fn record_call_transport() -> u64 {
+    CallPair pair = make_call_pair(7, 9);
+    return sum_call_pair(pair);
+}
+
+/// post result = 1
+pub fn record_loop_transport(u64 count) -> u64 {
+    mut CallPair pair = make_call_pair(1, 2);
+    mut u64 i = count;
+    /// invariant pair.left = 1
+    /// invariant pair.right = 2
+    /// variant i
+    while (i > 0) {
+        pair = make_call_pair(1, 2);
+        i = i - 1;
+    }
+    return pair.left;
+}

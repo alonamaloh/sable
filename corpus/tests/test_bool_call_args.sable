@@ -1,0 +1,20 @@
+// Dynamic coverage for literals, comparisons, negation, nested Bool-returning
+// calls, precondition substitution, and recursive Bool argument transport.
+
+use bool_call_args;
+
+fn test_bool_call_args() {
+    bool_literal_arg();
+    bool_comparison_arg(7);
+    bool_comparison_arg(-3);
+    bool_negated_arg(7);
+    bool_negated_arg(-3);
+    bool_false_clause_arg(7);
+    bool_false_clause_arg(-3);
+    bool_call_result_arg(7);
+    bool_call_result_arg(-3);
+    bool_guarded_pre_arg(7);
+    bool_guarded_pre_arg(-3);
+    bool_recursive_arg(0, true);
+    bool_recursive_arg(4, false);
+}

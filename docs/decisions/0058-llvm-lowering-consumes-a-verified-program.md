@@ -1,8 +1,9 @@
 # ADR 0058 — LLVM lowering consumes the verified program
 
 **Decided and implemented 2026-08-12; scalar v0 complete. G1.3 Boolean-option
-extension implemented and closed 2026-08-13.** Unsafe Sable v1 had a defensible
-formal stopping point but no native-code path. This backend makes verified
+and G1.4a POD-record extensions implemented and closed 2026-08-13.** Unsafe
+Sable v1 had a defensible formal stopping point but no native-code path. This
+backend makes verified
 programs in its deliberately narrow runtime subset runnable without making LLVM
 part of the verifier or introducing a second, subtly different front-end
 pipeline.
@@ -196,13 +197,48 @@ and observing 42 from the option subject; SVM differential 76/76; and the
 randomized allocator, grind-budget, LSP, and documentation gates. G1.2 and
 G1.3 are closed.
 
+## G1.4a amendment: internal semantic POD records
+
+The next backend aggregate is a root-owned POD record whose fields are all
+fixed-width integers. Each supported declaration has an internal named LLVM
+aggregate, and internal functions may construct it, project its fields, keep it
+in local slots across branches, and transport it through parameters, direct
+calls, and returns. This follows the checker/VCgen/interpreter widening that
+also admits ordinary record arguments and results. Those formal call results
+carry the nominal record's `wf` fact, including after loop havoc. Ordinary
+Boolean call arguments cross VC generation through an explicit Prop-to-`Bool`
+reification rather than treating propositions as machine values. Class-method
+record returns and Boolean/record trait signatures remain rejected.
+
+The native aggregate is a semantic value, not the record's raw-cell layout.
+The emitter therefore does not apply `#[layout]` or field-offset metadata to
+the LLVM type; that metadata belongs to the separately modeled raw-storage
+geometry. No imported record, pointer or Boolean field, nested or container
+record, class, or record-valued extern/entry/public ABI is accepted. The named
+type and its mangling are internal and versionable. In particular this
+amendment does not declare a C-compatible record layout, a cross-module Sable
+ABI, or general aggregate/generic-class support.
+
+The complete one-worker closure passed `cargo check`; 150/150 library tests;
+all 382 corpus subjects (82 verifies, 235 must-fail, 47 dynamic, 18
+dynamic-fail) in 218.30s; focused Boolean-call verification at 16/16 obligations
+across ten functions and record-call verification at 13/13 across four
+functions, with each dynamic subject at 1/1; LLVM CLI 6/6; and the 1/1 exact
+`VerifiedProgram` interpreter↔Clang differential at `-O0` and `-O2`, now over
+five subjects including POD records. The SVM differential remained green at
+76/76; separate public-AST hardening covered semantic operands, source scope,
+sealed operations, record geometry, and existing integer arrays, not Boolean
+arrays. Randomized allocator, grind-budget, LSP, and documentation gates were
+green. G1.4a is closed.
+
 ## Consequences
 
 This path gets Sable to native toolchains without expanding the trusted proof
 base: Lean still checks contracts, while the new emitter is an additional
 compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
-The cost is an intentionally narrow scalar-plus-Boolean-option backend and
+The cost is a backend intentionally limited to scalar, Boolean-option, and
+internal integer-POD values, with
 explicit traps/control flow where less careful LLVM frontends often rely on
 poison. Broader aggregate representations and every aggregate ABI, extern
 interoperability, optimization, debug information, object emission, and stable

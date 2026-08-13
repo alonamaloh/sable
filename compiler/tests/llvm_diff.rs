@@ -40,6 +40,11 @@ const CASES: &[Case] = &[
         source: "option_bool.sable",
         entry: "option_entry",
     },
+    Case {
+        label: "pod-record",
+        source: "pod_record.sable",
+        entry: "pod_record_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {

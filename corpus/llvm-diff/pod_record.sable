@@ -1,0 +1,33 @@
+// G1.4a's native POD record is an internal semantic aggregate. The explicit
+// offsets below govern abstract raw-cell storage only; this subject performs
+// no raw conversion and deliberately exercises value construction, branch
+// assignment, stack transport, and projection.
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] i32 answer;
+    #[offset(8)] i32 marker;
+}
+
+fn make_pair(i32 answer, i32 marker) -> Pair {
+    return Pair(answer, marker);
+}
+
+fn forward_pair(Pair pair) -> Pair {
+    Pair copy = pair;
+    return copy;
+}
+
+fn pair_answer(Pair pair) -> i32 {
+    return pair.answer;
+}
+
+fn pod_record_entry() -> i32 {
+    mut Pair value = make_pair(1, 2);
+    if (true) {
+        value = make_pair(42, 7);
+    } else {
+        value = make_pair(9, 3);
+    }
+    Pair copy = forward_pair(value);
+    return pair_answer(copy);
+}

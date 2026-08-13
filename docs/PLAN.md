@@ -13,9 +13,11 @@ deliberately deferred rather than required before the usability roadmap.
 On that boundary, M45's scalar LLVM v0 backend is also complete: lowering starts
 from the exact Lean-authorized `VerifiedProgram`, preserves checked scalar
 semantics under optimization, and has interpreter/native plus trap-ABI gates.
-G1.1's verified/interpreted `option<bool>` slice is closed, and G1.2/G1.3 now
-carry its ordinary-function intersection through the formal SVM and native
-LLVM. Their combined full serial closure gate is green.
+G1.1's verified/interpreted `option<bool>` slice is closed, G1.2/G1.3 carry its
+ordinary-function intersection through the formal SVM and native LLVM, and
+G1.4a closes ordinary Boolean argument transport plus verified, interpreted,
+and natively lowered internal integer-field POD record calls. Its full serial
+closure gate is green; no record ABI or generic-class widening is claimed.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -660,8 +662,9 @@ backend support belongs to M46 and later.
 
 ## Post-U10 usability sequence
 
-Unsafe Sable v1, the scalar LLVM v0 boundary, and the first end-to-end Boolean
-option slice are now complete. The next work broadens the
+Unsafe Sable v1, the scalar LLVM v0 boundary, the first end-to-end Boolean
+option slice, and G1.4a's internal POD record-value slice are now complete. The
+next work broadens the
 aggregate-generics/backend track at M46+. The order remains a working
 hypothesis, not a promise that evidence cannot reorder it:
 
@@ -700,7 +703,7 @@ hypothesis, not a promise that evidence cannot reorder it:
      subjects in 424.42s; LLVM CLI 6/6; exact-`VerifiedProgram`
      interpreter↔Clang differential at `-O0` and `-O2`; SVM 69/69; allocator,
      grind-budget, and LSP gates green.
-   - **G1 — Boolean/POD aggregates (first slice complete; broader work in
+   - **G1 — Boolean/POD aggregates (through G1.4a complete; broader work in
      progress):** establish non-integer aggregate storage, value, verification,
      interpreter, and LLVM paths one fenced representation at a time.
 
@@ -814,6 +817,46 @@ hypothesis, not a promise that evidence cannot reorder it:
      and `-O2`, with 42 from the option subject; and SVM differential 76/76.
      Randomized allocator, grind-budget, LSP, and documentation gates were
      green. G1.2 and G1.3 are closed.
+
+     **G1.4a — ordinary Boolean/POD calls and LLVM POD records (complete):**
+     ordinary function calls now accept Boolean arguments. VC generation
+     crosses the symbolic proposition/runtime-value boundary explicitly with a
+     Prop-to-`Bool` reification based on the formal parameter type. Ordinary
+     POD records may cross function parameters and returns in the
+     verifier, interpreter, and dynamic monitor. Record returns regain the
+     nominal declaration's `wf` fact, and loop havoc keeps that fact for the
+     fresh record symbol. Class-method record returns and Boolean/record trait
+     signatures remain closed rather than inheriting ordinary-call support.
+
+     LLVM lowers a supported root-owned integer-field POD declaration as an
+     internal named semantic aggregate. Construction, field projection,
+     locals, branches, internal parameters, direct calls, and returns are in
+     scope. This ordinary value deliberately ignores the declaration's raw
+     `#[layout]` and field-offset metadata: those describe abstract raw-cell
+     geometry, not an LLVM storage layout. Imported records, extern/entry/public
+     ABIs, pointer and Boolean fields, nested and container records, and classes
+     remain rejected. The internal name is versionable; this stage neither
+     defines a record ABI nor makes generic classes real.
+
+     The complete one-worker closure passed `cargo check`; 150/150 library
+     tests; all 382 corpus subjects (82 verifies, 235 must-fail, 47 dynamic, 18
+     dynamic-fail) in 218.30s; focused Boolean-call verification at 16/16
+     obligations across ten functions and record-call verification at 13/13
+     across four functions, with each dynamic subject at 1/1; LLVM CLI 6/6;
+     and the 1/1 exact-`VerifiedProgram` interpreter↔Clang differential at
+     `-O0` and `-O2`, now looping over five subjects including POD records. SVM
+     differential remained green at 76/76. Its Rust lowerer also hardened
+     semantic operand, source-scope, sealed-op, record-geometry, and
+     integer-array coherence at the public AST boundary; that does not admit
+     Boolean arrays. Randomized allocator,
+     grind-budget, LSP, and documentation gates were green. G1.4a is closed.
+
+     **G1.4b — owned-local Boolean arrays (next):** first admit only owned local
+     `[bool]` values through checking, VC generation, interpretation, and the
+     dynamic monitor. The formal SVM and LLVM emitter initially remain
+     fail-closed. Dedicated follow-on stages then add formal-machine semantics
+     and native storage/lifetime lowering before any parameter, field, return,
+     borrow, expose, or generic Boolean-array boundary widens.
    - **G2 — affine options:** carry ownership and destruction correctly through
      present/absent aggregate values.
    - **G3 — slots and `Vec`:** make generic element storage and movement real

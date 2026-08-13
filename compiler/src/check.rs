@@ -2517,6 +2517,63 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 )],
             });
         }
+        if let Some(parameter) = method
+            .params
+            .iter()
+            .find(|parameter| matches!(parameter.ty, Ty::Bool | Ty::Record(_)))
+        {
+            return Err(Diagnostic {
+                name: "type.trait_param_unsupported".into(),
+                title: "trait calls do not transport Boolean or POD-record parameters".into(),
+                span: parameter.span,
+                label: format!(
+                    "`{}` is not supported in a trait method parameter",
+                    parameter.ty.name()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    "ordinary functions may transport Boolean and POD-record values, but \
+                     retained trait calls do not yet model those value kinds"
+                        .into(),
+                )],
+            });
+        }
+        if matches!(method.ret, Ty::Bool | Ty::Record(_)) {
+            return Err(Diagnostic {
+                name: "type.trait_return_unsupported".into(),
+                title: "trait calls do not return Boolean or POD-record values".into(),
+                span: method.name_span,
+                label: format!(
+                    "`{}` is not supported as a trait method result",
+                    method.ret.name()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    "ordinary functions may return Boolean and POD-record values, but retained \
+                     trait calls do not yet model those result kinds"
+                        .into(),
+                )],
+            });
+        }
+        Ok(())
+    }
+
+    fn class_method(method: &Fn) -> CResult<()> {
+        function(method)?;
+        if matches!(method.ret, Ty::Record(_)) {
+            return Err(Diagnostic {
+                name: "type.member_record_return".into(),
+                title: "class methods may not return POD records yet".into(),
+                span: method.name_span,
+                label: "return the record from an ordinary function".into(),
+                notes: vec![(
+                    "note".into(),
+                    "method-call verification has separate receiver-state and result transport; \
+                     its record-valued result boundary is not implemented yet"
+                        .into(),
+                )],
+            });
+        }
         Ok(())
     }
 
@@ -2531,7 +2588,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
             function(initializer)?;
         }
         for method in &class.methods {
-            function(&method.f)?;
+            class_method(&method.f)?;
         }
     }
     for record in &program.records {
@@ -4403,15 +4460,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             for (arg, pty) in args.iter_mut().zip(param_tys) {
                 let escapes = launders.then(|| ("be passed to a function", arg.span));
                 match pty {
-                    Ty::Bool => {
-                        return Err(Diagnostic {
-                            name: "type.bool_arg".into(),
-                            title: "bool-typed call arguments are not supported yet".into(),
-                            span: arg.span,
-                            label: "bool argument".into(),
-                            notes: vec![],
-                        });
-                    }
                     Ty::Array(elem, m) => {
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
                             return Err(Diagnostic {
@@ -5585,5 +5633,122 @@ fn unsupported() -> option<Pair> {
             Ok(_) => panic!("POD option values remain unsupported"),
         };
         assert_eq!(error.name, "type.option_payload_unsupported");
+    }
+
+    #[test]
+    fn ordinary_bool_call_arguments_use_normal_typechecking() {
+        let mut program = monomorphized_program(
+            r#"
+fn echo(bool value) -> bool {
+    return value;
+}
+
+fn nested(i32 value) -> bool {
+    return echo(echo(!(value > 0)));
+}
+"#,
+        );
+        check(&mut program).expect("ordinary calls should accept checked Bool values");
+
+        let Stmt::Return {
+            value: Some(outer), ..
+        } = &program.fns[1].body[0]
+        else {
+            panic!("expected the nested Bool call");
+        };
+        let ExprKind::Call { args, .. } = &outer.kind else {
+            panic!("expected an outer call");
+        };
+        assert_eq!(args[0].ty, Some(Ty::Bool));
+        assert_eq!(outer.ty, Some(Ty::Bool));
+
+        let mut mismatch = monomorphized_program(
+            r#"
+fn consume(bool value) {}
+
+fn bad() {
+    consume(1);
+}
+"#,
+        );
+        let error = match check(&mut mismatch) {
+            Ok(_) => panic!("non-Bool arguments still fail normally"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name, "type.mismatch");
+    }
+
+    #[test]
+    fn record_method_returns_stay_outside_the_ordinary_call_slice() {
+        let mut program = monomorphized_program(
+            r#"
+record Pair #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+class Holder {
+    u64 value;
+
+    init new() {
+        self.value = 1;
+    }
+
+    fn pair(&self) -> Pair {
+        return Pair(self.value);
+    }
+}
+"#,
+        );
+        let error = match check(&mut program) {
+            Ok(_) => panic!("method record returns remain unsupported"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name, "type.member_record_return");
+    }
+
+    #[test]
+    fn bool_and_record_trait_calls_stay_in_the_integer_model() {
+        let mut bool_parameter = parse_program(
+            r#"
+trait Select {
+    fn select(Self value, bool choose) -> u64;
+}
+"#,
+        );
+        let error = match check(&mut bool_parameter) {
+            Ok(_) => panic!("retained trait calls do not reify Boolean arguments"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name, "type.trait_param_unsupported");
+
+        let mut bool_result = parse_program(
+            r#"
+trait Predicate {
+    fn test(Self value) -> bool;
+}
+"#,
+        );
+        let error = match check(&mut bool_result) {
+            Ok(_) => panic!("retained trait calls do not return propositions"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name, "type.trait_return_unsupported");
+
+        let mut record_result = parse_program(
+            r#"
+record Pair #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+trait Factory {
+    fn make(Self value) -> Pair;
+}
+"#,
+        );
+        let error = match check(&mut record_result) {
+            Ok(_) => panic!("retained trait calls do not return POD records"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name, "type.trait_return_unsupported");
     }
 }
