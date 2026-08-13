@@ -60,6 +60,11 @@ const CASES: &[Case] = &[
         source: "u32_arrays.sable",
         entry: "u32_arrays_entry",
     },
+    Case {
+        label: "bignum-native",
+        source: "../verifies/bignum_native.sable",
+        entry: "bignum_native_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {

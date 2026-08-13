@@ -4654,7 +4654,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         label: "unknown field".into(),
                         notes: vec![],
                     })?;
-                return match fld.1 {
+                let borrowed_ty = match fld.1 {
                     Ty::Class(fci) => Ok(Ty::ClassRef(fci, Mutability::Shared)),
                     // A resource field is a place too. Its mutability is
                     // the borrow's: shared anywhere, and unique only in a
@@ -4679,7 +4679,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         label: "only class- and array-valued fields are borrowed this way".into(),
                         notes: vec![],
                     }),
-                };
+                }?;
+                e.ty = Some(borrowed_ty);
+                return Ok(borrowed_ty);
             }
             // `&s` / `&mut s` of a resource local or parameter, or a
             // re-borrow of one passed along to a callee (ADR 0024). The
@@ -4715,14 +4717,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    return Ok(Ty::ResRef(
+                    let borrowed_ty = Ty::ResRef(
                         k,
                         if *mutable {
                             Mutability::Mut
                         } else {
                             Mutability::Shared
                         },
-                    ));
+                    );
+                    e.ty = Some(borrowed_ty);
+                    return Ok(borrowed_ty);
                 }
             }
             // `&c` / `&mut c` of a class local, or a re-borrow of a class
@@ -4759,14 +4763,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    return Ok(Ty::ClassRef(
+                    let borrowed_ty = Ty::ClassRef(
                         ci,
                         if *mutable {
                             Mutability::Mut
                         } else {
                             Mutability::Shared
                         },
-                    ));
+                    );
+                    e.ty = Some(borrowed_ty);
+                    return Ok(borrowed_ty);
                 }
             }
             let elem = array_elem_ty(ctx, array, span)?;

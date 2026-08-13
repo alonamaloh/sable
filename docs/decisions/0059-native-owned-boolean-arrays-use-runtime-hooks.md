@@ -196,4 +196,5 @@ were green. G2.3 is closed. At that checkpoint generic slots and `Vec`
 ownership were recorded as the next aggregate design, not an affine-option ABI
 widening. The subsequently implemented N0 amendment above begins an independent
 native `Nat` ladder; its next checkpoint is local-only `Nat` class construction
-and destruction.
+and destruction. N1a subsequently closed that fixed-owner construction slice
+and the real imported `cmp`, while class moves and returns remain later work.

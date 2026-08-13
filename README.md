@@ -15,6 +15,7 @@ G2.2's atomic formal-SVM `optTake` transition and exact Rust bridge are closed.
 G2.3's matching local-only LLVM representation, atomic take, and conditional
 destruction are closed.
 N0's exact native `[u32]` local and internal borrowed-call slice is closed.
+N1a's fixed-owner native `Nat::from_prefix` and `cmp` slice is closed.
 
 ## The idea in thirty seconds
 
@@ -528,13 +529,36 @@ subjects at Clang `-O0` and `-O2`; and SVM differential remained 92/92.
 Randomized allocator, grind-budget, LSP, documentation, rustfmt, diff-check,
 and static-audit gates were green. N0 is closed.
 
-The next native checkpoints are deliberately incremental: N1 adds a local-only
-`Nat` class representation, `from_prefix`, shared class borrows, class returns,
-and destruction; N2 admits `cmp` and `add`; N3 adds `sub` and schoolbook `mul`;
-N4 carries `div`, `rem`, and `gcd` through class reassignment and loop cleanup;
-and only then does N5 lower nested `Integer { Nat mag; u64 neg; }` ownership,
-mutable class borrows, and sign/magnitude operations. Generic owner slots and
-`Vec` remain a separate later design, not something N0 silently authorizes.
+N1a is the first fixed-owner class checkpoint. It represents the exact admitted
+class as `%sable.class.<id> = type { %sable.array.u32 }`, constructs it directly
+into a final stack owner through an internal destination-pointer initializer,
+passes only shared `&Nat` pointers to internal free functions, and destroys the
+nested limb allocation in reverse lexical order. Initializer validation admits
+one concrete owned `[u32]` field, requires an explicit empty destructor, and
+proves the field is initialized exactly once from fresh array storage before
+any element store. The checker now retains the exact checked type on successful
+class, resource, and field borrows so the LLVM boundary can revalidate rather
+than infer it.
+
+This is enough to compile the real imported `Nat::from_prefix` and `cmp`, not a
+backend-shaped copy. Mutable owner locals, class reassignment, moves, returns,
+owned class parameters, methods, mutable class borrows, multiple or nested
+fields, generic classes, nonempty destructors, extern transport, and public
+class/constructor ABIs remain fenced. N1a closed under the standard one-worker
+command with `cargo check` and rustfmt green; focused LLVM units passed 33/33;
+Rust library tests passed 217/217; and all 417 corpus subjects passed (85
+verifies, 263 must-fail, 49 tests, 20 test-fails), including the 19-obligation
+native bignum subject. LLVM CLI passed 9/9; the exact interpreter/native
+differential passed 1/1 over nine subjects at Clang `-O0` and `-O2`; and SVM
+differential remained 92/92. Randomized allocator, grind-budget, LSP, doc, and
+diff-check gates were green.
+
+The remaining native checkpoints stay incremental: N1b adds class
+returns/moves; N2 adds `add`; N3 adds `sub` and schoolbook `mul`; N4 carries
+`div`, `rem`, and `gcd` through class reassignment and loop cleanup; and only
+then does N5 lower nested `Integer { Nat mag; u64 neg; }` ownership, mutable
+class borrows, and sign/magnitude operations. Generic owner slots and `Vec`
+remain a separate later design.
 
 The complete G0 gate ran with one Cargo job, one Sable test job, one Lean job,
 and one Rust test thread. It passed 82/82 library tests, all 368 verifier,

@@ -24,7 +24,9 @@ cleanup slice. G2.0–G2.2 close affine-option representation, local semantics,
 and atomic formal-machine take; G2.3 closes the exact local LLVM lowering. No
 array, affine-option, or record ABI, and no generic-class widening, is claimed.
 N0's exact local `[u32]` LLVM storage and internal borrowed-array call slice is
-closed as the native `Nat` foundation.
+closed as the native `Nat` foundation. N1a closes the fixed-owner class slice
+needed by the real imported `Nat::from_prefix` and `cmp` while general class
+transport remains fenced.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -1179,14 +1181,45 @@ a working hypothesis, not a promise that evidence cannot reorder it:
      differential remained 92/92. Randomized allocator, grind-budget, LSP,
      documentation, rustfmt, diff-check, and static-audit gates were green.
 
-   - **N1–N5 — native bignum ladder:** N1 adds the local-only `Nat` class,
-     `from_prefix`, shared class borrows, class returns/moves, and destruction.
-     N2 lowers `cmp` and `add`; N3 adds `sub` and schoolbook `mul`; N4 adds
-     `div`, `rem`, and `gcd` with mutable class reassignment and loop cleanup.
-     N5 is the separate full `Integer` step: nested `Nat` ownership, by-value
-     class constructor arguments, class-field borrows, `&mut Integer`, and
-     nested reverse destruction. Each checkpoint retains internal-only
-     representations and scalar process wrappers.
+   - **N1a — fixed-owner native `Nat` construction and comparison (closed):**
+     admit exactly one concrete class shape with one owned `[u32]` field, no
+     methods, and an explicit empty destructor. The internal representation is
+     `%sable.class.<id> = type { %sable.array.u32 }`. A direct constructor call
+     initializes a final immutable stack owner through an internal
+     destination-pointer initializer; the initializer must establish its field
+     exactly once from fresh array storage on every path before any field
+     store. Reverse lexical cleanup frees the nested limb allocation.
+
+     Internal ordinary functions may accept shared `&Nat`; calls require the
+     exact checked, fieldless named borrow and lower it as a non-owning pointer.
+     Successful class/resource/field borrows now retain their checked `Expr.ty`,
+     preserving the LLVM backend's fail-closed revalidation. Constructor and
+     function closure selection, initializer mangling, class-field length/index
+     operations, and unaligned limb accesses are all internal-only.
+
+     The end-to-end subject imports the real verified `Nat::from_prefix` and
+     `cmp`, checks copy independence plus less/equal/greater and zero cases, and
+     returns 42 in the interpreter and Clang at `-O0`/`-O2`. Mutable owner
+     locals, reassignment, moves, returns, owned class parameters, methods,
+     mutable class borrows, multiple/nested fields, generic classes, nonempty
+     destructors, extern crossings, and a public class ABI remain fenced.
+
+     N1a closed under the exact standard one-worker command. `cargo check` and
+     rustfmt were green; focused LLVM units passed 33/33; Rust library tests
+     passed 217/217; and all 417 corpus subjects passed (85 verifies, 263
+     must-fail, 49 tests, 20 test-fails), including the 19-obligation native
+     bignum subject. LLVM CLI passed 9/9; the exact interpreter/native
+     differential passed 1/1 over nine subjects at Clang `-O0` and `-O2`; SVM
+     differential remained 92/92; and randomized allocator, grind-budget, LSP,
+     documentation, and diff-check gates were green.
+
+   - **N1b–N5 — remaining native bignum ladder:** N1b adds class returns and
+     moves. N2 lowers `add` (`cmp` is already in N1a); N3 adds `sub` and
+     schoolbook `mul`; N4 adds `div`, `rem`, and `gcd` with mutable class
+     reassignment and loop cleanup. N5 is the separate full `Integer` step:
+     nested `Nat` ownership, by-value class constructor arguments, class-field
+     borrows, `&mut Integer`, and nested reverse destruction. Each checkpoint
+     retains internal-only representations and scalar process wrappers.
 
    - **G3 — slots and `Vec` (later planning target):** make generic element
      storage and movement real for the existing growable-vector benchmark;

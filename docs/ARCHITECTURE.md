@@ -698,12 +698,26 @@ foreign, or cross-module array ABI.
   grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
   were green. N0 is closed.
 
-  The staged native bignum ladder is N1 `Nat` construction/shared borrows/class
-  return and destruction; N2 `cmp` plus `add`; N3 `sub` plus schoolbook `mul`;
-  N4 `div`/`rem`/`gcd` with class reassignment and loop cleanup; and N5 the
-  nested `Integer` sign/magnitude class, class-valued field ownership, and
-  mutable class borrows. Generic owner slots and `Vec` remain a separate later
-  design rather than an implication of N0.
+  N1a closes the first fixed-owner class slice. The exact admitted class has
+  one owned `[u32]` field, no methods, and an explicit empty destructor; its
+  internal type is `%sable.class.<id> = type { %sable.array.u32 }`. A direct
+  constructor initializes a final immutable stack owner through an internal
+  destination pointer. Definite-initialization validation requires fresh field
+  storage exactly once on every path, and reverse lexical cleanup frees the
+  nested limb allocation.
+
+  Shared `&Nat` parameters are non-owning internal pointers. Together with
+  class-field length/index lowering, this compiles the real imported
+  `Nat::from_prefix` and `cmp`. Mutable owners, reassignment, moves, returns,
+  owned class parameters, methods, mutable borrows, broader class shapes, and
+  every class ABI stay closed. The standard gate passed 217/217 library tests,
+  33/33 focused LLVM units, all 417 corpus subjects, LLVM CLI 9/9, nine-subject
+  interpreter/native comparison at `-O0`/`-O2`, and SVM 92/92.
+
+  The remaining ladder is N1b class return/movement; N2 `add`; N3 `sub` plus
+  schoolbook `mul`; N4 `div`/`rem`/`gcd` with class reassignment and loop
+  cleanup; and N5 the nested `Integer` sign/magnitude class. Generic owner slots
+  and `Vec` remain a separate later design.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

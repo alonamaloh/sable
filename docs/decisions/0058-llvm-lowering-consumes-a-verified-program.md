@@ -404,6 +404,36 @@ and `-O2`; and SVM differential remained 92/92. Randomized allocator,
 grind-budget, LSP, documentation, rustfmt, diff-check, and static-audit gates
 were green.
 
+## N1a amendment: fixed-owner `Nat` construction and shared comparison
+
+N1a is closed. It admits one concrete class representation:
+`%sable.class.<id> = type { %sable.array.u32 }`, for a class with exactly one
+owned `[u32]` field, no methods, and an explicit empty destructor. A direct
+constructor initializes a final immutable stack owner through an internal
+destination-pointer initializer; constructor symbols include nominal class
+identity and remain module-internal. Initializer validation requires the field
+to receive fresh array storage exactly once on every path before element stores.
+Normal reverse lexical cleanup frees the nested allocation, while traps retain
+the established no-unwind behavior.
+
+Internal ordinary functions may accept shared `&Nat` parameters as non-owning
+pointers. Call sites retain the exact typed, fieldless named borrow, and class
+field length/index operations reuse N0's logical lengths, bounds traps, and
+explicit `align 1` limb accesses. The checker records `Expr.ty` on successful
+class, resource, and field borrows so LLVM continues to revalidate a checked
+node rather than infer backend types.
+
+This exact slice compiles the real imported `Nat::from_prefix` and `cmp`.
+Mutable owners, reassignment, moves, returns, owned class parameters, methods,
+mutable class borrows, multiple or nested fields, generic classes, nonempty
+destructors, extern transport, and public/cross-module class ABIs remain
+rejected. N1a closed under the standard one-worker command: `cargo check` and
+rustfmt were green; LLVM units passed 33/33; library tests 217/217; all 417
+corpus subjects passed (85 verifies, 263 must-fail, 49 tests, 20 test-fails);
+LLVM CLI passed 9/9; the exact interpreter/native differential agreed over nine
+subjects at Clang `-O0` and `-O2`; and SVM remained 92/92. Randomized allocator,
+grind-budget, LSP, documentation, and diff-check gates were green.
+
 ## Consequences
 
 This path gets Sable to native toolchains without expanding the trusted proof

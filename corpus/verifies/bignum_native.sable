@@ -1,0 +1,37 @@
+// N1a native fixed-owner class subject. This imports the real verified Nat
+// implementation rather than copying a backend-shaped facsimile. Constructors
+// initialize their final local owner directly; only shared Nat borrows cross
+// calls, and general class moves/returns remain outside this checkpoint.
+
+use bignum::{Nat, cmp};
+
+fn bignum_native_entry() -> i32 {
+    mut [u32] left_source = [1];
+    [u32] right_source = [2];
+    [u32] same_source = [1, 99];
+
+    var left = Nat::from_prefix(&left_source, 1);
+    var right = Nat::from_prefix(&right_source, 1);
+    var same = Nat::from_prefix(&same_source, 1);
+    var zero = Nat::from_prefix(&left_source, 0);
+
+    // Construction copies the requested prefix; it does not alias the source.
+    left_source[0] = 9;
+
+    if (cmp(&left, &right) != -1) {
+        return 1;
+    }
+    if (cmp(&right, &left) != 1) {
+        return 2;
+    }
+    if (cmp(&left, &same) != 0) {
+        return 3;
+    }
+    if (cmp(&zero, &left) != -1) {
+        return 4;
+    }
+    if (cmp(&left, &zero) != 1) {
+        return 5;
+    }
+    return 42;
+}
