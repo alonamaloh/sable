@@ -347,15 +347,6 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 notes: vec![],
             });
         }
-        if matches!(f.ret, Ty::Array(..)) {
-            return Err(Diagnostic {
-                name: "type.array_return".into(),
-                title: format!("function `{}` returns an array", f.name),
-                span: f.name_span,
-                label: "arrays are parameters only for now".into(),
-                notes: vec![],
-            });
-        }
         if f.extern_info.is_none() {
             check_uart_params(&f.params)?;
         }
@@ -1401,6 +1392,22 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 mutable,
             } => {
                 validate_aggregate_ty(*ty, *name_span)?;
+                if matches!(
+                    ty,
+                    Ty::Array(ValueTy::Bool, Mutability::Shared | Mutability::Mut)
+                ) {
+                    return Err(bool_array_borrow(*name_span));
+                }
+                if *ty == Ty::Array(ValueTy::Bool, Mutability::Owned) && init.is_none() {
+                    return Err(Diagnostic {
+                        name: "type.bool_array_initializer".into(),
+                        title: format!("Boolean array local `{name}` needs an initializer"),
+                        span: *name_span,
+                        label: "initialize it with a Boolean array literal or `alloc_array<bool>`"
+                            .into(),
+                        notes: vec![],
+                    });
+                }
                 if !ctx.declared.insert(name.clone()) {
                     return Err(Diagnostic {
                         name: "type.duplicate_name".into(),
@@ -1811,6 +1818,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             }
             Stmt::ExprStmt(e) => {
                 let ty = check_expr(ctx, e, None)?;
+                if ty == Ty::Array(ValueTy::Bool, Mutability::Owned) {
+                    return Err(Diagnostic {
+                        name: "type.bool_array_temporary".into(),
+                        title: "discarding a Boolean array temporary".into(),
+                        span: e.span,
+                        label: "bind the literal or allocation to an owned local".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "the first Boolean-array slice has no temporary or transport semantics"
+                                .into(),
+                        )],
+                    });
+                }
                 if mandatory_ty(ty) {
                     return Err(Diagnostic {
                         name: "resource.abandoned".into(),
@@ -2344,6 +2364,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 if ctx.is_moved(&place) {
                     return Err(moved_out(ctx, &place, *array_span, "store"));
                 }
+                if !ctx
+                    .vars
+                    .get(array.as_str())
+                    .is_some_and(|info| info.initialized)
+                {
+                    return Err(Diagnostic {
+                        name: "type.uninitialized".into(),
+                        title: format!("array `{array}` may be used before initialization"),
+                        span: *array_span,
+                        label: "not initialized on every path to this point".into(),
+                        notes: vec![],
+                    });
+                }
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
                 check_expr(ctx, value, Some(array_payload_ty(elem, *array_span)?))?;
             }
@@ -2406,21 +2439,39 @@ fn noncanonical_aggregate_payload(span: Span) -> Diagnostic {
     }
 }
 
-/// Arrays retain the ADR 0009 integer domain. G1.1 must not gain Boolean
-/// arrays merely because options now have a Boolean payload model.
+fn bool_array_borrow(span: Span) -> Diagnostic {
+    Diagnostic {
+        name: "type.bool_array_borrow".into(),
+        title: "Boolean arrays cannot be borrowed yet".into(),
+        span,
+        label: "use this `[bool]` through its owned local name".into(),
+        notes: vec![(
+            "note".into(),
+            "the first Boolean-array slice supports owned local indexing, length, and stores; \
+             borrowed transport remains closed until every backend models it"
+                .into(),
+        )],
+    }
+}
+
+/// Convert an array's payload identity to the type of one indexed element.
+/// This is deliberately independent of where the array occurs: position
+/// policy below keeps Boolean arrays owned and local while element checking
+/// can preserve their exact `bool` identity.
 fn array_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
     match payload {
         ValueTy::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
         ValueTy::Int(integer) => Ok(Ty::Int(integer)),
         ValueTy::Param(parameter) => Ok(Ty::Param(parameter)),
-        ValueTy::Bool | ValueTy::Record(_) => Err(Diagnostic {
+        ValueTy::Bool => Ok(Ty::Bool),
+        ValueTy::Record(_) => Err(Diagnostic {
             name: "type.array_payload_unsupported".into(),
             title: format!(
                 "array payload type `{}` is not supported yet",
                 payload.name()
             ),
             span,
-            label: "array operations currently require an integer payload".into(),
+            label: "array operations currently support integers and `bool`".into(),
             notes: vec![(
                 "note".into(),
                 "the AST records this type without granting runtime or proof semantics; \
@@ -2468,8 +2519,26 @@ fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
 }
 
 fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
+    fn bool_array_parameter(span: Span) -> Diagnostic {
+        Diagnostic {
+            name: "type.bool_array_param".into(),
+            title: "Boolean arrays cannot cross a call boundary yet".into(),
+            span,
+            label: "keep `[bool]` as an owned local; borrowed Boolean arrays are deferred".into(),
+            notes: vec![(
+                "note".into(),
+                "the first Boolean-array slice has local proof and execution semantics only; \
+                 parameter transport must land together in every backend"
+                    .into(),
+            )],
+        }
+    }
+
     fn function(function: &Fn) -> CResult<()> {
         for parameter in &function.params {
+            if matches!(parameter.ty, Ty::Array(ValueTy::Bool, _)) {
+                return Err(bool_array_parameter(parameter.span));
+            }
             validate_aggregate_ty(parameter.ty, parameter.span)?;
             if matches!(parameter.ty, Ty::Option(_)) {
                 return Err(Diagnostic {
@@ -2481,10 +2550,39 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 });
             }
         }
-        validate_aggregate_ty(function.ret, function.name_span)
+        validate_aggregate_ty(function.ret, function.name_span)?;
+        if matches!(function.ret, Ty::Array(..)) {
+            return Err(Diagnostic {
+                name: "type.array_return".into(),
+                title: format!("function `{}` returns an array", function.name),
+                span: function.name_span,
+                label: "arrays cannot be returned yet".into(),
+                notes: vec![(
+                    "note".into(),
+                    "the owned-local Boolean-array slice does not define array ownership \
+                     transfer across a return boundary"
+                        .into(),
+                )],
+            });
+        }
+        Ok(())
     }
 
     fn class_field(field: &Field) -> CResult<()> {
+        if matches!(field.ty, Ty::Array(ValueTy::Bool, _)) {
+            return Err(Diagnostic {
+                name: "type.bool_array_field".into(),
+                title: "Boolean arrays cannot be stored in class fields yet".into(),
+                span: field.span,
+                label: "keep `[bool]` as an owned local".into(),
+                notes: vec![(
+                    "note".into(),
+                    "field ownership, invariant transport, and backend layout must be enabled \
+                     together before a class can retain a Boolean array"
+                        .into(),
+                )],
+            });
+        }
         validate_aggregate_ty(field.ty, field.span)?;
         if matches!(field.ty, Ty::Option(_)) {
             return Err(Diagnostic {
@@ -4043,6 +4141,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     )),
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
+                    Ty::Array(ValueTy::Bool, _) => Err(bool_array_borrow(span)),
                     Ty::Array(elem, _) => Ok(Ty::Array(elem, Mutability::Shared)),
                     _ => Err(Diagnostic {
                         name: "type.not_a_place".into(),
@@ -4142,6 +4241,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
             }
             let elem = array_elem_ty(ctx, array, span)?;
+            if elem == ValueTy::Bool {
+                return Err(bool_array_borrow(span));
+            }
             let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty) {
                 Some(Ty::Array(_, m)) => m,
                 _ => unreachable!("array_elem_ty checked"),
@@ -5375,10 +5477,25 @@ fn reject_view_read(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
 fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<ValueTy> {
     reject_view_read(ctx, array, span)?;
     match ctx.vars.get(array) {
-        Some(VarInfo {
-            ty: Ty::Array(t, _),
-            ..
-        }) => {
+        Some(
+            v @ VarInfo {
+                ty: Ty::Array(t, _),
+                ..
+            },
+        ) => {
+            if !v.initialized {
+                return Err(Diagnostic {
+                    name: "type.uninitialized".into(),
+                    title: format!("array `{array}` may be used before initialization"),
+                    span,
+                    label: "not initialized on every path to this point".into(),
+                    notes: vec![],
+                });
+            }
+            let place = Place::local(array);
+            if ctx.is_moved(&place) {
+                return Err(moved_out(ctx, &place, span, "array access"));
+            }
             array_payload_ty(*t, span)?;
             Ok(*t)
         }
@@ -5496,7 +5613,7 @@ fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<String> {
 }
 
 #[cfg(test)]
-mod g1_bool_option_tests {
+mod g1_concrete_aggregate_tests {
     use super::*;
     use crate::span::LineMap;
 
@@ -5516,6 +5633,13 @@ mod g1_bool_option_tests {
         let mut program = parse_program(source);
         crate::mono::monomorphize(&mut program).expect("test source should monomorphize");
         program
+    }
+
+    fn check_error(program: &mut Program) -> Diagnostic {
+        match check(program) {
+            Err(error) => error,
+            Ok(_) => panic!("test source unexpectedly typechecked"),
+        }
     }
 
     #[test]
@@ -5563,16 +5687,207 @@ fn consume(i32 value) -> bool {
     }
 
     #[test]
-    fn array_and_record_payloads_remain_outside_the_bool_option_slice() {
+    fn bool_is_an_exact_array_and_option_payload_while_records_stay_closed() {
         assert_eq!(
             option_payload_ty(ValueTy::Bool, Span::new(0, 1)).unwrap(),
             Ty::Bool
         );
-        let array = array_payload_ty(ValueTy::Bool, Span::new(0, 1)).unwrap_err();
-        assert_eq!(array.name, "type.array_payload_unsupported");
+        assert_eq!(
+            array_payload_ty(ValueTy::Bool, Span::new(0, 1)).unwrap(),
+            Ty::Bool
+        );
 
-        let record = option_payload_ty(ValueTy::Record(0), Span::new(0, 1)).unwrap_err();
-        assert_eq!(record.name, "type.option_payload_unsupported");
+        let option_record = option_payload_ty(ValueTy::Record(0), Span::new(0, 1)).unwrap_err();
+        assert_eq!(option_record.name, "type.option_payload_unsupported");
+        let array_record = array_payload_ty(ValueTy::Record(0), Span::new(0, 1)).unwrap_err();
+        assert_eq!(array_record.name, "type.array_payload_unsupported");
+    }
+
+    #[test]
+    fn owned_local_bool_arrays_cache_exact_types_for_literals_alloc_index_len_and_store() {
+        let mut program = monomorphized_program(
+            r#"
+fn select(u64 index) -> bool {
+    mut [bool] flags = [true, false];
+    var mut copy = alloc_array<bool>(flags.len, false);
+    copy[index] = flags[index];
+    return copy[index];
+}
+"#,
+        );
+        check(&mut program).expect("the owned-local Boolean-array surface should typecheck");
+
+        let function = &program.fns[0];
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let Stmt::Decl {
+            ty,
+            init: Some(literal),
+            ..
+        } = &function.body[0]
+        else {
+            panic!("expected the explicit array declaration");
+        };
+        assert_eq!(*ty, array_ty);
+        assert_eq!(literal.ty, Some(array_ty));
+        let ExprKind::ArrayLit(elements) = &literal.kind else {
+            panic!("expected a contextual array literal");
+        };
+        assert!(elements.iter().all(|element| element.ty == Some(Ty::Bool)));
+
+        let Stmt::VarDecl { init, ty, .. } = &function.body[1] else {
+            panic!("expected the inferred allocation declaration");
+        };
+        assert_eq!(*ty, Some(array_ty));
+        assert_eq!(init.ty, Some(array_ty));
+        let ExprKind::AllocArray {
+            elem,
+            len,
+            init: fill,
+        } = &init.kind
+        else {
+            panic!("expected alloc_array<bool>");
+        };
+        assert_eq!(*elem, ValueTy::Bool);
+        assert_eq!(len.ty, Some(Ty::Int(IntTy::U64)));
+        assert_eq!(fill.ty, Some(Ty::Bool));
+
+        let Stmt::Store { index, value, .. } = &function.body[2] else {
+            panic!("expected a Boolean element store");
+        };
+        assert_eq!(index.ty, Some(Ty::Int(IntTy::U64)));
+        assert_eq!(value.ty, Some(Ty::Bool));
+
+        let Stmt::Return {
+            value: Some(value), ..
+        } = &function.body[3]
+        else {
+            panic!("expected an indexed Boolean return");
+        };
+        assert_eq!(value.ty, Some(Ty::Bool));
+    }
+
+    #[test]
+    fn bool_array_call_boundaries_are_rejected_before_member_or_abi_lowering() {
+        let sources = [
+            "fn bad(&[bool] values) {}\n",
+            r#"
+class Holder {
+    init new() {}
+
+    fn bad(&self, &[bool] values) {}
+}
+"#,
+            r#"
+trait Bad {
+    fn bad(Self value, &[bool] values);
+}
+"#,
+            r#"
+extern "C" #[audit(id := "test.bool-array.v1", reason := "boundary stays closed")]
+fn bad(&[bool] values);
+"#,
+        ];
+
+        for source in sources {
+            let mut program = monomorphized_program(source);
+            let error = check_error(&mut program);
+            assert_eq!(error.name, "type.bool_array_param");
+        }
+    }
+
+    #[test]
+    fn bool_array_fields_borrows_exposure_and_returns_stay_closed() {
+        let mut field = monomorphized_program(
+            r#"
+class Holder {
+    [bool] flags;
+
+    init new() {
+        self.flags = alloc_array<bool>(1, false);
+    }
+}
+"#,
+        );
+        assert_eq!(check_error(&mut field).name, "type.bool_array_field");
+
+        let mut borrowed = monomorphized_program(
+            r#"
+fn bad() {
+    [bool] flags = [true];
+    var view = &flags;
+}
+"#,
+        );
+        assert_eq!(check_error(&mut borrowed).name, "type.bool_array_borrow");
+
+        let mut exposed = monomorphized_program(
+            r#"
+fn bad() {
+    [bool] flags = [true];
+    unsafe expose &flags as (ptr, resource bytes) {}
+}
+"#,
+        );
+        assert_eq!(check_error(&mut exposed).name, "expose.element_type");
+
+        let mut returned = monomorphized_program("fn bad() {}\n");
+        returned.fns[0].ret = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        assert_eq!(check_error(&mut returned).name, "type.array_return");
+    }
+
+    #[test]
+    fn synthetic_bool_array_positions_fail_closed() {
+        let mut borrowed_local = monomorphized_program("fn bad() { [bool] flags = [true]; }\n");
+        let Stmt::Decl { ty, .. } = &mut borrowed_local.fns[0].body[0] else {
+            panic!("expected the explicit array local");
+        };
+        *ty = Ty::Array(ValueTy::Bool, Mutability::Shared);
+        assert_eq!(
+            check_error(&mut borrowed_local).name,
+            "type.bool_array_borrow"
+        );
+
+        let mut record = monomorphized_program(
+            r#"
+record Flag #[layout(size := 1, align := 1)] {
+    #[offset(0)] u8 value;
+}
+"#,
+        );
+        record.records[0].fields[0].ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        assert_eq!(check_error(&mut record).name, "record.field_type");
+
+        let mut owned_parameter = monomorphized_program("fn bad(u8 value) {}\n");
+        owned_parameter.fns[0].params[0].ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        assert_eq!(
+            check_error(&mut owned_parameter).name,
+            "type.bool_array_param"
+        );
+
+        let mut uninitialized = monomorphized_program("fn test_bad() { [bool] flags = [true]; }\n");
+        let Stmt::Decl { init, .. } = &mut uninitialized.fns[0].body[0] else {
+            panic!("expected the explicit array local");
+        };
+        *init = None;
+        assert_eq!(
+            check_error(&mut uninitialized).name,
+            "type.bool_array_initializer"
+        );
+
+        let mut discarded =
+            monomorphized_program("fn bad() { [bool] flags = alloc_array<bool>(1, false); }\n");
+        let Stmt::Decl {
+            init: Some(allocation),
+            ..
+        } = discarded.fns[0].body.remove(0)
+        else {
+            panic!("expected the array allocation declaration");
+        };
+        discarded.fns[0].body.push(Stmt::ExprStmt(allocation));
+        assert_eq!(
+            check_error(&mut discarded).name,
+            "type.bool_array_temporary"
+        );
     }
 
     #[test]

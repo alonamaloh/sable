@@ -1,0 +1,9 @@
+// expect-error: unguarded_bool_array.bounds
+// Boolean payloads have a distinct proof model, but indexing is still partial:
+// the array can be empty, so reading element zero requires a bounds proof.
+
+/// post result
+fn unguarded_bool_array() -> bool {
+    [bool] bits = alloc_array<bool>(0, true);
+    return bits[0];
+}

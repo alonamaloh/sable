@@ -1,10 +1,11 @@
 /-
-Sable prelude: the ghost sequence type that borrowed arrays lift to
-(design §2.1). Everything is `Int`, matching the uniform "program values
-lift to ℤ" rule: `len : Int` comes with the fact `0 ≤ len` as a
-hypothesis at every use, and `get : Int → α` returns junk outside
-`[0, len)` — bounds VCs keep program accesses inside, and specification
-quantifiers over indices carry explicit `0 ≤ k` guards.
+Sable prelude: the ghost sequence type that arrays lift to (design §2.1).
+Lengths and indices are always `Int`; the element type is the source array's
+proof-domain type (`Int` for integer arrays and `Bool` for Boolean arrays).
+`len : Int` comes with the fact `0 ≤ len` as a hypothesis at every use, and
+`get : Int → α` returns junk outside `[0, len)` — bounds VCs keep program
+accesses inside, and specification quantifiers over indices carry explicit
+`0 ≤ k` guards.
 
 (The alternative — `Nat`-typed lengths and indices — does not elaborate
 against Int-lifted program values: in `∀ k, k < lo → a.get k < key` Lean

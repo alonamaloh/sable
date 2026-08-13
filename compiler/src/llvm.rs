@@ -2971,6 +2971,7 @@ mod tests {
     #[test]
     fn boolean_option_does_not_open_parameters_entries_or_other_payloads() {
         let option = Ty::Option(ValueTy::Bool);
+        let bool_array = Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned);
         let mut parameterized = function(
             "parameterized",
             Ty::Bool,
@@ -2984,6 +2985,28 @@ mod tests {
             emit_program(&program(vec![parameterized]), 1, &EmitOptions::default()).unwrap_err();
         assert_eq!(parameter_error[0].name, "backend.unsupported");
         assert!(parameter_error[0].label.contains("function parameter"));
+
+        let local_array = function(
+            "bool_array_local",
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: bool_array,
+                    name: "values".into(),
+                    name_span: Span::new(0, 1),
+                    init: None,
+                    mutable: true,
+                },
+                Stmt::Return {
+                    value: None,
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        let array_error =
+            emit_program(&program(vec![local_array]), 1, &EmitOptions::default()).unwrap_err();
+        assert_eq!(array_error[0].name, "backend.unsupported");
+        assert!(array_error[0].label.contains("local representation"));
 
         for unsupported_return in [
             Ty::Option(ValueTy::Int(IntTy::I32)),

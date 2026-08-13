@@ -1,7 +1,8 @@
 # ADR 0058 — LLVM lowering consumes the verified program
 
 **Decided and implemented 2026-08-12; scalar v0 complete. G1.3 Boolean-option
-and G1.4a POD-record extensions implemented and closed 2026-08-13.** Unsafe
+and G1.4a POD-record extensions implemented and closed 2026-08-13; G1.4b
+owned-local Boolean arrays remain explicitly rejected.** Unsafe
 Sable v1 had a defensible formal stopping point but no native-code path. This
 backend makes verified
 programs in its deliberately narrow runtime subset runnable without making LLVM
@@ -231,6 +232,36 @@ sealed operations, record geometry, and existing integer arrays, not Boolean
 arrays. Randomized allocator, grind-budget, LSP, and documentation gates were
 green. G1.4a is closed.
 
+## G1.4b boundary: source-local Boolean arrays are not native arrays
+
+G1.4b widens checking, VC generation, interpretation, and dynamic monitoring
+for fresh owned-local `[bool]` values. It does not amend the LLVM representation
+decision. The emitter rejects a reachable Boolean-array declaration and every
+expression that would carry the value, even though the input is an otherwise
+valid `VerifiedProgram`. A focused public-boundary regression pins this local
+rejection alongside the existing parameter, entry, extern, field, and payload
+fences.
+
+This separation is intentional. The source slice has no parameter or return
+transport, field storage, borrow, exposure, whole-array rebinding, or generic
+Boolean-array instance. Choosing an LLVM element representation now would not
+answer allocation, ownership, lifetime, trap, name-mangling, or future ABI
+questions. A dedicated native-array stage must make those choices and add an
+interpreter/native differential before ADR 0058 admits the type.
+
+G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1
+--nocapture`: 171/171 library tests; all 394 corpus subjects (83 verifies, 244
+must-fail, 48 dynamic, 19 dynamic-fail) with 208.73s in the all-target corpus
+portion; focused Boolean-array verification at 18/18 obligations across four
+functions; 2/2 dynamic tests and the expected out-of-bounds trap; LLVM CLI 6/6;
+the 1/1 exact-`VerifiedProgram` interpreter↔Clang differential over five
+subjects at `-O0` and `-O2`; and the unchanged SVM differential at 76/76. A
+standalone corpus repeat was green in 195.71s; randomized allocator,
+grind-budget, LSP, and documentation gates were green. This closes G1.4b but
+claims no LLVM Boolean-array support. G1.5 adds formal SVM semantics next;
+native array lowering remains later.
+
 ## Consequences
 
 This path gets Sable to native toolchains without expanding the trusted proof
@@ -238,7 +269,7 @@ base: Lean still checks contracts, while the new emitter is an additional
 compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
 The cost is a backend intentionally limited to scalar, Boolean-option, and
-internal integer-POD values, with
+internal integer-POD values, with Boolean arrays still rejected, and
 explicit traps/control flow where less careful LLVM frontends often rely on
 poison. Broader aggregate representations and every aggregate ABI, extern
 interoperability, optimization, debug information, object emission, and stable

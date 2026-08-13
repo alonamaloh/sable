@@ -1,0 +1,24 @@
+// Dynamic G1.4b coverage: Boolean array literals and allocations retain their
+// payload even when empty, and monitor snapshots observe stores, reads, length,
+// equality, and Boolean literals without integer coercion.
+
+fn test_bool_array_literal_store_and_monitor() {
+    mut [bool] flags = [true, false, true];
+    /// assert #[label(literal_len)] flags.len = 3
+    /// assert #[label(literal_values)] flags.get 0 = true ∧ flags.get 1 = false
+    flags[1] = true;
+    bool stored = flags[1];
+    /// assert #[label(store_value)] stored = true ∧ flags.get 1 = true
+    [bool] expected = [true, true, true];
+    /// assert #[label(array_equality)] flags = expected
+}
+
+fn test_bool_array_alloc_and_empty_payload() {
+    mut [bool] flags = alloc_array<bool>(3, false);
+    flags[2] = true;
+    /// assert #[label(alloc_values)] flags.len = 3 ∧ flags.get 0 = false ∧ flags.get 2 = true
+    [bool] empty_literal = [];
+    [bool] empty_alloc = alloc_array<bool>(0, true);
+    /// assert #[label(empty_lengths)] empty_literal.len = 0 ∧ empty_alloc.len = 0
+    /// assert #[label(empty_payloads)] empty_literal = empty_alloc
+}

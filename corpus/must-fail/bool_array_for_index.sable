@@ -1,0 +1,6 @@
+// expect-error: parse.unknown_type
+// Widening array payload syntax must not widen integer loop indices.
+
+fn bool_is_not_an_index_type() {
+    for (bool i : range(1)) {}
+}

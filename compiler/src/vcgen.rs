@@ -283,9 +283,9 @@ fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
 }
 
 /// Recover the abstract/concrete integer model used by the retained ADR 0009
-/// proof domain. Arrays still have integer-only proof semantics; options add a
-/// concrete Bool model in G1.1. Keep the integer boundary fail-closed so a POD
-/// record (or a future value kind) cannot silently be emitted as Lean `Int`.
+/// proof domain. Boolean arrays have their own concrete proof model; options
+/// likewise admit Bool. Keep the integer boundary fail-closed so a POD record
+/// (or a future value kind) cannot silently be emitted as Lean `Int`.
 fn adr0009_int_model(ty: ValueTy) -> IntTy {
     ty.int_model().unwrap_or_else(|| match ty {
         ValueTy::Int(IntTy::TParam(_)) => {
@@ -316,8 +316,16 @@ fn adr0009_ty_int_model(ty: Ty) -> IntTy {
 }
 
 fn lean_array_ty(element: ValueTy) -> String {
-    let _ = adr0009_int_model(element);
-    "Sable.Seq Int".into()
+    match element {
+        ValueTy::Bool => "Sable.Seq Bool".into(),
+        ValueTy::Int(_) | ValueTy::Param(_) => {
+            let _ = adr0009_int_model(element);
+            "Sable.Seq Int".into()
+        }
+        ValueTy::Record(_) => {
+            unreachable!("VC preflight rejects POD-record array payloads")
+        }
+    }
 }
 
 fn lean_option_ty(element: ValueTy) -> String {
@@ -350,7 +358,7 @@ enum VcAggregateKind {
 fn validate_vc_value_ty(
     ty: ValueTy,
     allow_param: bool,
-    aggregate: VcAggregateKind,
+    _aggregate: VcAggregateKind,
     context: &str,
 ) -> Result<(), String> {
     match ty {
@@ -362,10 +370,7 @@ fn validate_vc_value_ty(
         ValueTy::Param(_) => Err(format!(
             "internal G1.1 VC type error: type parameter escaped monomorphization in {context}"
         )),
-        ValueTy::Bool if aggregate == VcAggregateKind::Option => Ok(()),
-        ValueTy::Bool => Err(format!(
-            "internal G1.1 VC type error: bool array payload reached {context} before bool array proof semantics"
-        )),
+        ValueTy::Bool => Ok(()),
         ValueTy::Record(_) => Err(format!(
             "internal G1.1 VC type error: POD-record payload reached {context} before record proof semantics"
         )),
@@ -401,125 +406,17 @@ fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result<(), String
     }
 }
 
-fn validate_vc_expr(expr: &Expr, allow_param: bool, context: &str) -> Result<(), String> {
-    if let Some(ty) = expr.ty {
-        validate_vc_ty(ty, allow_param, context)?;
-    }
-    match &expr.kind {
-        ExprKind::Unary { operand, .. }
-        | ExprKind::Widen { arg: operand, .. }
-        | ExprKind::Narrow { arg: operand, .. }
-        | ExprKind::IsSome { operand }
-        | ExprKind::OptValue { operand }
-        | ExprKind::SomeE(operand) => validate_vc_expr(operand, allow_param, context),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            validate_vc_expr(lhs, allow_param, context)?;
-            validate_vc_expr(rhs, allow_param, context)
-        }
-        ExprKind::Call { args, .. }
-        | ExprKind::RawOp { args, .. }
-        | ExprKind::DeviceOp { args, .. }
-        | ExprKind::ResOp { args, .. }
-        | ExprKind::CtorCall { args, .. }
-        | ExprKind::RecordLit { args, .. }
-        | ExprKind::TraitCall { args, .. }
-        | ExprKind::MethodCall { args, .. }
-        | ExprKind::ArrayLit(args) => {
-            for arg in args {
-                validate_vc_expr(arg, allow_param, context)?;
-            }
-            Ok(())
-        }
-        ExprKind::Index { index, .. }
-        | ExprKind::SelfFieldIndex { index, .. }
-        | ExprKind::ClassFieldIndex { index, .. } => validate_vc_expr(index, allow_param, context),
-        ExprKind::AllocArray { elem, len, init } => {
-            validate_vc_value_ty(*elem, allow_param, VcAggregateKind::Array, context)?;
-            validate_vc_expr(len, allow_param, context)?;
-            validate_vc_expr(init, allow_param, context)
-        }
-        ExprKind::IntLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Var(_)
-        | ExprKind::Len { .. }
-        | ExprKind::NoneE
-        | ExprKind::SelfField { .. }
-        | ExprKind::SelfFieldLen { .. }
-        | ExprKind::ClassField { .. }
-        | ExprKind::RecordField { .. }
-        | ExprKind::ClassFieldLen { .. }
-        | ExprKind::Borrow { .. } => Ok(()),
-    }
-}
-
-fn validate_vc_block(block: &[Stmt], allow_param: bool, context: &str) -> Result<(), String> {
-    for statement in block {
-        match statement {
-            Stmt::Decl { ty, init, .. } => {
-                validate_vc_ty(*ty, allow_param, context)?;
-                if let Some(init) = init {
-                    validate_vc_expr(init, allow_param, context)?;
-                }
-            }
-            Stmt::VarDecl { init, ty, .. } => {
-                if let Some(ty) = ty {
-                    validate_vc_ty(*ty, allow_param, context)?;
-                }
-                validate_vc_expr(init, allow_param, context)?;
-            }
-            Stmt::Assign { value, .. }
-            | Stmt::FieldAssign { value, .. }
-            | Stmt::ExprStmt(value) => validate_vc_expr(value, allow_param, context)?,
-            Stmt::If {
-                cond,
-                then_block,
-                else_block,
-            } => {
-                validate_vc_expr(cond, allow_param, context)?;
-                validate_vc_block(then_block, allow_param, context)?;
-                if let Some(else_block) = else_block {
-                    validate_vc_block(else_block, allow_param, context)?;
-                }
-            }
-            Stmt::Return { value, .. } => {
-                if let Some(value) = value {
-                    validate_vc_expr(value, allow_param, context)?;
-                }
-            }
-            Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
-                validate_vc_expr(index, allow_param, context)?;
-                validate_vc_expr(value, allow_param, context)?;
-            }
-            Stmt::While { cond, body, .. } => {
-                validate_vc_expr(cond, allow_param, context)?;
-                validate_vc_block(body, allow_param, context)?;
-            }
-            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
-                validate_vc_block(body, allow_param, context)?;
-            }
-            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
-                validate_vc_expr(size, allow_param, context)?;
-            }
-            Stmt::SystemDealloc {
-                ptr, res, release, ..
-            } => {
-                validate_vc_expr(ptr, allow_param, context)?;
-                validate_vc_expr(res, allow_param, context)?;
-                validate_vc_expr(release, allow_param, context)?;
-            }
-            Stmt::Assert(_) => {}
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VcTypePosition {
-    General,
+    Expression,
+    Local,
     Parameter,
+    TraitParameter,
+    Return,
     TraitReturn,
     ClassField,
     RecordField,
+    Borrow,
 }
 
 fn validate_vc_type_position(
@@ -529,22 +426,737 @@ fn validate_vc_type_position(
     context: &str,
 ) -> Result<(), String> {
     // Validate the payload first. This keeps the unsupported POD-record model
-    // an independent fail-closed boundary even if the surrounding option is
-    // also in a position that the checked language currently forbids.
+    // (and an escaped ordinary-function type parameter) an independent
+    // fail-closed boundary even if the surrounding aggregate is also in a
+    // position that the checked language currently forbids.
     validate_vc_ty(ty, allow_param, context)?;
-    if !matches!(ty, Ty::Option(_)) {
-        return Ok(());
+
+    if let Ty::Array(ValueTy::Bool, mutability) = ty {
+        if matches!(position, VcTypePosition::Expression | VcTypePosition::Local)
+            && mutability == Mutability::Owned
+        {
+            return Ok(());
+        }
+        let position = match position {
+            VcTypePosition::Expression => "a borrowed array expression",
+            VcTypePosition::Local => "a non-owned local",
+            VcTypePosition::Parameter => "a function parameter",
+            VcTypePosition::TraitParameter => "a trait parameter",
+            VcTypePosition::Return => "a function return",
+            VcTypePosition::TraitReturn => "a trait return",
+            VcTypePosition::ClassField => "a class field",
+            VcTypePosition::RecordField => "a record field",
+            VcTypePosition::Borrow => "a borrow",
+        };
+        return Err(format!(
+            "internal G1.4 VC type error: Boolean arrays are owned-local only; {position} is not supported in {context}"
+        ));
     }
-    let position = match position {
-        VcTypePosition::General => return Ok(()),
-        VcTypePosition::Parameter => "option parameters",
-        VcTypePosition::TraitReturn => "trait option returns",
-        VcTypePosition::ClassField => "option-valued class fields",
-        VcTypePosition::RecordField => "option-valued record fields",
-    };
-    Err(format!(
-        "internal G1.1 VC type error: {position} are not supported in {context}"
-    ))
+
+    if let Ty::Option(_) = ty {
+        let position = match position {
+            VcTypePosition::Expression | VcTypePosition::Local | VcTypePosition::Return => {
+                return Ok(());
+            }
+            VcTypePosition::Parameter => "option parameters",
+            VcTypePosition::TraitParameter => "trait option parameters",
+            VcTypePosition::TraitReturn => "trait option returns",
+            VcTypePosition::ClassField => "option-valued class fields",
+            VcTypePosition::RecordField => "option-valued record fields",
+            VcTypePosition::Borrow => "option borrows",
+        };
+        return Err(format!(
+            "internal G1.1 VC type error: {position} are not supported in {context}"
+        ));
+    }
+    Ok(())
+}
+
+fn is_bool_array(ty: Ty) -> bool {
+    matches!(ty, Ty::Array(ValueTy::Bool, _))
+}
+
+fn expr_is_bool_array(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
+    expr.ty.is_some_and(is_bool_array)
+        || matches!(
+            &expr.kind,
+            ExprKind::Var(name)
+                if matches!(locals.get(name), Some(Ty::Array(ValueTy::Bool, _)))
+        )
+}
+
+fn is_fresh_bool_array_value(expr: &Expr) -> bool {
+    expr.ty == Some(Ty::Array(ValueTy::Bool, Mutability::Owned))
+        && matches!(
+            expr.kind,
+            ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. }
+        )
+}
+
+fn reject_bool_array_value(
+    expr: &Expr,
+    locals: &HashMap<String, Ty>,
+    boundary: &str,
+    context: &str,
+) -> Result<(), String> {
+    if expr_is_bool_array(expr, locals) {
+        return Err(format!(
+            "internal G1.4 VC type error: Boolean arrays cannot cross {boundary} in {context}"
+        ));
+    }
+    Ok(())
+}
+
+/// The checked type an expression contributes to a scalar/option operator.
+/// A local name is resolved from the source environment as well as its cached
+/// annotation: otherwise a forged AST could relabel an owned Boolean array as
+/// `bool`/`u64` and drive the symbolic evaluator into the wrong `Val` arm.
+fn vc_semantic_expr_ty(
+    expr: &Expr,
+    locals: &HashMap<String, Ty>,
+    context: &str,
+) -> Result<Ty, String> {
+    if let ExprKind::Var(name) = &expr.kind {
+        if let Some(local_ty) = locals.get(name).copied() {
+            // Checked affine resource variables intentionally may lack a
+            // cached expression type: their sealed operand position is the
+            // typing authority.  Preserve that phase invariant while still
+            // requiring exact cache/local agreement for runtime values.
+            if expr.ty != Some(local_ty) && !(local_ty.is_resource() && expr.ty.is_none()) {
+                return Err(format!(
+                    "internal VC type error: `{name}` has an inconsistent cached type in {context}"
+                ));
+            }
+            return Ok(local_ty);
+        }
+    }
+    expr.ty.ok_or_else(|| {
+        format!("internal VC type error: expression lacks its checked type in {context}")
+    })
+}
+
+fn require_vc_expr_ty(
+    expr: &Expr,
+    expected: Ty,
+    locals: &HashMap<String, Ty>,
+    role: &str,
+    context: &str,
+) -> Result<(), String> {
+    let actual = vc_semantic_expr_ty(expr, locals, context)?;
+    if actual != expected {
+        return Err(format!(
+            "internal VC type error: {role} has type `{}`, expected `{}` in {context}",
+            actual.name(),
+            expected.name()
+        ));
+    }
+    Ok(())
+}
+
+fn vc_option_payload_ty(payload: ValueTy) -> Ty {
+    match payload {
+        ValueTy::Int(integer) => Ty::Int(integer),
+        ValueTy::Bool => Ty::Bool,
+        ValueTy::Record(record) => Ty::Record(record),
+        ValueTy::Param(parameter) => Ty::Param(parameter),
+    }
+}
+
+fn vc_integer_ty(ty: Ty, allow_param: bool) -> bool {
+    matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+        || allow_param && matches!(ty, Ty::Param(_))
+}
+
+fn validate_vc_scalar_operator(
+    expr: &Expr,
+    allow_param: bool,
+    context: &str,
+    locals: &HashMap<String, Ty>,
+) -> Result<(), String> {
+    let result = vc_semantic_expr_ty(expr, locals, context)?;
+    match &expr.kind {
+        ExprKind::Widen { target, arg } => {
+            let source = vc_semantic_expr_ty(arg, locals, context)?;
+            let (Ty::Int(source), Ty::Int(result_integer)) = (source, result) else {
+                return Err(format!(
+                    "internal VC type error: `widen` requires concrete integer operands and result in {context}"
+                ));
+            };
+            if matches!(source, IntTy::TParam(_))
+                || matches!(target, IntTy::TParam(_))
+                || result_integer != *target
+                || source.min() < target.min()
+                || source.max() > target.max()
+            {
+                return Err(format!(
+                    "internal VC type error: inconsistent `widen` operand/result types in {context}"
+                ));
+            }
+        }
+        ExprKind::Narrow { target, arg } => {
+            let source = vc_semantic_expr_ty(arg, locals, context)?;
+            if !vc_integer_ty(source, allow_param)
+                || matches!(target, IntTy::TParam(_))
+                || result != Ty::Int(*target)
+            {
+                return Err(format!(
+                    "internal VC type error: inconsistent `narrow` operand/result types in {context}"
+                ));
+            }
+        }
+        ExprKind::Unary { op, operand } => {
+            let operand = vc_semantic_expr_ty(operand, locals, context)?;
+            let coherent = match op {
+                UnOp::Neg => {
+                    matches!(operand, Ty::Int(integer) if integer.signed()) && result == operand
+                }
+                UnOp::Not => operand == Ty::Bool && result == Ty::Bool,
+            };
+            if !coherent {
+                return Err(format!(
+                    "internal VC type error: inconsistent unary operand/result types in {context}"
+                ));
+            }
+        }
+        ExprKind::Binary { op, lhs, rhs, .. } => {
+            let lhs = vc_semantic_expr_ty(lhs, locals, context)?;
+            let rhs = vc_semantic_expr_ty(rhs, locals, context)?;
+            let same_integer = lhs == rhs && vc_integer_ty(lhs, allow_param);
+            let coherent = if op.is_arith() {
+                same_integer
+                    && result == lhs
+                    && (!matches!(op, BinOp::Div | BinOp::Rem) || !matches!(lhs, Ty::Param(_)))
+            } else if op.is_comparison() {
+                same_integer && result == Ty::Bool
+            } else {
+                lhs == Ty::Bool && rhs == Ty::Bool && result == Ty::Bool
+            };
+            if !coherent {
+                return Err(format!(
+                    "internal VC type error: inconsistent binary operand/result types in {context}"
+                ));
+            }
+        }
+        _ => unreachable!("scalar-operator validation called for a different expression"),
+    }
+    Ok(())
+}
+
+fn validate_vc_option_operator(
+    expr: &Expr,
+    context: &str,
+    locals: &HashMap<String, Ty>,
+) -> Result<(), String> {
+    let result = vc_semantic_expr_ty(expr, locals, context)?;
+    match &expr.kind {
+        ExprKind::IsSome { operand } => {
+            let operand = vc_semantic_expr_ty(operand, locals, context)?;
+            if !matches!(operand, Ty::Option(_) | Ty::OptionRaw(_)) || result != Ty::Bool {
+                return Err(format!(
+                    "internal VC type error: inconsistent `.is_some` operand/result types in {context}"
+                ));
+            }
+        }
+        ExprKind::OptValue { operand } => {
+            let operand = vc_semantic_expr_ty(operand, locals, context)?;
+            let expected = match operand {
+                Ty::Option(payload) => vc_option_payload_ty(payload),
+                Ty::OptionRaw(record) => Ty::RawRecord(record),
+                _ => {
+                    return Err(format!(
+                        "internal VC type error: `.value` requires an option operand in {context}"
+                    ));
+                }
+            };
+            if result != expected {
+                return Err(format!(
+                    "internal VC type error: inconsistent `.value` payload type in {context}"
+                ));
+            }
+        }
+        ExprKind::SomeE(inner) => {
+            let expected = match result {
+                Ty::Option(payload) => vc_option_payload_ty(payload),
+                Ty::OptionRaw(record) => Ty::RawRecord(record),
+                _ => {
+                    return Err(format!(
+                        "internal VC type error: `some` requires an option result in {context}"
+                    ));
+                }
+            };
+            if vc_semantic_expr_ty(inner, locals, context)? != expected {
+                return Err(format!(
+                    "internal VC type error: inconsistent `some` payload type in {context}"
+                ));
+            }
+        }
+        ExprKind::NoneE => {
+            if !matches!(result, Ty::Option(_) | Ty::OptionRaw(_)) {
+                return Err(format!(
+                    "internal VC type error: `none` requires an option result in {context}"
+                ));
+            }
+        }
+        _ => unreachable!("option-operator validation called for a different expression"),
+    }
+    Ok(())
+}
+
+fn validate_vc_expr(
+    expr: &Expr,
+    allow_param: bool,
+    context: &str,
+    locals: &HashMap<String, Ty>,
+) -> Result<(), String> {
+    if let Some(ty) = expr.ty {
+        let position = if matches!(expr.kind, ExprKind::Borrow { .. }) {
+            VcTypePosition::Borrow
+        } else {
+            VcTypePosition::Expression
+        };
+        validate_vc_type_position(ty, allow_param, position, context)?;
+        if is_bool_array(ty) {
+            match &expr.kind {
+                ExprKind::Var(name) if locals.get(name) == Some(&ty) => {}
+                ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } => {}
+                ExprKind::Var(_) => {
+                    return Err(format!(
+                        "internal G1.4 VC type error: Boolean array variable has an inconsistent source type in {context}"
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "internal G1.4 VC type error: Boolean array value has an unsupported producer in {context}"
+                    ));
+                }
+            }
+        }
+    }
+    match &expr.kind {
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Widen { arg: operand, .. }
+        | ExprKind::Narrow { arg: operand, .. } => {
+            validate_vc_expr(operand, allow_param, context, locals)?;
+            validate_vc_scalar_operator(expr, allow_param, context, locals)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            validate_vc_expr(lhs, allow_param, context, locals)?;
+            validate_vc_expr(rhs, allow_param, context, locals)?;
+            validate_vc_scalar_operator(expr, allow_param, context, locals)
+        }
+        ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
+            validate_vc_expr(operand, allow_param, context, locals)?;
+            validate_vc_option_operator(expr, context, locals)
+        }
+        ExprKind::SomeE(operand) => {
+            validate_vc_expr(operand, allow_param, context, locals)?;
+            validate_vc_option_operator(expr, context, locals)
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::TraitCall { args, .. } => {
+            for arg in args {
+                reject_bool_array_value(arg, locals, "a call boundary", context)?;
+                validate_vc_expr(arg, allow_param, context, locals)?;
+            }
+            Ok(())
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            if matches!(locals.get(recv), Some(Ty::Array(ValueTy::Bool, _))) {
+                return Err(format!(
+                    "internal G1.4 VC type error: Boolean arrays cannot be method receivers in {context}"
+                ));
+            }
+            for arg in args {
+                reject_bool_array_value(arg, locals, "a call boundary", context)?;
+                validate_vc_expr(arg, allow_param, context, locals)?;
+            }
+            Ok(())
+        }
+        ExprKind::RawOp { args, .. }
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::ResOp { args, .. } => {
+            for arg in args {
+                reject_bool_array_value(arg, locals, "an intrinsic boundary", context)?;
+                validate_vc_expr(arg, allow_param, context, locals)?;
+            }
+            Ok(())
+        }
+        ExprKind::ArrayLit(elements) => {
+            let Some(Ty::Array(element, Mutability::Owned)) = expr.ty else {
+                return Err(format!(
+                    "internal G1.4 VC type error: array literal lacks an owned array type in {context}"
+                ));
+            };
+            validate_vc_value_ty(element, allow_param, VcAggregateKind::Array, context)?;
+            for element_expr in elements {
+                validate_vc_expr(element_expr, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    element_expr,
+                    vc_option_payload_ty(element),
+                    locals,
+                    "array-literal element",
+                    context,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::Index { array, index, .. } => {
+            validate_vc_expr(index, allow_param, context, locals)?;
+            require_vc_expr_ty(index, Ty::Int(IntTy::U64), locals, "array index", context)?;
+            let Some(Ty::Array(element, _)) = locals.get(array).copied() else {
+                return Err(format!(
+                    "internal VC type error: index source `{array}` is not an active array in {context}"
+                ));
+            };
+            if vc_semantic_expr_ty(expr, locals, context)? != vc_option_payload_ty(element) {
+                return Err(format!(
+                    "internal VC type error: array index has an inconsistent result type in {context}"
+                ));
+            }
+            Ok(())
+        }
+        ExprKind::SelfFieldIndex { index, .. } => {
+            validate_vc_expr(index, allow_param, context, locals)?;
+            require_vc_expr_ty(
+                index,
+                Ty::Int(IntTy::U64),
+                locals,
+                "self-field array index",
+                context,
+            )
+        }
+        ExprKind::ClassFieldIndex { obj, index, .. } => {
+            if matches!(locals.get(obj), Some(Ty::Array(ValueTy::Bool, _))) {
+                return Err(format!(
+                    "internal G1.4 VC type error: Boolean arrays cannot be class-field receivers in {context}"
+                ));
+            }
+            validate_vc_expr(index, allow_param, context, locals)?;
+            require_vc_expr_ty(
+                index,
+                Ty::Int(IntTy::U64),
+                locals,
+                "class-field array index",
+                context,
+            )
+        }
+        ExprKind::AllocArray { elem, len, init } => {
+            validate_vc_value_ty(*elem, allow_param, VcAggregateKind::Array, context)?;
+            if expr.ty != Some(Ty::Array(*elem, Mutability::Owned)) {
+                return Err(format!(
+                    "internal G1.4 VC type error: array allocation has an inconsistent result type in {context}"
+                ));
+            }
+            validate_vc_expr(len, allow_param, context, locals)?;
+            require_vc_expr_ty(
+                len,
+                Ty::Int(IntTy::U64),
+                locals,
+                "array-allocation length",
+                context,
+            )?;
+            validate_vc_expr(init, allow_param, context, locals)?;
+            require_vc_expr_ty(
+                init,
+                vc_option_payload_ty(*elem),
+                locals,
+                "array-allocation initializer",
+                context,
+            )?;
+            Ok(())
+        }
+        ExprKind::Borrow { array, .. } => {
+            if matches!(locals.get(array), Some(Ty::Array(ValueTy::Bool, _))) {
+                return Err(format!(
+                    "internal G1.4 VC type error: Boolean array borrows are not supported in {context}"
+                ));
+            }
+            Ok(())
+        }
+        ExprKind::Var(name) => {
+            if matches!(locals.get(name), Some(Ty::Array(ValueTy::Bool, _)))
+                && expr.ty != locals.get(name).copied()
+            {
+                return Err(format!(
+                    "internal G1.4 VC type error: Boolean array variable lacks its checked owned-local type in {context}"
+                ));
+            }
+            Ok(())
+        }
+        ExprKind::NoneE => validate_vc_option_operator(expr, context, locals),
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. } => Ok(()),
+        ExprKind::ClassField { obj, .. }
+        | ExprKind::RecordField { obj, .. }
+        | ExprKind::ClassFieldLen { obj, .. } => {
+            if matches!(locals.get(obj), Some(Ty::Array(ValueTy::Bool, _))) {
+                return Err(format!(
+                    "internal G1.4 VC type error: Boolean arrays cannot be aggregate-field receivers in {context}"
+                ));
+            }
+            Ok(())
+        }
+        ExprKind::Len { array } => {
+            if matches!(locals.get(array), Some(Ty::Array(ValueTy::Bool, _)))
+                && expr.ty != Some(Ty::Int(IntTy::U64))
+            {
+                return Err(format!(
+                    "internal G1.4 VC type error: Boolean array length has a non-u64 result in {context}"
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_vc_block(
+    block: &[Stmt],
+    allow_param: bool,
+    context: &str,
+    locals: &mut HashMap<String, Ty>,
+) -> Result<(), String> {
+    for statement in block {
+        match statement {
+            Stmt::Decl { ty, name, init, .. } => {
+                validate_vc_type_position(*ty, allow_param, VcTypePosition::Local, context)?;
+                if *ty == Ty::Array(ValueTy::Bool, Mutability::Owned) && init.is_none() {
+                    return Err(format!(
+                        "internal G1.4 VC type error: owned Boolean array local `{name}` must be initialized in {context}"
+                    ));
+                }
+                if let Some(init) = init {
+                    validate_vc_expr(init, allow_param, context, locals)?;
+                    let declaration_is_bool_array =
+                        *ty == Ty::Array(ValueTy::Bool, Mutability::Owned);
+                    let initializer_is_bool_array =
+                        init.ty == Some(Ty::Array(ValueTy::Bool, Mutability::Owned));
+                    if declaration_is_bool_array != initializer_is_bool_array {
+                        return Err(format!(
+                            "internal G1.4 VC type error: Boolean array declaration has an incompatible initializer in {context}"
+                        ));
+                    }
+                    if declaration_is_bool_array && !is_fresh_bool_array_value(init) {
+                        return Err(format!(
+                            "internal G1.4 VC type error: Boolean array local `{name}` must be initialized by a literal or allocation in {context}"
+                        ));
+                    }
+                }
+                locals.insert(name.clone(), *ty);
+            }
+            Stmt::VarDecl { name, init, ty, .. } => {
+                validate_vc_expr(init, allow_param, context, locals)?;
+                if let Some(ty) = ty {
+                    validate_vc_type_position(*ty, allow_param, VcTypePosition::Local, context)?;
+                    let declaration_is_bool_array =
+                        *ty == Ty::Array(ValueTy::Bool, Mutability::Owned);
+                    let initializer_is_bool_array =
+                        init.ty == Some(Ty::Array(ValueTy::Bool, Mutability::Owned));
+                    if declaration_is_bool_array != initializer_is_bool_array {
+                        return Err(format!(
+                            "internal G1.4 VC type error: inferred Boolean array declaration has an incompatible initializer in {context}"
+                        ));
+                    }
+                    if declaration_is_bool_array && !is_fresh_bool_array_value(init) {
+                        return Err(format!(
+                            "internal G1.4 VC type error: inferred Boolean array local `{name}` must be initialized by a literal or allocation in {context}"
+                        ));
+                    }
+                    locals.insert(name.clone(), *ty);
+                } else if init.ty.is_some_and(is_bool_array) {
+                    return Err(format!(
+                        "internal G1.4 VC type error: inferred Boolean array local lacks its checked type in {context}"
+                    ));
+                }
+            }
+            Stmt::Assign { name, value, .. } => {
+                validate_vc_expr(value, allow_param, context, locals)?;
+                let target_is_bool_array = matches!(
+                    locals.get(name),
+                    Some(Ty::Array(ValueTy::Bool, Mutability::Owned))
+                );
+                let value_is_bool_array =
+                    value.ty == Some(Ty::Array(ValueTy::Bool, Mutability::Owned));
+                if target_is_bool_array {
+                    return Err(format!(
+                        "internal G1.4 VC type error: Boolean array local `{name}` cannot be rebound in {context}"
+                    ));
+                }
+                if target_is_bool_array != value_is_bool_array {
+                    return Err(format!(
+                        "internal G1.4 VC type error: Boolean array assignment has an incompatible value in {context}"
+                    ));
+                }
+            }
+            Stmt::FieldAssign { value, .. } => {
+                reject_bool_array_value(value, locals, "a field boundary", context)?;
+                validate_vc_expr(value, allow_param, context, locals)?;
+            }
+            Stmt::ExprStmt(value) => {
+                reject_bool_array_value(value, locals, "an expression statement", context)?;
+                validate_vc_expr(value, allow_param, context, locals)?;
+            }
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                validate_vc_expr(cond, allow_param, context, locals)?;
+                require_vc_expr_ty(cond, Ty::Bool, locals, "`if` condition", context)?;
+                let mut then_locals = locals.clone();
+                validate_vc_block(then_block, allow_param, context, &mut then_locals)?;
+                if let Some(else_block) = else_block {
+                    let mut else_locals = locals.clone();
+                    validate_vc_block(else_block, allow_param, context, &mut else_locals)?;
+                }
+            }
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    if let Some(ty) = value.ty {
+                        validate_vc_type_position(
+                            ty,
+                            allow_param,
+                            VcTypePosition::Return,
+                            context,
+                        )?;
+                    }
+                    validate_vc_expr(value, allow_param, context, locals)?;
+                }
+            }
+            Stmt::FieldStore { index, value, .. } => {
+                validate_vc_expr(index, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    index,
+                    Ty::Int(IntTy::U64),
+                    locals,
+                    "field-store index",
+                    context,
+                )?;
+                validate_vc_expr(value, allow_param, context, locals)?;
+                reject_bool_array_value(value, locals, "a field-store value", context)?;
+            }
+            Stmt::Store {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                validate_vc_expr(index, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    index,
+                    Ty::Int(IntTy::U64),
+                    locals,
+                    "array-store index",
+                    context,
+                )?;
+                validate_vc_expr(value, allow_param, context, locals)?;
+                let Some(Ty::Array(element, _)) = locals.get(array).copied() else {
+                    return Err(format!(
+                        "internal VC type error: array-store target `{array}` is not an active array in {context}"
+                    ));
+                };
+                require_vc_expr_ty(
+                    value,
+                    vc_option_payload_ty(element),
+                    locals,
+                    "array-store value",
+                    context,
+                )?;
+            }
+            Stmt::While { cond, body, .. } => {
+                validate_vc_expr(cond, allow_param, context, locals)?;
+                require_vc_expr_ty(cond, Ty::Bool, locals, "`while` condition", context)?;
+                let mut body_locals = locals.clone();
+                validate_vc_block(body, allow_param, context, &mut body_locals)?;
+            }
+            // Unsafe is a marker rather than a scope, so declarations made
+            // inside it remain available to the following statements.
+            Stmt::Unsafe { body, .. } => {
+                validate_vc_block(body, allow_param, context, locals)?;
+            }
+            Stmt::Expose {
+                array,
+                ptr,
+                res,
+                body,
+                ..
+            } => {
+                if matches!(locals.get(array), Some(Ty::Array(ValueTy::Bool, _))) {
+                    return Err(format!(
+                        "internal G1.4 VC type error: Boolean array exposure is not supported in {context}"
+                    ));
+                }
+                let mut body_locals = locals.clone();
+                body_locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                body_locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                validate_vc_block(body, allow_param, context, &mut body_locals)?;
+            }
+            Stmt::StaticAlloc { size, ptr, res, .. } => {
+                validate_vc_expr(size, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    size,
+                    Ty::Int(IntTy::U64),
+                    locals,
+                    "static-allocation size",
+                    context,
+                )?;
+                locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
+            }
+            Stmt::SystemAlloc {
+                size,
+                ptr,
+                res,
+                release,
+                ..
+            } => {
+                validate_vc_expr(size, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    size,
+                    Ty::Int(IntTy::U64),
+                    locals,
+                    "system-allocation size",
+                    context,
+                )?;
+                locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                locals.insert(release.clone(), Ty::Res(ResKind::SystemDealloc));
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                validate_vc_expr(ptr, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    ptr,
+                    Ty::Raw(IntTy::U8),
+                    locals,
+                    "system-deallocation pointer",
+                    context,
+                )?;
+                validate_vc_expr(res, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    res,
+                    Ty::Res(ResKind::RawSpan),
+                    locals,
+                    "system-deallocation byte authority",
+                    context,
+                )?;
+                validate_vc_expr(release, allow_param, context, locals)?;
+                require_vc_expr_ty(
+                    release,
+                    Ty::Res(ResKind::SystemDealloc),
+                    locals,
+                    "system-deallocation release authority",
+                    context,
+                )?;
+            }
+            Stmt::Assert(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_vc_fn(
@@ -557,7 +1169,11 @@ fn validate_vc_fn(
         validate_vc_type_position(
             parameter.ty,
             allow_param,
-            VcTypePosition::Parameter,
+            if trait_signature {
+                VcTypePosition::TraitParameter
+            } else {
+                VcTypePosition::Parameter
+            },
             context,
         )?;
     }
@@ -567,11 +1183,16 @@ fn validate_vc_fn(
         if trait_signature {
             VcTypePosition::TraitReturn
         } else {
-            VcTypePosition::General
+            VcTypePosition::Return
         },
         context,
     )?;
-    validate_vc_block(&function.body, allow_param, context)
+    let mut locals: HashMap<String, Ty> = function
+        .params
+        .iter()
+        .map(|parameter| (parameter.name.clone(), parameter.ty))
+        .collect();
+    validate_vc_block(&function.body, allow_param, context, &mut locals)
 }
 
 fn validate_vc_trait_fn(function: &Fn, context: &str) -> Result<(), String> {
@@ -603,6 +1224,19 @@ fn validate_vc_method(function: &Fn, allow_param: bool, context: &str) -> Result
     Ok(())
 }
 
+fn seed_class_state_types(
+    class: &ClassDecl,
+    allow_param: bool,
+    locals: &mut HashMap<String, Ty>,
+    context: &str,
+) -> Result<(), String> {
+    for field in &class.fields {
+        validate_vc_type_position(field.ty, allow_param, VcTypePosition::ClassField, context)?;
+        locals.insert(format!("self.{}", field.name), field.ty);
+    }
+    Ok(())
+}
+
 fn validate_vc_class(class: &ClassDecl, allow_param: bool) -> Result<(), String> {
     let context = format!("class `{}`", class.name);
     for field in &class.fields {
@@ -615,7 +1249,9 @@ fn validate_vc_class(class: &ClassDecl, allow_param: bool) -> Result<(), String>
         validate_vc_method(&method.f, allow_param, &context)?;
     }
     if let Some(deinit) = &class.deinit {
-        validate_vc_block(deinit, allow_param, &context)?;
+        let mut locals = HashMap::new();
+        seed_class_state_types(class, allow_param, &mut locals, &context)?;
+        validate_vc_block(deinit, allow_param, &context, &mut locals)?;
     }
     Ok(())
 }
@@ -1444,14 +2080,9 @@ impl<'a> Generator<'a> {
                         format!("h_field_{}_len", fld.name),
                         format!("0 ≤ {path}.len ∧ {path}.len ≤ u64.max"),
                     );
-                    self.push_hyp_unique(
-                        format!("h_field_{}_elems", fld.name),
-                        format!(
-                            "∀ k, 0 ≤ k → k < {path}.len → {} ≤ {path}.get k ∧ {path}.get k ≤ {}",
-                            self.t_min(elem),
-                            self.t_max(elem)
-                        ),
-                    );
+                    if let Some(prop) = self.array_element_range_prop(&path, elem) {
+                        self.push_hyp_unique(format!("h_field_{}_elems", fld.name), prop);
+                    }
                 }
                 // A class-valued field carries its own class's facts and
                 // invariant, one level down (ADR 0020).
@@ -1735,14 +2366,9 @@ impl<'a> Generator<'a> {
                         format!("h_{}_len", p.name),
                         format!("0 ≤ {binder}.len ∧ {binder}.len ≤ u64.max"),
                     ));
-                    self.hyps.push((
-                        format!("h_{}_elems", p.name),
-                        format!(
-                            "∀ k, 0 ≤ k → k < {binder}.len → {} ≤ {binder}.get k ∧ {binder}.get k ≤ {}",
-                            self.t_min(elem),
-                            self.t_max(elem)
-                        ),
-                    ));
+                    if let Some(prop) = self.array_element_range_prop(&binder, elem) {
+                        self.hyps.push((format!("h_{}_elems", p.name), prop));
+                    }
                     if mutability == Mutability::Mut {
                         self.entry_states.insert(p.name.clone(), binder.clone());
                     }
@@ -2305,8 +2931,12 @@ impl<'a> Generator<'a> {
                 let Val::Int(i) = self.eval(index) else {
                     unreachable!()
                 };
-                let Val::Int(v) = self.eval(value) else {
-                    unreachable!()
+                let v = match (self.var_tys.get(array).copied(), self.eval(value)) {
+                    (Some(Ty::Array(ValueTy::Bool, _)), Val::Prop(prop)) => lean_bool_value(&prop),
+                    (Some(Ty::Array(ValueTy::Int(_) | ValueTy::Param(_), _)), Val::Int(value)) => {
+                        value
+                    }
+                    _ => unreachable!("checked: store value matches the array element type"),
                 };
                 let arr = self.arr_str(array);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
@@ -2657,14 +3287,12 @@ impl<'a> Generator<'a> {
                                         format!("({b}.len) = ({prior}.len)"),
                                     );
                                 }
-                                self.push_hyp_unique(
-                                    format!("h_self_{}_elems", fld.name),
-                                    format!(
-                                        "∀ k, 0 ≤ k → k < {b}.len → {} ≤ {b}.get k ∧ {b}.get k ≤ {}",
-                                        self.t_min(elem),
-                                        self.t_max(elem)
-                                    ),
-                                );
+                                if let Some(prop) = self.array_element_range_prop(&b, elem) {
+                                    self.push_hyp_unique(
+                                        format!("h_self_{}_elems", fld.name),
+                                        prop,
+                                    );
+                                }
                                 self.env.insert(key, Val::Arr(b));
                             }
                             (Ty::Int(it), Some(Val::Int(_))) => {
@@ -2786,14 +3414,9 @@ impl<'a> Generator<'a> {
                             ));
                         }
                     }
-                    self.hyps.push((
-                        format!("h_{name}_elems"),
-                        format!(
-                            "∀ k, 0 ≤ k → k < {name}.len → {} ≤ {name}.get k ∧ {name}.get k ≤ {}",
-                            self.t_min(elem),
-                            self.t_max(elem)
-                        ),
-                    ));
+                    if let Some(prop) = self.array_element_range_prop(name, elem) {
+                        self.hyps.push((format!("h_{name}_elems"), prop));
+                    }
                     self.env.insert(name.clone(), Val::Arr(name.clone()));
                 }
                 Some(Ty::Array(elem, Mutability::Mut)) => {
@@ -2807,14 +3430,9 @@ impl<'a> Generator<'a> {
                         format!("h_{name}_len"),
                         format!("({name}.len) = ({entry}.len)"),
                     ));
-                    self.hyps.push((
-                        format!("h_{name}_elems"),
-                        format!(
-                            "∀ k, 0 ≤ k → k < {name}.len → {} ≤ {name}.get k ∧ {name}.get k ≤ {}",
-                            self.t_min(elem),
-                            self.t_max(elem)
-                        ),
-                    ));
+                    if let Some(prop) = self.array_element_range_prop(name, elem) {
+                        self.hyps.push((format!("h_{name}_elems"), prop));
+                    }
                     self.env.insert(name.clone(), Val::Arr(name.clone()));
                 }
                 _ => {}
@@ -4764,8 +5382,13 @@ impl<'a> Generator<'a> {
                 let h1 = self.fresh_hyp("h_lit");
                 self.hyps.push((h1, format!("({b}.len) = {}", elems.len())));
                 for (i, el) in elems.iter().enumerate() {
-                    let Val::Int(v) = self.eval(el) else {
-                        unreachable!()
+                    let v = match (element, self.eval(el)) {
+                        (ValueTy::Bool, Val::Prop(prop)) => lean_bool_value(&prop),
+                        (ValueTy::Int(_) | ValueTy::Param(_), Val::Int(value)) => value,
+                        (ValueTy::Record(_), _) => {
+                            unreachable!("VC preflight rejects POD-record array literals")
+                        }
+                        _ => unreachable!("checked: array literal element type"),
                     };
                     let h = self.fresh_hyp("h_lit");
                     self.hyps.push((h, format!("{b}.get {i} = {v}")));
@@ -4776,7 +5399,6 @@ impl<'a> Generator<'a> {
                 let Val::Int(i) = self.eval(index) else {
                     unreachable!()
                 };
-                let model = adr0009_ty_int_model(e.ty.expect("checked: array index type"));
                 let arr = self.arr_str(array);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
                 let ob = self.obligation(
@@ -4788,20 +5410,31 @@ impl<'a> Generator<'a> {
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
                 let value = format!("({arr}.get {i})");
-                // Element range follows from the array's element fact +
-                // the just-proven bounds; assuming it here saves the
-                // automation a quantifier instantiation.
-                let range = self.r_prop(&value, model);
-                self.assume_fact(&range);
-                Val::Int(value)
+                match e.ty.expect("checked: array index type") {
+                    Ty::Bool => Val::Prop(format!("({value} = true)")),
+                    ty @ (Ty::Int(_) | Ty::Param(_)) => {
+                        // Element range follows from the array's element fact
+                        // plus the just-proven bounds; assuming it here saves
+                        // the automation a quantifier instantiation.
+                        let range = self.r_prop(&value, adr0009_ty_int_model(ty));
+                        self.assume_fact(&range);
+                        Val::Int(value)
+                    }
+                    _ => unreachable!("checked: scalar array index result"),
+                }
             }
             ExprKind::AllocArray { elem, len, init } => {
                 let hint = self.name_hint.take();
                 let Val::Int(n) = self.eval(len) else {
                     unreachable!()
                 };
-                let Val::Int(v0) = self.eval(init) else {
-                    unreachable!()
+                let v0 = match (*elem, self.eval(init)) {
+                    (ValueTy::Bool, Val::Prop(prop)) => lean_bool_value(&prop),
+                    (ValueTy::Int(_) | ValueTy::Param(_), Val::Int(value)) => value,
+                    (ValueTy::Record(_), _) => {
+                        unreachable!("VC preflight rejects POD-record array allocation")
+                    }
+                    _ => unreachable!("checked: array allocation initializer type"),
                 };
                 // Allocation succeeds symbolically: failure is the named
                 // OOM trap (design §10), not a proof obligation.
@@ -5479,14 +6112,9 @@ impl<'a> Generator<'a> {
                         format!("h_{array}_len"),
                         format!("({b}.len) = ({old_chain}.len)"),
                     ));
-                    self.hyps.push((
-                        format!("h_{array}_elems"),
-                        format!(
-                            "∀ k, 0 ≤ k → k < {b}.len → {} ≤ {b}.get k ∧ {b}.get k ≤ {}",
-                            self.t_min(elem),
-                            self.t_max(elem)
-                        ),
-                    ));
+                    if let Some(prop) = self.array_element_range_prop(&b, elem) {
+                        self.hyps.push((format!("h_{array}_elems"), prop));
+                    }
                     self.env.insert(array.clone(), Val::Arr(b.clone()));
                     subst_map.insert(p.name.clone(), b);
                 }
@@ -5922,6 +6550,24 @@ impl<'a> Generator<'a> {
             return format!("{}.max", self.tparams[i as usize]);
         }
         it.lean_max()
+    }
+
+    /// Integer arrays carry explicit element-range hypotheses. A Boolean
+    /// sequence needs no analogue: Lean's `Bool` type is already its complete
+    /// value domain, so inventing numeric bounds would both be ill-typed and
+    /// would conflate the two aggregate proof models.
+    fn array_element_range_prop(&self, array: &str, ty: ValueTy) -> Option<String> {
+        match ty {
+            ValueTy::Bool => None,
+            ValueTy::Record(_) => {
+                unreachable!("VC preflight rejects POD-record array payloads")
+            }
+            ValueTy::Int(_) | ValueTy::Param(_) => Some(format!(
+                "∀ k, 0 ≤ k → k < {array}.len → {} ≤ {array}.get k ∧ {array}.get k ≤ {}",
+                self.t_min(ty),
+                self.t_max(ty)
+            )),
+        }
     }
 
     /// A binder name for a call/alloc result: the hinted source local
@@ -6574,19 +7220,27 @@ mod g1_type_domain_tests {
     }
 
     #[test]
+    fn semantic_type_lookup_preserves_unannotated_resource_places() {
+        let ty = Ty::Res(ResKind::RawSpan);
+        let locals = HashMap::from([("whole".to_string(), ty)]);
+        let place = Expr {
+            kind: ExprKind::Var("whole".into()),
+            span: Span::new(0, 0),
+            ty: None,
+        };
+        assert_eq!(
+            vc_semantic_expr_ty(&place, &locals, "sealed resource operand").unwrap(),
+            ty
+        );
+    }
+
+    #[test]
     fn g1_1_bool_options_have_a_distinct_proof_model() {
         assert_eq!(lean_option_ty(ValueTy::Bool), "Option Bool");
         assert!(
             validate_vc_ty(Ty::Option(ValueTy::Bool), false, "unused ordinary function").is_ok()
         );
-
-        let bool_array_error = validate_vc_ty(
-            Ty::Array(ValueTy::Bool, Mutability::Shared),
-            false,
-            "unused ordinary function",
-        )
-        .expect_err("bool arrays do not acquire proof semantics with bool options");
-        assert!(bool_array_error.contains("bool array payload"));
+        assert_eq!(lean_array_ty(ValueTy::Bool), "Sable.Seq Bool");
     }
 
     #[test]
@@ -6616,6 +7270,464 @@ mod g1_type_domain_tests {
             .expect_err("unsupported option position must fail before VC generation");
             assert!(error.contains(expected));
         }
+    }
+
+    #[test]
+    fn bool_arrays_are_owned_local_only_in_vc_preflight() {
+        assert!(
+            validate_vc_type_position(
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                false,
+                VcTypePosition::Local,
+                "synthetic local",
+            )
+            .is_ok()
+        );
+
+        for (ty, position) in [
+            (
+                Ty::Array(ValueTy::Bool, Mutability::Shared),
+                VcTypePosition::Parameter,
+            ),
+            (
+                Ty::Array(ValueTy::Bool, Mutability::Mut),
+                VcTypePosition::TraitParameter,
+            ),
+            (
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                VcTypePosition::Return,
+            ),
+            (
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                VcTypePosition::ClassField,
+            ),
+            (
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                VcTypePosition::RecordField,
+            ),
+            (
+                Ty::Array(ValueTy::Bool, Mutability::Shared),
+                VcTypePosition::Borrow,
+            ),
+        ] {
+            let error = validate_vc_type_position(ty, false, position, "synthetic declaration")
+                .expect_err("Boolean array boundary must fail before symbolic evaluation");
+            assert!(error.contains("owned-local only"));
+        }
+
+        for payload in [
+            ValueTy::Record(0),
+            ValueTy::Param(TypeParamId::from_legacy(0)),
+        ] {
+            let error = validate_vc_type_position(
+                Ty::Array(payload, Mutability::Owned),
+                false,
+                VcTypePosition::Local,
+                "synthetic local",
+            )
+            .expect_err("non-Boolean future payloads stay independently closed");
+            assert!(error.contains(if matches!(payload, ValueTy::Record(_)) {
+                "POD-record payload"
+            } else {
+                "escaped monomorphization"
+            }));
+        }
+    }
+
+    #[test]
+    fn bool_array_preflight_rejects_forged_borrow_and_exposure() {
+        let span = Span::new(0, 1);
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let mut locals = HashMap::from([("bits".to_string(), array_ty)]);
+        let borrowed = Expr {
+            kind: ExprKind::Borrow {
+                array: "bits".into(),
+                field: None,
+                mutable: false,
+            },
+            span,
+            ty: Some(Ty::Array(ValueTy::Bool, Mutability::Shared)),
+        };
+        let error = validate_vc_expr(&borrowed, false, "forged borrow", &locals)
+            .expect_err("forged Boolean array borrow must fail closed");
+        assert!(error.contains("owned-local only") || error.contains("borrows"));
+
+        let call = Expr {
+            kind: ExprKind::Call {
+                callee: "sink".into(),
+                callee_span: span,
+                type_args: Vec::new(),
+                args: vec![Expr {
+                    kind: ExprKind::Var("bits".into()),
+                    span,
+                    ty: Some(array_ty),
+                }],
+            },
+            span,
+            ty: Some(Ty::Unit),
+        };
+        let error = validate_vc_expr(&call, false, "forged call", &locals)
+            .expect_err("forged Boolean array call argument must fail closed");
+        assert!(error.contains("call boundary"));
+
+        let expose = Stmt::Expose {
+            kw_span: span,
+            array: "bits".into(),
+            array_span: span,
+            mutable: true,
+            ptr: "p".into(),
+            ptr_span: span,
+            res: "mem".into(),
+            res_span: span,
+            body: Vec::new(),
+        };
+        let error = validate_vc_block(&[expose], false, "forged exposure", &mut locals)
+            .expect_err("forged Boolean array exposure must fail closed");
+        assert!(error.contains("exposure"));
+    }
+
+    #[test]
+    fn bool_array_preflight_rejects_initializer_free_owned_local() {
+        let source = r#"
+fn subject() {
+    [bool] bits = alloc_array<bool>(1, false);
+}
+"#;
+        let (mut program, _) = checked_program(source);
+        let Stmt::Decl { init, .. } = &mut program.fns[0].body[0] else {
+            panic!("expected explicit Boolean array declaration")
+        };
+        *init = None;
+
+        let error = validate_vc_type_domain(&program)
+            .expect_err("initializer-free Boolean array must fail before generation");
+        assert!(error.contains("must be initialized"));
+
+        let parameter = TypeParamId::from_legacy(0);
+        assert!(
+            validate_vc_type_position(
+                Ty::Array(ValueTy::Param(parameter), Mutability::Owned),
+                true,
+                VcTypePosition::Local,
+                "retained template",
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn bool_array_preflight_rejects_alias_initialization_and_rebinding() {
+        let source = r#"
+fn subject() {
+    [bool] first = alloc_array<bool>(1, false);
+    [bool] second = alloc_array<bool>(1, true);
+}
+"#;
+        let (program, _) = checked_program(source);
+        let Stmt::Decl {
+            init: Some(first), ..
+        } = &program.fns[0].body[0]
+        else {
+            panic!("expected first Boolean array declaration")
+        };
+        let first_span = first.span;
+        let mut aliased = program.clone();
+        let Stmt::Decl {
+            init: Some(second), ..
+        } = &mut aliased.fns[0].body[1]
+        else {
+            panic!("expected second Boolean array declaration")
+        };
+        *second = Expr {
+            kind: ExprKind::Var("first".into()),
+            span: first_span,
+            ty: Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
+        };
+        let error = validate_vc_type_domain(&aliased)
+            .expect_err("Boolean array alias initialization must fail closed");
+        assert!(error.contains("literal or allocation"));
+
+        let mut rebound = program;
+        rebound.fns[0].body.push(Stmt::Assign {
+            name: "first".into(),
+            name_span: first_span,
+            value: Expr {
+                kind: ExprKind::Var("second".into()),
+                span: first_span,
+                ty: Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
+            },
+        });
+        let error = validate_vc_type_domain(&rebound)
+            .expect_err("Boolean array rebinding must fail closed");
+        assert!(error.contains("cannot be rebound"));
+    }
+
+    #[test]
+    fn bool_array_preflight_rejects_option_operator_laundering() {
+        let span = Span::new(0, 1);
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let locals = HashMap::from([("bits".to_string(), array_ty)]);
+        let bits = || Expr {
+            kind: ExprKind::Var("bits".into()),
+            span,
+            ty: Some(array_ty),
+        };
+
+        let forged = [
+            (
+                Expr {
+                    kind: ExprKind::SomeE(Box::new(bits())),
+                    span,
+                    ty: Some(Ty::Option(ValueTy::Bool)),
+                },
+                "some",
+            ),
+            (
+                Expr {
+                    kind: ExprKind::IsSome {
+                        operand: Box::new(bits()),
+                    },
+                    span,
+                    ty: Some(Ty::Bool),
+                },
+                "is_some",
+            ),
+            (
+                Expr {
+                    kind: ExprKind::OptValue {
+                        operand: Box::new(bits()),
+                    },
+                    span,
+                    ty: Some(Ty::Bool),
+                },
+                "value",
+            ),
+        ];
+
+        for (expr, operator) in forged {
+            let error = validate_vc_expr(&expr, false, "forged option operator", &locals)
+                .expect_err("Boolean array must not enter an option operator");
+            assert!(error.contains(operator), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn bool_array_preflight_rejects_scalar_operator_laundering() {
+        let span = Span::new(0, 1);
+        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let locals = HashMap::from([("bits".to_string(), array_ty)]);
+        let bits = || Expr {
+            kind: ExprKind::Var("bits".into()),
+            span,
+            ty: Some(array_ty),
+        };
+        let int = || Expr {
+            kind: ExprKind::IntLit(1),
+            span,
+            ty: Some(Ty::Int(IntTy::U64)),
+        };
+        let boolean = || Expr {
+            kind: ExprKind::BoolLit(true),
+            span,
+            ty: Some(Ty::Bool),
+        };
+
+        let forged = [
+            Expr {
+                kind: ExprKind::Widen {
+                    target: IntTy::U64,
+                    arg: Box::new(bits()),
+                },
+                span,
+                ty: Some(Ty::Int(IntTy::U64)),
+            },
+            Expr {
+                kind: ExprKind::Narrow {
+                    target: IntTy::U64,
+                    arg: Box::new(bits()),
+                },
+                span,
+                ty: Some(Ty::Int(IntTy::U64)),
+            },
+            Expr {
+                kind: ExprKind::Unary {
+                    op: UnOp::Neg,
+                    operand: Box::new(bits()),
+                },
+                span,
+                ty: Some(Ty::Int(IntTy::I64)),
+            },
+            Expr {
+                kind: ExprKind::Unary {
+                    op: UnOp::Not,
+                    operand: Box::new(bits()),
+                },
+                span,
+                ty: Some(Ty::Bool),
+            },
+            Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Add,
+                    op_span: span,
+                    lhs: Box::new(bits()),
+                    rhs: Box::new(int()),
+                },
+                span,
+                ty: Some(Ty::Int(IntTy::U64)),
+            },
+            Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Eq,
+                    op_span: span,
+                    lhs: Box::new(bits()),
+                    rhs: Box::new(int()),
+                },
+                span,
+                ty: Some(Ty::Bool),
+            },
+            Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::And,
+                    op_span: span,
+                    lhs: Box::new(bits()),
+                    rhs: Box::new(boolean()),
+                },
+                span,
+                ty: Some(Ty::Bool),
+            },
+        ];
+
+        for expr in forged {
+            let error = validate_vc_expr(&expr, false, "forged scalar operator", &locals)
+                .expect_err("Boolean array must not enter a scalar operator");
+            assert!(
+                error.contains("operand/result") || error.contains("integer operands"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn bool_array_preflight_rejects_scalar_statement_operands() {
+        let span = Span::new(0, 1);
+        let bool_array = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let int_array = Ty::Array(ValueTy::Int(IntTy::U64), Mutability::Owned);
+        let mut locals = HashMap::from([
+            ("bits".to_string(), bool_array),
+            ("numbers".to_string(), int_array),
+        ]);
+        let bits = || Expr {
+            kind: ExprKind::Var("bits".into()),
+            span,
+            ty: Some(bool_array),
+        };
+        let integer = || Expr {
+            kind: ExprKind::IntLit(0),
+            span,
+            ty: Some(Ty::Int(IntTy::U64)),
+        };
+
+        let forged_store = Stmt::Store {
+            array: "numbers".into(),
+            array_span: span,
+            index: bits(),
+            value: integer(),
+        };
+        let error = validate_vc_block(
+            &[forged_store],
+            false,
+            "forged integer-array store",
+            &mut locals,
+        )
+        .expect_err("Boolean array must not be an integer-array store index");
+        assert!(error.contains("array-store index"));
+
+        let forged_if = Stmt::If {
+            cond: bits(),
+            then_block: Vec::new(),
+            else_block: None,
+        };
+        let error = validate_vc_block(&[forged_if], false, "forged condition", &mut locals)
+            .expect_err("Boolean array must not be an `if` condition");
+        assert!(error.contains("`if` condition"));
+    }
+
+    #[test]
+    fn bool_array_symbolics_use_bool_values_without_numeric_element_ranges() {
+        let source = r#"
+/// post result
+fn bool_array_local(bool seed) -> bool {
+    mut [bool] bits = alloc_array<bool>(2, seed);
+    bits[1] = !seed;
+    return bits[1];
+}
+"#;
+        let (program, sigs) = checked_program(source);
+        let generated = generate(&program, &sigs, source, std::path::Path::new("."))
+            .expect("owned Boolean locals should stay inside the VC type domain");
+
+        assert!(generated.obligations.iter().any(|obligation| {
+            obligation
+                .binders
+                .iter()
+                .any(|(name, ty)| name == "bits" && ty == "Sable.Seq Bool")
+        }));
+        assert!(generated.obligations.iter().all(|obligation| {
+            obligation.hyps.iter().all(|(_, proposition)| {
+                !proposition.contains("≤ bits.get") && !proposition.contains("bits.get k ≤")
+            })
+        }));
+        assert!(generated.obligations.iter().any(|obligation| {
+            obligation.hyps.iter().any(|(name, proposition)| {
+                name == "h_result"
+                    && proposition.contains(".get 1")
+                    && proposition.contains("= true")
+            })
+        }));
+        assert!(generated.obligations.iter().any(|obligation| {
+            obligation.hyps.iter().any(|(_, proposition)| {
+                proposition.contains("∀ k") && proposition.contains(".get k = (@decide")
+            })
+        }));
+    }
+
+    #[test]
+    fn bool_array_loop_havoc_keeps_the_seq_bool_type() {
+        let source = r#"
+fn bool_array_loop(u64 n, bool seed) {
+    mut [bool] bits = alloc_array<bool>(n, seed);
+    mut u64 i = 0;
+    /// invariant bits.len = n
+    /// variant n - i
+    while (i < n) {
+        bits[i] = !bits[i];
+        i = i + 1;
+    }
+}
+"#;
+        let (program, sigs) = checked_program(source);
+        let generated = generate(&program, &sigs, source, std::path::Path::new("."))
+            .expect("Boolean array loop havoc should remain in the concrete Bool model");
+        let preservation = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.starts_with("bool_array_loop.inv_preserved"))
+            .expect("loop should emit an invariant-preservation obligation");
+
+        assert!(
+            preservation
+                .binders
+                .iter()
+                .any(|(name, ty)| name == "bits" && ty == "Sable.Seq Bool")
+        );
+        assert!(preservation.binders.iter().any(|(name, ty)| {
+            name.starts_with("_old") && name.ends_with("_bits") && ty == "Sable.Seq Bool"
+        }));
+        assert!(preservation.hyps.iter().all(|(name, proposition)| {
+            name != "h_bits_elems"
+                && !proposition.contains("≤ bits.get")
+                && !proposition.contains("bits.get k ≤")
+        }));
     }
 
     #[test]

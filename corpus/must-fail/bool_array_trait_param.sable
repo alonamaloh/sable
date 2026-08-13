@@ -1,0 +1,6 @@
+// expect-error: type.bool_array_param
+// Retained trait methods do not transport borrowed Boolean arrays.
+
+trait Select {
+    fn select(Self value, &[bool] flags) -> Self;
+}

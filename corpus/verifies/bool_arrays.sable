@@ -1,0 +1,49 @@
+// Boolean arrays are owned locals in G1.4. Their proof model is
+// `Sable.Seq Bool`: indices and lengths stay Int-valued, while reads become
+// propositions and writes reify those propositions at the Seq boundary.
+
+/// post result
+pub fn bool_array_literal() -> bool {
+    [bool] bits = [true, false, true];
+    return bits[0];
+}
+
+/// post result ↔ seed = true
+pub fn bool_array_alloc(bool seed) -> bool {
+    [bool] bits = alloc_array<bool>(3, seed);
+    return bits[2];
+}
+
+/// post result ↔ x > 0
+pub fn bool_array_store(i32 x) -> bool {
+    mut [bool] bits = alloc_array<bool>(2, false);
+    bits[1] = x > 0;
+    return bits[1];
+}
+
+/// post result
+pub fn bool_array_loop() -> bool {
+    mut [bool] bits = alloc_array<bool>(2, false);
+    u64 n = bits.len;
+    /// invariant n = 2
+    /// invariant ∀ k, 0 ≤ k → k < i → bits.get k = true
+    for (u64 i : range(n)) {
+        bits[i] = true;
+    }
+    return bits[1];
+}
+
+/// discharge bool_array_loop.inv_preserved.n_2 by
+///   omega
+
+/// discharge bool_array_loop.inv_preserved.k_0_k_k_i_bits_get_k_true by
+///   intro k hk0 hk
+///   by_cases hki : k = i
+///   · simp [Sable.Seq.get_set, hki]
+///   · have h2 := h_inv_k_0_k_k_i_bits_get_k_tru k hk0 (by omega)
+///     simp [Sable.Seq.get_set, hki]
+///     exact h2
+
+/// discharge bool_array_loop.post.result by
+///   rw [h_result]
+///   exact h_inv_k_0_k_k_i_bits_get_k_tru 1 (by omega) (by omega)

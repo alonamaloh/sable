@@ -16,8 +16,12 @@ semantics under optimization, and has interpreter/native plus trap-ABI gates.
 G1.1's verified/interpreted `option<bool>` slice is closed, G1.2/G1.3 carry its
 ordinary-function intersection through the formal SVM and native LLVM, and
 G1.4a closes ordinary Boolean argument transport plus verified, interpreted,
-and natively lowered internal integer-field POD record calls. Its full serial
-closure gate is green; no record ABI or generic-class widening is claimed.
+and natively lowered internal integer-field POD record calls. G1.4b closes
+owned-local Boolean arrays through checking, verification, interpretation, and
+dynamic monitoring, while deliberately leaving the formal SVM and LLVM
+boundaries closed. Its full serial closure gate is green; no array ABI, record
+ABI, or generic-class widening is claimed. G1.5 carries Boolean arrays into the
+formal SVM next; LLVM remains a later independent stage.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -663,9 +667,10 @@ backend support belongs to M46 and later.
 ## Post-U10 usability sequence
 
 Unsafe Sable v1, the scalar LLVM v0 boundary, the first end-to-end Boolean
-option slice, and G1.4a's internal POD record-value slice are now complete. The
-next work broadens the
-aggregate-generics/backend track at M46+. The order remains a working
+option slice, G1.4a's internal POD record-value slice, and G1.4b's owned-local
+Boolean-array proof/runtime slice are now complete. G1.5 next carries that exact
+local slice through the formal SVM; native lowering remains later. The broader
+aggregate-generics/backend track continues at M46+. The order remains a working
 hypothesis, not a promise that evidence cannot reorder it:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
@@ -703,7 +708,7 @@ hypothesis, not a promise that evidence cannot reorder it:
      subjects in 424.42s; LLVM CLI 6/6; exact-`VerifiedProgram`
      interpreter↔Clang differential at `-O0` and `-O2`; SVM 69/69; allocator,
      grind-budget, and LSP gates green.
-   - **G1 — Boolean/POD aggregates (through G1.4a complete; broader work in
+   - **G1 — Boolean/POD aggregates (through G1.4b complete; broader work in
      progress):** establish non-integer aggregate storage, value, verification,
      interpreter, and LLVM paths one fenced representation at a time.
 
@@ -851,12 +856,57 @@ hypothesis, not a promise that evidence cannot reorder it:
      Boolean arrays. Randomized allocator,
      grind-budget, LSP, and documentation gates were green. G1.4a is closed.
 
-     **G1.4b — owned-local Boolean arrays (next):** first admit only owned local
-     `[bool]` values through checking, VC generation, interpretation, and the
-     dynamic monitor. The formal SVM and LLVM emitter initially remain
-     fail-closed. Dedicated follow-on stages then add formal-machine semantics
-     and native storage/lifetime lowering before any parameter, field, return,
-     borrow, expose, or generic Boolean-array boundary widens.
+     **G1.4b — owned-local Boolean arrays (complete):** fresh `[bool]` locals may
+     be explicitly or inferentially typed and initialized by contextual literals or
+     `alloc_array<bool>(u64, bool)`. This includes empty arrays. The supported
+     surface is `.len`, checked index reads, element stores, loops, assertions,
+     and contracts; array bounds keep their ordinary proof obligation and
+     executable trap.
+
+     VC generation gives this payload its actual proof type,
+     `Sable.Seq Bool`. Because symbolic program Booleans remain propositions,
+     literals, allocation fills, and stores use an explicit Prop-to-`Bool`
+     reification, while an indexed read becomes `get ... = true`. Loop havoc
+     keeps a Boolean sequence and its sound length relation without fabricating
+     numeric element bounds. This is independent of ADR 0009's integer-only
+     template proof reuse.
+
+     The interpreter and monitor preserve an array's payload domain even when
+     it is empty. Separate integer and Boolean runtime/snapshot variants support
+     Boolean length, reads, stores, deep snapshots, and same-domain equality.
+     Integer/Boolean-array equality is unmonitorable rather than coerced, and
+     integer-only sequence helpers reject the Boolean domain.
+
+     The slice stays local: Boolean-array parameters (ordinary, method, trait,
+     and extern), Boolean-array returns, class/record fields, borrows, exposure,
+     whole-array rebinding, Boolean `for` indices, and generic Boolean-array
+     arguments remain rejected.
+     The Rust SVM lowerer rejects Boolean arrays and the formal machine remains
+     unchanged; the LLVM emitter independently rejects them, so neither a
+     machine value nor a native storage/lifetime/ABI policy has been introduced.
+
+     G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
+     SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+     --test-threads=1 --nocapture`: 171/171 library tests; all 394 corpus
+     subjects (83 verifies, 244 must-fail, 48 dynamic, 19 dynamic-fail), whose
+     all-target corpus portion took 208.73s; the focused `bool_arrays` subject
+     at 18/18 obligations across four functions; both dynamic tests and the
+     expected out-of-bounds failure; LLVM CLI 6/6; the 1/1 exact-
+     `VerifiedProgram` interpreter↔Clang differential over five subjects at
+     `-O0` and `-O2`; and the unchanged SVM differential at 76/76. A standalone
+     corpus repeat was green in 195.71s. Randomized allocator, grind-budget,
+     LSP, and documentation gates were green. G1.4b is closed.
+
+     One boundary has a synthetic checker regression rather than a source
+     corpus file: a discarded `alloc_array<bool>` expression statement. The
+     parser cannot spell that form, but the public checked-AST boundary still
+     rejects a forged instance rather than relying on the surface grammar.
+
+     **G1.5 — formal SVM Boolean arrays (next):** give the formal value plane,
+     relational semantics, proved evaluator, renderer, Rust lowerer, and
+     differential harness the same owned-local Boolean-array intersection.
+     Preserve the source position fence, and leave LLVM storage/lifetime
+     lowering to its own later stage.
    - **G2 — affine options:** carry ownership and destruction correctly through
      present/absent aggregate values.
    - **G3 — slots and `Vec`:** make generic element storage and movement real

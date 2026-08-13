@@ -1,0 +1,7 @@
+// expect-error: expose.element_type
+// Raw exposure remains byte-array-only.
+
+fn cannot_expose_bool_array() {
+    [bool] values = [true];
+    unsafe expose &values as (ptr, resource bytes) {}
+}

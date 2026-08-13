@@ -54,3 +54,21 @@ must-fail, 45 dynamic, 18 dynamic-fail) in 414.80s; LLVM CLI 6/6; the
 exact-`VerifiedProgram` interpreter↔Clang differential over four subjects at
 both `-O0` and `-O2`; SVM differential 76/76; and the randomized allocator,
 grind-budget, LSP, and documentation gates. G1.2 is closed.
+
+## G1.4b boundary note: no Boolean-array machine value yet (2026-08-13)
+
+G1.4b adds a checked, verified, interpreted, and dynamically monitored
+owned-local `[bool]` slice without changing the normative SVM. The Rust SVM
+lowerer rejects every Boolean-array declaration before machine syntax is
+produced, and the Lean value/rule/evaluator layers acquire no Boolean sequence
+value, allocation rule, index rule, store rule, or observation spelling. The
+existing 76/76 differential remaining green therefore demonstrates boundary
+preservation, not formal-machine coverage of the new source feature.
+
+This stage still gives out-of-bounds indexing defined language behavior: the
+Rust interpreter uses the established array trap. That executable behavior is
+not yet a claim that the formal SVM models Boolean-array allocation or traps.
+A dedicated formal-machine stage must add the value representation, relational
+and executable rules, their two-directional agreement proof, direct guards,
+and Rust↔Lean differential subjects before the lowerer may accept `[bool]`.
+That stage is G1.5; LLVM array lowering remains independently deferred.

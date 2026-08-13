@@ -1119,13 +1119,16 @@ impl<'a> Parser<'a> {
             })
     }
 
-    /// The currently admitted array payload grammar: concrete integer types
-    /// plus an in-scope declaration parameter. Unlike `int_ty`, this preserves
-    /// a parameter as `ValueTy::Param`, so later stages cannot infer integer
-    /// semantics from its representation. Boolean and record arrays remain a
-    /// later G1 semantic slice.
-    fn value_ty(&mut self) -> PResult<(ValueTy, Span)> {
+    /// The admitted array payload grammar. Unlike `int_ty`, this preserves a
+    /// declaration parameter as `ValueTy::Param`, so later stages cannot infer
+    /// integer semantics from its representation. Boolean is a concrete array
+    /// payload; POD-record arrays remain behind their later representation and
+    /// ownership slice.
+    fn array_payload_ty(&mut self) -> PResult<(ValueTy, Span)> {
         let (name, span) = self.ident()?;
+        if name == "bool" {
+            return Ok((ValueTy::Bool, span));
+        }
         if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
             let parameter = TypeParamId::new(index)
                 .expect("type_param_list enforces the type-parameter ceiling");
@@ -1135,19 +1138,39 @@ impl<'a> Parser<'a> {
             .map(|ty| (ValueTy::Int(ty), span))
             .ok_or_else(|| Diagnostic {
                 name: "parse.unknown_type".into(),
-                title: format!("unknown integer type `{name}`"),
+                title: format!("unknown array payload type `{name}`"),
+                span,
+                label: "expected `bool`, `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter"
+                    .into(),
+                notes: vec![],
+            })
+    }
+
+    /// A `for` index remains in the integer proof domain. Keep this parser
+    /// separate from `array_payload_ty`: widening array payloads must never
+    /// make `for (bool i : range(...))` syntactically meaningful.
+    fn for_index_ty(&mut self) -> PResult<(Ty, Span)> {
+        let (name, span) = self.ident()?;
+        if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
+            let parameter = TypeParamId::new(index)
+                .expect("type_param_list enforces the type-parameter ceiling");
+            return Ok((Ty::Param(parameter), span));
+        }
+        IntTy::from_name(&name)
+            .map(|ty| (Ty::Int(ty), span))
+            .ok_or_else(|| Diagnostic {
+                name: "parse.unknown_type".into(),
+                title: format!("unknown `for` index type `{name}`"),
                 span,
                 label: "expected `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter".into(),
                 notes: vec![],
             })
     }
 
-    /// The first non-integer aggregate slice is deliberately option-specific:
-    /// integers and declaration parameters retain their existing behavior,
-    /// while `bool` gains a payload identity without also admitting `[bool]`
-    /// or `alloc_array<bool>`. Visible POD records are represented honestly so
-    /// the checker can reject them at its semantic boundary with a stable
-    /// diagnostic; classes and nested aggregates are not value payloads here.
+    /// Option payload parsing shares the concrete Boolean identity admitted by
+    /// arrays, and additionally represents visible POD records honestly so the
+    /// checker can reject them at its semantic boundary with a stable
+    /// diagnostic. Classes and nested aggregates are not value payloads here.
     fn option_value_ty(&mut self) -> PResult<(ValueTy, Span)> {
         let (name, span) = self.ident()?;
         if name == "bool" {
@@ -1281,7 +1304,7 @@ impl<'a> Parser<'a> {
                 }
             }
             self.expect(Tok::LBracket)?;
-            let (elem, _) = self.value_ty()?;
+            let (elem, _) = self.array_payload_ty()?;
             let end = self.expect(Tok::RBracket)?.span;
             return Ok((Ty::Array(elem, mutability), start.join(end)));
         }
@@ -1715,7 +1738,7 @@ impl<'a> Parser<'a> {
                 }
                 Tok::LBracket => {
                     self.bump();
-                    let (elem, _) = self.value_ty()?;
+                    let (elem, _) = self.array_payload_ty()?;
                     self.expect(Tok::RBracket)?;
                     let (fname, fspan) = self.ident()?;
                     self.expect(Tok::Semi)?;
@@ -2694,14 +2717,7 @@ impl<'a> Parser<'a> {
         }
 
         self.expect(Tok::LParen)?;
-        let (value_ty, _) = self.value_ty()?;
-        let loop_ty = match value_ty {
-            ValueTy::Int(integer) => Ty::Int(integer),
-            ValueTy::Param(parameter) => Ty::Param(parameter),
-            ValueTy::Bool | ValueTy::Record(_) => {
-                unreachable!("value_ty currently admits only integers and parameters")
-            }
-        };
+        let (loop_ty, _) = self.for_index_ty()?;
         let (index, index_span) = self.ident()?;
         if is_reserved_name(&index) {
             return Err(reserved_name_error(&index, index_span, "loop index"));
@@ -3176,10 +3192,11 @@ impl<'a> Parser<'a> {
                 })
             }
             Tok::LBracket => {
-                // `[i32] a = [1, 2, 3];` — owned array local (tests only;
-                // the checker enforces the context).
+                // `[i32] a = [1, 2, 3];` / `[bool] flags = [true];` — an
+                // owned array local. The checker enforces the positional
+                // boundary for concrete payload kinds.
                 self.bump();
-                let (elem, _) = self.value_ty()?;
+                let (elem, _) = self.array_payload_ty()?;
                 self.expect(Tok::RBracket)?;
                 let (name, name_span) = self.ident()?;
                 if is_reserved_name(&name) {
@@ -3906,7 +3923,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(name) if name == "alloc_array" => {
                 self.bump();
                 self.expect(Tok::Lt)?;
-                let (elem, _) = self.value_ty()?;
+                let (elem, _) = self.array_payload_ty()?;
                 self.expect(Tok::Gt)?;
                 self.expect(Tok::LParen)?;
                 let len = self.expr()?;
@@ -4781,7 +4798,7 @@ fn plumbing<T>(&[T] input, T value) -> option<T> {
     }
 
     #[test]
-    fn bool_options_parse_without_widening_array_payload_syntax() {
+    fn bool_options_preserve_their_exact_payload_identity() {
         let source = r#"
 fn choose(i32 value) -> option<bool> {
     mut option<bool> r = none;
@@ -4816,15 +4833,57 @@ fn choose(i32 value) -> option<bool> {
             &payload.kind,
             ExprKind::Binary { op: BinOp::Gt, .. }
         ));
+    }
 
-        let array_error = parse_source("fn bad(&[bool] values) {}\n").unwrap_err();
-        assert_eq!(array_error.name, "parse.unknown_type");
-        assert!(array_error.title.contains("bool"));
+    #[test]
+    fn bool_array_payload_syntax_does_not_widen_for_index_types() {
+        let source = r#"
+fn surface(&[bool] input) {
+    mut [bool] flags = [true, false];
+    var copy = alloc_array<bool>(input.len, false);
+    flags[0] = copy[0];
+}
+"#;
+        let program = parse_source(source).unwrap();
+        let function = &program.fns[0];
+        assert_eq!(
+            function.params[0].ty,
+            Ty::Array(ValueTy::Bool, Mutability::Shared)
+        );
 
-        let allocation_error =
-            parse_source("fn bad() { var values = alloc_array<bool>(1, false); }\n").unwrap_err();
-        assert_eq!(allocation_error.name, "parse.unknown_type");
-        assert!(allocation_error.title.contains("bool"));
+        let Stmt::Decl {
+            ty,
+            init: Some(initializer),
+            mutable,
+            ..
+        } = &function.body[0]
+        else {
+            panic!("expected an explicit Boolean-array local");
+        };
+        assert_eq!(*ty, Ty::Array(ValueTy::Bool, Mutability::Owned));
+        assert!(*mutable);
+        assert!(matches!(&initializer.kind, ExprKind::ArrayLit(_)));
+
+        let Stmt::VarDecl { init, ty, .. } = &function.body[1] else {
+            panic!("expected an inferred Boolean-array local");
+        };
+        assert!(
+            ty.is_none(),
+            "the checker, not the parser, fills this cache"
+        );
+        let ExprKind::AllocArray { elem, .. } = &init.kind else {
+            panic!("expected alloc_array initializer");
+        };
+        assert_eq!(*elem, ValueTy::Bool);
+
+        let Stmt::Store { value, .. } = &function.body[2] else {
+            panic!("expected a Boolean-array element store");
+        };
+        assert!(matches!(&value.kind, ExprKind::Index { .. }));
+
+        let error = parse_source("fn bad() { for (bool i : range(1)) {} }\n").unwrap_err();
+        assert_eq!(error.name, "parse.unknown_type");
+        assert!(error.title.contains("`for` index"));
     }
 
     #[test]

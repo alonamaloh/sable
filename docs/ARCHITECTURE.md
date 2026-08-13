@@ -86,6 +86,9 @@ vcgen (compiler/src/vcgen.rs)         forward symbolic execution over the AST;
   │                                   G1.4a uses the same explicit Prop→Bool bridge
   │                                   for ordinary Boolean call arguments and carries
   │                                   nominal POD values across ordinary calls;
+  │                                   G1.4b models owned-local Boolean arrays as
+  │                                   `Sable.Seq Bool`: writes cross Prop→Bool and
+  │                                   reads cross back through `get ... = true`;
   │                                   path-splitting at `if`; per-operation VCs;
   │                                   call sites: callee pres become obligations,
   │                                   callee posts become hypotheses on a fresh symbol;
@@ -125,7 +128,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (through G1.4a internal POD records)
+## Native lowering boundary (G1.4a values; G1.4b arrays fail closed)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -197,6 +200,12 @@ raw-cell geometry in the abstract storage model, not the layout of an ordinary
 LLVM SSA value. Imported records, extern/entry/public ABIs, pointer and Boolean
 fields, nested and container records, and classes remain rejected. The named
 aggregate is versionable internal lowering, not a record ABI.
+
+G1.4b does not widen this native boundary. Although the checked language can
+now verify and interpret owned-local Boolean arrays, the emitter rejects their
+declarations and every expression that would carry them before selecting a
+representation. No LLVM element layout, allocation strategy, lifetime rule,
+trap extension, mangling, or array ABI is implied by the source-level slice.
 
 ## Key invariants
 
@@ -365,10 +374,43 @@ aggregate is versionable internal lowering, not a record ABI.
   boundary, without admitting Boolean arrays. Randomized allocator,
   grind-budget, LSP, and documentation gates were green. G1.4a is closed.
 
-  G1.4b is staged narrowly: owned-local Boolean arrays first reach the checker,
-  VC generator, interpreter, and dynamic monitor while SVM and LLVM reject
-  them. Dedicated formal-machine and native lowering stages follow before that
-  boundary widens.
+- **Boolean arrays are owned-local proof/runtime values, not a transport or
+  backend representation.** G1.4b admits fresh `[bool]` locals initialized by
+  a contextual literal or `alloc_array<bool>(u64, bool)`, including empty
+  arrays. Their supported operations are `.len`, checked index reads, element
+  stores, loops, assertions, and contracts. The checker keeps Boolean-array
+  parameters, returns, class/record fields, borrows, exposure, whole-array
+  rebinding, Boolean `for` indices, and generic arguments closed.
+
+  VC generation uses `Sable.Seq Bool`. Program Boolean expressions remain
+  symbolic propositions: literals, allocation fills, and stores explicitly
+  reify them to Lean `Bool`, while reads become propositions through
+  `sequence.get index = true`. Owned-local loop havoc keeps the sequence type
+  and preserves a usable length relation where sound, but adds no integer
+  element-range facts. Bounds obligations are unchanged.
+
+  Runtime arrays retain their payload domain even at length zero. The
+  interpreter and dynamic monitor use separate integer and Boolean variants,
+  support Boolean length/get/store and deep snapshots, and compare arrays only
+  within a payload domain. Integer/Boolean cross-domain equality is
+  unmonitorable rather than a coercion. Integer-only sequence helpers likewise
+  do not reinterpret Boolean elements.
+
+  The Rust SVM lowerer rejects the new local value and the formal SVM remains
+  unchanged; LLVM independently rejects it as described above. G1.5 adds the
+  formal-machine representation next, while native lowering remains a later
+  independent stage.
+
+  G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
+  SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`: 171/171 library tests; all 394 corpus subjects
+  (83 verifies, 244 must-fail, 48 dynamic, 19 dynamic-fail), whose all-target
+  corpus portion took 208.73s; focused verification at 18/18 obligations across
+  four functions; 2/2 dynamic tests and the expected out-of-bounds trap; LLVM
+  CLI 6/6; the exact-`VerifiedProgram` interpreter↔Clang differential 1/1 over
+  five subjects at `-O0` and `-O2`; and SVM differential 76/76. A standalone
+  corpus repeat was green in 195.71s. Randomized allocator, grind-budget, LSP,
+  and documentation gates were green. G1.4b is closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across
@@ -482,7 +524,9 @@ script-expression traps), and all three selection contexts.
 The same boundary now checks integer-array expression annotations, element
 types, constructor shape, and call coherence on public AST input; this is
 hardening of the existing integer-array lowering path, not Boolean-array
-acceptance.
+acceptance. G1.4b preserves that fence even though the verifier/interpreter now
+accept owned-local Boolean arrays; G1.5 is the stage that will extend the
+formal value, rules, evaluator, lowerer, and differential together.
 
 ## Repo layout
 

@@ -1,0 +1,11 @@
+// expect-error: mono.type_arg_unsupported
+// Recursive generic syntax can represent the shape, but G1.4b is not generic.
+
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn bool_array_is_not_a_generic_argument() {
+    [bool] values = [true];
+    identity<[bool]>(values);
+}

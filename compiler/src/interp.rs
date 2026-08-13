@@ -9,16 +9,17 @@
 //! verification claim, and test functions are never verified.
 
 use crate::ast::*;
-use crate::speceval::{self, GhostDefs, SpecEnv, SpecVal};
+use crate::speceval::{self, GhostDefs, SpecArray, SpecEnv, SpecVal};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub enum RtVal {
     Int(i128),
     Bool(bool),
-    Arr(Rc<RefCell<Vec<i128>>>),
+    Arr(Rc<RefCell<RtArray>>),
     /// An ordinary option. The checked payload type is retained even for
     /// `none`, because the dynamic proof monitor must implement the typed
     /// `Option.value = getD default` model (`0` for integers, `false` for
@@ -45,6 +46,139 @@ pub enum RtVal {
     /// absent take or duplicate put in unverified `test_` code.
     ResMap(Rc<RefCell<HashSet<i128>>>),
     Unit,
+}
+
+/// Runtime arrays retain their checked payload even when empty. Integer
+/// widths remain explicit so snapshots and literal/allocation construction
+/// cannot silently change the array's source type.
+#[derive(Debug, Clone)]
+pub enum RtArray {
+    Int { payload: IntTy, values: Vec<i128> },
+    Bool(Vec<bool>),
+}
+
+#[derive(Clone, Copy)]
+pub enum RtArrayElem {
+    Int(i128),
+    Bool(bool),
+}
+
+impl fmt::Display for RtArrayElem {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RtArrayElem::Int(value) => value.fmt(formatter),
+            RtArrayElem::Bool(value) => value.fmt(formatter),
+        }
+    }
+}
+
+pub enum RtArrayIter<'a> {
+    Int(std::slice::Iter<'a, i128>),
+    Bool(std::slice::Iter<'a, bool>),
+}
+
+impl Iterator for RtArrayIter<'_> {
+    type Item = RtArrayElem;
+
+    fn next(&mut self) -> Option<RtArrayElem> {
+        match self {
+            RtArrayIter::Int(values) => values.next().copied().map(RtArrayElem::Int),
+            RtArrayIter::Bool(values) => values.next().copied().map(RtArrayElem::Bool),
+        }
+    }
+}
+
+impl RtArray {
+    pub fn len(&self) -> usize {
+        match self {
+            RtArray::Int { values, .. } => values.len(),
+            RtArray::Bool(values) => values.len(),
+        }
+    }
+
+    pub fn iter(&self) -> RtArrayIter<'_> {
+        match self {
+            RtArray::Int { values, .. } => RtArrayIter::Int(values.iter()),
+            RtArray::Bool(values) => RtArrayIter::Bool(values.iter()),
+        }
+    }
+
+    fn from_values(payload: ValueTy, values: Vec<RtVal>) -> RtArray {
+        match payload {
+            ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => RtArray::Int {
+                payload: integer,
+                values: values
+                    .into_iter()
+                    .map(|value| match value {
+                        RtVal::Int(value) => value,
+                        _ => unreachable!("checked: integer array element"),
+                    })
+                    .collect(),
+            },
+            ValueTy::Bool => RtArray::Bool(
+                values
+                    .into_iter()
+                    .map(|value| match value {
+                        RtVal::Bool(value) => value,
+                        _ => unreachable!("checked: Boolean array element"),
+                    })
+                    .collect(),
+            ),
+            _ => unreachable!("interpreter guard rejected unsupported array payload"),
+        }
+    }
+
+    fn repeat(payload: ValueTy, value: RtVal, len: usize) -> RtArray {
+        match (payload, value) {
+            (ValueTy::Int(integer), RtVal::Int(value)) if !matches!(integer, IntTy::TParam(_)) => {
+                RtArray::Int {
+                    payload: integer,
+                    values: vec![value; len],
+                }
+            }
+            (ValueTy::Bool, RtVal::Bool(value)) => RtArray::Bool(vec![value; len]),
+            _ => unreachable!("checked: array initializer matches its payload"),
+        }
+    }
+
+    fn get(&self, index: usize) -> RtVal {
+        match self {
+            RtArray::Int { values, .. } => RtVal::Int(values[index]),
+            RtArray::Bool(values) => RtVal::Bool(values[index]),
+        }
+    }
+
+    fn set(&mut self, index: usize, value: RtVal) {
+        match (self, value) {
+            (RtArray::Int { values, .. }, RtVal::Int(value)) => values[index] = value,
+            (RtArray::Bool(values), RtVal::Bool(value)) => values[index] = value,
+            _ => unreachable!("checked: array store value matches its payload"),
+        }
+    }
+
+    fn int_values(&self) -> Option<&[i128]> {
+        match self {
+            RtArray::Int { values, .. } => Some(values),
+            RtArray::Bool(_) => None,
+        }
+    }
+
+    fn set_int(&mut self, index: usize, value: i128) {
+        match self {
+            RtArray::Int { values, .. } => values[index] = value,
+            RtArray::Bool(_) => unreachable!("interpreter guard rejects Boolean exposure"),
+        }
+    }
+
+    fn to_spec(&self) -> SpecArray {
+        match self {
+            RtArray::Int { payload, values } => SpecArray::Int {
+                payload: *payload,
+                values: values.clone(),
+            },
+            RtArray::Bool(values) => SpecArray::Bool(values.clone()),
+        }
+    }
 }
 
 pub struct TestReport {
@@ -93,11 +227,10 @@ type IResult<T> = Result<T, Trap>;
 
 const FUEL: u64 = 50_000_000;
 
-/// The interpreter still stores ordinary arrays as `i128` payloads; G1.1 adds
-/// typed recursive ordinary options for concrete integers and booleans. Raw
-/// `Program` callers need the same explicit domain boundary as normal checked
-/// callers: a newly representable payload must not silently inherit runtime
-/// semantics it has not implemented.
+/// Raw `Program` callers need the same explicit domain boundary as normal
+/// checked callers: newly executable Boolean arrays are owned locals only.
+/// Integer arrays retain their established positions; Boolean arrays do not
+/// acquire a parameter, return, field, borrow, or exposure ABI in G1.4b.
 fn validate_interp_program(program: &Program) -> Result<(), String> {
     // Retained generic templates are proof artifacts and are never executed by
     // the interpreter.  They intentionally contain `ValueTy::Param`; validate
@@ -120,7 +253,7 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
             validate_interp_fn(&method.f)?;
         }
         if let Some(deinit) = &class.deinit {
-            validate_interp_stmts(deinit)?;
+            validate_interp_stmts(deinit, &mut HashMap::new())?;
         }
     }
 
@@ -137,11 +270,19 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 }
 
 fn validate_interp_fn(function: &Fn) -> Result<(), String> {
+    let mut locals = HashMap::new();
     for param in &function.params {
         validate_interp_nonlocal_option_position(param.ty, &format!("parameter `{}`", param.name))?;
+        locals.insert(param.name.clone(), param.ty);
+    }
+    if matches!(function.ret, Ty::Array(ValueTy::Bool, _)) {
+        return Err(format!(
+            "interp.array_position_unsupported: return type of `{}` is a Boolean array; G1.4b supports Boolean arrays only as owned locals",
+            function.name
+        ));
     }
     validate_interp_ty(function.ret, &format!("return type of `{}`", function.name))?;
-    validate_interp_stmts(&function.body)
+    validate_interp_stmts(&function.body, &mut locals)
 }
 
 /// G1.1 gives ordinary value options local/return semantics only. Keep raw
@@ -155,11 +296,22 @@ fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(),
              G1.1 supports ordinary options only as returns and locals"
         ));
     }
+    if matches!(ty, Ty::Array(ValueTy::Bool, _)) {
+        return Err(format!(
+            "interp.array_position_unsupported: {context} is a Boolean array; \
+             G1.4b supports Boolean arrays only as owned locals"
+        ));
+    }
     validate_interp_ty(ty, context)
 }
 
 fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
+        Ty::Array(ValueTy::Bool, Mutability::Owned) => Ok(()),
+        Ty::Array(ValueTy::Bool, _) => Err(format!(
+            "interp.array_position_unsupported: {context} is a borrowed Boolean array; \
+             G1.4b supports Boolean arrays only as owned locals"
+        )),
         Ty::Array(payload, _) => validate_interp_array_payload(payload, context),
         Ty::Option(payload) => validate_interp_option_payload(payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
@@ -172,9 +324,10 @@ fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
 fn validate_interp_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
     match payload {
         ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        ValueTy::Bool => Ok(()),
         _ => Err(format!(
             "interp.aggregate_payload_unsupported: {context} has array payload `{}`; \
-             the interpreter currently executes only concrete integer payloads",
+             the interpreter currently executes only concrete integer and Boolean payloads",
             payload.name()
         )),
     }
@@ -192,32 +345,63 @@ fn validate_interp_option_payload(payload: ValueTy, context: &str) -> Result<(),
     }
 }
 
-fn validate_interp_stmts(stmts: &[Stmt]) -> Result<(), String> {
+fn validate_interp_stmts(stmts: &[Stmt], locals: &mut HashMap<String, Ty>) -> Result<(), String> {
     for stmt in stmts {
         match stmt {
             Stmt::Decl { ty, init, name, .. } => {
                 validate_interp_ty(*ty, &format!("declaration `{name}`"))?;
                 if let Some(init) = init {
-                    validate_interp_expr(init)?;
+                    validate_interp_expr(init, locals)?;
+                    validate_interp_sink(*ty, init, locals, &format!("declaration `{name}`"))?;
+                } else if matches!(ty, Ty::Array(ValueTy::Bool, _)) {
+                    return Err(format!(
+                        "interp.array_position_unsupported: Boolean array local `{name}` must be initialized by an owned literal or allocation"
+                    ));
                 }
+                locals.insert(name.clone(), *ty);
             }
-            Stmt::Assign { value, .. }
-            | Stmt::ExprStmt(value)
-            | Stmt::FieldAssign { value, .. } => validate_interp_expr(value)?,
+            Stmt::Assign { name, value, .. } => {
+                let destination = locals.get(name).copied().ok_or_else(|| {
+                    format!("interp.unknown_local: assignment to unknown local `{name}`")
+                })?;
+                if matches!(destination, Ty::Array(ValueTy::Bool, _)) {
+                    return Err(format!(
+                        "interp.array_position_unsupported: Boolean array `{name}` cannot be rebound; use an element store"
+                    ));
+                }
+                validate_interp_sink(destination, value, locals, &format!("assignment `{name}`"))?;
+            }
+            Stmt::ExprStmt(value) => {
+                validate_interp_expr(value, locals)?;
+                reject_bool_array_transport(value, locals, "expression statement")?;
+            }
+            Stmt::FieldAssign { value, .. } => {
+                validate_interp_expr(value, locals)?;
+                reject_bool_array_transport(value, locals, "field assignment")?;
+            }
             Stmt::If {
                 cond,
                 then_block,
                 else_block,
             } => {
-                validate_interp_expr(cond)?;
-                validate_interp_stmts(then_block)?;
+                validate_interp_sink(Ty::Bool, cond, locals, "if condition")?;
+                let mut then_locals = locals.clone();
+                validate_interp_stmts(then_block, &mut then_locals)?;
                 if let Some(else_block) = else_block {
-                    validate_interp_stmts(else_block)?;
+                    let mut else_locals = locals.clone();
+                    validate_interp_stmts(else_block, &mut else_locals)?;
                 }
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
-                    validate_interp_expr(value)?;
+                    if matches!(value.ty, Some(Ty::Array(ValueTy::Bool, _))) {
+                        return Err(
+                            "interp.array_position_unsupported: returning a Boolean array; G1.4b supports Boolean arrays only as owned locals"
+                                .into(),
+                        );
+                    }
+                    validate_interp_expr(value, locals)?;
+                    reject_bool_array_transport(value, locals, "return")?;
                 }
             }
             Stmt::Assert(_) => {}
@@ -225,64 +409,157 @@ fn validate_interp_stmts(stmts: &[Stmt]) -> Result<(), String> {
                 if let Some(ty) = ty {
                     validate_interp_ty(*ty, &format!("inferred declaration `{name}`"))?;
                 }
-                validate_interp_expr(init)?;
+                validate_interp_expr(init, locals)?;
+                let inferred = (*ty).or(init.ty).ok_or_else(|| {
+                    format!("interp.missing_type: inferred declaration `{name}` has no type")
+                })?;
+                validate_interp_sink(inferred, init, locals, &format!("declaration `{name}`"))?;
+                locals.insert(name.clone(), inferred);
             }
-            Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
-                validate_interp_expr(index)?;
-                validate_interp_expr(value)?;
+            Stmt::FieldStore { index, value, .. } => {
+                validate_interp_sink(
+                    Ty::Int(IntTy::U64),
+                    index,
+                    locals,
+                    "array field store index",
+                )?;
+                validate_interp_expr(value, locals)?;
+                reject_bool_array_transport(value, locals, "array field store")?;
+            }
+            Stmt::Store {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                let array_ty = locals.get(array).copied().ok_or_else(|| {
+                    format!("interp.unknown_local: store names unknown array `{array}`")
+                })?;
+                let Ty::Array(payload, _) = array_ty else {
+                    return Err(format!(
+                        "interp.not_array: store target `{array}` is not an array"
+                    ));
+                };
+                let element_ty = value_ty(payload).ok_or_else(|| {
+                    format!(
+                        "interp.aggregate_payload_unsupported: store target `{array}` has unsupported payload `{}`",
+                        payload.name()
+                    )
+                })?;
+                validate_interp_sink(Ty::Int(IntTy::U64), index, locals, "array store index")?;
+                validate_interp_sink(element_ty, value, locals, "array store value")?;
             }
             Stmt::While { cond, body, .. } => {
-                validate_interp_expr(cond)?;
-                validate_interp_stmts(body)?;
+                validate_interp_sink(Ty::Bool, cond, locals, "while condition")?;
+                let mut body_locals = locals.clone();
+                validate_interp_stmts(body, &mut body_locals)?;
             }
-            Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
-                validate_interp_stmts(body)?;
+            Stmt::Unsafe { body, .. } => {
+                validate_interp_stmts(body, locals)?;
             }
-            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
-                validate_interp_expr(size)?;
+            Stmt::Expose {
+                array,
+                ptr,
+                res,
+                body,
+                ..
+            } => {
+                if locals.get(array) == Some(&Ty::Array(ValueTy::Bool, Mutability::Owned)) {
+                    return Err(format!(
+                        "interp.array_position_unsupported: exposure of Boolean array `{array}`; G1.4b Boolean arrays are safe owned locals only"
+                    ));
+                }
+                let mut body_locals = locals.clone();
+                body_locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                body_locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                validate_interp_stmts(body, &mut body_locals)?;
+            }
+            Stmt::StaticAlloc { size, ptr, res, .. } => {
+                validate_interp_sink(Ty::Int(IntTy::U64), size, locals, "static allocation size")?;
+                locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
+            }
+            Stmt::SystemAlloc {
+                size,
+                ptr,
+                res,
+                release,
+                ..
+            } => {
+                validate_interp_sink(Ty::Int(IntTy::U64), size, locals, "system allocation size")?;
+                locals.insert(ptr.clone(), Ty::Raw(IntTy::U8));
+                locals.insert(res.clone(), Ty::Res(ResKind::RawSpan));
+                locals.insert(release.clone(), Ty::Res(ResKind::SystemDealloc));
             }
             Stmt::SystemDealloc {
                 ptr, res, release, ..
             } => {
-                validate_interp_expr(ptr)?;
-                validate_interp_expr(res)?;
-                validate_interp_expr(release)?;
+                validate_interp_expr(ptr, locals)?;
+                reject_bool_array_transport_if_present(ptr, locals, "system deallocation pointer")?;
+                validate_interp_expr(res, locals)?;
+                reject_bool_array_transport_if_present(
+                    res,
+                    locals,
+                    "system deallocation resource",
+                )?;
+                validate_interp_expr(release, locals)?;
+                reject_bool_array_transport_if_present(
+                    release,
+                    locals,
+                    "system deallocation release token",
+                )?;
             }
         }
     }
     Ok(())
 }
 
-fn validate_interp_expr(expr: &Expr) -> Result<(), String> {
+fn validate_interp_expr(expr: &Expr, locals: &HashMap<String, Ty>) -> Result<(), String> {
     if let Some(ty) = expr.ty {
         validate_interp_ty(ty, "expression annotation")?;
     }
+    if matches!(expr.ty, Some(Ty::Array(ValueTy::Bool, _)))
+        && !matches!(
+            expr.kind,
+            ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } | ExprKind::Var(_)
+        )
+    {
+        return Err(
+            "interp.array_position_unsupported: only owned Boolean array literals, allocations, and their local places are executable"
+                .into(),
+        );
+    }
 
     match &expr.kind {
-        ExprKind::Index { index, .. } => {
-            match expr.ty {
-                Some(Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_)) => {}
-                Some(ty) => {
-                    return Err(format!(
-                        "interp.index_result_unsupported: array index result has type `{}`; \
-                         the interpreter requires a concrete integer annotation",
-                        ty.name()
-                    ));
-                }
-                None => {
-                    return Err(
-                        "interp.index_result_unsupported: array index result has no type; \
-                         the interpreter requires a concrete integer annotation"
-                            .into(),
-                    );
-                }
-            }
-            validate_interp_expr(index)?;
+        ExprKind::Index { array, index, .. } => {
+            let array_ty = locals.get(array).copied().ok_or_else(|| {
+                format!("interp.unknown_local: index names unknown array `{array}`")
+            })?;
+            let Ty::Array(payload, _) = array_ty else {
+                return Err(format!(
+                    "interp.not_array: indexed local `{array}` is not an array"
+                ));
+            };
+            validate_interp_sink(Ty::Int(IntTy::U64), index, locals, "array index")?;
+            let result_ty = value_ty(payload).ok_or_else(|| {
+                format!(
+                    "interp.aggregate_payload_unsupported: indexed array `{array}` has unsupported payload `{}`",
+                    payload.name()
+                )
+            })?;
+            require_cached_type(expr, result_ty, "array index result")?;
         }
         ExprKind::AllocArray { elem, len, init } => {
             validate_interp_array_payload(*elem, "alloc_array")?;
-            validate_interp_expr(len)?;
-            validate_interp_expr(init)?;
+            let expected = Ty::Array(*elem, Mutability::Owned);
+            require_cached_type(expr, expected, "alloc_array result")?;
+            validate_interp_sink(Ty::Int(IntTy::U64), len, locals, "alloc_array length")?;
+            validate_interp_sink(
+                value_ty(*elem).expect("validated concrete interpreter array payload"),
+                init,
+                locals,
+                "alloc_array initializer",
+            )?;
         }
         ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
             if matches!(target, IntTy::TParam(_)) {
@@ -291,7 +568,17 @@ fn validate_interp_expr(expr: &Expr) -> Result<(), String> {
                         .into(),
                 );
             }
-            validate_interp_expr(arg)?;
+            validate_interp_expr(arg, locals)?;
+            if !matches!(
+                semantic_interp_ty(arg, locals)?,
+                Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))
+            ) {
+                return Err(
+                    "interp.expression_type: integer conversion operand must have a concrete integer type"
+                        .into(),
+                );
+            }
+            require_cached_type(expr, Ty::Int(*target), "integer conversion result")?;
         }
         ExprKind::Call {
             type_args, args, ..
@@ -306,42 +593,339 @@ fn validate_interp_expr(expr: &Expr) -> Result<(), String> {
                 );
             }
             for arg in args {
-                validate_interp_expr(arg)?;
+                validate_interp_expr(arg, locals)?;
+                reject_bool_array_transport(arg, locals, "call argument")?;
             }
+            reject_bool_array_result(expr, "call result")?;
         }
-        ExprKind::Unary { operand, .. }
-        | ExprKind::IsSome { operand }
-        | ExprKind::OptValue { operand }
-        | ExprKind::SomeE(operand) => validate_interp_expr(operand)?,
-        ExprKind::Binary { lhs, rhs, .. } => {
-            validate_interp_expr(lhs)?;
-            validate_interp_expr(rhs)?;
+        ExprKind::Unary { op, operand } => match op {
+            UnOp::Not => {
+                validate_interp_sink(Ty::Bool, operand, locals, "Boolean negation operand")?;
+                require_cached_type(expr, Ty::Bool, "Boolean negation result")?;
+            }
+            UnOp::Neg => {
+                validate_interp_expr(operand, locals)?;
+                let operand_ty = semantic_interp_ty(operand, locals)?;
+                if !matches!(operand_ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) {
+                    return Err(
+                        "interp.expression_type: negation operand must be a concrete integer"
+                            .into(),
+                    );
+                }
+                require_cached_type(expr, operand_ty, "integer negation result")?;
+            }
+        },
+        ExprKind::IsSome { operand } => {
+            validate_interp_expr(operand, locals)?;
+            let operand_ty = semantic_interp_ty(operand, locals)?;
+            if !matches!(operand_ty, Ty::Option(_) | Ty::OptionRaw(_)) {
+                return Err(format!(
+                    "interp.option_operand: `.is_some` needs an option, found `{}`",
+                    operand_ty.name()
+                ));
+            }
+            require_cached_type(expr, Ty::Bool, "`.is_some` result")?;
         }
+        ExprKind::OptValue { operand } => {
+            validate_interp_expr(operand, locals)?;
+            let operand_ty = semantic_interp_ty(operand, locals)?;
+            let result_ty = option_value_ty(operand_ty).ok_or_else(|| {
+                format!(
+                    "interp.option_operand: `.value` needs an option, found `{}`",
+                    operand_ty.name()
+                )
+            })?;
+            require_cached_type(expr, result_ty, "`.value` result")?;
+        }
+        ExprKind::SomeE(operand) => {
+            validate_interp_expr(operand, locals)?;
+            reject_bool_array_transport(operand, locals, "option payload")?;
+        }
+        ExprKind::Binary { op, lhs, rhs, .. } => match op {
+            BinOp::And | BinOp::Or => {
+                validate_interp_sink(Ty::Bool, lhs, locals, "Boolean left operand")?;
+                validate_interp_sink(Ty::Bool, rhs, locals, "Boolean right operand")?;
+                require_cached_type(expr, Ty::Bool, "Boolean operator result")?;
+            }
+            op => {
+                validate_interp_expr(lhs, locals)?;
+                validate_interp_expr(rhs, locals)?;
+                let left = semantic_interp_ty(lhs, locals)?;
+                let right = semantic_interp_ty(rhs, locals)?;
+                if left != right
+                    || !matches!(left, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+                {
+                    return Err(
+                        "interp.expression_type: integer operator operands must have one concrete integer type"
+                            .into(),
+                    );
+                }
+                require_cached_type(
+                    expr,
+                    if op.is_comparison() { Ty::Bool } else { left },
+                    "integer operator result",
+                )?;
+            }
+        },
         ExprKind::RawOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
         | ExprKind::ResOp { args, .. }
         | ExprKind::TraitCall { args, .. }
-        | ExprKind::MethodCall { args, .. }
-        | ExprKind::RecordLit { args, .. }
-        | ExprKind::ArrayLit(args) => {
+        | ExprKind::RecordLit { args, .. } => {
             for arg in args {
-                validate_interp_expr(arg)?;
+                validate_interp_expr(arg, locals)?;
+                reject_bool_array_transport(arg, locals, "operation argument")?;
+            }
+            reject_bool_array_result(expr, "operation result")?;
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            reject_bool_array_named_receiver(recv, locals, "method receiver")?;
+            for arg in args {
+                validate_interp_expr(arg, locals)?;
+                reject_bool_array_transport(arg, locals, "method argument")?;
+            }
+            reject_bool_array_result(expr, "method result")?;
+        }
+        ExprKind::ArrayLit(elements) => {
+            let Some(Ty::Array(payload, Mutability::Owned)) = expr.ty else {
+                return Err(
+                    "interp.array_literal_type: array literal must have an owned array annotation"
+                        .into(),
+                );
+            };
+            validate_interp_array_payload(payload, "array literal")?;
+            let element_ty =
+                value_ty(payload).expect("validated concrete interpreter array literal payload");
+            for element in elements {
+                validate_interp_sink(element_ty, element, locals, "array literal element")?;
             }
         }
-        ExprKind::SelfFieldIndex { index, .. } | ExprKind::ClassFieldIndex { index, .. } => {
-            validate_interp_expr(index)?;
+        ExprKind::SelfFieldIndex { index, .. } => {
+            validate_interp_sink(Ty::Int(IntTy::U64), index, locals, "self field array index")?;
+            reject_bool_array_result(expr, "array field index result")?;
         }
-        ExprKind::IntLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Var(_)
-        | ExprKind::Len { .. }
-        | ExprKind::NoneE
-        | ExprKind::SelfField { .. }
-        | ExprKind::SelfFieldLen { .. }
-        | ExprKind::ClassField { .. }
-        | ExprKind::RecordField { .. }
-        | ExprKind::ClassFieldLen { .. }
-        | ExprKind::Borrow { .. } => {}
+        ExprKind::ClassFieldIndex { obj, index, .. } => {
+            reject_bool_array_named_receiver(obj, locals, "class-field index receiver")?;
+            validate_interp_sink(
+                Ty::Int(IntTy::U64),
+                index,
+                locals,
+                "class field array index",
+            )?;
+            reject_bool_array_result(expr, "array field index result")?;
+        }
+        ExprKind::IntLit(_) => {
+            if !matches!(expr.ty, Some(Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_))) {
+                return Err(
+                    "interp.literal_type: integer literal lacks a concrete integer type".into(),
+                );
+            }
+        }
+        ExprKind::BoolLit(_) => require_cached_type(expr, Ty::Bool, "Boolean literal")?,
+        ExprKind::Var(name) => {
+            let ty = locals.get(name).copied().ok_or_else(|| {
+                format!("interp.unknown_local: expression names unknown local `{name}`")
+            })?;
+            if let Some(cached) = expr.ty {
+                if cached != ty && !ty.is_resource() {
+                    return Err(format!(
+                        "interp.expression_type: local `{name}` has type `{}` but its expression is annotated `{}`",
+                        ty.name(),
+                        cached.name()
+                    ));
+                }
+            }
+        }
+        ExprKind::Len { array } => {
+            if !matches!(locals.get(array), Some(Ty::Array(..))) {
+                return Err(format!(
+                    "interp.unknown_local: length names unknown or non-array local `{array}`"
+                ));
+            }
+            require_cached_type(expr, Ty::Int(IntTy::U64), "array length")?;
+        }
+        ExprKind::NoneE => {}
+        ExprKind::SelfField { .. } | ExprKind::SelfFieldLen { .. } => {
+            reject_bool_array_result(expr, "field access")?
+        }
+        ExprKind::ClassField { obj, .. }
+        | ExprKind::RecordField { obj, .. }
+        | ExprKind::ClassFieldLen { obj, .. } => {
+            reject_bool_array_named_receiver(obj, locals, "field receiver")?;
+            reject_bool_array_result(expr, "field access")?;
+        }
+        ExprKind::Borrow { array, .. } => {
+            if locals.get(array) == Some(&Ty::Array(ValueTy::Bool, Mutability::Owned)) {
+                return Err(format!(
+                    "interp.array_position_unsupported: borrow of Boolean array `{array}`; G1.4b Boolean arrays are owned locals only"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn value_ty(payload: ValueTy) -> Option<Ty> {
+    match payload {
+        ValueTy::Int(IntTy::TParam(_)) => None,
+        ValueTy::Int(integer) => Some(Ty::Int(integer)),
+        ValueTy::Bool => Some(Ty::Bool),
+        ValueTy::Record(_) | ValueTy::Param(_) => None,
+    }
+}
+
+fn option_value_ty(option: Ty) -> Option<Ty> {
+    match option {
+        Ty::Option(payload) => value_ty(payload),
+        Ty::OptionRaw(record) => Some(Ty::RawRecord(record)),
+        _ => None,
+    }
+}
+
+fn reject_bool_array_named_receiver(
+    name: &str,
+    locals: &HashMap<String, Ty>,
+    context: &str,
+) -> Result<(), String> {
+    if matches!(locals.get(name), Some(Ty::Array(ValueTy::Bool, _))) {
+        return Err(format!(
+            "interp.array_position_unsupported: {context} `{name}` is a Boolean array, not an object"
+        ));
+    }
+    Ok(())
+}
+
+fn require_cached_type(expr: &Expr, expected: Ty, context: &str) -> Result<(), String> {
+    if expr.ty == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "interp.expression_type: {context} must have type `{}`, found `{}`",
+            expected.name(),
+            expr.ty.map_or_else(|| "<missing>".into(), Ty::name)
+        ))
+    }
+}
+
+fn semantic_interp_ty(expr: &Expr, locals: &HashMap<String, Ty>) -> Result<Ty, String> {
+    match &expr.kind {
+        ExprKind::BoolLit(_) => Ok(Ty::Bool),
+        ExprKind::IntLit(_) => match expr.ty {
+            Some(ty @ Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_)) => Ok(ty),
+            _ => Err("interp.literal_type: integer literal lacks a concrete integer type".into()),
+        },
+        ExprKind::Var(name) => locals.get(name).copied().ok_or_else(|| {
+            format!("interp.unknown_local: expression names unknown local `{name}`")
+        }),
+        ExprKind::Index { array, .. } => match locals.get(array).copied() {
+            Some(Ty::Array(payload, _)) => value_ty(payload).ok_or_else(|| {
+                format!("interp.aggregate_payload_unsupported: `{array}` has unsupported payload")
+            }),
+            _ => Err(format!(
+                "interp.not_array: indexed local `{array}` is not an array"
+            )),
+        },
+        ExprKind::Len { .. } => Ok(Ty::Int(IntTy::U64)),
+        ExprKind::AllocArray { elem, .. } => Ok(Ty::Array(*elem, Mutability::Owned)),
+        ExprKind::ArrayLit(_) => expr
+            .ty
+            .ok_or_else(|| "interp.array_literal_type: missing array literal type".into()),
+        ExprKind::Unary { op, .. } => match op {
+            UnOp::Not => Ok(Ty::Bool),
+            UnOp::Neg => expr
+                .ty
+                .ok_or_else(|| "interp.expression_type: missing negation type".into()),
+        },
+        ExprKind::Binary { op, .. }
+            if matches!(op, BinOp::And | BinOp::Or) || op.is_comparison() =>
+        {
+            Ok(Ty::Bool)
+        }
+        ExprKind::Widen { target, .. } | ExprKind::Narrow { target, .. } => Ok(Ty::Int(*target)),
+        _ => expr
+            .ty
+            .ok_or_else(|| "interp.expression_type: expression has no cached type".into()),
+    }
+}
+
+fn validate_interp_sink(
+    expected: Ty,
+    expr: &Expr,
+    locals: &HashMap<String, Ty>,
+    context: &str,
+) -> Result<(), String> {
+    validate_interp_expr(expr, locals)?;
+    let actual = semantic_interp_ty(expr, locals)?;
+    if actual != expected {
+        return Err(format!(
+            "interp.expression_type: {context} expects `{}`, found `{}`",
+            expected.name(),
+            actual.name()
+        ));
+    }
+    if matches!(expected, Ty::Array(ValueTy::Bool, _))
+        && !matches!(
+            expr.kind,
+            ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. }
+        )
+    {
+        return Err(format!(
+            "interp.array_position_unsupported: {context} receives a Boolean array through an unsupported transport; only owned literals and allocations are executable"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_bool_array_transport(
+    expr: &Expr,
+    locals: &HashMap<String, Ty>,
+    context: &str,
+) -> Result<(), String> {
+    // Checked affine-resource places deliberately may have no cached `Expr.ty`:
+    // their sealed operand position is the typing authority.  This guard only
+    // needs to recognize Boolean-array transport, so do not demand unrelated
+    // scalar/resource metadata here.  Named locals are resolved from the
+    // active environment to prevent a forged cache from hiding an array.
+    let transports_bool_array = match &expr.kind {
+        ExprKind::Var(name) => matches!(locals.get(name), Some(Ty::Array(ValueTy::Bool, _))),
+        _ => matches!(expr.ty, Some(Ty::Array(ValueTy::Bool, _))),
+    };
+    if transports_bool_array {
+        return Err(format!(
+            "interp.array_position_unsupported: {context} transports a Boolean array; G1.4b Boolean arrays are owned locals only"
+        ));
+    }
+    Ok(())
+}
+
+/// Resource operands may intentionally omit cached `Expr::ty` metadata.
+/// This narrower boundary check rejects the newly executable Boolean-array
+/// representation without turning that established erasure convention into
+/// a new annotation requirement.
+fn reject_bool_array_transport_if_present(
+    expr: &Expr,
+    locals: &HashMap<String, Ty>,
+    context: &str,
+) -> Result<(), String> {
+    let is_bool_array = matches!(expr.ty, Some(Ty::Array(ValueTy::Bool, _)))
+        || matches!(
+            &expr.kind,
+            ExprKind::Var(name)
+                if matches!(locals.get(name), Some(Ty::Array(ValueTy::Bool, _)))
+        );
+    if is_bool_array {
+        return Err(format!(
+            "interp.array_position_unsupported: {context} cannot receive a Boolean array"
+        ));
+    }
+    Ok(())
+}
+
+fn reject_bool_array_result(expr: &Expr, context: &str) -> Result<(), String> {
+    if matches!(expr.ty, Some(Ty::Array(ValueTy::Bool, _))) {
+        return Err(format!(
+            "interp.array_position_unsupported: {context} is a Boolean array; G1.4b permits only owned literal/allocation results"
+        ));
     }
     Ok(())
 }
@@ -869,7 +1453,7 @@ impl<'a> Interp<'a> {
                 (RtVal::Arr(a), Ty::Array(_, Mutability::Mut)) => {
                     frame
                         .olds
-                        .insert(p.name.clone(), SpecVal::Arr(a.borrow().clone()));
+                        .insert(p.name.clone(), SpecVal::Arr(a.borrow().to_spec()));
                 }
                 // `&mut C`: the borrow shares storage with the caller, so
                 // the bare name reads the current state and `old p` needs
@@ -1390,7 +1974,14 @@ impl<'a> Interp<'a> {
                 let RtVal::Arr(a) = frame.vars[array.as_str()].clone() else {
                     unreachable!("checked: u8 array")
                 };
-                let bytes: Vec<Option<i128>> = a.borrow().iter().map(|v| Some(*v)).collect();
+                let bytes: Vec<Option<i128>> = a
+                    .borrow()
+                    .int_values()
+                    .expect("interpreter guard rejects Boolean exposure")
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .collect();
                 let n = bytes.len();
                 let alloc = self.raw.fresh(bytes);
                 frame.vars.insert(ptr.clone(), RtVal::Ptr(alloc, 0));
@@ -1411,7 +2002,7 @@ impl<'a> Interp<'a> {
                 if *mutable {
                     for (i, b) in final_bytes.iter().enumerate().take(n) {
                         match b {
-                            Some(v) => a.borrow_mut()[i] = *v,
+                            Some(v) => a.borrow_mut().set_int(i, *v),
                             None => {
                                 return Err(Trap {
                                     undef: false,
@@ -1470,7 +2061,7 @@ impl<'a> Interp<'a> {
                 value,
             } => {
                 let idx = self.eval_int(index, frame)?;
-                let val = self.eval_int(value, frame)?;
+                let val = self.eval(value, frame)?;
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
                 let arr = match fields.borrow().get(field.as_str()) {
                     Some(RtVal::Arr(a)) => a.clone(),
@@ -1484,7 +2075,7 @@ impl<'a> Interp<'a> {
                         span: *field_span,
                     });
                 }
-                arr.borrow_mut()[idx as usize] = val;
+                arr.borrow_mut().set(idx as usize, val);
                 Ok(Flow::Normal)
             }
             Stmt::Store {
@@ -1494,7 +2085,7 @@ impl<'a> Interp<'a> {
                 value,
             } => {
                 let idx = self.eval_int(index, frame)?;
-                let val = self.eval_int(value, frame)?;
+                let val = self.eval(value, frame)?;
                 let RtVal::Arr(a) = frame.vars[array.as_str()].clone() else {
                     unreachable!()
                 };
@@ -1506,7 +2097,7 @@ impl<'a> Interp<'a> {
                         span: *array_span,
                     });
                 }
-                a.borrow_mut()[idx as usize] = val;
+                a.borrow_mut().set(idx as usize, val);
                 Ok(Flow::Normal)
             }
             Stmt::Return { value, .. } => {
@@ -2410,7 +3001,7 @@ impl<'a> Interp<'a> {
                         span: e.span,
                     });
                 }
-                Ok(RtVal::Int(arr[idx as usize]))
+                Ok(arr.get(idx as usize))
             }
             ExprKind::IsSome { operand } => match self.eval(operand, frame)? {
                 RtVal::Opt { value, .. } => Ok(RtVal::Bool(value.is_some())),
@@ -2473,7 +3064,7 @@ impl<'a> Interp<'a> {
                         span: e.span,
                     });
                 }
-                Ok(RtVal::Int(arr[idx as usize]))
+                Ok(arr.get(idx as usize))
             }
             ExprKind::Widen { arg, .. } => self.eval(arg, frame),
             ExprKind::Narrow { target, arg } => {
@@ -2515,11 +3106,16 @@ impl<'a> Interp<'a> {
                 _ => unreachable!("checked: option construction"),
             },
             ExprKind::ArrayLit(elems) => {
-                let mut v = Vec::with_capacity(elems.len());
+                let Some(Ty::Array(payload, Mutability::Owned)) = e.ty else {
+                    unreachable!("checked: owned array literal type")
+                };
+                let mut values = Vec::with_capacity(elems.len());
                 for el in elems {
-                    v.push(self.eval_int(el, frame)?);
+                    values.push(self.eval(el, frame)?);
                 }
-                Ok(RtVal::Arr(Rc::new(RefCell::new(v))))
+                Ok(RtVal::Arr(Rc::new(RefCell::new(RtArray::from_values(
+                    payload, values,
+                )))))
             }
             ExprKind::Borrow { array, field, .. } => {
                 let base = if array == "self" {
@@ -2541,9 +3137,9 @@ impl<'a> Interp<'a> {
                     None => Ok(base),
                 }
             }
-            ExprKind::AllocArray { len, init, .. } => {
+            ExprKind::AllocArray { elem, len, init } => {
                 let n = self.eval_int(len, frame)?;
-                let v0 = self.eval_int(init, frame)?;
+                let initial = self.eval(init, frame)?;
                 // Defined allocation-failure behavior: the named OOM trap.
                 if n < 0 || n > 50_000_000 {
                     return Err(Trap {
@@ -2552,7 +3148,9 @@ impl<'a> Interp<'a> {
                         span: e.span,
                     });
                 }
-                Ok(RtVal::Arr(Rc::new(RefCell::new(vec![v0; n as usize]))))
+                Ok(RtVal::Arr(Rc::new(RefCell::new(RtArray::repeat(
+                    *elem, initial, n as usize,
+                )))))
             }
             ExprKind::SelfField { field } => {
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
@@ -2587,8 +3185,7 @@ impl<'a> Interp<'a> {
                         span: e.span,
                     });
                 }
-                let v = arr.borrow()[idx as usize];
-                Ok(RtVal::Int(v))
+                Ok(arr.borrow().get(idx as usize))
             }
             ExprKind::CtorCall {
                 class, init, args, ..
@@ -2802,7 +3399,7 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
     Some(match v {
         RtVal::Int(n) => SpecVal::Int(*n),
         RtVal::Bool(b) => SpecVal::Bool(*b),
-        RtVal::Arr(a) => SpecVal::Arr(a.borrow().clone()),
+        RtVal::Arr(a) => SpecVal::Arr(a.borrow().to_spec()),
         RtVal::Opt { payload, value } => SpecVal::Opt {
             payload: Some(*payload),
             value: match value {
@@ -2909,7 +3506,7 @@ mod g1_payload_guard_tests {
         expr(ExprKind::IntLit(value), Some(Ty::Int(IntTy::U64)))
     }
 
-    fn eval_with_empty_runtime(expression: &Expr) -> Result<RtVal, String> {
+    fn eval_with_frame(expression: &Expr, vars: HashMap<String, RtVal>) -> Result<RtVal, String> {
         let fns: HashMap<&str, &Fn> = HashMap::new();
         let classes: Vec<ClassDecl> = Vec::new();
         let records: Vec<RecordDecl> = Vec::new();
@@ -2927,7 +3524,7 @@ mod g1_payload_guard_tests {
             uart: None,
         };
         let mut frame = Frame {
-            vars: HashMap::new(),
+            vars,
             entry_scalars: HashMap::new(),
             olds: HashMap::new(),
             self_ctx: None,
@@ -2935,6 +3532,10 @@ mod g1_payload_guard_tests {
         interpreter
             .eval(expression, &mut frame)
             .map_err(|trap| trap.message)
+    }
+
+    fn eval_with_empty_runtime(expression: &Expr) -> Result<RtVal, String> {
+        eval_with_frame(expression, HashMap::new())
     }
 
     #[test]
@@ -2960,25 +3561,45 @@ mod g1_payload_guard_tests {
     }
 
     #[test]
-    fn permits_boolean_options_but_not_boolean_arrays() {
+    fn permits_owned_local_boolean_arrays_but_not_nonlocal_positions() {
         let mut program = empty_program();
         program.fns.push(function(
             "subject",
-            Ty::Option(ValueTy::Bool),
-            vec![Stmt::Return {
-                value: Some(expr(
-                    ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool)))),
-                    Some(Ty::Option(ValueTy::Bool)),
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+                name: "flags".into(),
+                name_span: Span::new(0, 0),
+                init: Some(expr(
+                    ExprKind::AllocArray {
+                        elem: ValueTy::Bool,
+                        len: Box::new(int_lit(0)),
+                        init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
+                    },
+                    Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
                 )),
-                span: Span::new(0, 0),
+                mutable: true,
             }],
         ));
 
-        validate_interp_program(&program).expect("Boolean options have G1.1 runtime semantics");
+        validate_interp_program(&program).expect("owned local Boolean arrays have G1.4b semantics");
+        for ty in [
+            Ty::Array(ValueTy::Bool, Mutability::Shared),
+            Ty::Array(ValueTy::Bool, Mutability::Mut),
+        ] {
+            assert!(
+                validate_interp_ty(ty, "Boolean array borrow")
+                    .unwrap_err()
+                    .starts_with("interp.array_position_unsupported:")
+            );
+        }
         assert!(
-            validate_interp_ty(Ty::Array(ValueTy::Bool, Mutability::Owned), "Boolean array")
-                .unwrap_err()
-                .contains("only concrete integer payloads")
+            validate_interp_nonlocal_option_position(
+                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                "parameter `flags`",
+            )
+            .unwrap_err()
+            .starts_with("interp.array_position_unsupported:")
         );
     }
 
@@ -3058,34 +3679,33 @@ mod g1_payload_guard_tests {
     }
 
     #[test]
-    fn recursively_checks_alloc_array_element_metadata() {
+    fn recursively_accepts_boolean_alloc_array_element_metadata() {
         let allocation = expr(
             ExprKind::AllocArray {
                 elem: ValueTy::Bool,
                 len: Box::new(int_lit(1)),
                 init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
             },
-            Some(Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned)),
+            Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
         );
         let mut program = empty_program();
         program.fns.push(function(
             "subject",
             Ty::Unit,
-            vec![Stmt::Unsafe {
-                kw_span: Span::new(0, 0),
-                body: vec![Stmt::ExprStmt(allocation)],
+            vec![Stmt::Decl {
+                ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+                name: "values".into(),
+                name_span: Span::new(0, 0),
+                init: Some(allocation),
+                mutable: false,
             }],
         ));
 
-        assert_eq!(
-            validate_interp_program(&program).unwrap_err(),
-            "interp.aggregate_payload_unsupported: alloc_array has array payload `bool`; \
-             the interpreter currently executes only concrete integer payloads"
-        );
+        validate_interp_program(&program).expect("Boolean allocation metadata is executable");
     }
 
     #[test]
-    fn index_requires_a_concrete_integer_result_annotation() {
+    fn index_accepts_boolean_or_concrete_integer_result_annotations() {
         let load = expr(
             ExprKind::Index {
                 array: "values".into(),
@@ -3097,18 +3717,342 @@ mod g1_payload_guard_tests {
         let mut program = empty_program();
         program.fns.push(function(
             "subject",
-            Ty::Bool,
-            vec![Stmt::Return {
-                value: Some(load),
-                span: Span::new(0, 0),
-            }],
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+                    name: "values".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(
+                        ExprKind::ArrayLit(vec![expr(ExprKind::BoolLit(true), Some(Ty::Bool))]),
+                        Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
+                    )),
+                    mutable: false,
+                },
+                Stmt::ExprStmt(load),
+            ],
         ));
 
-        assert_eq!(
-            validate_interp_program(&program).unwrap_err(),
-            "interp.index_result_unsupported: array index result has type `bool`; \
-             the interpreter requires a concrete integer annotation"
+        validate_interp_program(&program).expect("Boolean array indices produce Boolean values");
+    }
+
+    #[test]
+    fn boolean_array_literal_allocation_index_store_and_snapshots_are_typed() {
+        let bool_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let literal = expr(
+            ExprKind::ArrayLit(vec![
+                expr(ExprKind::BoolLit(true), Some(Ty::Bool)),
+                expr(ExprKind::BoolLit(false), Some(Ty::Bool)),
+            ]),
+            Some(bool_ty),
         );
+        let RtVal::Arr(values) = eval_with_empty_runtime(&literal).unwrap() else {
+            panic!("expected an array")
+        };
+        assert!(matches!(
+            &*values.borrow(),
+            RtArray::Bool(values) if values == &[true, false]
+        ));
+
+        let allocated = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(int_lit(2)),
+                init: Box::new(expr(ExprKind::BoolLit(true), Some(Ty::Bool))),
+            },
+            Some(bool_ty),
+        );
+        let RtVal::Arr(values) = eval_with_empty_runtime(&allocated).unwrap() else {
+            panic!("expected an array")
+        };
+        values.borrow_mut().set(1, RtVal::Bool(false));
+        let index = expr(
+            ExprKind::Index {
+                array: "flags".into(),
+                array_span: Span::new(0, 0),
+                index: Box::new(int_lit(1)),
+            },
+            Some(Ty::Bool),
+        );
+        assert!(matches!(
+            eval_with_frame(
+                &index,
+                HashMap::from([("flags".into(), RtVal::Arr(values.clone()))])
+            ),
+            Ok(RtVal::Bool(false))
+        ));
+
+        let empty = RtVal::Arr(Rc::new(RefCell::new(RtArray::Bool(Vec::new()))));
+        assert_eq!(
+            spec_of(&empty),
+            Some(SpecVal::Arr(SpecArray::Bool(Vec::new())))
+        );
+        let RtVal::Arr(copied) = deep_copy(&empty) else {
+            panic!("expected copied array")
+        };
+        assert!(matches!(&*copied.borrow(), RtArray::Bool(values) if values.is_empty()));
+    }
+
+    #[test]
+    fn boolean_array_guard_rejects_forged_payloads_indices_stores_and_transports() {
+        let bool_array = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let bad_alloc = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(expr(ExprKind::BoolLit(true), Some(Ty::Int(IntTy::U64)))),
+                init: Box::new(expr(ExprKind::IntLit(1), Some(Ty::Bool))),
+            },
+            Some(bool_array),
+        );
+        assert!(validate_interp_expr(&bad_alloc, &HashMap::new()).is_err());
+
+        let bad_outer = expr(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(int_lit(1)),
+                init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
+            },
+            Some(Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned)),
+        );
+        assert!(validate_interp_expr(&bad_outer, &HashMap::new()).is_err());
+
+        let mut program = empty_program();
+        program.fns.push(function(
+            "subject",
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: bool_array,
+                    name: "flags".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(ExprKind::ArrayLit(vec![]), Some(bool_array))),
+                    mutable: true,
+                },
+                Stmt::Store {
+                    array: "flags".into(),
+                    array_span: Span::new(0, 0),
+                    index: expr(ExprKind::BoolLit(false), Some(Ty::Int(IntTy::U64))),
+                    value: expr(ExprKind::IntLit(0), Some(Ty::Bool)),
+                },
+            ],
+        ));
+        assert!(validate_interp_program(&program).is_err());
+
+        let forged_call = expr(
+            ExprKind::Call {
+                callee: "make".into(),
+                callee_span: Span::new(0, 0),
+                type_args: vec![],
+                args: vec![],
+            },
+            Some(bool_array),
+        );
+        assert!(
+            validate_interp_expr(&forged_call, &HashMap::new())
+                .unwrap_err()
+                .starts_with("interp.array_position_unsupported:")
+        );
+    }
+
+    #[test]
+    fn boolean_array_guard_rejects_object_option_and_scalar_operator_laundering() {
+        let bool_array = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let locals = HashMap::from([("flags".into(), bool_array)]);
+        let span = Span::new(0, 0);
+        let receiver_uses = [
+            expr(
+                ExprKind::MethodCall {
+                    recv: "flags".into(),
+                    recv_span: span,
+                    method: "read".into(),
+                    method_span: span,
+                    args: vec![],
+                },
+                Some(Ty::Unit),
+            ),
+            expr(
+                ExprKind::ClassField {
+                    obj: "flags".into(),
+                    obj_span: span,
+                    field: "value".into(),
+                },
+                Some(Ty::Bool),
+            ),
+            expr(
+                ExprKind::RecordField {
+                    obj: "flags".into(),
+                    obj_span: span,
+                    field: "value".into(),
+                },
+                Some(Ty::Bool),
+            ),
+            expr(
+                ExprKind::ClassFieldLen {
+                    obj: "flags".into(),
+                    field: "values".into(),
+                },
+                Some(Ty::Int(IntTy::U64)),
+            ),
+            expr(
+                ExprKind::ClassFieldIndex {
+                    obj: "flags".into(),
+                    obj_span: span,
+                    field: "values".into(),
+                    index: Box::new(int_lit(0)),
+                },
+                Some(Ty::Bool),
+            ),
+        ];
+        for receiver_use in receiver_uses {
+            assert!(
+                validate_interp_expr(&receiver_use, &locals)
+                    .unwrap_err()
+                    .starts_with("interp.array_position_unsupported:"),
+                "{receiver_use:?}"
+            );
+        }
+
+        for accessor in [
+            expr(
+                ExprKind::IsSome {
+                    operand: Box::new(expr(ExprKind::Var("flags".into()), Some(bool_array))),
+                },
+                Some(Ty::Bool),
+            ),
+            expr(
+                ExprKind::OptValue {
+                    operand: Box::new(expr(ExprKind::Var("flags".into()), Some(bool_array))),
+                },
+                Some(Ty::Bool),
+            ),
+        ] {
+            assert!(
+                validate_interp_expr(&accessor, &locals)
+                    .unwrap_err()
+                    .starts_with("interp.option_operand:"),
+                "{accessor:?}"
+            );
+        }
+
+        for conversion in [
+            expr(
+                ExprKind::Widen {
+                    target: IntTy::U64,
+                    arg: Box::new(expr(ExprKind::Var("flags".into()), Some(bool_array))),
+                },
+                Some(Ty::Int(IntTy::U64)),
+            ),
+            expr(
+                ExprKind::Narrow {
+                    target: IntTy::U8,
+                    arg: Box::new(expr(ExprKind::Var("flags".into()), Some(bool_array))),
+                },
+                Some(Ty::Int(IntTy::U8)),
+            ),
+        ] {
+            assert!(
+                validate_interp_expr(&conversion, &locals)
+                    .unwrap_err()
+                    .contains("integer conversion operand"),
+                "{conversion:?}"
+            );
+        }
+
+        let forged_boolean = expr(
+            ExprKind::Unary {
+                op: UnOp::Not,
+                operand: Box::new(expr(ExprKind::Var("flags".into()), Some(bool_array))),
+            },
+            Some(Ty::Bool),
+        );
+        assert!(validate_interp_expr(&forged_boolean, &locals).is_err());
+
+        let resource_locals = HashMap::from([("authority".into(), Ty::Res(ResKind::RawSpan))]);
+        let erased_place = expr(ExprKind::Var("authority".into()), None);
+        reject_bool_array_transport(&erased_place, &resource_locals, "sealed operand")
+            .expect("an intentionally unannotated resource place is not a Boolean array");
+    }
+
+    #[test]
+    fn boolean_array_guard_rejects_scalar_statement_sinks() {
+        let span = Span::new(0, 0);
+        let bool_array = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let int_array = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let bool_var = || expr(ExprKind::Var("bits".into()), Some(bool_array));
+        let byte = || expr(ExprKind::IntLit(1), Some(Ty::Int(IntTy::U8)));
+        let base = HashMap::from([
+            ("bits".into(), bool_array),
+            ("ints".into(), int_array),
+            ("raw".into(), Ty::Res(ResKind::RawSpan)),
+            ("release".into(), Ty::Res(ResKind::SystemDealloc)),
+        ]);
+
+        let forged_sinks = vec![
+            Stmt::Store {
+                array: "ints".into(),
+                array_span: span,
+                index: bool_var(),
+                value: byte(),
+            },
+            Stmt::Store {
+                array: "ints".into(),
+                array_span: span,
+                index: int_lit(0),
+                value: bool_var(),
+            },
+            Stmt::FieldStore {
+                field: "bytes".into(),
+                field_span: span,
+                index: bool_var(),
+                value: byte(),
+            },
+            Stmt::If {
+                cond: bool_var(),
+                then_block: vec![],
+                else_block: None,
+            },
+            Stmt::While {
+                cond: bool_var(),
+                invariants: vec![],
+                variant: None,
+                kw_span: span,
+                body: vec![],
+            },
+            Stmt::StaticAlloc {
+                kw_span: span,
+                size: bool_var(),
+                ptr: "p".into(),
+                ptr_span: span,
+                res: "memory".into(),
+                res_span: span,
+            },
+            Stmt::SystemAlloc {
+                kw_span: span,
+                size: bool_var(),
+                ptr: "p".into(),
+                ptr_span: span,
+                res: "memory".into(),
+                res_span: span,
+                release: "free".into(),
+                release_span: span,
+            },
+            Stmt::SystemDealloc {
+                kw_span: span,
+                ptr: bool_var(),
+                res: expr(ExprKind::Var("raw".into()), None),
+                release: expr(ExprKind::Var("release".into()), None),
+            },
+        ];
+
+        for statement in forged_sinks {
+            let error = validate_interp_stmts(&[statement], &mut base.clone())
+                .expect_err("a Boolean array must not reach a scalar statement sink");
+            assert!(
+                error.starts_with("interp.expression_type:")
+                    || error.starts_with("interp.array_position_unsupported:"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

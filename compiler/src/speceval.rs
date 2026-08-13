@@ -19,7 +19,7 @@ use std::collections::HashMap;
 pub enum SpecVal {
     Int(i128),
     Bool(bool),
-    Arr(Vec<i128>),
+    Arr(SpecArray),
     /// An ordinary option's proof value. Program-derived options retain their
     /// checked payload type even when absent, because `Option.value` is
     /// `getD default` in Lean: the junk value is `0` for integers and `false`
@@ -31,6 +31,40 @@ pub enum SpecVal {
     },
     /// A class value: field name → value.
     Obj(HashMap<String, SpecVal>),
+}
+
+/// A monitored array retains its checked payload even when it is empty.
+/// Fixed integer widths remain useful for faithful snapshots, although the
+/// proof language itself observes every integer element as mathematical Int.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpecArray {
+    Int { payload: IntTy, values: Vec<i128> },
+    Bool(Vec<bool>),
+}
+
+impl SpecArray {
+    fn len(&self) -> usize {
+        match self {
+            SpecArray::Int { values, .. } => values.len(),
+            SpecArray::Bool(values) => values.len(),
+        }
+    }
+
+    fn get_or_default(&self, index: i128) -> SpecVal {
+        let index = usize::try_from(index).ok();
+        match self {
+            SpecArray::Int { values, .. } => SpecVal::Int(
+                index
+                    .and_then(|index| values.get(index).copied())
+                    .unwrap_or(0),
+            ),
+            SpecArray::Bool(values) => SpecVal::Bool(
+                index
+                    .and_then(|index| values.get(index).copied())
+                    .unwrap_or(false),
+            ),
+        }
+    }
 }
 
 /// Why a clause could not be checked dynamically.
@@ -753,7 +787,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             .cloned()
             .ok_or_else(|| Unmonitorable(format!("no entry snapshot for `{v}`"))),
         S::Len(a) => match eval(a, env, depth + 1)? {
-            SpecVal::Arr(v) => Ok(SpecVal::Int(v.len() as i128)),
+            SpecVal::Arr(array) => Ok(SpecVal::Int(array.len() as i128)),
             // A class field that happens to be named `len`.
             SpecVal::Obj(fields) => fields
                 .get("len")
@@ -769,19 +803,14 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             _ => Err(Unmonitorable(format!("`.{field}` on a non-class value"))),
         },
         S::Get(a, i) => {
-            let arr = match eval(a, env, depth + 1)? {
-                SpecVal::Arr(v) => v,
+            let array = match eval(a, env, depth + 1)? {
+                SpecVal::Arr(array) => array,
                 _ => return Err(Unmonitorable("`.get` on a non-array".into())),
             };
             let idx = int(eval(i, env, depth + 1)?)?;
-            // Off-range get is junk in the model; 0 is as good a junk
-            // value as any for monitoring (guards keep real specs inside).
-            Ok(SpecVal::Int(
-                usize::try_from(idx)
-                    .ok()
-                    .and_then(|k| arr.get(k).copied())
-                    .unwrap_or(0),
-            ))
+            // Off-range get is typed junk in the model; guards keep real
+            // specifications in range.
+            Ok(array.get_or_default(idx))
         }
         S::IsSomeE(x) => match eval(x, env, depth + 1)? {
             SpecVal::Opt { value, .. } => Ok(SpecVal::Bool(value.is_some())),
@@ -881,11 +910,11 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             let base = name.rsplit('.').next().unwrap_or(name);
             match base {
                 "sorted" if args.len() == 1 => {
-                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    let a = int_array(eval(&args[0], env, depth + 1)?, "sorted")?;
                     return Ok(SpecVal::Bool(a.windows(2).all(|w| w[0] <= w[1])));
                 }
                 "sortedRange" if args.len() == 3 => {
-                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    let a = int_array(eval(&args[0], env, depth + 1)?, "sortedRange")?;
                     let lo = int(eval(&args[1], env, depth + 1)?)?.max(0) as usize;
                     let hi = (int(eval(&args[2], env, depth + 1)?)?.max(0) as usize).min(a.len());
                     return Ok(SpecVal::Bool(
@@ -893,12 +922,12 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                     ));
                 }
                 "contains" if args.len() == 2 => {
-                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    let a = int_array(eval(&args[0], env, depth + 1)?, "contains")?;
                     let v = int(eval(&args[1], env, depth + 1)?)?;
                     return Ok(SpecVal::Bool(a.contains(&v)));
                 }
                 "count" if args.len() == 2 => {
-                    let a = array(eval(&args[0], env, depth + 1)?)?;
+                    let a = int_array(eval(&args[0], env, depth + 1)?, "count")?;
                     let v = int(eval(&args[1], env, depth + 1)?)?;
                     return Ok(SpecVal::Int(a.iter().filter(|x| **x == v).count() as i128));
                 }
@@ -908,8 +937,8 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                 if args.len() != 2 {
                     return Err(Unmonitorable("`perm` takes two sequences".into()));
                 }
-                let a = array(eval(&args[0], env, depth + 1)?)?;
-                let b = array(eval(&args[1], env, depth + 1)?)?;
+                let a = int_array(eval(&args[0], env, depth + 1)?, "perm")?;
+                let b = int_array(eval(&args[1], env, depth + 1)?, "perm")?;
                 let mut sa = a.clone();
                 let mut sb = b.clone();
                 sa.sort_unstable();
@@ -919,14 +948,12 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             if let Some((head, "get")) = name.rsplit_once('.') {
                 if args.len() == 1 {
                     let arr = eval(&ident_to_expr(head)?, env, depth + 1)?;
-                    let arr = array(arr)?;
+                    let arr = match arr {
+                        SpecVal::Arr(array) => array,
+                        _ => return Err(Unmonitorable("`.get` on a non-array".into())),
+                    };
                     let idx = int(eval(&args[0], env, depth + 1)?)?;
-                    return Ok(SpecVal::Int(
-                        usize::try_from(idx)
-                            .ok()
-                            .and_then(|k| arr.get(k).copied())
-                            .unwrap_or(0),
-                    ));
+                    return Ok(arr.get_or_default(idx));
                 }
             }
             let Some((params, body)) = env.ghosts.defs.get(name) else {
@@ -1122,7 +1149,12 @@ fn spec_eq(a: &SpecVal, b: &SpecVal) -> Option<bool> {
     match (a, b) {
         (SpecVal::Int(x), SpecVal::Int(y)) => Some(x == y),
         (SpecVal::Bool(x), SpecVal::Bool(y)) => Some(x == y),
-        (SpecVal::Arr(x), SpecVal::Arr(y)) => Some(x == y),
+        (
+            SpecVal::Arr(SpecArray::Int { values: x, .. }),
+            SpecVal::Arr(SpecArray::Int { values: y, .. }),
+        ) => Some(x == y),
+        (SpecVal::Arr(SpecArray::Bool(x)), SpecVal::Arr(SpecArray::Bool(y))) => Some(x == y),
+        (SpecVal::Arr(_), SpecVal::Arr(_)) => None,
         (SpecVal::Opt { value: x, .. }, SpecVal::Opt { value: y, .. }) => match (x, y) {
             (None, None) => Some(true),
             (Some(_), None) | (None, Some(_)) => Some(false),
@@ -1166,10 +1198,15 @@ fn boolean(v: SpecVal) -> EResult<bool> {
     }
 }
 
-fn array(v: SpecVal) -> EResult<Vec<i128>> {
+fn int_array(v: SpecVal, operation: &str) -> EResult<Vec<i128>> {
     match v {
-        SpecVal::Arr(a) => Ok(a),
-        _ => Err(Unmonitorable("expected a sequence value".into())),
+        SpecVal::Arr(SpecArray::Int { values, .. }) => Ok(values),
+        SpecVal::Arr(SpecArray::Bool(_)) => Err(Unmonitorable(format!(
+            "`{operation}` is integer-array-only; Boolean arrays are unsupported"
+        ))),
+        _ => Err(Unmonitorable(format!(
+            "`{operation}` expected a sequence value"
+        ))),
     }
 }
 
@@ -1239,5 +1276,81 @@ mod g1_option_monitor_tests {
 
         let error = eval_clause("record_option.value = 0", &env).unwrap_err();
         assert!(error.0.contains("no default value for a POD-record option"));
+    }
+
+    #[test]
+    fn boolean_arrays_support_length_get_equality_and_typed_junk() {
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut vars = HashMap::new();
+        vars.insert(
+            "flags".into(),
+            SpecVal::Arr(SpecArray::Bool(vec![true, false, true])),
+        );
+        vars.insert(
+            "same".into(),
+            SpecVal::Arr(SpecArray::Bool(vec![true, false, true])),
+        );
+        vars.insert("empty".into(), SpecVal::Arr(SpecArray::Bool(Vec::new())));
+        vars.insert(
+            "integers".into(),
+            SpecVal::Arr(SpecArray::Int {
+                payload: IntTy::U8,
+                values: vec![1, 0, 1],
+            }),
+        );
+        vars.insert(
+            "wide_integers".into(),
+            SpecVal::Arr(SpecArray::Int {
+                payload: IntTy::I64,
+                values: vec![1, 0, 1],
+            }),
+        );
+        let env = SpecEnv {
+            vars,
+            olds: HashMap::new(),
+            ghosts: &ghosts,
+        };
+
+        assert!(eval_clause("flags.len = 3", &env).unwrap());
+        assert!(eval_clause("flags.get 0 = true", &env).unwrap());
+        assert!(eval_clause("flags.get 1 = false", &env).unwrap());
+        assert!(eval_clause("empty.get 0 = false", &env).unwrap());
+        assert!(eval_clause("flags = same", &env).unwrap());
+        assert!(eval_clause("flags = integers", &env).is_err());
+        assert!(eval_clause("flags ≠ integers", &env).is_err());
+        assert!(eval_clause("integers = wide_integers", &env).unwrap());
+    }
+
+    #[test]
+    fn integer_only_sequence_helpers_reject_boolean_arrays_explicitly() {
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut vars = HashMap::new();
+        vars.insert(
+            "flags".into(),
+            SpecVal::Arr(SpecArray::Bool(vec![false, true])),
+        );
+        let env = SpecEnv {
+            vars,
+            olds: HashMap::new(),
+            ghosts: &ghosts,
+        };
+
+        for (operation, clause) in [
+            ("sorted", "sorted flags"),
+            ("sortedRange", "sortedRange flags 0 2"),
+            ("contains", "contains flags 1"),
+            ("count", "count flags 1 = 0"),
+            ("perm", "perm flags flags"),
+        ] {
+            let error = eval_clause(clause, &env)
+                .expect_err("integer-only sequence helpers must reject Boolean arrays");
+            assert!(
+                error
+                    .0
+                    .contains(&format!("`{operation}` is integer-array-only")),
+                "{clause}: {}",
+                error.0
+            );
+        }
     }
 }

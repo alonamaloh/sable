@@ -1,0 +1,6 @@
+// expect-test-failure: index out of bounds: index 2, length 2
+
+fn test_bool_array_oob() {
+    [bool] flags = [true, false];
+    bool value = flags[2];
+}

@@ -1,0 +1,5 @@
+// expect-error: type.bool_array_param
+// The owned-local slice does not create a foreign Boolean-array ABI.
+
+extern "C" #[audit(id := "test.bool-array-param.v1", reason := "no Boolean-array ABI")]
+fn c_take_bool_array(&[bool] flags);

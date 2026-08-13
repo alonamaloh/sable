@@ -216,3 +216,41 @@ library tests; all 374 corpus subjects (80 verifies, 231 must-fail, 45 dynamic,
 interpreter↔Clang differential over four subjects at `-O0` and `-O2`; SVM
 differential 76/76; and randomized allocator, grind-budget, LSP, and
 documentation gates. Both stages are closed without widening concepts.
+
+## G1.4b amendment: a concrete Boolean sequence is not a concept instance (2026-08-13)
+
+G1.4b gives owned-local `[bool]` a concrete proof and runtime model without
+widening ADR 0009's integer-only template authorization. A fresh contextual
+literal or `alloc_array<bool>(u64, bool)` may initialize an explicit or inferred
+local; length, checked reads, element stores, loops, assertions, and contracts
+operate on that local. Boolean arrays remain invalid as generic type arguments,
+and no Boolean or Boolean-array instance can receive
+`ProofReuse::Adr0009IntModel`.
+
+VC generation uses `Sable.Seq Bool`, not the abstract `Sable.IntModel` sequence
+used by retained templates. Proposition-valued symbolic program Booleans cross
+to sequence elements through explicit `Bool` reification; reads cross back as
+`get ... = true`. Boolean-array loop havoc retains that concrete sequence type
+and does not derive the integer element-range facts available to an ADR 0009
+array parameter.
+
+The position fence is part of this decision. Boolean-array parameters, returns,
+class and record fields, borrows, exposure, whole-array rebinding, Boolean `for`
+indices, and generic Boolean-array arguments remain rejected. The interpreter and
+dynamic monitor carry a typed Boolean-array variant, including at length zero;
+same-domain equality is monitorable while integer/Boolean-array equality is
+unmonitorable. The formal SVM and LLVM emitter independently reject the type.
+Thus a concrete non-integer local has landed without making a non-integer
+concept, template proof, machine representation, or native ABI available by
+accident.
+
+G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1
+--nocapture`: 171/171 library tests; all 394 corpus subjects (83 verifies, 244
+must-fail, 48 dynamic, 19 dynamic-fail), whose all-target corpus portion took
+208.73s; focused verification at 18/18 obligations across four functions; 2/2
+dynamic tests and the expected out-of-bounds trap; LLVM CLI 6/6; the
+exact-`VerifiedProgram` interpreter↔Clang differential 1/1 over five subjects at
+`-O0` and `-O2`; and SVM differential 76/76. A standalone corpus repeat was
+green in 195.71s. Randomized allocator, grind-budget, LSP, and documentation
+gates were green. G1.4b is closed without widening concepts.
