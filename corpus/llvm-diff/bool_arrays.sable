@@ -1,0 +1,90 @@
+// G1.6 native Boolean-array subjects. The executable entry covers fresh
+// allocation, literal construction, mutation, reads, length, and the
+// allocation-free zero-length representation. Helpers cover nested block,
+// backedge, unsafe-block, and early-return cleanup. The guarded functions let
+// the native integration test exercise otherwise unreachable backend traps.
+
+fn nested_array_scope() -> bool {
+    if (true) {
+        [bool] nested = alloc_array<bool>(5, true);
+        if (nested[4]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn loop_array_scope() -> bool {
+    mut u64 iteration = 0;
+    /// invariant iteration <= 2
+    /// variant 2 - iteration
+    while (iteration < 2) {
+        [bool] per_iteration = alloc_array<bool>(6, true);
+        if (!per_iteration[5]) {
+            return false;
+        }
+        iteration = iteration + 1;
+    }
+    return true;
+}
+
+fn unsafe_array_scope() -> bool {
+    unsafe {
+        [bool] open_scope = alloc_array<bool>(7, true);
+        if (!open_scope[6]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn early_array_return() -> bool {
+    [bool] before_return = alloc_array<bool>(8, true);
+    return before_return[7];
+}
+
+fn bool_arrays_entry() -> i32 {
+    mut [bool] allocated = alloc_array<bool>(4, false);
+    allocated[0] = true;
+    allocated[3] = true;
+
+    [bool] literal = [true, false, true];
+    [bool] empty_literal = [];
+    [bool] empty_alloc = alloc_array<bool>(0, true);
+
+    if (allocated.len == 4) {
+        if (allocated[0] && !allocated[1] && allocated[3]) {
+            if (literal.len == 3) {
+                if (literal[0] && !literal[1] && literal[2]) {
+                    if (empty_literal.len == 0 && empty_alloc.len == 0) {
+                        if (nested_array_scope() && loop_array_scope()) {
+                            if (unsafe_array_scope() && early_array_return()) {
+                                return 42;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
+/// pre length = 0
+fn bool_array_alloc_guard(u64 length) -> u64 {
+    [bool] values = alloc_array<bool>(length, false);
+    return values.len;
+}
+
+/// pre index = 0
+fn bool_array_load_guard(u64 index) -> bool {
+    [bool] values = [true, false];
+    return values[index];
+}
+
+/// pre index = 0
+fn bool_array_store_guard(u64 index) -> bool {
+    mut [bool] values = [false, true];
+    values[index] = true;
+    return values[0];
+}

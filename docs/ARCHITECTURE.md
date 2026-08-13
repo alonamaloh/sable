@@ -131,7 +131,7 @@ Generated Lean goes to `.sable-out/` (gitignored): immutable content-addressed r
 
 The versioned `proof-env-v2-fnv64:<hash>` tag covers `lean-toolchain`, `lakefile.toml`, `lake-manifest.json`, and every repository-local `.lean` file under `lean/`; exact byte maps, not the compact FNV tag alone, authorize reuse. Generated content separately records machine-profile ids and hashes, used machine intrinsics, and audited extern ids. `uart-poll-v1`'s displayed profile hash is computed from the immutable snapshot over the recursive local import closure rooted at `Sable/MMIO.lean` and `Sable/SVMUart.lean`, plus `lean-toolchain` and `lakefile.toml`. Thus profile identity states the device-semantics dependency, while the broader proof-environment identity pins everything Lean actually reads.
 
-## Native lowering boundary (G1.4a values; G1.4b arrays fail closed)
+## Native lowering boundary (through G1.6 owned-local Boolean arrays)
 
 ADR 0058 adds a second consumer only *after* the verification path succeeds:
 the exact checked, monomorphized AST becomes a `VerifiedProgram`, and a
@@ -204,13 +204,43 @@ LLVM SSA value. Imported records, extern/entry/public ABIs, pointer and Boolean
 fields, nested and container records, and classes remain rejected. The named
 aggregate is versionable internal lowering, not a record ABI.
 
-G1.4b does not widen this native boundary. Although the checked language can
-now verify and interpret owned-local Boolean arrays, the emitter rejects their
-declarations and every expression that would carry them before selecting a
-representation. No LLVM element layout, allocation strategy, lifetime rule,
-trap extension, mangling, or array ABI is implied by the source-level slice.
-G1.5 widens the formal SVM and its Rust differential lowerer only; the same
-LLVM rejection remains in force.
+At the G1.4b checkpoint the native boundary remained closed: source checking,
+VC generation, interpretation, and monitoring admitted owned-local Boolean
+arrays without choosing LLVM storage or lifetime. G1.5 then added a tagged
+formal-SVM value and the matching local-only Rust bridge, still without native
+lowering. Those historical fences matter because G1.6 widens only the same
+intersection rather than treating the formal representation as an array ABI.
+
+G1.6 uses `%sable.array.bool = type { ptr, i64 }` for an internal local
+descriptor: opaque data pointer, then `u64` length. Elements are canonical
+zero/one `i8` bytes rather than packed `i1` values. Nonempty storage is obtained
+and released only through the external versioned declarations
+`__sable_rt_array_alloc_v1(i64 bytes)` and
+`__sable_rt_array_free_v1(ptr)`; zero length uses a null pointer and bypasses
+both hooks. The checked type, not the pointer, retains the Boolean payload tag.
+The optional hosted C shim in `runtime/hosted/sable_rt_v1.c` implements the
+fixed-width boundary with the platform allocator after a `size_t` fit check;
+the emitter itself remains target-neutral and never names `malloc` or `free`.
+
+The native ordering is part of the semantics. Allocation evaluates length and
+initializer before the 50,000,000-element cap and hook result; a literal
+evaluates every element left-to-right before allocation and ordered writes.
+Store evaluates index then value, guards with an unsigned comparison, and only
+then forms a non-`inbounds` address; a read likewise guards before address and
+load. Cap exhaustion and a null allocation result reach trap kind 9 with
+`type_info = 0`, `lhs = len`, `rhs = 0`. Out-of-bounds reads and writes reach
+kind 10 with `type_info = 0`, `lhs = index`, `rhs = len`. The observer is still
+followed by mandatory `llvm.trap`.
+
+Owned-array destruction follows source lifetimes. Function bodies, `if` arms,
+and each `while` iteration are cleanup scopes, with reverse declaration order
+on normal fallthrough and before a loop backedge. Returns evaluate their value
+first and then unwind inner-to-outer. `unsafe` remains an open marker, so its
+declarations belong to the enclosing scope; a trap runs no cleanup. Parameters,
+returns, fields, borrows, exposure, rebinding or movement, calls, extern/public
+positions, generic or option containment, discarded temporaries, and integer
+arrays remain rejected independently. This is internal lowering, not a public,
+foreign, or cross-module array ABI.
 
 ## Key invariants
 
@@ -403,8 +433,8 @@ LLVM rejection remains in force.
 
   At the G1.4b checkpoint the Rust SVM lowerer rejected the new local value and
   the formal SVM remained unchanged; LLVM independently rejected it as
-  described above. G1.5 changes only that formal-machine boundary, while native
-  lowering remains a later independent stage.
+  described above. G1.5 changed only that formal-machine boundary; G1.6 later
+  supplied the independently reviewed native stage.
 
   G1.4b closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
   SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
@@ -443,7 +473,7 @@ LLVM rejection remains in force.
   false-filled Boolean array and emits ordered stores; an element trap
   therefore precedes allocation/OOM. Expansion is capped at 50,000,000
   elements, and even an empty literal allocates a Boolean-tagged empty value.
-  LLVM remains fail closed.
+  At the G1.5 checkpoint LLVM remained fail closed.
 
   G1.5 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
   SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
@@ -455,6 +485,36 @@ LLVM rejection remains in force.
   and the SVM differential passed 86/86.
   `free_list_return_random`, grind-budget, LSP, and doc-tests were
   green. G1.5 is closed.
+- **Native Boolean arrays add a lifetime, not a transport ABI.** G1.6 lowers
+  only a fresh owned-local `[bool]` produced by `alloc_array<bool>` or a
+  contextual literal. Its `{ ptr, i64 }` descriptor and `i8` element bytes are
+  internal. Allocation/free cross the external versioned runtime hooks only
+  for nonempty storage; zero length bypasses both. The 50,000,000-element cap
+  and hook-null failure report kind 9 `(0, len, 0)`, while unsigned bounds
+  failure reports kind 10 `(0, index, len)`. Guard dominance, canonical bytes,
+  literal/operand order, and the absence of `inbounds` promises are structural
+  emitter invariants.
+
+  The compiler tracks successfully initialized array locals in a stack of
+  lexical cleanup scopes. Function, branch-arm, and loop-body scopes destroy
+  in reverse declaration order; returns preserve expression effects before
+  unwinding all active scopes, and loop cleanup precedes the backedge. Unsafe
+  blocks do not push a cleanup scope, and trap edges do not clean up. The
+  interpreter uses the same boundary: dropping an array place removes its
+  runtime binding, including branch and loop locals, while a trapped frame
+  retains its places because unwinding is not language semantics.
+
+  G1.6's complete low-concurrency command
+  (`CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+  SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
+  --test-threads=1 --nocapture`) is green. So are `cargo check` and the
+  standalone 22-target one-job Lake build. Rust library tests pass 185/185 and
+  LLVM units 26/26; all 395 corpus subjects (83 verifies, 245 must-fail, 48
+  tests, 19 test-fails) pass in 192.76s; LLVM CLI passes 7/7, including the
+  strong-hook fixture at Clang `-O0`/`-O2`; the exact interpreter/native
+  differential passes 1/1 over six subjects at both levels; and SVM remains
+  86/86. Randomized allocator, grind-budget, LSP, documentation, diff-check,
+  and static-audit gates are green. G1.6 is closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across
@@ -485,7 +545,19 @@ LLVM rejection remains in force.
   `p` is the base and `mem` is the complete matching raw extent; lowering is
   the SVM's `rawFree`.
 - **A destructor owns the value outright** (ADR 0029). `deinit` bodies run; the class invariant holds on *entry* and is not re-established, so a destructor owes no `inv_exit` and has no `_old_self`. It may move fields out — the *field* is the place that dies, and untouched siblings stay readable — and a moved field is not dropped again. The interpreter's order within a drop is **invariant → body → remaining fields in reverse declaration order**. Classes hold resource fields; `#[must_consume]` turns an abandoned one from a permitted leak into a diagnostic. `&mut self.f` is legal in a destructor and nowhere else, because the invariant it could break no longer has to hold.
-- **A move is one operation, and every sink performs it** (ADR 0030). A declaration, an assignment, a field assignment, a call/constructor/method argument and a return all *take* a value: the source place stops holding it, and whatever the destination held is destroyed. The interpreter has one `take_place`/`drop_place` behind `eval_moved` — overwriting a place runs a full drop (invariant → destructor → remaining fields), a returned local leaves with the caller rather than being destroyed behind it, and an owned parameter dies with the callee's frame after its contract has been checked. The checker has one `transfer` at the matching sinks: it kills the source place, applies the loan-brand rule (recursively, so `raw_offset(p, 1)` cannot launder what `p` may not), and reports whether a `#[must_consume]` obligation travelled with the value. Affinity covers class values, resources, **and owned arrays** — two names reaching the same elements is unsound the same way, and the diagnostic names the category (`class`/`resource`/`array` prefixes on `use_after_move` and `loop_shape`). A member may move a field out but must restore it before it exits (`class.field_not_restored`); only a `deinit` may leave a hole, because only there is the invariant already gone. A contract still reads a moved-from parameter's entry value: a value outlives the transfer of authority over it. Branch joins and loop checks operate over the whole per-place state (`PlaceState`: initialized, branded, obligation) rather than a chosen subset: branches join initialization by AND and brand/obligation by OR over reaching paths, while a loop requires its backedge to preserve affine liveness, brands, and obligations before restoring the zero-iteration entry state. Every `Place` maps to that state by its complete rendered key (`self.f`, not merely `self`). The `#[must_consume]` obligation is a *state of the place*: moving the token clears it, landing sets it, a marked field regains it on assignment, and a live one may not be assigned over. Two corollaries about *where* a value dies: a discarded class-valued result is a temporary with no place, destroyed at the end of its statement, and **`unsafe { ... }` is a marker while an exposure body is a scope** — the block grants vocabulary and has no lifetime (its locals belong to the enclosing function, and the interpreter runs it through `exec_open_block`), while an exposure *is* a lifetime, so the loan's bindings and everything the body declared end at its closing brace. Scope exit rejects a disappearing local that still holds a must-consume token.
+- **A move is one operation, and every sink performs it** (ADR 0030). A declaration, an assignment, a field assignment, a call/constructor/method argument and a return all *take* a value: the source place stops holding it, and whatever the destination held is destroyed. The interpreter has one `take_place`/`drop_place` behind `eval_moved` — overwriting a place runs a full drop (invariant → destructor → remaining fields), a returned local leaves with the caller rather than being destroyed behind it, and an owned parameter dies with the callee's frame after its contract has been checked. The checker has one `transfer` at the matching sinks: it kills the source place, applies the loan-brand rule (recursively, so `raw_offset(p, 1)` cannot launder what `p` may not), and reports whether a `#[must_consume]` obligation travelled with the value. Affinity covers class values, resources, **and owned arrays** — two names reaching the same elements is unsound the same way, and the diagnostic names the category (`class`/`resource`/`array` prefixes on `use_after_move` and `loop_shape`). A member may move a field out but must restore it before it exits (`class.field_not_restored`); only a `deinit` may leave a hole, because only there is the invariant already gone. A contract still reads a moved-from parameter's entry value: a value outlives the transfer of authority over it. Branch joins and loop checks operate over the whole per-place state (`PlaceState`: initialized, branded, obligation) rather than a chosen subset: branches join initialization by AND and brand/obligation by OR over reaching paths, while a loop requires its backedge to preserve affine liveness, brands, and obligations before restoring the zero-iteration entry state. Every `Place` maps to that state by its complete rendered key (`self.f`, not merely `self`). The `#[must_consume]` obligation is a *state of the place*: moving the token clears it, landing sets it, a marked field regains it on assignment, and a live one may not be assigned over.
+
+  G1.6's lifetime audit closed a legacy exception to that rule: array-field
+  assignment has a special whole-array consuming path, and it had stamped a
+  matching owned type without first checking whether the local source was
+  already moved. The checker now performs the moved-place guard explicitly;
+  the interpreter's `eval_moved` takes a named owned-array source, while local
+  and owned-parameter drops remove arrays from their places. The 245th
+  must-fail subject moves one integer array into two fields and pins
+  `array.use_after_move`, preventing two logical sequences from sharing one
+  mutable backing allocation.
+
+  Two corollaries about *where* a value dies: a discarded class-valued result is a temporary with no place, destroyed at the end of its statement, and **`unsafe { ... }` is a marker while an exposure body is a scope** — the block grants vocabulary and has no lifetime (its locals belong to the enclosing function, and the interpreter runs it through `exec_open_block`), while an exposure *is* a lifetime, so the loan's bindings and everything the body declared end at its closing brace. Scope exit rejects a disappearing local that still holds a must-consume token.
 - **Non-memory resources, and an explicit world** (ADR 0028). `resource OpenFile` is the authority to use one descriptor (position in the view, as POSIX has it); `resource PosixWorld` is the outside, and any foreign operation touching global state must receive it explicitly — which is what replaces a `modifies` clause over the universe, and lets a caller see from a signature whether a function can reach outside. Authority for a descriptor is carved from the world (`open_file(&mut w, fd)`) with *availability* as a precondition — open, and not already handed out — and carving **spends** it (`PosixWorldView.claimed`, updated functionally as `w.claim fd`), since affinity governs a token that exists and would not stop a second being minted beside it (ADR 0030). The checker tracks tokens, the VCs track the state of the outside. `posix_world(script)` is confined to `test_` functions — the one place authority appears from nothing — and the script is how a test author controls short reads and I/O errors, which the *view* deliberately does not model because no contract can predict them.
 - **Foreign contracts are audited, and the build says so** (ADR 0027). `extern "C" #[audit(id := ..., reason := ...)] fn f(...);` owes no obligations — there is no body to check — but its clauses still get well-formedness defs, and the audit metadata is mandatory. Effects are structural: only a passed `resource &mut R` may change, so there is no `modifies` clause in the language. Resource erasure at this boundary is governed by an explicit ABI whitelist (`RawSpan`, `OpenFile`, and `PosixWorld`), not a permissive “all resources erase” rule; sealed allocator authorities and profile capabilities such as `Uart` cannot cross an extern. **Nonescape sits on the audited side of the boundary**: that a callee unable to *return* storage cannot retain it is compiler-checked for a verified callee (no globals, so the pointer dies with the frame) and an audited promise for a foreign one, since nothing stops C stashing it in a foreign global — part of what the audit id covers (ADR 0030). The trust manifest is emitted **into** the hashed Lean content, so changing an audit id invalidates an artifact exactly as changing a proof does (ADR 0018's hash is over bytes); importers inherit it through the flat merge. Status reads `verified relative to audited boundary`, never `fully verified`, whenever an extern assumption remains. `sable test` supplies deterministic shims keyed on the *audit id*; an unknown id traps rather than running the empty body.
 - **A safe `[u8]` reaches raw memory through a lexical construct, not a proof** (ADR 0026). `unsafe expose &a / &mut a as (p, resource m) { ... }` lends the array's bytes for the body and takes them back: entry binds a span whose bytes are the array's elements, exit makes the array what the bytes say, under generated obligations (the whole extent came back; every byte is present and in `u8` range). Hidden *loan brands* do nonescape with no lifetime syntax — branded values cannot be returned, assigned outside the body, or passed to a user function — and the brand follows provenance through `raw_offset`/`split_off`/`join` but not onto loaded bytes. Raw operations pair a pointer with a resource borrow (`Ty::Raw`, `Val::Ptr`, `SpanView.namesByte`) and live inside `unsafe`; `unsafe regions: N` is reported in build output. `raw_copy_nonoverlapping` carries **no nonoverlap premise**: two distinct affine tokens *are* separation.
@@ -588,6 +660,7 @@ docs/PLAN.md       milestones and exit criteria (kept current)
 docs/decisions/    ADRs — one settled decision each, with the why
 compiler/          Rust package `sable` (single crate until it hurts; split when it does)
 lean/              Lake package: Sable prelude; pinned via lean-toolchain
+runtime/hosted/    optional C implementation of versioned native runtime hooks
 corpus/verifies/   programs that must verify (status: fully verified)
 corpus/must-fail/  programs annotated with the exact diagnostic that must fire
 corpus/tests/      dynamic-test programs (import subjects from corpus/verifies via

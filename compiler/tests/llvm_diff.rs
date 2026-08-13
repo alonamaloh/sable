@@ -45,6 +45,11 @@ const CASES: &[Case] = &[
         source: "pod_record.sable",
         entry: "pod_record_entry",
     },
+    Case {
+        label: "bool-arrays",
+        source: "bool_arrays.sable",
+        entry: "bool_arrays_entry",
+    },
 ];
 
 fn repo_root() -> &'static Path {
@@ -66,6 +71,7 @@ fn verified_llvm_matches_the_interpreter_at_o0_and_o2() {
     };
 
     let temp = temp_dir("diff");
+    let hosted_runtime = repo_root().join("runtime/hosted/sable_rt_v1.c");
     for case in CASES {
         let source = repo_root().join("corpus/llvm-diff").join(case.source);
         eprintln!("llvm-diff {}: verify", case.label);
@@ -114,6 +120,8 @@ fn verified_llvm_matches_the_interpreter_at_o0_and_o2() {
             let compile = Command::new(&clang)
                 .args([optimization, "-x", "ir"])
                 .arg(&ir_path)
+                .args(["-x", "c"])
+                .arg(&hosted_runtime)
                 .arg("-o")
                 .arg(&executable)
                 .output()

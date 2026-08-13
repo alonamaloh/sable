@@ -2,8 +2,9 @@
 
 **Decided and implemented 2026-08-12; scalar v0 complete. G1.3 Boolean-option
 and G1.4a POD-record extensions implemented and closed 2026-08-13; G1.5's
-formal Boolean-array extension is closed while owned-local Boolean arrays remain
-explicitly rejected by LLVM.** Unsafe
+formal Boolean-array extension is closed. G1.6's owned-local native-array
+extension is implemented and closed 2026-08-13; ADR 0059 pins its runtime and
+lifetime contract.** Unsafe
 Sable v1 had a defensible formal stopping point but no native-code path. This
 backend makes verified
 programs in its deliberately narrow runtime subset runnable without making LLVM
@@ -97,9 +98,12 @@ failures, not a stable calling convention for Sable functions.
 The `v1` numeric schema is fixed independently of Rust enum layout. Failure
 `kind` values are 1 add overflow, 2 subtract overflow, 3 multiply overflow,
 4 negation overflow, 5 division/remainder by zero, 6 signed division overflow,
-7 narrowing out of range, and 8 option value of none. Kind 8 has zero
+7 narrowing out of range, 8 option value of none, 9 owned-array allocation
+failure, and 10 array index out of bounds. Kind 8 has zero
 `type_info`, `lhs_bits`, and `rhs_bits`: there is no integer operation to
-describe. Integer type codes are 1 through 8 for
+describe. Array kinds likewise use zero `type_info`: kind 9 carries
+`lhs_bits = len`, `rhs_bits = 0`, and kind 10 carries `lhs_bits = index`,
+`rhs_bits = len`. Integer type codes are 1 through 8 for
 `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, and `i64`, respectively.
 `type_info` packs the result/destination code in bits 0–7, the left/source code
 in bits 8–15, and the optional right code in bits 16–23. Operand payloads are
@@ -261,16 +265,17 @@ subjects at `-O0` and `-O2`; and the unchanged SVM differential at 76/76. A
 standalone corpus repeat was green in 195.71s; randomized allocator,
 grind-budget, LSP, and documentation gates were green. This closes G1.4b but
 claims no LLVM Boolean-array support. G1.5 has since closed the formal SVM
-semantics; native array lowering remains a separate later stage.
+semantics; G1.6 and ADR 0059 subsequently supply the separate native stage.
 
 ## G1.5 boundary: formal arrays are not LLVM arrays
 
 G1.5 adds tagged `ArrayVal.ints` and `ArrayVal.bools` payloads to the formal SVM
 and admits the already-authorized owned-local Boolean-array slice to the Rust
-differential bridge. It does not amend this ADR's representation decision. The
-LLVM emitter still rejects Boolean arrays, including empty values whose formal
-machine tag is observable. No native allocation, storage, lifetime, trap, or
-ABI policy follows from the formal value.
+differential bridge. At that checkpoint it did not amend this ADR's
+representation decision: the LLVM emitter still rejected Boolean arrays,
+including empty values whose formal machine tag is observable. No native
+allocation, storage, lifetime, trap, or ABI policy followed from the formal
+value alone.
 
 The Rust bridge likewise stays smaller than a native aggregate ABI: only a
 fresh owned local from `alloc_array<bool>` or a contextual literal, followed by
@@ -289,7 +294,73 @@ with required Clang; the exact `VerifiedProgram`↔Clang differential passed 1/1
 over five subjects at `-O0` and `-O2`; and the exact Rust↔Lean SVM
 differential passed 86/86. `free_list_return_random`, grind-budget, LSP, and
 doc-tests were green. This closes G1.5 while the LLVM Boolean-array boundary
-remains closed.
+remained closed; G1.6 is the separately reviewed widening below.
+
+## G1.6 amendment: internal owned-local Boolean arrays
+
+G1.6 admits exactly the source intersection established in G1.4b and carried
+through the formal machine in G1.5. A fresh owned-local `[bool]` may be
+initialized by `alloc_array<bool>` or a contextual literal and then used for
+length, checked reads, and element stores. LLVM represents the local as
+`%sable.array.bool = type { ptr, i64 }`: opaque data pointer followed by `u64`
+length. Each element is one canonical zero/one `i8` byte, never packed `i1`
+storage. The internal descriptor and checked source type distinguish the
+Boolean payload even when zero length is represented by a null pointer.
+
+Storage is deliberately outside the generated module. Nonempty arrays use the
+external versioned hooks `__sable_rt_array_alloc_v1(i64 bytes)` and
+`__sable_rt_array_free_v1(ptr)`; a zero-length array calls neither. The
+optional hosted shim `runtime/hosted/sable_rt_v1.c` checks that the fixed-width
+byte count fits `size_t` and then uses the C allocator. LLVM output never names
+`malloc` or `free`, and no weak allocator default is embedded in a module.
+
+Evaluation order is preserved explicitly. Allocation evaluates length and
+then the Boolean initializer before checking the 50,000,000-element native
+profile cap and the hook result. A literal evaluates all elements
+left-to-right before allocating, then writes their canonical bytes in order.
+Store evaluates index and then value, performs an unsigned bounds check, and
+only afterward forms a non-`inbounds` address and writes; read also guards
+before address and load. Exceeding the cap or receiving null reports kind 9
+with `(type_info, lhs_bits, rhs_bits) = (0, len, 0)`. An out-of-bounds read or
+write reports kind 10 with `(0, index, len)`. The versioned observer is still
+followed unconditionally by `llvm.trap`.
+
+The new ownership substrate is lexical. Function bodies, `if` arms, and each
+`while` iteration are cleanup scopes. Normal exits destroy owned arrays in
+reverse declaration order; loop cleanup runs before the backedge. A return
+evaluates its expression first and then unwinds active scopes inner-to-outer.
+`unsafe` remains an open marker whose declarations belong to the enclosing
+scope. Trap edges do not run cleanup. This mirrors the interpreter rather than
+assuming host-language exception unwinding.
+
+This is not an array transport or public ABI. Boolean-array parameters,
+returns, fields, borrows, exposure, whole-array rebinding or movement, call
+transport, extern/public positions, generic or option containment, and
+discarded array temporaries remain rejected. Integer arrays are independently
+outside the native slice. Internal `{ ptr, i64 }` spelling and runtime-hook
+contract therefore authorize no cross-module or C-compatible Sable array
+layout.
+
+The lifetime audit also closed a pre-existing integer-array ownership bug.
+Array-field assignment is a special consuming boundary because ordinary
+whole-array reads are forbidden; it now explicitly checks whether a named
+source was already moved before stamping its contextual type. Interpreter
+ownership transfer now takes named array sources, and lexical/frame drops
+remove owned-array places. The regression that moves one integer array into two
+fields requires `array.use_after_move`, bringing the corpus inventory to 395
+subjects (83 verifies, 245 must-fail, 48 tests, 19 test-fails).
+
+G1.6 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 SABLE_TEST_JOBS=1
+SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 -- --test-threads=1
+--nocapture`. `cargo check` and the standalone 22-target one-job Lake build
+were green; Rust library tests passed 185/185 and LLVM units 26/26; all 395
+corpus subjects (83 verifies, 245 must-fail, 48 tests, 19 test-fails) passed in
+192.76s; LLVM CLI passed 7/7, including the strong-hook fixture at Clang `-O0`
+and `-O2`; the exact interpreter/native differential passed 1/1 over six
+subjects at both levels; and SVM differential remained 86/86. Randomized
+allocator, grind-budget, LSP, documentation, diff-check, and static-audit gates
+were green. G1.6 is closed. ADR 0059 is the detailed representation, runtime,
+and lifetime decision.
 
 ## Consequences
 
@@ -297,9 +368,10 @@ This path gets Sable to native toolchains without expanding the trusted proof
 base: Lean still checks contracts, while the new emitter is an additional
 compiler component whose correctness is tested rather than assumed proven.
 Starting from `VerifiedProgram` prevents verification/code-generation skew.
-The cost is a backend intentionally limited to scalar, Boolean-option, and
-internal integer-POD values, with Boolean arrays still rejected, and
-explicit traps/control flow where less careful LLVM frontends often rely on
-poison. Broader aggregate representations and every aggregate ABI, extern
+The cost is a backend intentionally limited to scalar, Boolean-option,
+internal integer-POD values, and one owned-local Boolean-array slice, with all
+array transport still rejected, plus explicit traps/control flow where less
+careful LLVM frontends often rely on poison. Broader aggregate representations
+and every aggregate ABI, extern
 interoperability, optimization, debug information, object emission, and stable
 cross-module symbols remain separate decisions.

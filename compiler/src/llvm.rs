@@ -1,5 +1,5 @@
 //! Strict textual LLVM IR lowering for the verified scalar, Boolean-option,
-//! and bounded POD-record core (ADR 0058).
+//! bounded POD-record, and owned-local Boolean-array core (ADRs 0058--0059).
 //!
 //! This first slice handles scalar storage, calls, comparisons, and structured
 //! control flow.  A construct is either lowered with its Sable meaning or
@@ -11,6 +11,8 @@ use crate::ast::{BinOp, Expr, ExprKind, Fn, IntTy, Program, RecordDecl, Stmt, Ty
 use crate::diag::Diagnostic;
 use crate::span::Span;
 use std::collections::{BTreeSet, HashMap, HashSet};
+
+const BOOL_ARRAY_CAPACITY: u64 = 50_000_000;
 
 pub type BackendError = Diagnostic;
 
@@ -349,32 +351,120 @@ fn validate_function(
         function.name_span,
         "function return type",
     )?;
-    validate_block(program, &function.body, root_span_end)
+    let mut locals = ValidationLocals::new();
+    for parameter in &function.params {
+        locals.insert(
+            parameter.name.clone(),
+            ValidationLocal {
+                ty: parameter.ty,
+                mutable: false,
+            },
+            parameter.span,
+        )?;
+    }
+    validate_block(program, &function.body, root_span_end, &mut locals)
+}
+
+#[derive(Clone, Copy)]
+struct ValidationLocal {
+    ty: Ty,
+    mutable: bool,
+}
+
+/// The checker reserves local names function-wide, while ordinary `if` and
+/// `while` bodies have lexical lifetimes. `unsafe` is only a vocabulary gate,
+/// so its declarations intentionally enter the current scope.
+struct ValidationLocals {
+    scopes: Vec<HashMap<String, ValidationLocal>>,
+    declared: HashSet<String>,
+}
+
+impl ValidationLocals {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+            declared: HashSet::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        name: String,
+        local: ValidationLocal,
+        span: Span,
+    ) -> Result<(), Vec<BackendError>> {
+        if !self.declared.insert(name.clone()) {
+            return Err(vec![unsupported(
+                span,
+                format!("duplicate LLVM local `{name}` escaped checking"),
+            )]);
+        }
+        self.scopes
+            .last_mut()
+            .expect("validation has a function scope")
+            .insert(name, local);
+        Ok(())
+    }
+
+    fn get(&self, name: &str) -> Option<ValidationLocal> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        assert!(self.scopes.len() > 1, "cannot pop the function scope");
+        self.scopes.pop();
+    }
 }
 
 fn validate_block(
     program: &Program,
     statements: &[Stmt],
     root_span_end: usize,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     for statement in statements {
         match statement {
             Stmt::Decl {
                 ty,
+                name,
                 name_span,
                 init,
-                ..
+                mutable,
             } => {
                 require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
-                if let Some(value) = init {
-                    validate_expr(program, value, root_span_end)?;
+                if is_owned_bool_array(*ty) {
+                    let Some(value) = init else {
+                        return Err(vec![unsupported(
+                            *name_span,
+                            format!("owned Boolean-array local `{name}` has no initializer"),
+                        )]);
+                    };
+                    validate_fresh_bool_array_initializer(program, value, root_span_end, locals)?;
+                } else if let Some(value) = init {
+                    validate_expr(program, value, root_span_end, locals)?;
                 }
+                locals.insert(
+                    name.clone(),
+                    ValidationLocal {
+                        ty: *ty,
+                        mutable: *mutable,
+                    },
+                    *name_span,
+                )?;
             }
             Stmt::VarDecl {
                 ty,
+                name,
                 name_span,
                 init,
-                ..
+                mutable,
             } => {
                 let Some(ty) = *ty else {
                     return Err(vec![unsupported(
@@ -383,29 +473,75 @@ fn validate_block(
                     )]);
                 };
                 require_local_value(program, root_span_end, ty, *name_span, "inferred local")?;
-                validate_expr(program, init, root_span_end)?;
+                if is_owned_bool_array(ty) {
+                    validate_fresh_bool_array_initializer(program, init, root_span_end, locals)?;
+                } else {
+                    validate_expr(program, init, root_span_end, locals)?;
+                }
+                locals.insert(
+                    name.clone(),
+                    ValidationLocal {
+                        ty,
+                        mutable: *mutable,
+                    },
+                    *name_span,
+                )?;
             }
-            Stmt::Assign { value, .. }
-            | Stmt::ExprStmt(value)
+            Stmt::Assign {
+                name,
+                name_span,
+                value,
+            } => {
+                let Some(local) = locals.get(name) else {
+                    return Err(vec![unsupported(
+                        *name_span,
+                        format!("assignment names unknown or out-of-scope local `{name}`"),
+                    )]);
+                };
+                if !local.mutable {
+                    return Err(vec![unsupported(
+                        *name_span,
+                        format!("assignment targets immutable local `{name}`"),
+                    )]);
+                }
+                if is_owned_bool_array(local.ty) {
+                    return Err(vec![unsupported(
+                        *name_span,
+                        format!("owned Boolean-array local `{name}` cannot be rebound"),
+                    )]);
+                }
+                validate_expr(program, value, root_span_end, locals)?;
+                require_expr_type(value, local.ty, "assignment value")?;
+            }
+            Stmt::ExprStmt(value)
             | Stmt::Return {
                 value: Some(value), ..
-            } => validate_expr(program, value, root_span_end)?,
+            } => validate_expr(program, value, root_span_end, locals)?,
             Stmt::Return { value: None, .. } | Stmt::Assert(_) => {}
-            Stmt::Unsafe { body, .. } => validate_block(program, body, root_span_end)?,
+            Stmt::Unsafe { body, .. } => validate_block(program, body, root_span_end, locals)?,
             Stmt::If {
                 cond,
                 then_block,
                 else_block,
             } => {
-                validate_bool_expr(program, cond, "`if` condition", root_span_end)?;
-                validate_block(program, then_block, root_span_end)?;
+                validate_bool_expr(program, cond, "`if` condition", root_span_end, locals)?;
+                locals.push_scope();
+                let then_result = validate_block(program, then_block, root_span_end, locals);
+                locals.pop_scope();
+                then_result?;
                 if let Some(else_block) = else_block {
-                    validate_block(program, else_block, root_span_end)?;
+                    locals.push_scope();
+                    let else_result = validate_block(program, else_block, root_span_end, locals);
+                    locals.pop_scope();
+                    else_result?;
                 }
             }
             Stmt::While { cond, body, .. } => {
-                validate_bool_expr(program, cond, "`while` condition", root_span_end)?;
-                validate_block(program, body, root_span_end)?;
+                validate_bool_expr(program, cond, "`while` condition", root_span_end, locals)?;
+                locals.push_scope();
+                let body_result = validate_block(program, body, root_span_end, locals);
+                locals.pop_scope();
+                body_result?;
             }
             Stmt::FieldAssign { field_span, .. } | Stmt::FieldStore { field_span, .. } => {
                 return Err(vec![unsupported(
@@ -413,12 +549,20 @@ fn validate_block(
                     "class field mutation is outside the scalar LLVM subset",
                 )]);
             }
-            Stmt::Store { array_span, .. } => {
-                return Err(vec![unsupported(
-                    *array_span,
-                    "array mutation is outside the scalar LLVM subset",
-                )]);
-            }
+            Stmt::Store {
+                array,
+                array_span,
+                index,
+                value,
+            } => validate_bool_array_store(
+                program,
+                array,
+                *array_span,
+                index,
+                value,
+                root_span_end,
+                locals,
+            )?,
             Stmt::StaticAlloc { kw_span, .. }
             | Stmt::SystemAlloc { kw_span, .. }
             | Stmt::SystemDealloc { kw_span, .. }
@@ -433,10 +577,104 @@ fn validate_block(
     Ok(())
 }
 
+fn is_owned_bool_array(ty: Ty) -> bool {
+    matches!(ty, Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned))
+}
+
+fn validate_fresh_bool_array_initializer(
+    program: &Program,
+    expression: &Expr,
+    root_span_end: usize,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    let expected = Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned);
+    require_expr_type(expression, expected, "owned Boolean-array initializer")?;
+    match &expression.kind {
+        ExprKind::ArrayLit(elements) => {
+            if elements.len() as u64 > BOOL_ARRAY_CAPACITY {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "Boolean array literal has {} elements; the native allocation cap is {BOOL_ARRAY_CAPACITY}",
+                        elements.len()
+                    ),
+                )]);
+            }
+            for element in elements {
+                validate_bool_expr(
+                    program,
+                    element,
+                    "Boolean array literal element",
+                    root_span_end,
+                    locals,
+                )?;
+            }
+            Ok(())
+        }
+        ExprKind::AllocArray { elem, len, init } if *elem == ValueTy::Bool => {
+            validate_expr(program, len, root_span_end, locals)?;
+            require_expr_type(len, Ty::Int(IntTy::U64), "Boolean array allocation length")?;
+            validate_bool_expr(
+                program,
+                init,
+                "Boolean array allocation initializer",
+                root_span_end,
+                locals,
+            )
+        }
+        _ => Err(vec![unsupported(
+            expression.span,
+            "owned Boolean-array local must be initialized by a fresh literal or `alloc_array<bool>`",
+        )]),
+    }
+}
+
+fn validate_bool_array_store(
+    program: &Program,
+    array: &str,
+    array_span: Span,
+    index: &Expr,
+    value: &Expr,
+    root_span_end: usize,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    let Some(local) = locals.get(array) else {
+        return Err(vec![unsupported(
+            array_span,
+            format!("array store names unknown or out-of-scope local `{array}`"),
+        )]);
+    };
+    if !is_owned_bool_array(local.ty) {
+        return Err(vec![unsupported(
+            array_span,
+            format!(
+                "array store target `{array}` has unsupported LLVM type `{}`",
+                local.ty.name()
+            ),
+        )]);
+    }
+    if !local.mutable {
+        return Err(vec![unsupported(
+            array_span,
+            format!("array store targets immutable Boolean array `{array}`"),
+        )]);
+    }
+    validate_expr(program, index, root_span_end, locals)?;
+    require_expr_type(index, Ty::Int(IntTy::U64), "Boolean array store index")?;
+    validate_bool_expr(
+        program,
+        value,
+        "Boolean array store value",
+        root_span_end,
+        locals,
+    )
+}
+
 fn validate_expr(
     program: &Program,
     expression: &Expr,
     root_span_end: usize,
+    locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     match &expression.kind {
         ExprKind::IntLit(_) => {
@@ -449,14 +687,37 @@ fn validate_expr(
             require_concrete_integer(integer, expression.span, "integer literal")
         }
         ExprKind::BoolLit(_) => require_expr_type(expression, Ty::Bool, "Boolean literal"),
-        ExprKind::Var(_) => {
+        ExprKind::Var(name) => {
+            let Some(local) = locals.get(name) else {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!("expression names unknown or out-of-scope local `{name}`"),
+                )]);
+            };
+            if is_owned_bool_array(local.ty) {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!("owned Boolean-array local `{name}` cannot be transported as a value"),
+                )]);
+            }
             let ty = expression.ty.ok_or_else(|| {
                 vec![unsupported(
                     expression.span,
                     "expression is missing its checked type",
                 )]
             })?;
-            require_runtime_type(program, root_span_end, ty, expression.span, "expression")
+            require_runtime_type(program, root_span_end, ty, expression.span, "expression")?;
+            if ty != local.ty {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "local `{name}` has LLVM type `{}` but the expression is annotated `{}`",
+                        local.ty.name(),
+                        ty.name()
+                    ),
+                )]);
+            }
+            Ok(())
         }
         ExprKind::Call {
             callee,
@@ -494,7 +755,7 @@ fn validate_expr(
                 )]);
             }
             for (argument, parameter) in args.iter().zip(&function.params) {
-                validate_expr(program, argument, root_span_end)?;
+                validate_expr(program, argument, root_span_end, locals)?;
                 require_expr_type(argument, parameter.ty, "call argument")?;
             }
             require_runtime_type(
@@ -509,12 +770,18 @@ fn validate_expr(
         ExprKind::Unary {
             op: UnOp::Not,
             operand,
-        } => validate_bool_expr(program, operand, "logical-not operand", root_span_end),
+        } => validate_bool_expr(
+            program,
+            operand,
+            "logical-not operand",
+            root_span_end,
+            locals,
+        ),
         ExprKind::Unary {
             op: UnOp::Neg,
             operand,
         } => {
-            validate_expr(program, operand, root_span_end)?;
+            validate_expr(program, operand, root_span_end, locals)?;
             let Some(Ty::Int(integer)) = operand.ty else {
                 return Err(vec![unsupported(
                     operand.span,
@@ -535,8 +802,20 @@ fn validate_expr(
             rhs,
             ..
         } => {
-            validate_bool_expr(program, lhs, "short-circuit left operand", root_span_end)?;
-            validate_bool_expr(program, rhs, "short-circuit right operand", root_span_end)?;
+            validate_bool_expr(
+                program,
+                lhs,
+                "short-circuit left operand",
+                root_span_end,
+                locals,
+            )?;
+            validate_bool_expr(
+                program,
+                rhs,
+                "short-circuit right operand",
+                root_span_end,
+                locals,
+            )?;
             require_expr_type(expression, Ty::Bool, "short-circuit result")
         }
         ExprKind::Binary {
@@ -545,8 +824,8 @@ fn validate_expr(
             rhs,
             ..
         } => {
-            validate_expr(program, lhs, root_span_end)?;
-            validate_expr(program, rhs, root_span_end)?;
+            validate_expr(program, lhs, root_span_end, locals)?;
+            validate_expr(program, rhs, root_span_end, locals)?;
             let Some(Ty::Int(lhs_ty)) = lhs.ty else {
                 return Err(vec![unsupported(
                     lhs.span,
@@ -571,8 +850,8 @@ fn validate_expr(
             rhs,
             ..
         } => {
-            validate_expr(program, lhs, root_span_end)?;
-            validate_expr(program, rhs, root_span_end)?;
+            validate_expr(program, lhs, root_span_end, locals)?;
+            validate_expr(program, rhs, root_span_end, locals)?;
             let Some(Ty::Int(integer)) = lhs.ty else {
                 return Err(vec![unsupported(
                     lhs.span,
@@ -592,7 +871,7 @@ fn validate_expr(
             require_expr_type(expression, Ty::Int(integer), "arithmetic result")
         }
         ExprKind::Widen { target, arg } => {
-            validate_expr(program, arg, root_span_end)?;
+            validate_expr(program, arg, root_span_end, locals)?;
             require_concrete_integer(*target, expression.span, "widen target")?;
             let Some(Ty::Int(source)) = arg.ty else {
                 return Err(vec![unsupported(
@@ -613,7 +892,7 @@ fn validate_expr(
             require_expr_type(expression, Ty::Int(*target), "widen result")
         }
         ExprKind::Narrow { target, arg } => {
-            validate_expr(program, arg, root_span_end)?;
+            validate_expr(program, arg, root_span_end, locals)?;
             require_concrete_integer(*target, expression.span, "narrow target")?;
             if !matches!(arg.ty, Some(Ty::Int(_))) {
                 return Err(vec![unsupported(
@@ -629,7 +908,13 @@ fn validate_expr(
                 Ty::Option(ValueTy::Bool),
                 "Boolean option construction",
             )?;
-            validate_bool_expr(program, inner, "Boolean option payload", root_span_end)
+            validate_bool_expr(
+                program,
+                inner,
+                "Boolean option payload",
+                root_span_end,
+                locals,
+            )
         }
         ExprKind::NoneE => require_expr_type(
             expression,
@@ -637,7 +922,7 @@ fn validate_expr(
             "Boolean option construction",
         ),
         ExprKind::IsSome { operand } => {
-            validate_expr(program, operand, root_span_end)?;
+            validate_expr(program, operand, root_span_end, locals)?;
             require_expr_type(
                 operand,
                 Ty::Option(ValueTy::Bool),
@@ -646,7 +931,7 @@ fn validate_expr(
             require_expr_type(expression, Ty::Bool, "`.is_some` result")
         }
         ExprKind::OptValue { operand } => {
-            validate_expr(program, operand, root_span_end)?;
+            validate_expr(program, operand, root_span_end, locals)?;
             require_expr_type(
                 operand,
                 Ty::Option(ValueTy::Bool),
@@ -654,6 +939,56 @@ fn validate_expr(
             )?;
             require_expr_type(expression, Ty::Bool, "Boolean option payload")
         }
+        ExprKind::Index {
+            array,
+            array_span,
+            index,
+        } => {
+            let Some(local) = locals.get(array) else {
+                return Err(vec![unsupported(
+                    *array_span,
+                    format!("array index names unknown or out-of-scope local `{array}`"),
+                )]);
+            };
+            if !is_owned_bool_array(local.ty) {
+                return Err(vec![unsupported(
+                    *array_span,
+                    format!(
+                        "array index base `{array}` has unsupported LLVM type `{}`",
+                        local.ty.name()
+                    ),
+                )]);
+            }
+            validate_expr(program, index, root_span_end, locals)?;
+            require_expr_type(index, Ty::Int(IntTy::U64), "Boolean array index")?;
+            require_expr_type(expression, Ty::Bool, "Boolean array index result")
+        }
+        ExprKind::Len { array } => {
+            let Some(local) = locals.get(array) else {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!("array length names unknown or out-of-scope local `{array}`"),
+                )]);
+            };
+            if !is_owned_bool_array(local.ty) {
+                return Err(vec![unsupported(
+                    expression.span,
+                    format!(
+                        "array length base `{array}` has unsupported LLVM type `{}`",
+                        local.ty.name()
+                    ),
+                )]);
+            }
+            require_expr_type(
+                expression,
+                Ty::Int(IntTy::U64),
+                "Boolean array length result",
+            )
+        }
+        ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } => Err(vec![unsupported(
+            expression.span,
+            "Boolean arrays are only values at a fresh owned-local initializer",
+        )]),
         ExprKind::RecordLit { record, args, .. } => {
             let Some(Ty::Record(record_index)) = expression.ty else {
                 return Err(vec![unsupported(
@@ -689,7 +1024,7 @@ fn validate_expr(
                 )]);
             }
             for (argument, field) in args.iter().zip(&declaration.fields) {
-                validate_expr(program, argument, root_span_end)?;
+                validate_expr(program, argument, root_span_end, locals)?;
                 require_expr_type(argument, field.ty, "record field initializer")?;
             }
             Ok(())
@@ -705,7 +1040,7 @@ fn validate_expr(
         }
         _ => Err(vec![unsupported(
             expression.span,
-            "expression is outside the scalar/Boolean-option/POD-record LLVM subset",
+            "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
         )]),
     }
 }
@@ -715,8 +1050,9 @@ fn validate_bool_expr(
     expression: &Expr,
     role: &str,
     root_span_end: usize,
+    locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    validate_expr(program, expression, root_span_end)?;
+    validate_expr(program, expression, root_span_end, locals)?;
     require_expr_type(expression, Ty::Bool, role)
 }
 
@@ -806,6 +1142,7 @@ fn require_local_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool | Ty::Option(ValueTy::Bool) => Ok(()),
+        ty if is_owned_bool_array(ty) => Ok(()),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
             span,
@@ -864,11 +1201,18 @@ const TRAP_DIV_ZERO: u32 = 5;
 const TRAP_DIV_OVERFLOW: u32 = 6;
 const TRAP_NARROW_RANGE: u32 = 7;
 const TRAP_OPTION_NONE: u32 = 8;
+const TRAP_ARRAY_OOM: u32 = 9;
+const TRAP_ARRAY_OOB: u32 = 10;
 
 /// Internal aggregate representation for the first non-integer option slice.
 /// This is deliberately not a C ABI promise: byte fields make the layout
 /// unambiguous inside generated LLVM while ordinary Sable `bool` remains i1.
 const LLVM_OPTION_BOOL: &str = "%sable.option.bool";
+
+/// Internal owned Boolean-array descriptor. Field 0 is either null for an
+/// empty array or a runtime-owned allocation containing one i8 byte per
+/// element; field 1 is the logical element count. This is not a source ABI.
+const LLVM_ARRAY_BOOL: &str = "%sable.array.bool";
 
 /// Nominal identity is the checked program's record tag, the same identity
 /// carried by interpreter/SVM values. Numeric names are deterministic and
@@ -946,6 +1290,7 @@ struct ModuleSupport {
     overflow_intrinsics: BTreeSet<OverflowIntrinsic>,
     needs_trap: bool,
     needs_option_bool: bool,
+    needs_array_bool: bool,
     records: BTreeSet<usize>,
 }
 
@@ -961,6 +1306,11 @@ impl ModuleSupport {
 
     fn require_option_bool(&mut self) {
         self.needs_option_bool = true;
+    }
+
+    fn require_array_bool(&mut self) {
+        self.needs_array_bool = true;
+        self.needs_trap = true;
     }
 
     fn require_record(&mut self, record: usize) {
@@ -994,6 +1344,15 @@ impl ModuleSupport {
             out.push_str(LLVM_OPTION_BOOL);
             out.push_str(" = type { i8, i8 }\n\n");
         }
+        if self.needs_array_bool {
+            out.push_str(LLVM_ARRAY_BOOL);
+            out.push_str(" = type { ptr, i64 }\n\n");
+            out.push_str(
+                "; target runtime hooks for owned Boolean-array storage; allocation size is bytes\n\
+                 declare ptr @__sable_rt_array_alloc_v1(i64)\n\
+                 declare void @__sable_rt_array_free_v1(ptr)\n\n",
+            );
+        }
         for record in &self.records {
             Self::emit_record_type(*record, &program.records[*record], out);
         }
@@ -1008,9 +1367,11 @@ impl ModuleSupport {
             out.push_str(
                 "; __sable_rt_trap_v1 kinds: 1 add, 2 sub, 3 mul, 4 neg, \
                  5 div/rem zero, 6 signed div overflow, 7 narrow range, \
-                 8 option value of none\n\
+                 8 option value of none, 9 array OOM, 10 array index OOB\n\
                  ; type_info bytes: result/destination, lhs/source, rhs; \
                  type codes u8..u64,i8..i64 = 1..8\n\
+                 ; array traps use type_info 0: OOM lhs=len/rhs=0; \
+                 OOB lhs=index/rhs=len\n\
                  declare void @llvm.trap() cold noreturn nounwind\n\n\
                  define weak void @__sable_rt_trap_v1(i32 %kind, i32 %type_info, \
                  i64 %lhs_bits, i64 %rhs_bits) nounwind {\n\
@@ -1055,6 +1416,10 @@ struct FunctionEmitter<'a, 'support> {
     /// that its terminator has been emitted; a sibling or merge may still be
     /// started afterwards.
     current_block: Option<String>,
+    /// Owned arrays initialized on the current structured path, grouped by
+    /// lexical lifetime. An `unsafe` block deliberately shares its caller's
+    /// scope; `if` branches and loop bodies push one of their own.
+    cleanup_scopes: Vec<Vec<String>>,
 }
 
 impl<'a, 'support> FunctionEmitter<'a, 'support> {
@@ -1069,6 +1434,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             next_block: 0,
             lines: Vec::new(),
             current_block: Some("entry".into()),
+            cleanup_scopes: vec![Vec::new()],
         }
     }
 
@@ -1127,6 +1493,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.emit_block(&self.function.body)?;
         if self.current_block.is_some() {
             if self.function.ret == Ty::Unit {
+                self.emit_current_scope_cleanups();
                 self.terminate("ret void");
             } else {
                 return Err(vec![diag(
@@ -1151,6 +1518,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     fn require_type_support(&mut self, ty: Ty) {
         match ty {
             Ty::Option(ValueTy::Bool) => self.support.require_option_bool(),
+            ty if is_owned_bool_array(ty) => self.support.require_array_bool(),
             Ty::Record(record) => self.support.require_record(record),
             _ => {}
         }
@@ -1210,8 +1578,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                             // A unit-returning call is still effectful.  Its
                             // absent LLVM operand is consumed by `ret void`,
                             // rather than being unwrapped as a scalar.
+                            self.emit_all_cleanups();
                             self.terminate("ret void");
                         } else {
+                            self.emit_all_cleanups();
                             self.terminate(format!(
                                 "ret {} {}",
                                 llvm_ty(emitted.ty),
@@ -1228,6 +1598,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                                 ),
                             )]);
                         }
+                        self.emit_all_cleanups();
                         self.terminate("ret void");
                     }
                 }
@@ -1239,6 +1610,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     else_block,
                 } => self.emit_if(cond, then_block, else_block.as_deref())?,
                 Stmt::While { cond, body, .. } => self.emit_while(cond, body)?,
+                Stmt::Store {
+                    array,
+                    index,
+                    value,
+                    ..
+                } => self.emit_bool_array_store(array, index, value)?,
                 _ => unreachable!("validated before lowering"),
             }
         }
@@ -1259,12 +1636,22 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         };
         let slot = local.slot.clone();
         if let Some(init) = init {
-            let value = self.emit_expr(init)?;
+            let value = if is_owned_bool_array(ty) {
+                self.emit_fresh_bool_array(init)?
+            } else {
+                self.emit_expr(init)?
+            };
             self.instruction(format!(
                 "store {} {}, ptr {slot}",
                 llvm_ty(ty),
                 value.operand.expect("local initializer is non-unit")
             ));
+            if is_owned_bool_array(ty) {
+                self.cleanup_scopes
+                    .last_mut()
+                    .expect("array declaration has a lexical cleanup scope")
+                    .push(name.to_owned());
+            }
         }
         Ok(())
     }
@@ -1287,19 +1674,25 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         ));
 
         self.start_block(then_label);
+        self.cleanup_scopes.push(Vec::new());
         self.emit_block(then_block)?;
         let then_reaches_merge = self.current_block.is_some();
         if then_reaches_merge {
+            self.emit_current_scope_cleanups();
             self.terminate(format!("br label %{merge_label}"));
         }
+        self.cleanup_scopes.pop();
 
         let else_reaches_merge = if let Some(else_block) = else_block {
             self.start_block(false_label);
+            self.cleanup_scopes.push(Vec::new());
             self.emit_block(else_block)?;
             let reaches = self.current_block.is_some();
             if reaches {
+                self.emit_current_scope_cleanups();
                 self.terminate(format!("br label %{merge_label}"));
             }
+            self.cleanup_scopes.pop();
             reaches
         } else {
             // The condition's false edge targets the merge directly.
@@ -1329,15 +1722,262 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         ));
 
         self.start_block(body_label);
+        self.cleanup_scopes.push(Vec::new());
         self.emit_block(body)?;
         if self.current_block.is_some() {
+            self.emit_current_scope_cleanups();
             self.terminate(format!("br label %{header_label}"));
         }
+        self.cleanup_scopes.pop();
 
         // The header's false edge always reaches this block, even when every
         // body path returns.
         self.start_block(exit_label);
         Ok(())
+    }
+
+    fn emit_fresh_bool_array(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
+        self.support.require_array_bool();
+        match &expression.kind {
+            ExprKind::ArrayLit(elements) => self.emit_bool_array_literal(elements),
+            ExprKind::AllocArray { len, init, .. } => self.emit_bool_array_allocation(len, init),
+            _ => unreachable!("validated fresh Boolean-array initializer"),
+        }
+    }
+
+    fn emit_bool_array_literal(&mut self, elements: &[Expr]) -> Result<Value, Vec<BackendError>> {
+        // Finish every source element before attempting allocation. This is
+        // observable when an element calls or traps, and matches the
+        // interpreter's left-to-right literal construction order.
+        let mut bytes = Vec::with_capacity(elements.len());
+        for element in elements {
+            let value = self.emit_expr(element)?;
+            let byte = self.new_temp();
+            self.instruction(format!(
+                "{byte} = zext i1 {} to i8",
+                value.operand.expect("validated Boolean literal element")
+            ));
+            bytes.push(byte);
+        }
+
+        let len = elements.len() as u64;
+        if len == 0 {
+            return Ok(Value {
+                ty: Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned),
+                operand: Some("zeroinitializer".into()),
+            });
+        }
+
+        let ptr = self.emit_array_alloc_call(&len.to_string());
+        for (index, byte) in bytes.iter().enumerate() {
+            let address = self.new_temp();
+            self.instruction(format!(
+                "{address} = getelementptr i8, ptr {ptr}, i64 {index}"
+            ));
+            self.instruction(format!("store i8 {byte}, ptr {address}"));
+        }
+        Ok(self.bool_array_descriptor(ptr, len.to_string()))
+    }
+
+    fn emit_bool_array_allocation(
+        &mut self,
+        len: &Expr,
+        init: &Expr,
+    ) -> Result<Value, Vec<BackendError>> {
+        // Sable evaluates both operands before deciding whether allocation
+        // succeeds. Keep the cap/null checks after those effects.
+        let len = self
+            .emit_expr(len)?
+            .operand
+            .expect("validated Boolean allocation length");
+        let init = self
+            .emit_expr(init)?
+            .operand
+            .expect("validated Boolean allocation initializer");
+        let byte = self.new_temp();
+        self.instruction(format!("{byte} = zext i1 {init} to i8"));
+
+        let over_cap = self.new_temp();
+        self.instruction(format!(
+            "{over_cap} = icmp ugt i64 {len}, {BOOL_ARRAY_CAPACITY}"
+        ));
+        self.emit_trap_branch(&over_cap, TRAP_ARRAY_OOM, 0, &len, "0");
+
+        let empty = self.new_temp();
+        self.instruction(format!("{empty} = icmp eq i64 {len}, 0"));
+        let zero_label = self.new_label("array.zero");
+        let alloc_label = self.new_label("array.alloc");
+        let merge_label = self.new_label("array.ready");
+        self.terminate(format!(
+            "br i1 {empty}, label %{zero_label}, label %{alloc_label}"
+        ));
+
+        self.start_block(zero_label.clone());
+        self.terminate(format!("br label %{merge_label}"));
+
+        self.start_block(alloc_label);
+        let ptr = self.emit_array_alloc_call(&len);
+        let fill_predecessor = self.current_label().to_owned();
+        let fill_head = self.new_label("array.fill.head");
+        let fill_body = self.new_label("array.fill.body");
+        let fill_end = self.new_label("array.fill.end");
+        self.terminate(format!("br label %{fill_head}"));
+
+        self.start_block(fill_head.clone());
+        let index = self.new_temp();
+        self.instruction(format!(
+            "{index} = phi i64 [ 0, %{fill_predecessor} ], [ %array.fill.next.{}, %{fill_body} ]",
+            self.next_temp
+        ));
+        // Reserve the human-readable backedge name before using ordinary
+        // temporaries again, so the phi references a unique SSA definition.
+        let next = format!("%array.fill.next.{}", self.next_temp);
+        self.next_temp += 1;
+        let more = self.new_temp();
+        self.instruction(format!("{more} = icmp ult i64 {index}, {len}"));
+        self.terminate(format!(
+            "br i1 {more}, label %{fill_body}, label %{fill_end}"
+        ));
+
+        self.start_block(fill_body.clone());
+        let address = self.new_temp();
+        self.instruction(format!(
+            "{address} = getelementptr i8, ptr {ptr}, i64 {index}"
+        ));
+        self.instruction(format!("store i8 {byte}, ptr {address}"));
+        self.instruction(format!("{next} = add i64 {index}, 1"));
+        self.terminate(format!("br label %{fill_head}"));
+
+        self.start_block(fill_end.clone());
+        self.terminate(format!("br label %{merge_label}"));
+
+        self.start_block(merge_label);
+        let merged_ptr = self.new_temp();
+        self.instruction(format!(
+            "{merged_ptr} = phi ptr [ null, %{zero_label} ], [ {ptr}, %{fill_end} ]"
+        ));
+        Ok(self.bool_array_descriptor(merged_ptr, len))
+    }
+
+    fn emit_array_alloc_call(&mut self, bytes: &str) -> String {
+        let ptr = self.new_temp();
+        self.instruction(format!(
+            "{ptr} = call ptr @__sable_rt_array_alloc_v1(i64 {bytes})"
+        ));
+        let failed = self.new_temp();
+        self.instruction(format!("{failed} = icmp eq ptr {ptr}, null"));
+        self.emit_trap_branch(&failed, TRAP_ARRAY_OOM, 0, bytes, "0");
+        ptr
+    }
+
+    fn bool_array_descriptor(&mut self, ptr: String, len: String) -> Value {
+        let with_ptr = self.new_temp();
+        self.instruction(format!(
+            "{with_ptr} = insertvalue {LLVM_ARRAY_BOOL} zeroinitializer, ptr {ptr}, 0"
+        ));
+        let descriptor = self.new_temp();
+        self.instruction(format!(
+            "{descriptor} = insertvalue {LLVM_ARRAY_BOOL} {with_ptr}, i64 {len}, 1"
+        ));
+        Value {
+            ty: Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned),
+            operand: Some(descriptor),
+        }
+    }
+
+    fn emit_bool_array_store(
+        &mut self,
+        array: &str,
+        index: &Expr,
+        value: &Expr,
+    ) -> Result<(), Vec<BackendError>> {
+        // Store order is index, value, then bounds/place access.
+        let index = self
+            .emit_expr(index)?
+            .operand
+            .expect("validated Boolean array store index");
+        let value = self
+            .emit_expr(value)?
+            .operand
+            .expect("validated Boolean array store value");
+        let byte = self.new_temp();
+        self.instruction(format!("{byte} = zext i1 {value} to i8"));
+        let (ptr, len) = self.load_bool_array_parts(array);
+        self.emit_bool_array_bounds_guard(&index, &len);
+        let address = self.new_temp();
+        self.instruction(format!(
+            "{address} = getelementptr i8, ptr {ptr}, i64 {index}"
+        ));
+        self.instruction(format!("store i8 {byte}, ptr {address}"));
+        Ok(())
+    }
+
+    fn load_bool_array_parts(&mut self, array: &str) -> (String, String) {
+        let slot = self
+            .locals
+            .get(array)
+            .expect("validated Boolean array local")
+            .slot
+            .clone();
+        let descriptor = self.new_temp();
+        self.instruction(format!("{descriptor} = load {LLVM_ARRAY_BOOL}, ptr {slot}"));
+        let ptr = self.new_temp();
+        self.instruction(format!(
+            "{ptr} = extractvalue {LLVM_ARRAY_BOOL} {descriptor}, 0"
+        ));
+        let len = self.new_temp();
+        self.instruction(format!(
+            "{len} = extractvalue {LLVM_ARRAY_BOOL} {descriptor}, 1"
+        ));
+        (ptr, len)
+    }
+
+    fn emit_bool_array_bounds_guard(&mut self, index: &str, len: &str) {
+        let outside = self.new_temp();
+        self.instruction(format!("{outside} = icmp uge i64 {index}, {len}"));
+        self.emit_trap_branch(&outside, TRAP_ARRAY_OOB, 0, index, len);
+    }
+
+    fn emit_current_scope_cleanups(&mut self) {
+        let names = self
+            .cleanup_scopes
+            .last()
+            .expect("cleanup has a function scope")
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in names {
+            self.emit_bool_array_drop(&name);
+        }
+    }
+
+    fn emit_all_cleanups(&mut self) {
+        let names = self
+            .cleanup_scopes
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.iter().rev())
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in names {
+            self.emit_bool_array_drop(&name);
+        }
+    }
+
+    fn emit_bool_array_drop(&mut self, array: &str) {
+        let (ptr, _) = self.load_bool_array_parts(array);
+        let empty = self.new_temp();
+        self.instruction(format!("{empty} = icmp eq ptr {ptr}, null"));
+        let free_label = self.new_label("array.free");
+        let done_label = self.new_label("array.free.done");
+        self.terminate(format!(
+            "br i1 {empty}, label %{done_label}, label %{free_label}"
+        ));
+        self.start_block(free_label);
+        self.instruction(format!("call void @__sable_rt_array_free_v1(ptr {ptr})"));
+        self.terminate(format!("br label %{done_label}"));
+        self.start_block(done_label);
     }
 
     fn emit_expr(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
@@ -1364,6 +2004,35 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 Ok(Value {
                     ty,
                     operand: Some(temp),
+                })
+            }
+            ExprKind::Index { array, index, .. } => {
+                // Index expression effects precede place access and its
+                // language-defined bounds trap.
+                let index = self
+                    .emit_expr(index)?
+                    .operand
+                    .expect("validated Boolean array index");
+                let (ptr, len) = self.load_bool_array_parts(array);
+                self.emit_bool_array_bounds_guard(&index, &len);
+                let address = self.new_temp();
+                self.instruction(format!(
+                    "{address} = getelementptr i8, ptr {ptr}, i64 {index}"
+                ));
+                let byte = self.new_temp();
+                self.instruction(format!("{byte} = load i8, ptr {address}"));
+                let value = self.new_temp();
+                self.instruction(format!("{value} = trunc i8 {byte} to i1"));
+                Ok(Value {
+                    ty: Ty::Bool,
+                    operand: Some(value),
+                })
+            }
+            ExprKind::Len { array } => {
+                let (_, len) = self.load_bool_array_parts(array);
+                Ok(Value {
+                    ty: Ty::Int(IntTy::U64),
+                    operand: Some(len),
                 })
             }
             ExprKind::RecordLit { record, args, .. } => {
@@ -2202,6 +2871,7 @@ fn llvm_ty(ty: Ty) -> String {
         Ty::Bool => "i1".into(),
         Ty::Unit => "void".into(),
         Ty::Option(ValueTy::Bool) => LLVM_OPTION_BOOL.into(),
+        ty if is_owned_bool_array(ty) => LLVM_ARRAY_BOOL.into(),
         Ty::Record(record) => llvm_record_ty(record),
         _ => unreachable!("type without an LLVM runtime representation validated out"),
     }
@@ -2468,6 +3138,33 @@ mod tests {
 
     fn bool_option_variable(name: &str) -> Expr {
         bool_option(ExprKind::Var(name.into()))
+    }
+
+    fn bool_array_ty() -> Ty {
+        Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned)
+    }
+
+    fn bool_array_literal(values: &[bool]) -> Expr {
+        expression(
+            ExprKind::ArrayLit(
+                values
+                    .iter()
+                    .map(|value| expression(ExprKind::BoolLit(*value), Ty::Bool))
+                    .collect(),
+            ),
+            bool_array_ty(),
+        )
+    }
+
+    fn bool_array_alloc(len: Expr, init: Expr) -> Expr {
+        expression(
+            ExprKind::AllocArray {
+                elem: ValueTy::Bool,
+                len: Box::new(len),
+                init: Box::new(init),
+            },
+            bool_array_ty(),
+        )
     }
 
     fn binary(operator: BinOp, integer: IntTy, lhs: Expr, rhs: Expr) -> Expr {
@@ -3006,7 +3703,7 @@ mod tests {
         let array_error =
             emit_program(&program(vec![local_array]), 1, &EmitOptions::default()).unwrap_err();
         assert_eq!(array_error[0].name, "backend.unsupported");
-        assert!(array_error[0].label.contains("local representation"));
+        assert!(array_error[0].label.contains("has no initializer"));
 
         for unsupported_return in [
             Ty::Option(ValueTy::Int(IntTy::I32)),
@@ -3070,6 +3767,362 @@ mod tests {
             emit_program(&program(vec![audited]), 1, &EmitOptions::default()).unwrap_err();
         assert_eq!(extern_error[0].name, "backend.unsupported");
         assert!(extern_error[0].label.contains("audited extern"));
+    }
+
+    #[test]
+    fn owned_boolean_arrays_lower_bytes_guards_and_reverse_cleanups() {
+        let array = bool_array_ty();
+        let len = expression(ExprKind::IntLit(3), Ty::Int(IntTy::U64));
+        let mut f = function(
+            "arrays",
+            Ty::Bool,
+            vec![
+                Stmt::Decl {
+                    ty: array,
+                    name: "first".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(bool_array_literal(&[true, false])),
+                    mutable: true,
+                },
+                Stmt::Unsafe {
+                    kw_span: Span::new(0, 1),
+                    body: vec![Stmt::Decl {
+                        ty: array,
+                        name: "second".into(),
+                        name_span: Span::new(0, 1),
+                        init: Some(bool_array_alloc(
+                            len,
+                            expression(ExprKind::BoolLit(true), Ty::Bool),
+                        )),
+                        mutable: true,
+                    }],
+                },
+                Stmt::Store {
+                    array: "second".into(),
+                    array_span: Span::new(0, 1),
+                    index: expression(ExprKind::IntLit(1), Ty::Int(IntTy::U64)),
+                    value: expression(ExprKind::BoolLit(false), Ty::Bool),
+                },
+                Stmt::Return {
+                    value: Some(expression(
+                        ExprKind::Index {
+                            array: "first".into(),
+                            array_span: Span::new(0, 1),
+                            index: Box::new(expression(ExprKind::IntLit(0), Ty::Int(IntTy::U64))),
+                        },
+                        Ty::Bool,
+                    )),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        f.params = Vec::new();
+
+        let ir = emit_program(&program(vec![f]), 1, &EmitOptions::default()).unwrap();
+        assert!(ir.contains("%sable.array.bool = type { ptr, i64 }"));
+        assert!(ir.contains("declare ptr @__sable_rt_array_alloc_v1(i64)"));
+        assert!(ir.contains("declare void @__sable_rt_array_free_v1(ptr)"));
+        assert!(ir.contains("icmp ugt i64"));
+        assert!(ir.contains(", 50000000"));
+        assert!(ir.contains("@__sable_rt_fail_v1(i32 9, i32 0"));
+        assert!(ir.contains("@__sable_rt_fail_v1(i32 10, i32 0"));
+        assert!(ir.contains("getelementptr i8"));
+        assert!(!ir.contains("getelementptr inbounds"));
+        assert_eq!(ir.matches("call void @__sable_rt_array_free_v1").count(), 2);
+        let return_value = ir.rfind(" = trunc i8").unwrap();
+        let cleanup = &ir[return_value..];
+        let second_slot_load = cleanup
+            .find("load %sable.array.bool, ptr %v1")
+            .expect("the later `second` declaration is dropped first");
+        let first_drop = cleanup.find("call void @__sable_rt_array_free_v1").unwrap();
+        let first_slot_load = cleanup[first_drop + 1..]
+            .find("load %sable.array.bool, ptr %v0")
+            .expect("the earlier `first` declaration is dropped second")
+            + first_drop
+            + 1;
+        let second_drop = cleanup[first_drop + 1..]
+            .find("call void @__sable_rt_array_free_v1")
+            .unwrap()
+            + first_drop
+            + 1;
+        let ret = cleanup.rfind("ret i1").unwrap();
+        assert!(
+            second_slot_load < first_drop
+                && first_drop < first_slot_load
+                && first_slot_load < second_drop
+                && second_drop < ret
+        );
+    }
+
+    #[test]
+    fn boolean_array_effect_order_and_guard_dominance_are_structural() {
+        let lit_first = function(
+            "lit_first",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let lit_second = function(
+            "lit_second",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let allocation_length = returning_function(
+            "allocation_length",
+            IntTy::U64,
+            expression(ExprKind::IntLit(3), Ty::Int(IntTy::U64)),
+        );
+        let allocation_init = function(
+            "allocation_init",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let store_index = returning_function(
+            "store_index",
+            IntTy::U64,
+            expression(ExprKind::IntLit(1), Ty::Int(IntTy::U64)),
+        );
+        let store_value = function(
+            "store_value",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                span: Span::new(0, 1),
+            }],
+        );
+        let read_index = returning_function(
+            "read_index",
+            IntTy::U64,
+            expression(ExprKind::IntLit(2), Ty::Int(IntTy::U64)),
+        );
+
+        let literal = expression(
+            ExprKind::ArrayLit(vec![
+                call("lit_first", Ty::Bool),
+                call("lit_second", Ty::Bool),
+            ]),
+            bool_array_ty(),
+        );
+        let subject = function(
+            "array_effects",
+            Ty::Bool,
+            vec![
+                Stmt::Decl {
+                    ty: bool_array_ty(),
+                    name: "literal".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(literal),
+                    mutable: false,
+                },
+                Stmt::Decl {
+                    ty: bool_array_ty(),
+                    name: "allocated".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(bool_array_alloc(
+                        call("allocation_length", Ty::Int(IntTy::U64)),
+                        call("allocation_init", Ty::Bool),
+                    )),
+                    mutable: true,
+                },
+                Stmt::Store {
+                    array: "allocated".into(),
+                    array_span: Span::new(0, 1),
+                    index: call("store_index", Ty::Int(IntTy::U64)),
+                    value: call("store_value", Ty::Bool),
+                },
+                Stmt::Return {
+                    value: Some(expression(
+                        ExprKind::Index {
+                            array: "allocated".into(),
+                            array_span: Span::new(0, 1),
+                            index: Box::new(call("read_index", Ty::Int(IntTy::U64))),
+                        },
+                        Ty::Bool,
+                    )),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+
+        let subject_symbol = mangle(&subject);
+        let call_marker =
+            |function: &Fn| format!("call {} @{}()", llvm_ty(function.ret), mangle(function));
+        let lit_first_call = call_marker(&lit_first);
+        let lit_second_call = call_marker(&lit_second);
+        let length_call = call_marker(&allocation_length);
+        let init_call = call_marker(&allocation_init);
+        let store_index_call = call_marker(&store_index);
+        let store_value_call = call_marker(&store_value);
+        let read_index_call = call_marker(&read_index);
+
+        let ir = emit_program(
+            &program(vec![
+                lit_first,
+                lit_second,
+                allocation_length,
+                allocation_init,
+                store_index,
+                store_value,
+                read_index,
+                subject,
+            ]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap();
+        let definition = format!("define internal i1 @{subject_symbol}()");
+        let subject = &ir[ir.find(&definition).unwrap()..];
+        let subject = &subject[..subject.find("\n}\n").unwrap() + 3];
+
+        let literal_first = subject.find(&lit_first_call).unwrap();
+        let literal_second = subject.find(&lit_second_call).unwrap();
+        let literal_alloc = subject.find("call ptr @__sable_rt_array_alloc_v1").unwrap();
+        assert!(literal_first < literal_second && literal_second < literal_alloc);
+
+        let length = subject.find(&length_call).unwrap();
+        let literal_first_gep =
+            subject[literal_alloc..].find("getelementptr i8").unwrap() + literal_alloc;
+        let literal_first_write =
+            subject[literal_first_gep..].find("store i8").unwrap() + literal_first_gep;
+        let literal_second_gep = subject[literal_first_write + 1..]
+            .find("getelementptr i8")
+            .unwrap()
+            + literal_first_write
+            + 1;
+        let literal_second_write =
+            subject[literal_second_gep..].find("store i8").unwrap() + literal_second_gep;
+        assert!(
+            literal_alloc < literal_first_gep
+                && literal_first_gep < literal_first_write
+                && literal_first_write < literal_second_gep
+                && literal_second_gep < literal_second_write
+                && literal_second_write < length
+        );
+        let init = subject.find(&init_call).unwrap();
+        let cap = subject[init..].find("icmp ugt i64").unwrap() + init;
+        let cap_guard = subject[cap..].find("br i1").unwrap() + cap;
+        let allocation = subject[literal_alloc + 1..]
+            .find("call ptr @__sable_rt_array_alloc_v1")
+            .unwrap()
+            + literal_alloc
+            + 1;
+        assert!(literal_alloc < length && length < init && init < cap && cap < cap_guard);
+        assert!(cap_guard < allocation);
+
+        let null_check = subject[allocation..].find("icmp eq ptr").unwrap() + allocation;
+        let null_guard = subject[null_check..].find("br i1").unwrap() + null_check;
+        let fill_gep = subject[null_guard..].find("getelementptr i8").unwrap() + null_guard;
+        assert!(allocation < null_check && null_check < null_guard && null_guard < fill_gep);
+
+        let store_index = subject.find(&store_index_call).unwrap();
+        let store_value = subject.find(&store_value_call).unwrap();
+        let store_oob = subject[store_value..].find("icmp uge i64").unwrap() + store_value;
+        let store_guard = subject[store_oob..].find("br i1").unwrap() + store_oob;
+        let store_gep = subject[store_guard..].find("getelementptr i8").unwrap() + store_guard;
+        let store_write = subject[store_gep..].find("store i8").unwrap() + store_gep;
+        assert!(
+            fill_gep < store_index
+                && store_index < store_value
+                && store_value < store_oob
+                && store_oob < store_guard
+                && store_guard < store_gep
+                && store_gep < store_write
+        );
+
+        let read_index = subject.find(&read_index_call).unwrap();
+        let read_descriptor = subject[read_index..]
+            .find("load %sable.array.bool")
+            .unwrap()
+            + read_index;
+        let read_oob = subject[read_descriptor..].find("icmp uge i64").unwrap() + read_descriptor;
+        let read_guard = subject[read_oob..].find("br i1").unwrap() + read_oob;
+        let read_gep = subject[read_guard..].find("getelementptr i8").unwrap() + read_guard;
+        let read_byte = subject[read_gep..].find("load i8").unwrap() + read_gep;
+        assert!(
+            store_write < read_index
+                && read_index < read_descriptor
+                && read_descriptor < read_oob
+                && read_oob < read_guard
+                && read_guard < read_gep
+                && read_gep < read_byte
+        );
+    }
+
+    #[test]
+    fn empty_boolean_array_bypasses_both_runtime_hooks() {
+        let f = function(
+            "empty",
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: bool_array_ty(),
+                name: "values".into(),
+                name_span: Span::new(0, 1),
+                init: Some(bool_array_literal(&[])),
+                mutable: false,
+            }],
+        );
+        let ir = emit_program(&program(vec![f]), 1, &EmitOptions::default()).unwrap();
+        assert!(!ir.contains("call ptr @__sable_rt_array_alloc_v1"));
+        // A conditional drop is emitted, but its null edge bypasses the call.
+        let null_check = ir.find("icmp eq ptr").unwrap();
+        let free_call = ir.find("call void @__sable_rt_array_free_v1").unwrap();
+        assert!(null_check < free_call);
+    }
+
+    #[test]
+    fn boolean_array_transport_boundaries_remain_closed_on_forged_ast() {
+        let array = bool_array_ty();
+        let mut parameter_fn = function(
+            "parameter",
+            Ty::Unit,
+            vec![Stmt::Return {
+                value: None,
+                span: Span::new(0, 1),
+            }],
+        );
+        parameter_fn.params = vec![parameter("values", array)];
+        assert!(emit_program(&program(vec![parameter_fn]), 1, &EmitOptions::default()).is_err());
+
+        let returned = function(
+            "returned",
+            array,
+            vec![Stmt::Return {
+                value: Some(bool_array_literal(&[true])),
+                span: Span::new(0, 1),
+            }],
+        );
+        assert!(emit_program(&program(vec![returned]), 1, &EmitOptions::default()).is_err());
+
+        let moved = function(
+            "moved",
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: array,
+                    name: "source".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(bool_array_literal(&[true])),
+                    mutable: false,
+                },
+                Stmt::Decl {
+                    ty: array,
+                    name: "dest".into(),
+                    name_span: Span::new(0, 1),
+                    init: Some(typed_variable("source", array)),
+                    mutable: false,
+                },
+            ],
+        );
+        let error = emit_program(&program(vec![moved]), 1, &EmitOptions::default()).unwrap_err();
+        assert!(error[0].label.contains("fresh literal"));
     }
 
     #[test]

@@ -2223,28 +2223,38 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             } => {
                 let fty = ctx.self_field_ty_rebind(field, *field_span, true)?;
                 // Array fields accept an owned-array MOVE (`self.buf = nb;`
-                // — Vec growth) or a fresh allocation; the moved-from local
-                // is not tracked as dead in v1 (documented).
+                // — Vec growth) or a fresh allocation. This path cannot use
+                // ordinary array-expression checking, because a whole-array
+                // read is legal only at this consuming boundary; it therefore
+                // performs the moved-place check explicitly before stamping
+                // the contextual owned type.
                 let mut checked = false;
                 if let Ty::Array(elem, _) = fty {
                     match &value.kind {
-                        ExprKind::Var(name) => match ctx.vars.get(name.as_str()).map(|v| v.ty) {
-                            Some(Ty::Array(e2, Mutability::Owned)) if e2 == elem => {
-                                value.ty = Some(Ty::Array(e2, Mutability::Owned));
-                                checked = true;
+                        ExprKind::Var(name) => {
+                            let source = Place::local(name);
+                            if ctx.is_moved(&source) {
+                                return Err(moved_out(ctx, &source, value.span, "move"));
                             }
-                            _ => {
-                                return Err(Diagnostic {
-                                    name: "type.field_array_move".into(),
-                                    title: format!(
-                                        "`{name}` cannot move into array field `{field}`"
-                                    ),
-                                    span: value.span,
-                                    label: "needs an owned array of the same element type".into(),
-                                    notes: vec![],
-                                });
+                            match ctx.vars.get(name.as_str()).map(|v| v.ty) {
+                                Some(Ty::Array(e2, Mutability::Owned)) if e2 == elem => {
+                                    value.ty = Some(Ty::Array(e2, Mutability::Owned));
+                                    checked = true;
+                                }
+                                _ => {
+                                    return Err(Diagnostic {
+                                        name: "type.field_array_move".into(),
+                                        title: format!(
+                                            "`{name}` cannot move into array field `{field}`"
+                                        ),
+                                        span: value.span,
+                                        label: "needs an owned array of the same element type"
+                                            .into(),
+                                        notes: vec![],
+                                    });
+                                }
                             }
-                        },
+                        }
                         ExprKind::AllocArray { .. } => {}
                         _ => {
                             return Err(Diagnostic {
@@ -5764,6 +5774,29 @@ fn select(u64 index) -> bool {
             panic!("expected an indexed Boolean return");
         };
         assert_eq!(value.ty, Some(Ty::Bool));
+    }
+
+    #[test]
+    fn integer_array_field_move_cannot_reuse_the_moved_source() {
+        let mut program = monomorphized_program(
+            r#"
+class Twin {
+    [u64] left;
+    [u64] right;
+
+    /// post self.right.get 0 = 7
+    init make() {
+        [u64] values = alloc_array<u64>(1, 7);
+        self.left = values;
+        self.right = values;
+        self.left[0] = 99;
+    }
+}
+"#,
+        );
+
+        let error = check_error(&mut program);
+        assert_eq!(error.name, "array.use_after_move");
     }
 
     #[test]

@@ -668,8 +668,8 @@ backend support belongs to M46 and later.
 Unsafe Sable v1, the scalar LLVM v0 boundary, the first end-to-end Boolean
 option slice, G1.4a's internal POD record-value slice, and G1.4b's owned-local
 Boolean-array proof/runtime slice are complete. G1.5's closure of that exact
-local slice in the formal SVM and differential lowerer is also complete. Native
-lowering remains later. The broader
+local slice in the formal SVM and differential lowerer is also complete. G1.6's
+native storage and lexical cleanup for that same local slice are complete. The broader
 aggregate-generics/backend track continues at M46+. The order remains a working
 hypothesis, not a promise that evidence cannot reorder it:
 
@@ -708,9 +708,9 @@ hypothesis, not a promise that evidence cannot reorder it:
      subjects in 424.42s; LLVM CLI 6/6; exact-`VerifiedProgram`
      interpreter↔Clang differential at `-O0` and `-O2`; SVM 69/69; allocator,
      grind-budget, and LSP gates green.
-   - **G1 — Boolean/POD aggregates (through G1.5 complete; broader work in
-     progress):** establish non-integer aggregate storage, value, verification,
-     interpreter, and LLVM paths one fenced representation at a time.
+   - **G1 — Boolean/POD aggregates (through G1.6 complete):** establish
+     non-integer aggregate storage, value, verification, interpreter, and LLVM
+     paths one fenced representation at a time.
 
      **G1.0 — representation and proof provenance (complete):** declaration
      parameters now use `Ty::Param(TypeParamId)`, and
@@ -929,8 +929,8 @@ hypothesis, not a promise that evidence cannot reorder it:
      before allocating a false-filled array and emitting ordered stores, so an
      element trap beats allocation/OOM. Expansion is limited to the SVM profile
      cap of 50,000,000 elements, and an empty literal still constructs a tagged
-     Boolean array. LLVM storage, lifetime, and ABI lowering remain out of
-     scope.
+     Boolean array. LLVM storage, lifetime, and ABI lowering remained out of
+     scope at the G1.5 checkpoint.
 
      G1.5 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
      SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1 --
@@ -942,6 +942,67 @@ hypothesis, not a promise that evidence cannot reorder it:
      and the SVM differential passed 86/86.
      `free_list_return_random`, grind-budget, LSP, and doc-tests were
      green. G1.5 is closed.
+
+     **G1.6 — native owned-local Boolean arrays (complete):** LLVM admits
+     exactly the G1.4b/G1.5 local intersection.
+     A fresh owned `[bool]` local may be initialized by
+     `alloc_array<bool>(u64, bool)` or a contextual literal and then used for
+     `.len`, checked reads, and element stores. The internal descriptor is
+     `%sable.array.bool = type { ptr, i64 }`; elements are canonical zero/one
+     `i8` bytes, not packed `i1` values. Parameters, returns, class/record
+     fields, borrows, exposure, whole-array rebinding or movement, calls,
+     extern/public ABI positions, generic/option containment, discarded array
+     temporaries, and native integer arrays remain fail closed.
+
+     Nonempty storage crosses only two external versioned hooks:
+     `__sable_rt_array_alloc_v1(i64 bytes)` and
+     `__sable_rt_array_free_v1(ptr)`. Zero length uses a null data pointer and
+     bypasses both calls while its checked type still identifies `[bool]`.
+     `runtime/hosted/sable_rt_v1.c` is an optional hosted implementation that
+     rejects byte counts not representable by `size_t` and otherwise delegates
+     to the C allocator; generated LLVM never directly imports `malloc` or
+     `free`. The hook contract is a runtime boundary, not a Sable array ABI.
+
+     Evaluation and failure order match the verifier, interpreter, and SVM.
+     Allocation evaluates length, then initializer, then checks the
+     50,000,000-element cap and hook result. A literal evaluates every element
+     left-to-right before allocating and applying ordered stores. A store
+     evaluates index and then value, performs an unsigned bounds check, and
+     only then computes a non-`inbounds` address; a read also guards before its
+     address/load. Cap exhaustion or hook null reports trap kind 9 with
+     `(type_info, lhs, rhs) = (0, len, 0)`. Out-of-bounds read or store reports
+     kind 10 with `(0, index, len)`. The returning observer cannot suppress the
+     mandatory following `llvm.trap`.
+
+     Owned locals now have an explicit native cleanup stack. The function
+     body, each `if` arm, and each `while` body execution are scopes; normal
+     exit frees in reverse declaration order, loop-body cleanup precedes the
+     backedge, and a return evaluates its expression before unwinding active
+     scopes inner-to-outer. `unsafe { ... }` is still an open marker whose
+     declarations live in the enclosing scope. Trap edges do not run cleanup.
+     The interpreter mirrors those lexical deaths by removing owned-array
+     places at block and frame exit.
+
+     The same audit fixed an older integer-array transfer hole. Array-field
+     assignment is a special consuming boundary because ordinary whole-array
+     reads are forbidden; it now explicitly rejects a local already marked
+     moved. Interpreter moves take the named owned-array source, and owned-array
+     local/parameter drops clear their places. The regression moves one array
+     into two fields and requires `array.use_after_move`, raising the corpus
+     inventory to 395 subjects (83 verifies, 245 must-fail, 48 tests, 19
+     test-fails).
+
+     G1.6 closed under `CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0
+     SABLE_TEST_JOBS=1 SABLE_LEAN_JOBS=1 SABLE_REQUIRE_CLANG=1 cargo test -j1
+     -- --test-threads=1 --nocapture`. `cargo check` and the standalone
+     22-target one-job Lake build were green; Rust library tests passed 185/185
+     and LLVM units 26/26; all 395 corpus subjects (83 verifies, 245 must-fail,
+     48 tests, 19 test-fails) passed in 192.76s; LLVM CLI passed 7/7, including
+     the strong-hook allocation/free, zero, OOM, OOB, early-return, branch, and
+     loop fixture at Clang `-O0` and `-O2`; the exact interpreter/native
+     differential passed 1/1 over six subjects at both levels; and SVM stayed
+     green at 86/86. Randomized allocator, grind-budget, LSP, documentation,
+     diff-check, and static-audit gates were green. G1.6 is closed.
    - **G2 — affine options:** carry ownership and destruction correctly through
      present/absent aggregate values.
    - **G3 — slots and `Vec`:** make generic element storage and movement real

@@ -278,6 +278,60 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
 }
 
 #[test]
+fn boolean_arrays_use_versioned_host_hooks_and_pin_lifetime_and_traps() {
+    let source = repo_root().join("corpus/llvm-diff/bool_arrays.sable");
+    let output = build_command()
+        .args(["build", "--emit-llvm", "-o", "-"])
+        .arg(&source)
+        .output()
+        .expect("run the Sable Boolean-array LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM Boolean-array build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
+    assert!(report.contains("status: fully verified"));
+    assert!(!ir.contains("define i32 @main("));
+    assert!(ir.contains("@__sable_rt_array_alloc_v1"));
+    assert!(ir.contains("@__sable_rt_array_free_v1"));
+
+    // Whole-module mode leaves the Sable functions internal. Injecting the
+    // test-only main into the same LLVM module lets it violate their verified
+    // preconditions without publishing an array ABI. The strong C hooks then
+    // expose allocation/free traffic and deliberately fail the 13-byte case.
+    let ir = format!(
+        "{ir}\n\
+         define i32 @main(i32 %argc, ptr %argv) {{\n\
+         entry:\n\
+           switch i32 %argc, label %unexpected [\n\
+             i32 1, label %normal\n\
+             i32 2, label %oom\n\
+             i32 3, label %load_oob\n\
+             i32 4, label %store_oob\n\
+           ]\n\
+         normal:\n\
+           %normal_result = call i32 @__sable_v0_f_17_bool_arrays_entry__p___r_i32()\n\
+           ret i32 %normal_result\n\
+         oom:\n\
+           %oom_result = call i64 @__sable_v0_f_22_bool_array_alloc_guard__p_u64__r_u64(i64 13)\n\
+           ret i32 0\n\
+         load_oob:\n\
+           %load_result = call i1 @__sable_v0_f_21_bool_array_load_guard__p_u64__r_b(i64 7)\n\
+           ret i32 0\n\
+         store_oob:\n\
+           %store_result = call i1 @__sable_v0_f_22_bool_array_store_guard__p_u64__r_b(i64 9)\n\
+           ret i32 0\n\
+         unexpected:\n\
+           ret i32 99\n\
+         }}\n"
+    );
+
+    assert_clang_array_runtime("bool-arrays", &ir);
+}
+
+#[test]
 fn failed_verification_preserves_an_existing_output() {
     let temp = temp_dir("atomic");
     let destination = temp.join("program.ll");
@@ -433,6 +487,150 @@ void __sable_rt_trap_v1(
         }
     }
     fs::remove_dir_all(&temp).expect("remove isolated LLVM trap test directory");
+}
+
+fn assert_clang_array_runtime(label: &str, ir: &str) {
+    let Some(clang) = find_clang() else {
+        assert_ne!(
+            std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
+            Ok("1"),
+            "SABLE_REQUIRE_CLANG=1 but no clang executable was found"
+        );
+        return;
+    };
+    let temp = temp_dir(label);
+    let ir_path = temp.join(format!("{label}.ll"));
+    let hook_path = temp.join("array-hooks.c");
+    fs::write(&ir_path, ir).expect("write emitted Boolean-array IR fixture");
+    fs::write(
+        &hook_path,
+        br#"#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+void *__sable_rt_array_alloc_v1(uint64_t bytes) {
+    fprintf(stderr, "SABLE_ARRAY_ALLOC_V1 bytes=%" PRIu64 "\n", bytes);
+    fflush(stderr);
+    if (bytes == 13 || bytes > SIZE_MAX) {
+        return NULL;
+    }
+    return malloc((size_t)bytes);
+}
+
+void __sable_rt_array_free_v1(void *storage) {
+    fprintf(stderr, "SABLE_ARRAY_FREE_V1\n");
+    fflush(stderr);
+    free(storage);
+}
+
+void __sable_rt_trap_v1(
+    int32_t kind,
+    int32_t type_info,
+    uint64_t lhs_bits,
+    uint64_t rhs_bits
+) {
+    fprintf(
+        stderr,
+        "SABLE_TRAP_V1 kind=%" PRId32 " type_info=%" PRIu32
+        " lhs=%" PRIu64 " rhs=%" PRIu64 "\n",
+        kind,
+        (uint32_t)type_info,
+        lhs_bits,
+        rhs_bits
+    );
+    fflush(stderr);
+}
+"#,
+    )
+    .expect("write strong Boolean-array runtime hooks");
+
+    for optimization in ["-O0", "-O2"] {
+        let executable = temp.join(format!("{label}-{}", &optimization[1..]));
+        let compile = Command::new(&clang)
+            .args([optimization, "-x", "ir"])
+            .arg(&ir_path)
+            .args(["-x", "c"])
+            .arg(&hook_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("run clang over emitted Boolean-array IR and replacement hooks");
+        assert!(
+            compile.status.success(),
+            "clang {optimization} rejected Boolean-array fixture:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let normal = Command::new(&executable)
+            .output()
+            .expect("run the compiled normal Boolean-array case");
+        assert_eq!(
+            normal.status.code(),
+            Some(42),
+            "normal Boolean-array case diverged at {optimization}:\n{}",
+            String::from_utf8_lossy(&normal.stderr)
+        );
+        let normal_stderr = String::from_utf8_lossy(&normal.stderr);
+        assert_eq!(normal_stderr.matches("SABLE_ARRAY_ALLOC_V1").count(), 7);
+        assert_eq!(normal_stderr.matches("SABLE_ARRAY_FREE_V1").count(), 7);
+        assert!(normal_stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=4"));
+        assert!(normal_stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=3"));
+        assert!(normal_stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=5"));
+        assert_eq!(
+            normal_stderr
+                .matches("SABLE_ARRAY_ALLOC_V1 bytes=6")
+                .count(),
+            2
+        );
+        assert!(normal_stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=7"));
+        assert!(normal_stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=8"));
+        assert!(
+            !normal_stderr.contains("bytes=0"),
+            "zero-length arrays must use the allocation-free representation"
+        );
+
+        for (arguments, expected_trap, expected_allocation) in [
+            (
+                &["oom"][..],
+                "SABLE_TRAP_V1 kind=9 type_info=0 lhs=13 rhs=0",
+                "SABLE_ARRAY_ALLOC_V1 bytes=13",
+            ),
+            (
+                &["load", "oob"][..],
+                "SABLE_TRAP_V1 kind=10 type_info=0 lhs=7 rhs=2",
+                "SABLE_ARRAY_ALLOC_V1 bytes=2",
+            ),
+            (
+                &["store", "oob", "case"][..],
+                "SABLE_TRAP_V1 kind=10 type_info=0 lhs=9 rhs=2",
+                "SABLE_ARRAY_ALLOC_V1 bytes=2",
+            ),
+        ] {
+            let trapped = Command::new(&executable)
+                .args(arguments)
+                .output()
+                .expect("run a compiled Boolean-array trap case");
+            assert!(
+                !trapped.status.success(),
+                "Boolean-array trap hook returned at {optimization}; llvm.trap must terminate"
+            );
+            let stderr = String::from_utf8_lossy(&trapped.stderr);
+            assert!(
+                stderr.contains(expected_trap),
+                "wrong Boolean-array trap at {optimization} (status {}):\n{stderr}",
+                trapped.status
+            );
+            assert_eq!(stderr.matches("SABLE_ARRAY_ALLOC_V1").count(), 1);
+            assert!(stderr.contains(expected_allocation));
+            assert_eq!(
+                stderr.matches("SABLE_ARRAY_FREE_V1").count(),
+                0,
+                "trap edges do not unwind owned arrays"
+            );
+        }
+    }
+    fs::remove_dir_all(&temp).expect("remove isolated LLVM Boolean-array test directory");
 }
 
 fn assert_clang_exit(label: &str, ir: &str, expected: i32) {

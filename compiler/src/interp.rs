@@ -1505,12 +1505,12 @@ impl<'a> Interp<'a> {
     }
 
     /// Owned parameters die with the frame, after the contract has been
-    /// checked against them. A by-value class argument was handed over, so
-    /// the callee is who destroys it — unless the body moved it on, in
-    /// which case its place is already empty.
+    /// checked against them. A by-value class or array argument was handed
+    /// over, so the callee is who destroys it — unless the body moved it on,
+    /// in which case its place is already empty.
     fn drop_owned_params(&mut self, params: &[Param], frame: &mut Frame) -> IResult<()> {
         for p in params.iter().rev() {
-            if matches!(p.ty, Ty::Class(_)) {
+            if matches!(p.ty, Ty::Class(_) | Ty::Array(_, Mutability::Owned)) {
                 self.drop_place(&RtPlace::Local(p.name.clone()), frame)?;
             }
         }
@@ -1721,14 +1721,26 @@ impl<'a> Interp<'a> {
                 .as_ref()
                 .and_then(|(_, fields)| fields.borrow().get(field.as_str()).cloned()),
         };
-        let Some(RtVal::Obj { class, fields }) = held else {
-            return Ok(());
-        };
-        // Out of its place *before* the destructor runs: a `deinit` that
-        // reached the dying value through its own name would see a value
-        // that no longer belongs to anyone.
-        self.take_place(place, frame);
-        self.drop_value(class, &fields, &place.name())
+        match held {
+            Some(RtVal::Obj { class, fields }) => {
+                // Out of its place *before* the destructor runs: a `deinit`
+                // that reached the dying value through its own name would
+                // see a value that no longer belongs to anyone.
+                self.take_place(place, frame);
+                self.drop_value(class, &fields, &place.name())
+            }
+            Some(RtVal::Arr(_)) => {
+                // Arrays have no destructor, but an owned local still dies
+                // at its lexical boundary. Removing the binding here is
+                // observable through the backing Rc: branch and loop-body
+                // storage must not remain live until the whole frame ends.
+                // This is a drop, not a move; an array transferred through
+                // `eval_moved` has already left its source place.
+                self.take_place(place, frame);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The source place of an expression, if it names one. A call or a
@@ -1749,11 +1761,14 @@ impl<'a> Interp<'a> {
     /// field assignments, arguments, and returns all transfer ownership,
     /// and they all transfer it the same way.
     ///
-    /// Only class values have runtime identity to transfer: resources are
-    /// erased (ADR 0024), and integers are copied.
+    /// Classes, owned arrays, and resource-map sanitizer shadows have runtime
+    /// identity and leave a named source place when transferred. Boolean-array
+    /// transport remains rejected by the checked owned-local slice; fresh
+    /// literals and allocations have no source place to clear. Other resources
+    /// are erased (ADR 0024), and scalars are copied.
     fn eval_moved(&mut self, e: &Expr, frame: &mut Frame) -> IResult<RtVal> {
         let v = self.eval(e, frame)?;
-        if matches!(v, RtVal::Obj { .. } | RtVal::ResMap(_)) {
+        if matches!(v, RtVal::Obj { .. } | RtVal::Arr(_) | RtVal::ResMap(_)) {
             if let Some(place) = Self::source_place(e) {
                 self.take_place(&place, frame);
             }
@@ -3506,7 +3521,7 @@ mod g1_payload_guard_tests {
         expr(ExprKind::IntLit(value), Some(Ty::Int(IntTy::U64)))
     }
 
-    fn eval_with_frame(expression: &Expr, vars: HashMap<String, RtVal>) -> Result<RtVal, String> {
+    fn with_empty_interpreter<R>(run: impl FnOnce(&mut Interp<'_>) -> R) -> R {
         let fns: HashMap<&str, &Fn> = HashMap::new();
         let classes: Vec<ClassDecl> = Vec::new();
         let records: Vec<RecordDecl> = Vec::new();
@@ -3523,19 +3538,173 @@ mod g1_payload_guard_tests {
             world: None,
             uart: None,
         };
-        let mut frame = Frame {
+        run(&mut interpreter)
+    }
+
+    fn frame_with(vars: HashMap<String, RtVal>) -> Frame {
+        Frame {
             vars,
             entry_scalars: HashMap::new(),
             olds: HashMap::new(),
             self_ctx: None,
-        };
-        interpreter
-            .eval(expression, &mut frame)
-            .map_err(|trap| trap.message)
+        }
+    }
+
+    fn bool_array_decl(name: &str) -> Stmt {
+        let ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        Stmt::Decl {
+            ty,
+            name: name.into(),
+            name_span: Span::new(0, 0),
+            init: Some(expr(
+                ExprKind::ArrayLit(vec![expr(ExprKind::BoolLit(true), Some(Ty::Bool))]),
+                Some(ty),
+            )),
+            mutable: false,
+        }
+    }
+
+    fn eval_with_frame(expression: &Expr, vars: HashMap<String, RtVal>) -> Result<RtVal, String> {
+        with_empty_interpreter(|interpreter| {
+            interpreter
+                .eval(expression, &mut frame_with(vars))
+                .map_err(|trap| trap.message)
+        })
     }
 
     fn eval_with_empty_runtime(expression: &Expr) -> Result<RtVal, String> {
         eval_with_frame(expression, HashMap::new())
+    }
+
+    #[test]
+    fn dropping_an_array_place_removes_its_binding_and_releases_its_rc() {
+        let storage = Rc::new(RefCell::new(RtArray::Bool(vec![true])));
+        let mut frame = frame_with(HashMap::from([(
+            "flags".into(),
+            RtVal::Arr(storage.clone()),
+        )]));
+        assert_eq!(Rc::strong_count(&storage), 2);
+
+        with_empty_interpreter(|interpreter| {
+            interpreter
+                .drop_place(&RtPlace::Local("flags".into()), &mut frame)
+                .unwrap_or_else(|trap| panic!("unexpected array-drop trap: {}", trap.message));
+        });
+
+        assert!(!frame.vars.contains_key("flags"));
+        assert_eq!(Rc::strong_count(&storage), 1);
+    }
+
+    #[test]
+    fn eval_moved_takes_an_owned_integer_array_place() {
+        let storage = Rc::new(RefCell::new(RtArray::Int {
+            payload: IntTy::U64,
+            values: vec![7],
+        }));
+        let mut frame = frame_with(HashMap::from([(
+            "values".into(),
+            RtVal::Arr(storage.clone()),
+        )]));
+        let read = expr(
+            ExprKind::Var("values".into()),
+            Some(Ty::Array(ValueTy::Int(IntTy::U64), Mutability::Owned)),
+        );
+
+        let value = with_empty_interpreter(|interpreter| {
+            interpreter
+                .eval_moved(&read, &mut frame)
+                .unwrap_or_else(|trap| panic!("unexpected array-move trap: {}", trap.message))
+        });
+
+        assert!(!frame.vars.contains_key("values"));
+        assert!(matches!(&value, RtVal::Arr(_)));
+        assert_eq!(Rc::strong_count(&storage), 2);
+    }
+
+    #[test]
+    fn successful_branch_and_loop_blocks_remove_array_locals() {
+        let mut frame = frame_with(HashMap::from([("again".into(), RtVal::Bool(true))]));
+        let branch = Stmt::If {
+            cond: expr(ExprKind::BoolLit(true), Some(Ty::Bool)),
+            then_block: vec![bool_array_decl("branch_flags")],
+            else_block: None,
+        };
+        let loop_stmt = Stmt::While {
+            cond: expr(ExprKind::Var("again".into()), Some(Ty::Bool)),
+            invariants: Vec::new(),
+            variant: None,
+            kw_span: Span::new(0, 0),
+            body: vec![
+                bool_array_decl("loop_flags"),
+                Stmt::Assign {
+                    name: "again".into(),
+                    name_span: Span::new(0, 0),
+                    value: expr(ExprKind::BoolLit(false), Some(Ty::Bool)),
+                },
+            ],
+        };
+
+        with_empty_interpreter(|interpreter| {
+            let mut outer_locals = Vec::new();
+            assert!(matches!(
+                interpreter.exec_stmt(&branch, &mut frame, &mut outer_locals),
+                Ok(Flow::Normal)
+            ));
+            assert!(!frame.vars.contains_key("branch_flags"));
+            assert!(matches!(
+                interpreter.exec_stmt(&loop_stmt, &mut frame, &mut outer_locals),
+                Ok(Flow::Normal)
+            ));
+        });
+
+        assert!(!frame.vars.contains_key("loop_flags"));
+    }
+
+    #[test]
+    fn trapped_blocks_retain_array_places_without_running_cleanup() {
+        let mut frame = frame_with(HashMap::new());
+        let body = vec![
+            bool_array_decl("trapped_flags"),
+            Stmt::ExprStmt(expr(
+                ExprKind::Index {
+                    array: "trapped_flags".into(),
+                    array_span: Span::new(0, 0),
+                    index: Box::new(int_lit(1)),
+                },
+                Some(Ty::Bool),
+            )),
+        ];
+
+        let trapped =
+            with_empty_interpreter(
+                |interpreter| match interpreter.exec_block(&body, &mut frame) {
+                    Err(trap) => trap,
+                    Ok(_) => panic!("out-of-bounds index should trap"),
+                },
+            );
+
+        assert_eq!(trapped.message, "index out of bounds: index 1, length 1");
+        assert!(frame.vars.contains_key("trapped_flags"));
+    }
+
+    #[test]
+    fn unsafe_marker_keeps_array_local_in_the_enclosing_scope() {
+        let mut frame = frame_with(HashMap::new());
+        let unsafe_block = Stmt::Unsafe {
+            kw_span: Span::new(0, 0),
+            body: vec![bool_array_decl("open_flags")],
+        };
+        let mut enclosing_locals = Vec::new();
+
+        with_empty_interpreter(|interpreter| {
+            assert!(matches!(
+                interpreter.exec_stmt(&unsafe_block, &mut frame, &mut enclosing_locals),
+                Ok(Flow::Normal)
+            ));
+        });
+
+        assert!(frame.vars.contains_key("open_flags"));
+        assert_eq!(enclosing_locals, vec!["open_flags".to_string()]);
     }
 
     #[test]

@@ -1,0 +1,18 @@
+// expect-error: array.use_after_move
+// A field assignment consumes an owned array local. Reusing the same local
+// for a second field would give both fields the same backing storage while
+// the value model treats them as independent sequences. The final store would
+// therefore make the provable post below false in the interpreter.
+
+class Twin {
+    [u64] left;
+    [u64] right;
+
+    /// post self.right.get 0 = 7
+    init make() {
+        [u64] values = alloc_array<u64>(1, 7);
+        self.left = values;
+        self.right = values;
+        self.left[0] = 99;
+    }
+}
