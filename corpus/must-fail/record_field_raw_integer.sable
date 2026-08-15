@@ -1,0 +1,8 @@
+// expect-error: record.field_type
+// Only a raw pointer to a laid-out record has a field form. `raw<u8>` is a
+// byte cursor whose pointee has no record identity, so storing one in a field
+// would put provenance in a cell nothing can type.
+
+record Cursor #[layout(size := 8, align := 8)] {
+    #[offset(0)] raw<u8> at;
+}

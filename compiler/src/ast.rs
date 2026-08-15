@@ -15,8 +15,8 @@ pub enum IntTy {
     I32,
     I64,
     /// Legacy integer-expression representation of a type parameter in
-    /// `widen<T>` / `narrow<T>` and G0 compatibility helpers. Declaration
-    /// positions use `Ty::Param` / `ValueTy::Param`, so a parameter is not
+    /// `widen<T>` / `narrow<T>` and generic compatibility helpers. Declaration
+    /// positions use `Ty::Param` / `Ty::Param`, so a parameter is not
     /// accidentally treated as an integer merely because v1 instances are
     /// currently integer-only.
     TParam(u8),
@@ -108,18 +108,19 @@ impl IntTy {
     }
 }
 
-/// The original AST stored every generic parameter in `IntTy::TParam(u8)`, so
-/// G0 keeps the same 256-parameter ceiling explicitly instead of silently
-/// truncating a parser index with `as u8`.
+/// A declaration may bind at most this many type parameters. The ceiling is
+/// explicit because `IntTy::TParam(u8)` still carries a parameter in the
+/// integer-expression positions, and a parser index must never be truncated
+/// into it with `as u8`.
 pub const MAX_TYPE_PARAMS: usize = u8::MAX as usize + 1;
 
 /// Stable index of a parameter in its enclosing generic declaration.
 ///
 /// This is deliberately distinct from `IntTy::TParam`: neither the recursive
 /// generic type tree nor a declaration-position type parameter is
-/// intrinsically integer-typed. Construction is checked against the legacy G0
-/// ceiling while the remaining integer-expression compatibility positions
-/// still use the `u8` representation.
+/// intrinsically integer-typed. Construction is checked against the same
+/// ceiling as `IntTy::TParam`, which the remaining integer-expression
+/// positions still use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeParamId(u32);
 
@@ -137,7 +138,7 @@ impl TypeParamId {
     }
 
     fn legacy_index(self) -> u8 {
-        u8::try_from(self.0).expect("TypeParamId construction enforces the G0 u8 ceiling")
+        u8::try_from(self.0).expect("TypeParamId construction enforces the u8 parameter ceiling")
     }
 }
 
@@ -151,9 +152,9 @@ pub enum NominalKind {
 /// A source-level value-type shape carried through generic parsing and
 /// monomorphization.
 ///
-/// G0 stores this at call and constructor type-argument sites without yet
-/// accepting any new syntax. It is an owned structural representation for the
-/// migration away from integer-only arguments. Nominal types are name-based
+/// Call and constructor type-argument sites store this. It is an owned
+/// structural representation, wider than the integer arguments instantiation
+/// currently accepts. Nominal types are name-based
 /// because module-local class indices are not stable until merging and
 /// monomorphization have finished.
 ///
@@ -258,7 +259,7 @@ impl GenericTy {
         }
     }
 
-    /// Convert a fully instantiated G0 argument to an integer type.
+    /// Convert a fully instantiated type argument to an integer type.
     pub fn try_to_concrete_v1_int(&self) -> Result<IntTy, GenericTyError> {
         match self {
             GenericTy::Param(parameter) => {
@@ -417,83 +418,57 @@ fn push_length_prefixed(out: &mut String, value: &str) {
     out.push_str(value);
 }
 
-/// A storable, copyable value payload used by arrays and options.
-///
-/// G1 deliberately separates this from `IntTy`: parsed template parameters
-/// retain their own identity until monomorphization, and the concrete bool and
-/// POD-record cases have an honest representation before their runtime/proof
-/// semantics are enabled. The parser continues to admit only integers and
-/// in-scope parameters in these positions for now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ValueTy {
-    Int(IntTy),
-    Bool,
-    Record(usize),
-    Param(TypeParamId),
-}
-
-impl ValueTy {
-    pub fn name(self) -> String {
-        match self {
-            ValueTy::Int(ty) => ty.name().to_string(),
-            ValueTy::Bool => "bool".to_string(),
-            ValueTy::Record(_) => "record".to_string(),
-            ValueTy::Param(parameter) => format!("<T{}>", parameter.index()),
-        }
-    }
-
-    pub fn is_concrete(self) -> bool {
-        !matches!(self, ValueTy::Param(_) | ValueTy::Int(IntTy::TParam(_)))
-    }
-
-    /// The ADR 0009 integer model carried by this value type. A retained
-    /// template parameter maps to its legacy abstract integer binder; concrete
-    /// Boolean/POD payloads deliberately do not.
-    pub fn int_model(self) -> Option<IntTy> {
-        match self {
-            ValueTy::Int(IntTy::TParam(_)) => None,
-            ValueTy::Int(integer) => Some(integer),
-            ValueTy::Param(parameter) => Some(IntTy::TParam(parameter.legacy_index())),
-            ValueTy::Bool | ValueTy::Record(_) => None,
-        }
-    }
-}
-
-impl From<IntTy> for ValueTy {
-    fn from(ty: IntTy) -> ValueTy {
-        match ty {
-            IntTy::TParam(index) => ValueTy::Param(TypeParamId::from_legacy(index)),
-            concrete => ValueTy::Int(concrete),
-        }
-    }
-}
-
 /// The ownership-carrying payload shapes represented by an affine option.
 ///
-/// This is deliberately distinct from [`ValueTy`]: ordinary `option<T>` is a
-/// copyable scalar/POD value, while `option<[T]>` conditionally owns array
-/// storage and therefore needs move, take, join, and destruction rules. G2.1
-/// enables one concrete local shape without weakening that separation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// This is a distinct family from a copyable `option<T>`: an ordinary option
+/// duplicates its payload whenever it is duplicated, while `option<[T]>`
+/// conditionally owns array storage and therefore needs move, take, join, and
+/// destruction rules.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AffineOptionTy {
-    Array(ValueTy),
+    Array(Box<Ty>),
 }
 
 impl AffineOptionTy {
-    pub fn name(self) -> String {
+    /// `option<[T]>` whose payload owns the array `[element]`.
+    pub fn array(element: Ty) -> AffineOptionTy {
+        AffineOptionTy::Array(Box::new(element))
+    }
+
+    /// The element type of the owned array, for the one payload family there
+    /// is. It is an accessor rather than a pattern because the payload is a
+    /// full type and therefore boxed.
+    pub fn array_element(&self) -> &Ty {
+        match self {
+            AffineOptionTy::Array(element) => element,
+        }
+    }
+
+    pub fn name(&self) -> String {
         match self {
             AffineOptionTy::Array(element) => format!("[{}]", element.name()),
         }
     }
 
-    pub fn is_concrete(self) -> bool {
+    pub fn is_concrete(&self) -> bool {
         match self {
             AffineOptionTy::Array(element) => element.is_concrete(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The language's one type grammar.
+///
+/// Every checked type is a value of this type: there is no narrower payload
+/// representation anywhere in the compiler, so what a container can hold is
+/// not a property of the representation. Which shapes a position accepts is
+/// stated by `Parser::admits` (ADR 0063) and by one named gate per consuming
+/// stage (ADR 0064) — never by what the representation happens to be able to
+/// express.
+///
+/// The container payloads are boxed, so a payload is matched through an
+/// accessor (`as_array`, `as_option`) rather than as a nested pattern.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Ty {
     Int(IntTy),
     Bool,
@@ -510,16 +485,14 @@ pub enum Ty {
     /// layout. Records are deliberately distinct from affine classes:
     /// they have no invariant, methods, resources, or destructor (ADR 0054).
     Record(usize),
-    /// Borrowed array: `&[i32]` (shared) or `&mut [i32]` (unique, mutable).
-    /// Parameters only. Non-integer concrete payloads are represented but not
-    /// admitted by the checked language yet.
-    Array(ValueTy, Mutability),
-    /// `option<u64>` etc. Return types only. As with arrays, G1 represents the
-    /// future bool/POD cases before enabling their semantics.
-    Option(ValueTy),
-    /// An option whose present case owns an affine aggregate. G2.1 admits the
-    /// first concrete local form, `option<[bool]>`, with fresh construction,
-    /// presence inspection, and atomic named-place extraction. It remains a
+    /// `[T]` owned, or `&[T]` / `&mut [T]` borrowed. The element is a full
+    /// type: which elements a stage will actually execute, prove, or lower is
+    /// each stage's own named gate to state, not this constructor's.
+    Array(Box<Ty>, Mutability),
+    /// `option<T>` for a copyable payload. The payload is a full type for the
+    /// same reason an array element is.
+    Option(Box<Ty>),
+    /// An option whose present case owns an affine aggregate. It remains a
     /// separate type family so no ordinary copy-option rule can reach it.
     AffineOption(AffineOptionTy),
     /// `option<raw<R>>` for an explicitly laid-out record. This is an
@@ -531,11 +504,21 @@ pub enum Ty {
     /// `raw<u8>` — a raw pointer: provenance plus a byte offset, never an
     /// address. Carries no authority at all; a load or a store needs a
     /// resource borrow alongside it (ADR 0026).
+    ///
+    /// This stays split from `RawRecord` rather than becoming
+    /// `Raw(Box<Ty>)`: the pointee of a `raw<...>` is a width or a nominal
+    /// record and nothing else, and one merged constructor would give
+    /// `raw<u8>` the record-field layout that only a record pointer has.
     Raw(IntTy),
     /// A statically tagged pointer to an explicitly laid-out record.
     /// Runtime representation remains provenance plus byte offset.
     RawRecord(usize),
     /// `resource &R` / `resource &mut R` — a borrow of that authority.
+    ///
+    /// Distinct from a borrowed value type because resource borrow-ness is
+    /// spelled with the `resource` keyword and classified as its own shape:
+    /// folding it in would make a shape function disagree with
+    /// `Parser::admits` about the same spelling.
     ResRef(ResKind, Mutability),
     /// No return value (procedures like in-place sorts).
     Unit,
@@ -966,7 +949,7 @@ impl ResKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mutability {
     Shared,
     Mut,
@@ -975,24 +958,204 @@ pub enum Mutability {
 }
 
 impl Ty {
+    /// `[element]` owned, or `&[element]` / `&mut [element]` borrowed.
+    pub fn array(element: Ty, mutability: Mutability) -> Ty {
+        Ty::Array(Box::new(element), mutability)
+    }
+
+    /// A copyable `option<payload>`.
+    pub fn option(payload: Ty) -> Ty {
+        Ty::Option(Box::new(payload))
+    }
+
+    /// An owning `option<[element]>`.
+    pub fn affine_array_option(element: Ty) -> Ty {
+        Ty::AffineOption(AffineOptionTy::array(element))
+    }
+
+    /// The element type and binding mode of an array.
+    ///
+    /// Container payloads are read through accessors rather than nested
+    /// patterns because they are boxed. A caller that wants an exact payload
+    /// compares the result: `ty.as_array() == Some((&Ty::Bool, ...))`.
+    pub fn as_array(&self) -> Option<(&Ty, Mutability)> {
+        match self {
+            Ty::Array(element, mutability) => Some((element, *mutability)),
+            _ => None,
+        }
+    }
+
+    /// The element type of an owned array, ignoring borrowed ones.
+    pub fn as_owned_array(&self) -> Option<&Ty> {
+        match self {
+            Ty::Array(element, Mutability::Owned) => Some(element),
+            _ => None,
+        }
+    }
+
+    /// The payload of a copyable option.
+    pub fn as_option(&self) -> Option<&Ty> {
+        match self {
+            Ty::Option(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    /// The owned array element of an ownership-bearing option.
+    pub fn as_affine_array_option(&self) -> Option<&Ty> {
+        match self {
+            Ty::AffineOption(payload) => Some(payload.array_element()),
+            _ => None,
+        }
+    }
+
+    /// Whether this is an array of exactly `element`, in any binding mode.
+    ///
+    /// A payload is compared rather than pattern-matched because it is boxed,
+    /// and an exact comparison is what a stage allow-list wants: `[bool]` is
+    /// admitted somewhere `[u64]` is not.
+    pub fn is_array_of(&self, element: &Ty) -> bool {
+        matches!(self.as_array(), Some((found, _)) if found == element)
+    }
+
+    /// Whether this is an owned array of exactly `element`.
+    pub fn is_owned_array_of(&self, element: &Ty) -> bool {
+        matches!(self.as_array(), Some((found, Mutability::Owned)) if found == element)
+    }
+
+    /// Whether this is a copyable option of exactly `payload`.
+    pub fn is_option_of(&self, payload: &Ty) -> bool {
+        matches!(self.as_option(), Some(found) if found == payload)
+    }
+
+    /// Whether this is an owning option of exactly `[element]`.
+    pub fn is_affine_array_option_of(&self, element: &Ty) -> bool {
+        matches!(self.as_affine_array_option(), Some(found) if found == element)
+    }
+
+    /// Values that can be transferred but not duplicated.
+    ///
+    /// Ownership is a property of the shape, read off the shape rather than
+    /// off a constructor kept for the purpose: an option owns exactly when
+    /// its payload does, and a borrow never owns its referent (ADRs 0010,
+    /// 0023).
+    ///
+    /// `Param` is copyable because the type-argument domain is concrete
+    /// integers (ADR 0009). `type_arguments_are_copyable` pins that coupling,
+    /// so widening the domain fails a test rather than silently classifying
+    /// an owner as copyable.
+    pub fn is_affine(&self) -> bool {
+        match self {
+            Ty::Class(_) | Ty::Res(_) => true,
+            Ty::Array(_, Mutability::Owned) => true,
+            Ty::Array(_, Mutability::Shared | Mutability::Mut) => false,
+            // An option owns exactly when its present case does. The owning
+            // family's payload is an owned array, so it always does.
+            Ty::Option(payload) => payload.is_affine(),
+            Ty::AffineOption(_) => true,
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Record(_)
+            | Ty::ClassRef(..)
+            | Ty::OptionRaw(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::ResRef(..)
+            | Ty::Unit => false,
+        }
+    }
+
+    /// May a value of this type occupy a record field, and with what
+    /// geometry.
+    ///
+    /// A gate: an allow-list, never recursive. A record field states raw-cell
+    /// geometry, so a type has a field form only if it has a chosen width and
+    /// a copy rule. `option<raw<R>>` is a nullable pointer with both;
+    /// `option<u64>` is a tag plus a payload, which is a representation
+    /// decision the language has not made. `raw<u8>` is deliberately absent:
+    /// a pointee is a width or a nominal record, and only the record pointer
+    /// has a field form.
+    pub fn storage_layout(&self) -> Option<StorageLayout> {
+        match self {
+            Ty::Int(width) if !matches!(width, IntTy::TParam(_)) => Some(width.layout()),
+            Ty::RawRecord(_) | Ty::OptionRaw(_) => Some(StorageLayout { size: 8, align: 8 }),
+            _ => None,
+        }
+    }
+
     /// Resources are erased from runtime signatures and layout: authority
     /// is a static notion with no value to pass (ADR 0024).
-    pub fn is_resource(self) -> bool {
+    pub fn is_resource(&self) -> bool {
         matches!(self, Ty::Res(_) | Ty::ResRef(..))
+    }
+
+    /// Whether this type contains no type parameter, including the
+    /// non-canonical `Int(TParam(_))` spelling.
+    ///
+    /// A traversal: it recurses into every payload, and the match is
+    /// exhaustive with no wildcard so a new constructor is a compile error
+    /// rather than a shape silently reported concrete.
+    pub fn is_concrete(&self) -> bool {
+        match self {
+            Ty::Int(IntTy::TParam(_)) | Ty::Param(_) => false,
+            Ty::Raw(IntTy::TParam(_)) => false,
+            Ty::Array(element, _) => element.is_concrete(),
+            Ty::Option(payload) => payload.is_concrete(),
+            Ty::AffineOption(payload) => payload.is_concrete(),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Class(_)
+            | Ty::ClassRef(..)
+            | Ty::Record(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::ResRef(..)
+            | Ty::Unit => true,
+        }
+    }
+
+    /// How many constructors deep this type is.
+    ///
+    /// The parser bounds a *spelled* type, but substitution can multiply
+    /// depth: a template parameter under two containers becomes the argument
+    /// under two containers. Since `name`, `is_concrete`, and every traversal
+    /// recurse over this tree, the bound has to hold on the substituted type
+    /// too, not only on the written one.
+    pub fn structural_depth(&self) -> usize {
+        1 + match self {
+            Ty::Array(element, _) => element.structural_depth(),
+            Ty::Option(payload) => payload.structural_depth(),
+            Ty::AffineOption(AffineOptionTy::Array(element)) => 1 + element.structural_depth(),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::ClassRef(..)
+            | Ty::Record(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::ResRef(..)
+            | Ty::Unit => 0,
+        }
     }
 
     /// Return the integer model for concrete integer values and retained
     /// ADR 0009 template parameters. Ordinary post-mono declarations never
     /// contain `Ty::Param`; this helper keeps template checking explicit.
-    pub fn int_model(self) -> Option<IntTy> {
+    pub fn int_model(&self) -> Option<IntTy> {
         match self {
-            Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Some(integer),
+            Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Some(*integer),
             Ty::Param(parameter) => Some(IntTy::TParam(parameter.legacy_index())),
             _ => None,
         }
     }
 
-    pub fn name(self) -> String {
+    pub fn name(&self) -> String {
         match self {
             Ty::Int(t) => t.name().to_string(),
             Ty::Bool => "bool".to_string(),
@@ -1165,7 +1328,7 @@ pub enum ExprKind {
     /// `alloc_array<T>(len, init)` — a fresh owned array (design §7/§10:
     /// allocation failure is a named OOM trap, not a VC).
     AllocArray {
-        elem: ValueTy,
+        elem: Ty,
         len: Box<Expr>,
         init: Box<Expr>,
     },
@@ -1758,20 +1921,130 @@ mod generic_ty_tests {
         assert_eq!(TypeParamId::new(MAX_TYPE_PARAMS), None);
     }
 
+    /// Affinity is computed from the shape, so it has to agree with the
+    /// constructors it replaced — for every shape, not for the ones someone
+    /// remembered. The right-hand side is the rule as it was written when
+    /// ownership was a list of constructors.
     #[test]
-    fn value_types_normalize_legacy_parameters_without_claiming_integer_semantics() {
+    fn affinity_agrees_with_the_constructors_it_replaces() {
+        for (_, ty) in crate::shape_admission::samples() {
+            let by_constructor = matches!(
+                ty,
+                Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned) | Ty::AffineOption(_)
+            );
+            if ty.is_affine() == by_constructor {
+                continue;
+            }
+            // The two can disagree in exactly one place: an option whose
+            // payload owns. The constructor rule could not express that case,
+            // because a copyable option's payload could not be spelled as an
+            // owner — and the copyable-option gate still refuses it, so no
+            // reachable shape changed its answer.
+            let Ty::Option(payload) = &ty else {
+                panic!(
+                    "affinity of `{}` disagrees with the constructors it is read from",
+                    ty.name()
+                );
+            };
+            assert!(payload.is_affine(), "for `{}`", ty.name());
+            assert!(
+                crate::check::option_payload_ty((**payload).clone(), crate::span::Span::new(0, 0))
+                    .is_err(),
+                "`{}` must be refused by the copyable-option gate",
+                ty.name()
+            );
+        }
+    }
+
+    /// The record-field allow-list, checked against the match it replaced.
+    /// Getting this wrong moves matrix cells in either direction: an extra
+    /// admission opens a cell silently, a missing one closes a shape two
+    /// corpus subjects rely on.
+    #[test]
+    fn storage_layout_agrees_with_the_record_field_rule_it_replaces() {
+        for (_, ty) in crate::shape_admission::samples() {
+            let by_constructor = match &ty {
+                Ty::Int(width) if !matches!(width, IntTy::TParam(_)) => Some(width.layout()),
+                Ty::RawRecord(_) | Ty::OptionRaw(_) => Some(StorageLayout { size: 8, align: 8 }),
+                _ => None,
+            };
+            assert_eq!(
+                ty.storage_layout(),
+                by_constructor,
+                "the field geometry of `{}` disagrees with the rule it is read from",
+                ty.name()
+            );
+        }
+        // `raw<u8>` is a byte cursor whose pointee has no record identity, so
+        // it stays without a field form even though `raw<Record>` has one.
+        assert_eq!(Ty::Raw(IntTy::U8).storage_layout(), None);
+        assert!(Ty::RawRecord(0).storage_layout().is_some());
+    }
+
+    /// The argument domain is concrete integers, which is what makes a
+    /// retained template parameter provably copyable. Widening the domain
+    /// fails here rather than silently classifying an owner as copyable.
+    #[test]
+    fn type_arguments_are_copyable() {
+        for width in [
+            IntTy::U8,
+            IntTy::U16,
+            IntTy::U32,
+            IntTy::U64,
+            IntTy::I8,
+            IntTy::I16,
+            IntTy::I32,
+            IntTy::I64,
+        ] {
+            assert!(!Ty::Int(width).is_affine());
+        }
+        let parameter = TypeParamId::from_legacy(0);
+        assert!(!Ty::Param(parameter).is_affine());
+    }
+
+    #[test]
+    fn container_payloads_are_ordinary_types() {
         let parameter = TypeParamId::from_legacy(7);
-        assert_eq!(ValueTy::from(IntTy::I32), ValueTy::Int(IntTy::I32));
-        assert_eq!(ValueTy::from(IntTy::TParam(7)), ValueTy::Param(parameter));
-        assert!(!ValueTy::Param(parameter).is_concrete());
-        assert!(!ValueTy::Int(IntTy::TParam(7)).is_concrete());
-        assert!(ValueTy::Bool.is_concrete());
+        assert!(!Ty::Param(parameter).is_concrete());
+        assert!(!Ty::Int(IntTy::TParam(7)).is_concrete());
+        assert!(Ty::Bool.is_concrete());
         assert_eq!(Ty::Param(parameter).name(), "<T7>");
-        assert_eq!(Ty::Option(ValueTy::Param(parameter)).name(), "option<<T7>>");
-        let affine = AffineOptionTy::Array(ValueTy::Param(parameter));
+        assert_eq!(Ty::option(Ty::Param(parameter)).name(), "option<<T7>>");
+        let affine = AffineOptionTy::array(Ty::Param(parameter));
         assert!(!affine.is_concrete());
         assert_eq!(Ty::AffineOption(affine).name(), "option<[<T7>]>");
-        assert!(AffineOptionTy::Array(ValueTy::Bool).is_concrete());
+        assert!(AffineOptionTy::array(Ty::Bool).is_concrete());
+
+        // Nesting is representable, and prints exactly as it is spelled. What
+        // refuses these shapes is a stage gate with a name, not the grammar.
+        assert_eq!(
+            Ty::array(
+                Ty::array(Ty::Int(IntTy::U64), Mutability::Owned),
+                Mutability::Owned
+            )
+            .name(),
+            "[[u64]]"
+        );
+        assert_eq!(
+            Ty::option(Ty::option(Ty::Int(IntTy::U64))).name(),
+            "option<option<u64>>"
+        );
+        assert_eq!(Ty::array(Ty::Class(0), Mutability::Owned).name(), "[class]");
+        assert!(
+            !Ty::array(
+                Ty::array(Ty::Param(parameter), Mutability::Owned),
+                Mutability::Owned
+            )
+            .is_concrete()
+        );
+        assert_eq!(
+            Ty::array(
+                Ty::array(Ty::Int(IntTy::U64), Mutability::Owned),
+                Mutability::Owned
+            )
+            .structural_depth(),
+            3
+        );
     }
 
     #[test]

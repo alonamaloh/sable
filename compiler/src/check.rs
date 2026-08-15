@@ -117,7 +117,7 @@ struct Ctx<'a> {
 /// param).
 fn class_of(ctx: &Ctx, name: &str, span: Span) -> CResult<usize> {
     reject_view_read(ctx, name, span)?;
-    match ctx.vars.get(name).map(|v| v.ty) {
+    match ctx.vars.get(name).map(|v| v.ty.clone()) {
         Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Ok(ci),
         _ => Err(Diagnostic {
             name: "type.mismatch".into(),
@@ -239,7 +239,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
     // need a layout and an ownership-transfer meaning at the ABI that
     // Sable has not specified, so they wait until it does.
     if !matches!(f.ret, Ty::Unit | Ty::Int(_)) {
-        let what = match f.ret {
+        let what = match &f.ret {
             Ty::Class(_) => "a class value".to_string(),
             other => format!("`{}`", other.name()),
         };
@@ -289,7 +289,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
         if !ok {
             return Err(Diagnostic {
                 name: "extern.param_abi".into(),
-                title: format!("`{}` is not an ABI type", p.ty.name()),
+                title: format!("`{}` is not an ABI type", p.ty.clone().name()),
                 span: p.span,
                 label: "not in the explicit extern ABI whitelist".into(),
                 notes: vec![(
@@ -354,7 +354,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             f.name.clone(),
             FnSig {
                 params: f.params.clone(),
-                ret: f.ret,
+                ret: f.ret.clone(),
             },
         );
     }
@@ -406,29 +406,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         notes: vec![],
                     });
                 }
-                let field_layout = match field.ty {
-                    Ty::Int(it) if !matches!(it, IntTy::TParam(_)) => it.layout(),
-                    Ty::RawRecord(_) | Ty::OptionRaw(_) => StorageLayout { size: 8, align: 8 },
-                    other => {
-                        return Err(Diagnostic {
-                            name: "record.field_type".into(),
-                            title: format!(
-                                "field `{}` has non-raw-storable type `{}`",
-                                field.name,
-                                other.name()
-                            ),
-                            span: field.span,
-                            label: "records initially hold integers and nullable/non-null raw record pointers"
-                                .into(),
-                            notes: vec![(
-                                "note".into(),
-                                "classes, resources, arrays, and nested records need separate \
-                                 ownership or layout decisions"
-                                    .into(),
-                            )],
-                        });
-                    }
-                };
+                let field_layout = record_field_layout(&field.ty, &field.name, field.span)?;
                 let end =
                     field
                         .offset
@@ -502,7 +480,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     });
                 }
                 extents.push((field.offset, end, field.name.as_str(), field.offset_span));
-                fields.push((field.name.clone(), field.ty));
+                fields.push((field.name.clone(), field.ty.clone()));
             }
             record_metas.push(RecordMeta {
                 name: r.name.clone(),
@@ -559,7 +537,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         )],
                     });
                 }
-                fields.push((fld.name.clone(), fld.ty));
+                fields.push((fld.name.clone(), fld.ty.clone()));
             }
             let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
                 check_uart_params(params)?;
@@ -578,7 +556,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                             name: "type.member_param".into(),
                             title: "init/method parameters must be integers for now".into(),
                             span: p.span,
-                            label: format!("this has type `{}`", p.ty.name()),
+                            label: format!("this has type `{}`", p.ty.clone().name()),
                             notes: vec![],
                         });
                     }
@@ -595,15 +573,20 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             let mut methods = Vec::new();
             for m in &c.methods {
                 scalar_params(&m.f.params, false)?;
-                methods.push((m.f.name.clone(), m.f.params.clone(), m.f.ret, m.self_kind));
+                methods.push((
+                    m.f.name.clone(),
+                    m.f.params.clone(),
+                    m.f.ret.clone(),
+                    m.self_kind,
+                ));
             }
             if c.deinit.is_none() {
                 if let Some(f) = c
                     .fields
                     .iter()
-                    .find(|f| f.must_consume || mandatory_ty(f.ty))
+                    .find(|f| f.must_consume || mandatory_ty(f.ty.clone()))
                 {
-                    let mandatory = mandatory_ty(f.ty);
+                    let mandatory = mandatory_ty(f.ty.clone());
                     return Err(Diagnostic {
                         name: "resource.abandoned".into(),
                         title: format!("`{}` has no `deinit` to consume `{}`", c.name, f.name),
@@ -668,8 +651,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             notes: vec![],
         };
         let (ci_a, ci_b) = match (
-            sig.params.first().map(|p| p.ty),
-            sig.params.get(1).map(|p| p.ty),
+            sig.params.first().map(|p| p.ty.clone()),
+            sig.params.get(1).map(|p| p.ty.clone()),
         ) {
             (
                 Some(Ty::ClassRef(a, Mutability::Shared)),
@@ -777,15 +760,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             ctx.vars.insert(
                 p.name.clone(),
                 VarInfo {
-                    ty: p.ty,
+                    ty: p.ty.clone(),
                     initialized: true,
                     mutable: false,
                     branded: false,
-                    obligation: mandatory_ty(p.ty),
+                    obligation: mandatory_ty(p.ty.clone()),
                 },
             );
         }
-        let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
+        let returns = check_block(&mut ctx, &mut f.body, f.ret.clone())?;
         unsafe_regions += ctx.unsafe_blocks;
         if !returns && f.ret != Ty::Unit {
             return Err(Diagnostic {
@@ -842,15 +825,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             ctx.vars.insert(
                 p.name.clone(),
                 VarInfo {
-                    ty: p.ty,
+                    ty: p.ty.clone(),
                     initialized: true,
                     mutable: false,
                     branded: false,
-                    obligation: mandatory_ty(p.ty),
+                    obligation: mandatory_ty(p.ty.clone()),
                 },
             );
         }
-        let returns = check_block(&mut ctx, &mut f.body, f.ret)?;
+        let returns = check_block(&mut ctx, &mut f.body, f.ret.clone())?;
         unsafe_regions += ctx.unsafe_blocks;
         if !returns && f.ret != Ty::Unit {
             return Err(Diagnostic {
@@ -875,7 +858,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         let marked: Vec<(String, Span)> = class
             .fields
             .iter()
-            .filter(|f| f.must_consume || mandatory_ty(f.ty))
+            .filter(|f| f.must_consume || mandatory_ty(f.ty.clone()))
             .map(|f| (f.name.clone(), f.span))
             .collect();
         let class_span = class.name_span;
@@ -906,11 +889,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 ctx.vars.insert(
                     p.name.clone(),
                     VarInfo {
-                        ty: p.ty,
+                        ty: p.ty.clone(),
                         initialized: true,
                         mutable: false,
                         branded: false,
-                        obligation: mandatory_ty(p.ty),
+                        obligation: mandatory_ty(p.ty.clone()),
                     },
                 );
             }
@@ -918,7 +901,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 ctx.vars.insert(
                     format!("self.{fname}"),
                     VarInfo {
-                        ty: *fty,
+                        ty: fty.clone(),
                         initialized: false,
                         mutable: true,
                         branded: false,
@@ -976,11 +959,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 ctx.vars.insert(
                     p.name.clone(),
                     VarInfo {
-                        ty: p.ty,
+                        ty: p.ty.clone(),
                         initialized: true,
                         mutable: false,
                         branded: false,
-                        obligation: mandatory_ty(p.ty),
+                        obligation: mandatory_ty(p.ty.clone()),
                     },
                 );
             }
@@ -988,7 +971,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 ctx.vars.insert(
                     format!("self.{fname}"),
                     VarInfo {
-                        ty: *fty,
+                        ty: fty.clone(),
                         initialized: true,
                         mutable: true,
                         branded: false,
@@ -996,7 +979,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     },
                 );
             }
-            let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
+            let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret.clone())?;
             unsafe_regions += ctx.unsafe_blocks;
             reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
             if !returns {
@@ -1052,7 +1035,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 ctx.vars.insert(
                     format!("self.{fname}"),
                     VarInfo {
-                        ty: *fty,
+                        ty: fty.clone(),
                         initialized: true,
                         mutable: true,
                         branded: false,
@@ -1127,7 +1110,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         )],
                     });
                 }
-                fields.push((fld.name.clone(), fld.ty));
+                fields.push((fld.name.clone(), fld.ty.clone()));
             }
             tmetas.push(ClassMeta {
                 name: c.name.clone(),
@@ -1140,7 +1123,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 methods: c
                     .methods
                     .iter()
-                    .map(|m| (m.f.name.clone(), m.f.params.clone(), m.f.ret, m.self_kind))
+                    .map(|m| {
+                        (
+                            m.f.name.clone(),
+                            m.f.params.clone(),
+                            m.f.ret.clone(),
+                            m.self_kind,
+                        )
+                    })
                     .collect(),
             });
         }
@@ -1154,7 +1144,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             let marked: Vec<(String, Span)> = class
                 .fields
                 .iter()
-                .filter(|f| f.must_consume || mandatory_ty(f.ty))
+                .filter(|f| f.must_consume || mandatory_ty(f.ty.clone()))
                 .map(|f| (f.name.clone(), f.span))
                 .collect();
             let class_span = class.name_span;
@@ -1186,11 +1176,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ctx.vars.insert(
                         p.name.clone(),
                         VarInfo {
-                            ty: p.ty,
+                            ty: p.ty.clone(),
                             initialized: true,
                             mutable: false,
                             branded: false,
-                            obligation: mandatory_ty(p.ty),
+                            obligation: mandatory_ty(p.ty.clone()),
                         },
                     );
                 }
@@ -1198,7 +1188,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ctx.vars.insert(
                         format!("self.{fname}"),
                         VarInfo {
-                            ty: *fty,
+                            ty: fty.clone(),
                             initialized: false,
                             mutable: true,
                             branded: false,
@@ -1253,11 +1243,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ctx.vars.insert(
                         p.name.clone(),
                         VarInfo {
-                            ty: p.ty,
+                            ty: p.ty.clone(),
                             initialized: true,
                             mutable: false,
                             branded: false,
-                            obligation: mandatory_ty(p.ty),
+                            obligation: mandatory_ty(p.ty.clone()),
                         },
                     );
                 }
@@ -1265,7 +1255,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ctx.vars.insert(
                         format!("self.{fname}"),
                         VarInfo {
-                            ty: *fty,
+                            ty: fty.clone(),
                             initialized: true,
                             mutable: true,
                             branded: false,
@@ -1273,7 +1263,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         },
                     );
                 }
-                let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret)?;
+                let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret.clone())?;
                 unsafe_regions += ctx.unsafe_blocks;
                 reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
                 if !returns {
@@ -1322,7 +1312,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ctx.vars.insert(
                         format!("self.{fname}"),
                         VarInfo {
-                            ty: *fty,
+                            ty: fty.clone(),
                             initialized: true,
                             mutable: true,
                             branded: false,
@@ -1391,8 +1381,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 init,
                 mutable,
             } => {
-                if let Ty::AffineOption(payload) = *ty {
-                    affine_option_payload(payload, *name_span)?;
+                if let Ty::AffineOption(payload) = ty {
+                    affine_option_payload(payload.clone(), *name_span)?;
                     if !*mutable {
                         return Err(Diagnostic {
                             name: "mut.option_take_immutable".into(),
@@ -1417,15 +1407,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 } else {
-                    validate_aggregate_ty(*ty, *name_span)?;
+                    validate_aggregate_ty(ty.clone(), *name_span)?;
                 }
                 if matches!(
-                    ty,
-                    Ty::Array(ValueTy::Bool, Mutability::Shared | Mutability::Mut)
+                    ty.as_array(),
+                    Some((&Ty::Bool, Mutability::Shared | Mutability::Mut))
                 ) {
                     return Err(bool_array_borrow(*name_span));
                 }
-                if *ty == Ty::Array(ValueTy::Bool, Mutability::Owned) && init.is_none() {
+                if *ty == Ty::array(Ty::Bool, Mutability::Owned) && init.is_none() {
                     return Err(Diagnostic {
                         name: "type.bool_array_initializer".into(),
                         title: format!("Boolean array local `{name}` needs an initializer"),
@@ -1460,7 +1450,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                                 &operand.kind,
                                 ExprKind::Var(option)
                                     if matches!(
-                                        ctx.vars.get(option.as_str()).map(|info| info.ty),
+                                        ctx.vars.get(option.as_str()).map(|info| info.ty.clone()),
                                         Some(Ty::AffineOption(_))
                                     )
                             )
@@ -1468,7 +1458,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 });
                 if affine_value_copy {
                     let e = init.as_mut().expect("affine value copy has an initializer");
-                    check_expr(ctx, e, Some(*ty))?;
+                    check_expr(ctx, e, Some(ty.clone()))?;
                     unreachable!("affine-option `.value` must be rejected")
                 }
                 let alloc_init = matches!(
@@ -1490,18 +1480,18 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let mut branded = false;
                 let mut must_consume = false;
                 if let Some(e) = init {
-                    match (*ty, &e.kind) {
+                    match (ty.clone(), &e.kind) {
                         (Ty::AffineOption(payload), _) => {
                             check_affine_option_initializer(ctx, e, payload)?;
                         }
-                        (Ty::Array(ValueTy::Bool, Mutability::Owned), ExprKind::OptTake { .. }) => {
+                        (owned, ExprKind::OptTake { .. }) if owned.is_owned_array_of(&Ty::Bool) => {
                             check_affine_option_take(ctx, e)?;
                         }
                         (_, ExprKind::OptTake { .. }) => {
                             return Err(option_take_position(e.span));
                         }
                         _ => {
-                            check_expr(ctx, e, Some(*ty))?;
+                            check_expr(ctx, e, Some(ty.clone()))?;
                         }
                     }
                     // A local initialized from branded storage is branded
@@ -1526,7 +1516,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 ctx.vars.insert(
                     name.clone(),
                     VarInfo {
-                        ty: *ty,
+                        ty: ty.clone(),
                         initialized: init.is_some(),
                         mutable: *mutable,
                         branded,
@@ -1540,7 +1530,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 value,
             } => {
                 let (ty, was_mutable) = match ctx.vars.get(name.as_str()) {
-                    Some(v) => (v.ty, v.mutable),
+                    Some(v) => (v.ty.clone(), v.mutable),
                     None => {
                         return Err(Diagnostic {
                             name: "type.unknown_variable".into(),
@@ -1560,7 +1550,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             .into(),
                         notes: vec![(
                             "note".into(),
-                            "whole-option replacement needs an explicit rule for dropping the previous conditional owner and is outside G2.1".into(),
+                            "whole-option replacement needs an explicit rule for dropping the previous conditional owner".into(),
                         )],
                     });
                 }
@@ -1633,13 +1623,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // walk last, which is traversal order deciding a rule.
                 let before = snapshot(ctx);
                 let before_moved = ctx.moved.clone();
-                let then_ret = check_block(ctx, then_block, ret_ty)?;
+                let then_ret = check_block(ctx, then_block, ret_ty.clone())?;
                 let after_then = snapshot(ctx);
                 let after_then_moved = ctx.moved.clone();
                 restore(ctx, &before);
                 ctx.moved = before_moved.clone();
                 let else_ret = match else_block {
-                    Some(b) => check_block(ctx, b, ret_ty)?,
+                    Some(b) => check_block(ctx, b, ret_ty.clone())?,
                     None => false,
                 };
                 let after_else = snapshot(ctx);
@@ -1763,7 +1753,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // checking condition + body against the pre-condition head.
                 let after_cond = snapshot(ctx);
                 let after_cond_moved = ctx.moved.clone();
-                let _body_ret = check_block(ctx, body, ret_ty)?;
+                let _body_ret = check_block(ctx, body, ret_ty.clone())?;
                 // Affine shape must be preserved at the backedge
                 // (ADR 0024): a value consumed by the condition or body is
                 // not there for the next condition evaluation, and a
@@ -1774,7 +1764,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // shape. One declared and consumed inside the body is
                 // per-iteration scratch, not something the backedge owes.
                 if let Some(p) = ctx.moved.symmetric_difference(&head_moved).find(|p| {
-                    ctx.place_ty(p).is_some_and(is_affine) && snapshot_has_place(&head, p)
+                    ctx.place_ty(p).as_ref().is_some_and(is_affine) && snapshot_has_place(&head, p)
                 }) {
                     return Err(Diagnostic {
                         name: format!("{}.loop_shape", ctx.affine_kind(p)),
@@ -1851,7 +1841,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         notes: vec![],
                     });
                 }
-                match (value, ret_ty) {
+                match (value, ret_ty.clone()) {
                     (None, Ty::Unit) => {}
                     (Some(e), Ty::Unit) => {
                         return Err(Diagnostic {
@@ -1872,7 +1862,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                     (Some(e), _) => {
-                        check_expr(ctx, e, Some(ret_ty))?;
+                        check_expr(ctx, e, Some(ret_ty.clone()))?;
                         // Returning a place consumes it: the value leaves
                         // with the caller, and a field returned this way is
                         // authority the object no longer has.
@@ -1897,7 +1887,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             }
             Stmt::ExprStmt(e) => {
                 let ty = check_expr(ctx, e, None)?;
-                if ty == Ty::Array(ValueTy::Bool, Mutability::Owned) {
+                if ty == Ty::array(Ty::Bool, Mutability::Owned) {
                     return Err(Diagnostic {
                         name: "type.bool_array_temporary".into(),
                         title: "discarding a Boolean array temporary".into(),
@@ -1905,12 +1895,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         label: "bind the literal or allocation to an owned local".into(),
                         notes: vec![(
                             "note".into(),
-                            "the first Boolean-array slice has no temporary or transport semantics"
-                                .into(),
+                            "an owned Boolean array has no temporary or transport form".into(),
                         )],
                     });
                 }
-                if mandatory_ty(ty) {
+                if mandatory_ty(ty.clone()) {
                     return Err(Diagnostic {
                         name: "resource.abandoned".into(),
                         title: format!(
@@ -1935,7 +1924,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // Validate it before inference can overwrite it, otherwise
                 // an affine aggregate could be relabelled as its scalar
                 // initializer and bypass the explicit affine-option boundary.
-                if let Some(cached) = *ty {
+                if let Some(cached) = ty {
                     if matches!(cached, Ty::AffineOption(_)) {
                         return Err(Diagnostic {
                             name: "option.affine_inferred".into(),
@@ -1945,7 +1934,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             notes: vec![],
                         });
                     }
-                    validate_aggregate_ty(cached, *name_span)?;
+                    validate_aggregate_ty(cached.clone(), *name_span)?;
                 }
                 if matches!(
                     &init.kind,
@@ -1979,12 +1968,16 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // be legal at all. `var x = self.f;` moves a field the
                 // same way.
                 let moved_from = match &init.kind {
-                    ExprKind::Var(src) => match ctx.vars.get(src.as_str()).map(|v| v.ty) {
+                    ExprKind::Var(src) => match ctx.vars.get(src.as_str()).map(|v| v.ty.clone()) {
                         Some(Ty::Class(ci)) => Some(ci),
                         _ => None,
                     },
                     ExprKind::SelfField { field } => {
-                        match ctx.vars.get(format!("self.{field}").as_str()).map(|v| v.ty) {
+                        match ctx
+                            .vars
+                            .get(format!("self.{field}").as_str())
+                            .map(|v| v.ty.clone())
+                        {
                             Some(Ty::Class(ci)) => Some(ci),
                             _ => None,
                         }
@@ -2017,7 +2010,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         notes: vec![],
                     });
                 }
-                *ty = Some(t);
+                *ty = Some(t.clone());
                 ctx.vars.insert(
                     name.clone(),
                     VarInfo {
@@ -2036,7 +2029,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let outer = ctx.in_unsafe;
                 ctx.in_unsafe = true;
                 ctx.unsafe_blocks += 1;
-                let r = check_block(ctx, body, ret_ty);
+                let r = check_block(ctx, body, ret_ty.clone());
                 ctx.in_unsafe = outer;
                 returned = r?;
             }
@@ -2144,7 +2137,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     ctx.vars.insert(
                         name.to_string(),
                         VarInfo {
-                            ty,
+                            ty: ty.clone(),
                             initialized: true,
                             mutable,
                             branded: false,
@@ -2176,7 +2169,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 body,
             } => {
                 let (elem, src_mut, declared_mut) = match ctx.vars.get(array.as_str()) {
-                    Some(v) => match v.ty {
+                    Some(v) => match &v.ty {
                         Ty::Array(e, m) => (e, m, v.mutable),
                         Ty::AffineOption(_) => {
                             return Err(Diagnostic {
@@ -2196,7 +2189,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                                 name: "expose.not_an_array".into(),
                                 title: format!("`{array}` is not an array"),
                                 span: *array_span,
-                                label: format!("this has type `{}`", v.ty.name()),
+                                label: format!("this has type `{}`", v.ty.clone().name()),
                                 notes: vec![],
                             });
                         }
@@ -2211,7 +2204,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
-                let elem_ty = array_payload_ty(elem, *array_span)?;
+                let elem_ty = array_payload_ty(*elem.clone(), *array_span)?;
                 if elem_ty != Ty::Int(IntTy::U8) {
                     return Err(Diagnostic {
                         name: "expose.element_type".into(),
@@ -2227,7 +2220,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     });
                 }
                 if *mutable {
-                    if src_mut == Mutability::Shared {
+                    if *src_mut == Mutability::Shared {
                         return Err(Diagnostic {
                             name: "expose.mutate_shared".into(),
                             title: format!("cannot expose `{array}` mutably"),
@@ -2236,7 +2229,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             notes: vec![],
                         });
                     }
-                    if src_mut == Mutability::Owned && !declared_mut {
+                    if *src_mut == Mutability::Owned && !declared_mut {
                         return Err(Diagnostic {
                             name: "mut.borrow_immutable".into(),
                             title: format!("`&mut` exposure of immutable local `{array}`"),
@@ -2287,7 +2280,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let outer = ctx.in_unsafe;
                 ctx.in_unsafe = true;
                 ctx.unsafe_blocks += 1;
-                let r = check_block(ctx, body, ret_ty);
+                let r = check_block(ctx, body, ret_ty.clone());
                 ctx.in_unsafe = outer;
                 let body_returned = r?;
                 if body_returned {
@@ -2355,15 +2348,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // performs the moved-place check explicitly before stamping
                 // the contextual owned type.
                 let mut checked = false;
-                if let Ty::Array(elem, _) = fty {
+                if let Ty::Array(ref elem, _) = fty {
                     match &value.kind {
                         ExprKind::Var(name) => {
                             let source = Place::local(name);
                             if ctx.is_moved(&source) {
                                 return Err(moved_out(ctx, &source, value.span, "move"));
                             }
-                            match ctx.vars.get(name.as_str()).map(|v| v.ty) {
-                                Some(Ty::Array(e2, Mutability::Owned)) if e2 == elem => {
+                            match ctx.vars.get(name.as_str()).map(|v| v.ty.clone()) {
+                                Some(Ty::Array(e2, Mutability::Owned)) if e2 == *elem => {
                                     value.ty = Some(Ty::Array(e2, Mutability::Owned));
                                     checked = true;
                                 }
@@ -2441,7 +2434,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 };
                 ctx.require_field_init(field, *field_span)?;
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(array_payload_ty(elem, *field_span)?))?;
+                check_expr(ctx, value, Some(array_payload_ty(*elem, *field_span)?))?;
             }
             Stmt::Store {
                 array,
@@ -2454,13 +2447,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         ty: Ty::Array(t, m),
                         mutable,
                         ..
-                    }) => (*t, *m, *mutable),
+                    }) => (t.clone(), *m, *mutable),
                     Some(v) => {
                         return Err(Diagnostic {
                             name: "type.not_an_array".into(),
                             title: format!("`{array}` is not an array"),
                             span: *array_span,
-                            label: format!("this has type `{}`", v.ty.name()),
+                            label: format!("this has type `{}`", v.ty.clone().name()),
                             notes: vec![],
                         });
                     }
@@ -2514,7 +2507,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     });
                 }
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(array_payload_ty(elem, *array_span)?))?;
+                check_expr(ctx, value, Some(array_payload_ty(*elem, *array_span)?))?;
             }
         }
     }
@@ -2547,17 +2540,18 @@ fn stmt_span(stmt: &Stmt) -> Span {
 /// overloaded sealed/raw operations need this narrow peek first.
 fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
     let ty = match &e.kind {
-        ExprKind::Var(name) => ctx.vars.get(name.as_str()).map(|v| v.ty),
-        ExprKind::SelfField { field } => {
-            ctx.vars.get(format!("self.{field}").as_str()).map(|v| v.ty)
-        }
+        ExprKind::Var(name) => ctx.vars.get(name.as_str()).map(|v| v.ty.clone()),
+        ExprKind::SelfField { field } => ctx
+            .vars
+            .get(format!("self.{field}").as_str())
+            .map(|v| v.ty.clone()),
         ExprKind::Borrow { array, field, .. } => {
             let key = field
                 .as_ref()
                 .map_or_else(|| array.clone(), |f| format!("{array}.{f}"));
-            ctx.vars.get(key.as_str()).map(|v| v.ty)
+            ctx.vars.get(key.as_str()).map(|v| v.ty.clone())
         }
-        _ => e.ty,
+        _ => e.ty.clone(),
     }?;
     match ty {
         Ty::Res(kind) | Ty::ResRef(kind, _) => Some(kind),
@@ -2583,24 +2577,39 @@ fn bool_array_borrow(span: Span) -> Diagnostic {
         label: "use this `[bool]` through its owned local name".into(),
         notes: vec![(
             "note".into(),
-            "the first Boolean-array slice supports owned local indexing, length, and stores; \
-             borrowed transport remains closed until every backend models it"
+            "an owned Boolean array supports local indexing, length, and stores; borrowed \
+             transport stays closed until every backend models it"
                 .into(),
         )],
     }
 }
 
-/// Convert an array's payload identity to the type of one indexed element.
-/// This is deliberately independent of where the array occurs: position
-/// policy below keeps Boolean arrays owned and local while element checking
-/// can preserve their exact `bool` identity.
-fn array_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
+/// May a value of this type be an array element, and if so, what is the type
+/// of one indexed element.
+///
+/// This is a *gate*, not a traversal: an allow-list ending in a named
+/// refusal, which never calls itself — a gate that recursed would admit
+/// arbitrary nesting. Validation and lowering are one function on purpose, so
+/// there is no second, unguarded way to ask for the element type.
+///
+/// It is load-bearing well beyond the type it returns. Indexing and element
+/// stores neither move the value nor re-brand it, and they are sound only
+/// because every payload admitted here is copyable. Refusing every owning
+/// payload by name is what keeps that true, and it is the real gate, not the
+/// parser's admissibility table: `Place` is a root plus a field path with no
+/// index component, so an owner living in an array element could not be
+/// tracked at all.
+///
+/// It is deliberately independent of where the array occurs: position policy
+/// below keeps Boolean arrays owned and local, while element checking can
+/// preserve their exact `bool` identity.
+pub(crate) fn array_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
     match payload {
-        ValueTy::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
-        ValueTy::Int(integer) => Ok(Ty::Int(integer)),
-        ValueTy::Param(parameter) => Ok(Ty::Param(parameter)),
-        ValueTy::Bool => Ok(Ty::Bool),
-        ValueTy::Record(_) => Err(Diagnostic {
+        Ty::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
+        Ty::Int(integer) => Ok(Ty::Int(integer)),
+        Ty::Param(parameter) => Ok(Ty::Param(parameter)),
+        Ty::Bool => Ok(Ty::Bool),
+        _ => Err(Diagnostic {
             name: "type.array_payload_unsupported".into(),
             title: format!(
                 "array payload type `{}` is not supported yet",
@@ -2610,25 +2619,31 @@ fn array_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
             label: "array operations currently support integers and `bool`".into(),
             notes: vec![(
                 "note".into(),
-                "the AST records this type without granting runtime or proof semantics; \
-                 enable array checking, proof, and execution together before accepting it"
+                "an element is stored, copied, and compared in place, so a payload needs a \
+                 layout, a copy rule, and — if it owns anything — a place path that can name \
+                 one element"
                     .into(),
             )],
         }),
     }
 }
 
-/// G1.1's first concrete non-integer aggregate: options may contain Boolean
-/// values, while POD records remain behind their later representation,
-/// ownership, proof, and runtime slice. Retained declaration parameters keep
-/// the existing ADR 0009 abstract-integer semantics.
-fn option_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
+/// May a value of this type be a copyable option payload, and if so, what is
+/// the type of the present case.
+///
+/// A gate on the same terms as `array_payload_ty`: an allow-list, never
+/// recursive, validating and lowering in one function. Copyable is the whole
+/// rule — an option duplicates its payload whenever it is duplicated, so the
+/// owning payloads are the separate `option<[T]>` and `option<raw<Record>>`
+/// families. Retained declaration parameters keep the ADR 0009
+/// abstract-integer semantics.
+pub(crate) fn option_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
     match payload {
-        ValueTy::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
-        ValueTy::Int(integer) => Ok(Ty::Int(integer)),
-        ValueTy::Param(parameter) => Ok(Ty::Param(parameter)),
-        ValueTy::Bool => Ok(Ty::Bool),
-        ValueTy::Record(_) => Err(Diagnostic {
+        Ty::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
+        Ty::Int(integer) => Ok(Ty::Int(integer)),
+        Ty::Param(parameter) => Ok(Ty::Param(parameter)),
+        Ty::Bool => Ok(Ty::Bool),
+        _ => Err(Diagnostic {
             name: "type.option_payload_unsupported".into(),
             title: format!(
                 "option payload type `{}` is not supported yet",
@@ -2646,8 +2661,8 @@ fn option_payload_ty(payload: ValueTy, span: Span) -> CResult<Ty> {
     }
 }
 
-/// Fallback fence for an ownership-bearing option that reaches a context
-/// without a G2.1 rule. Source-facing boundaries use the more specific
+/// Fallback fence for an ownership-bearing option that reaches a context with
+/// no ownership rule. Source-facing boundaries use the more specific
 /// diagnostics below; retaining this last gate keeps preconstructed ASTs from
 /// falling into the ordinary copy-option implementation.
 fn affine_option_unsupported(ty: Ty, span: Span) -> Diagnostic {
@@ -2658,15 +2673,18 @@ fn affine_option_unsupported(ty: Ty, span: Span) -> Diagnostic {
         label: "this context has no affine-option ownership rule".into(),
         notes: vec![(
             "note".into(),
-            "G2.1 admits only explicit mutable local `option<[bool]>` values and atomic `.take`; affine options never use the ordinary copy-option path"
+            "an affine option is an explicit mutable local inspected with `.is_some` and emptied with atomic `.take`; it never uses the ordinary copy-option path"
                 .into(),
         )],
     }
 }
 
-fn affine_option_payload(ty: AffineOptionTy, span: Span) -> CResult<()> {
+/// May an owning option carry this payload. A gate: an allow-list ending in a
+/// named refusal, because each owned payload kind needs matching proof,
+/// interpreter, formal-machine, and native destruction semantics.
+pub(crate) fn affine_option_payload(ty: AffineOptionTy, span: Span) -> CResult<()> {
     match ty {
-        AffineOptionTy::Array(ValueTy::Bool) => Ok(()),
+        AffineOptionTy::Array(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
         AffineOptionTy::Array(payload) => Err(Diagnostic {
             name: "type.affine_option_payload".into(),
             title: format!(
@@ -2674,7 +2692,7 @@ fn affine_option_payload(ty: AffineOptionTy, span: Span) -> CResult<()> {
                 payload.name()
             ),
             span,
-            label: "the first affine-option slice supports only `option<[bool]>`".into(),
+            label: "the affine-option family currently owns only `option<[bool]>`".into(),
             notes: vec![(
                 "note".into(),
                 "each owned payload kind needs matching proof, interpreter, SVM, and native destruction semantics".into(),
@@ -2722,67 +2740,110 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
         label: label.into(),
         notes: vec![(
             "note".into(),
-            "G2.1 intentionally has no affine-option ABI, field layout, or generic ownership substitution".into(),
+            "an affine option has no ABI, field layout, or generic ownership substitution".into(),
         )],
     }
 }
 
-fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
+/// Check every container payload inside a type.
+///
+/// This is a *traversal*, and the match is exhaustive with no wildcard on
+/// purpose: a wildcard here is fail-open, because a shape nested under a
+/// constructor nobody thought about would be admitted without any gate seeing
+/// it. A new constructor must be a compile error, not a silent `Ok`. Each
+/// leaf hands off to the gate that owns the position.
+pub(crate) fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
     match ty {
-        Ty::Array(payload, _) => array_payload_ty(payload, span).map(|_| ()),
-        Ty::Option(payload) => option_payload_ty(payload, span).map(|_| ()),
+        Ty::Array(payload, _) => array_payload_ty(*payload, span).map(|_| ()),
+        Ty::Option(payload) => option_payload_ty(*payload, span).map(|_| ()),
         Ty::AffineOption(_) => Err(affine_option_unsupported(ty, span)),
-        _ => Ok(()),
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::ClassRef(..)
+        | Ty::Record(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::ResRef(..)
+        | Ty::Unit => Ok(()),
     }
 }
 
-fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
-    fn bool_array_parameter(span: Span) -> Diagnostic {
-        Diagnostic {
-            name: "type.bool_array_param".into(),
-            title: "Boolean arrays cannot cross a call boundary yet".into(),
-            span,
-            label: "keep `[bool]` as an owned local; borrowed Boolean arrays are deferred".into(),
-            notes: vec![(
-                "note".into(),
-                "the first Boolean-array slice has local proof and execution semantics only; \
-                 parameter transport must land together in every backend"
-                    .into(),
-            )],
-        }
-    }
+/// May a record field hold this type, and if so with what storage geometry.
+///
+/// A gate: an allow-list ending in a named refusal. A record field is a raw
+/// byte extent, so only a type that has chosen a width and a copy rule has a
+/// field form; `Ty::storage_layout` is that allow-list.
+pub(crate) fn record_field_layout(ty: &Ty, field: &str, span: Span) -> CResult<StorageLayout> {
+    ty.storage_layout().ok_or_else(|| Diagnostic {
+        name: "record.field_type".into(),
+        title: format!("field `{field}` has non-raw-storable type `{}`", ty.name()),
+        span,
+        label: "records initially hold integers and nullable/non-null raw record pointers".into(),
+        notes: vec![(
+            "note".into(),
+            "classes, resources, arrays, and nested records need separate ownership or layout \
+             decisions"
+                .into(),
+        )],
+    })
+}
 
+fn bool_array_parameter(span: Span) -> Diagnostic {
+    Diagnostic {
+        name: "type.bool_array_param".into(),
+        title: "Boolean arrays cannot cross a call boundary yet".into(),
+        span,
+        label: "keep `[bool]` as an owned local; borrowed Boolean arrays are deferred".into(),
+        notes: vec![(
+            "note".into(),
+            "an owned Boolean array has local proof and execution semantics only; parameter \
+             transport must land together in every backend"
+                .into(),
+        )],
+    }
+}
+
+/// May a parameter carry this type. A position gate: the payload traversal
+/// decides what the type may contain, and these refusals decide what the call
+/// boundary may transport, which is a separate question with a separate
+/// answer for the same type.
+pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
+    if matches!(ty, Ty::AffineOption(_)) {
+        return Err(affine_option_boundary(ty.clone(), span, "parameter"));
+    }
+    if ty.is_array_of(&Ty::Bool) {
+        return Err(bool_array_parameter(span));
+    }
+    validate_aggregate_ty(ty.clone(), span)?;
+    if matches!(ty, Ty::Option(_)) {
+        return Err(Diagnostic {
+            name: "type.option_param".into(),
+            title: "option-typed parameters are not supported yet".into(),
+            span,
+            label: "`option<T>` is a return type or local for now".into(),
+            notes: vec![],
+        });
+    }
+    Ok(())
+}
+
+fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     fn function(function: &Fn) -> CResult<()> {
         for parameter in &function.params {
-            if matches!(parameter.ty, Ty::AffineOption(_)) {
-                return Err(affine_option_boundary(
-                    parameter.ty,
-                    parameter.span,
-                    "parameter",
-                ));
-            }
-            if matches!(parameter.ty, Ty::Array(ValueTy::Bool, _)) {
-                return Err(bool_array_parameter(parameter.span));
-            }
-            validate_aggregate_ty(parameter.ty, parameter.span)?;
-            if matches!(parameter.ty, Ty::Option(_)) {
-                return Err(Diagnostic {
-                    name: "type.option_param".into(),
-                    title: "option-typed parameters are not supported yet".into(),
-                    span: parameter.span,
-                    label: "`option<T>` is a return type or local for now".into(),
-                    notes: vec![],
-                });
-            }
+            parameter_ty(&parameter.ty, parameter.span)?;
         }
         if matches!(function.ret, Ty::AffineOption(_)) {
             return Err(affine_option_boundary(
-                function.ret,
+                function.ret.clone(),
                 function.name_span,
                 "return",
             ));
         }
-        validate_aggregate_ty(function.ret, function.name_span)?;
+        validate_aggregate_ty(function.ret.clone(), function.name_span)?;
         if matches!(function.ret, Ty::Array(..)) {
             return Err(Diagnostic {
                 name: "type.array_return".into(),
@@ -2791,8 +2852,8 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 label: "arrays cannot be returned yet".into(),
                 notes: vec![(
                     "note".into(),
-                    "the owned-local Boolean-array slice does not define array ownership \
-                     transfer across a return boundary"
+                    "an owned array local has no ownership-transfer rule across a return \
+                     boundary"
                         .into(),
                 )],
             });
@@ -2802,9 +2863,13 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
 
     fn class_field(field: &Field) -> CResult<()> {
         if matches!(field.ty, Ty::AffineOption(_)) {
-            return Err(affine_option_boundary(field.ty, field.span, "field"));
+            return Err(affine_option_boundary(
+                field.ty.clone(),
+                field.span,
+                "field",
+            ));
         }
-        if matches!(field.ty, Ty::Array(ValueTy::Bool, _)) {
+        if field.ty.is_array_of(&Ty::Bool) {
             return Err(Diagnostic {
                 name: "type.bool_array_field".into(),
                 title: "Boolean arrays cannot be stored in class fields yet".into(),
@@ -2818,13 +2883,13 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 )],
             });
         }
-        validate_aggregate_ty(field.ty, field.span)?;
+        validate_aggregate_ty(field.ty.clone(), field.span)?;
         if matches!(field.ty, Ty::Option(_)) {
             return Err(Diagnostic {
                 name: "type.option_field".into(),
                 title: "option-valued class fields are not supported yet".into(),
                 span: field.span,
-                label: "G1.1 keeps `option<T>` in returns and locals".into(),
+                label: "`option<T>` lives in returns and locals".into(),
                 notes: vec![(
                     "note".into(),
                     "field storage must land together with aggregate ownership and lowering".into(),
@@ -2841,14 +2906,14 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
             .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
         {
             return Err(affine_option_boundary(
-                parameter.ty,
+                parameter.ty.clone(),
                 parameter.span,
                 "trait",
             ));
         }
         if matches!(method.ret, Ty::AffineOption(_)) {
             return Err(affine_option_boundary(
-                method.ret,
+                method.ret.clone(),
                 method.name_span,
                 "trait",
             ));
@@ -2879,7 +2944,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 span: parameter.span,
                 label: format!(
                     "`{}` is not supported in a trait method parameter",
-                    parameter.ty.name()
+                    parameter.ty.clone().name()
                 ),
                 notes: vec![(
                     "note".into(),
@@ -2896,7 +2961,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 span: method.name_span,
                 label: format!(
                     "`{}` is not supported as a trait method result",
-                    method.ret.name()
+                    method.ret.clone().name()
                 ),
                 notes: vec![(
                     "note".into(),
@@ -2935,7 +3000,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                     ty: ty @ Ty::AffineOption(_),
                     name_span,
                     ..
-                } => return Some((*ty, *name_span)),
+                } => return Some((ty.clone(), *name_span)),
                 Stmt::If {
                     then_block,
                     else_block,
@@ -2971,14 +3036,14 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
             .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
         {
             return Err(affine_option_boundary(
-                parameter.ty,
+                parameter.ty.clone(),
                 parameter.span,
                 "generic",
             ));
         }
         if matches!(function.ret, Ty::AffineOption(_)) {
             return Err(affine_option_boundary(
-                function.ret,
+                function.ret.clone(),
                 function.name_span,
                 "generic",
             ));
@@ -3021,9 +3086,13 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     for record in &program.records {
         for field in &record.fields {
             if matches!(field.ty, Ty::AffineOption(_)) {
-                return Err(affine_option_boundary(field.ty, field.span, "field"));
+                return Err(affine_option_boundary(
+                    field.ty.clone(),
+                    field.span,
+                    "field",
+                ));
             }
-            validate_aggregate_ty(field.ty, field.span)?;
+            validate_aggregate_ty(field.ty.clone(), field.span)?;
         }
     }
     for trait_ in &program.traits {
@@ -3075,24 +3144,14 @@ fn check_affine_option_initializer(
     expression: &mut Expr,
     payload: AffineOptionTy,
 ) -> CResult<Ty> {
-    affine_option_payload(payload, expression.span)?;
+    affine_option_payload(payload.clone(), expression.span)?;
     let option_ty = Ty::AffineOption(payload);
     match &mut expression.kind {
         ExprKind::NoneE => {}
         ExprKind::SomeE(inner)
-            if matches!(
-                &inner.kind,
-                ExprKind::AllocArray {
-                    elem: ValueTy::Bool,
-                    ..
-                }
-            ) =>
+            if matches!(&inner.kind, ExprKind::AllocArray { elem: Ty::Bool, .. }) =>
         {
-            check_expr(
-                ctx,
-                inner,
-                Some(Ty::Array(ValueTy::Bool, Mutability::Owned)),
-            )?;
+            check_expr(ctx, inner, Some(Ty::array(Ty::Bool, Mutability::Owned)))?;
         }
         _ => {
             return Err(Diagnostic {
@@ -3107,7 +3166,7 @@ fn check_affine_option_initializer(
             });
         }
     }
-    expression.ty = Some(option_ty);
+    expression.ty = Some(option_ty.clone());
     Ok(option_ty)
 }
 
@@ -3126,16 +3185,16 @@ fn check_affine_option_local(
             notes: vec![],
         });
     };
-    let Ty::AffineOption(payload) = info.ty else {
+    let Ty::AffineOption(ref payload) = info.ty else {
         return Err(Diagnostic {
             name: "type.mismatch".into(),
-            title: format!("`.{operation}` on `{}`", info.ty.name()),
+            title: format!("`.{operation}` on `{}`", info.ty.clone().name()),
             span,
             label: "expected an affine `option<[bool]>` local".into(),
             notes: vec![],
         });
     };
-    affine_option_payload(payload, span)?;
+    affine_option_payload(payload.clone(), span)?;
     if !info.initialized {
         return Err(Diagnostic {
             name: "type.uninitialized".into(),
@@ -3149,7 +3208,7 @@ fn check_affine_option_local(
     if ctx.is_moved(&place) {
         return Err(moved_out(ctx, &place, span, operation));
     }
-    Ok((payload, info.mutable))
+    Ok((payload.clone(), info.mutable))
 }
 
 fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty> {
@@ -3173,19 +3232,19 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
             )],
         });
     }
-    let ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
-    expression.ty = Some(ty);
+    let ty = Ty::array(Ty::Bool, Mutability::Owned);
+    expression.ty = Some(ty.clone());
     Ok(ty)
 }
 
 fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
-    if let Some(ty @ Ty::AffineOption(_)) = expected {
-        return Err(affine_option_unsupported(ty, e.span));
+    if let Some(ty @ Ty::AffineOption(_)) = &expected {
+        return Err(affine_option_unsupported(ty.clone(), e.span));
     }
-    if let Some(ty @ Ty::AffineOption(_)) = e.ty {
-        return Err(affine_option_unsupported(ty, e.span));
+    if let Some(ty @ Ty::AffineOption(_)) = &e.ty {
+        return Err(affine_option_unsupported(ty.clone(), e.span));
     }
-    let ty = infer_expr(ctx, e, expected)?;
+    let ty = infer_expr(ctx, e, expected.clone())?;
     if let Some(exp) = expected {
         if ty != exp {
             return Err(Diagnostic {
@@ -3193,7 +3252,7 @@ fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 title: format!(
                     "type mismatch: expected `{}`, found `{}`",
                     exp.name(),
-                    ty.name()
+                    ty.clone().name()
                 ),
                 span: e.span,
                 label: format!("this has type `{}`", ty.name()),
@@ -3212,7 +3271,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     let ty = match &mut e.kind {
         ExprKind::IntLit(n) => {
             let t = match expected {
-                Some(t) if is_integer_ty(t) => t,
+                Some(t) if is_integer_ty(t.clone()) => t,
                 Some(other) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -3292,8 +3351,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                                 notes: vec![],
                             });
                         }
-                        e.ty = Some(v.ty);
-                        return Ok(v.ty);
+                        e.ty = Some(v.ty.clone());
+                        return Ok(v.ty.clone());
                     }
                     return Err(Diagnostic {
                         name: "resource.not_a_value".into(),
@@ -3325,8 +3384,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                                 notes: vec![],
                             });
                         }
-                        e.ty = Some(v.ty);
-                        return Ok(v.ty);
+                        e.ty = Some(v.ty.clone());
+                        return Ok(v.ty.clone());
                     }
                     return Err(Diagnostic {
                         name: "type.class_value".into(),
@@ -3361,7 +3420,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         )],
                     });
                 }
-                v.ty
+                v.ty.clone()
             }
             None => {
                 return Err(Diagnostic {
@@ -3386,7 +3445,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // `a.len` on a class receiver is the FIELD named `len`
             // (ADR 0010) — rewrite and re-check.
             if matches!(
-                ctx.vars.get(array.as_str()).map(|v| v.ty),
+                ctx.vars.get(array.as_str()).map(|v| v.ty.clone()),
                 Some(Ty::Class(_)) | Some(Ty::ClassRef(..))
             ) {
                 let obj = array.clone();
@@ -3403,7 +3462,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Widen { target, arg } => {
             let target_ty = legacy_integer_ty(*target);
             let src = match check_expr(ctx, arg, None) {
-                Ok(ty) if is_integer_ty(ty) => ty,
+                Ok(ty) if is_integer_ty(ty.clone()) => ty,
                 Ok(other) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -3417,14 +3476,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     // Literals need context; widening a literal is pointless
                     // but legal — retry with the target type.
                     if d.name == "type.ambiguous_literal" {
-                        check_expr(ctx, arg, Some(target_ty))?;
-                        target_ty
+                        check_expr(ctx, arg, Some(target_ty.clone()))?;
+                        target_ty.clone()
                     } else {
                         return Err(d);
                     }
                 }
             };
-            if is_abstract_integer_ty(src) || is_abstract_integer_ty(target_ty) {
+            if is_abstract_integer_ty(src.clone()) || is_abstract_integer_ty(target_ty.clone()) {
                 return Err(Diagnostic {
                     name: "concepts.template_conv".into(),
                     title: "`widen`/`narrow` on a type parameter".into(),
@@ -3465,7 +3524,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // proof obligation (`narrow.range`), not a typing rule.
             let target_ty = legacy_integer_ty(*target);
             match check_expr(ctx, arg, None) {
-                Ok(ty) if is_integer_ty(ty) => {}
+                Ok(ty) if is_integer_ty(ty.clone()) => {}
                 Ok(other) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -3477,7 +3536,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 Err(d) => {
                     if d.name == "type.ambiguous_literal" {
-                        check_expr(ctx, arg, Some(target_ty))?;
+                        check_expr(ctx, arg, Some(target_ty.clone()))?;
                     } else {
                         return Err(d);
                     }
@@ -3489,7 +3548,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let affine_name = match &operand.kind {
                 ExprKind::Var(option)
                     if matches!(
-                        ctx.vars.get(option.as_str()).map(|info| info.ty),
+                        ctx.vars.get(option.as_str()).map(|info| info.ty.clone()),
                         Some(Ty::AffineOption(_))
                     ) =>
                 {
@@ -3520,7 +3579,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::OptValue { operand } => {
             if let ExprKind::Var(option) = &operand.kind {
                 if matches!(
-                    ctx.vars.get(option.as_str()).map(|info| info.ty),
+                    ctx.vars.get(option.as_str()).map(|info| info.ty.clone()),
                     Some(Ty::AffineOption(_))
                 ) {
                     return Err(Diagnostic {
@@ -3536,7 +3595,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
             }
             match check_expr(ctx, operand, None)? {
-                Ty::Option(payload) => option_payload_ty(payload, span)?,
+                Ty::Option(payload) => option_payload_ty(*payload, span)?,
                 Ty::OptionRaw(ri) => Ty::RawRecord(ri),
                 other => {
                     return Err(Diagnostic {
@@ -3558,7 +3617,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             field,
         } => {
             if matches!(
-                ctx.vars.get(obj.as_str()).map(|v| v.ty),
+                ctx.vars.get(obj.as_str()).map(|v| v.ty.clone()),
                 Some(Ty::Record(_))
             ) {
                 let record_obj = obj.clone();
@@ -3597,7 +3656,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 other => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
-                        title: format!("field `{field}` has type `{}`", other.name()),
+                        title: format!("field `{field}` has type `{}`", other.clone().name()),
                         span,
                         label: "unsupported field read".into(),
                         notes: vec![],
@@ -3641,7 +3700,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             meta.fields
                 .iter()
                 .find(|(name, _)| name == field)
-                .map(|(_, ty)| *ty)
+                .map(|(_, ty)| ty.clone())
                 .ok_or_else(|| Diagnostic {
                     name: "type.unknown_field".into(),
                     title: format!("`{}` has no field `{field}`", meta.name),
@@ -3675,7 +3734,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let ci = class_of(ctx, obj, *obj_span)?;
             let meta = &ctx.class_metas[ci];
             let elem = match meta.fields.iter().find(|(n, _)| n == field) {
-                Some((_, Ty::Array(el, _))) => *el,
+                Some((_, Ty::Array(el, _))) => el.clone(),
                 _ => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -3687,7 +3746,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
             };
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            array_payload_ty(elem, span)?
+            array_payload_ty(*elem, span)?
         }
         ExprKind::TraitCall {
             param,
@@ -3722,13 +3781,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // bounded parameter is `pidx`. Remap both direct and aggregate
             // payload positions without turning either into an `IntTy`.
             let remap = |t: Ty| -> Ty {
-                let remap_payload = |payload: ValueTy| match payload {
-                    ValueTy::Param(parameter) if parameter.index() == 0 => {
-                        ValueTy::Param(TypeParamId::from_legacy(pidx))
+                let remap_payload = |payload: Ty| match payload {
+                    Ty::Param(parameter) if parameter.index() == 0 => {
+                        Ty::Param(TypeParamId::from_legacy(pidx))
                     }
-                    ValueTy::Int(IntTy::TParam(0)) => {
-                        ValueTy::Param(TypeParamId::from_legacy(pidx))
-                    }
+                    Ty::Int(IntTy::TParam(0)) => Ty::Param(TypeParamId::from_legacy(pidx)),
                     other => other,
                 };
                 match t {
@@ -3736,8 +3793,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         Ty::Param(TypeParamId::from_legacy(pidx))
                     }
                     Ty::Int(IntTy::TParam(0)) => Ty::Param(TypeParamId::from_legacy(pidx)),
-                    Ty::Array(payload, mutability) => Ty::Array(remap_payload(payload), mutability),
-                    Ty::Option(payload) => Ty::Option(remap_payload(payload)),
+                    Ty::Array(payload, mutability) => {
+                        Ty::Array(Box::new(remap_payload(*payload)), mutability)
+                    }
+                    Ty::Option(payload) => Ty::Option(Box::new(remap_payload(*payload))),
                     other => other,
                 }
             };
@@ -3754,12 +3813,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            let want: Vec<Ty> = m.params.iter().map(|p| remap(p.ty)).collect();
+            let want: Vec<Ty> = m.params.iter().map(|p| remap(p.ty.clone())).collect();
             for (a, w) in args.iter_mut().zip(&want) {
-                check_expr(ctx, a, Some(*w))?;
+                check_expr(ctx, a, Some(w.clone()))?;
             }
             check_borrow_conflicts(ctx, args, None)?;
-            remap(m.ret)
+            remap(m.ret.clone())
         }
         ExprKind::RawOp { op, op_span, args } => {
             let op = *op;
@@ -3828,15 +3887,29 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let leased_cell_shared = Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Shared);
             let leased_cell_unique = Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Mut);
             let want: Vec<Ty> = match op {
-                RawOp::Offset => vec![raw, u64t],
-                RawOp::Load8 => vec![raw, shared],
-                RawOp::Store8 => vec![raw, u8t, unique],
-                RawOp::Copy => vec![raw, raw, u64t, shared, unique],
-                RawOp::IntoCellU64 => vec![raw, if leased_role { leased } else { span }],
-                RawOp::FromCellU64 => vec![raw, if leased_role { leased_cell } else { cell }],
+                RawOp::Offset => vec![raw.clone(), u64t.clone()],
+                RawOp::Load8 => vec![raw.clone(), shared],
+                RawOp::Store8 => vec![raw.clone(), u8t.clone(), unique],
+                RawOp::Copy => vec![raw.clone(), raw.clone(), u64t.clone(), shared, unique],
+                RawOp::IntoCellU64 => vec![
+                    raw.clone(),
+                    if leased_role {
+                        leased.clone()
+                    } else {
+                        span.clone()
+                    },
+                ],
+                RawOp::FromCellU64 => vec![
+                    raw.clone(),
+                    if leased_role {
+                        leased_cell.clone()
+                    } else {
+                        cell.clone()
+                    },
+                ],
                 RawOp::CellInitU64 => vec![
-                    raw,
-                    u64t,
+                    raw.clone(),
+                    u64t.clone(),
                     if leased_role {
                         leased_cell_unique
                     } else {
@@ -3844,7 +3917,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     },
                 ],
                 RawOp::CellReadU64 => vec![
-                    raw,
+                    raw.clone(),
                     if leased_role {
                         leased_cell_shared
                     } else {
@@ -3852,7 +3925,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     },
                 ],
                 RawOp::CellTakeU64 | RawOp::CellDropU64 => vec![
-                    raw,
+                    raw.clone(),
                     if leased_role {
                         leased_cell_unique
                     } else {
@@ -3876,17 +3949,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::RawRecord(ri),
                     Ty::ResRef(ResKind::PointsToRecord(ri), Mutability::Mut),
                 ],
-                RawOp::CastRecord(_) => vec![raw],
+                RawOp::CastRecord(_) => vec![raw.clone()],
                 RawOp::PointerOffsetRecord(ri) => vec![Ty::RawRecord(ri)],
-                RawOp::IntoFreeHeader => vec![raw, free_block],
-                RawOp::FromFreeHeader => vec![raw, free_header],
-                RawOp::HeaderInit => vec![raw, u64t, u64t, free_header_unique],
-                RawOp::HeaderSize | RawOp::HeaderNext => vec![raw, free_header_shared],
-                RawOp::HeaderClear => vec![raw, free_header_unique],
+                RawOp::IntoFreeHeader => vec![raw.clone(), free_block.clone()],
+                RawOp::FromFreeHeader => vec![raw.clone(), free_header.clone()],
+                RawOp::HeaderInit => {
+                    vec![raw.clone(), u64t.clone(), u64t.clone(), free_header_unique]
+                }
+                RawOp::HeaderSize | RawOp::HeaderNext => vec![raw.clone(), free_header_shared],
+                RawOp::HeaderClear => vec![raw.clone(), free_header_unique],
             };
             for (arg, w) in args.iter_mut().zip(&want) {
-                require_explicit_borrow(ctx, arg, *w)?;
-                check_expr(ctx, arg, Some(*w))?;
+                require_explicit_borrow(ctx, arg, w.clone())?;
+                check_expr(ctx, arg, Some(w.clone()))?;
                 if matches!(w, Ty::Res(_)) {
                     transfer(ctx, arg, None)?;
                 }
@@ -3963,7 +4038,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 DeviceOp::UartWrite => vec![Ty::Int(IntTy::U8), uart],
             };
             for (arg, expected) in args.iter_mut().zip(want) {
-                require_explicit_borrow(ctx, arg, expected)?;
+                require_explicit_borrow(ctx, arg, expected.clone())?;
                 check_expr(ctx, arg, Some(expected))?;
             }
             check_borrow_conflicts(ctx, args, None)?;
@@ -4017,8 +4092,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 // through the borrow (ADR 0024).
                 ResOp::SplitOff => {
                     let want = Ty::ResRef(ResKind::RawSpan, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], want)?;
-                    let got = check_expr(ctx, &mut args[0], Some(want))?;
+                    require_explicit_borrow(ctx, &args[0], want.clone())?;
+                    let got = check_expr(ctx, &mut args[0], Some(want.clone()))?;
                     debug_assert_eq!(got, want);
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -4037,7 +4112,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     // either: the token would be duplicated out of
                     // nothing.
                     for arg in args.iter_mut() {
-                        check_expr(ctx, arg, Some(want))?;
+                        check_expr(ctx, arg, Some(want.clone()))?;
                         mark_moved(ctx, arg)?;
                     }
                     want
@@ -4049,7 +4124,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 // state of the outside world (ADR 0028).
                 ResOp::OpenFileOf => {
                     let want = Ty::ResRef(ResKind::PosixWorld, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], want)?;
+                    require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::I32)))?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -4112,7 +4187,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::AllocatorTake => {
                     let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], want)?;
+                    require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -4120,7 +4195,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::AllocatorPut => {
                     let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], state)?;
+                    require_explicit_borrow(ctx, &args[0], state.clone())?;
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let lease = Ty::Res(ResKind::BlockLease);
                     check_expr(ctx, &mut args[1], Some(lease))?;
@@ -4130,7 +4205,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::AllocatorTakeFree => {
                     let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], want)?;
+                    require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -4138,7 +4213,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::AllocatorPutFree => {
                     let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], state)?;
+                    require_explicit_borrow(ctx, &args[0], state.clone())?;
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let block = Ty::Res(ResKind::FreeBlock);
                     check_expr(ctx, &mut args[1], Some(block))?;
@@ -4148,7 +4223,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::AllocatorTakeHeader => {
                     let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], want)?;
+                    require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -4156,7 +4231,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::AllocatorPutHeader => {
                     let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], state)?;
+                    require_explicit_borrow(ctx, &args[0], state.clone())?;
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let header = Ty::Res(ResKind::FreeHeader);
                     check_expr(ctx, &mut args[1], Some(header))?;
@@ -4166,7 +4241,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::AllocatorStepHeader => {
                     let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], want)?;
+                    require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_expr(ctx, &mut args[2], Some(Ty::Int(IntTy::U64)))?;
@@ -4175,7 +4250,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 ResOp::FreeBlockSplit => {
                     let block = Ty::ResRef(ResKind::FreeBlock, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], block)?;
+                    require_explicit_borrow(ctx, &args[0], block.clone())?;
                     check_expr(ctx, &mut args[0], Some(block))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -4184,7 +4259,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ResOp::FreeBlockJoin => {
                     let block = Ty::Res(ResKind::FreeBlock);
                     for arg in args.iter_mut() {
-                        check_expr(ctx, arg, Some(block))?;
+                        check_expr(ctx, arg, Some(block.clone()))?;
                         transfer(ctx, arg, None)?;
                     }
                     Ty::Res(ResKind::FreeBlock)
@@ -4221,7 +4296,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         });
                     };
                     let map = Ty::ResRef(map_kind, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], map)?;
+                    require_explicit_borrow(ctx, &args[0], map.clone())?;
                     check_expr(ctx, &mut args[0], Some(map))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_borrow_conflicts(ctx, args, None)?;
@@ -4246,7 +4321,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         });
                     };
                     let map = Ty::ResRef(map_kind, Mutability::Mut);
-                    require_explicit_borrow(ctx, &args[0], map)?;
+                    require_explicit_borrow(ctx, &args[0], map.clone())?;
                     check_expr(ctx, &mut args[0], Some(map))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     let cell = Ty::Res(match map_kind {
@@ -4262,10 +4337,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
         }
         ExprKind::AllocArray { elem, len, init } => {
-            let elem = *elem;
+            let elem = elem.clone();
             check_expr(ctx, len, Some(Ty::Int(IntTy::U64)))?;
-            check_expr(ctx, init, Some(array_payload_ty(elem, span)?))?;
-            Ty::Array(elem, Mutability::Owned)
+            check_expr(ctx, init, Some(array_payload_ty(elem.clone(), span)?))?;
+            Ty::Array(Box::new(elem), Mutability::Owned)
         }
         ExprKind::SelfField { field } => {
             let fty = ctx.self_field_ty(field, span, false)?;
@@ -4314,7 +4389,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ctx.require_field_init(field, span)?;
             }
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            array_payload_ty(elem, span)?
+            array_payload_ty(*elem, span)?
         }
         ExprKind::CtorCall {
             class,
@@ -4370,7 +4445,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 // resource fields (ADR 0029) — so it is exactly a container
                 // a brand could leave in.
                 let escapes = launders.then(|| ("be passed to a constructor", arg.span));
-                match p.ty {
+                match &p.ty {
                     Ty::Array(elem, m) => {
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
                             return Err(Diagnostic {
@@ -4379,18 +4454,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                                 span: arg.span,
                                 label: format!(
                                     "write `{}name`",
-                                    if m == Mutability::Mut { "&mut " } else { "&" }
+                                    if *m == Mutability::Mut { "&mut " } else { "&" }
                                 ),
                                 notes: vec![],
                             });
                         }
                         let got = check_expr(ctx, arg, None)?;
-                        if got != Ty::Array(elem, m) {
+                        if got != Ty::Array(elem.clone(), *m) {
                             return Err(Diagnostic {
                                 name: "type.mismatch".into(),
                                 title: format!(
                                     "expected `{}`, found `{}`",
-                                    Ty::Array(elem, m).name(),
+                                    Ty::Array(elem.clone(), *m).name(),
                                     got.name()
                                 ),
                                 span: arg.span,
@@ -4400,11 +4475,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         }
                     }
                     Ty::ClassRef(..) | Ty::ResRef(..) => {
-                        require_explicit_borrow(ctx, arg, p.ty)?;
-                        check_expr(ctx, arg, Some(p.ty))?;
+                        require_explicit_borrow(ctx, arg, p.ty.clone())?;
+                        check_expr(ctx, arg, Some(p.ty.clone()))?;
                     }
                     _ => {
-                        check_expr(ctx, arg, Some(p.ty))?;
+                        check_expr(ctx, arg, Some(p.ty.clone()))?;
                     }
                 }
                 transfer(ctx, arg, escapes)?;
@@ -4437,7 +4512,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         name: "type.not_a_class".into(),
                         title: format!("`{recv}` is not a class value"),
                         span: *recv_span,
-                        label: format!("this has type `{}`", v.ty.name()),
+                        label: format!("this has type `{}`", v.ty.clone().name()),
                         notes: vec![],
                     });
                 }
@@ -4515,7 +4590,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 _ => false,
             };
             for (arg, p) in args.iter_mut().zip(&params) {
-                check_expr(ctx, arg, Some(p.ty))?;
+                check_expr(ctx, arg, Some(p.ty.clone()))?;
                 transfer(
                     ctx,
                     arg,
@@ -4533,9 +4608,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::ArrayLit(elems) => match expected {
             Some(Ty::Array(t, Mutability::Owned)) => {
-                let element_ty = array_payload_ty(t, span)?;
+                let element_ty = array_payload_ty((*t).clone(), span)?;
                 for el in elems {
-                    check_expr(ctx, el, Some(element_ty))?;
+                    check_expr(ctx, el, Some(element_ty.clone()))?;
                 }
                 Ty::Array(t, Mutability::Owned)
             }
@@ -4556,7 +4631,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         } => {
             if field.is_none()
                 && matches!(
-                    ctx.vars.get(array.as_str()).map(|info| info.ty),
+                    ctx.vars.get(array.as_str()).map(|info| info.ty.clone()),
                     Some(Ty::AffineOption(_))
                 )
             {
@@ -4567,7 +4642,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     label: "inspect `.is_some` or extract the array with `.take`".into(),
                     notes: vec![(
                         "note".into(),
-                        "G2.1 has no borrowed option or conditional-array borrow representation"
+                        "there is no borrowed option or conditional-array borrow representation"
                             .into(),
                     )],
                 });
@@ -4623,7 +4698,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         }
                     }
                 } else {
-                    match ctx.vars.get(array.as_str()).map(|v| v.ty) {
+                    match ctx.vars.get(array.as_str()).map(|v| v.ty.clone()) {
                         Some(t) => t,
                         None => {
                             return Err(Diagnostic {
@@ -4656,14 +4731,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         label: "unknown field".into(),
                         notes: vec![],
                     })?;
-                let borrowed_ty = match fld.1 {
-                    Ty::Class(fci) => Ok(Ty::ClassRef(fci, Mutability::Shared)),
+                let borrowed_ty = match &fld.1 {
+                    Ty::Class(fci) => Ok(Ty::ClassRef(*fci, Mutability::Shared)),
                     // A resource field is a place too. Its mutability is
                     // the borrow's: shared anywhere, and unique only in a
                     // destructor, where the invariant it could break no
                     // longer has to hold (ADR 0029).
                     Ty::Res(k) => Ok(Ty::ResRef(
-                        k,
+                        *k,
                         if *mutable {
                             Mutability::Mut
                         } else {
@@ -4672,8 +4747,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     )),
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
-                    Ty::Array(ValueTy::Bool, _) => Err(bool_array_borrow(span)),
-                    Ty::Array(elem, _) => Ok(Ty::Array(elem, Mutability::Shared)),
+                    Ty::Array(elem, _) if elem.as_ref() == &Ty::Bool => {
+                        Err(bool_array_borrow(span))
+                    }
+                    Ty::Array(elem, _) => Ok(Ty::Array(elem.clone(), Mutability::Shared)),
                     _ => Err(Diagnostic {
                         name: "type.not_a_place".into(),
                         title: format!("field `{fname}` is not a borrowable place"),
@@ -4682,7 +4759,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     }),
                 }?;
-                e.ty = Some(borrowed_ty);
+                e.ty = Some(borrowed_ty.clone());
                 return Ok(borrowed_ty);
             }
             // `&s` / `&mut s` of a resource local or parameter, or a
@@ -4727,7 +4804,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             Mutability::Shared
                         },
                     );
-                    e.ty = Some(borrowed_ty);
+                    e.ty = Some(borrowed_ty.clone());
                     return Ok(borrowed_ty);
                 }
             }
@@ -4773,15 +4850,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             Mutability::Shared
                         },
                     );
-                    e.ty = Some(borrowed_ty);
+                    e.ty = Some(borrowed_ty.clone());
                     return Ok(borrowed_ty);
                 }
             }
             let elem = array_elem_ty(ctx, array, span)?;
-            if elem == ValueTy::Bool {
+            if elem == Ty::Bool {
                 return Err(bool_array_borrow(span));
             }
-            let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty) {
+            let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty.clone()) {
                 Some(Ty::Array(_, m)) => m,
                 _ => unreachable!("array_elem_ty checked"),
             };
@@ -4807,7 +4884,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
             Ty::Array(
-                elem,
+                Box::new(elem),
                 if *mutable {
                     Mutability::Mut
                 } else {
@@ -4817,7 +4894,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::SomeE(inner) => match expected {
             Some(Ty::Option(t)) => {
-                check_expr(ctx, inner, Some(option_payload_ty(t, span)?))?;
+                check_expr(ctx, inner, Some(option_payload_ty((*t).clone(), span)?))?;
                 Ty::Option(t)
             }
             Some(Ty::OptionRaw(ri)) => {
@@ -4893,7 +4970,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // cmp binding against 0) and re-infer. Downstream stages
             // only ever see the ordinary call.
             let class_of = |ctx: &Ctx, e: &Expr| match &e.kind {
-                ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty) {
+                ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) {
                     Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Some((n.clone(), ci)),
                     _ => None,
                 },
@@ -4991,11 +5068,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             if op.is_arith() {
                 let expected_int = match expected {
-                    Some(ty) if is_integer_ty(ty) => expected,
+                    Some(ref ty) if is_integer_ty(ty.clone()) => expected,
                     _ => None,
                 };
                 let t = infer_int_pair(ctx, lhs, rhs, expected_int, op_span)?;
-                if matches!(op, BinOp::Div | BinOp::Rem) && is_abstract_integer_ty(t) {
+                if matches!(op, BinOp::Div | BinOp::Rem) && is_abstract_integer_ty(t.clone()) {
                     return Err(Diagnostic {
                         name: "concepts.template_div".into(),
                         title: "division on a type parameter".into(),
@@ -5075,8 +5152,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     )],
                 });
             }
-            let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty).collect();
-            let ret = sig.ret;
+            let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty.clone()).collect();
+            let ret = sig.ret.clone();
             // Only a signature that *returns* storage can launder a brand
             // out — and since ADR 0029 a class counts, because it may have
             // resource fields.
@@ -5113,7 +5190,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                         let got = check_expr(ctx, arg, None)?;
-                        if got != Ty::Array(elem, m) {
+                        if got != Ty::Array(elem.clone(), m) {
                             return Err(Diagnostic {
                                 name: "type.mismatch".into(),
                                 title: format!(
@@ -5128,7 +5205,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         }
                     }
                     Ty::ClassRef(..) | Ty::ResRef(..) => {
-                        require_explicit_borrow(ctx, arg, pty)?;
+                        require_explicit_borrow(ctx, arg, pty.clone())?;
                         check_expr(ctx, arg, Some(pty))?;
                     }
                     _ => {
@@ -5171,14 +5248,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            let field_tys: Vec<Ty> = meta.fields.iter().map(|(_, ty)| *ty).collect();
+            let field_tys: Vec<Ty> = meta.fields.iter().map(|(_, ty)| ty.clone()).collect();
             for (arg, field_ty) in args.iter_mut().zip(field_tys) {
                 check_expr(ctx, arg, Some(field_ty))?;
             }
             Ty::Record(ri)
         }
     };
-    e.ty = Some(ty);
+    e.ty = Some(ty.clone());
     Ok(ty)
 }
 
@@ -5246,7 +5323,7 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
             }
             Some((p, *mutable))
         }
-        ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty) {
+        ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) {
             Some(Ty::ClassRef(_, m)) | Some(Ty::ResRef(_, m)) => {
                 Some((Place::local(n), m == Mutability::Mut))
             }
@@ -5321,7 +5398,7 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
     // havoc both rely on).
     if m == Mutability::Shared {
         if let ExprKind::Var(n) = &arg.kind {
-            if ctx.vars.get(n.as_str()).map(|v| v.ty) == Some(pty) {
+            if ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) == Some(pty.clone()) {
                 return Ok(());
             }
         }
@@ -5369,7 +5446,11 @@ fn flip(m: Mutability) -> Mutability {
 fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
     match &arg.kind {
         ExprKind::Var(name) => {
-            if ctx.vars.get(name.as_str()).is_some_and(|v| is_affine(v.ty)) {
+            if ctx
+                .vars
+                .get(name.as_str())
+                .is_some_and(|v| is_affine(&v.ty))
+            {
                 ctx.moved.insert(Place::local(name));
             }
         }
@@ -5383,9 +5464,9 @@ fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
                     .fields
                     .iter()
                     .find(|(n, _)| n == field)
-                    .map(|(_, t)| *t)
+                    .map(|(_, t)| t.clone())
             });
-            if fty.is_some_and(is_affine) {
+            if fty.as_ref().is_some_and(is_affine) {
                 ctx.moved.insert(Place {
                     root: "self".to_string(),
                     fields: vec![field.clone()],
@@ -5397,15 +5478,13 @@ fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
     Ok(())
 }
 
-/// Values that can be transferred but not duplicated: class values,
-/// resources, owned arrays, and options which conditionally own an affine
-/// payload. G2.1 gives the latter a narrow atomic-take path, while its
-/// ownership identity remains independent of which checker entry observes it.
-fn is_affine(ty: Ty) -> bool {
-    matches!(
-        ty,
-        Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned) | Ty::AffineOption(_)
-    )
+/// Values that can be transferred but not duplicated.
+///
+/// The rule lives on the type (`Ty::is_affine`), so every checker entry that
+/// asks gets the same answer, and so ownership is read off the shape rather
+/// than off a list of constructors kept in step by hand.
+fn is_affine(ty: &Ty) -> bool {
+    ty.is_affine()
 }
 
 fn mandatory_ty(ty: Ty) -> bool {
@@ -5451,7 +5530,7 @@ fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<b
     // finds the same obligation on its source; deriving it from the type
     // as well makes returns and compiler-sealed resource producers obey
     // the same rule without one-off minting hooks.
-    let mut carries = e.ty.is_some_and(mandatory_ty);
+    let mut carries = e.ty.clone().is_some_and(mandatory_ty);
     if let Some(name) = source {
         if let Some(v) = ctx.vars.get_mut(name.as_str()) {
             carries |= v.obligation;
@@ -5594,7 +5673,7 @@ fn reject_outstanding_obligations(
         let mandatory = ctx
             .vars
             .get(name.as_str())
-            .is_some_and(|v| mandatory_ty(v.ty));
+            .is_some_and(|v| mandatory_ty(v.ty.clone()));
         let sealed_release = ctx
             .vars
             .get(name.as_str())
@@ -5723,7 +5802,7 @@ impl<'a> Ctx<'a> {
     /// pseudo-var, which is where a field's type lives; nothing deeper
     /// than one projection is nameable yet.
     fn place_ty(&self, p: &Place) -> Option<Ty> {
-        self.vars.get(&p.state_key()).map(|v| v.ty)
+        self.vars.get(&p.state_key()).map(|v| v.ty.clone())
     }
 
     /// Whether this place names a resource.
@@ -5802,7 +5881,7 @@ impl<'a> Ctx<'a> {
             .fields
             .iter()
             .find(|(n, _)| n == field)
-            .map(|(_, t)| *t)
+            .map(|(_, t)| t.clone())
             .ok_or_else(|| Diagnostic {
                 name: "type.unknown_field".into(),
                 title: format!("`{}` has no field `{field}`", self.class_metas[ci].name),
@@ -5898,9 +5977,9 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
         // class- or resource-typed name is inferred without ever being
         // stamped on the expression.
         ExprKind::Var(n) | ExprKind::Borrow { array: n, .. } => {
-            ctx.vars.get(n.as_str()).map(|v| v.ty)
+            ctx.vars.get(n.as_str()).map(|v| v.ty.clone())
         }
-        _ => e.ty,
+        _ => e.ty.clone(),
     };
     if !ty.is_some_and(|t| {
         matches!(
@@ -6013,7 +6092,7 @@ fn reject_view_read(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
     })
 }
 
-fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<ValueTy> {
+fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<Ty> {
     reject_view_read(ctx, array, span)?;
     match ctx.vars.get(array) {
         Some(
@@ -6035,14 +6114,14 @@ fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<ValueTy> {
             if ctx.is_moved(&place) {
                 return Err(moved_out(ctx, &place, span, "array access"));
             }
-            array_payload_ty(*t, span)?;
-            Ok(*t)
+            array_payload_ty(*t.clone(), span)?;
+            Ok(*t.clone())
         }
         Some(v) => Err(Diagnostic {
             name: "type.not_an_array".into(),
             title: format!("`{array}` is not an array"),
             span,
-            label: format!("this has type `{}`", v.ty.name()),
+            label: format!("this has type `{}`", v.ty.clone().name()),
             notes: vec![],
         }),
         None => Err(Diagnostic {
@@ -6068,11 +6147,11 @@ fn infer_int_pair(
     let rhs_literal = is_literal_only(rhs);
     let t = if lhs_literal && !rhs_literal {
         let t = int_of(ctx, rhs, expected, op_span)?;
-        check_expr(ctx, lhs, Some(t))?;
+        check_expr(ctx, lhs, Some(t.clone()))?;
         t
     } else {
         let t = int_of(ctx, lhs, expected, op_span)?;
-        check_expr(ctx, rhs, Some(t))?;
+        check_expr(ctx, rhs, Some(t.clone()))?;
         t
     };
     Ok(t)
@@ -6080,7 +6159,7 @@ fn infer_int_pair(
 
 fn int_of(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>, op_span: Span) -> CResult<Ty> {
     match check_expr(ctx, e, expected)? {
-        ty if is_integer_ty(ty) => Ok(ty),
+        ty if is_integer_ty(ty.clone()) => Ok(ty),
         other => Err(Diagnostic {
             name: "type.mismatch".into(),
             title: format!("arithmetic/comparison on `{}`", other.name()),
@@ -6152,7 +6231,7 @@ fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<String> {
 }
 
 #[cfg(test)]
-mod g1_concrete_aggregate_tests {
+mod concrete_aggregate_tests {
     use super::*;
     use crate::span::LineMap;
 
@@ -6182,7 +6261,79 @@ mod g1_concrete_aggregate_tests {
     }
 
     fn affine_bool_option() -> Ty {
-        Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+        Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
+    }
+
+    /// The grammar can spell a container of anything; no stage can execute,
+    /// prove, or lower most of it. These types cannot be written in a source
+    /// program — `Parser::admits` refuses the spelling — so this feeds them
+    /// to the checker directly. The representation can hold them, so the
+    /// checker's own refusal is the boundary that has to hold.
+    #[test]
+    fn preconstructed_nested_payloads_are_refused_by_name() {
+        let span = Span::new(0, 0);
+        let owned = Mutability::Owned;
+        let cases: [(Ty, &str); 8] = [
+            (
+                Ty::array(Ty::array(Ty::Int(IntTy::U64), owned), owned),
+                "type.array_payload_unsupported",
+            ),
+            (
+                Ty::array(Ty::array(Ty::Bool, owned), owned),
+                "type.array_payload_unsupported",
+            ),
+            (
+                Ty::array(Ty::Class(0), owned),
+                "type.array_payload_unsupported",
+            ),
+            (
+                Ty::array(Ty::option(Ty::Int(IntTy::U64)), owned),
+                "type.array_payload_unsupported",
+            ),
+            (
+                Ty::array(Ty::affine_array_option(Ty::Bool), owned),
+                "type.array_payload_unsupported",
+            ),
+            (
+                Ty::array(Ty::Res(ResKind::RawSpan), owned),
+                "type.array_payload_unsupported",
+            ),
+            (
+                Ty::option(Ty::option(Ty::Int(IntTy::U64))),
+                "type.option_payload_unsupported",
+            ),
+            (Ty::option(Ty::Class(0)), "type.option_payload_unsupported"),
+        ];
+        for (ty, expected) in cases {
+            let refusal = validate_aggregate_ty(ty.clone(), span)
+                .expect_err(&format!("`{}` must be refused by a named gate", ty.name()));
+            assert_eq!(refusal.name, expected, "for `{}`", ty.name());
+            assert_eq!(refusal.span, span);
+        }
+    }
+
+    /// Every owning payload is refused by name, and that refusal — not the
+    /// parser table — is what keeps indexing and element stores sound: they
+    /// neither move the value nor re-brand it, and `Place` has no index
+    /// component to track an owner living in an element.
+    #[test]
+    fn no_owning_array_payload_is_admitted() {
+        let span = Span::new(0, 0);
+        for owner in [
+            Ty::Class(0),
+            Ty::array(Ty::Bool, Mutability::Owned),
+            Ty::affine_array_option(Ty::Bool),
+            Ty::Res(ResKind::RawSpan),
+        ] {
+            assert_eq!(
+                array_payload_ty(owner.clone(), span)
+                    .expect_err("an owning payload has no element form")
+                    .name,
+                "type.array_payload_unsupported",
+                "for `{}`",
+                owner.name()
+            );
+        }
     }
 
     #[test]
@@ -6256,7 +6407,7 @@ fn consume(u64 count) -> bool {
         let ExprKind::SomeE(array) = &ready.kind else {
             panic!("expected some allocation");
         };
-        assert_eq!(array.ty, Some(Ty::Array(ValueTy::Bool, Mutability::Owned)));
+        assert_eq!(array.ty, Some(Ty::array(Ty::Bool, Mutability::Owned)));
 
         let Stmt::Decl {
             init: Some(take), ..
@@ -6264,7 +6415,7 @@ fn consume(u64 count) -> bool {
         else {
             panic!("expected take destination");
         };
-        assert_eq!(take.ty, Some(Ty::Array(ValueTy::Bool, Mutability::Owned)));
+        assert_eq!(take.ty, Some(Ty::array(Ty::Bool, Mutability::Owned)));
         assert!(matches!(
             &take.kind,
             ExprKind::OptTake { option, .. } if option == "ready"
@@ -6367,8 +6518,8 @@ fn consume(i32 value) -> bool {
         );
 
         check(&mut program).expect("the complete narrow option<bool> surface should typecheck");
-        assert_eq!(program.fns[0].ret, Ty::Option(ValueTy::Bool));
-        assert_eq!(program.fns[1].ret, Ty::Option(ValueTy::Bool));
+        assert_eq!(program.fns[0].ret, Ty::option(Ty::Bool));
+        assert_eq!(program.fns[1].ret, Ty::option(Ty::Bool));
 
         let Stmt::If { then_block, .. } = &program.fns[2].body[3] else {
             panic!("expected the accessor guard");
@@ -6385,17 +6536,17 @@ fn consume(i32 value) -> bool {
     #[test]
     fn bool_is_an_exact_array_and_option_payload_while_records_stay_closed() {
         assert_eq!(
-            option_payload_ty(ValueTy::Bool, Span::new(0, 1)).unwrap(),
+            option_payload_ty(Ty::Bool, Span::new(0, 1)).unwrap(),
             Ty::Bool
         );
         assert_eq!(
-            array_payload_ty(ValueTy::Bool, Span::new(0, 1)).unwrap(),
+            array_payload_ty(Ty::Bool, Span::new(0, 1)).unwrap(),
             Ty::Bool
         );
 
-        let option_record = option_payload_ty(ValueTy::Record(0), Span::new(0, 1)).unwrap_err();
+        let option_record = option_payload_ty(Ty::Record(0), Span::new(0, 1)).unwrap_err();
         assert_eq!(option_record.name, "type.option_payload_unsupported");
-        let array_record = array_payload_ty(ValueTy::Record(0), Span::new(0, 1)).unwrap_err();
+        let array_record = array_payload_ty(Ty::Record(0), Span::new(0, 1)).unwrap_err();
         assert_eq!(array_record.name, "type.array_payload_unsupported");
     }
 
@@ -6449,7 +6600,7 @@ fn select(u64 index) -> bool {
         check(&mut program).expect("the owned-local Boolean-array surface should typecheck");
 
         let function = &program.fns[0];
-        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
         let Stmt::Decl {
             ty,
             init: Some(literal),
@@ -6459,7 +6610,7 @@ fn select(u64 index) -> bool {
             panic!("expected the explicit array declaration");
         };
         assert_eq!(*ty, array_ty);
-        assert_eq!(literal.ty, Some(array_ty));
+        assert_eq!(literal.ty, Some(array_ty.clone()));
         let ExprKind::ArrayLit(elements) = &literal.kind else {
             panic!("expected a contextual array literal");
         };
@@ -6468,7 +6619,7 @@ fn select(u64 index) -> bool {
         let Stmt::VarDecl { init, ty, .. } = &function.body[1] else {
             panic!("expected the inferred allocation declaration");
         };
-        assert_eq!(*ty, Some(array_ty));
+        assert_eq!(*ty, Some(array_ty.clone()));
         assert_eq!(init.ty, Some(array_ty));
         let ExprKind::AllocArray {
             elem,
@@ -6478,7 +6629,7 @@ fn select(u64 index) -> bool {
         else {
             panic!("expected alloc_array<bool>");
         };
-        assert_eq!(*elem, ValueTy::Bool);
+        assert_eq!(*elem, Ty::Bool);
         assert_eq!(len.ty, Some(Ty::Int(IntTy::U64)));
         assert_eq!(fill.ty, Some(Ty::Bool));
 
@@ -6585,7 +6736,7 @@ fn bad() {
         assert_eq!(check_error(&mut exposed).name, "expose.element_type");
 
         let mut returned = monomorphized_program("fn bad() {}\n");
-        returned.fns[0].ret = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        returned.fns[0].ret = Ty::array(Ty::Bool, Mutability::Owned);
         assert_eq!(check_error(&mut returned).name, "type.array_return");
     }
 
@@ -6595,7 +6746,7 @@ fn bad() {
         let Stmt::Decl { ty, .. } = &mut borrowed_local.fns[0].body[0] else {
             panic!("expected the explicit array local");
         };
-        *ty = Ty::Array(ValueTy::Bool, Mutability::Shared);
+        *ty = Ty::array(Ty::Bool, Mutability::Shared);
         assert_eq!(
             check_error(&mut borrowed_local).name,
             "type.bool_array_borrow"
@@ -6608,11 +6759,11 @@ record Flag #[layout(size := 1, align := 1)] {
 }
 "#,
         );
-        record.records[0].fields[0].ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        record.records[0].fields[0].ty = Ty::array(Ty::Bool, Mutability::Owned);
         assert_eq!(check_error(&mut record).name, "record.field_type");
 
         let mut owned_parameter = monomorphized_program("fn bad(u8 value) {}\n");
-        owned_parameter.fns[0].params[0].ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        owned_parameter.fns[0].params[0].ty = Ty::array(Ty::Bool, Mutability::Owned);
         assert_eq!(
             check_error(&mut owned_parameter).name,
             "type.bool_array_param"

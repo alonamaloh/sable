@@ -1,0 +1,10 @@
+// expect-error: type.array_payload_unsupported
+// An option is not an array element: the element type states the geometry of
+// one cell, and a copyable option has no such layout.
+// Refused by the parser's admissibility table (ADR 0063), which does not admit
+// the option shape at `TyPos::ArrayElement`, not by `check::array_payload_ty`.
+
+fn maybes() -> u64 {
+    [option<u64>] cells = alloc_array<option<u64>>(1, 0);
+    return 0;
+}

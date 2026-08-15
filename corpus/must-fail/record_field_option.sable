@@ -1,0 +1,8 @@
+// expect-error: record.field_type
+// `option<u64>` has no raw-cell geometry: a tag plus a payload is a
+// representation decision the language has not made. The nullable pointer
+// `option<raw<Record>>` is the one option shape with a checked field layout.
+
+record Slot #[layout(size := 8, align := 8)] {
+    #[offset(0)] option<u64> value;
+}

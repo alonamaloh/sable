@@ -1,0 +1,17 @@
+// expect-error: type.array_payload_unsupported
+// An array of arrays has no element representation: each element would own
+// storage of its own, and an array element is copied and compared in place.
+// Ownership inside a container needs a place path down to the element before
+// it can be tracked at all.
+//
+// The rule that refuses this is the parser's admissibility table (ADR 0063):
+// `TyPos::ArrayElement` does not admit the array shape. The checker gate
+// `check::array_payload_ty` carries the same diagnostic name, because
+// `TyPos::gate_name()` maps the position to it, so this fence cannot tell the
+// two apart; `array_element_record.sable` is the subject that reaches the
+// checker gate.
+
+fn nested() -> u64 {
+    [[u64]] rows = alloc_array<[u64]>(1, 0);
+    return 0;
+}

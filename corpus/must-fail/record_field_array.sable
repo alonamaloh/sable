@@ -1,0 +1,7 @@
+// expect-error: record.field_type
+// An array owns its storage; a record is copied freely. A field of array type
+// would duplicate that ownership on every copy, so the layout rule refuses it.
+
+record Buffer #[layout(size := 8, align := 8)] {
+    #[offset(0)] [u64] items;
+}

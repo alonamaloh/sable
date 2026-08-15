@@ -1,0 +1,10 @@
+// expect-error: type.array_payload_unsupported
+// The Boolean payload changes nothing: `[[bool]]` is still an array whose
+// elements own storage, so it is refused for the same reason `[[u64]]` is.
+// Refused by the parser's admissibility table (ADR 0063), which does not admit
+// the array shape at `TyPos::ArrayElement`, not by `check::array_payload_ty`.
+
+fn nested() -> u64 {
+    [[bool]] rows = alloc_array<[bool]>(1, 0);
+    return 0;
+}

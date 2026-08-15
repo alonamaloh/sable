@@ -1,0 +1,13 @@
+// expect-error: record.field_type
+// A nested record field needs the inner record's geometry to be placed inside
+// the outer one's, which is a layout composition rule the language does not
+// have. A `raw<Pair>` pointer field is the supported spelling.
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+record Outer #[layout(size := 16, align := 8)] {
+    #[offset(0)] Pair inner;
+}

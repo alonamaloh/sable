@@ -1,9 +1,9 @@
 //! Strict textual LLVM IR lowering for the verified scalar, Boolean-option,
-//! bounded POD-record, owned-local Boolean-array, N0 local `u32`-array, and
-//! N1b fixed-owner class core with internal borrows, returns, and named moves
+//! bounded POD-record, owned-local Boolean-array, local `u32`-array, and
+//! fixed-owner class core with internal borrows, returns, and named moves
 //! (ADRs 0058--0059).
 //!
-//! This first slice handles scalar storage, calls, comparisons, and structured
+//! The backend lowers scalar storage, calls, comparisons, and structured
 //! control flow.  A construct is either lowered with its Sable meaning or
 //! rejected with a source diagnostic; there is no silent fallback and no
 //! unchecked arithmetic.
@@ -11,7 +11,7 @@
 use crate::VerifiedProgram;
 use crate::ast::{
     AffineOptionTy, BinOp, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl,
-    SelfKind, Stmt, Ty, UnOp, ValueTy,
+    SelfKind, Stmt, Ty, UnOp,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -179,14 +179,14 @@ fn select_callables(
             return Err(vec![affine_option_unsupported(
                 parameter.span,
                 "LLVM entry parameter",
-                parameter.ty,
+                parameter.ty.clone(),
             )]);
         }
         if matches!(function.ret, Ty::AffineOption(_)) {
             return Err(vec![affine_option_unsupported(
                 function.name_span,
                 "LLVM entry return type",
-                function.ret,
+                function.ret.clone(),
             )]);
         }
         if function.name.starts_with("test_") {
@@ -403,7 +403,7 @@ fn callable_dependencies(
                 .params
                 .iter()
                 .find(|parameter| parameter.name == receiver)
-                .map(|parameter| parameter.ty)
+                .map(|parameter| parameter.ty.clone())
                 .or_else(|| find_declared_type(body, &receiver))
                 .ok_or_else(|| {
                     vec![diag(
@@ -609,21 +609,21 @@ fn validate_function(
         return Err(vec![affine_option_unsupported(
             parameter.span,
             "function parameter",
-            parameter.ty,
+            parameter.ty.clone(),
         )]);
     }
     if matches!(function.ret, Ty::AffineOption(_)) {
         return Err(vec![affine_option_unsupported(
             function.name_span,
             "function return type",
-            function.ret,
+            function.ret.clone(),
         )]);
     }
     for parameter in &function.params {
         require_parameter_value(
             program,
             root_span_end,
-            parameter.ty,
+            parameter.ty.clone(),
             parameter.span,
             "function parameter",
         )?;
@@ -634,7 +634,7 @@ fn validate_function(
         require_runtime_type(
             program,
             root_span_end,
-            function.ret,
+            function.ret.clone(),
             function.name_span,
             "function return type",
         )?;
@@ -644,7 +644,7 @@ fn validate_function(
         locals.insert(
             parameter.name.clone(),
             ValidationLocal {
-                ty: parameter.ty,
+                ty: parameter.ty.clone(),
                 mutable: false,
             },
             parameter.span,
@@ -655,7 +655,7 @@ fn validate_function(
         &function.body,
         root_span_end,
         &mut locals,
-        function.ret,
+        function.ret.clone(),
         None,
         None,
     )
@@ -695,11 +695,16 @@ fn validate_initializer(
     }
     let mut locals = ValidationLocals::new();
     for parameter in &initializer.params {
-        require_initializer_parameter(program, root_span_end, parameter.ty, parameter.span)?;
+        require_initializer_parameter(
+            program,
+            root_span_end,
+            parameter.ty.clone(),
+            parameter.span,
+        )?;
         locals.insert(
             parameter.name.clone(),
             ValidationLocal {
-                ty: parameter.ty,
+                ty: parameter.ty.clone(),
                 mutable: false,
             },
             parameter.span,
@@ -754,9 +759,9 @@ fn validate_method(
     {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "method is outside the exact native Integer slice",
+            "method is outside the concrete `Integer` surface the LLVM backend lowers",
             method.f.name_span,
-            "N5 admits only `Integer::flip_sign(&mut self) -> ()` with no explicit arguments",
+            "the backend lowers only `Integer::flip_sign(&mut self) -> ()`, with no explicit arguments",
         )]);
     }
     let mut locals = ValidationLocals::new();
@@ -780,7 +785,7 @@ fn validate_method(
     .map(|_| ())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ValidationLocal {
     ty: Ty,
     mutable: bool,
@@ -828,7 +833,7 @@ impl ValidationLocals {
         self.scopes
             .iter()
             .rev()
-            .find_map(|scope| scope.get(name).copied())
+            .find_map(|scope| scope.get(name).cloned())
     }
 
     fn push_scope(&mut self) {
@@ -891,22 +896,28 @@ fn validate_block(
                     validate_affine_bool_option_decl(
                         program,
                         name,
-                        *ty,
+                        ty.clone(),
                         *mutable,
                         init.as_ref(),
                         root_span_end,
                         locals,
                         *name_span,
                     )?;
-                } else if is_owned_native_array(*ty) {
-                    require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
+                } else if is_owned_native_array(&ty.clone()) {
+                    require_local_value(
+                        program,
+                        root_span_end,
+                        ty.clone(),
+                        *name_span,
+                        "local variable",
+                    )?;
                     let Some(value) = init else {
                         return Err(vec![unsupported(
                             *name_span,
                             format!("owned array local `{name}` has no initializer"),
                         )]);
                     };
-                    if is_owned_bool_array(*ty) {
+                    if is_owned_bool_array(&ty.clone()) {
                         validate_fresh_bool_array_initializer(
                             program,
                             value,
@@ -924,7 +935,13 @@ fn validate_block(
                         )?;
                     }
                 } else {
-                    require_local_value(program, root_span_end, *ty, *name_span, "local variable")?;
+                    require_local_value(
+                        program,
+                        root_span_end,
+                        ty.clone(),
+                        *name_span,
+                        "local variable",
+                    )?;
                     if let Some(value) = init {
                         validate_expr(program, value, root_span_end, locals)?;
                     }
@@ -932,7 +949,7 @@ fn validate_block(
                 locals.insert(
                     name.clone(),
                     ValidationLocal {
-                        ty: *ty,
+                        ty: ty.clone(),
                         mutable: *mutable,
                     },
                     *name_span,
@@ -945,18 +962,18 @@ fn validate_block(
                 init,
                 mutable,
             } => {
-                let Some(ty) = *ty else {
+                let Some(ref ty) = *ty else {
                     return Err(vec![unsupported(
                         *name_span,
                         "inferred local is missing its checked type",
                     )]);
                 };
                 if let Ty::Class(class) = ty {
-                    validate_fixed_class_initializer(program, class, init, root_span_end, locals)?;
+                    validate_fixed_class_initializer(program, *class, init, root_span_end, locals)?;
                     locals.insert(
                         name.clone(),
                         ValidationLocal {
-                            ty,
+                            ty: ty.clone(),
                             mutable: *mutable,
                         },
                         *name_span,
@@ -967,7 +984,7 @@ fn validate_block(
                     return Err(vec![affine_option_unsupported(
                         *name_span,
                         "inferred local",
-                        ty,
+                        ty.clone(),
                     )]);
                 }
                 if matches!(init.kind, ExprKind::OptTake { .. }) {
@@ -977,9 +994,15 @@ fn validate_block(
                         "inferred declaration",
                     )]);
                 }
-                require_local_value(program, root_span_end, ty, *name_span, "inferred local")?;
-                if is_owned_native_array(ty) {
-                    if is_owned_bool_array(ty) {
+                require_local_value(
+                    program,
+                    root_span_end,
+                    ty.clone(),
+                    *name_span,
+                    "inferred local",
+                )?;
+                if is_owned_native_array(&ty.clone()) {
+                    if is_owned_bool_array(&ty.clone()) {
                         validate_fresh_bool_array_initializer(
                             program,
                             init,
@@ -997,7 +1020,7 @@ fn validate_block(
                 locals.insert(
                     name.clone(),
                     ValidationLocal {
-                        ty,
+                        ty: ty.clone(),
                         mutable: *mutable,
                     },
                     *name_span,
@@ -1020,7 +1043,7 @@ fn validate_block(
                         format!("assignment targets immutable local `{name}`"),
                     )]);
                 }
-                if is_owned_native_array(local.ty) {
+                if is_owned_native_array(&local.ty) {
                     return Err(vec![unsupported(
                         *name_span,
                         format!("owned array local `{name}` cannot be rebound"),
@@ -1056,7 +1079,7 @@ fn validate_block(
                 value: Some(value),
                 span: _,
             } => {
-                require_expr_type(value, ret_ty, "return value")?;
+                require_expr_type(value, ret_ty.clone(), "return value")?;
                 if let Ty::Class(class) = ret_ty {
                     validate_fixed_class_initializer(program, class, value, root_span_end, locals)?;
                 } else {
@@ -1083,7 +1106,7 @@ fn validate_block(
                     body,
                     root_span_end,
                     locals,
-                    ret_ty,
+                    ret_ty.clone(),
                     initializer.as_deref_mut(),
                     method,
                 )?;
@@ -1103,7 +1126,7 @@ fn validate_block(
                     then_block,
                     root_span_end,
                     locals,
-                    ret_ty,
+                    ret_ty.clone(),
                     then_initializer.as_mut(),
                     method,
                 )?;
@@ -1118,7 +1141,7 @@ fn validate_block(
                         else_block,
                         root_span_end,
                         locals,
-                        ret_ty,
+                        ret_ty.clone(),
                         else_initializer.as_mut(),
                         method,
                     )?;
@@ -1164,7 +1187,7 @@ fn validate_block(
                     body,
                     root_span_end,
                     locals,
-                    ret_ty,
+                    ret_ty.clone(),
                     body_initializer.as_mut(),
                     method,
                 )?;
@@ -1253,20 +1276,20 @@ fn validate_block(
     Ok(returned)
 }
 
-fn is_owned_bool_array(ty: Ty) -> bool {
-    matches!(ty, Ty::Array(ValueTy::Bool, Mutability::Owned))
+fn is_owned_bool_array(ty: &Ty) -> bool {
+    ty.is_owned_array_of(&Ty::Bool)
 }
 
 fn is_owned_u32_array(ty: Ty) -> bool {
-    matches!(ty, Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned))
+    ty.is_owned_array_of(&Ty::Int(IntTy::U32))
 }
 
-fn is_u32_array(ty: Ty) -> bool {
-    matches!(ty, Ty::Array(ValueTy::Int(IntTy::U32), _))
+fn is_u32_array(ty: &Ty) -> bool {
+    ty.is_array_of(&Ty::Int(IntTy::U32))
 }
 
-fn is_owned_native_array(ty: Ty) -> bool {
-    is_owned_bool_array(ty) || is_owned_u32_array(ty)
+fn is_owned_native_array(ty: &Ty) -> bool {
+    is_owned_bool_array(&ty.clone()) || is_owned_u32_array(ty.clone())
 }
 
 fn require_fixed_class<'a>(
@@ -1288,7 +1311,7 @@ fn require_fixed_class<'a>(
     let nat_supported = declaration.name == "Nat"
         && declaration.fields.len() == 1
         && declaration.fields[0].name == "limbs"
-        && declaration.fields[0].ty == Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned)
+        && declaration.fields[0].ty == Ty::array(Ty::Int(IntTy::U32), Mutability::Owned)
         && declaration.methods.is_empty()
         && matches!(declaration.deinit.as_deref(), Some([]));
     let integer_supported = declaration.name == "Integer"
@@ -1306,10 +1329,10 @@ fn require_fixed_class<'a>(
     if !common_supported || (!nat_supported && !integer_supported) {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "class is outside the fixed-owner native slice",
+            "class is outside the fixed-owner class shapes the LLVM backend lowers",
             span,
             format!(
-                "{role} uses `{}`; N5 admits only exact concrete `Nat {{ [u32] limbs }}` and `Integer {{ Nat mag; u64 neg }}` shapes with the selected empty destruction/method surface",
+                "{role} uses `{}`; the backend lowers only the concrete `Nat {{ [u32] limbs }}` and `Integer {{ Nat mag; u64 neg }}` shapes, each with an empty destruction and method surface",
                 declaration.name
             ),
         )]);
@@ -1332,8 +1355,7 @@ fn require_fixed_class<'a>(
             && child_declaration.proof_reuse.is_none()
             && child_declaration.fields.len() == 1
             && child_declaration.fields[0].name == "limbs"
-            && child_declaration.fields[0].ty
-                == Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned)
+            && child_declaration.fields[0].ty == Ty::array(Ty::Int(IntTy::U32), Mutability::Owned)
             && !child_declaration.fields[0].must_consume
             && child_declaration.methods.is_empty()
             && matches!(child_declaration.deinit.as_deref(), Some([]));
@@ -1359,7 +1381,9 @@ fn require_initializer_parameter(
     span: Span,
 ) -> Result<(), Vec<BackendError>> {
     match ty {
-        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) => Ok(()),
+        Ty::Array(element, Mutability::Shared) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+            Ok(())
+        }
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
         Ty::Class(class) => {
@@ -1371,7 +1395,7 @@ fn require_initializer_parameter(
                     "backend.class_unsupported",
                     "initializer owned parameter is outside the exact native take ABI",
                     span,
-                    "N5 admits only owned `Nat` initializer parameters",
+                    "the backend lowers only owned `Nat` initializer parameters",
                 )])
             }
         }
@@ -1470,7 +1494,7 @@ fn validate_fixed_class_initializer(
             if function.extern_info.is_some() || function.ret != Ty::Class(class) {
                 return Err(vec![diag(
                     "backend.class_unsupported",
-                    "class-returning call is outside the fixed-owner native slice",
+                    "class-returning call is outside the fixed-owner class shapes the LLVM backend lowers",
                     expression.span,
                     format!("`{callee}` does not return the checked fixed-owner class"),
                 )]);
@@ -1506,7 +1530,7 @@ fn validate_fixed_class_initializer(
         }
         _ => Err(vec![diag(
             "backend.class_unsupported",
-            "class value source is outside the fixed-owner native slice",
+            "class value source is outside the fixed-owner class shapes the LLVM backend lowers",
             expression.span,
             "expected a direct constructor, internal class-returning call, or named owner move",
         )]),
@@ -1536,29 +1560,36 @@ fn validate_moving_arguments(
     validate_owned_argument_aliases(args, params, locals)?;
     for (argument, parameter) in args.iter().zip(params) {
         if initializer_parameters {
-            require_initializer_parameter(program, root_span_end, parameter.ty, parameter.span)?;
+            require_initializer_parameter(
+                program,
+                root_span_end,
+                parameter.ty.clone(),
+                parameter.span,
+            )?;
         } else {
             require_parameter_value(
                 program,
                 root_span_end,
-                parameter.ty,
+                parameter.ty.clone(),
                 parameter.span,
                 "class-returning function parameter",
             )?;
         }
-        match parameter.ty {
+        match &parameter.ty {
             Ty::Class(class) => {
-                validate_fixed_class_initializer(program, class, argument, root_span_end, locals)?;
+                validate_fixed_class_initializer(program, *class, argument, root_span_end, locals)?;
             }
             Ty::ClassRef(..) => {
-                validate_class_borrow_argument(program, argument, parameter.ty, locals)?;
+                validate_class_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
             }
-            Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared | Mutability::Mut) => {
-                validate_u32_array_borrow_argument(program, argument, parameter.ty, locals)?
+            Ty::Array(element, Mutability::Shared | Mutability::Mut)
+                if element.as_ref() == &Ty::Int(IntTy::U32) =>
+            {
+                validate_u32_array_borrow_argument(program, argument, parameter.ty.clone(), locals)?
             }
             _ => {
                 validate_expr(program, argument, root_span_end, locals)?;
-                require_expr_type(argument, parameter.ty, "moving call argument")?;
+                require_expr_type(argument, parameter.ty.clone(), "moving call argument")?;
             }
         }
     }
@@ -1621,18 +1652,15 @@ fn validate_call_arguments(
             parameter.ty,
             Ty::ClassRef(_, Mutability::Shared | Mutability::Mut)
         ) {
-            validate_class_borrow_argument(program, argument, parameter.ty, locals)?;
+            validate_class_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
         } else if matches!(
-            parameter.ty,
-            Ty::Array(
-                ValueTy::Int(IntTy::U32),
-                Mutability::Shared | Mutability::Mut
-            )
+            parameter.ty.as_array(),
+            Some((&Ty::Int(IntTy::U32), Mutability::Shared | Mutability::Mut))
         ) {
-            validate_u32_array_borrow_argument(program, argument, parameter.ty, locals)?;
+            validate_u32_array_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
         } else {
             validate_expr(program, argument, root_span_end, locals)?;
-            require_expr_type(argument, parameter.ty, "call argument")?;
+            require_expr_type(argument, parameter.ty.clone(), "call argument")?;
         }
     }
     validate_borrow_aliases(args, &function.params, locals)
@@ -1684,16 +1712,20 @@ fn validate_initializer_field_assign(
                 ),
             )]);
         }
-        match declaration_field.ty {
-            Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+        match &declaration_field.ty {
+            Ty::Array(element, Mutability::Owned) if element.as_ref() == &Ty::Int(IntTy::U32) => {
                 validate_fresh_u32_array_initializer(program, value, root_span_end, locals)?;
             }
             Ty::Class(child) => {
-                validate_fixed_class_initializer(program, child, value, root_span_end, locals)?;
+                validate_fixed_class_initializer(program, *child, value, root_span_end, locals)?;
             }
             Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => {
                 validate_expr(program, value, root_span_end, locals)?;
-                require_expr_type(value, declaration_field.ty, "initializer scalar field")?;
+                require_expr_type(
+                    value,
+                    declaration_field.ty.clone(),
+                    "initializer scalar field",
+                )?;
             }
             other => {
                 return Err(vec![diag(
@@ -1712,22 +1744,22 @@ fn validate_initializer_field_assign(
             "backend.class_unsupported",
             "shared method cannot assign a class field",
             field_span,
-            "N5 field mutation requires `&mut self`",
+            "a lowered method mutates a field only through `&mut self`",
         )]);
     };
     let Ty::Int(integer) = declaration_field.ty else {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "method field replacement is outside the exact native Integer slice",
+            "method field replacement is outside the concrete `Integer` surface the LLVM backend lowers",
             field_span,
-            "N5 methods may assign only the scalar `Integer.neg` field",
+            "a lowered method may assign only the scalar `Integer.neg` field",
         )]);
     };
     require_concrete_integer(integer, field_span, "method scalar field")?;
     validate_expr(program, value, root_span_end, locals)?;
     require_expr_type(
         value,
-        declaration_field.ty,
+        declaration_field.ty.clone(),
         "method scalar field assignment",
     )
 }
@@ -1767,7 +1799,7 @@ fn validate_initializer_field_store(
             format!("class `{}` has no field `{field}`", declaration.name),
         )]);
     };
-    if declaration_field.ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned)
+    if declaration_field.ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned)
         || !initializer.fields_initialized[field_index]
     {
         return Err(vec![diag(
@@ -1827,15 +1859,15 @@ fn validate_fixed_class_field_base(
             format!("class `{}` has no native field `{field}`", declaration.name),
         )]);
     };
-    Ok((class, field_index, declaration_field.ty))
+    Ok((class, field_index, declaration_field.ty.clone()))
 }
 
 fn affine_bool_option_ty() -> Ty {
-    Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+    Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
 }
 
-fn is_affine_bool_option(ty: Ty) -> bool {
-    ty == affine_bool_option_ty()
+fn is_affine_bool_option(ty: &Ty) -> bool {
+    *ty == affine_bool_option_ty()
 }
 
 fn reject_named_affine_option(
@@ -1862,7 +1894,7 @@ fn validate_affine_bool_option_decl(
     locals: &ValidationLocals,
     span: Span,
 ) -> Result<(), Vec<BackendError>> {
-    if !is_affine_bool_option(ty) {
+    if !is_affine_bool_option(&ty.clone()) {
         return Err(vec![affine_option_unsupported(
             span,
             &format!("declaration `{name}`"),
@@ -1872,7 +1904,7 @@ fn validate_affine_bool_option_decl(
     if !mutable {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             span,
             format!("affine option local `{name}` must be mutable"),
         )]);
@@ -1880,7 +1912,7 @@ fn validate_affine_bool_option_decl(
     let Some(init) = init else {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             span,
             format!(
                 "affine option local `{name}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
@@ -1893,13 +1925,13 @@ fn validate_affine_bool_option_decl(
         ExprKind::SomeE(payload) => {
             require_expr_type(
                 payload,
-                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                Ty::array(Ty::Bool, Mutability::Owned),
                 "affine-option payload",
             )?;
             let ExprKind::AllocArray { elem, len, init } = &payload.kind else {
                 return Err(vec![affine_option_initializer_unsupported(init.span, name)]);
             };
-            if *elem != ValueTy::Bool {
+            if *elem != Ty::Bool {
                 return Err(vec![affine_option_initializer_unsupported(init.span, name)]);
             }
             validate_expr(program, len, root_span_end, locals)?;
@@ -1925,13 +1957,13 @@ fn validate_affine_option_take(
 ) -> Result<(), Vec<BackendError>> {
     require_expr_type(
         expression,
-        Ty::Array(ValueTy::Bool, Mutability::Owned),
+        Ty::array(Ty::Bool, Mutability::Owned),
         "affine-option take result",
     )?;
     if destination == option {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             expression.span,
             format!("`.take` destination `{destination}` cannot also be its source"),
         )]);
@@ -1945,12 +1977,12 @@ fn validate_affine_option_take(
     let Some(source) = locals.get(option) else {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             option_span,
             format!("`.take` names unknown or out-of-scope local `{option}`"),
         )]);
     };
-    if !is_affine_bool_option(source.ty) {
+    if !is_affine_bool_option(&source.ty) {
         return if matches!(source.ty, Ty::AffineOption(_)) {
             Err(vec![affine_option_unsupported(
                 option_span,
@@ -1960,7 +1992,7 @@ fn validate_affine_option_take(
         } else {
             Err(vec![diag(
                 "backend.affine_option_unsupported",
-                "affine option is outside the admitted LLVM local slice",
+                "affine option is outside the locals the LLVM backend lowers",
                 option_span,
                 format!(
                     "`.take` source `{option}` has type `{}`; expected `option<[bool]>`",
@@ -1972,7 +2004,7 @@ fn validate_affine_option_take(
     if !source.mutable {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             option_span,
             format!("`.take` source `{option}` must be mutable"),
         )]);
@@ -1988,7 +2020,7 @@ fn validate_fresh_bool_array_initializer(
     local: &str,
     allow_take: bool,
 ) -> Result<(), Vec<BackendError>> {
-    let expected = Ty::Array(ValueTy::Bool, Mutability::Owned);
+    let expected = Ty::array(Ty::Bool, Mutability::Owned);
     require_expr_type(expression, expected, "owned Boolean-array initializer")?;
     match &expression.kind {
         ExprKind::ArrayLit(elements) => {
@@ -2012,7 +2044,7 @@ fn validate_fresh_bool_array_initializer(
             }
             Ok(())
         }
-        ExprKind::AllocArray { elem, len, init } if *elem == ValueTy::Bool => {
+        ExprKind::AllocArray { elem, len, init } if *elem == Ty::Bool => {
             validate_expr(program, len, root_span_end, locals)?;
             require_expr_type(len, Ty::Int(IntTy::U64), "Boolean array allocation length")?;
             validate_bool_expr(
@@ -2047,7 +2079,7 @@ fn validate_fresh_u32_array_initializer(
     root_span_end: usize,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let expected = Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned);
+    let expected = Ty::array(Ty::Int(IntTy::U32), Mutability::Owned);
     require_expr_type(expression, expected, "owned `u32`-array initializer")?;
     match &expression.kind {
         ExprKind::ArrayLit(elements) => {
@@ -2066,7 +2098,7 @@ fn validate_fresh_u32_array_initializer(
             }
             Ok(())
         }
-        ExprKind::AllocArray { elem, len, init } if *elem == ValueTy::Int(IntTy::U32) => {
+        ExprKind::AllocArray { elem, len, init } if *elem == Ty::Int(IntTy::U32) => {
             validate_expr(program, len, root_span_end, locals)?;
             require_expr_type(len, Ty::Int(IntTy::U64), "`u32` array allocation length")?;
             validate_expr(program, init, root_span_end, locals)?;
@@ -2098,8 +2130,8 @@ fn validate_native_array_store(
             format!("array store names unknown or out-of-scope local `{array}`"),
         )]);
     };
-    if !is_owned_native_array(local.ty)
-        && local.ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Mut)
+    if !is_owned_native_array(&local.ty)
+        && local.ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Mut)
     {
         return Err(vec![unsupported(
             array_span,
@@ -2109,7 +2141,7 @@ fn validate_native_array_store(
             ),
         )]);
     }
-    if is_owned_native_array(local.ty) && !local.mutable {
+    if is_owned_native_array(&local.ty) && !local.mutable {
         return Err(vec![unsupported(
             array_span,
             format!("array store targets immutable owned array `{array}`"),
@@ -2117,7 +2149,7 @@ fn validate_native_array_store(
     }
     validate_expr(program, index, root_span_end, locals)?;
     require_expr_type(index, Ty::Int(IntTy::U64), "array store index")?;
-    if is_owned_bool_array(local.ty) {
+    if is_owned_bool_array(&local.ty) {
         validate_bool_expr(
             program,
             value,
@@ -2137,7 +2169,7 @@ fn validate_u32_array_borrow_argument(
     expected: Ty,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let Ty::Array(ValueTy::Int(IntTy::U32), expected_mutability) = expected else {
+    let Some((&Ty::Int(IntTy::U32), expected_mutability)) = expected.as_array() else {
         unreachable!("called only for a checked `u32` array borrow parameter")
     };
     if !matches!(expected_mutability, Mutability::Shared | Mutability::Mut) {
@@ -2179,14 +2211,14 @@ fn validate_u32_array_borrow_argument(
         if *mutable {
             return Err(vec![diag(
                 "backend.class_unsupported",
-                "mutable class-field borrow is outside the native Integer slice",
+                "mutable class-field borrow is outside the concrete `Integer` surface the LLVM backend lowers",
                 argument.span,
-                "N5 admits shared `u32` field borrows only",
+                "the backend lowers shared `u32` field borrows only",
             )]);
         }
         let (_, _, field_ty) =
             validate_fixed_class_field_base(program, locals, array, field, argument.span)?;
-        if field_ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) {
+        if field_ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned) {
             return Err(vec![diag(
                 "backend.class_unsupported",
                 "array field borrow has the wrong native type",
@@ -2196,7 +2228,7 @@ fn validate_u32_array_borrow_argument(
         }
         return Ok(());
     }
-    let Ty::Array(ValueTy::Int(IntTy::U32), source_mutability) = source.ty else {
+    let Some((&Ty::Int(IntTy::U32), source_mutability)) = source.ty.as_array() else {
         return Err(vec![unsupported(
             argument.span,
             format!("array borrow source `{array}` is not a native `u32` array"),
@@ -2225,7 +2257,7 @@ fn validate_class_borrow_argument(
     else {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "class borrow is outside the fixed-owner native slice",
+            "class borrow is outside the fixed-owner class shapes the LLVM backend lowers",
             argument.span,
             format!(
                 "class borrow parameter `{}` has no native reference representation",
@@ -2234,7 +2266,7 @@ fn validate_class_borrow_argument(
         )]);
     };
     require_fixed_class(program, class, argument.span, "class borrow parameter")?;
-    require_expr_type(argument, expected, "class borrow argument")?;
+    require_expr_type(argument, expected.clone(), "class borrow argument")?;
     if let ExprKind::Var(name) = &argument.kind {
         let Some(source) = locals.get(name) else {
             return Err(vec![unsupported(
@@ -2265,7 +2297,7 @@ fn validate_class_borrow_argument(
     else {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "class borrow argument is outside the fixed-owner native slice",
+            "class borrow argument is outside the fixed-owner class shapes the LLVM backend lowers",
             argument.span,
             "a class parameter requires an explicit named borrow with matching mutability",
         )]);
@@ -2296,7 +2328,7 @@ fn validate_class_borrow_argument(
         if *mutable {
             return Err(vec![diag(
                 "backend.class_unsupported",
-                "mutable class-field borrow is outside the native Integer slice",
+                "mutable class-field borrow is outside the concrete `Integer` surface the LLVM backend lowers",
                 argument.span,
                 "borrow the whole Integer mutably and mutate through its method",
             )]);
@@ -2507,9 +2539,9 @@ fn validate_native_method_call(
     {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "method call is outside the exact native Integer slice",
+            "method call is outside the concrete `Integer` surface the LLVM backend lowers",
             expression.span,
-            "N5 admits only the zero-argument unit method `Integer::flip_sign`",
+            "the backend lowers only the zero-argument unit method `Integer::flip_sign`",
         )]);
     }
     let receiver_is_mutable = match local.ty {
@@ -2539,11 +2571,11 @@ fn validate_expr(
             return validate_affine_option_is_some(expression, operand, locals);
         }
     }
-    if let Some(ty @ Ty::AffineOption(_)) = expression.ty {
+    if let Some(ty @ Ty::AffineOption(_)) = &expression.ty {
         return Err(vec![affine_option_unsupported(
             expression.span,
             "expression",
-            ty,
+            ty.clone(),
         )]);
     }
     match &expression.kind {
@@ -2579,13 +2611,19 @@ fn validate_expr(
                     "owned classes may only initialize another owner, return, or cross an admitted by-value boundary",
                 )]);
             }
-            let ty = expression.ty.ok_or_else(|| {
+            let ty = expression.ty.clone().ok_or_else(|| {
                 vec![unsupported(
                     expression.span,
                     "expression is missing its checked type",
                 )]
             })?;
-            require_runtime_type(program, root_span_end, ty, expression.span, "expression")?;
+            require_runtime_type(
+                program,
+                root_span_end,
+                ty.clone(),
+                expression.span,
+                "expression",
+            )?;
             if ty != local.ty {
                 return Err(vec![unsupported(
                     expression.span,
@@ -2635,11 +2673,11 @@ fn validate_expr(
             require_runtime_type(
                 program,
                 root_span_end,
-                function.ret,
+                function.ret.clone(),
                 expression.span,
                 "call result",
             )?;
-            require_expr_type(expression, function.ret, "call result")
+            require_expr_type(expression, function.ret.clone(), "call result")
         }
         ExprKind::Unary {
             op: UnOp::Not,
@@ -2779,7 +2817,7 @@ fn validate_expr(
         ExprKind::SomeE(inner) => {
             require_expr_type(
                 expression,
-                Ty::Option(ValueTy::Bool),
+                Ty::option(Ty::Bool),
                 "Boolean option construction",
             )?;
             validate_bool_expr(
@@ -2792,32 +2830,24 @@ fn validate_expr(
         }
         ExprKind::NoneE => require_expr_type(
             expression,
-            Ty::Option(ValueTy::Bool),
+            Ty::option(Ty::Bool),
             "Boolean option construction",
         ),
         ExprKind::IsSome { operand } => {
             validate_expr(program, operand, root_span_end, locals)?;
-            require_expr_type(
-                operand,
-                Ty::Option(ValueTy::Bool),
-                "option accessor operand",
-            )?;
+            require_expr_type(operand, Ty::option(Ty::Bool), "option accessor operand")?;
             require_expr_type(expression, Ty::Bool, "`.is_some` result")
         }
         ExprKind::OptValue { operand } => {
-            if let Some(ty @ Ty::AffineOption(_)) = operand.ty {
+            if let Some(ty @ Ty::AffineOption(_)) = &operand.ty {
                 return Err(vec![affine_option_unsupported(
                     operand.span,
                     "copying `.value` accessor operand",
-                    ty,
+                    ty.clone(),
                 )]);
             }
             validate_expr(program, operand, root_span_end, locals)?;
-            require_expr_type(
-                operand,
-                Ty::Option(ValueTy::Bool),
-                "option accessor operand",
-            )?;
+            require_expr_type(operand, Ty::option(Ty::Bool), "option accessor operand")?;
             require_expr_type(expression, Ty::Bool, "Boolean option payload")
         }
         ExprKind::OptTake { option, .. } => Err(vec![affine_option_take_position(
@@ -2843,7 +2873,7 @@ fn validate_expr(
                     local.ty,
                 )]);
             }
-            if !is_owned_bool_array(local.ty) && !is_u32_array(local.ty) {
+            if !is_owned_bool_array(&local.ty) && !is_u32_array(&local.ty) {
                 return Err(vec![unsupported(
                     *array_span,
                     format!(
@@ -2854,7 +2884,7 @@ fn validate_expr(
             }
             validate_expr(program, index, root_span_end, locals)?;
             require_expr_type(index, Ty::Int(IntTy::U64), "array index")?;
-            let element_ty = if is_owned_bool_array(local.ty) {
+            let element_ty = if is_owned_bool_array(&local.ty) {
                 Ty::Bool
             } else {
                 Ty::Int(IntTy::U32)
@@ -2875,7 +2905,7 @@ fn validate_expr(
                     local.ty,
                 )]);
             }
-            if !is_owned_bool_array(local.ty) && !is_u32_array(local.ty) {
+            if !is_owned_bool_array(&local.ty) && !is_u32_array(&local.ty) {
                 return Err(vec![unsupported(
                     expression.span,
                     format!(
@@ -2926,7 +2956,7 @@ fn validate_expr(
             }
             for (argument, field) in args.iter().zip(&declaration.fields) {
                 validate_expr(program, argument, root_span_end, locals)?;
-                require_expr_type(argument, field.ty, "record field initializer")?;
+                require_expr_type(argument, field.ty.clone(), "record field initializer")?;
             }
             Ok(())
         }
@@ -2935,7 +2965,7 @@ fn validate_expr(
             let Some(Ty::Int(integer)) = expression.ty else {
                 return Err(vec![unsupported(
                     expression.span,
-                    "G1.4a record projection must have a concrete integer field type",
+                    "a lowered record projection must have a concrete integer field type",
                 )]);
             };
             require_concrete_integer(integer, expression.span, "record field projection")
@@ -2964,7 +2994,7 @@ fn validate_expr(
         } => {
             let (_, _, field_ty) =
                 validate_fixed_class_field_base(program, locals, obj, field, *obj_span)?;
-            if field_ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) {
+            if field_ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned) {
                 return Err(vec![diag(
                     "backend.class_unsupported",
                     "indexed class field is not the native `u32` array",
@@ -2979,7 +3009,7 @@ fn validate_expr(
         ExprKind::ClassFieldLen { obj, field } => {
             let (_, _, field_ty) =
                 validate_fixed_class_field_base(program, locals, obj, field, expression.span)?;
-            if field_ty != Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) {
+            if field_ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned) {
                 return Err(vec![diag(
                     "backend.class_unsupported",
                     "class `.len` field is not the native `u32` array",
@@ -2999,7 +3029,7 @@ fn validate_expr(
             let Ty::Int(integer) = field_ty else {
                 return Err(vec![diag(
                     "backend.class_unsupported",
-                    "class field value is outside the exact native Integer slice",
+                    "class field value is outside the concrete `Integer` surface the LLVM backend lowers",
                     expression.span,
                     format!("`{obj}.{field}` has non-scalar type `{}`", field_ty.name()),
                 )]);
@@ -3013,7 +3043,7 @@ fn validate_expr(
             let Ty::Int(integer) = field_ty else {
                 return Err(vec![diag(
                     "backend.class_unsupported",
-                    "method field read is outside the exact native Integer slice",
+                    "method field read is outside the concrete `Integer` surface the LLVM backend lowers",
                     expression.span,
                     format!("`self.{field}` has type `{}`", field_ty.name()),
                 )]);
@@ -3034,20 +3064,20 @@ fn validate_affine_option_is_some(
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     require_expr_type(expression, Ty::Bool, "affine-option `.is_some` result")?;
-    let Some(ty @ Ty::AffineOption(_)) = operand.ty else {
+    let Some(ref ty @ Ty::AffineOption(_)) = operand.ty else {
         unreachable!("called only for an affine-option operand")
     };
-    if !is_affine_bool_option(ty) {
+    if !is_affine_bool_option(&ty.clone()) {
         return Err(vec![affine_option_unsupported(
             operand.span,
             "`.is_some` operand",
-            ty,
+            ty.clone(),
         )]);
     }
     let ExprKind::Var(name) = &operand.kind else {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             operand.span,
             "`.is_some` requires a named affine-option local",
         )]);
@@ -3055,27 +3085,27 @@ fn validate_affine_option_is_some(
     let Some(local) = locals.get(name) else {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             operand.span,
             format!("`.is_some` names unknown or out-of-scope local `{name}`"),
         )]);
     };
-    if local.ty != ty {
+    if local.ty != *ty {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             operand.span,
             format!(
                 "`.is_some` names `{name}` of type `{}` but is annotated `{}`",
                 local.ty.name(),
-                ty.name()
+                ty.clone().name()
             ),
         )]);
     }
     if !local.mutable {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
-            "affine option is outside the admitted LLVM local slice",
+            "affine option is outside the locals the LLVM backend lowers",
             operand.span,
             format!("affine option local `{name}` must be mutable"),
         )]);
@@ -3095,7 +3125,7 @@ fn validate_bool_expr(
 }
 
 fn require_expr_type(expression: &Expr, expected: Ty, role: &str) -> Result<(), Vec<BackendError>> {
-    if expression.ty == Some(expected) {
+    if expression.ty == Some(expected.clone()) {
         Ok(())
     } else {
         Err(vec![unsupported(
@@ -3105,7 +3135,8 @@ fn require_expr_type(expression: &Expr, expected: Ty, role: &str) -> Result<(), 
     }
 }
 
-/// Authorize one nominal record for G1.4a's *value* representation.  The
+/// Authorize one nominal record for the backend's internal *value*
+/// representation.  The
 /// declaration's `#[layout]` and `#[offset]` metadata describes abstract raw
 /// typed storage (ADR 0054); it is intentionally irrelevant to this internal
 /// LLVM aggregate. Pointer-bearing records wait for a provenance-preserving
@@ -3128,7 +3159,7 @@ fn require_record_value(
         return Err(vec![unsupported(
             span,
             format!(
-                "{role} uses imported record `{}`; G1.4a has no cross-module record ABI",
+                "{role} uses imported record `{}`; the backend declares no cross-module record ABI, so a record identity is lowered only inside the module that declares it",
                 declaration.name
             ),
         )]);
@@ -3138,17 +3169,17 @@ fn require_record_value(
             return Err(vec![affine_option_unsupported(
                 field.span,
                 &format!("record `{}.{}` field", declaration.name, field.name),
-                field.ty,
+                field.ty.clone(),
             )]);
         }
         if !matches!(field.ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) {
             return Err(vec![unsupported(
                 field.span,
                 format!(
-                    "record `{}.{}` has field type `{}`; G1.4a lowers integer-only POD values",
+                    "record `{}.{}` has field type `{}`; the backend lowers a record value only when every field is a concrete integer",
                     declaration.name,
                     field.name,
-                    field.ty.name()
+                    field.ty.clone().name()
                 ),
             )]);
         }
@@ -3156,7 +3187,7 @@ fn require_record_value(
     Ok(())
 }
 
-fn require_runtime_type(
+pub(crate) fn require_runtime_type(
     program: &Program,
     root_span_end: usize,
     ty: Ty,
@@ -3165,7 +3196,8 @@ fn require_runtime_type(
 ) -> Result<(), Vec<BackendError>> {
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        Ty::Bool | Ty::Unit | Ty::Option(ValueTy::Bool) => Ok(()),
+        Ty::Bool | Ty::Unit => Ok(()),
+        Ty::Option(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
         Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
@@ -3178,7 +3210,7 @@ fn require_runtime_type(
     }
 }
 
-fn require_local_value(
+pub(crate) fn require_local_value(
     program: &Program,
     root_span_end: usize,
     ty: Ty,
@@ -3187,10 +3219,11 @@ fn require_local_value(
 ) -> Result<(), Vec<BackendError>> {
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        Ty::Bool | Ty::Option(ValueTy::Bool) => Ok(()),
-        ty if is_affine_bool_option(ty) => Ok(()),
+        Ty::Bool => Ok(()),
+        Ty::Option(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
+        ty if is_affine_bool_option(&ty.clone()) => Ok(()),
         Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
-        ty if is_owned_native_array(ty) => Ok(()),
+        ty if is_owned_native_array(&ty.clone()) => Ok(()),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
             span,
@@ -3202,7 +3235,7 @@ fn require_local_value(
     }
 }
 
-fn require_parameter_value(
+pub(crate) fn require_parameter_value(
     program: &Program,
     root_span_end: usize,
     ty: Ty,
@@ -3212,7 +3245,11 @@ fn require_parameter_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
-        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared | Mutability::Mut) => Ok(()),
+        Ty::Array(element, Mutability::Shared | Mutability::Mut)
+            if element.as_ref() == &Ty::Int(IntTy::U32) =>
+        {
+            Ok(())
+        }
         Ty::Class(class) => {
             let declaration = require_fixed_class(program, class, span, role)?;
             if declaration.name == "Nat" {
@@ -3222,7 +3259,7 @@ fn require_parameter_value(
                     "backend.class_unsupported",
                     "owned class parameter is outside the exact native take ABI",
                     span,
-                    "N5 admits owned `Nat` parameters only",
+                    "the backend lowers owned `Nat` parameters only",
                 )])
             }
         }
@@ -3238,7 +3275,7 @@ fn require_parameter_value(
                     "backend.class_unsupported",
                     "mutable class reference is outside the exact native method ABI",
                     span,
-                    "N5 admits mutable `Integer` references only",
+                    "the backend lowers mutable `Integer` references only",
                 )])
             }
         }
@@ -3247,7 +3284,7 @@ fn require_parameter_value(
         _ => Err(vec![unsupported(
             span,
             format!(
-                "{role} type `{}` has no first-slice LLVM value representation",
+                "{role} type `{}` has no LLVM value representation; the backend lowers concrete integers, `bool`, borrowed `u32` arrays, fixed-owner classes, and integer-field records as values",
                 ty.name()
             ),
         )]),
@@ -3283,7 +3320,7 @@ const TRAP_OPTION_NONE: u32 = 8;
 const TRAP_ARRAY_OOM: u32 = 9;
 const TRAP_ARRAY_OOB: u32 = 10;
 
-/// Internal aggregate representation for the first non-integer option slice.
+/// Internal aggregate representation for an option over a non-integer payload.
 /// This is deliberately not a C ABI promise: byte fields make the layout
 /// unambiguous inside generated LLVM while ordinary Sable `bool` remains i1.
 const LLVM_OPTION_BOOL: &str = "%sable.option.bool";
@@ -3424,11 +3461,13 @@ impl ModuleSupport {
             return;
         }
         for field in &program.classes[class].fields {
-            match field.ty {
-                Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+            match &field.ty {
+                Ty::Array(element, Mutability::Owned)
+                    if element.as_ref() == &Ty::Int(IntTy::U32) =>
+                {
                     self.require_array_u32();
                 }
-                Ty::Class(child) => self.require_class(program, child),
+                Ty::Class(child) => self.require_class(program, *child),
                 _ => {}
             }
         }
@@ -3442,7 +3481,7 @@ impl ModuleSupport {
         let fields = declaration
             .fields
             .iter()
-            .map(|field| llvm_ty(field.ty))
+            .map(|field| llvm_ty(field.ty.clone()))
             .collect::<Vec<_>>()
             .join(", ");
         // This is an ordinary-value carrier only. It does not encode the
@@ -3492,7 +3531,7 @@ impl ModuleSupport {
             let fields = program.classes[*class]
                 .fields
                 .iter()
-                .map(|field| llvm_ty(field.ty))
+                .map(|field| llvm_ty(field.ty.clone()))
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push_str(&format!(
@@ -3633,12 +3672,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         {
             self.support.require_class(self.program, class);
         }
-        self.require_type_support(self.function.ret);
+        self.require_type_support(self.function.ret.clone());
         let parameter_types = self
             .function
             .params
             .iter()
-            .map(|parameter| parameter.ty)
+            .map(|parameter| parameter.ty.clone())
             .collect::<Vec<_>>();
         for ty in parameter_types {
             self.require_type_support(ty);
@@ -3648,7 +3687,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .params
             .iter()
             .enumerate()
-            .map(|(index, parameter)| format!("{} %p{index}", llvm_ty(parameter.ty)))
+            .map(|(index, parameter)| format!("{} %p{index}", llvm_ty(parameter.ty.clone())))
             .collect::<Vec<_>>();
         let implicit_parameter = self
             .initializer_class
@@ -3676,7 +3715,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let return_ty = if matches!(self.function.ret, Ty::Class(_)) {
             "void".to_string()
         } else {
-            llvm_ty(self.function.ret)
+            llvm_ty(self.function.ret.clone())
         };
         out.push_str(&format!(
             "define internal {} @{symbol}({parameters}) {{\nentry:\n",
@@ -3690,15 +3729,21 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .function
             .params
             .iter()
-            .map(|parameter| (parameter.name.clone(), parameter.ty))
+            .map(|parameter| (parameter.name.clone(), parameter.ty.clone()))
             .collect::<Vec<_>>();
         let mut declarations = Vec::new();
         collect_local_declarations(&self.function.body, &mut declarations);
         for (name, ty) in parameters.iter().chain(declarations.iter()) {
-            self.require_type_support(*ty);
+            self.require_type_support(ty.clone());
             let slot = self.new_slot();
-            self.instruction(format!("{slot} = alloca {}", llvm_ty(*ty)));
-            self.locals.insert(name.clone(), Local { ty: *ty, slot });
+            self.instruction(format!("{slot} = alloca {}", llvm_ty(ty.clone())));
+            self.locals.insert(
+                name.clone(),
+                Local {
+                    ty: ty.clone(),
+                    slot,
+                },
+            );
         }
         let mut assignment_targets = BTreeSet::new();
         collect_assignment_targets(&self.function.body, &mut assignment_targets);
@@ -3707,7 +3752,8 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 .locals
                 .get(&name)
                 .expect("validated assignment target was preallocated")
-                .ty;
+                .ty
+                .clone();
             if let Ty::Class(class) = ty {
                 let slot = self.new_slot();
                 self.instruction(format!("{slot} = alloca {}", llvm_class_ty(class)));
@@ -3721,7 +3767,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 .expect("parameter slot was preallocated")
                 .slot
                 .clone();
-            self.instruction(format!("store {} %p{index}, ptr {slot}", llvm_ty(*ty)));
+            self.instruction(format!(
+                "store {} %p{index}, ptr {slot}",
+                llvm_ty(ty.clone())
+            ));
             if let Ty::Class(class) = ty {
                 self.cleanup_scopes[0].push(OwnedCleanup::FixedClass(name.clone(), *class));
             }
@@ -3758,10 +3807,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
 
     fn require_type_support(&mut self, ty: Ty) {
         match ty {
-            Ty::Option(ValueTy::Bool) => self.support.require_option_bool(),
-            ty if is_owned_bool_array(ty) => self.support.require_array_bool(),
-            ty if is_u32_array(ty) => self.support.require_array_u32(),
-            ty if is_affine_bool_option(ty) => self.support.require_affine_option_bool_array(),
+            Ty::Option(payload) if payload.as_ref() == &Ty::Bool => {
+                self.support.require_option_bool()
+            }
+            ty if is_owned_bool_array(&ty.clone()) => self.support.require_array_bool(),
+            ty if is_u32_array(&ty.clone()) => self.support.require_array_u32(),
+            ty if is_affine_bool_option(&ty.clone()) => {
+                self.support.require_affine_option_bool_array()
+            }
             Ty::Record(record) => self.support.require_record(record),
             Ty::Class(class) | Ty::ClassRef(class, _) => {
                 self.support.require_class(self.program, class)
@@ -3780,10 +3833,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             }
             match statement {
                 Stmt::Decl { ty, name, init, .. } => {
-                    self.emit_decl(name, *ty, init.as_ref())?;
+                    self.emit_decl(name, ty.clone(), init.as_ref())?;
                 }
                 Stmt::VarDecl { name, init, ty, .. } => {
-                    self.emit_decl(name, ty.expect("validated inferred type"), Some(init))?;
+                    self.emit_decl(
+                        name,
+                        ty.clone().expect("validated inferred type"),
+                        Some(init),
+                    )?;
                 }
                 Stmt::Assign {
                     name,
@@ -3796,7 +3853,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                             format!("LLVM local `{name}` was not declared"),
                         )]);
                     };
-                    let ty = local.ty;
+                    let ty = local.ty.clone();
                     let slot = local.slot.clone();
                     if let Ty::Class(class) = ty {
                         let scratch = self
@@ -3838,7 +3895,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                                     "return has checked type `{}` but function `{}` returns `{}`",
                                     emitted.ty.name(),
                                     self.function.name,
-                                    self.function.ret.name()
+                                    self.function.ret.clone().name()
                                 ),
                             )]);
                         }
@@ -3892,7 +3949,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     let (field_index, field_ty) = self.class_field(class, field);
                     let field_slot = self.emit_class_field_slot(class, "%self", field_index);
                     match field_ty {
-                        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+                        Ty::Array(element, Mutability::Owned)
+                            if element.as_ref() == &Ty::Int(IntTy::U32) =>
+                        {
                             let value = self.emit_fresh_u32_array(value)?;
                             self.instruction(format!(
                                 "store {LLVM_ARRAY_U32} {}, ptr {field_slot}",
@@ -3949,34 +4008,34 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .push(OwnedCleanup::FixedClass(name.to_owned(), class));
                 return Ok(());
             }
-            let value = if is_owned_bool_array(ty) {
+            let value = if is_owned_bool_array(&ty.clone()) {
                 match &init.kind {
                     ExprKind::OptTake { option, .. } => self.emit_affine_option_take(option)?,
                     _ => self.emit_fresh_bool_array(init)?,
                 }
-            } else if is_owned_u32_array(ty) {
+            } else if is_owned_u32_array(ty.clone()) {
                 self.emit_fresh_u32_array(init)?
-            } else if is_affine_bool_option(ty) {
+            } else if is_affine_bool_option(&ty.clone()) {
                 self.emit_affine_bool_option_initializer(init)?
             } else {
                 self.emit_expr(init)?
             };
             self.instruction(format!(
                 "store {} {}, ptr {slot}",
-                llvm_ty(ty),
+                llvm_ty(ty.clone()),
                 value.operand.expect("local initializer is non-unit")
             ));
-            if is_owned_bool_array(ty) {
+            if is_owned_bool_array(&ty.clone()) {
                 self.cleanup_scopes
                     .last_mut()
                     .expect("array declaration has a lexical cleanup scope")
                     .push(OwnedCleanup::BoolArray(name.to_owned()));
-            } else if is_owned_u32_array(ty) {
+            } else if is_owned_u32_array(ty.clone()) {
                 self.cleanup_scopes
                     .last_mut()
                     .expect("array declaration has a lexical cleanup scope")
                     .push(OwnedCleanup::U32Array(name.to_owned()));
-            } else if is_affine_bool_option(ty) {
+            } else if is_affine_bool_option(&ty) {
                 self.cleanup_scopes
                     .last_mut()
                     .expect("affine option declaration has a lexical cleanup scope")
@@ -4161,7 +4220,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             };
             lowered.push(format!(
                 "{} {}",
-                llvm_ty(parameter.ty),
+                llvm_ty(parameter.ty.clone()),
                 value.operand.expect("call argument is non-unit")
             ));
         }
@@ -4210,7 +4269,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .iter()
             .enumerate()
             .find(|(_, declaration_field)| declaration_field.name == field)
-            .map(|(index, declaration_field)| (index, declaration_field.ty))
+            .map(|(index, declaration_field)| (index, declaration_field.ty.clone()))
             .expect("validated native class field")
     }
 
@@ -4236,7 +4295,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .locals
             .get(object)
             .expect("validated fixed-owner class base");
-        let ty = local.ty;
+        let ty = local.ty.clone();
         let slot = local.slot.clone();
         match ty {
             Ty::Class(class) => (class, slot),
@@ -4371,7 +4430,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             "store {LLVM_AFFINE_OPTION_BOOL_ARRAY} zeroinitializer, ptr {source_slot}"
         ));
         Ok(Value {
-            ty: Ty::Array(ValueTy::Bool, Mutability::Owned),
+            ty: Ty::array(Ty::Bool, Mutability::Owned),
             operand: Some(payload),
         })
     }
@@ -4422,7 +4481,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let len = elements.len() as u64;
         if len == 0 {
             return Ok(Value {
-                ty: Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned),
+                ty: Ty::array(Ty::Bool, crate::ast::Mutability::Owned),
                 operand: Some("zeroinitializer".into()),
             });
         }
@@ -4530,7 +4589,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let len = elements.len() as u64;
         if len == 0 {
             return Ok(Value {
-                ty: Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned),
+                ty: Ty::array(Ty::Int(IntTy::U32), Mutability::Owned),
                 operand: Some("zeroinitializer".into()),
             });
         }
@@ -4640,7 +4699,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             "{descriptor} = insertvalue {LLVM_ARRAY_BOOL} {with_ptr}, i64 {len}, 1"
         ));
         Value {
-            ty: Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned),
+            ty: Ty::array(Ty::Bool, crate::ast::Mutability::Owned),
             operand: Some(descriptor),
         }
     }
@@ -4655,7 +4714,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             "{descriptor} = insertvalue {LLVM_ARRAY_U32} {with_ptr}, i64 {len}, 1"
         ));
         Value {
-            ty: Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned),
+            ty: Ty::array(Ty::Int(IntTy::U32), Mutability::Owned),
             operand: Some(descriptor),
         }
     }
@@ -4670,8 +4729,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .locals
             .get(array)
             .expect("validated native array local")
-            .ty;
-        if is_owned_bool_array(ty) {
+            .ty
+            .clone();
+        if is_owned_bool_array(&ty) {
             return self.emit_bool_array_store(array, index, value);
         }
         self.emit_u32_array_store(array, index, value)
@@ -4859,12 +4919,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .fields
             .iter()
             .enumerate()
-            .map(|(index, field)| (index, field.ty))
+            .map(|(index, field)| (index, field.ty.clone()))
             .collect::<Vec<_>>();
         for (field_index, field_ty) in fields.into_iter().rev() {
             let field_slot = self.emit_class_field_slot(class, slot, field_index);
             match field_ty {
-                Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Owned) => {
+                Ty::Array(element, Mutability::Owned)
+                    if element.as_ref() == &Ty::Int(IntTy::U32) =>
+                {
                     self.emit_u32_array_drop_from_slot(&field_slot);
                 }
                 Ty::Class(child) => self.emit_fixed_class_drop_from_slot(&field_slot, child),
@@ -4879,7 +4941,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit_u32_array_drop_from_slot(&mut self, field_slot: &str) {
-        let (ptr, _) = self.load_u32_array_parts_from_slot(&field_slot);
+        let (ptr, _) = self.load_u32_array_parts_from_slot(field_slot);
         let empty = self.new_temp();
         self.instruction(format!("{empty} = icmp eq ptr {ptr}, null"));
         let free_label = self.new_label("class.free");
@@ -4944,7 +5006,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     fn emit_expr(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
         match &expression.kind {
             ExprKind::IntLit(value) => Ok(Value {
-                ty: expression.ty.expect("validated literal type"),
+                ty: expression.ty.clone().expect("validated literal type"),
                 operand: Some(value.to_string()),
             }),
             ExprKind::BoolLit(value) => Ok(Value {
@@ -4958,10 +5020,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         format!("LLVM local `{name}` was not declared"),
                     )]);
                 };
-                let ty = local.ty;
+                let ty = local.ty.clone();
                 let slot = local.slot.clone();
                 let temp = self.new_temp();
-                self.instruction(format!("{temp} = load {}, ptr {slot}", llvm_ty(ty)));
+                self.instruction(format!("{temp} = load {}, ptr {slot}", llvm_ty(ty.clone())));
                 Ok(Value {
                     ty,
                     operand: Some(temp),
@@ -4974,8 +5036,8 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .emit_expr(index)?
                     .operand
                     .expect("validated Boolean array index");
-                let ty = self.locals[array].ty;
-                if is_owned_bool_array(ty) {
+                let ty = self.locals[array].ty.clone();
+                if is_owned_bool_array(&ty) {
                     let (ptr, len) = self.load_bool_array_parts(array);
                     self.emit_bool_array_bounds_guard(&index, &len);
                     let address = self.new_temp();
@@ -5006,8 +5068,8 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 }
             }
             ExprKind::Len { array } => {
-                let ty = self.locals[array].ty;
-                let (_, len) = if is_owned_bool_array(ty) {
+                let ty = self.locals[array].ty.clone();
+                let (_, len) = if is_owned_bool_array(&ty) {
                     self.load_bool_array_parts(array)
                 } else {
                     self.load_u32_array_parts(array)
@@ -5049,7 +5111,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 let value = self.new_temp();
                 self.instruction(format!(
                     "{value} = load {}, ptr {field_slot}",
-                    llvm_ty(field_ty)
+                    llvm_ty(field_ty.clone())
                 ));
                 Ok(Value {
                     ty: field_ty,
@@ -5061,7 +5123,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 let value = self.new_temp();
                 self.instruction(format!(
                     "{value} = load {}, ptr {field_slot}",
-                    llvm_ty(field_ty)
+                    llvm_ty(field_ty.clone())
                 ));
                 Ok(Value {
                     ty: field_ty,
@@ -5071,6 +5133,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ExprKind::RecordLit { record, args, .. } => {
                 let Ty::Record(record_index) = expression
                     .ty
+                    .clone()
                     .expect("validated record construction has a nominal type")
                 else {
                     unreachable!("validated record construction type")
@@ -5079,7 +5142,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 let declaration = self.program.records[record_index].clone();
                 debug_assert_eq!(declaration.name.as_str(), record.as_str());
 
-                // All G1.4a fields are integers, so zero is a valid defined
+                // Every lowered record field is an integer, so zero is a valid defined
                 // seed. Every declared field is then overwritten in source
                 // order; evaluating each argument before the next preserves
                 // Sable's left-to-right call/trap order.
@@ -5090,7 +5153,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     let next = self.new_temp();
                     self.instruction(format!(
                         "{next} = insertvalue {record_ty} {aggregate}, {} {}, {index}",
-                        llvm_ty(field.ty),
+                        llvm_ty(field.ty.clone()),
                         value.operand.expect("validated record field value")
                     ));
                     aggregate = next;
@@ -5111,7 +5174,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         format!("LLVM record local `{obj}` was not declared"),
                     )]);
                 };
-                let (record_index, slot) = match local.ty {
+                let (record_index, slot) = match &local.ty {
                     Ty::Record(record_index) => (record_index, local.slot.clone()),
                     other => {
                         return Err(vec![unsupported(
@@ -5123,8 +5186,8 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         )]);
                     }
                 };
-                self.support.require_record(record_index);
-                let declaration = self.program.records[record_index].clone();
+                self.support.require_record(*record_index);
+                let declaration = self.program.records[*record_index].clone();
                 let Some((field_index, declaration_field)) = declaration
                     .fields
                     .iter()
@@ -5137,18 +5200,21 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         format!("record `{}` has no field `{field}`", declaration.name),
                     )]);
                 };
-                if expression.ty != Some(declaration_field.ty) {
+                if expression.ty.as_ref() != Some(&declaration_field.ty) {
                     return Err(vec![unsupported(
                         expression.span,
                         format!(
                             "record `{}.{field}` is annotated `{}` instead of `{}`",
                             declaration.name,
-                            expression.ty.map_or_else(|| "<missing>".into(), Ty::name),
+                            expression
+                                .ty
+                                .as_ref()
+                                .map_or_else(|| "<missing>".to_string(), |ty| ty.name()),
                             declaration_field.ty.name()
                         ),
                     )]);
                 }
-                let record_ty = llvm_record_ty(record_index);
+                let record_ty = llvm_record_ty(*record_index);
                 let aggregate = self.new_temp();
                 self.instruction(format!("{aggregate} = load {record_ty}, ptr {slot}"));
                 let value = self.new_temp();
@@ -5156,7 +5222,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     "{value} = extractvalue {record_ty} {aggregate}, {field_index}"
                 ));
                 Ok(Value {
-                    ty: declaration_field.ty,
+                    ty: declaration_field.ty.clone(),
                     operand: Some(value),
                 })
             }
@@ -5177,14 +5243,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     "{result} = insertvalue {LLVM_OPTION_BOOL} {tagged}, i8 {payload}, 1"
                 ));
                 Ok(Value {
-                    ty: Ty::Option(ValueTy::Bool),
+                    ty: Ty::option(Ty::Bool),
                     operand: Some(result),
                 })
             }
             ExprKind::NoneE => {
                 self.support.require_option_bool();
                 Ok(Value {
-                    ty: Ty::Option(ValueTy::Bool),
+                    ty: Ty::option(Ty::Bool),
                     operand: Some("zeroinitializer".into()),
                 })
             }
@@ -5274,7 +5340,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 let lowered = self.emit_call_arguments(&function.params, args)?;
                 let call = format!(
                     "call {} @{}({})",
-                    llvm_ty(function.ret),
+                    llvm_ty(function.ret.clone()),
                     mangle(function),
                     lowered.join(", ")
                 );
@@ -5288,7 +5354,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     let temp = self.new_temp();
                     self.instruction(format!("{temp} = {call}"));
                     Ok(Value {
-                        ty: function.ret,
+                        ty: function.ret.clone(),
                         operand: Some(temp),
                     })
                 }
@@ -5326,7 +5392,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     self.class_base_pointer(array)
                 };
                 Ok(Value {
-                    ty: expression.ty.expect("validated class borrow type"),
+                    ty: expression.ty.clone().expect("validated class borrow type"),
                     operand: Some(pointer),
                 })
             }
@@ -5343,7 +5409,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 let descriptor = self.new_temp();
                 self.instruction(format!("{descriptor} = load {LLVM_ARRAY_U32}, ptr {slot}"));
                 Ok(Value {
-                    ty: expression.ty.expect("validated borrow type"),
+                    ty: expression.ty.clone().expect("validated borrow type"),
                     operand: Some(descriptor),
                 })
             }
@@ -5914,9 +5980,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
 fn collect_local_declarations(statements: &[Stmt], declarations: &mut Vec<(String, Ty)>) {
     for statement in statements {
         match statement {
-            Stmt::Decl { name, ty, .. } => declarations.push((name.clone(), *ty)),
+            Stmt::Decl { name, ty, .. } => declarations.push((name.clone(), ty.clone())),
             Stmt::VarDecl { name, ty, .. } => {
-                declarations.push((name.clone(), ty.expect("validated inferred type")));
+                declarations.push((name.clone(), ty.clone().expect("validated inferred type")));
             }
             Stmt::If {
                 then_block,
@@ -5939,8 +6005,8 @@ fn collect_local_declarations(statements: &[Stmt], declarations: &mut Vec<(Strin
 fn find_declared_type(statements: &[Stmt], target: &str) -> Option<Ty> {
     for statement in statements {
         match statement {
-            Stmt::Decl { name, ty, .. } if name == target => return Some(*ty),
-            Stmt::VarDecl { name, ty, .. } if name == target => return *ty,
+            Stmt::Decl { name, ty, .. } if name == target => return Some(ty.clone()),
+            Stmt::VarDecl { name, ty, .. } if name == target => return ty.clone(),
             Stmt::If {
                 then_block,
                 else_block,
@@ -6007,15 +6073,15 @@ fn emit_main_bridge(function: &Fn, out: &mut String) {
     out.push_str("}\n");
 }
 
-fn llvm_ty(ty: Ty) -> String {
+pub(crate) fn llvm_ty(ty: Ty) -> String {
     match ty {
         Ty::Int(integer) => format!("i{}", integer.bits()),
         Ty::Bool => "i1".into(),
         Ty::Unit => "void".into(),
-        Ty::Option(ValueTy::Bool) => LLVM_OPTION_BOOL.into(),
-        ty if is_owned_bool_array(ty) => LLVM_ARRAY_BOOL.into(),
-        ty if is_u32_array(ty) => LLVM_ARRAY_U32.into(),
-        ty if is_affine_bool_option(ty) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
+        Ty::Option(payload) if payload.as_ref() == &Ty::Bool => LLVM_OPTION_BOOL.into(),
+        ty if is_owned_bool_array(&ty.clone()) => LLVM_ARRAY_BOOL.into(),
+        ty if is_u32_array(&ty.clone()) => LLVM_ARRAY_U32.into(),
+        ty if is_affine_bool_option(&ty.clone()) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
         Ty::Class(class) => llvm_class_ty(class),
         Ty::ClassRef(_, Mutability::Shared | Mutability::Mut) => "ptr".into(),
         Ty::Record(record) => llvm_record_ty(record),
@@ -6046,7 +6112,7 @@ fn packed_type_info(result: IntTy, lhs: IntTy, rhs: Option<IntTy>) -> u32 {
         | (rhs.map(integer_type_code).unwrap_or(0) << 16)
 }
 
-fn type_code(ty: Ty) -> String {
+pub(crate) fn type_code(ty: Ty) -> String {
     match ty {
         Ty::Int(IntTy::U8) => "u8".into(),
         Ty::Int(IntTy::U16) => "u16".into(),
@@ -6058,9 +6124,13 @@ fn type_code(ty: Ty) -> String {
         Ty::Int(IntTy::I64) => "i64".into(),
         Ty::Bool => "b".into(),
         Ty::Unit => "v".into(),
-        Ty::Option(ValueTy::Bool) => "ob".into(),
-        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Shared) => "au32s".into(),
-        Ty::Array(ValueTy::Int(IntTy::U32), Mutability::Mut) => "au32m".into(),
+        Ty::Option(payload) if payload.as_ref() == &Ty::Bool => "ob".into(),
+        Ty::Array(element, Mutability::Shared) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+            "au32s".into()
+        }
+        Ty::Array(element, Mutability::Mut) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+            "au32m".into()
+        }
         Ty::ClassRef(class, Mutability::Shared) => format!("c{class}s"),
         Ty::ClassRef(class, Mutability::Mut) => format!("c{class}m"),
         Ty::Class(class) => format!("c{class}o"),
@@ -6076,7 +6146,7 @@ fn mangle(function: &Fn) -> String {
     let params = function
         .params
         .iter()
-        .map(|parameter| type_code(parameter.ty))
+        .map(|parameter| type_code(parameter.ty.clone()))
         .collect::<Vec<_>>()
         .join("_");
     format!(
@@ -6084,7 +6154,7 @@ fn mangle(function: &Fn) -> String {
         function.name.len(),
         function.name,
         params,
-        type_code(function.ret)
+        type_code(function.ret.clone())
     )
 }
 
@@ -6092,7 +6162,7 @@ fn mangle_initializer(class: usize, initializer: &Fn) -> String {
     let params = initializer
         .params
         .iter()
-        .map(|parameter| type_code(parameter.ty))
+        .map(|parameter| type_code(parameter.ty.clone()))
         .collect::<Vec<_>>()
         .join("_");
     format!(
@@ -6106,14 +6176,14 @@ fn mangle_method(class: usize, method: &Fn) -> String {
     let params = method
         .params
         .iter()
-        .map(|parameter| type_code(parameter.ty))
+        .map(|parameter| type_code(parameter.ty.clone()))
         .collect::<Vec<_>>()
         .join("_");
     format!(
         "__sable_v0_c{class}_m_{}_{}__p_{params}__r_{}",
         method.name.len(),
         method.name,
-        type_code(method.ret)
+        type_code(method.ret.clone())
     )
 }
 
@@ -6473,7 +6543,7 @@ fn affine_option_unsupported(span: Span, role: &str, ty: Ty) -> BackendError {
     debug_assert!(matches!(ty, Ty::AffineOption(_)));
     diag(
         "backend.affine_option_unsupported",
-        "affine option is outside the admitted LLVM local slice",
+        "affine option is outside the locals the LLVM backend lowers",
         span,
         format!(
             "{role} has type `{}`; native lowering admits only explicit mutable local `option<[bool]>` construction, named `.is_some`, and atomic `.take` into an explicit owned Boolean-array local",
@@ -6485,7 +6555,7 @@ fn affine_option_unsupported(span: Span, role: &str, ty: Ty) -> BackendError {
 fn affine_option_take_position(span: Span, option: &str, role: &str) -> BackendError {
     diag(
         "backend.affine_option_unsupported",
-        "affine option is outside the admitted LLVM local slice",
+        "affine option is outside the locals the LLVM backend lowers",
         span,
         format!(
             "{role} cannot receive `.take` of affine option local `{option}`; `.take` must directly initialize an explicit owned Boolean-array local"
@@ -6496,7 +6566,7 @@ fn affine_option_take_position(span: Span, option: &str, role: &str) -> BackendE
 fn affine_option_initializer_unsupported(span: Span, local: &str) -> BackendError {
     diag(
         "backend.affine_option_unsupported",
-        "affine option is outside the admitted LLVM local slice",
+        "affine option is outside the locals the LLVM backend lowers",
         span,
         format!(
             "affine option local `{local}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
@@ -6524,7 +6594,7 @@ mod tests {
     use super::*;
     use crate::ast::{
         AffineOptionTy, ExternInfo, Field, GenericTy, Method, Param, Program, ProofReuse,
-        RecordField, SelfKind, StorageLayout, TypeArg, ValueTy,
+        RecordField, SelfKind, StorageLayout, Ty, TypeArg,
     };
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
@@ -6589,7 +6659,7 @@ mod tests {
     }
 
     fn bool_option(kind: ExprKind) -> Expr {
-        expression(kind, Ty::Option(ValueTy::Bool))
+        expression(kind, Ty::option(Ty::Bool))
     }
 
     fn bool_option_variable(name: &str) -> Expr {
@@ -6597,7 +6667,7 @@ mod tests {
     }
 
     fn bool_array_ty() -> Ty {
-        Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned)
+        Ty::array(Ty::Bool, crate::ast::Mutability::Owned)
     }
 
     fn bool_array_literal(values: &[bool]) -> Expr {
@@ -6615,7 +6685,7 @@ mod tests {
     fn bool_array_alloc(len: Expr, init: Expr) -> Expr {
         expression(
             ExprKind::AllocArray {
-                elem: ValueTy::Bool,
+                elem: Ty::Bool,
                 len: Box::new(len),
                 init: Box::new(init),
             },
@@ -6624,7 +6694,7 @@ mod tests {
     }
 
     fn u32_array_ty(mutability: Mutability) -> Ty {
-        Ty::Array(ValueTy::Int(IntTy::U32), mutability)
+        Ty::array(Ty::Int(IntTy::U32), mutability)
     }
 
     fn u32_array_literal(values: &[u32]) -> Expr {
@@ -6642,7 +6712,7 @@ mod tests {
     fn u32_array_alloc(len: Expr, init: Expr) -> Expr {
         expression(
             ExprKind::AllocArray {
-                elem: ValueTy::Int(IntTy::U32),
+                elem: Ty::Int(IntTy::U32),
                 len: Box::new(len),
                 init: Box::new(init),
             },
@@ -6925,26 +6995,29 @@ mod tests {
 
         let mut make = function(
             "make",
-            record,
+            record.clone(),
             vec![Stmt::Return {
                 value: Some(pair_literal(
-                    typed_variable("answer", i32_ty),
-                    typed_variable("marker", u64_ty),
+                    typed_variable("answer", i32_ty.clone()),
+                    typed_variable("marker", u64_ty.clone()),
                 )),
                 span: Span::new(0, 1),
             }],
         );
-        make.params = vec![parameter("answer", i32_ty), parameter("marker", u64_ty)];
+        make.params = vec![
+            parameter("answer", i32_ty.clone()),
+            parameter("marker", u64_ty.clone()),
+        ];
 
         let mut project = function(
             "project",
-            i32_ty,
+            i32_ty.clone(),
             vec![
                 Stmt::Decl {
-                    ty: record,
+                    ty: record.clone(),
                     name: "copy".into(),
                     name_span: Span::new(0, 1),
-                    init: Some(typed_variable("pair", record)),
+                    init: Some(typed_variable("pair", record.clone())),
                     mutable: false,
                 },
                 Stmt::Return {
@@ -6953,19 +7026,19 @@ mod tests {
                 },
             ],
         );
-        project.params = vec![parameter("pair", record)];
+        project.params = vec![parameter("pair", record.clone())];
 
         let forward = function(
             "forward",
-            record,
+            record.clone(),
             vec![
                 Stmt::Decl {
-                    ty: record,
+                    ty: record.clone(),
                     name: "result".into(),
                     name_span: Span::new(0, 1),
                     init: Some(pair_literal(
-                        expression(ExprKind::IntLit(0), i32_ty),
-                        expression(ExprKind::IntLit(0), u64_ty),
+                        expression(ExprKind::IntLit(0), i32_ty.clone()),
+                        expression(ExprKind::IntLit(0), u64_ty.clone()),
                     )),
                     mutable: true,
                 },
@@ -6976,10 +7049,10 @@ mod tests {
                         name_span: Span::new(0, 1),
                         value: call_with(
                             "make",
-                            record,
+                            record.clone(),
                             vec![
-                                expression(ExprKind::IntLit(42), i32_ty),
-                                expression(ExprKind::IntLit(7), u64_ty),
+                                expression(ExprKind::IntLit(42), i32_ty.clone()),
+                                expression(ExprKind::IntLit(7), u64_ty.clone()),
                             ],
                         ),
                     }],
@@ -6987,13 +7060,13 @@ mod tests {
                         name: "result".into(),
                         name_span: Span::new(0, 1),
                         value: pair_literal(
-                            expression(ExprKind::IntLit(1), i32_ty),
+                            expression(ExprKind::IntLit(1), i32_ty.clone()),
                             expression(ExprKind::IntLit(2), u64_ty),
                         ),
                     }]),
                 },
                 Stmt::Return {
-                    value: Some(typed_variable("result", record)),
+                    value: Some(typed_variable("result", record.clone())),
                     span: Span::new(0, 1),
                 },
             ],
@@ -7001,13 +7074,13 @@ mod tests {
 
         let consume = function(
             "consume",
-            i32_ty,
+            i32_ty.clone(),
             vec![
                 Stmt::Decl {
-                    ty: record,
+                    ty: record.clone(),
                     name: "value".into(),
                     name_span: Span::new(0, 1),
-                    init: Some(call("forward", record)),
+                    init: Some(call("forward", record.clone())),
                     mutable: false,
                 },
                 Stmt::Return {
@@ -7053,7 +7126,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_record_value_slice_rejects_pointer_fields_and_imported_identity() {
+    fn pod_record_value_rejects_pointer_fields_and_imported_identity() {
         let mut pointer_record = integer_pair_record();
         pointer_record.name = "Node".into();
         pointer_record.fields[0].name = "next".into();
@@ -7062,7 +7135,11 @@ mod tests {
         pointer_program.records.push(pointer_record);
         let pointer_error = emit_program(&pointer_program, 1, &EmitOptions::default()).unwrap_err();
         assert_eq!(pointer_error[0].name, "backend.unsupported");
-        assert!(pointer_error[0].label.contains("integer-only POD values"));
+        assert!(
+            pointer_error[0]
+                .label
+                .contains("only when every field is a concrete integer")
+        );
 
         let mut imported_record = integer_pair_record();
         imported_record.name_span = Span::new(2, 3);
@@ -7161,13 +7238,13 @@ mod tests {
 
     #[test]
     fn affine_options_lower_canonical_local_state_atomic_take_and_conditional_drop() {
-        let affine_bool = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool));
+        let affine_bool = Ty::AffineOption(AffineOptionTy::array(Ty::Bool));
         let subject = function(
             "affine_local",
             Ty::Bool,
             vec![
                 Stmt::Decl {
-                    ty: affine_bool,
+                    ty: affine_bool.clone(),
                     name: "pending".into(),
                     name_span: Span::new(0, 1),
                     init: Some(affine_some_alloc(2, false)),
@@ -7249,12 +7326,12 @@ mod tests {
     #[test]
     fn affine_option_abi_construction_transport_and_take_fences_stay_closed() {
         let affine_bool = affine_bool_option_ty();
-        let affine_integer = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)));
+        let affine_integer = Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)));
         let assert_affine_error = |errors: Vec<BackendError>| {
             assert_eq!(errors[0].name, "backend.affine_option_unsupported");
         };
 
-        for ty in [affine_bool, affine_integer] {
+        for ty in [affine_bool.clone(), affine_integer.clone()] {
             assert_affine_error(
                 emit_program(
                     &program(vec![function("affine_return", ty, Vec::new())]),
@@ -7265,7 +7342,9 @@ mod tests {
             );
         }
         let mut parameterized = function("affine_parameter", Ty::Unit, Vec::new());
-        parameterized.params.push(parameter("pending", affine_bool));
+        parameterized
+            .params
+            .push(parameter("pending", affine_bool.clone()));
         assert_affine_error(
             emit_program(&program(vec![parameterized]), 1, &EmitOptions::default())
                 .expect_err("affine options must not acquire a parameter ABI"),
@@ -7273,28 +7352,28 @@ mod tests {
 
         for invalid in [
             Stmt::Decl {
-                ty: affine_bool,
+                ty: affine_bool.clone(),
                 name: "immutable".into(),
                 name_span: Span::new(0, 1),
                 init: Some(affine_bool_option(ExprKind::NoneE)),
                 mutable: false,
             },
             Stmt::Decl {
-                ty: affine_bool,
+                ty: affine_bool.clone(),
                 name: "missing".into(),
                 name_span: Span::new(0, 1),
                 init: None,
                 mutable: true,
             },
             Stmt::Decl {
-                ty: affine_integer,
+                ty: affine_integer.clone(),
                 name: "nonbool".into(),
                 name_span: Span::new(0, 1),
                 init: Some(expression(ExprKind::NoneE, affine_integer)),
                 mutable: true,
             },
             Stmt::Decl {
-                ty: affine_bool,
+                ty: affine_bool.clone(),
                 name: "literal".into(),
                 name_span: Span::new(0, 1),
                 init: Some(affine_bool_option(ExprKind::SomeE(Box::new(
@@ -7307,7 +7386,7 @@ mod tests {
                 name_span: Span::new(0, 1),
                 init: affine_bool_option(ExprKind::NoneE),
                 mutable: true,
-                ty: Some(affine_bool),
+                ty: Some(affine_bool.clone()),
             },
         ] {
             assert_affine_error(
@@ -7316,7 +7395,7 @@ mod tests {
                     1,
                     &EmitOptions::default(),
                 )
-                .expect_err("forged construction must remain outside the exact local slice"),
+                .expect_err("forged construction must remain outside what the backend lowers"),
             );
         }
 
@@ -7326,7 +7405,7 @@ mod tests {
             .insert(
                 "pending".into(),
                 ValidationLocal {
-                    ty: affine_bool,
+                    ty: affine_bool.clone(),
                     mutable: true,
                 },
                 Span::new(0, 1),
@@ -7336,7 +7415,7 @@ mod tests {
             .insert(
                 "immutable".into(),
                 ValidationLocal {
-                    ty: affine_bool,
+                    ty: affine_bool.clone(),
                     mutable: false,
                 },
                 Span::new(0, 1),
@@ -7389,7 +7468,7 @@ mod tests {
             Ty::Unit,
             vec![
                 Stmt::Decl {
-                    ty: affine_bool,
+                    ty: affine_bool.clone(),
                     name: "pending".into(),
                     name_span: Span::new(0, 1),
                     init: Some(affine_bool_option(ExprKind::NoneE)),
@@ -7423,7 +7502,7 @@ mod tests {
     fn affine_option_cleanups_follow_branch_loop_unsafe_and_return_lifetimes() {
         let affine = affine_bool_option_ty();
         let option_decl = |name: &str, len: u64| Stmt::Decl {
-            ty: affine,
+            ty: affine.clone(),
             name: name.into(),
             name_span: Span::new(0, 1),
             init: Some(affine_some_alloc(len, true)),
@@ -7500,10 +7579,10 @@ mod tests {
 
     #[test]
     fn boolean_option_is_canonical_and_transports_across_cfg_calls_and_locals() {
-        let option = Ty::Option(ValueTy::Bool);
+        let option = Ty::option(Ty::Bool);
         let make_false = function(
             "make_false",
-            option,
+            option.clone(),
             vec![Stmt::Return {
                 value: Some(bool_option(ExprKind::SomeE(Box::new(expression(
                     ExprKind::BoolLit(false),
@@ -7514,10 +7593,10 @@ mod tests {
         );
         let forward = function(
             "forward",
-            option,
+            option.clone(),
             vec![
                 Stmt::Decl {
-                    ty: option,
+                    ty: option.clone(),
                     name: "result".into(),
                     name_span: Span::new(0, 1),
                     init: Some(bool_option(ExprKind::NoneE)),
@@ -7528,7 +7607,7 @@ mod tests {
                     then_block: vec![Stmt::Assign {
                         name: "result".into(),
                         name_span: Span::new(0, 1),
-                        value: call("make_false", option),
+                        value: call("make_false", option.clone()),
                     }],
                     else_block: Some(vec![Stmt::Assign {
                         name: "result".into(),
@@ -7552,7 +7631,7 @@ mod tests {
                 Stmt::VarDecl {
                     name: "value".into(),
                     name_span: Span::new(0, 1),
-                    init: call("forward", option),
+                    init: call("forward", option.clone()),
                     mutable: false,
                     ty: Some(option),
                 },
@@ -7636,8 +7715,8 @@ mod tests {
 
     #[test]
     fn boolean_option_does_not_open_parameters_entries_or_other_payloads() {
-        let option = Ty::Option(ValueTy::Bool);
-        let bool_array = Ty::Array(ValueTy::Bool, crate::ast::Mutability::Owned);
+        let option = Ty::option(Ty::Bool);
+        let bool_array = Ty::array(Ty::Bool, crate::ast::Mutability::Owned);
         let mut parameterized = function(
             "parameterized",
             Ty::Bool,
@@ -7646,7 +7725,7 @@ mod tests {
                 span: Span::new(0, 1),
             }],
         );
-        parameterized.params = vec![parameter("value", option)];
+        parameterized.params = vec![parameter("value", option.clone())];
         let parameter_error =
             emit_program(&program(vec![parameterized]), 1, &EmitOptions::default()).unwrap_err();
         assert_eq!(parameter_error[0].name, "backend.unsupported");
@@ -7675,9 +7754,9 @@ mod tests {
         assert!(array_error[0].label.contains("has no initializer"));
 
         for unsupported_return in [
-            Ty::Option(ValueTy::Int(IntTy::I32)),
-            Ty::Option(ValueTy::Record(0)),
-            Ty::Option(ValueTy::Param(crate::ast::TypeParamId::from_legacy(0))),
+            Ty::option(Ty::Int(IntTy::I32)),
+            Ty::option(Ty::Record(0)),
+            Ty::option(Ty::Param(crate::ast::TypeParamId::from_legacy(0))),
             Ty::OptionRaw(0),
         ] {
             let error = emit_program(
@@ -7709,7 +7788,7 @@ mod tests {
 
         let option_entry = function(
             "option_entry",
-            option,
+            option.clone(),
             vec![Stmt::Return {
                 value: Some(bool_option(ExprKind::NoneE)),
                 span: Span::new(0, 1),
@@ -7748,15 +7827,15 @@ mod tests {
 
         let mut shared_head = function(
             "shared_head",
-            u32_ty,
+            u32_ty.clone(),
             vec![Stmt::Return {
                 value: Some(expression(
                     ExprKind::Index {
                         array: "values".into(),
                         array_span: Span::new(0, 1),
-                        index: Box::new(expression(ExprKind::IntLit(0), u64_ty)),
+                        index: Box::new(expression(ExprKind::IntLit(0), u64_ty.clone())),
                     },
-                    u32_ty,
+                    u32_ty.clone(),
                 )),
                 span: Span::new(0, 1),
             }],
@@ -7765,22 +7844,22 @@ mod tests {
 
         let mut mutate = function(
             "mutate",
-            u32_ty,
+            u32_ty.clone(),
             vec![
                 Stmt::Store {
                     array: "values".into(),
                     array_span: Span::new(0, 1),
-                    index: expression(ExprKind::IntLit(1), u64_ty),
-                    value: typed_variable("replacement", u32_ty),
+                    index: expression(ExprKind::IntLit(1), u64_ty.clone()),
+                    value: typed_variable("replacement", u32_ty.clone()),
                 },
                 Stmt::Return {
                     value: Some(expression(
                         ExprKind::Index {
                             array: "values".into(),
                             array_span: Span::new(0, 1),
-                            index: Box::new(expression(ExprKind::IntLit(1), u64_ty)),
+                            index: Box::new(expression(ExprKind::IntLit(1), u64_ty.clone())),
                         },
-                        u32_ty,
+                        u32_ty.clone(),
                     )),
                     span: Span::new(0, 1),
                 },
@@ -7788,20 +7867,20 @@ mod tests {
         );
         mutate.params = vec![
             parameter("values", mutable),
-            parameter("replacement", u32_ty),
+            parameter("replacement", u32_ty.clone()),
         ];
 
         let mut allocate = function(
             "allocate",
-            u64_ty,
+            u64_ty.clone(),
             vec![
                 Stmt::Decl {
-                    ty: owned,
+                    ty: owned.clone(),
                     name: "values".into(),
                     name_span: Span::new(0, 1),
                     init: Some(u32_array_alloc(
-                        typed_variable("length", u64_ty),
-                        expression(ExprKind::IntLit(17), u32_ty),
+                        typed_variable("length", u64_ty.clone()),
+                        expression(ExprKind::IntLit(17), u32_ty.clone()),
                     )),
                     mutable: false,
                 },
@@ -7810,7 +7889,7 @@ mod tests {
                         ExprKind::Len {
                             array: "values".into(),
                         },
-                        u64_ty,
+                        u64_ty.clone(),
                     )),
                     span: Span::new(0, 1),
                 },
@@ -7820,7 +7899,7 @@ mod tests {
 
         let caller = function(
             "caller",
-            u32_ty,
+            u32_ty.clone(),
             vec![
                 Stmt::Decl {
                     ty: owned,
@@ -7830,15 +7909,15 @@ mod tests {
                     mutable: true,
                 },
                 Stmt::Decl {
-                    ty: u32_ty,
+                    ty: u32_ty.clone(),
                     name: "changed".into(),
                     name_span: Span::new(0, 1),
                     init: Some(call_with(
                         "mutate",
-                        u32_ty,
+                        u32_ty.clone(),
                         vec![
                             u32_array_borrow("values", Mutability::Mut),
-                            expression(ExprKind::IntLit(9), u32_ty),
+                            expression(ExprKind::IntLit(9), u32_ty.clone()),
                         ],
                     )),
                     mutable: false,
@@ -7929,7 +8008,10 @@ mod tests {
                 span: Span::new(0, 1),
             }],
         );
-        sink.params = vec![parameter("left", mutable), parameter("right", shared)];
+        sink.params = vec![
+            parameter("left", mutable.clone()),
+            parameter("right", shared.clone()),
+        ];
 
         let caller_with = |first: Expr, second: Expr, source_mutable: bool| {
             function(
@@ -7937,7 +8019,7 @@ mod tests {
                 Ty::Unit,
                 vec![
                     Stmt::Decl {
-                        ty: owned,
+                        ty: owned.clone(),
                         name: "values".into(),
                         name_span: Span::new(0, 1),
                         init: Some(u32_array_literal(&[1])),
@@ -8038,7 +8120,7 @@ mod tests {
             Ty::Bool,
             vec![
                 Stmt::Decl {
-                    ty: array,
+                    ty: array.clone(),
                     name: "first".into(),
                     name_span: Span::new(0, 1),
                     init: Some(bool_array_literal(&[true, false])),
@@ -8213,8 +8295,13 @@ mod tests {
         );
 
         let subject_symbol = mangle(&subject);
-        let call_marker =
-            |function: &Fn| format!("call {} @{}()", llvm_ty(function.ret), mangle(function));
+        let call_marker = |function: &Fn| {
+            format!(
+                "call {} @{}()",
+                llvm_ty(function.ret.clone()),
+                mangle(function)
+            )
+        };
         let lit_first_call = call_marker(&lit_first);
         let lit_second_call = call_marker(&lit_second);
         let length_call = call_marker(&allocation_length);
@@ -8348,12 +8435,12 @@ mod tests {
                 span: Span::new(0, 1),
             }],
         );
-        parameter_fn.params = vec![parameter("values", array)];
+        parameter_fn.params = vec![parameter("values", array.clone())];
         assert!(emit_program(&program(vec![parameter_fn]), 1, &EmitOptions::default()).is_err());
 
         let returned = function(
             "returned",
-            array,
+            array.clone(),
             vec![Stmt::Return {
                 value: Some(bool_array_literal(&[true])),
                 span: Span::new(0, 1),
@@ -8366,14 +8453,14 @@ mod tests {
             Ty::Unit,
             vec![
                 Stmt::Decl {
-                    ty: array,
+                    ty: array.clone(),
                     name: "source".into(),
                     name_span: Span::new(0, 1),
                     init: Some(bool_array_literal(&[true])),
                     mutable: false,
                 },
                 Stmt::Decl {
-                    ty: array,
+                    ty: array.clone(),
                     name: "dest".into(),
                     name_span: Span::new(0, 1),
                     init: Some(typed_variable("source", array)),
@@ -8447,14 +8534,14 @@ mod tests {
             ExprKind::Binary {
                 op: BinOp::Add,
                 op_span: Span::new(0, 1),
-                lhs: Box::new(expression(ExprKind::IntLit(1), int)),
-                rhs: Box::new(expression(ExprKind::IntLit(2), int)),
+                lhs: Box::new(expression(ExprKind::IntLit(1), int.clone())),
+                rhs: Box::new(expression(ExprKind::IntLit(2), int.clone())),
             },
-            int,
+            int.clone(),
         );
         let f = function(
             "add",
-            int,
+            int.clone(),
             vec![Stmt::Return {
                 value: Some(first_binary),
                 span: Span::new(0, 1),
@@ -8464,10 +8551,10 @@ mod tests {
             ExprKind::Binary {
                 op: BinOp::Add,
                 op_span: Span::new(0, 1),
-                lhs: Box::new(expression(ExprKind::IntLit(3), int)),
-                rhs: Box::new(expression(ExprKind::IntLit(4), int)),
+                lhs: Box::new(expression(ExprKind::IntLit(3), int.clone())),
+                rhs: Box::new(expression(ExprKind::IntLit(4), int.clone())),
             },
-            int,
+            int.clone(),
         );
         let g = function(
             "add_again",
@@ -8528,7 +8615,7 @@ mod tests {
         );
         unrelated.params = vec![parameter(
             "values",
-            Ty::Array(ValueTy::Int(IntTy::I32), crate::ast::Mutability::Shared),
+            Ty::array(Ty::Int(IntTy::I32), crate::ast::Mutability::Shared),
         )];
         let program = program(vec![entry, unrelated]);
 
@@ -8554,7 +8641,7 @@ mod tests {
             Ty::Bool,
             vec![
                 Stmt::Decl {
-                    ty: Ty::Array(ValueTy::Int(IntTy::I32), crate::ast::Mutability::Owned),
+                    ty: Ty::array(Ty::Int(IntTy::I32), crate::ast::Mutability::Owned),
                     name: "values".into(),
                     name_span: Span::new(0, 1),
                     init: None,
@@ -8709,12 +8796,12 @@ mod tests {
         let int = Ty::Int(IntTy::I32);
         let mut choose = function(
             "choose",
-            int,
+            int.clone(),
             vec![
                 Stmt::If {
                     cond: expression(ExprKind::Var("flag".into()), Ty::Bool),
                     then_block: vec![Stmt::Return {
-                        value: Some(expression(ExprKind::IntLit(1), int)),
+                        value: Some(expression(ExprKind::IntLit(1), int.clone())),
                         span: Span::new(0, 1),
                     }],
                     else_block: None,
@@ -8784,7 +8871,7 @@ mod tests {
         let int = Ty::Int(IntTy::I32);
         let mut loop_once = function(
             "loop_once",
-            int,
+            int.clone(),
             vec![
                 Stmt::While {
                     cond: expression(ExprKind::Var("keep_going".into()), Ty::Bool),
@@ -8792,7 +8879,7 @@ mod tests {
                     variant: None,
                     kw_span: Span::new(0, 1),
                     body: vec![Stmt::Return {
-                        value: Some(expression(ExprKind::IntLit(7), int)),
+                        value: Some(expression(ExprKind::IntLit(7), int.clone())),
                         span: Span::new(0, 1),
                     }],
                 },
@@ -9458,8 +9545,8 @@ mod tests {
                     "alias",
                     Ty::Unit,
                     vec![
-                        typed_variable("reference", mutable_reference),
-                        typed_variable("reference", mutable_reference),
+                        typed_variable("reference", mutable_reference.clone()),
+                        typed_variable("reference", mutable_reference.clone()),
                     ],
                 )),
                 Stmt::Return {
@@ -9468,7 +9555,7 @@ mod tests {
                 },
             ],
         );
-        forward.params = vec![parameter("reference", mutable_reference)];
+        forward.params = vec![parameter("reference", mutable_reference.clone())];
         forwarded_alias.fns.push(alias);
         forwarded_alias.fns.push(forward);
         forwarded_alias.fns.push(function(

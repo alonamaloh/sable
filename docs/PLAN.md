@@ -729,8 +729,9 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      paths one fenced representation at a time.
 
      **G1.0 — representation and proof provenance (complete):** declaration
-     parameters now use `Ty::Param(TypeParamId)`, and
-     aggregate payloads use `ValueTy::{Int, Bool, Record, Param}`. This was an
+     parameters now use `Ty::Param(TypeParamId)`, and aggregate payloads carried
+     a narrowed `ValueTy` until ADR 0064 made them full `Ty` values gated per
+     stage. This was an
      internal separation of concerns, not a usable Boolean/POD feature: parser
      and checker acceptance was not widened, and concrete Boolean/record arrays
      and options remained fail-closed. Mono validates every declaration
@@ -1024,15 +1025,18 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      values without widening the existing copy-option family by accident.
 
      **G2.0 — representation/fail-closed foundation (complete):** preserve
-     `Ty::Option(ValueTy)` for copyable payloads
+     `Ty::Option` for copyable payloads
      and represent a conditionally owning array option separately as
-     `Ty::AffineOption(AffineOptionTy::Array(ValueTy))`. The parser accepts
+     `Ty::AffineOption(AffineOptionTy::Array(..))`. The parser accepts
      `option<[T]>` for Boolean, integer, or in-scope type-parameter payloads.
      Monomorphization must validate, substitute, and recheck that identity. The
-     checked representation also has an honest `ValueTy::Record` case, and
+     checked representation also carries a record payload case, and
      module traversal must enforce its nominal visibility for future or
      synthetic checked-AST inputs; the surface parser does not yet construct
-     that case.
+     that case. Since ADR 0064 both payloads are full `Ty` values
+     (`Ty::Option(Box<Ty>)`, `AffineOptionTy::Array(Box<Ty>)`), and deleting
+     `AffineOptionTy` in favour of affinity read off the payload is recorded
+     there as remaining work.
 
      G2.0 deliberately had no construction, accessor, move, destruction,
      proof, interpreter, machine, or native semantics. The checker, VC

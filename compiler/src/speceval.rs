@@ -12,7 +12,7 @@
 //! `match result with | some i => .. | none => ..` idiom, and
 //! `Sable.Seq.perm` (checked as multiset equality).
 
-use crate::ast::{GhostItem, IntTy, ValueTy};
+use crate::ast::{GhostItem, IntTy, Ty};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,7 +26,7 @@ pub enum SpecVal {
     /// for booleans. Clause literals are polymorphic and therefore carry no
     /// payload metadata until a surrounding program value supplies it.
     Opt {
-        payload: Option<ValueTy>,
+        payload: Option<Ty>,
         value: Option<Box<SpecVal>>,
     },
     /// An immutable proof snapshot of an ownership-bearing
@@ -41,14 +41,19 @@ pub enum SpecVal {
 }
 
 impl SpecVal {
-    /// The junk value Lean's `getD default` produces for this payload. Every
-    /// place that needs a typed default reads it here, so admitting a payload
-    /// answers the question once.
-    fn default_of(payload: ValueTy) -> SpecVal {
+    /// The junk value Lean's `getD default` produces for this payload.
+    ///
+    /// This is an allow-list, and it is the one gate in the compiler whose
+    /// failure mode is a wrong answer rather than a loud one: a payload with
+    /// no `Inhabited` instance in Lean has no junk value, and inventing one
+    /// here would make the monitor agree with a `getD default` the proof
+    /// never wrote. A payload not listed has no default, and the clause
+    /// reading it is reported unmonitorable instead.
+    pub(crate) fn default_of(payload: Ty) -> Option<SpecVal> {
         match payload {
-            ValueTy::Int(_) => SpecVal::Int(0),
-            ValueTy::Bool => SpecVal::Bool(false),
-            ValueTy::Record(_) | ValueTy::Param(_) => SpecVal::Obj(HashMap::new()),
+            Ty::Int(_) => Some(SpecVal::Int(0)),
+            Ty::Bool => Some(SpecVal::Bool(false)),
+            _ => None,
         }
     }
 }
@@ -59,12 +64,12 @@ impl SpecVal {
 /// sits beside the elements rather than inside their representation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpecArray {
-    payload: ValueTy,
+    payload: Ty,
     values: Vec<SpecVal>,
 }
 
 impl SpecArray {
-    pub fn new(payload: ValueTy, values: Vec<SpecVal>) -> SpecArray {
+    pub fn new(payload: Ty, values: Vec<SpecVal>) -> SpecArray {
         SpecArray { payload, values }
     }
 
@@ -75,12 +80,29 @@ impl SpecArray {
     /// Lean reads `a.get i` outside the array as `getD default`, so an
     /// out-of-range index produces the payload's junk value rather than a
     /// monitoring failure.
-    fn get_or_default(&self, index: i128) -> SpecVal {
-        usize::try_from(index)
+    fn get_or_default(&self, index: i128) -> EResult<SpecVal> {
+        if let Some(value) = usize::try_from(index)
             .ok()
             .and_then(|index| self.values.get(index).cloned())
-            .unwrap_or_else(|| SpecVal::default_of(self.payload))
+        {
+            return Ok(value);
+        }
+        SpecVal::default_of(self.payload.clone()).ok_or_else(|| no_junk_value(&self.payload))
     }
+}
+
+/// Why a monitored out-of-range read of a `[T]` cannot be answered.
+///
+/// The reason is printed verbatim in `sable test`'s skipped list, so it is
+/// user-facing text and carries a user-facing name.
+pub(crate) fn no_junk_value(payload: &Ty) -> Unmonitorable {
+    Unmonitorable(format!(
+        "monitor.no_junk_value: this clause reads a `[{payload}]` outside its bounds, \
+         and `{payload}` has no junk value the monitor can produce; \
+         constrain the index against the array's `.len` so the clause reads \
+         only elements that exist",
+        payload = payload.name()
+    ))
 }
 
 /// Why a clause could not be checked dynamically.
@@ -826,7 +848,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
             let idx = int(eval(i, env, depth + 1)?)?;
             // Off-range get is typed junk in the model; guards keep real
             // specifications in range.
-            Ok(array.get_or_default(idx))
+            array.get_or_default(idx)
         }
         S::IsSomeE(x) => match eval(x, env, depth + 1)? {
             SpecVal::Opt { value, .. } => Ok(SpecVal::Bool(value.is_some())),
@@ -921,7 +943,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
         S::SomeLit(inner) => {
             let value = eval(inner, env, depth + 1)?;
             let payload = match &value {
-                SpecVal::Bool(_) => Some(ValueTy::Bool),
+                SpecVal::Bool(_) => Some(Ty::Bool),
                 // The proof language erases fixed integer widths to `Int`, so
                 // a standalone `some(1)` has no honest `IntTy` metadata. It
                 // does not need one while present; `.value` returns the value.
@@ -979,7 +1001,7 @@ fn eval(s: &S, env: &SpecEnv, depth: u32) -> EResult<SpecVal> {
                         _ => return Err(Unmonitorable("`.get` on a non-array".into())),
                     };
                     let idx = int(eval(&args[0], env, depth + 1)?)?;
-                    return Ok(arr.get_or_default(idx));
+                    return arr.get_or_default(idx);
                 }
             }
             let Some((params, body)) = env.ghosts.defs.get(name) else {
@@ -1166,16 +1188,17 @@ fn closed_int(s: &S, env: &SpecEnv, depth: u32) -> EResult<i128> {
     int(eval(s, env, depth + 1)?)
 }
 
-fn option_default(payload: Option<ValueTy>) -> EResult<SpecVal> {
+fn option_default(payload: Option<Ty>) -> EResult<SpecVal> {
     match payload {
-        Some(ValueTy::Int(_)) => Ok(SpecVal::Int(0)),
-        Some(ValueTy::Bool) => Ok(SpecVal::Bool(false)),
-        Some(ValueTy::Record(_)) => Err(Unmonitorable(
+        Some(Ty::Int(_)) => Ok(SpecVal::Int(0)),
+        Some(Ty::Bool) => Ok(SpecVal::Bool(false)),
+        Some(Ty::Record(_)) => Err(Unmonitorable(
             "the monitor has no default value for a POD-record option".into(),
         )),
-        Some(ValueTy::Param(_)) => Err(Unmonitorable(
-            "an unresolved option payload reached the dynamic monitor".into(),
-        )),
+        Some(payload) => Err(Unmonitorable(format!(
+            "the monitor has no default value for an `option<{}>`",
+            payload.name()
+        ))),
         None => Err(Unmonitorable(
             "cannot determine the payload type of `none.value`".into(),
         )),
@@ -1226,7 +1249,7 @@ fn spec_eq(a: &SpecVal, b: &SpecVal) -> Option<bool> {
 /// Boolean array are reported as unmonitorable rather than coerced into
 /// comparability.
 fn spec_array_eq(left: &SpecArray, right: &SpecArray) -> Option<bool> {
-    if !comparable_payloads(left.payload, right.payload) {
+    if !comparable_payloads(left.payload.clone(), right.payload.clone()) {
         return None;
     }
     if left.values.len() != right.values.len() {
@@ -1239,10 +1262,10 @@ fn spec_array_eq(left: &SpecArray, right: &SpecArray) -> Option<bool> {
     Some(equal)
 }
 
-fn comparable_payloads(left: ValueTy, right: ValueTy) -> bool {
+fn comparable_payloads(left: Ty, right: Ty) -> bool {
     match (left, right) {
-        (ValueTy::Int(_), ValueTy::Int(_)) | (ValueTy::Bool, ValueTy::Bool) => true,
-        (ValueTy::Record(left), ValueTy::Record(right)) => left == right,
+        (Ty::Int(_), Ty::Int(_)) | (Ty::Bool, Ty::Bool) => true,
+        (Ty::Record(left), Ty::Record(right)) => left == right,
         _ => false,
     }
 }
@@ -1298,7 +1321,7 @@ fn int_array(v: SpecVal, operation: &str) -> EResult<Vec<i128>> {
             "`{operation}` expected a sequence value"
         )));
     };
-    if !matches!(array.payload, ValueTy::Int(_)) {
+    if !matches!(array.payload, Ty::Int(_)) {
         return Err(Unmonitorable(format!(
             "`{operation}` is integer-array-only; `{}` arrays are unsupported",
             array.payload.name()
@@ -1312,7 +1335,7 @@ fn int_array(v: SpecVal, operation: &str) -> EResult<Vec<i128>> {
 #[cfg(test)]
 pub(crate) fn spec_bools(values: &[bool]) -> SpecArray {
     SpecArray::new(
-        ValueTy::Bool,
+        Ty::Bool,
         values.iter().copied().map(SpecVal::Bool).collect(),
     )
 }
@@ -1320,16 +1343,55 @@ pub(crate) fn spec_bools(values: &[bool]) -> SpecArray {
 #[cfg(test)]
 pub(crate) fn spec_ints(payload: IntTy, values: &[i128]) -> SpecArray {
     SpecArray::new(
-        ValueTy::Int(payload),
+        Ty::Int(payload),
         values.iter().copied().map(SpecVal::Int).collect(),
     )
 }
 
 #[cfg(test)]
-mod g1_option_monitor_tests {
+mod option_monitor_tests {
     use super::*;
 
-    fn option(payload: ValueTy, value: Option<SpecVal>) -> SpecVal {
+    /// A payload with no Lean `Inhabited` instance has no junk value, and
+    /// inventing one here would make the monitor agree with a `getD default`
+    /// the proof never wrote. The reason is printed verbatim in `sable test`'s
+    /// skipped list, so it carries a user-facing name and an actionable
+    /// message. No source program reaches it while a monitored array payload
+    /// is an integer or a Boolean, so it is pinned by a unit test with a
+    /// hand-built value rather than by a corpus subject.
+    #[test]
+    fn an_unmonitorable_payload_has_no_default_value() {
+        assert_eq!(
+            SpecVal::default_of(Ty::Int(IntTy::U64)),
+            Some(SpecVal::Int(0))
+        );
+        assert_eq!(SpecVal::default_of(Ty::Bool), Some(SpecVal::Bool(false)));
+        for payload in [
+            Ty::Record(0),
+            Ty::Class(0),
+            Ty::array(Ty::Bool, crate::ast::Mutability::Owned),
+            Ty::option(Ty::Int(IntTy::U64)),
+        ] {
+            assert_eq!(
+                SpecVal::default_of(payload.clone()),
+                None,
+                "`{}` must have no junk value",
+                payload.name()
+            );
+        }
+
+        let array = SpecArray::new(Ty::Record(0), Vec::new());
+        let reason = array
+            .get_or_default(0)
+            .expect_err("an out-of-range read of an unmonitorable payload has no value");
+        assert!(
+            reason.0.starts_with("monitor.no_junk_value:"),
+            "{}",
+            reason.0
+        );
+    }
+
+    fn option(payload: Ty, value: Option<SpecVal>) -> SpecVal {
         SpecVal::Opt {
             payload: Some(payload),
             value: value.map(Box::new),
@@ -1372,8 +1434,8 @@ mod g1_option_monitor_tests {
         let affine_some = SpecVal::AffineOptBoolArray {
             value: Some(spec_bools(&[true])),
         };
-        let typed_none = option(ValueTy::Bool, None);
-        let typed_some = option(ValueTy::Bool, Some(SpecVal::Bool(true)));
+        let typed_none = option(Ty::Bool, None);
+        let typed_some = option(Ty::Bool, Some(SpecVal::Bool(true)));
         let literal_none = SpecVal::Opt {
             payload: None,
             value: None,
@@ -1393,12 +1455,12 @@ mod g1_option_monitor_tests {
     fn typed_none_uses_the_lean_default_for_its_payload() {
         let ghosts = GhostDefs::from_items(&[]);
         let mut vars = HashMap::new();
-        vars.insert("integer".into(), option(ValueTy::Int(IntTy::I32), None));
+        vars.insert("integer".into(), option(Ty::Int(IntTy::I32), None));
         vars.insert(
             "integer_some".into(),
-            option(ValueTy::Int(IntTy::I32), Some(SpecVal::Int(7))),
+            option(Ty::Int(IntTy::I32), Some(SpecVal::Int(7))),
         );
-        vars.insert("boolean".into(), option(ValueTy::Bool, None));
+        vars.insert("boolean".into(), option(Ty::Bool, None));
         let env = SpecEnv {
             vars,
             olds: HashMap::new(),
@@ -1416,10 +1478,7 @@ mod g1_option_monitor_tests {
     fn boolean_some_literals_access_and_match_without_integer_coercion() {
         let ghosts = GhostDefs::from_items(&[]);
         let mut vars = HashMap::new();
-        vars.insert(
-            "o".into(),
-            option(ValueTy::Bool, Some(SpecVal::Bool(false))),
-        );
+        vars.insert("o".into(), option(Ty::Bool, Some(SpecVal::Bool(false))));
         let env = SpecEnv {
             vars,
             olds: HashMap::new(),
@@ -1435,7 +1494,7 @@ mod g1_option_monitor_tests {
     fn unsupported_absent_payload_defaults_fail_closed() {
         let ghosts = GhostDefs::from_items(&[]);
         let mut vars = HashMap::new();
-        vars.insert("record_option".into(), option(ValueTy::Record(0), None));
+        vars.insert("record_option".into(), option(Ty::Record(0), None));
         let env = SpecEnv {
             vars,
             olds: HashMap::new(),
@@ -1487,10 +1546,7 @@ mod g1_option_monitor_tests {
     fn integer_only_sequence_helpers_reject_boolean_arrays_explicitly() {
         let ghosts = GhostDefs::from_items(&[]);
         let mut vars = HashMap::new();
-        vars.insert(
-            "flags".into(),
-            SpecVal::Arr(spec_bools(&[false, true])),
-        );
+        vars.insert("flags".into(), SpecVal::Arr(spec_bools(&[false, true])));
         let env = SpecEnv {
             vars,
             olds: HashMap::new(),

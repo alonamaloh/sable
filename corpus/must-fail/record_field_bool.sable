@@ -1,0 +1,8 @@
+// expect-error: record.field_type
+// A record field states raw-cell geometry, and `bool` has no chosen storage
+// width or byte encoding, so it has no field form. The parser admits the
+// shape and the layout rule owns the refusal.
+
+record Flags #[layout(size := 8, align := 8)] {
+    #[offset(0)] bool ready;
+}

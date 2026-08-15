@@ -1,0 +1,10 @@
+// expect-error: type.option_payload_unsupported
+// The owning option family `option<[T]>` is not itself an option payload:
+// nesting would need a take rule that clears both containers at once.
+// Refused by the parser's admissibility table (ADR 0063), which does not admit
+// the option shape at `TyPos::OptionPayload`, not by `check::option_payload_ty`.
+
+fn nested() -> u64 {
+    option<option<[bool]>> maybe = none;
+    return 0;
+}

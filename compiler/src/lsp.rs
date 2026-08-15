@@ -266,10 +266,10 @@ fn hover(state: &State, id: RequestId, params: HoverParams) -> Response {
     let params_str = f
         .params
         .iter()
-        .map(|p| format!("{} {}", p.ty.name(), p.name))
+        .map(|p| format!("{} {}", p.ty.clone().name(), p.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let ret = match f.ret {
+    let ret = match &f.ret {
         crate::ast::Ty::Unit => String::new(),
         other => format!(" -> {}", other.name()),
     };

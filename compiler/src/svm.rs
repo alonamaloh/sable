@@ -11,11 +11,12 @@
 //! is the one asymmetry: erased here (ghost, design §4) but monitored
 //! by the interpreter, so a diff program's variants must hold.
 
+use crate::ast;
 use crate::ast::*;
 use crate::interp::{MmioEvent, ObservedRun, RtArray, RtVal};
 use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LocalBinding {
     ty: Ty,
     mutable: bool,
@@ -54,10 +55,10 @@ impl<'a> LowerCtx<'a> {
             program,
             locals: HashMap::new(),
             declared: HashSet::new(),
-            return_ty: Some(function.ret),
+            return_ty: Some(function.ret.clone()),
         };
         for parameter in &function.params {
-            ctx.insert_local(&parameter.name, parameter.ty, false, true)?;
+            ctx.insert_local(&parameter.name, parameter.ty.clone(), false, true)?;
         }
         Ok(ctx)
     }
@@ -106,7 +107,7 @@ impl<'a> LowerCtx<'a> {
     }
 
     fn local(&self, name: &str) -> Option<LocalBinding> {
-        self.locals.get(name).copied()
+        self.locals.get(name).cloned()
     }
 }
 
@@ -123,41 +124,22 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
         ));
     }
     for param in &f.params {
-        if matches!(param.ty, Ty::AffineOption(_)) {
-            return Err(affine_option_unsupported(
-                param.ty,
-                &format!("parameter `{}`", param.name),
-            ));
-        }
-        validate_ty_payload(param.ty, &format!("parameter `{}`", param.name))?;
-        if bool_array_ty(param.ty) {
-            return Err(format!(
-                "svm.bool_array_position_unsupported: parameter `{}` is Boolean-array-typed; Boolean arrays are owned locals only",
-                param.name
-            ));
-        }
-        if matches!(param.ty, Ty::Option(_)) {
-            return Err(format!(
-                "svm.option_position_unsupported: parameter `{}` is option-typed; \
-                 ordinary options are returns and locals only",
-                param.name
-            ));
-        }
+        validate_parameter_ty(&param.ty, &format!("parameter `{}`", param.name))?;
     }
     if matches!(f.ret, Ty::AffineOption(_)) {
         return Err(affine_option_unsupported(
-            f.ret,
+            f.ret.clone(),
             &format!("return type of `{}`", f.name),
         ));
     }
-    validate_ty_payload(f.ret, &format!("return type of `{}`", f.name))?;
-    if bool_array_ty(f.ret) {
+    validate_ty_payload(f.ret.clone(), &format!("return type of `{}`", f.name))?;
+    if bool_array_ty(&f.ret.clone()) {
         return Err(format!(
             "svm.bool_array_position_unsupported: `{}` returns a Boolean array; Boolean arrays are owned locals only",
             f.name
         ));
     }
-    if f.ret.is_resource() {
+    if f.ret.clone().is_resource() {
         return Err(format!(
             "svm.resource_return_unsupported: `{}` returns erased authority, which has no SVM value representation",
             f.name
@@ -179,16 +161,56 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
+/// Check every container payload inside a type the machine will lower.
+///
+/// A traversal: exhaustive with no wildcard, so a new `Ty` constructor is a
+/// compile error here rather than a shape that reaches the machine without
+/// any gate seeing it (ADR 0064). Its leaves are the payload gates below,
+/// which are allow-lists and never recurse.
+pub(crate) fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
         Ty::AffineOption(_) => Err(affine_option_unsupported(ty, context)),
-        Ty::Array(payload, _) => validate_array_payload(payload, context),
-        Ty::Option(payload) => validate_option_payload(payload, context),
+        Ty::Array(payload, _) => validate_array_payload(*payload, context),
+        Ty::Option(payload) => validate_option_payload(*payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "svm.type_parameter_unsupported: {context} contains an unresolved type parameter"
         )),
-        _ => Ok(()),
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Class(_)
+        | Ty::ClassRef(..)
+        | Ty::Record(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::ResRef(..)
+        | Ty::Unit => Ok(()),
     }
+}
+
+/// May a parameter carry this type into the formal machine.
+///
+/// A position gate on top of the payload traversal: what a type may contain
+/// and what a call boundary may transport are separate questions, and the
+/// machine answers them separately for the same type.
+pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String> {
+    if matches!(ty, Ty::AffineOption(_)) {
+        return Err(affine_option_unsupported(ty.clone(), context));
+    }
+    validate_ty_payload(ty.clone(), context)?;
+    if bool_array_ty(ty) {
+        return Err(format!(
+            "svm.bool_array_position_unsupported: {context} is Boolean-array-typed; Boolean arrays are owned locals only"
+        ));
+    }
+    if matches!(ty, Ty::Option(_)) {
+        return Err(format!(
+            "svm.option_position_unsupported: {context} is option-typed; \
+             ordinary options are returns and locals only"
+        ));
+    }
+    Ok(())
 }
 
 fn affine_option_unsupported(ty: Ty, context: &str) -> String {
@@ -206,11 +228,11 @@ fn affine_option_take_position(option: &str) -> String {
 }
 
 fn affine_bool_option_ty() -> Ty {
-    Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+    Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
 }
 
-fn is_affine_bool_option(ty: Ty) -> bool {
-    ty == affine_bool_option_ty()
+fn is_affine_bool_option(ty: &Ty) -> bool {
+    *ty == affine_bool_option_ty()
 }
 
 fn reject_named_affine_option(ctx: &LowerCtx<'_>, name: &str, context: &str) -> Result<(), String> {
@@ -222,10 +244,21 @@ fn reject_named_affine_option(ctx: &LowerCtx<'_>, name: &str, context: &str) -> 
     Ok(())
 }
 
-fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String> {
+/// May the formal machine lower an array with this payload, and if so, the
+/// checked type of one element.
+///
+/// A gate: an allow-list ending in a named refusal, which never recurses. The
+/// allow-list is the Rust mirror of `Val.tag?` in `lean/Sable/SVM.lean` — the
+/// machine's element tag is `int | bool`, and this is where that fact is
+/// enforced on the way in.
+///
+/// Validation and lowering are one function on purpose. A separate lowering
+/// beside the validator is a second entry point nothing guards, which is
+/// exactly how a refusal turns into a silent acceptance.
+pub(crate) fn array_element_ty(payload: Ty, context: &str) -> Result<Ty, String> {
     match payload {
-        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        ValueTy::Bool => Ok(()),
+        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
+        Ty::Bool => Ok(Ty::Bool),
         _ => Err(format!(
             "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
              the SVM currently lowers only concrete integer and Boolean payloads",
@@ -234,21 +267,16 @@ fn validate_array_payload(payload: ValueTy, context: &str) -> Result<(), String>
     }
 }
 
-fn array_element_ty(payload: ValueTy, context: &str) -> Result<Ty, String> {
-    validate_array_payload(payload, context)?;
-    match payload {
-        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
-        ValueTy::Bool => Ok(Ty::Bool),
-        _ => unreachable!("validate_array_payload accepted an unsupported payload"),
-    }
+fn validate_array_payload(payload: Ty, context: &str) -> Result<(), String> {
+    array_element_ty(payload, context).map(|_| ())
 }
 
-fn bool_array_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Array(ValueTy::Bool, _))
+fn bool_array_ty(ty: &Ty) -> bool {
+    ty.is_array_of(&Ty::Bool)
 }
 
-fn owned_bool_array_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Array(ValueTy::Bool, Mutability::Owned))
+fn owned_bool_array_ty(ty: &Ty) -> bool {
+    ty.is_owned_array_of(&Ty::Bool)
 }
 
 fn require_expr_annotation(
@@ -257,8 +285,8 @@ fn require_expr_annotation(
     diagnostic: &str,
     context: &str,
 ) -> Result<(), String> {
-    match expr.ty {
-        Some(actual) if actual == expected => Ok(()),
+    match &expr.ty {
+        Some(actual) if *actual == expected => Ok(()),
         Some(actual) => Err(format!(
             "{diagnostic}: {context} is annotated `{}`; expected `{}`",
             actual.name(),
@@ -275,7 +303,7 @@ fn resolve_array(
     ctx: &LowerCtx<'_>,
     array: &str,
     operation: &str,
-) -> Result<(ValueTy, Mutability, bool), String> {
+) -> Result<(Ty, Mutability, bool), String> {
     let binding = ctx.initialized_local(array, operation)?;
     if matches!(binding.ty, Ty::AffineOption(_)) {
         return Err(affine_option_unsupported(
@@ -289,8 +317,8 @@ fn resolve_array(
             binding.ty.name()
         ));
     };
-    validate_array_payload(payload, &format!("{operation} of `{array}`"))?;
-    Ok((payload, mutability, binding.mutable))
+    validate_array_payload((*payload).clone(), &format!("{operation} of `{array}`"))?;
+    Ok((*payload, mutability, binding.mutable))
 }
 
 fn validate_array_index(
@@ -324,14 +352,14 @@ fn validate_array_len(ctx: &LowerCtx<'_>, expr: &Expr, array: &str) -> Result<()
 fn validate_alloc_array(
     ctx: &LowerCtx<'_>,
     expr: &Expr,
-    elem: ValueTy,
+    elem: Ty,
     len: &Expr,
     init: &Expr,
 ) -> Result<(), String> {
-    let element = array_element_ty(elem, "alloc_array")?;
+    let element = array_element_ty(elem.clone(), "alloc_array")?;
     require_expr_annotation(
         expr,
-        Ty::Array(elem, Mutability::Owned),
+        Ty::Array(Box::new(elem), Mutability::Owned),
         "svm.array_alloc_result_type",
         "alloc_array result",
     )?;
@@ -341,8 +369,8 @@ fn validate_alloc_array(
     validate_expr_payloads(ctx, init)
 }
 
-fn validate_array_literal_len(payload: ValueTy, len: usize) -> Result<(), String> {
-    if payload == ValueTy::Bool && len > 50_000_000 {
+fn validate_array_literal_len(payload: Ty, len: usize) -> Result<(), String> {
+    if payload == Ty::Bool && len > 50_000_000 {
         return Err(format!(
             "svm.array_literal_capacity: Boolean array literal has {len} elements; \
              literal expansion is supported only through the SVM allocation cap of 50000000"
@@ -356,7 +384,7 @@ fn validate_array_literal(
     expr: &Expr,
     elements: &[Expr],
 ) -> Result<(), String> {
-    let payload = match expr.ty {
+    let payload = match &expr.ty {
         Some(Ty::Array(payload, Mutability::Owned)) => payload,
         Some(actual) => {
             return Err(format!(
@@ -371,12 +399,12 @@ fn validate_array_literal(
             );
         }
     };
-    let element = array_element_ty(payload, "array literal")?;
-    validate_array_literal_len(payload, elements.len())?;
+    let element = array_element_ty(*payload.clone(), "array literal")?;
+    validate_array_literal_len(*payload.clone(), elements.len())?;
     for (index, value) in elements.iter().enumerate() {
         validate_sink_type(
             ctx,
-            element,
+            element.clone(),
             value,
             &format!("array literal element {}", index + 1),
         )?;
@@ -404,16 +432,16 @@ fn validate_affine_bool_option_initializer(
                     "svm.affine_option_initializer: affine option local `{local}` must be initialized by `none` or `some(alloc_array<bool>(...))`"
                 ));
             };
-            if *elem != ValueTy::Bool {
+            if *elem != Ty::Bool {
                 return Err(format!(
                     "svm.affine_option_payload: affine option local `{local}` wraps `{}`; only a freshly allocated Boolean array is supported",
                     elem.name()
                 ));
             }
-            validate_alloc_array(ctx, payload, *elem, len, init)?;
+            validate_alloc_array(ctx, payload, elem.clone(), len, init)?;
             require_expr_annotation(
                 payload,
-                Ty::Array(ValueTy::Bool, Mutability::Owned),
+                Ty::array(Ty::Bool, Mutability::Owned),
                 "svm.affine_option_payload_type",
                 &format!("payload of affine option `{local}`"),
             )
@@ -431,7 +459,7 @@ fn validate_affine_bool_option_decl(
     mutable: bool,
     initializer: Option<&Expr>,
 ) -> Result<(), String> {
-    if !is_affine_bool_option(ty) {
+    if !is_affine_bool_option(&ty.clone()) {
         return Err(affine_option_unsupported(
             ty,
             &format!("declaration `{local}`"),
@@ -458,7 +486,7 @@ fn validate_affine_option_take(
 ) -> Result<(), String> {
     require_expr_annotation(
         initializer,
-        Ty::Array(ValueTy::Bool, Mutability::Owned),
+        Ty::array(Ty::Bool, Mutability::Owned),
         "svm.affine_option_take_result",
         &format!("`.take` initializer of `{destination}`"),
     )?;
@@ -473,7 +501,7 @@ fn validate_affine_option_take(
         ));
     }
     let source = ctx.initialized_local(option, "affine-option take")?;
-    if !is_affine_bool_option(source.ty) {
+    if !is_affine_bool_option(&source.ty) {
         return if matches!(source.ty, Ty::AffineOption(_)) {
             Err(affine_option_unsupported(
                 source.ty,
@@ -505,7 +533,7 @@ fn validate_fresh_bool_array_initializer(
     initializer: &Expr,
     local: &str,
 ) -> Result<(), String> {
-    if !owned_bool_array_ty(declared_ty) {
+    if !owned_bool_array_ty(&declared_ty.clone()) {
         return Err(format!(
             "svm.bool_array_position_unsupported: local `{local}` has type `{}`; \
              Boolean arrays must be fresh owned locals",
@@ -518,7 +546,7 @@ fn validate_fresh_bool_array_initializer(
             len,
             init: value,
         } => {
-            validate_alloc_array(ctx, initializer, *elem, len, value)?;
+            validate_alloc_array(ctx, initializer, elem.clone(), len, value)?;
         }
         ExprKind::ArrayLit(elements) => validate_array_literal(ctx, initializer, elements)?,
         ExprKind::OptTake { option, .. } => {
@@ -548,7 +576,7 @@ fn validate_array_store(
     if mutability == Mutability::Shared || (mutability == Mutability::Owned && !declared_mutable) {
         return Err(format!(
             "svm.array_store_place: array store targets non-writable `{array}` of type `{}`",
-            Ty::Array(payload, mutability).name()
+            Ty::Array(Box::new(payload), mutability).name()
         ));
     }
     validate_sink_type(ctx, Ty::Int(IntTy::U64), index, "array store index")?;
@@ -578,7 +606,7 @@ fn call_return_ty(ctx: &LowerCtx<'_>, callee: &str) -> Result<Ty, String> {
             "svm.call_target: call target `{callee}` is ambiguous in the executable program"
         ));
     }
-    Ok(function.ret)
+    Ok(function.ret.clone())
 }
 
 /// Recover the type supplied by the expression's checked shape instead of
@@ -589,21 +617,21 @@ fn semantic_expr_ty(
     expected: Ty,
     context: &str,
 ) -> Result<Ty, String> {
-    if let Some(ty @ Ty::AffineOption(_)) = expr.ty {
-        return Err(affine_option_unsupported(ty, context));
+    if let Some(ty @ Ty::AffineOption(_)) = &expr.ty {
+        return Err(affine_option_unsupported(ty.clone(), context));
     }
     let semantic = match &expr.kind {
         ExprKind::Var(name) => {
             let ty = ctx.initialized_local(name, context)?.ty;
-            if bool_array_ty(ty) {
+            if bool_array_ty(&ty.clone()) {
                 return Err(format!(
                     "svm.bool_array_transport_unsupported: {context} moves Boolean array local `{name}`; Boolean arrays may only be accessed by index or length"
                 ));
             }
             ty
         }
-        ExprKind::AllocArray { elem, .. } => Ty::Array(*elem, Mutability::Owned),
-        ExprKind::ArrayLit(_) => match expr.ty {
+        ExprKind::AllocArray { elem, .. } => Ty::Array(Box::new(elem.clone()), Mutability::Owned),
+        ExprKind::ArrayLit(_) => match &expr.ty {
             Some(ty @ Ty::Array(_, Mutability::Owned)) => ty,
             Some(actual) => {
                 return Err(format!(
@@ -616,12 +644,13 @@ fn semantic_expr_ty(
                     "svm.sink_type: {context} is an array literal without a checked type"
                 ));
             }
-        },
+        }
+        .clone(),
         ExprKind::Call { callee, .. } => call_return_ty(ctx, callee)?,
         ExprKind::ResOp { op, args, .. } => semantic_res_op_ty(ctx, *op, args, expected)?,
         ExprKind::RawOp { op, args, .. } => validate_raw_op(ctx, *op, args)?,
         ExprKind::DeviceOp { op, args, .. } => validate_device_op(ctx, *op, args)?,
-        ExprKind::IntLit(value) => match expr.ty {
+        ExprKind::IntLit(value) => match &expr.ty {
             Some(actual @ Ty::Int(integer)) if !matches!(integer, IntTy::TParam(_)) => {
                 if *value < integer.min() || *value > integer.max() {
                     return Err(format!(
@@ -638,7 +667,8 @@ fn semantic_expr_ty(
                     "svm.sink_type: {context} has an integer literal with a non-integer annotation"
                 ));
             }
-        },
+        }
+        .clone(),
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::OptTake { option, .. } => {
             return Err(affine_option_take_position(option));
@@ -652,7 +682,7 @@ fn semantic_expr_ty(
                 let operand_ty = semantic_expr_ty(
                     ctx,
                     operand,
-                    operand.ty.unwrap_or(expected),
+                    operand.ty.clone().unwrap_or(expected),
                     &format!("{context} operand"),
                 )?;
                 match operand_ty {
@@ -680,13 +710,13 @@ fn semantic_expr_ty(
                 let left = semantic_expr_ty(
                     ctx,
                     lhs,
-                    lhs.ty.unwrap_or(expected),
+                    lhs.ty.clone().unwrap_or(expected),
                     &format!("{context} left operand"),
                 )?;
                 let right = semantic_expr_ty(
                     ctx,
                     rhs,
-                    rhs.ty.unwrap_or(left),
+                    rhs.ty.clone().unwrap_or(left.clone()),
                     &format!("{context} right operand"),
                 )?;
                 if left != right || !matches!(left, Ty::Int(_)) {
@@ -708,7 +738,7 @@ fn semantic_expr_ty(
             let source = semantic_expr_ty(
                 ctx,
                 arg,
-                arg.ty.unwrap_or(Ty::Int(*target)),
+                arg.ty.clone().unwrap_or(Ty::Int(*target)),
                 &format!("{context} conversion operand"),
             )?;
             let Ty::Int(source_integer) = source else {
@@ -752,11 +782,11 @@ fn semantic_expr_ty(
                 }
             };
             validate_sink_type(ctx, payload, inner, &format!("{context} option payload"))?;
-            expr.ty.expect("classified option result")
+            expr.ty.clone().expect("classified option result")
         }
         ExprKind::NoneE => {
             svm_option_repr(expr, "none")?;
-            expr.ty.expect("classified option result")
+            expr.ty.clone().expect("classified option result")
         }
         ExprKind::IsSome { operand } => {
             validate_option_accessor(ctx, expr, operand, false)?;
@@ -777,15 +807,15 @@ fn semantic_expr_ty(
                     "svm.sink_type: {context} has an expression shape that cannot produce an array"
                 ));
             }
-            match expr.ty {
-                Some(actual) => actual,
+            match &expr.ty {
+                Some(actual) => actual.clone(),
                 None if expected.is_resource()
                     && matches!(
                         expr.kind,
                         ExprKind::SelfField { .. } | ExprKind::Borrow { .. }
                     ) =>
                 {
-                    expected
+                    expected.clone()
                 }
                 None => {
                     return Err(format!(
@@ -795,8 +825,8 @@ fn semantic_expr_ty(
             }
         }
     };
-    if let Some(annotation) = expr.ty {
-        if annotation != semantic {
+    if let Some(annotation) = &expr.ty {
+        if *annotation != semantic {
             return Err(format!(
                 "svm.sink_type: {context} is semantically `{}` but annotated `{}`",
                 semantic.name(),
@@ -819,18 +849,18 @@ fn validate_local_var(
     operation: &str,
 ) -> Result<LocalBinding, String> {
     let binding = ctx.initialized_local(name, operation)?;
-    if bool_array_ty(binding.ty) {
+    if bool_array_ty(&binding.ty) {
         return Err(format!(
             "svm.bool_array_transport_unsupported: {operation} moves Boolean array local `{name}`; Boolean arrays may only be accessed by index or length"
         ));
     }
-    match expr.ty {
-        Some(annotation) if annotation != binding.ty => Err(format!(
+    match &expr.ty {
+        Some(annotation) if *annotation != binding.ty => Err(format!(
             "svm.local_type: {operation} names `{name}` of type `{}` but is annotated `{}`",
             binding.ty.name(),
             annotation.name()
         )),
-        None if !binding.ty.is_resource() => Err(format!(
+        None if !binding.ty.clone().is_resource() => Err(format!(
             "svm.local_type: {operation} names non-resource `{name}` without a checked type"
         )),
         _ => Ok(binding),
@@ -861,15 +891,17 @@ fn semantic_record_field_ty(
             record.name
         ));
     };
-    if expr.ty != Some(declared_field.ty) {
+    if expr.ty != Some(declared_field.ty.clone()) {
         return Err(format!(
             "svm.record_field_type: `{}.{field}` has type `{}` but is annotated `{}`",
             record.name,
-            declared_field.ty.name(),
-            expr.ty.map_or_else(|| "<missing>".into(), Ty::name)
+            declared_field.ty.clone().name(),
+            expr.ty
+                .clone()
+                .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
         ));
     }
-    Ok(declared_field.ty)
+    Ok(declared_field.ty.clone())
 }
 
 fn validate_record_literal(
@@ -900,7 +932,7 @@ fn validate_record_literal(
     for (argument, field) in args.iter().zip(&record.fields) {
         validate_sink_type(
             ctx,
-            field.ty,
+            field.ty.clone(),
             argument,
             &format!("record literal `{record_name}.{}`", field.name),
         )?;
@@ -914,7 +946,7 @@ fn validate_sink_type(
     value: &Expr,
     context: &str,
 ) -> Result<(), String> {
-    let actual = semantic_expr_ty(ctx, value, expected, context)?;
+    let actual = semantic_expr_ty(ctx, value, expected.clone(), context)?;
     if actual != expected {
         return Err(format!(
             "svm.sink_type: {context} supplies `{}`; destination expects `{}`",
@@ -938,24 +970,24 @@ fn validate_array_rebind(ctx: &LowerCtx<'_>, name: &str) -> Result<(), String> {
 }
 
 fn validate_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
-    let Some(expected) = ctx.return_ty else {
+    let Some(ref expected) = ctx.return_ty else {
         return Err("svm.sink_type: return lowering has no function result type".into());
     };
-    if expected.is_resource() {
+    if expected.clone().is_resource() {
         return Err(
             "svm.resource_return_unsupported: erased authority has no SVM result representation"
                 .into(),
         );
     }
-    validate_sink_type(ctx, expected, value, "return value")
+    validate_sink_type(ctx, expected.clone(), value, "return value")
 }
 
 fn validate_array_exposure(ctx: &LowerCtx<'_>, array: &str, mutable: bool) -> Result<(), String> {
     let (payload, mutability, declared_mutable) = resolve_array(ctx, array, "array exposure")?;
-    if payload != ValueTy::Int(IntTy::U8) {
+    if payload != Ty::Int(IntTy::U8) {
         return Err(format!(
             "svm.array_expose_type: exposure names `{array}` of type `{}`; only byte arrays have SVM exposure semantics",
-            Ty::Array(payload, mutability).name()
+            Ty::Array(Box::new(payload), mutability).name()
         ));
     }
     if mutable
@@ -1020,10 +1052,10 @@ fn validate_allocation_size(ctx: &LowerCtx<'_>, size: &Expr, context: &str) -> R
     Ok(())
 }
 
-fn validate_option_payload(payload: ValueTy, context: &str) -> Result<(), String> {
+fn validate_option_payload(payload: Ty, context: &str) -> Result<(), String> {
     match payload {
-        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        ValueTy::Bool => Ok(()),
+        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        Ty::Bool => Ok(()),
         _ => Err(format!(
             "svm.aggregate_payload_unsupported: {context} has option payload `{}`; \
              the SVM currently lowers only concrete integer and Boolean option payloads",
@@ -1032,9 +1064,9 @@ fn validate_option_payload(payload: ValueTy, context: &str) -> Result<(), String
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum SvmOptionRepr {
-    Ordinary(ValueTy),
+    Ordinary(Ty),
     RawRecord(usize),
     AffineBoolArray,
 }
@@ -1044,14 +1076,14 @@ enum SvmOptionRepr {
 /// annotation here would let a malformed public AST manufacture a value that
 /// the source checker could never produce.
 fn svm_option_repr(expr: &Expr, constructor: &str) -> Result<SvmOptionRepr, String> {
-    match expr.ty {
+    match &expr.ty {
         Some(Ty::Option(payload)) => {
-            validate_option_payload(payload, &format!("`{constructor}` result"))?;
-            Ok(SvmOptionRepr::Ordinary(payload))
+            validate_option_payload(*payload.clone(), &format!("`{constructor}` result"))?;
+            Ok(SvmOptionRepr::Ordinary(*payload.clone()))
         }
-        Some(Ty::OptionRaw(record)) => Ok(SvmOptionRepr::RawRecord(record)),
+        Some(Ty::OptionRaw(record)) => Ok(SvmOptionRepr::RawRecord(*record)),
         Some(ty @ Ty::AffineOption(_)) => Err(affine_option_unsupported(
-            ty,
+            ty.clone(),
             &format!("`{constructor}` result"),
         )),
         Some(ty) => Err(format!(
@@ -1066,10 +1098,13 @@ fn svm_option_repr(expr: &Expr, constructor: &str) -> Result<SvmOptionRepr, Stri
     }
 }
 
-fn ordinary_option_payload_ty(payload: ValueTy) -> Result<Ty, String> {
+/// May the formal machine lower a copyable option with this payload, and if
+/// so, the checked type of the present case. A gate on the same terms as
+/// `array_element_ty`.
+pub(crate) fn ordinary_option_payload_ty(payload: Ty) -> Result<Ty, String> {
     match payload {
-        ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
-        ValueTy::Bool => Ok(Ty::Bool),
+        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
+        Ty::Bool => Ok(Ty::Bool),
         _ => Err(format!(
             "svm.aggregate_payload_unsupported: option constructor has payload `{}`; \
              the SVM currently lowers only concrete integer and Boolean option payloads",
@@ -1081,18 +1116,22 @@ fn ordinary_option_payload_ty(payload: ValueTy) -> Result<Ty, String> {
 fn validate_some_constructor(expr: &Expr, inner: &Expr) -> Result<SvmOptionRepr, String> {
     let repr = svm_option_repr(expr, "some")?;
     let expected = match repr {
-        SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+        SvmOptionRepr::Ordinary(ref payload) => ordinary_option_payload_ty(payload.clone())?,
         SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
         SvmOptionRepr::AffineBoolArray => {
-            unreachable!("general option constructor classification excludes affine options")
+            return Err(
+                "svm.affine_option_unsupported: an ownership-bearing option has no general \
+                 `some` constructor; it is built only as a fresh owned allocation"
+                    .into(),
+            );
         }
     };
-    match inner.ty {
-        Some(actual) if actual == expected => Ok(repr),
+    match &inner.ty {
+        Some(actual) if *actual == expected => Ok(repr),
         Some(actual) => Err(format!(
             "svm.option_constructor_payload: `some(...)` is annotated `{}` but its payload has \
              type `{}`; malformed checked AST",
-            expr.ty.expect("classified option result").name(),
+            expr.ty.clone().expect("classified option result").name(),
             actual.name()
         )),
         None => Err(format!(
@@ -1124,19 +1163,19 @@ fn validate_option_accessor(
     value: bool,
 ) -> Result<SvmOptionRepr, String> {
     let accessor = if value { ".value" } else { ".is_some" };
-    let repr = match operand.ty {
+    let repr = match &operand.ty {
         Some(Ty::Option(payload)) => {
-            validate_option_payload(payload, "option accessor operand")?;
-            SvmOptionRepr::Ordinary(payload)
+            validate_option_payload(*payload.clone(), "option accessor operand")?;
+            SvmOptionRepr::Ordinary(*payload.clone())
         }
-        Some(Ty::OptionRaw(record)) => SvmOptionRepr::RawRecord(record),
+        Some(Ty::OptionRaw(record)) => SvmOptionRepr::RawRecord(*record),
         Some(ty @ Ty::AffineOption(_)) if value => {
             return Err(affine_option_unsupported(
-                ty,
+                ty.clone(),
                 "copying `.value` accessor operand",
             ));
         }
-        Some(ty @ Ty::AffineOption(_)) if is_affine_bool_option(ty) => {
+        Some(ty @ Ty::AffineOption(_)) if is_affine_bool_option(&ty.clone()) => {
             let ExprKind::Var(name) = &operand.kind else {
                 return Err(
                     "svm.affine_option_temporary: `.is_some` requires a named affine-option local"
@@ -1144,7 +1183,7 @@ fn validate_option_accessor(
                 );
             };
             let binding = ctx.initialized_local(name, "affine-option `.is_some`")?;
-            if binding.ty != ty {
+            if binding.ty != *ty {
                 return Err(format!(
                     "svm.local_type: affine-option `.is_some` names `{name}` of type `{}` but its operand is annotated `{}`",
                     binding.ty.name(),
@@ -1160,7 +1199,7 @@ fn validate_option_accessor(
         }
         Some(ty @ Ty::AffineOption(_)) => {
             return Err(affine_option_unsupported(
-                ty,
+                ty.clone(),
                 &format!("`{accessor}` operand"),
             ));
         }
@@ -1180,7 +1219,7 @@ fn validate_option_accessor(
     };
     let expected = if value {
         match repr {
-            SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+            SvmOptionRepr::Ordinary(ref payload) => ordinary_option_payload_ty(payload.clone())?,
             SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
             SvmOptionRepr::AffineBoolArray => {
                 unreachable!("affine options have no copying `.value` accessor")
@@ -1189,8 +1228,8 @@ fn validate_option_accessor(
     } else {
         Ty::Bool
     };
-    match expr.ty {
-        Some(actual) if actual == expected => Ok(repr),
+    match &expr.ty {
+        Some(actual) if *actual == expected => Ok(repr),
         Some(actual) => Err(format!(
             "svm.option_accessor_result: `{accessor}` is annotated `{}`; expected `{}` \
              from its operand type",
@@ -1215,41 +1254,25 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         trait_member: bool,
     ) -> Result<(), String> {
         for parameter in &function.params {
-            if matches!(parameter.ty, Ty::AffineOption(_)) {
-                return Err(affine_option_unsupported(
-                    parameter.ty,
-                    &format!("{context} parameter `{}`", parameter.name),
-                ));
-            }
-            if bool_array_ty(parameter.ty) {
-                return Err(format!(
-                    "svm.bool_array_position_unsupported: {context} parameter `{}` is Boolean-array-typed; Boolean arrays are owned locals only",
-                    parameter.name
-                ));
-            }
-            if let Ty::Option(payload) = parameter.ty {
-                validate_option_payload(payload, context)?;
-                return Err(format!(
-                    "svm.option_position_unsupported: {context} parameter `{}` is option-typed; \
-                     ordinary options are returns and locals only",
-                    parameter.name
-                ));
-            }
+            validate_parameter_ty(
+                &parameter.ty,
+                &format!("{context} parameter `{}`", parameter.name),
+            )?;
         }
         if matches!(function.ret, Ty::AffineOption(_)) {
             return Err(affine_option_unsupported(
-                function.ret,
+                function.ret.clone(),
                 &format!("{context} return type"),
             ));
         }
-        if bool_array_ty(function.ret) {
+        if bool_array_ty(&function.ret.clone()) {
             return Err(format!(
                 "svm.bool_array_position_unsupported: {context} returns a Boolean array; Boolean arrays are owned locals only"
             ));
         }
         if trait_member {
-            if let Ty::Option(payload) = function.ret {
-                validate_option_payload(payload, context)?;
+            if let Ty::Option(payload) = &function.ret {
+                validate_option_payload(*payload.clone(), context)?;
                 return Err(format!(
                     "svm.option_position_unsupported: {context} returns an ordinary option; \
                      trait option returns are not in the SVM model"
@@ -1272,18 +1295,18 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         for field in &class.fields {
             if matches!(field.ty, Ty::AffineOption(_)) {
                 return Err(affine_option_unsupported(
-                    field.ty,
+                    field.ty.clone(),
                     &format!("class `{}.{}` field", class.name, field.name),
                 ));
             }
-            if bool_array_ty(field.ty) {
+            if bool_array_ty(&field.ty.clone()) {
                 return Err(format!(
                     "svm.bool_array_position_unsupported: class `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
                     class.name, field.name
                 ));
             }
-            if let Ty::Option(payload) = field.ty {
-                validate_option_payload(payload, &format!("class `{}`", class.name))?;
+            if let Ty::Option(payload) = &field.ty {
+                validate_option_payload(*payload.clone(), &format!("class `{}`", class.name))?;
                 return Err(format!(
                     "svm.option_position_unsupported: class `{}.{}` has an option-typed field; \
                      option-valued fields are not in the SVM model",
@@ -1321,11 +1344,11 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         for field in &record.fields {
             if matches!(field.ty, Ty::AffineOption(_)) {
                 return Err(affine_option_unsupported(
-                    field.ty,
+                    field.ty.clone(),
                     &format!("record `{}.{}` field", record.name, field.name),
                 ));
             }
-            if bool_array_ty(field.ty) {
+            if bool_array_ty(&field.ty.clone()) {
                 return Err(format!(
                     "svm.bool_array_position_unsupported: record `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
                     record.name, field.name
@@ -1337,17 +1360,13 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                     record.name, field.name
                 ));
             }
-            let field_layout = match field.ty {
-                Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => integer.layout(),
-                Ty::RawRecord(_) | Ty::OptionRaw(_) => StorageLayout { size: 8, align: 8 },
-                unsupported => {
-                    return Err(format!(
-                        "svm.record_schema_type: record `{}.{}` has unsupported field type `{}`",
-                        record.name,
-                        field.name,
-                        unsupported.name()
-                    ));
-                }
+            let Some(field_layout) = field.ty.storage_layout() else {
+                return Err(format!(
+                    "svm.record_schema_type: record `{}.{}` has unsupported field type `{}`",
+                    record.name,
+                    field.name,
+                    field.ty.name()
+                ));
             };
             let Some(end) = field.offset.checked_add(field_layout.size) else {
                 return Err(format!(
@@ -1498,22 +1517,28 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 ..
             } => {
                 if matches!(ty, Ty::AffineOption(_)) {
-                    validate_affine_bool_option_decl(ctx, name, *ty, *mutable, init.as_ref())?;
-                } else if bool_array_ty(*ty) {
+                    validate_affine_bool_option_decl(
+                        ctx,
+                        name,
+                        ty.clone(),
+                        *mutable,
+                        init.as_ref(),
+                    )?;
+                } else if bool_array_ty(&ty.clone()) {
                     let Some(init) = init else {
                         return Err(format!(
                             "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
                         ));
                     };
-                    validate_fresh_bool_array_initializer(ctx, *ty, init, name)?;
+                    validate_fresh_bool_array_initializer(ctx, ty.clone(), init, name)?;
                 } else if let Some(init) = init {
-                    validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
+                    validate_ty_payload(ty.clone(), &format!("declaration `{name}`"))?;
                     validate_expr_payloads(ctx, init)?;
-                    validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+                    validate_sink_type(ctx, ty.clone(), init, &format!("initializer of `{name}`"))?;
                 } else {
-                    validate_ty_payload(*ty, &format!("declaration `{name}`"))?;
+                    validate_ty_payload(ty.clone(), &format!("declaration `{name}`"))?;
                 }
-                ctx.insert_local(name, *ty, *mutable, init.is_some())?;
+                ctx.insert_local(name, ty.clone(), *mutable, init.is_some())?;
             }
             Stmt::Assign { name, value, .. } => {
                 let Some(binding) = ctx.local(name) else {
@@ -1533,7 +1558,12 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                     ));
                 }
                 validate_expr_payloads(ctx, value)?;
-                validate_sink_type(ctx, binding.ty, value, &format!("assignment to `{name}`"))?;
+                validate_sink_type(
+                    ctx,
+                    binding.ty.clone(),
+                    value,
+                    &format!("assignment to `{name}`"),
+                )?;
                 validate_array_rebind(ctx, name)?;
                 ctx.locals
                     .get_mut(name)
@@ -1592,18 +1622,18 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 }
                 if matches!(ty, Ty::AffineOption(_)) {
                     return Err(affine_option_unsupported(
-                        *ty,
+                        ty.clone(),
                         &format!("inferred declaration `{name}`"),
                     ));
                 }
-                validate_ty_payload(*ty, &format!("inferred declaration `{name}`"))?;
-                if bool_array_ty(*ty) {
-                    validate_fresh_bool_array_initializer(ctx, *ty, init, name)?;
+                validate_ty_payload(ty.clone(), &format!("inferred declaration `{name}`"))?;
+                if bool_array_ty(&ty.clone()) {
+                    validate_fresh_bool_array_initializer(ctx, ty.clone(), init, name)?;
                 } else {
                     validate_expr_payloads(ctx, init)?;
-                    validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+                    validate_sink_type(ctx, ty.clone(), init, &format!("initializer of `{name}`"))?;
                 }
-                ctx.insert_local(name, *ty, *mutable, true)?;
+                ctx.insert_local(name, ty.clone(), *mutable, true)?;
             }
             Stmt::VarDecl { name, ty: None, .. } => {
                 return Err(format!(
@@ -1716,19 +1746,19 @@ fn validate_call_signature(
             "svm.call_target: call target `{callee}` is ambiguous in the executable program"
         ));
     }
-    match call.ty {
-        Some(actual) if actual == function.ret => {}
+    match &call.ty {
+        Some(actual) if *actual == function.ret => {}
         Some(actual) => {
             return Err(format!(
                 "svm.call_result_type: call to `{callee}` is annotated `{}`; callee returns `{}`",
                 actual.name(),
-                function.ret.name()
+                function.ret.clone().name()
             ));
         }
         None => {
             return Err(format!(
                 "svm.call_result_type: call to `{callee}` carries no result type; callee returns `{}`",
-                function.ret.name()
+                function.ret.clone().name()
             ));
         }
     }
@@ -1739,11 +1769,11 @@ fn validate_call_signature(
             function.params.len()
         ));
     }
-    if function.ret.is_resource()
+    if function.ret.clone().is_resource()
         || function
             .params
             .iter()
-            .any(|parameter| parameter.ty.is_resource())
+            .any(|parameter| parameter.ty.clone().is_resource())
     {
         return Err(format!(
             "svm.call_resource_unsupported: `{callee}` has resource parameters or result; erased authority has no SVM call ABI"
@@ -1752,7 +1782,7 @@ fn validate_call_signature(
     for (index, (arg, parameter)) in args.iter().zip(&function.params).enumerate() {
         validate_sink_type(
             ctx,
-            parameter.ty,
+            parameter.ty.clone(),
             arg,
             &format!("argument {} to `{callee}`", index + 1),
         )
@@ -1768,9 +1798,9 @@ fn validate_call_signature(
 }
 
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
-    if let Some(ty) = expr.ty {
-        validate_ty_payload(ty, "expression annotation")?;
-        if bool_array_ty(ty)
+    if let Some(ty) = &expr.ty {
+        validate_ty_payload(ty.clone(), "expression annotation")?;
+        if bool_array_ty(&ty.clone())
             && !matches!(
                 &expr.kind,
                 ExprKind::OptTake { .. } | ExprKind::OptValue { .. }
@@ -1788,7 +1818,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             validate_array_index(ctx, expr, array, index)?;
         }
         ExprKind::AllocArray { elem, len, init } => {
-            validate_alloc_array(ctx, expr, *elem, len, init)?;
+            validate_alloc_array(ctx, expr, elem.clone(), len, init)?;
         }
         ExprKind::ArrayLit(elements) => {
             validate_array_literal(ctx, expr, elements)?;
@@ -1806,7 +1836,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             semantic_expr_ty(
                 ctx,
                 expr,
-                expr.ty.unwrap_or(Ty::Int(*target)),
+                expr.ty.clone().unwrap_or(Ty::Int(*target)),
                 "conversion expression",
             )?;
             validate_expr_payloads(ctx, arg)?;
@@ -1843,7 +1873,12 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         }
         ExprKind::SomeE(operand) => {
             validate_some_constructor(expr, operand)?;
-            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "option constructor")?;
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.clone().unwrap_or(Ty::Unit),
+                "option constructor",
+            )?;
             validate_expr_payloads(ctx, operand)?;
         }
         ExprKind::NoneE => {
@@ -1861,7 +1896,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             semantic_expr_ty(
                 ctx,
                 expr,
-                expr.ty.unwrap_or(Ty::Unit),
+                expr.ty.clone().unwrap_or(Ty::Unit),
                 "option value accessor",
             )?;
             validate_expr_payloads(ctx, operand)?;
@@ -1870,11 +1905,21 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             return Err(affine_option_take_position(option));
         }
         ExprKind::Unary { operand, .. } => {
-            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "unary expression")?;
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.clone().unwrap_or(Ty::Unit),
+                "unary expression",
+            )?;
             validate_expr_payloads(ctx, operand)?;
         }
         ExprKind::Binary { lhs, rhs, .. } => {
-            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "binary expression")?;
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.clone().unwrap_or(Ty::Unit),
+                "binary expression",
+            )?;
             validate_expr_payloads(ctx, lhs)?;
             validate_expr_payloads(ctx, rhs)?;
         }
@@ -1882,7 +1927,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             semantic_expr_ty(
                 ctx,
                 expr,
-                expr.ty.unwrap_or(Ty::Unit),
+                expr.ty.clone().unwrap_or(Ty::Unit),
                 "sealed resource expression",
             )?;
             for arg in args {
@@ -1893,7 +1938,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             semantic_expr_ty(
                 ctx,
                 expr,
-                expr.ty.unwrap_or(Ty::Unit),
+                expr.ty.clone().unwrap_or(Ty::Unit),
                 "raw operation expression",
             )?;
             for arg in args {
@@ -1904,7 +1949,7 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             semantic_expr_ty(
                 ctx,
                 expr,
-                expr.ty.unwrap_or(Ty::Unit),
+                expr.ty.clone().unwrap_or(Ty::Unit),
                 "device operation expression",
             )?;
             for arg in args {
@@ -1939,16 +1984,26 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             validate_local_var(ctx, expr, name, "variable expression")?;
         }
         ExprKind::IntLit(_) => {
-            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "integer literal")?;
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.clone().unwrap_or(Ty::Unit),
+                "integer literal",
+            )?;
         }
         ExprKind::BoolLit(_) => {
-            semantic_expr_ty(ctx, expr, expr.ty.unwrap_or(Ty::Unit), "Boolean literal")?;
+            semantic_expr_ty(
+                ctx,
+                expr,
+                expr.ty.clone().unwrap_or(Ty::Unit),
+                "Boolean literal",
+            )?;
         }
         ExprKind::Borrow { array, .. } => {
             reject_named_affine_option(ctx, array, "a borrow source")?;
             if ctx
                 .local(array)
-                .is_some_and(|binding| bool_array_ty(binding.ty))
+                .is_some_and(|binding| bool_array_ty(&binding.ty))
             {
                 return Err(format!(
                     "svm.bool_array_borrow_unsupported: Boolean array local `{array}` cannot be borrowed or transported"
@@ -1975,13 +2030,13 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
         .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
     {
         return Err(affine_option_unsupported(
-            parameter.ty,
+            parameter.ty.clone(),
             &format!("parameter `{}`", parameter.name),
         ));
     }
     if matches!(f.ret, Ty::AffineOption(_)) {
         return Err(affine_option_unsupported(
-            f.ret,
+            f.ret.clone(),
             &format!("return type of `{}`", f.name),
         ));
     }
@@ -2065,9 +2120,10 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             init,
             ..
         } if matches!(ty, Ty::AffineOption(_)) => {
-            validate_affine_bool_option_decl(ctx, name, *ty, *mutable, init.as_ref())?;
-            let lowered = lower_affine_bool_option_bind(ctx, name, *ty, *mutable, init.as_ref())?;
-            ctx.insert_local(name, *ty, *mutable, true)?;
+            validate_affine_bool_option_decl(ctx, name, ty.clone(), *mutable, init.as_ref())?;
+            let lowered =
+                lower_affine_bool_option_bind(ctx, name, ty.clone(), *mutable, init.as_ref())?;
+            ctx.insert_local(name, ty.clone(), *mutable, true)?;
             Some(lowered)
         }
         Stmt::Decl {
@@ -2076,14 +2132,14 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             mutable,
             init,
             ..
-        } if bool_array_ty(*ty) => {
+        } if bool_array_ty(&ty.clone()) => {
             let Some(initializer) = init else {
                 return Err(format!(
                     "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
                 ));
             };
-            let lowered = lower_fresh_bool_array_bind(ctx, name, *ty, initializer)?;
-            ctx.insert_local(name, *ty, *mutable, true)?;
+            let lowered = lower_fresh_bool_array_bind(ctx, name, ty.clone(), initializer)?;
+            ctx.insert_local(name, ty.clone(), *mutable, true)?;
             Some(lowered)
         }
         // A ⊥ slot: the machine conflates "undeclared" with ⊥, and
@@ -2095,7 +2151,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             init: None,
             ..
         } => {
-            ctx.insert_local(name, *ty, *mutable, false)?;
+            ctx.insert_local(name, ty.clone(), *mutable, false)?;
             None
         }
         Stmt::Decl {
@@ -2104,10 +2160,10 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             mutable,
             init: Some(e),
             ..
-        } if ty.is_resource() => {
-            validate_sink_type(ctx, *ty, e, &format!("initializer of `{name}`"))?;
+        } if ty.clone().is_resource() => {
+            validate_sink_type(ctx, ty.clone(), e, &format!("initializer of `{name}`"))?;
             let lowered = lower_erased_resource_bind(ctx, name, e)?;
-            ctx.insert_local(name, *ty, *mutable, true)?;
+            ctx.insert_local(name, ty.clone(), *mutable, true)?;
             lowered
         }
         Stmt::Decl {
@@ -2117,9 +2173,9 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             init: Some(e),
             ..
         } => {
-            validate_sink_type(ctx, *ty, e, &format!("initializer of `{name}`"))?;
+            validate_sink_type(ctx, ty.clone(), e, &format!("initializer of `{name}`"))?;
             let lowered = lower_bind(ctx, name, e)?;
-            ctx.insert_local(name, *ty, *mutable, true)?;
+            ctx.insert_local(name, ty.clone(), *mutable, true)?;
             Some(lowered)
         }
         Stmt::VarDecl {
@@ -2139,7 +2195,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             ..
         } if matches!(ty, Ty::AffineOption(_)) => {
             return Err(affine_option_unsupported(
-                *ty,
+                ty.clone(),
                 &format!("inferred declaration `{name}`"),
             ));
         }
@@ -2149,9 +2205,9 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             ty: Some(ty),
             mutable,
             ..
-        } if bool_array_ty(*ty) => {
-            let lowered = lower_fresh_bool_array_bind(ctx, name, *ty, init)?;
-            ctx.insert_local(name, *ty, *mutable, true)?;
+        } if bool_array_ty(&ty.clone()) => {
+            let lowered = lower_fresh_bool_array_bind(ctx, name, ty.clone(), init)?;
+            ctx.insert_local(name, ty.clone(), *mutable, true)?;
             Some(lowered)
         }
         Stmt::VarDecl {
@@ -2160,10 +2216,10 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             ty: Some(ty),
             mutable,
             ..
-        } if ty.is_resource() => {
-            validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+        } if ty.clone().is_resource() => {
+            validate_sink_type(ctx, ty.clone(), init, &format!("initializer of `{name}`"))?;
             let lowered = lower_erased_resource_bind(ctx, name, init)?;
-            ctx.insert_local(name, *ty, *mutable, true)?;
+            ctx.insert_local(name, ty.clone(), *mutable, true)?;
             lowered
         }
         Stmt::VarDecl {
@@ -2173,9 +2229,9 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             mutable,
             ..
         } => {
-            validate_sink_type(ctx, *ty, init, &format!("initializer of `{name}`"))?;
+            validate_sink_type(ctx, ty.clone(), init, &format!("initializer of `{name}`"))?;
             let lowered = lower_bind(ctx, name, init)?;
-            ctx.insert_local(name, *ty, *mutable, true)?;
+            ctx.insert_local(name, ty.clone(), *mutable, true)?;
             Some(lowered)
         }
         Stmt::VarDecl { name, ty: None, .. } => {
@@ -2300,7 +2356,12 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                     &format!("whole-option assignment to `{name}`"),
                 ));
             }
-            validate_sink_type(ctx, binding.ty, value, &format!("assignment to `{name}`"))?;
+            validate_sink_type(
+                ctx,
+                binding.ty.clone(),
+                value,
+                &format!("assignment to `{name}`"),
+            )?;
             validate_array_rebind(ctx, name)?;
             let lowered = if binding.ty.is_resource() {
                 lower_erased_resource_bind(ctx, name, value)?
@@ -2389,12 +2450,13 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             // representation, so only the pointer and value lower.
             ExprKind::RawOp { op, args, .. } => {
                 let result = validate_raw_op(ctx, *op, args)?;
-                if e.ty != Some(result) {
+                if e.ty != Some(result.clone()) {
                     return Err(format!(
                         "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
                         op.name(),
                         result.name(),
-                        e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                        e.ty.clone()
+                            .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
                     ));
                 }
                 Some(match op {
@@ -2448,12 +2510,13 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             }
             ExprKind::DeviceOp { op, args, .. } => {
                 let result = validate_device_op(ctx, *op, args)?;
-                if e.ty != Some(result) {
+                if e.ty != Some(result.clone()) {
                     return Err(format!(
                         "svm.device_result_type: `{}` produces `{}` but is annotated `{}`",
                         op.name(),
                         result.name(),
-                        e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                        e.ty.clone()
+                            .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
                     ));
                 }
                 Some(match op {
@@ -2470,7 +2533,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                 semantic_expr_ty(
                     ctx,
                     e,
-                    e.ty.unwrap_or(Ty::Unit),
+                    e.ty.clone().unwrap_or(Ty::Unit),
                     "sealed resource expression statement",
                 )?;
                 lower_resource_op_stmt(ctx, *op, args)?
@@ -2529,7 +2592,7 @@ fn resolved_resource_place_ty(
     let actual = match &expr.kind {
         ExprKind::Var(name) => {
             let binding = ctx.initialized_local(name, operation)?;
-            if !binding.ty.is_resource() {
+            if !binding.ty.clone().is_resource() {
                 return Err(format!(
                     "svm.resource_operand_type: {operation} names `{name}` of non-resource type `{}`",
                     binding.ty.name()
@@ -2588,8 +2651,8 @@ fn resolved_resource_place_ty(
             ));
         }
     };
-    if let Some(annotation) = expr.ty {
-        if annotation != actual {
+    if let Some(annotation) = &expr.ty {
+        if *annotation != actual {
             return Err(format!(
                 "svm.resource_operand_type: {operation} is semantically `{}` but annotated `{}`",
                 actual.name(),
@@ -2649,7 +2712,7 @@ fn sealed_resource_operand_types(
             vec![mutable_ref(ResKind::AllocatorState), u64_ty]
         }
         ResOp::AllocatorStepHeader => {
-            vec![mutable_ref(ResKind::AllocatorState), u64_ty, u64_ty]
+            vec![mutable_ref(ResKind::AllocatorState), u64_ty.clone(), u64_ty]
         }
         ResOp::AllocatorPut => vec![
             mutable_ref(ResKind::AllocatorState),
@@ -2705,7 +2768,7 @@ fn validate_sealed_resource_operands(
     let expected = sealed_resource_operand_types(ctx, op, args)?;
     for (index, (arg, expected)) in args.iter().zip(expected).enumerate() {
         let context = format!("`{}` operand {}", op.name(), index + 1);
-        if expected.is_resource() {
+        if expected.clone().is_resource() {
             let actual = resolved_resource_place_ty(ctx, arg, &context)?;
             if actual != expected {
                 return Err(format!(
@@ -2768,7 +2831,7 @@ fn validate_typed_operand(
     expected: Ty,
     context: &str,
 ) -> Result<(), String> {
-    if expected.is_resource() {
+    if expected.clone().is_resource() {
         let actual = resolved_resource_place_ty(ctx, value, context)?;
         if actual != expected {
             return Err(format!(
@@ -2819,12 +2882,12 @@ fn raw_op_signature(ctx: &LowerCtx<'_>, op: RawOp, args: &[Expr]) -> Result<(Vec
     .is_some_and(|kind| matches!(kind, ResKind::BlockLease | ResKind::LeasedPointsToU64));
 
     let signature = match op {
-        RawOp::Offset => (vec![raw, u64_ty], raw),
+        RawOp::Offset => (vec![raw.clone(), u64_ty], raw),
         RawOp::Load8 => (vec![raw, shared(ResKind::RawSpan)], u8_ty),
         RawOp::Store8 => (vec![raw, u8_ty, mutable(ResKind::RawSpan)], Ty::Unit),
         RawOp::Copy => (
             vec![
-                raw,
+                raw.clone(),
                 raw,
                 u64_ty,
                 shared(ResKind::RawSpan),
@@ -2958,7 +3021,7 @@ fn raw_op_signature(ctx: &LowerCtx<'_>, op: RawOp, args: &[Expr]) -> Result<(Vec
             owned(ResKind::FreeBlock),
         ),
         RawOp::HeaderInit => (
-            vec![raw, u64_ty, u64_ty, mutable(ResKind::FreeHeader)],
+            vec![raw, u64_ty.clone(), u64_ty, mutable(ResKind::FreeHeader)],
             Ty::Unit,
         ),
         RawOp::HeaderSize | RawOp::HeaderNext => (vec![raw, shared(ResKind::FreeHeader)], u64_ty),
@@ -3026,14 +3089,14 @@ fn ensure_erased_resource_operands_inert(
 ) -> Result<(), String> {
     let expected = sealed_resource_operand_types(ctx, op, args)?;
     for (index, arg) in args.iter().enumerate() {
-        let expected = expected[index];
+        let expected = expected[index].clone();
         let inert = match &arg.kind {
             // Checked literals are in range and cannot trap.
             ExprKind::IntLit(_) | ExprKind::BoolLit(_) => true,
             // A scalar local read and a checked local resource place are both
             // side-effect-free. Resource variables deliberately may lack a
             // cached annotation, so resolve them through the active context.
-            ExprKind::Var(_) if expected.is_resource() => {
+            ExprKind::Var(_) if expected.clone().is_resource() => {
                 resolved_resource_place_ty(
                     ctx,
                     arg,
@@ -3041,7 +3104,7 @@ fn ensure_erased_resource_operands_inert(
                 )? == expected
             }
             ExprKind::Var(_) => true,
-            ExprKind::Borrow { .. } if expected.is_resource() => {
+            ExprKind::Borrow { .. } if expected.clone().is_resource() => {
                 resolved_resource_place_ty(
                     ctx,
                     arg,
@@ -3231,12 +3294,13 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
         }
         ExprKind::RawOp { op, args, .. } => {
             let result = validate_raw_op(ctx, *op, args)?;
-            if e.ty != Some(result) {
+            if e.ty != Some(result.clone()) {
                 return Err(format!(
                     "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
                     op.name(),
                     result.name(),
-                    e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                    e.ty.clone()
+                        .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
                 ));
             }
             match op {
@@ -3345,12 +3409,13 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
         }
         ExprKind::DeviceOp { op, args, .. } => {
             let result = validate_device_op(ctx, *op, args)?;
-            if e.ty != Some(result) {
+            if e.ty != Some(result.clone()) {
                 return Err(format!(
                     "svm.device_result_type: `{}` produces `{}` but is annotated `{}`",
                     op.name(),
                     result.name(),
-                    e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                    e.ty.clone()
+                        .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
                 ));
             }
             return Err(format!(
@@ -3370,12 +3435,13 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
         }
         ExprKind::RawOp { op, args, .. } => {
             let result = validate_raw_op(ctx, *op, args)?;
-            if e.ty != Some(result) {
+            if e.ty != Some(result.clone()) {
                 return Err(format!(
                     "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
                     op.name(),
                     result.name(),
-                    e.ty.map_or_else(|| "<missing>".into(), Ty::name)
+                    e.ty.clone()
+                        .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
                 ));
             }
             let lowered: Result<Vec<String>, String> =
@@ -3487,7 +3553,7 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
             format!("(.recordField (.var \"{obj}\") \"{field}\")")
         }
         ExprKind::AllocArray { elem, len, init } => {
-            validate_alloc_array(ctx, e, *elem, len, init)?;
+            validate_alloc_array(ctx, e, elem.clone(), len, init)?;
             format!(
                 "(.allocArray {} {})",
                 lower_expr(ctx, len)?,
@@ -3800,13 +3866,13 @@ mod tests {
     fn lowering_rejects_unmodeled_option_payloads() {
         let program = empty_program();
         let unsupported = [
-            ValueTy::Record(0),
-            ValueTy::Param(TypeParamId::from_legacy(0)),
-            ValueTy::Int(IntTy::TParam(0)),
+            Ty::Record(0),
+            Ty::Param(TypeParamId::from_legacy(0)),
+            Ty::Int(IntTy::TParam(0)),
         ];
 
         for payload in unsupported {
-            let function = checked_fn(Ty::Option(payload), Vec::new());
+            let function = checked_fn(Ty::option(payload.clone()), Vec::new());
             let error = lower_fn(&program, &function)
                 .expect_err("an unmodeled option must not inherit recursive SVM lowering");
             assert!(
@@ -3819,12 +3885,12 @@ mod tests {
     #[test]
     fn affine_option_lowering_is_local_atomic_and_fail_closed() {
         let program = empty_program();
-        let affine_bool = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool));
-        let affine_integer = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)));
-        let bool_array = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let affine_bool = Ty::AffineOption(AffineOptionTy::array(Ty::Bool));
+        let affine_integer = Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)));
+        let bool_array = Ty::array(Ty::Bool, Mutability::Owned);
 
-        for ty in [affine_bool, affine_integer] {
-            let error = lower_fn(&program, &checked_fn(ty, Vec::new()))
+        for ty in [affine_bool.clone(), affine_integer.clone()] {
+            let error = lower_fn(&program, &checked_fn(ty.clone(), Vec::new()))
                 .expect_err("an affine option must not inherit ordinary option lowering");
             assert!(
                 error.starts_with("svm.affine_option_unsupported:"),
@@ -3835,7 +3901,7 @@ mod tests {
         let mut parameterized = checked_fn(Ty::Unit, Vec::new());
         parameterized.params.push(Param {
             name: "pending".into(),
-            ty: affine_bool,
+            ty: affine_bool.clone(),
             span: Span::new(0, 0),
             consumes: false,
         });
@@ -3849,10 +3915,10 @@ mod tests {
         let none_local = checked_fn(
             Ty::Unit,
             vec![Stmt::Decl {
-                ty: affine_bool,
+                ty: affine_bool.clone(),
                 name: "pending".into(),
                 name_span: Span::new(0, 0),
-                init: Some(expr(ExprKind::NoneE, affine_bool)),
+                init: Some(expr(ExprKind::NoneE, affine_bool.clone())),
                 mutable: true,
             }],
         );
@@ -3862,11 +3928,11 @@ mod tests {
         );
 
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("pending", affine_bool, true, true)
+        ctx.insert_local("pending", affine_bool.clone(), true, true)
             .unwrap();
         let accessor = expr(
             ExprKind::IsSome {
-                operand: Box::new(expr(ExprKind::Var("pending".into()), affine_bool)),
+                operand: Box::new(expr(ExprKind::Var("pending".into()), affine_bool.clone())),
             },
             Ty::Bool,
         );
@@ -3880,10 +3946,10 @@ mod tests {
                 option: "pending".into(),
                 option_span: Span::new(0, 0),
             },
-            bool_array,
+            bool_array.clone(),
         );
         assert_eq!(
-            lower_fresh_bool_array_bind(&ctx, "bytes", bool_array, &take).unwrap(),
+            lower_fresh_bool_array_bind(&ctx, "bytes", bool_array.clone(), &take).unwrap(),
             "(.optTake \"bytes\" \"pending\")"
         );
         assert!(
@@ -3894,9 +3960,9 @@ mod tests {
 
         let value = expr(
             ExprKind::OptValue {
-                operand: Box::new(expr(ExprKind::Var("pending".into()), affine_bool)),
+                operand: Box::new(expr(ExprKind::Var("pending".into()), affine_bool.clone())),
             },
-            bool_array,
+            bool_array.clone(),
         );
         assert!(
             validate_expr_payloads(&ctx, &value)
@@ -3911,7 +3977,7 @@ mod tests {
                 name_span: Span::new(0, 0),
                 init: take.clone(),
                 mutable: false,
-                ty: Some(bool_array),
+                ty: Some(bool_array.clone()),
             }],
         );
         assert!(
@@ -3987,25 +4053,25 @@ mod tests {
     #[test]
     fn lowering_supports_boolean_option_construction_and_accessors() {
         let program = empty_program();
-        let bool_option = Ty::Option(ValueTy::Bool);
+        let bool_option = Ty::option(Ty::Bool);
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("choice", bool_option, false, true)
+        ctx.insert_local("choice", bool_option.clone(), false, true)
             .unwrap();
 
         let some_false = expr(
             ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
-            bool_option,
+            bool_option.clone(),
         );
         assert_eq!(
             lower_expr(&ctx, &some_false).unwrap(),
             "(.someE (.boolLit false))"
         );
         assert_eq!(
-            lower_expr(&ctx, &expr(ExprKind::NoneE, bool_option)).unwrap(),
+            lower_expr(&ctx, &expr(ExprKind::NoneE, bool_option.clone())).unwrap(),
             "(.noneE)"
         );
 
-        let option_var = || expr(ExprKind::Var("choice".into()), bool_option);
+        let option_var = || expr(ExprKind::Var("choice".into()), bool_option.clone());
         let is_some = expr(
             ExprKind::IsSome {
                 operand: Box::new(option_var()),
@@ -4034,18 +4100,18 @@ mod tests {
         let mut ctx = LowerCtx::bare(&program);
         ctx.insert_local("pointer", Ty::RawRecord(0), false, true)
             .unwrap();
-        let bool_option = Ty::Option(ValueTy::Bool);
+        let bool_option = Ty::option(Ty::Bool);
 
         let wrong_payload = expr(
             ExprKind::SomeE(Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::I32)))),
-            bool_option,
+            bool_option.clone(),
         );
         let nested_payload = expr(
             ExprKind::SomeE(Box::new(expr(
                 ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
-                bool_option,
+                bool_option.clone(),
             ))),
-            bool_option,
+            bool_option.clone(),
         );
         let non_option_result = expr(ExprKind::NoneE, Ty::Bool);
         let missing_result = Expr {
@@ -4059,7 +4125,7 @@ mod tests {
                 span: Span::new(0, 0),
                 ty: None,
             })),
-            bool_option,
+            bool_option.clone(),
         );
 
         for (malformed, diagnostic) in [
@@ -4079,11 +4145,11 @@ mod tests {
 
         let valid_bool = expr(
             ExprKind::SomeE(Box::new(expr(ExprKind::BoolLit(false), Ty::Bool))),
-            bool_option,
+            bool_option.clone(),
         );
         let valid_int = expr(
             ExprKind::SomeE(Box::new(expr(ExprKind::IntLit(7), Ty::Int(IntTy::I32)))),
-            Ty::Option(ValueTy::Int(IntTy::I32)),
+            Ty::option(Ty::Int(IntTy::I32)),
         );
         let valid_none = expr(ExprKind::NoneE, bool_option);
         for valid in [&valid_bool, &valid_int, &valid_none] {
@@ -4102,7 +4168,7 @@ mod tests {
         validate_expr_payloads(&ctx, &expr(ExprKind::NoneE, Ty::OptionRaw(0)))
             .expect("coherent nullable-raw none constructor");
 
-        let unsupported = expr(ExprKind::NoneE, Ty::Option(ValueTy::Record(0)));
+        let unsupported = expr(ExprKind::NoneE, Ty::option(Ty::Record(0)));
         let error = validate_expr_payloads(&ctx, &unsupported)
             .expect_err("record option payloads remain outside the supported subset");
         assert!(
@@ -4114,16 +4180,17 @@ mod tests {
     #[test]
     fn option_accessors_require_coherent_checked_annotations() {
         let program = empty_program();
-        let bool_option = Ty::Option(ValueTy::Bool);
-        let int_option = Ty::Option(ValueTy::Int(IntTy::I32));
+        let bool_option = Ty::option(Ty::Bool);
+        let int_option = Ty::option(Ty::Int(IntTy::I32));
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("choice", bool_option, false, true)
+        ctx.insert_local("choice", bool_option.clone(), false, true)
             .unwrap();
-        ctx.insert_local("number", int_option, false, true).unwrap();
+        ctx.insert_local("number", int_option.clone(), false, true)
+            .unwrap();
         ctx.insert_local("pointer", Ty::OptionRaw(0), false, true)
             .unwrap();
-        let bool_operand = || expr(ExprKind::Var("choice".into()), bool_option);
-        let int_operand = || expr(ExprKind::Var("number".into()), int_option);
+        let bool_operand = || expr(ExprKind::Var("choice".into()), bool_option.clone());
+        let int_operand = || expr(ExprKind::Var("number".into()), int_option.clone());
 
         let wrong_is_some_result = expr(
             ExprKind::IsSome {
@@ -4235,15 +4302,15 @@ mod tests {
     fn canonical_boolean_option_spelling_is_not_integer_or_nested_bool() {
         let program = empty_program();
         let absent = RtVal::Opt {
-            payload: ValueTy::Bool,
+            payload: Ty::Bool,
             value: None,
         };
         let false_value = RtVal::Opt {
-            payload: ValueTy::Bool,
+            payload: Ty::Bool,
             value: Some(Box::new(RtVal::Bool(false))),
         };
         let true_value = RtVal::Opt {
-            payload: ValueTy::Bool,
+            payload: Ty::Bool,
             value: Some(Box::new(RtVal::Bool(true))),
         };
         let affine_none = RtVal::AffineOptBoolArray(None);
@@ -4275,7 +4342,7 @@ mod tests {
         let mut function = checked_fn(Ty::Bool, Vec::new());
         function.params.push(Param {
             name: "choice".into(),
-            ty: Ty::Option(ValueTy::Bool),
+            ty: Ty::option(Ty::Bool),
             span: Span::new(0, 0),
             consumes: false,
         });
@@ -4291,12 +4358,12 @@ mod tests {
     #[test]
     fn lowering_rejects_boolean_arrays_outside_fresh_owned_locals() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
 
         let mut parameter = checked_fn(Ty::Bool, Vec::new());
         parameter.params.push(Param {
             name: "bits".into(),
-            ty: array_ty,
+            ty: array_ty.clone(),
             span: Span::new(0, 0),
             consumes: false,
         });
@@ -4307,7 +4374,7 @@ mod tests {
             "{error}"
         );
 
-        let returned = checked_fn(array_ty, Vec::new());
+        let returned = checked_fn(array_ty.clone(), Vec::new());
         let error =
             lower_fn_entry(&program, &returned).expect_err("Boolean arrays have no SVM result ABI");
         assert!(
@@ -4346,7 +4413,7 @@ mod tests {
     #[test]
     fn lowering_rejects_residual_generic_declarations() {
         let program = empty_program();
-        let mut function = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
+        let mut function = checked_fn(Ty::option(Ty::Bool), Vec::new());
         function.type_params.push("T".into());
         function.type_bounds.push(None);
 
@@ -4379,7 +4446,7 @@ mod tests {
     #[test]
     fn a_normal_calls_require_coherent_executable_signatures() {
         let mut program = empty_program();
-        let mut choose = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
+        let mut choose = checked_fn(Ty::option(Ty::Bool), Vec::new());
         choose.name = "choose".into();
         choose.params.push(Param {
             name: "selector".into(),
@@ -4401,7 +4468,7 @@ mod tests {
         };
         let selector = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32));
 
-        let valid = call(vec![selector()], Some(Ty::Option(ValueTy::Bool)));
+        let valid = call(vec![selector()], Some(Ty::option(Ty::Bool)));
         validate_expr_payloads(&ctx, &valid).expect("checked option-returning call");
         assert_eq!(
             lower_call(&ctx, &Some("choice".into()), &valid).unwrap(),
@@ -4410,10 +4477,10 @@ mod tests {
 
         let wrong_result = call(vec![selector()], Some(Ty::Int(IntTy::I32)));
         let missing_result = call(vec![selector()], None);
-        let wrong_arity = call(Vec::new(), Some(Ty::Option(ValueTy::Bool)));
+        let wrong_arity = call(Vec::new(), Some(Ty::option(Ty::Bool)));
         let wrong_argument = call(
             vec![expr(ExprKind::BoolLit(false), Ty::Bool)],
-            Some(Ty::Option(ValueTy::Bool)),
+            Some(Ty::option(Ty::Bool)),
         );
         let missing_argument = call(
             vec![Expr {
@@ -4421,7 +4488,7 @@ mod tests {
                 span: Span::new(0, 0),
                 ty: None,
             }],
-            Some(Ty::Option(ValueTy::Bool)),
+            Some(Ty::option(Ty::Bool)),
         );
         for (malformed, diagnostic) in [
             (&wrong_result, "svm.call_result_type:"),
@@ -4515,7 +4582,7 @@ mod tests {
             proof_reuse: ProofReuse::None,
             fields: vec![Field {
                 name: "choice".into(),
-                ty: Ty::Option(ValueTy::Bool),
+                ty: Ty::option(Ty::Bool),
                 span: Span::new(0, 0),
                 must_consume: false,
             }],
@@ -4538,7 +4605,7 @@ mod tests {
             name: "Chooser".into(),
             name_span: Span::new(0, 0),
             specs: Vec::new(),
-            methods: vec![checked_fn(Ty::Option(ValueTy::Bool), Vec::new())],
+            methods: vec![checked_fn(Ty::option(Ty::Bool), Vec::new())],
             span: Span::new(0, 0),
         });
         let trait_error = validate_program_option_positions(&trait_program)
@@ -4552,7 +4619,7 @@ mod tests {
     #[test]
     fn lowering_rejects_externs_before_they_can_become_empty_bodies() {
         let program = empty_program();
-        let mut function = checked_fn(Ty::Option(ValueTy::Bool), Vec::new());
+        let mut function = checked_fn(Ty::option(Ty::Bool), Vec::new());
         function.extern_info = Some(ExternInfo {
             abi: "C".into(),
             audit_id: "test-only".into(),
@@ -4569,17 +4636,17 @@ mod tests {
     fn lowering_materializes_fresh_boolean_array_allocations_and_literals() {
         let program = empty_program();
         let ctx = LowerCtx::bare(&program);
-        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
         let allocation = expr(
             ExprKind::AllocArray {
-                elem: ValueTy::Bool,
+                elem: Ty::Bool,
                 len: Box::new(expr(ExprKind::IntLit(3), Ty::Int(IntTy::U64))),
                 init: Box::new(expr(ExprKind::BoolLit(true), Ty::Bool)),
             },
-            array_ty,
+            array_ty.clone(),
         );
         assert_eq!(
-            lower_fresh_bool_array_bind(&ctx, "allocated", array_ty, &allocation).unwrap(),
+            lower_fresh_bool_array_bind(&ctx, "allocated", array_ty.clone(), &allocation).unwrap(),
             "(.assign \"allocated\" (.allocArray (.intLit .u64 3) (.boolLit true)))"
         );
 
@@ -4588,26 +4655,26 @@ mod tests {
                 expr(ExprKind::BoolLit(true), Ty::Bool),
                 expr(ExprKind::BoolLit(false), Ty::Bool),
             ]),
-            array_ty,
+            array_ty.clone(),
         );
         assert_eq!(
-            lower_fresh_bool_array_bind(&ctx, "literal", array_ty, &literal).unwrap(),
+            lower_fresh_bool_array_bind(&ctx, "literal", array_ty.clone(), &literal).unwrap(),
             "(.assign \"_bool_lit_literal_0\" (.boolLit true)), \
              (.assign \"_bool_lit_literal_1\" (.boolLit false)), \
              (.assign \"literal\" (.allocArray (.intLit .u64 2) (.boolLit false))), \
              (.store \"literal\" (.intLit .u64 0) (.var \"_bool_lit_literal_0\")), \
              (.store \"literal\" (.intLit .u64 1) (.var \"_bool_lit_literal_1\"))"
         );
-        let empty = expr(ExprKind::ArrayLit(Vec::new()), array_ty);
+        let empty = expr(ExprKind::ArrayLit(Vec::new()), array_ty.clone());
         assert_eq!(
-            lower_fresh_bool_array_bind(&ctx, "empty", array_ty, &empty).unwrap(),
+            lower_fresh_bool_array_bind(&ctx, "empty", array_ty.clone(), &empty).unwrap(),
             "(.assign \"empty\" (.allocArray (.intLit .u64 0) (.boolLit false)))"
         );
 
-        let error = validate_array_literal_len(ValueTy::Bool, 50_000_001)
+        let error = validate_array_literal_len(Ty::Bool, 50_000_001)
             .expect_err("literal expansion must remain inside the formal allocation cap");
         assert!(error.starts_with("svm.array_literal_capacity:"), "{error}");
-        validate_array_literal_len(ValueTy::Bool, 50_000_000)
+        validate_array_literal_len(Ty::Bool, 50_000_000)
             .expect("the exact formal allocation cap remains lowerable");
 
         let mut forged_ctx = LowerCtx::bare(&program);
@@ -4625,15 +4692,15 @@ mod tests {
     #[test]
     fn boolean_arrays_reject_uninitialized_alias_rebind_borrow_and_exposure() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
         let literal = || {
             expr(
                 ExprKind::ArrayLit(vec![expr(ExprKind::BoolLit(true), Ty::Bool)]),
-                array_ty,
+                array_ty.clone(),
             )
         };
         let declaration = |name: &str, mutable: bool| Stmt::Decl {
-            ty: array_ty,
+            ty: array_ty.clone(),
             name: name.into(),
             name_span: Span::new(0, 0),
             init: Some(literal()),
@@ -4643,7 +4710,7 @@ mod tests {
         let uninitialized = checked_fn(
             Ty::Unit,
             vec![Stmt::Decl {
-                ty: array_ty,
+                ty: array_ty.clone(),
                 name: "bits".into(),
                 name_span: Span::new(0, 0),
                 init: None,
@@ -4659,10 +4726,10 @@ mod tests {
             vec![
                 declaration("source", false),
                 Stmt::Decl {
-                    ty: array_ty,
+                    ty: array_ty.clone(),
                     name: "alias".into(),
                     name_span: Span::new(0, 0),
-                    init: Some(expr(ExprKind::Var("source".into()), array_ty)),
+                    init: Some(expr(ExprKind::Var("source".into()), array_ty.clone())),
                     mutable: false,
                 },
             ],
@@ -4694,7 +4761,8 @@ mod tests {
         );
 
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("bits", array_ty, true, true).unwrap();
+        ctx.insert_local("bits", array_ty.clone(), true, true)
+            .unwrap();
         let borrow = Expr {
             kind: ExprKind::Borrow {
                 array: "bits".into(),
@@ -4738,16 +4806,16 @@ mod tests {
         let program = empty_program();
         let allocation = expr(
             ExprKind::AllocArray {
-                elem: ValueTy::Record(0),
+                elem: Ty::Record(0),
                 len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                 init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
             },
-            Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+            Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
         );
         let function = checked_fn(
             Ty::Unit,
             vec![Stmt::Decl {
-                ty: Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+                ty: Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
                 name: "values".into(),
                 name_span: Span::new(0, 0),
                 init: Some(allocation),
@@ -4779,16 +4847,16 @@ mod tests {
             Ty::Unit,
             vec![
                 Stmt::Decl {
-                    ty: Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+                    ty: Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
                     name: "values".into(),
                     name_span: Span::new(0, 0),
                     init: Some(expr(
                         ExprKind::AllocArray {
-                            elem: ValueTy::Int(IntTy::U8),
+                            elem: Ty::Int(IntTy::U8),
                             len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                             init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
                         },
-                        Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+                        Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
                     )),
                     mutable: false,
                 },
@@ -4814,10 +4882,10 @@ mod tests {
     fn array_constructors_require_coherent_checked_annotations() {
         let program = empty_program();
         let ctx = LowerCtx::bare(&program);
-        let u8_array = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let u8_array = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let allocation = |len: Expr, init: Expr, ty: Option<Ty>| Expr {
             kind: ExprKind::AllocArray {
-                elem: ValueTy::Int(IntTy::U8),
+                elem: Ty::Int(IntTy::U8),
                 len: Box::new(len),
                 init: Box::new(init),
             },
@@ -4827,7 +4895,7 @@ mod tests {
         let length = || expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64));
         let byte = || expr(ExprKind::IntLit(7), Ty::Int(IntTy::U8));
 
-        let valid = allocation(length(), byte(), Some(u8_array));
+        let valid = allocation(length(), byte(), Some(u8_array.clone()));
         validate_expr_payloads(&ctx, &valid).expect("coherent integer allocation preflight");
         assert_eq!(
             lower_expr(&ctx, &valid).unwrap(),
@@ -4839,7 +4907,7 @@ mod tests {
                 allocation(
                     length(),
                     byte(),
-                    Some(Ty::Array(ValueTy::Int(IntTy::I32), Mutability::Owned)),
+                    Some(Ty::array(Ty::Int(IntTy::I32), Mutability::Owned)),
                 ),
                 "svm.array_alloc_result_type:",
             ),
@@ -4851,7 +4919,7 @@ mod tests {
                 allocation(
                     expr(ExprKind::BoolLit(false), Ty::Bool),
                     byte(),
-                    Some(u8_array),
+                    Some(u8_array.clone()),
                 ),
                 "svm.sink_type:",
             ),
@@ -4859,7 +4927,7 @@ mod tests {
                 allocation(
                     length(),
                     expr(ExprKind::IntLit(7), Ty::Int(IntTy::I32)),
-                    Some(u8_array),
+                    Some(u8_array.clone()),
                 ),
                 "svm.sink_type:",
             ),
@@ -4875,7 +4943,7 @@ mod tests {
 
         let literal = expr(
             ExprKind::ArrayLit(vec![byte(), expr(ExprKind::IntLit(8), Ty::Int(IntTy::U8))]),
-            u8_array,
+            u8_array.clone(),
         );
         validate_expr_payloads(&ctx, &literal).expect("coherent integer literal preflight");
         assert_eq!(
@@ -4898,23 +4966,24 @@ mod tests {
     #[test]
     fn array_integer_operands_reject_forged_boolean_annotations() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let forged_bool = |ty| expr(ExprKind::BoolLit(true), ty);
         let length = || expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64));
         let byte = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8));
         let allocation = |len: Expr, init: Expr| {
             expr(
                 ExprKind::AllocArray {
-                    elem: ValueTy::Int(IntTy::U8),
+                    elem: Ty::Int(IntTy::U8),
                     len: Box::new(len),
                     init: Box::new(init),
                 },
-                array_ty,
+                array_ty.clone(),
             )
         };
 
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("bytes", array_ty, true, true).unwrap();
+        ctx.insert_local("bytes", array_ty.clone(), true, true)
+            .unwrap();
         let malformed_exprs = [
             (
                 allocation(forged_bool(Ty::Int(IntTy::U64)), byte()),
@@ -4990,24 +5059,25 @@ mod tests {
     #[test]
     fn boolean_array_operands_require_exact_boolean_types() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("bits", array_ty, true, true).unwrap();
+        ctx.insert_local("bits", array_ty.clone(), true, true)
+            .unwrap();
         let length = || expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64));
         let boolean = || expr(ExprKind::BoolLit(false), Ty::Bool);
 
         let allocation = expr(
             ExprKind::AllocArray {
-                elem: ValueTy::Bool,
+                elem: Ty::Bool,
                 len: Box::new(length()),
                 init: Box::new(boolean()),
             },
-            array_ty,
+            array_ty.clone(),
         );
         validate_alloc_array(
             &ctx,
             &allocation,
-            ValueTy::Bool,
+            Ty::Bool,
             match &allocation.kind {
                 ExprKind::AllocArray { len, .. } => len,
                 _ => unreachable!(),
@@ -5021,7 +5091,7 @@ mod tests {
 
         let bad_allocation = expr(
             ExprKind::AllocArray {
-                elem: ValueTy::Bool,
+                elem: Ty::Bool,
                 len: Box::new(length()),
                 init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
             },
@@ -5030,7 +5100,7 @@ mod tests {
         let ExprKind::AllocArray { len, init, .. } = &bad_allocation.kind else {
             unreachable!()
         };
-        let error = validate_alloc_array(&ctx, &bad_allocation, ValueTy::Bool, len, init)
+        let error = validate_alloc_array(&ctx, &bad_allocation, Ty::Bool, len, init)
             .expect_err("Boolean allocations cannot inherit integer initializers");
         assert!(error.starts_with("svm.sink_type:"), "{error}");
 
@@ -5078,9 +5148,10 @@ mod tests {
     #[test]
     fn boolean_literal_evaluates_trapping_elements_before_allocation() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("source", array_ty, false, true).unwrap();
+        ctx.insert_local("source", array_ty.clone(), false, true)
+            .unwrap();
         let trapping_read = expr(
             ExprKind::Index {
                 array: "source".into(),
@@ -5089,7 +5160,7 @@ mod tests {
             },
             Ty::Bool,
         );
-        let literal = expr(ExprKind::ArrayLit(vec![trapping_read]), array_ty);
+        let literal = expr(ExprKind::ArrayLit(vec![trapping_read]), array_ty.clone());
         let lowered = lower_fresh_bool_array_bind(&ctx, "copy", array_ty, &literal).unwrap();
         let element = lowered
             .find("(.assign \"_bool_lit_copy_0\" (.index \"source\"")
@@ -5106,7 +5177,7 @@ mod tests {
     #[test]
     fn named_array_operations_resolve_their_checked_local_type() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let mut ctx = LowerCtx::bare(&program);
         ctx.insert_local("bytes", array_ty, true, true).unwrap();
         let index_operand = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64));
@@ -5179,14 +5250,14 @@ mod tests {
     #[test]
     fn array_stores_and_bindings_recheck_destination_payloads() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let allocation = expr(
             ExprKind::AllocArray {
-                elem: ValueTy::Int(IntTy::U8),
+                elem: Ty::Int(IntTy::U8),
                 len: Box::new(expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64))),
                 init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
             },
-            array_ty,
+            array_ty.clone(),
         );
         let store = |index: Expr, value: Expr| Stmt::Store {
             array: "bytes".into(),
@@ -5202,7 +5273,7 @@ mod tests {
             Ty::Int(IntTy::U64),
             vec![
                 Stmt::Decl {
-                    ty: array_ty,
+                    ty: array_ty.clone(),
                     name: "bytes".into(),
                     name_span: Span::new(0, 0),
                     init: Some(allocation.clone()),
@@ -5222,7 +5293,8 @@ mod tests {
         );
         lower_fn(&program, &valid_function).expect("existing integer-array lowering remains valid");
         let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("bytes", array_ty, true, true).unwrap();
+        ctx.insert_local("bytes", array_ty.clone(), true, true)
+            .unwrap();
         assert_eq!(
             lower_stmt_erasing(&mut ctx, &valid_store).unwrap(),
             Some("(.store \"bytes\" (.intLit .u64 0) (.intLit .u8 9))".into())
@@ -5254,16 +5326,16 @@ mod tests {
         let mismatched_binding = checked_fn(
             Ty::Unit,
             vec![Stmt::Decl {
-                ty: array_ty,
+                ty: array_ty.clone(),
                 name: "bytes".into(),
                 name_span: Span::new(0, 0),
                 init: Some(expr(
                     ExprKind::AllocArray {
-                        elem: ValueTy::Int(IntTy::I32),
+                        elem: Ty::Int(IntTy::I32),
                         len: Box::new(expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64))),
                         init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
                     },
-                    Ty::Array(ValueTy::Int(IntTy::I32), Mutability::Owned),
+                    Ty::array(Ty::Int(IntTy::I32), Mutability::Owned),
                 )),
                 mutable: false,
             }],
@@ -5274,10 +5346,10 @@ mod tests {
 
         let array_return = |returned_ty: Ty| {
             checked_fn(
-                array_ty,
+                array_ty.clone(),
                 vec![
                     Stmt::Decl {
-                        ty: array_ty,
+                        ty: array_ty.clone(),
                         name: "bytes".into(),
                         name_span: Span::new(0, 0),
                         init: Some(allocation.clone()),
@@ -5290,9 +5362,9 @@ mod tests {
                 ],
             )
         };
-        lower_fn(&program, &array_return(array_ty))
+        lower_fn(&program, &array_return(array_ty.clone()))
             .expect("coherent integer-array return remains lowerable");
-        let wrong_return = array_return(Ty::Array(ValueTy::Int(IntTy::I32), Mutability::Owned));
+        let wrong_return = array_return(Ty::array(Ty::Int(IntTy::I32), Mutability::Owned));
         let error = lower_fn(&program, &wrong_return)
             .expect_err("array result annotations must match the function return type");
         assert!(error.starts_with("svm.local_type:"), "{error}");
@@ -5301,15 +5373,15 @@ mod tests {
     #[test]
     fn array_sinks_reject_forged_scalar_array_crossings() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let allocation = || {
             expr(
                 ExprKind::AllocArray {
-                    elem: ValueTy::Int(IntTy::U8),
+                    elem: Ty::Int(IntTy::U8),
                     len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                     init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
                 },
-                array_ty,
+                array_ty.clone(),
             )
         };
         let rejects = |function: &Fn| {
@@ -5360,7 +5432,7 @@ mod tests {
             Ty::Unit,
             vec![
                 Stmt::Decl {
-                    ty: array_ty,
+                    ty: array_ty.clone(),
                     name: "bytes".into(),
                     name_span: Span::new(0, 0),
                     init: Some(allocation()),
@@ -5387,15 +5459,15 @@ mod tests {
     #[test]
     fn array_places_follow_source_order_and_scopes() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let allocation = || {
             expr(
                 ExprKind::AllocArray {
-                    elem: ValueTy::Int(IntTy::U8),
+                    elem: Ty::Int(IntTy::U8),
                     len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                     init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
                 },
-                array_ty,
+                array_ty.clone(),
             )
         };
         let length_decl = |name: &str, array: &str| Stmt::Decl {
@@ -5411,7 +5483,7 @@ mod tests {
             mutable: false,
         };
         let array_decl = |name: &str| Stmt::Decl {
-            ty: array_ty,
+            ty: array_ty.clone(),
             name: name.into(),
             name_span: Span::new(0, 0),
             init: Some(allocation()),
@@ -5501,14 +5573,14 @@ mod tests {
     #[test]
     fn unsafe_array_local_remains_in_the_enclosing_scope() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let allocation = expr(
             ExprKind::AllocArray {
-                elem: ValueTy::Int(IntTy::U8),
+                elem: Ty::Int(IntTy::U8),
                 len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                 init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
             },
-            array_ty,
+            array_ty.clone(),
         );
         let function = checked_fn(
             Ty::Unit,
@@ -5606,14 +5678,14 @@ mod tests {
                 .contains("uninitialized")
         );
 
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let allocation = expr(
             ExprKind::AllocArray {
-                elem: ValueTy::Int(IntTy::U8),
+                elem: Ty::Int(IntTy::U8),
                 len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                 init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
             },
-            array_ty,
+            array_ty.clone(),
         );
         let expose = Stmt::Expose {
             kw_span: Span::new(0, 0),
@@ -5650,17 +5722,17 @@ mod tests {
     #[test]
     fn exposure_rejects_nested_return_before_generated_cleanup() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let function = checked_fn(
             Ty::Int(IntTy::I32),
             vec![
                 Stmt::Decl {
-                    ty: array_ty,
+                    ty: array_ty.clone(),
                     name: "bytes".into(),
                     name_span: Span::new(0, 0),
                     init: Some(expr(
                         ExprKind::AllocArray {
-                            elem: ValueTy::Int(IntTy::U8),
+                            elem: Ty::Int(IntTy::U8),
                             len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                             init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
                         },
@@ -5697,17 +5769,17 @@ mod tests {
     #[test]
     fn nested_scalar_vars_follow_source_order() {
         let program = empty_program();
-        let array_ty = Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
         let function = checked_fn(
             Ty::Unit,
             vec![
                 Stmt::Decl {
-                    ty: array_ty,
+                    ty: array_ty.clone(),
                     name: "bytes".into(),
                     name_span: Span::new(0, 0),
                     init: Some(expr(
                         ExprKind::AllocArray {
-                            elem: ValueTy::Int(IntTy::U8),
+                            elem: Ty::Int(IntTy::U8),
                             len: Box::new(expr(ExprKind::Var("later".into()), Ty::Int(IntTy::U64))),
                             init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
                         },

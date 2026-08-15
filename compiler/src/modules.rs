@@ -14,7 +14,7 @@
 //! a root file covers the whole import DAG (separate verification with
 //! Lean-level imports is the next slice).
 
-use crate::ast::{Program, UseDecl};
+use crate::ast::{AffineOptionTy, Program, ResKind, Ty, UseDecl};
 use crate::diag::Diagnostic;
 use crate::span::{LineMap, Span};
 use crate::{lexer, parser, scan};
@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy)]
-enum ItemNamespace {
+pub(crate) enum ItemNamespace {
     Runtime,
     Trait,
     Const,
@@ -296,15 +296,77 @@ pub fn load(
     }
 }
 
+fn push_record_ref(
+    index: usize,
+    span: Span,
+    record_externs: &[String],
+    refs: &mut Vec<(ItemNamespace, String, Span)>,
+) {
+    if let Some(name) = record_externs.get(index) {
+        refs.push((ItemNamespace::Runtime, name.clone(), span));
+    }
+}
+
+/// Collect every nominal reference carried by a checked `Ty`.
+///
+/// A traversal: keeping the match exhaustive makes a new type form a
+/// visibility-pass compile error rather than a nominal reference that reaches
+/// the merged program without the visibility rule seeing it.
+pub(crate) fn walk_ty(
+    ty: &Ty,
+    span: Span,
+    externs: &[String],
+    record_externs: &[String],
+    refs: &mut Vec<(ItemNamespace, String, Span)>,
+) {
+    match ty {
+        Ty::Class(index) | Ty::ClassRef(index, _) => {
+            if let Some(name) = externs.get(*index) {
+                refs.push((ItemNamespace::Runtime, name.clone(), span));
+            }
+        }
+        Ty::Record(index) | Ty::RawRecord(index) | Ty::OptionRaw(index) => {
+            push_record_ref(*index, span, record_externs, refs);
+        }
+        Ty::Res(kind) | Ty::ResRef(kind, _) => {
+            let record = match kind {
+                ResKind::PointsToRecord(index) | ResKind::ResourceMapPointsToRecord(index) => {
+                    Some(*index)
+                }
+                ResKind::RawSpan
+                | ResKind::PointsToU64
+                | ResKind::OpenFile
+                | ResKind::PosixWorld
+                | ResKind::Uart
+                | ResKind::SystemDealloc
+                | ResKind::AllocatorState
+                | ResKind::BlockLease
+                | ResKind::LeasedPointsToU64
+                | ResKind::FreeBlock
+                | ResKind::FreeHeader
+                | ResKind::ResourceMapPointsToU64 => None,
+            };
+            if let Some(index) = record {
+                push_record_ref(index, span, record_externs, refs);
+            }
+        }
+        Ty::Array(element, _) | Ty::Option(element) => {
+            walk_ty(element, span, externs, record_externs, refs)
+        }
+        Ty::AffineOption(AffineOptionTy::Array(element)) => {
+            walk_ty(element, span, externs, record_externs, refs)
+        }
+        Ty::Int(_) | Ty::Param(_) | Ty::Bool | Ty::Raw(_) | Ty::Unit => {}
+    }
+}
+
 /// Visibility (ADR 0019): the program language sees its own module
 /// plus the `pub` items of modules it directly imports (a `use` list
 /// restricts further); the proof layer (ghost defs, theorems, clause
 /// text) sees the whole DAG. Enforced on the per-module parses, before
 /// the flat merge erases ownership.
 fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
-    use crate::ast::{
-        AffineOptionTy, Expr, ExprKind, GenericTy, RawOp, ResKind, Stmt, Ty, TypeArg, ValueTy,
-    };
+    use crate::ast::{Expr, ExprKind, GenericTy, RawOp, Stmt, TypeArg};
 
     // Each legal source namespace gets its own global index. Runtime items
     // deliberately share one table; traits and constants do not participate
@@ -429,83 +491,6 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
         }
     }
 
-    fn push_record_ref(
-        index: usize,
-        span: Span,
-        record_externs: &[String],
-        refs: &mut Vec<(ItemNamespace, String, Span)>,
-    ) {
-        if let Some(name) = record_externs.get(index) {
-            refs.push((ItemNamespace::Runtime, name.clone(), span));
-        }
-    }
-
-    /// Collect every nominal reference carried by a storable aggregate
-    /// payload. Keeping this match exhaustive prevents a newly represented
-    /// payload kind from silently bypassing module visibility.
-    fn walk_value_ty(
-        ty: &ValueTy,
-        span: Span,
-        record_externs: &[String],
-        refs: &mut Vec<(ItemNamespace, String, Span)>,
-    ) {
-        match ty {
-            ValueTy::Record(index) => push_record_ref(*index, span, record_externs, refs),
-            ValueTy::Int(_) | ValueTy::Bool | ValueTy::Param(_) => {}
-        }
-    }
-
-    /// Collect every nominal reference carried by a checked `Ty`. Keeping the
-    /// match exhaustive makes a new type form a visibility-pass compile error
-    /// rather than an accidental bypass.
-    fn walk_ty(
-        ty: &Ty,
-        span: Span,
-        externs: &[String],
-        record_externs: &[String],
-        refs: &mut Vec<(ItemNamespace, String, Span)>,
-    ) {
-        match ty {
-            Ty::Class(index) | Ty::ClassRef(index, _) => {
-                if let Some(name) = externs.get(*index) {
-                    refs.push((ItemNamespace::Runtime, name.clone(), span));
-                }
-            }
-            Ty::Record(index) | Ty::RawRecord(index) | Ty::OptionRaw(index) => {
-                push_record_ref(*index, span, record_externs, refs);
-            }
-            Ty::Res(kind) | Ty::ResRef(kind, _) => {
-                let record = match kind {
-                    ResKind::PointsToRecord(index) | ResKind::ResourceMapPointsToRecord(index) => {
-                        Some(*index)
-                    }
-                    ResKind::RawSpan
-                    | ResKind::PointsToU64
-                    | ResKind::OpenFile
-                    | ResKind::PosixWorld
-                    | ResKind::Uart
-                    | ResKind::SystemDealloc
-                    | ResKind::AllocatorState
-                    | ResKind::BlockLease
-                    | ResKind::LeasedPointsToU64
-                    | ResKind::FreeBlock
-                    | ResKind::FreeHeader
-                    | ResKind::ResourceMapPointsToU64 => None,
-                };
-                if let Some(index) = record {
-                    push_record_ref(index, span, record_externs, refs);
-                }
-            }
-            Ty::Array(element, _) | Ty::Option(element) => {
-                walk_value_ty(element, span, record_externs, refs)
-            }
-            Ty::AffineOption(AffineOptionTy::Array(element)) => {
-                walk_value_ty(element, span, record_externs, refs)
-            }
-            Ty::Int(_) | Ty::Param(_) | Ty::Bool | Ty::Raw(_) | Ty::Unit => {}
-        }
-    }
-
     /// Return the nominal record tag carried by a typed raw operation. This is
     /// deliberately exhaustive for the same fail-closed reason as `walk_ty`.
     fn raw_op_record_index(op: RawOp) -> Option<usize> {
@@ -541,12 +526,13 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
         e: &Expr,
         refs: &mut Vec<(ItemNamespace, String, Span)>,
         const_names: &HashMap<&str, (usize, bool)>,
+        externs: &[String],
         record_externs: &[String],
     ) {
         match &e.kind {
             ExprKind::ResOp { args, .. } | ExprKind::DeviceOp { args, .. } => {
                 for a in args {
-                    walk_expr(a, refs, const_names, record_externs);
+                    walk_expr(a, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::RawOp { op, op_span, args } => {
@@ -554,7 +540,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     push_record_ref(index, *op_span, record_externs, refs);
                 }
                 for a in args {
-                    walk_expr(a, refs, const_names, record_externs);
+                    walk_expr(a, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::Call {
@@ -566,7 +552,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 refs.push((ItemNamespace::Runtime, callee.clone(), *callee_span));
                 walk_type_args(type_args, refs);
                 for a in args {
-                    walk_expr(a, refs, const_names, record_externs);
+                    walk_expr(a, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::CtorCall {
@@ -579,7 +565,7 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 refs.push((ItemNamespace::Runtime, class.clone(), *class_span));
                 walk_type_args(type_args, refs);
                 for a in args {
-                    walk_expr(a, refs, const_names, record_externs);
+                    walk_expr(a, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::RecordLit {
@@ -589,12 +575,12 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             } => {
                 refs.push((ItemNamespace::Runtime, record.clone(), *record_span));
                 for a in args {
-                    walk_expr(a, refs, const_names, record_externs);
+                    walk_expr(a, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::MethodCall { args, .. } | ExprKind::TraitCall { args, .. } => {
                 for a in args {
-                    walk_expr(a, refs, const_names, record_externs);
+                    walk_expr(a, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::Var(name) => {
@@ -605,34 +591,34 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 }
             }
             ExprKind::Unary { operand, .. } => {
-                walk_expr(operand, refs, const_names, record_externs)
+                walk_expr(operand, refs, const_names, externs, record_externs)
             }
             ExprKind::Binary { lhs, rhs, .. } => {
-                walk_expr(lhs, refs, const_names, record_externs);
-                walk_expr(rhs, refs, const_names, record_externs);
+                walk_expr(lhs, refs, const_names, externs, record_externs);
+                walk_expr(rhs, refs, const_names, externs, record_externs);
             }
             ExprKind::Index { index, .. }
             | ExprKind::ClassFieldIndex { index, .. }
             | ExprKind::SelfFieldIndex { index, .. } => {
-                walk_expr(index, refs, const_names, record_externs)
+                walk_expr(index, refs, const_names, externs, record_externs)
             }
             ExprKind::Widen { arg, .. } | ExprKind::Narrow { arg, .. } => {
-                walk_expr(arg, refs, const_names, record_externs)
+                walk_expr(arg, refs, const_names, externs, record_externs)
             }
             ExprKind::IsSome { operand } | ExprKind::OptValue { operand } => {
-                walk_expr(operand, refs, const_names, record_externs)
+                walk_expr(operand, refs, const_names, externs, record_externs)
             }
             ExprKind::OptTake { .. } => {}
-            ExprKind::SomeE(inner) => walk_expr(inner, refs, const_names, record_externs),
+            ExprKind::SomeE(inner) => walk_expr(inner, refs, const_names, externs, record_externs),
             ExprKind::ArrayLit(elems) => {
                 for el in elems {
-                    walk_expr(el, refs, const_names, record_externs);
+                    walk_expr(el, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::AllocArray { elem, len, init } => {
-                walk_value_ty(elem, e.span, record_externs, refs);
-                walk_expr(len, refs, const_names, record_externs);
-                walk_expr(init, refs, const_names, record_externs);
+                walk_ty(elem, e.span, externs, record_externs, refs);
+                walk_expr(len, refs, const_names, externs, record_externs);
+                walk_expr(init, refs, const_names, externs, record_externs);
             }
             ExprKind::IntLit(_)
             | ExprKind::BoolLit(_)
@@ -664,10 +650,12 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                 } => {
                     walk_ty(ty, *name_span, externs, record_externs, refs);
                     if let Some(e) = init {
-                        walk_expr(e, refs, const_names, record_externs);
+                        walk_expr(e, refs, const_names, externs, record_externs);
                     }
                 }
-                Stmt::Assign { value, .. } => walk_expr(value, refs, const_names, record_externs),
+                Stmt::Assign { value, .. } => {
+                    walk_expr(value, refs, const_names, externs, record_externs)
+                }
                 Stmt::VarDecl {
                     init,
                     ty,
@@ -677,32 +665,32 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     if let Some(ty) = ty {
                         walk_ty(ty, *name_span, externs, record_externs, refs);
                     }
-                    walk_expr(init, refs, const_names, record_externs);
+                    walk_expr(init, refs, const_names, externs, record_externs);
                 }
-                Stmt::ExprStmt(e) => walk_expr(e, refs, const_names, record_externs),
+                Stmt::ExprStmt(e) => walk_expr(e, refs, const_names, externs, record_externs),
                 Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
-                    walk_expr(size, refs, const_names, record_externs)
+                    walk_expr(size, refs, const_names, externs, record_externs)
                 }
                 Stmt::SystemDealloc {
                     ptr, res, release, ..
                 } => {
-                    walk_expr(ptr, refs, const_names, record_externs);
-                    walk_expr(res, refs, const_names, record_externs);
-                    walk_expr(release, refs, const_names, record_externs);
+                    walk_expr(ptr, refs, const_names, externs, record_externs);
+                    walk_expr(res, refs, const_names, externs, record_externs);
+                    walk_expr(release, refs, const_names, externs, record_externs);
                 }
                 Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
                     walk_stmts(body, refs, const_names, externs, record_externs)
                 }
                 Stmt::FieldAssign { value, .. } => {
-                    walk_expr(value, refs, const_names, record_externs)
+                    walk_expr(value, refs, const_names, externs, record_externs)
                 }
                 Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
-                    walk_expr(index, refs, const_names, record_externs);
-                    walk_expr(value, refs, const_names, record_externs);
+                    walk_expr(index, refs, const_names, externs, record_externs);
+                    walk_expr(value, refs, const_names, externs, record_externs);
                 }
                 Stmt::Return { value, .. } => {
                     if let Some(e) = value {
-                        walk_expr(e, refs, const_names, record_externs);
+                        walk_expr(e, refs, const_names, externs, record_externs);
                     }
                 }
                 Stmt::If {
@@ -710,14 +698,14 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                     then_block,
                     else_block,
                 } => {
-                    walk_expr(cond, refs, const_names, record_externs);
+                    walk_expr(cond, refs, const_names, externs, record_externs);
                     walk_stmts(then_block, refs, const_names, externs, record_externs);
                     if let Some(eb) = else_block {
                         walk_stmts(eb, refs, const_names, externs, record_externs);
                     }
                 }
                 Stmt::While { cond, body, .. } => {
-                    walk_expr(cond, refs, const_names, record_externs);
+                    walk_expr(cond, refs, const_names, externs, record_externs);
                     walk_stmts(body, refs, const_names, externs, record_externs);
                 }
                 Stmt::Assert(_) => {}
@@ -1220,7 +1208,7 @@ fn collision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{AffineOptionTy, ExprKind, Mutability, Stmt, Ty, ValueTy};
+    use crate::ast::{ExprKind, Mutability, Stmt, Ty};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1317,8 +1305,7 @@ mod tests {
                     .iter_mut()
                     .find(|function| function.name == "aggregate")
                     .expect("aggregate function exists");
-                function.params[0].ty =
-                    Ty::Array(ValueTy::Record(record_index), Mutability::Shared);
+                function.params[0].ty = Ty::array(Ty::Record(record_index), Mutability::Shared);
             }
             AggregateRecordSite::OptionReturn => {
                 let function = root
@@ -1326,7 +1313,7 @@ mod tests {
                     .iter_mut()
                     .find(|function| function.name == "aggregate")
                     .expect("aggregate function exists");
-                function.ret = Ty::Option(ValueTy::Record(record_index));
+                function.ret = Ty::option(Ty::Record(record_index));
             }
             AggregateRecordSite::AffineOptionReturn => {
                 let function = root
@@ -1334,8 +1321,7 @@ mod tests {
                     .iter_mut()
                     .find(|function| function.name == "aggregate")
                     .expect("aggregate function exists");
-                function.ret =
-                    Ty::AffineOption(AffineOptionTy::Array(ValueTy::Record(record_index)));
+                function.ret = Ty::affine_array_option(Ty::Record(record_index));
             }
             AggregateRecordSite::InferredAffineOptionLocal => {
                 let function = root
@@ -1352,9 +1338,7 @@ mod tests {
                         span: function.name_span,
                         ty: None,
                     },
-                    ty: Some(Ty::AffineOption(AffineOptionTy::Array(ValueTy::Record(
-                        record_index,
-                    )))),
+                    ty: Some(Ty::affine_array_option(Ty::Record(record_index))),
                 });
             }
             AggregateRecordSite::AllocationElement => {
@@ -1377,7 +1361,7 @@ mod tests {
                 let ExprKind::AllocArray { elem, .. } = &mut expression.kind else {
                     panic!("initializer is an array allocation");
                 };
-                *elem = ValueTy::Record(record_index);
+                *elem = Ty::Record(record_index);
             }
         }
     }

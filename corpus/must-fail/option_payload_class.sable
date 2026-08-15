@@ -1,0 +1,21 @@
+// expect-error: type.option_payload_unsupported
+// A class is owned by one name at a time, and a copyable option duplicates
+// its payload whenever it is duplicated, so a class has no payload form here.
+// Refused by the parser's admissibility table (ADR 0063), which does not admit
+// the class shape at `TyPos::OptionPayload`, not by `check::option_payload_ty`;
+// `option_payload_record.sable` is the subject that reaches the checker gate.
+
+class Box {
+    u64 v;
+
+    /// invariant v <= 100
+
+    init make() {
+        self.v = 0;
+    }
+}
+
+fn boxed() -> u64 {
+    option<Box> maybe = none;
+    return 0;
+}

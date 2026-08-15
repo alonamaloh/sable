@@ -1560,14 +1560,7 @@ impl<'a> Parser<'a> {
             // value spelling reaches it.
             P::RecordField => matches!(
                 shape,
-                S::Int
-                    | S::Bool
-                    | S::Param
-                    | S::Record
-                    | S::Class
-                    | S::Array
-                    | S::Option
-                    | S::Raw
+                S::Int | S::Bool | S::Param | S::Record | S::Class | S::Array | S::Option | S::Raw
             ),
             // A raw pointer or a record in a class field would need a field
             // layout and a copy rule that no downstream gate states, so this
@@ -1576,10 +1569,10 @@ impl<'a> Parser<'a> {
                 shape,
                 S::Int | S::Bool | S::Param | S::Class | S::Array | S::Option | S::Resource
             ),
-            // `ValueTy` holds exactly these; `type.array_payload_unsupported`
+            // `Ty` holds exactly these; `type.array_payload_unsupported`
             // decides which of them the checker gives semantics to.
             P::ArrayElement => matches!(shape, S::Int | S::Bool | S::Param | S::Record),
-            // The copyable payloads `ValueTy` holds, plus the two spellings
+            // The copyable payloads `Ty` holds, plus the two spellings
             // that name an owning option family — `option<[T]>` and
             // `option<raw<Record>>`. `type.option_payload_unsupported` and
             // the affine-option boundary decide the rest.
@@ -1642,7 +1635,11 @@ impl<'a> Parser<'a> {
     fn unrepresentable(&self, ty: &Ty, pos: TyPos, span: Span) -> Diagnostic {
         Diagnostic {
             name: pos.gate_name().into(),
-            title: format!("`{}` is not admitted as {}", ty.name(), pos.describe()),
+            title: format!(
+                "`{}` is not admitted as {}",
+                ty.clone().name(),
+                pos.describe()
+            ),
             span,
             label: format!("expected {}", Self::admitted_spellings(pos)),
             notes: vec![],
@@ -1689,7 +1686,7 @@ impl<'a> Parser<'a> {
             TypeSyntaxKind::Array(element) => {
                 self.check_admits(TypeShape::Array, pos, syntax.span)?;
                 Ok(Ty::Array(
-                    self.lower_value_ty(element, TyPos::ArrayElement)?,
+                    Box::new(self.lower_type(element, TyPos::ArrayElement)?),
                     Mutability::Owned,
                 ))
             }
@@ -1770,7 +1767,11 @@ impl<'a> Parser<'a> {
                 TypeParamId::new(index).expect("type_param_list enforces the parameter ceiling"),
             ));
         }
-        if let Some(class) = self.class_names.iter().position(|candidate| candidate == name) {
+        if let Some(class) = self
+            .class_names
+            .iter()
+            .position(|candidate| candidate == name)
+        {
             self.check_admits(TypeShape::Class, pos, span)?;
             no_args("parse.nongeneric_class_type_args")?;
             return Ok(Ty::Class(class));
@@ -1848,13 +1849,13 @@ impl<'a> Parser<'a> {
         }
         if let TypeSyntaxKind::Array(element) = &payload.kind {
             self.check_admits(TypeShape::Array, TyPos::OptionPayload, payload.span)?;
-            return Ok(Ty::AffineOption(AffineOptionTy::Array(
-                self.lower_value_ty(element, TyPos::ArrayElement)?,
-            )));
+            return Ok(Ty::AffineOption(AffineOptionTy::Array(Box::new(
+                self.lower_type(element, TyPos::ArrayElement)?,
+            ))));
         }
-        Ok(Ty::Option(
-            self.lower_value_ty(payload, TyPos::OptionPayload)?,
-        ))
+        Ok(Ty::Option(Box::new(
+            self.lower_type(payload, TyPos::OptionPayload)?,
+        )))
     }
 
     /// The resource kinds the compiler defines. `resource` is a lexer
@@ -1988,12 +1989,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn map_type_error(
-        &self,
-        span: Span,
-        label: &str,
-        notes: Vec<(String, String)>,
-    ) -> Diagnostic {
+    fn map_type_error(&self, span: Span, label: &str, notes: Vec<(String, String)>) -> Diagnostic {
         Diagnostic {
             name: "resource.map_type".into(),
             title: "this `ResourceMap` value type is not supported yet".into(),
@@ -2019,19 +2015,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `ValueTy` is the payload representation shared by arrays and copyable
-    /// options; the positions that use it admit exactly the shapes it holds,
-    /// plus the two payload spellings `lower_option_type` takes for itself.
-    fn lower_value_ty(&self, syntax: &TypeSyntax, pos: TyPos) -> PResult<ValueTy> {
-        match self.lower_type(syntax, pos)? {
-            Ty::Int(integer) => Ok(ValueTy::Int(integer)),
-            Ty::Bool => Ok(ValueTy::Bool),
-            Ty::Param(parameter) => Ok(ValueTy::Param(parameter)),
-            Ty::Record(record) => Ok(ValueTy::Record(record)),
-            other => Err(self.unrepresentable(&other, pos, syntax.span)),
-        }
-    }
-
     /// The positions that name a machine integer width. A retained template
     /// parameter keeps its abstract integer binder (ADR 0009).
     fn lower_int_ty(&self, syntax: &TypeSyntax, pos: TyPos) -> PResult<IntTy> {
@@ -2053,15 +2036,6 @@ impl<'a> Parser<'a> {
         let mut budget = TypeBudget::default();
         let syntax = self.parse_type_syntax_at(&mut index, 1, &mut budget)?;
         let lowered = self.lower_type(&syntax, pos)?;
-        self.pos = index;
-        Ok((lowered, syntax.span))
-    }
-
-    fn value_ty(&mut self, pos: TyPos) -> PResult<(ValueTy, Span)> {
-        let mut index = self.pos;
-        let mut budget = TypeBudget::default();
-        let syntax = self.parse_type_syntax_at(&mut index, 1, &mut budget)?;
-        let lowered = self.lower_value_ty(&syntax, pos)?;
         self.pos = index;
         Ok((lowered, syntax.span))
     }
@@ -3607,7 +3581,7 @@ impl<'a> Parser<'a> {
                         })
                         .collect();
                     self.pending.push(Stmt::Decl {
-                        ty: Ty::Array(ValueTy::Int(IntTy::U8), Mutability::Owned),
+                        ty: Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
                         name: temp.clone(),
                         name_span: lit_span,
                         init: Some(Expr {
@@ -4380,7 +4354,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(name) if name == "alloc_array" => {
                 self.bump();
                 self.expect(Tok::Lt)?;
-                let (elem, _) = self.value_ty(TyPos::ArrayElement)?;
+                let (elem, _) = self.ty(TyPos::ArrayElement)?;
                 self.expect(Tok::Gt)?;
                 self.expect(Tok::LParen)?;
                 let len = self.expr()?;
@@ -5148,10 +5122,7 @@ mod generic_type_arg_tests {
         let at_limit = vec!["i32"; MAX_TYPE_ARGS].join(", ");
         let source = format!("fn limit() -> i32 {{ return id<{at_limit}>(0); }}\n");
         let program = parse_source(&source).unwrap();
-        assert_eq!(
-            return_type_args(&program.fns[0]).len(),
-            MAX_TYPE_ARGS
-        );
+        assert_eq!(return_type_args(&program.fns[0]).len(), MAX_TYPE_ARGS);
 
         let mut outer = vec!["i32"; MAX_TYPE_ARGS];
         outer.push("u8");
@@ -5248,10 +5219,10 @@ fn plumbing<T>(&[T] input, T value) -> option<T> {
 
         assert_eq!(
             function.params[0].ty,
-            Ty::Array(ValueTy::Param(parameter), Mutability::Shared)
+            Ty::array(Ty::Param(parameter), Mutability::Shared)
         );
         assert_eq!(function.params[1].ty, Ty::Param(parameter));
-        assert_eq!(function.ret, Ty::Option(ValueTy::Param(parameter)));
+        assert_eq!(function.ret, Ty::option(Ty::Param(parameter)));
 
         let Stmt::Decl {
             ty,
@@ -5261,11 +5232,11 @@ fn plumbing<T>(&[T] input, T value) -> option<T> {
         else {
             panic!("expected the owned array declaration");
         };
-        assert_eq!(*ty, Ty::Array(ValueTy::Param(parameter), Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Param(parameter), Mutability::Owned));
         let ExprKind::AllocArray { elem, .. } = &initializer.kind else {
             panic!("expected alloc_array initializer");
         };
-        assert_eq!(*elem, ValueTy::Param(parameter));
+        assert_eq!(*elem, Ty::Param(parameter));
     }
 
     #[test]
@@ -5279,7 +5250,7 @@ fn choose(i32 value) -> option<bool> {
 "#;
         let program = parse_source(source).unwrap();
         let function = &program.fns[0];
-        assert_eq!(function.ret, Ty::Option(ValueTy::Bool));
+        assert_eq!(function.ret, Ty::option(Ty::Bool));
 
         let Stmt::Decl {
             ty,
@@ -5290,7 +5261,7 @@ fn choose(i32 value) -> option<bool> {
         else {
             panic!("expected the explicit option local");
         };
-        assert_eq!(*ty, Ty::Option(ValueTy::Bool));
+        assert_eq!(*ty, Ty::option(Ty::Bool));
         assert!(*mutable);
         assert!(matches!(&initializer.kind, ExprKind::NoneE));
 
@@ -5330,14 +5301,14 @@ fn generic<T>(option<[T]> input) -> option<[T]> {
         let surface = &program.fns[0];
         assert_eq!(
             surface.params[0].ty,
-            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool))
+            Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
         );
-        assert_eq!(surface.params[1].ty, Ty::Option(ValueTy::Bool));
+        assert_eq!(surface.params[1].ty, Ty::option(Ty::Bool));
         assert_eq!(surface.params[2].ty, Ty::OptionRaw(0));
         assert_eq!(surface.params[0].ty.name(), "option<[bool]>");
         assert_eq!(
             surface.ret,
-            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)))
+            Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)))
         );
 
         let Stmt::Decl {
@@ -5349,7 +5320,7 @@ fn generic<T>(option<[T]> input) -> option<[T]> {
         else {
             panic!("expected the explicit affine-option local");
         };
-        assert_eq!(*ty, Ty::AffineOption(AffineOptionTy::Array(ValueTy::Bool)));
+        assert_eq!(*ty, Ty::AffineOption(AffineOptionTy::array(Ty::Bool)));
         assert!(*mutable);
         assert!(matches!(&initializer.kind, ExprKind::NoneE));
 
@@ -5357,11 +5328,11 @@ fn generic<T>(option<[T]> input) -> option<[T]> {
         let generic = &program.fns[1];
         assert_eq!(
             generic.params[0].ty,
-            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)))
+            Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)))
         );
         assert_eq!(
             generic.ret,
-            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)))
+            Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)))
         );
     }
 
@@ -5383,7 +5354,7 @@ fn consume(u64 count) {
         else {
             panic!("expected the owned array declaration");
         };
-        assert_eq!(*ty, Ty::Array(ValueTy::Bool, Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Bool, Mutability::Owned));
         let ExprKind::OptTake {
             option,
             option_span,
@@ -5450,7 +5421,7 @@ fn surface(&[bool] input) {
         let function = &program.fns[0];
         assert_eq!(
             function.params[0].ty,
-            Ty::Array(ValueTy::Bool, Mutability::Shared)
+            Ty::array(Ty::Bool, Mutability::Shared)
         );
 
         let Stmt::Decl {
@@ -5462,7 +5433,7 @@ fn surface(&[bool] input) {
         else {
             panic!("expected an explicit Boolean-array local");
         };
-        assert_eq!(*ty, Ty::Array(ValueTy::Bool, Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Bool, Mutability::Owned));
         assert!(*mutable);
         assert!(matches!(&initializer.kind, ExprKind::ArrayLit(_)));
 
@@ -5476,7 +5447,7 @@ fn surface(&[bool] input) {
         let ExprKind::AllocArray { elem, .. } = &init.kind else {
             panic!("expected alloc_array initializer");
         };
-        assert_eq!(*elem, ValueTy::Bool);
+        assert_eq!(*elem, Ty::Bool);
 
         let Stmt::Store { value, .. } = &function.body[2] else {
             panic!("expected a Boolean-array element store");
@@ -5502,7 +5473,7 @@ fn unsupported() -> option<Pair> {
 }
 "#;
         let program = parse_source(source).unwrap();
-        assert_eq!(program.fns[0].ret, Ty::Option(ValueTy::Record(0)));
+        assert_eq!(program.fns[0].ret, Ty::option(Ty::Record(0)));
     }
 
     #[test]
@@ -5619,29 +5590,21 @@ mod type_position_tests {
                 if !Parser::admits(shape, pos) {
                     continue;
                 }
-                // Each of these lowerings has a representation narrower than
-                // `Ty`, so its positions may admit only what it can hold.
-                // The table is the only thing standing between a spelling and
-                // that representation.
+                // Only the positions whose lowering narrows to something
+                // other than `Ty` have a representation constraint left. For
+                // the rest the row would restate the table it is checking,
+                // which reads as a guard without being one: what a container
+                // payload may be is decided by the checker's payload gates
+                // and pinned by `docs/shape-admission.md`, not by what the
+                // representation can hold.
                 let holds = match pos {
                     // `lower_int_ty` yields `IntTy`.
                     TyPos::Const
                     | TyPos::CastTarget
                     | TyPos::TraitImplTarget
                     | TyPos::ResourceMapKey => matches!(shape, S::Int | S::Param),
-                    // `lower_value_ty` yields `ValueTy`.
-                    TyPos::ArrayElement => matches!(shape, S::Int | S::Bool | S::Param | S::Record),
-                    // The copyable payloads `lower_value_ty` yields, plus the
-                    // two spellings `lower_option_type` claims for the owning
-                    // families before the copyable path is reached.
-                    TyPos::OptionPayload => {
-                        matches!(
-                            shape,
-                            S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw
-                        )
-                    }
-                    // A borrow rebinds the referent's mutability, which only
-                    // `Ty::ClassRef` and `Ty::Array` carry.
+                    // The borrow lowering rebinds the referent's mutability,
+                    // which only a class reference and an array carry.
                     TyPos::BorrowParam => matches!(shape, S::Class | S::Array),
                     // `lower_raw_type` and `lower_res_kind` decide which
                     // spellings of these shapes exist, and both answer with a
@@ -5655,6 +5618,8 @@ mod type_position_tests {
                     | TyPos::Local
                     | TyPos::RecordField
                     | TyPos::ClassField
+                    | TyPos::ArrayElement
+                    | TyPos::OptionPayload
                     | TyPos::ForIndex => true,
                 };
                 assert!(
@@ -5682,15 +5647,21 @@ mod type_position_tests {
         // The note is per (shape, position): a returned borrow is not told
         // about calling conventions, and an owned array parameter is told the
         // one thing that fixes it.
-        assert!(TyPos::Return
-            .rejection_note(TypeShape::Borrow)
-            .contains("callee's frame"));
-        assert!(TyPos::Param
-            .rejection_note(TypeShape::Array)
-            .contains("&mut [T]"));
-        assert!(TyPos::Local
-            .rejection_note(TypeShape::Class)
-            .contains("`var`"));
+        assert!(
+            TyPos::Return
+                .rejection_note(TypeShape::Borrow)
+                .contains("callee's frame")
+        );
+        assert!(
+            TyPos::Param
+                .rejection_note(TypeShape::Array)
+                .contains("&mut [T]")
+        );
+        assert!(
+            TyPos::Local
+                .rejection_note(TypeShape::Class)
+                .contains("`var`")
+        );
         assert_ne!(
             TyPos::Local.rejection_note(TypeShape::Class),
             TyPos::Local.rejection_note(TypeShape::Borrow)

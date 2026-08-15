@@ -1,0 +1,11 @@
+// expect-error: type.array_payload_unsupported
+// `option<bool>` is refused as an array element for the same reason
+// `option<u64>` is: an element needs a layout and a copy rule, and the option
+// families have neither in a container.
+// Refused by the parser's admissibility table (ADR 0063), which does not admit
+// the option shape at `TyPos::ArrayElement`, not by `check::array_payload_ty`.
+
+fn maybes() -> u64 {
+    [option<bool>] cells = alloc_array<option<bool>>(1, 0);
+    return 0;
+}

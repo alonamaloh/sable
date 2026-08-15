@@ -187,10 +187,10 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             let args = [im.for_ty];
             let mut want_params = tm.params.clone();
             for p in &mut want_params {
-                subst_ty(&mut p.ty, &args);
+                subst_ty(&mut p.ty, &args, p.span)?;
             }
-            let mut want_ret = tm.ret;
-            subst_ty(&mut want_ret, &args);
+            let mut want_ret = tm.ret.clone();
+            subst_ty(&mut want_ret, &args, im.trait_span)?;
             let sig_ok = body_fn.params.len() == want_params.len()
                 && body_fn
                     .params
@@ -490,20 +490,38 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
         Ok(())
     }
 
-    fn value(ty: ValueTy, arity: usize, span: Span, representation: &str) -> MResult<()> {
+    /// Check the parameter identities inside a container payload.
+    ///
+    /// A traversal: it recurses into every payload and matches exhaustively
+    /// with no wildcard, so a new constructor is a compile error rather than
+    /// a nested parameter nobody validated. The payload keeps its caller's
+    /// `representation` on the way down, so the diagnostic still names the
+    /// position the reader wrote.
+    fn value(ty: Ty, arity: usize, span: Span, representation: &str) -> MResult<()> {
         match ty {
-            ValueTy::Param(parameter_) => {
-                validate_parameter(parameter_, arity, span, representation)
+            Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, representation),
+            Ty::Int(integer) => legacy_integer(integer, arity, span, representation, false),
+            Ty::Array(element, _) | Ty::Option(element) => {
+                value(*element, arity, span, representation)
             }
-            ValueTy::Int(integer) => legacy_integer(integer, arity, span, representation, false),
-            ValueTy::Bool | ValueTy::Record(_) => Ok(()),
+            Ty::AffineOption(payload) => affine_option(payload, arity, span),
+            Ty::Raw(integer) => legacy_integer(integer, arity, span, representation, true),
+            Ty::Bool
+            | Ty::Class(_)
+            | Ty::ClassRef(..)
+            | Ty::Record(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::RawRecord(_)
+            | Ty::ResRef(..)
+            | Ty::Unit => Ok(()),
         }
     }
 
     fn affine_option(ty: AffineOptionTy, arity: usize, span: Span) -> MResult<()> {
         match ty {
             AffineOptionTy::Array(element) => {
-                value(element, arity, span, "affine-option array element type")
+                value(*element, arity, span, "affine-option array element type")
             }
         }
     }
@@ -512,8 +530,8 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, "type"),
             Ty::Int(integer) => legacy_integer(integer, arity, span, "value type", false),
-            Ty::Array(element, _) => value(element, arity, span, "array element type"),
-            Ty::Option(element) => value(element, arity, span, "option payload type"),
+            Ty::Array(element, _) => value(*element, arity, span, "array element type"),
+            Ty::Option(element) => value(*element, arity, span, "option payload type"),
             Ty::AffineOption(payload) => affine_option(payload, arity, span),
             // Raw pointer element types and conversion targets still use the
             // legacy IntTy-shaped syntax in G1.0, so a bounded TParam is the
@@ -534,8 +552,8 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
     }
 
     fn expression(expr: &Expr, arity: usize) -> MResult<()> {
-        if let Some(ty) = expr.ty {
-            checked_ty(ty, arity, expr.span)?;
+        if let Some(ty) = &expr.ty {
+            checked_ty(ty.clone(), arity, expr.span)?;
         }
         match &expr.kind {
             ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
@@ -543,7 +561,12 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
                 expression(arg, arity)
             }
             ExprKind::AllocArray { elem, len, init } => {
-                value(*elem, arity, expr.span, "array allocation element type")?;
+                value(
+                    elem.clone(),
+                    arity,
+                    expr.span,
+                    "array allocation element type",
+                )?;
                 expression(len, arity)?;
                 expression(init, arity)
             }
@@ -596,7 +619,7 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
                     init,
                     ..
                 } => {
-                    checked_ty(*ty, arity, *name_span)?;
+                    checked_ty(ty.clone(), arity, *name_span)?;
                     if let Some(initializer) = init {
                         expression(initializer, arity)?;
                     }
@@ -608,7 +631,7 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
                     ..
                 } => {
                     if let Some(ty) = ty {
-                        checked_ty(*ty, arity, *name_span)?;
+                        checked_ty(ty.clone(), arity, *name_span)?;
                     }
                     expression(init, arity)?;
                 }
@@ -655,16 +678,16 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
 
     fn function(function: &Fn, arity: usize) -> MResult<()> {
         for parameter_ in &function.params {
-            checked_ty(parameter_.ty, arity, parameter_.span)?;
+            checked_ty(parameter_.ty.clone(), arity, parameter_.span)?;
         }
-        checked_ty(function.ret, arity, function.name_span)?;
+        checked_ty(function.ret.clone(), arity, function.name_span)?;
         statements(&function.body, arity)
     }
 
     fn class(class: &ClassDecl) -> MResult<()> {
         let arity = class.type_params.len();
         for field in &class.fields {
-            checked_ty(field.ty, arity, field.span)?;
+            checked_ty(field.ty.clone(), arity, field.span)?;
         }
         for initializer in &class.inits {
             function(initializer, arity)?;
@@ -689,7 +712,7 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
     }
     for record in &program.records {
         for field in &record.fields {
-            checked_ty(field.ty, 0, field.span)?;
+            checked_ty(field.ty.clone(), 0, field.span)?;
         }
     }
     for constant in &program.consts {
@@ -919,18 +942,32 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
         Ok(())
     }
 
-    fn value(ty: ValueTy, span: Span, representation: &str) -> MResult<()> {
+    /// Check that no type parameter survives inside a container payload.
+    /// A traversal, exhaustive and recursive for the same reason the
+    /// declaration-side `value` is.
+    fn value(ty: Ty, span: Span, representation: &str) -> MResult<()> {
         match ty {
-            ValueTy::Param(parameter) => Err(escaped(span, parameter, representation)),
-            ValueTy::Int(integer_ty) => integer(integer_ty, span, representation),
-            ValueTy::Bool | ValueTy::Record(_) => Ok(()),
+            Ty::Param(parameter) => Err(escaped(span, parameter, representation)),
+            Ty::Int(integer_ty) => integer(integer_ty, span, representation),
+            Ty::Array(element, _) | Ty::Option(element) => value(*element, span, representation),
+            Ty::AffineOption(payload) => affine_option(payload, span),
+            Ty::Raw(integer_ty) => integer(integer_ty, span, representation),
+            Ty::Bool
+            | Ty::Class(_)
+            | Ty::ClassRef(..)
+            | Ty::Record(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::RawRecord(_)
+            | Ty::ResRef(..)
+            | Ty::Unit => Ok(()),
         }
     }
 
     fn affine_option(ty: AffineOptionTy, span: Span) -> MResult<()> {
         match ty {
             AffineOptionTy::Array(element) => {
-                value(element, span, "affine-option array element type")
+                value(*element, span, "affine-option array element type")
             }
         }
     }
@@ -939,8 +976,8 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter) => Err(escaped(span, parameter, "type")),
             Ty::Int(integer_ty) => integer(integer_ty, span, "integer type"),
-            Ty::Array(element, _) => value(element, span, "array element type"),
-            Ty::Option(element) => value(element, span, "option payload type"),
+            Ty::Array(element, _) => value(*element, span, "array element type"),
+            Ty::Option(element) => value(*element, span, "option payload type"),
             Ty::AffineOption(payload) => affine_option(payload, span),
             Ty::Raw(integer_ty) => integer(integer_ty, span, "raw-pointer element type"),
             Ty::Bool
@@ -956,8 +993,8 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
     }
 
     fn expression(expr: &Expr) -> MResult<()> {
-        if let Some(ty) = expr.ty {
-            checked_ty(ty, expr.span)?;
+        if let Some(ty) = &expr.ty {
+            checked_ty(ty.clone(), expr.span)?;
         }
         match &expr.kind {
             ExprKind::Unary { operand, .. }
@@ -1009,7 +1046,7 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
             | ExprKind::SelfFieldIndex { index, .. }
             | ExprKind::ClassFieldIndex { index, .. } => expression(index),
             ExprKind::AllocArray { elem, len, init } => {
-                value(*elem, expr.span, "array allocation element type")?;
+                value(elem.clone(), expr.span, "array allocation element type")?;
                 expression(len)?;
                 expression(init)
             }
@@ -1037,7 +1074,7 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
                     init,
                     ..
                 } => {
-                    checked_ty(*ty, *name_span)?;
+                    checked_ty(ty.clone(), *name_span)?;
                     if let Some(initializer) = init {
                         expression(initializer)?;
                     }
@@ -1049,7 +1086,7 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
                     ..
                 } => {
                     if let Some(ty) = ty {
-                        checked_ty(*ty, *name_span)?;
+                        checked_ty(ty.clone(), *name_span)?;
                     }
                     expression(init)?;
                 }
@@ -1096,15 +1133,15 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
 
     fn function(function: &Fn) -> MResult<()> {
         for parameter in &function.params {
-            checked_ty(parameter.ty, parameter.span)?;
+            checked_ty(parameter.ty.clone(), parameter.span)?;
         }
-        checked_ty(function.ret, function.name_span)?;
+        checked_ty(function.ret.clone(), function.name_span)?;
         statements(&function.body)
     }
 
     fn class(class: &ClassDecl) -> MResult<()> {
         for field in &class.fields {
-            checked_ty(field.ty, field.span)?;
+            checked_ty(field.ty.clone(), field.span)?;
         }
         for initializer in &class.inits {
             function(initializer)?;
@@ -1126,7 +1163,7 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
     }
     for record in &program.records {
         for field in &record.fields {
-            checked_ty(field.ty, field.span)?;
+            checked_ty(field.ty.clone(), field.span)?;
         }
     }
     for constant in &program.consts {
@@ -1527,12 +1564,12 @@ fn unsupported_type_arg(span: Span, error: GenericTyError) -> Diagnostic {
         name: "mono.type_arg_unsupported".into(),
         title: "this generic type argument is not supported yet".into(),
         span,
-        label: "G0 instantiation still accepts only `u8`..`u64` and `i8`..`i64`".into(),
+        label: "instantiation accepts only `u8`..`u64` and `i8`..`i64`".into(),
         notes: vec![(
             "note".into(),
             format!(
-                "{reason}; the recursive representation is present so later slices can enable \
-                 Boolean, aggregate, and nominal arguments without changing instance identity"
+                "{reason}; the argument representation is recursive so that Boolean, aggregate, \
+                 and nominal arguments can be enabled without changing instance identity"
             ),
         )],
     }
@@ -1723,7 +1760,7 @@ impl Mono {
             c.name = req.emitted_name;
             c.proof_reuse = proof_reuse;
             for fld in &mut c.fields {
-                subst_ty(&mut fld.ty, &req.args);
+                subst_ty(&mut fld.ty, &req.args, fld.span)?;
             }
             for inv in &mut c.invariants {
                 inv.text = subst_clause_text(&inv.text, &text_map);
@@ -1794,9 +1831,9 @@ impl Mono {
         depth: usize,
     ) -> MResult<()> {
         for p in &mut f.params {
-            subst_ty(&mut p.ty, args);
+            subst_ty(&mut p.ty, args, p.span)?;
         }
-        subst_ty(&mut f.ret, args);
+        subst_ty(&mut f.ret, args, f.name_span)?;
         for c in f
             .pres
             .iter_mut()
@@ -2016,53 +2053,63 @@ fn adr0009_int_model_reuse(template: &str, args: &[IntTy], span: Span) -> MResul
     Ok(ProofReuse::adr0009_int_model(template.to_string()))
 }
 
-fn subst_intty(t: &mut IntTy, args: &[IntTy]) {
+/// The argument bound to a declaration's type parameter.
+///
+/// `validate_v1_type_args` checks arity before any substitution runs, so an
+/// index outside the list means the checked AST disagrees with the request
+/// that produced it. That is an internal inconsistency, and it gets a named,
+/// spanned diagnostic: an index panic is never an acceptable answer, however
+/// unreachable it is believed to be.
+fn type_argument(args: &[IntTy], index: usize, span: Span) -> MResult<IntTy> {
+    args.get(index).copied().ok_or_else(|| Diagnostic {
+        name: "internal.mono.type_arg_arity".into(),
+        title: "a type parameter has no argument to substitute".into(),
+        span,
+        label: format!(
+            "parameter #{index} is outside the {} argument(s) of this instantiation",
+            args.len()
+        ),
+        notes: vec![(
+            "note".into(),
+            "the declaration and the instantiation request disagree about arity".into(),
+        )],
+    })
+}
+
+fn subst_intty(t: &mut IntTy, args: &[IntTy], span: Span) -> MResult<()> {
     if let IntTy::TParam(i) = t {
-        *t = args[*i as usize];
+        *t = type_argument(args, *i as usize, span)?;
     }
+    Ok(())
 }
 
-fn subst_value_ty(t: &mut ValueTy, args: &[IntTy]) {
-    match *t {
-        ValueTy::Param(parameter) => *t = ValueTy::Int(args[parameter.index()]),
-        ValueTy::Int(mut integer) => {
-            subst_intty(&mut integer, args);
-            *t = ValueTy::Int(integer);
-        }
-        ValueTy::Bool | ValueTy::Record(_) => {}
+/// Replace every type parameter in a checked type by its argument.
+///
+/// A traversal: one function for the whole grammar, recursing into every
+/// payload. The argument vector stays `&[IntTy]` — the type-argument domain
+/// is concrete integers (ADR 0009), and widening it here would delete the
+/// refusal that keeps non-integer arguments closed. It is a separate axis
+/// from what a container may hold.
+pub(crate) fn subst_ty(t: &mut Ty, args: &[IntTy], span: Span) -> MResult<()> {
+    match t {
+        Ty::Param(parameter) => *t = Ty::Int(type_argument(args, parameter.index(), span)?),
+        Ty::Int(integer) => subst_intty(integer, args, span)?,
+        Ty::Array(element, _) | Ty::Option(element) => subst_ty(element, args, span)?,
+        Ty::AffineOption(AffineOptionTy::Array(element)) => subst_ty(element, args, span)?,
+        // A `raw<...>` element type is a width, and its parameter spelling is
+        // canonical there rather than substituted.
+        Ty::Raw(_)
+        | Ty::Bool
+        | Ty::Class(_)
+        | Ty::ClassRef(..)
+        | Ty::Record(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::RawRecord(_)
+        | Ty::ResRef(..)
+        | Ty::Unit => {}
     }
-}
-
-fn subst_affine_option_ty(t: &mut AffineOptionTy, args: &[IntTy]) {
-    match *t {
-        AffineOptionTy::Array(mut element) => {
-            subst_value_ty(&mut element, args);
-            *t = AffineOptionTy::Array(element);
-        }
-    }
-}
-
-fn subst_ty(t: &mut Ty, args: &[IntTy]) {
-    match *t {
-        Ty::Param(parameter) => *t = Ty::Int(args[parameter.index()]),
-        Ty::Int(mut integer) => {
-            subst_intty(&mut integer, args);
-            *t = Ty::Int(integer);
-        }
-        Ty::Array(mut element, mutability) => {
-            subst_value_ty(&mut element, args);
-            *t = Ty::Array(element, mutability);
-        }
-        Ty::Option(mut element) => {
-            subst_value_ty(&mut element, args);
-            *t = Ty::Option(element);
-        }
-        Ty::AffineOption(mut payload) => {
-            subst_affine_option_ty(&mut payload, args);
-            *t = Ty::AffineOption(payload);
-        }
-        _ => {}
-    }
+    Ok(())
 }
 
 type BoundCalls = HashMap<String, (String, HashSet<String>)>;
@@ -2075,17 +2122,25 @@ fn subst_stmts(
 ) -> MResult<()> {
     for s in stmts {
         match s {
-            Stmt::Decl { ty, init, .. } => {
-                subst_ty(ty, args);
+            Stmt::Decl {
+                ty,
+                name_span,
+                init,
+                ..
+            } => {
+                subst_ty(ty, args, *name_span)?;
                 if let Some(e) = init {
                     subst_expr(e, args, bound_calls)?;
                 }
             }
             Stmt::VarDecl {
-                init: value, ty, ..
+                init: value,
+                ty,
+                name_span,
+                ..
             } => {
                 if let Some(ty) = ty {
-                    subst_ty(ty, args);
+                    subst_ty(ty, args, *name_span)?;
                 }
                 subst_expr(value, args, bound_calls)?;
             }
@@ -2146,16 +2201,17 @@ fn subst_stmts(
 }
 
 fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult<()> {
+    let span = e.span;
     if let Some(ty) = &mut e.ty {
-        subst_ty(ty, args);
+        subst_ty(ty, args, span)?;
     }
     match &mut e.kind {
         ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
-            subst_intty(target, args);
+            subst_intty(target, args, span)?;
             subst_expr(arg, args, bound_calls)?;
         }
         ExprKind::AllocArray { elem, len, init } => {
-            subst_value_ty(elem, args);
+            subst_ty(elem, args, span)?;
             subst_expr(len, args, bound_calls)?;
             subst_expr(init, args, bound_calls)?;
         }
@@ -2296,6 +2352,64 @@ pub(crate) fn subst_clause_text(text: &str, map: &HashMap<String, String>) -> St
 mod tests {
     use super::*;
     use crate::span::LineMap;
+
+    /// `validate_v1_type_args` checks arity before substitution runs, so this
+    /// cannot be reached from a source program. It is still a named, spanned
+    /// diagnostic rather than an index panic: "never a panic" is a property
+    /// of the compiler, not of the paths someone has thought about.
+    #[test]
+    fn a_parameter_without_an_argument_is_a_named_diagnostic() {
+        let parameter = TypeParamId::new(3).expect("index 3 is within the parameter ceiling");
+        let span = Span::new(7, 11);
+        let mut ty = Ty::array(Ty::Param(parameter), Mutability::Owned);
+        let diagnostic = subst_ty(&mut ty, &[IntTy::U32], span)
+            .expect_err("parameter #3 has no argument in a one-argument instantiation");
+        assert_eq!(diagnostic.name, "internal.mono.type_arg_arity");
+        assert_eq!(diagnostic.span, span);
+
+        let mut legacy = Ty::option(Ty::Int(IntTy::TParam(3)));
+        assert_eq!(
+            subst_ty(&mut legacy, &[IntTy::U32], span)
+                .expect_err("the legacy parameter spelling is checked too")
+                .name,
+            "internal.mono.type_arg_arity"
+        );
+    }
+
+    /// Substitution cannot deepen a checked type, because the argument domain
+    /// is concrete integers (ADR 0009): a parameter is a leaf and so is the
+    /// integer that replaces it. That is what makes the parser's depth bound
+    /// hold on the substituted type too, without a second check after
+    /// expansion. Widening the argument domain breaks this and needs the
+    /// bound re-imposed on `Ty::structural_depth`.
+    #[test]
+    fn substitution_never_deepens_a_checked_type() {
+        let parameter = TypeParamId::new(0).expect("index 0 is within the parameter ceiling");
+        let owned = Mutability::Owned;
+        for original in [
+            Ty::Param(parameter),
+            Ty::Int(IntTy::TParam(0)),
+            Ty::array(Ty::Param(parameter), owned),
+            Ty::option(Ty::Param(parameter)),
+            Ty::affine_array_option(Ty::Param(parameter)),
+            Ty::array(Ty::array(Ty::Param(parameter), owned), owned),
+        ] {
+            let mut substituted = original.clone();
+            subst_ty(&mut substituted, &[IntTy::U32], Span::new(0, 0))
+                .expect("one argument covers a single-parameter declaration");
+            assert_eq!(
+                substituted.structural_depth(),
+                original.structural_depth(),
+                "substituting `{}` changed its depth",
+                original.name()
+            );
+            assert!(
+                substituted.is_concrete(),
+                "substituting `{}` left a parameter",
+                original.name()
+            );
+        }
+    }
 
     fn parse_program(source: &str) -> Program {
         let lines = LineMap::new(source);
@@ -3001,7 +3115,7 @@ fn root() -> option<u16> {
             .find(|function| function.name == "make_u16")
             .expect("concrete integer instance");
         assert_eq!(instance.params[0].ty, Ty::Int(IntTy::U16));
-        assert_eq!(instance.ret, Ty::Option(ValueTy::Int(IntTy::U16)));
+        assert_eq!(instance.ret, Ty::option(Ty::Int(IntTy::U16)));
         assert_eq!(instance.proof_reuse.template(), Some("make"));
         assert!(matches!(
             &instance.proof_reuse,
@@ -3016,11 +3130,11 @@ fn root() -> option<u16> {
         else {
             panic!("expected instantiated array declaration");
         };
-        assert_eq!(*ty, Ty::Array(ValueTy::Int(IntTy::U16), Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Int(IntTy::U16), Mutability::Owned));
         let ExprKind::AllocArray { elem, .. } = &initializer.kind else {
             panic!("expected instantiated allocation");
         };
-        assert_eq!(*elem, ValueTy::Int(IntTy::U16));
+        assert_eq!(*elem, Ty::Int(IntTy::U16));
 
         validate_concrete_output(&program).expect("ordinary output is fully concrete");
         let retained = program
@@ -3034,7 +3148,7 @@ fn root() -> option<u16> {
         );
         assert_eq!(
             retained.ret,
-            Ty::Option(ValueTy::Param(TypeParamId::from_legacy(0)))
+            Ty::option(Ty::Param(TypeParamId::from_legacy(0)))
         );
     }
 
@@ -3057,7 +3171,7 @@ fn root(option<[i32]> value) -> option<[i32]> {
             .iter()
             .find(|function| function.name == "hold_i32")
             .expect("concrete affine-option instance");
-        let expected = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Int(IntTy::I32)));
+        let expected = Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)));
         assert_eq!(instance.params[0].ty, expected);
         assert_eq!(instance.ret, expected);
         validate_concrete_output(&program).expect("affine-option output is fully concrete");
@@ -3068,7 +3182,7 @@ fn root(option<[i32]> value) -> option<[i32]> {
             .find(|function| function.name == "hold")
             .expect("retained affine-option template");
         let parameter = TypeParamId::from_legacy(0);
-        let abstract_ty = Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)));
+        let abstract_ty = Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)));
         assert_eq!(retained.params[0].ty, abstract_ty);
         assert_eq!(retained.ret, abstract_ty);
     }
@@ -3121,7 +3235,7 @@ fn root(i32 value) -> i32 {
         let Stmt::Decl { ty, .. } = &mut noncanonical_array.fns[0].body[0] else {
             panic!("expected array declaration");
         };
-        *ty = Ty::Array(ValueTy::Int(IntTy::TParam(0)), Mutability::Owned);
+        *ty = Ty::array(Ty::Int(IntTy::TParam(0)), Mutability::Owned);
         let error = monomorphize(&mut noncanonical_array)
             .expect_err("legacy parameter in a value type must not escape");
         assert_eq!(error.name, "mono.type_param_out_of_bounds");
@@ -3137,14 +3251,13 @@ fn root(i32 value) -> i32 {
         let ExprKind::AllocArray { elem, .. } = &mut initializer.kind else {
             panic!("expected allocation");
         };
-        *elem = ValueTy::Param(parameter);
+        *elem = Ty::Param(parameter);
         let error =
             monomorphize(&mut allocation).expect_err("allocation parameter must not escape");
         assert_eq!(error.name, "mono.type_param_out_of_bounds");
 
         let mut escaped_affine = parse_program("fn root() {}\n");
-        escaped_affine.fns[0].ret =
-            Ty::AffineOption(AffineOptionTy::Array(ValueTy::Param(parameter)));
+        escaped_affine.fns[0].ret = Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)));
         let error = validate_concrete_output(&escaped_affine)
             .expect_err("affine-option payload parameters must not escape");
         assert_eq!(error.name, "mono.unsubstituted_type_param");

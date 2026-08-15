@@ -1,0 +1,18 @@
+// expect-error: record.field_type
+// A class is affine and carries an invariant and a destructor; a record is
+// copyable data with a layout. A class-typed field would make the record own
+// an object it has no rule to destroy.
+
+class Box {
+    u64 v;
+
+    /// invariant v <= 100
+
+    init make() {
+        self.v = 0;
+    }
+}
+
+record Holder #[layout(size := 8, align := 8)] {
+    #[offset(0)] Box boxed;
+}

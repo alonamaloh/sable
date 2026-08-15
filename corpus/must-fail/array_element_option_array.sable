@@ -1,0 +1,10 @@
+// expect-error: type.array_payload_unsupported
+// An owning option is doubly refused as an array element: it has no cell
+// layout, and each element would own array storage no place path can name.
+// Refused by the parser's admissibility table (ADR 0063), which does not admit
+// the option shape at `TyPos::ArrayElement`, not by `check::array_payload_ty`.
+
+fn maybes() -> u64 {
+    [option<[bool]>] cells = alloc_array<option<[bool]>>(1, 0);
+    return 0;
+}
