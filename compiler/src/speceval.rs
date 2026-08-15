@@ -40,37 +40,46 @@ pub enum SpecVal {
     Obj(HashMap<String, SpecVal>),
 }
 
-/// A monitored array retains its checked payload even when it is empty.
-/// Fixed integer widths remain useful for faithful snapshots, although the
-/// proof language itself observes every integer element as mathematical Int.
+impl SpecVal {
+    /// The junk value Lean's `getD default` produces for this payload. Every
+    /// place that needs a typed default reads it here, so admitting a payload
+    /// answers the question once.
+    fn default_of(payload: ValueTy) -> SpecVal {
+        match payload {
+            ValueTy::Int(_) => SpecVal::Int(0),
+            ValueTy::Bool => SpecVal::Bool(false),
+            ValueTy::Record(_) | ValueTy::Param(_) => SpecVal::Obj(HashMap::new()),
+        }
+    }
+}
+
+/// A monitored array retains its checked payload even when it is empty, so
+/// two empty arrays of different payloads are not equal and an out-of-range
+/// read still produces the right typed junk value. As at runtime, the tag
+/// sits beside the elements rather than inside their representation.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SpecArray {
-    Int { payload: IntTy, values: Vec<i128> },
-    Bool(Vec<bool>),
+pub struct SpecArray {
+    payload: ValueTy,
+    values: Vec<SpecVal>,
 }
 
 impl SpecArray {
-    fn len(&self) -> usize {
-        match self {
-            SpecArray::Int { values, .. } => values.len(),
-            SpecArray::Bool(values) => values.len(),
-        }
+    pub fn new(payload: ValueTy, values: Vec<SpecVal>) -> SpecArray {
+        SpecArray { payload, values }
     }
 
+    fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Lean reads `a.get i` outside the array as `getD default`, so an
+    /// out-of-range index produces the payload's junk value rather than a
+    /// monitoring failure.
     fn get_or_default(&self, index: i128) -> SpecVal {
-        let index = usize::try_from(index).ok();
-        match self {
-            SpecArray::Int { values, .. } => SpecVal::Int(
-                index
-                    .and_then(|index| values.get(index).copied())
-                    .unwrap_or(0),
-            ),
-            SpecArray::Bool(values) => SpecVal::Bool(
-                index
-                    .and_then(|index| values.get(index).copied())
-                    .unwrap_or(false),
-            ),
-        }
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.values.get(index).cloned())
+            .unwrap_or_else(|| SpecVal::default_of(self.payload))
     }
 }
 
@@ -1177,12 +1186,7 @@ fn spec_eq(a: &SpecVal, b: &SpecVal) -> Option<bool> {
     match (a, b) {
         (SpecVal::Int(x), SpecVal::Int(y)) => Some(x == y),
         (SpecVal::Bool(x), SpecVal::Bool(y)) => Some(x == y),
-        (
-            SpecVal::Arr(SpecArray::Int { values: x, .. }),
-            SpecVal::Arr(SpecArray::Int { values: y, .. }),
-        ) => Some(x == y),
-        (SpecVal::Arr(SpecArray::Bool(x)), SpecVal::Arr(SpecArray::Bool(y))) => Some(x == y),
-        (SpecVal::Arr(_), SpecVal::Arr(_)) => None,
+        (SpecVal::Arr(x), SpecVal::Arr(y)) => spec_array_eq(x, y),
         (SpecVal::Opt { value: x, .. }, SpecVal::Opt { value: y, .. }) => match (x, y) {
             (None, None) => Some(true),
             (Some(_), None) | (None, Some(_)) => Some(false),
@@ -1214,6 +1218,32 @@ fn spec_eq(a: &SpecVal, b: &SpecVal) -> Option<bool> {
         },
         (SpecVal::Obj(x), SpecVal::Obj(y)) => Some(x == y),
         _ => None,
+    }
+}
+
+/// Two arrays are comparable when their payloads share a proof domain:
+/// integer widths do not distinguish proof values, but an integer array and a
+/// Boolean array are reported as unmonitorable rather than coerced into
+/// comparability.
+fn spec_array_eq(left: &SpecArray, right: &SpecArray) -> Option<bool> {
+    if !comparable_payloads(left.payload, right.payload) {
+        return None;
+    }
+    if left.values.len() != right.values.len() {
+        return Some(false);
+    }
+    let mut equal = true;
+    for (left, right) in left.values.iter().zip(&right.values) {
+        equal &= spec_eq(left, right)?;
+    }
+    Some(equal)
+}
+
+fn comparable_payloads(left: ValueTy, right: ValueTy) -> bool {
+    match (left, right) {
+        (ValueTy::Int(_), ValueTy::Int(_)) | (ValueTy::Bool, ValueTy::Bool) => true,
+        (ValueTy::Record(left), ValueTy::Record(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -1260,16 +1290,39 @@ fn boolean(v: SpecVal) -> EResult<bool> {
     }
 }
 
+/// The sequence helpers of the proof language are stated over integers, so a
+/// non-integer payload is reported rather than projected onto one.
 fn int_array(v: SpecVal, operation: &str) -> EResult<Vec<i128>> {
-    match v {
-        SpecVal::Arr(SpecArray::Int { values, .. }) => Ok(values),
-        SpecVal::Arr(SpecArray::Bool(_)) => Err(Unmonitorable(format!(
-            "`{operation}` is integer-array-only; Boolean arrays are unsupported"
-        ))),
-        _ => Err(Unmonitorable(format!(
+    let SpecVal::Arr(array) = v else {
+        return Err(Unmonitorable(format!(
             "`{operation}` expected a sequence value"
-        ))),
+        )));
+    };
+    if !matches!(array.payload, ValueTy::Int(_)) {
+        return Err(Unmonitorable(format!(
+            "`{operation}` is integer-array-only; `{}` arrays are unsupported",
+            array.payload.name()
+        )));
     }
+    array.values.into_iter().map(int).collect()
+}
+
+/// Payload-tagged constructors for tests, so a probe states the payload it
+/// means instead of relying on an element representation.
+#[cfg(test)]
+pub(crate) fn spec_bools(values: &[bool]) -> SpecArray {
+    SpecArray::new(
+        ValueTy::Bool,
+        values.iter().copied().map(SpecVal::Bool).collect(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn spec_ints(payload: IntTy, values: &[i128]) -> SpecArray {
+    SpecArray::new(
+        ValueTy::Int(payload),
+        values.iter().copied().map(SpecVal::Int).collect(),
+    )
 }
 
 #[cfg(test)]
@@ -1290,7 +1343,7 @@ mod g1_option_monitor_tests {
         vars.insert(
             "pending".into(),
             SpecVal::AffineOptBoolArray {
-                value: Some(SpecArray::Bool(vec![true, false])),
+                value: Some(spec_bools(&[true, false])),
             },
         );
         vars.insert("empty".into(), SpecVal::AffineOptBoolArray { value: None });
@@ -1317,7 +1370,7 @@ mod g1_option_monitor_tests {
     fn affine_option_equality_rejects_typed_copy_option_crossings() {
         let affine_none = SpecVal::AffineOptBoolArray { value: None };
         let affine_some = SpecVal::AffineOptBoolArray {
-            value: Some(SpecArray::Bool(vec![true])),
+            value: Some(spec_bools(&[true])),
         };
         let typed_none = option(ValueTy::Bool, None);
         let typed_some = option(ValueTy::Bool, Some(SpecVal::Bool(true)));
@@ -1327,7 +1380,7 @@ mod g1_option_monitor_tests {
         };
         let literal_array_some = SpecVal::Opt {
             payload: None,
-            value: Some(Box::new(SpecVal::Arr(SpecArray::Bool(vec![true])))),
+            value: Some(Box::new(SpecVal::Arr(spec_bools(&[true])))),
         };
 
         assert_eq!(spec_eq(&affine_none, &typed_none), None);
@@ -1399,26 +1452,20 @@ mod g1_option_monitor_tests {
         let mut vars = HashMap::new();
         vars.insert(
             "flags".into(),
-            SpecVal::Arr(SpecArray::Bool(vec![true, false, true])),
+            SpecVal::Arr(spec_bools(&[true, false, true])),
         );
         vars.insert(
             "same".into(),
-            SpecVal::Arr(SpecArray::Bool(vec![true, false, true])),
+            SpecVal::Arr(spec_bools(&[true, false, true])),
         );
-        vars.insert("empty".into(), SpecVal::Arr(SpecArray::Bool(Vec::new())));
+        vars.insert("empty".into(), SpecVal::Arr(spec_bools(&[])));
         vars.insert(
             "integers".into(),
-            SpecVal::Arr(SpecArray::Int {
-                payload: IntTy::U8,
-                values: vec![1, 0, 1],
-            }),
+            SpecVal::Arr(spec_ints(IntTy::U8, &[1, 0, 1])),
         );
         vars.insert(
             "wide_integers".into(),
-            SpecVal::Arr(SpecArray::Int {
-                payload: IntTy::I64,
-                values: vec![1, 0, 1],
-            }),
+            SpecVal::Arr(spec_ints(IntTy::I64, &[1, 0, 1])),
         );
         let env = SpecEnv {
             vars,
@@ -1442,7 +1489,7 @@ mod g1_option_monitor_tests {
         let mut vars = HashMap::new();
         vars.insert(
             "flags".into(),
-            SpecVal::Arr(SpecArray::Bool(vec![false, true])),
+            SpecVal::Arr(spec_bools(&[false, true])),
         );
         let env = SpecEnv {
             vars,

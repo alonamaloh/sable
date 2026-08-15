@@ -12,7 +12,7 @@
 //! by the interpreter, so a diff program's variants must hold.
 
 use crate::ast::*;
-use crate::interp::{MmioEvent, ObservedRun, RtVal};
+use crate::interp::{MmioEvent, ObservedRun, RtArray, RtVal};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy)]
@@ -3598,19 +3598,27 @@ pub fn canonical_observed(program: &Program, observed: ObservedRun) -> String {
     )
 }
 
+/// Array elements are spelled bare on the wire — `arr [1, 2]`, `arr [true]` —
+/// because the array already carries the payload. A payload with no bare
+/// spelling falls back to the general value rendering.
+fn render_elements(program: &Program, array: &RtArray) -> String {
+    array
+        .iter()
+        .map(|element| match element {
+            RtVal::Int(n) => n.to_string(),
+            RtVal::Bool(b) => b.to_string(),
+            other => render_rt_val(program, other),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_rt_val(program: &Program, value: &RtVal) -> String {
     match value {
         RtVal::Unit => "unit".into(),
         RtVal::Int(n) => format!("int {n}"),
         RtVal::Bool(b) => format!("bool {b}"),
-        RtVal::Arr(a) => format!(
-            "arr [{}]",
-            a.borrow()
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        RtVal::Arr(a) => format!("arr [{}]", render_elements(program, &a.borrow())),
         RtVal::Ptr(a, o) => format!("ptr {a}+{o}"),
         RtVal::Opt { value: None, .. } => "opt none".into(),
         RtVal::Opt {
@@ -3625,12 +3633,7 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
         RtVal::AffineOptBoolArray(None) => "opt none".into(),
         RtVal::AffineOptBoolArray(Some(array)) => format!(
             "opt some arr [{}]",
-            array
-                .borrow()
-                .iter()
-                .map(|element| element.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            render_elements(program, &array.borrow())
         ),
         RtVal::PtrOpt(None) => "ptrOpt none".into(),
         RtVal::PtrOpt(Some((a, o))) => format!("ptrOpt some {a}+{o}"),
@@ -4209,10 +4212,10 @@ mod tests {
         };
         let affine_none = RtVal::AffineOptBoolArray(None);
         let affine_empty = RtVal::AffineOptBoolArray(Some(std::rc::Rc::new(
-            std::cell::RefCell::new(crate::interp::RtArray::Bool(Vec::new())),
+            std::cell::RefCell::new(crate::interp::rt_bools(&[])),
         )));
         let affine_values = RtVal::AffineOptBoolArray(Some(std::rc::Rc::new(
-            std::cell::RefCell::new(crate::interp::RtArray::Bool(vec![true, false])),
+            std::cell::RefCell::new(crate::interp::rt_bools(&[true, false])),
         )));
 
         assert_eq!(render_rt_val(&program, &absent), "opt none");

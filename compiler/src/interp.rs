@@ -12,7 +12,6 @@ use crate::ast::*;
 use crate::speceval::{self, GhostDefs, SpecArray, SpecEnv, SpecVal};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -81,136 +80,108 @@ impl Clone for RtVal {
     }
 }
 
-/// Runtime arrays retain their checked payload even when empty. Integer
-/// widths remain explicit so snapshots and literal/allocation construction
-/// cannot silently change the array's source type.
+impl RtVal {
+    /// Whether this value is a member of `payload`'s domain. Checking is what
+    /// establishes this; the assertion exists so a widening that forgets to
+    /// teach one construction path about a payload fails loudly in debug
+    /// builds instead of storing a mismatched element.
+    fn inhabits(&self, payload: ValueTy) -> bool {
+        match (self, payload) {
+            (RtVal::Int(_), ValueTy::Int(integer)) => !matches!(integer, IntTy::TParam(_)),
+            (RtVal::Bool(_), ValueTy::Bool) => true,
+            (RtVal::Record { record, .. }, ValueTy::Record(declared)) => *record == declared,
+            _ => false,
+        }
+    }
+}
+
+/// Runtime arrays retain their checked payload even when empty, so an empty
+/// integer array and an empty Boolean array remain distinguishable and accept
+/// different stores. The tag sits beside the elements rather than inside their
+/// representation: an array holds whatever a runtime value can hold, which
+/// makes admitting a new payload a checker question rather than a runtime one.
+///
+/// Elements are cloned in and out with `RtVal`'s ordinary semantics, which
+/// share an inner array's storage rather than copying it. Nested owned arrays
+/// therefore need an explicit copy rule before they are admitted; the checker
+/// rejects them today.
 #[derive(Debug, Clone)]
-pub enum RtArray {
-    Int { payload: IntTy, values: Vec<i128> },
-    Bool(Vec<bool>),
-}
-
-#[derive(Clone, Copy)]
-pub enum RtArrayElem {
-    Int(i128),
-    Bool(bool),
-}
-
-impl fmt::Display for RtArrayElem {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RtArrayElem::Int(value) => value.fmt(formatter),
-            RtArrayElem::Bool(value) => value.fmt(formatter),
-        }
-    }
-}
-
-pub enum RtArrayIter<'a> {
-    Int(std::slice::Iter<'a, i128>),
-    Bool(std::slice::Iter<'a, bool>),
-}
-
-impl Iterator for RtArrayIter<'_> {
-    type Item = RtArrayElem;
-
-    fn next(&mut self) -> Option<RtArrayElem> {
-        match self {
-            RtArrayIter::Int(values) => values.next().copied().map(RtArrayElem::Int),
-            RtArrayIter::Bool(values) => values.next().copied().map(RtArrayElem::Bool),
-        }
-    }
+pub struct RtArray {
+    payload: ValueTy,
+    values: Vec<RtVal>,
 }
 
 impl RtArray {
     pub fn len(&self) -> usize {
-        match self {
-            RtArray::Int { values, .. } => values.len(),
-            RtArray::Bool(values) => values.len(),
-        }
+        self.values.len()
     }
 
-    pub fn iter(&self) -> RtArrayIter<'_> {
-        match self {
-            RtArray::Int { values, .. } => RtArrayIter::Int(values.iter()),
-            RtArray::Bool(values) => RtArrayIter::Bool(values.iter()),
-        }
+    pub fn payload(&self) -> ValueTy {
+        self.payload
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, RtVal> {
+        self.values.iter()
     }
 
     fn from_values(payload: ValueTy, values: Vec<RtVal>) -> RtArray {
-        match payload {
-            ValueTy::Int(integer) if !matches!(integer, IntTy::TParam(_)) => RtArray::Int {
-                payload: integer,
-                values: values
-                    .into_iter()
-                    .map(|value| match value {
-                        RtVal::Int(value) => value,
-                        _ => unreachable!("checked: integer array element"),
-                    })
-                    .collect(),
-            },
-            ValueTy::Bool => RtArray::Bool(
-                values
-                    .into_iter()
-                    .map(|value| match value {
-                        RtVal::Bool(value) => value,
-                        _ => unreachable!("checked: Boolean array element"),
-                    })
-                    .collect(),
-            ),
-            _ => unreachable!("interpreter guard rejected unsupported array payload"),
-        }
+        debug_assert!(
+            values.iter().all(|value| value.inhabits(payload)),
+            "checked: array element matches its payload"
+        );
+        RtArray { payload, values }
     }
 
     fn repeat(payload: ValueTy, value: RtVal, len: usize) -> RtArray {
-        match (payload, value) {
-            (ValueTy::Int(integer), RtVal::Int(value)) if !matches!(integer, IntTy::TParam(_)) => {
-                RtArray::Int {
-                    payload: integer,
-                    values: vec![value; len],
-                }
-            }
-            (ValueTy::Bool, RtVal::Bool(value)) => RtArray::Bool(vec![value; len]),
-            _ => unreachable!("checked: array initializer matches its payload"),
+        debug_assert!(
+            value.inhabits(payload),
+            "checked: array initializer matches its payload"
+        );
+        RtArray {
+            payload,
+            values: vec![value; len],
         }
     }
 
     fn get(&self, index: usize) -> RtVal {
-        match self {
-            RtArray::Int { values, .. } => RtVal::Int(values[index]),
-            RtArray::Bool(values) => RtVal::Bool(values[index]),
-        }
+        self.values[index].clone()
     }
 
     fn set(&mut self, index: usize, value: RtVal) {
-        match (self, value) {
-            (RtArray::Int { values, .. }, RtVal::Int(value)) => values[index] = value,
-            (RtArray::Bool(values), RtVal::Bool(value)) => values[index] = value,
-            _ => unreachable!("checked: array store value matches its payload"),
-        }
+        debug_assert!(
+            value.inhabits(self.payload),
+            "checked: array store value matches its payload"
+        );
+        self.values[index] = value;
     }
 
-    fn int_values(&self) -> Option<&[i128]> {
-        match self {
-            RtArray::Int { values, .. } => Some(values),
-            RtArray::Bool(_) => None,
-        }
+    /// Byte exposure is defined over integer payloads only (ADR 0026).
+    fn int_values(&self) -> Option<Vec<i128>> {
+        matches!(self.payload, ValueTy::Int(_)).then(|| {
+            self.values
+                .iter()
+                .map(|value| match value {
+                    RtVal::Int(value) => *value,
+                    _ => unreachable!("checked: integer array element"),
+                })
+                .collect()
+        })
     }
 
     fn set_int(&mut self, index: usize, value: i128) {
-        match self {
-            RtArray::Int { values, .. } => values[index] = value,
-            RtArray::Bool(_) => unreachable!("interpreter guard rejects Boolean exposure"),
-        }
+        debug_assert!(
+            matches!(self.payload, ValueTy::Int(_)),
+            "interpreter guard rejects non-integer exposure"
+        );
+        self.values[index] = RtVal::Int(value);
     }
 
-    fn to_spec(&self) -> SpecArray {
-        match self {
-            RtArray::Int { payload, values } => SpecArray::Int {
-                payload: *payload,
-                values: values.clone(),
-            },
-            RtArray::Bool(values) => SpecArray::Bool(values.clone()),
-        }
+    /// The monitor's snapshot of this array. `None` when an element has no
+    /// specification value at all, which keeps a clause unmonitorable rather
+    /// than silently guessing one.
+    fn to_spec(&self) -> Option<SpecArray> {
+        let values = self.values.iter().map(spec_of).collect::<Option<Vec<_>>>()?;
+        Some(SpecArray::new(self.payload, values))
     }
 }
 
@@ -1762,9 +1733,9 @@ impl<'a> Interp<'a> {
         {
             match (&v, p.ty) {
                 (RtVal::Arr(a), Ty::Array(_, Mutability::Mut)) => {
-                    frame
-                        .olds
-                        .insert(p.name.clone(), SpecVal::Arr(a.borrow().to_spec()));
+                    if let Some(snapshot) = a.borrow().to_spec() {
+                        frame.olds.insert(p.name.clone(), SpecVal::Arr(snapshot));
+                    }
                 }
                 // `&mut C`: the borrow shares storage with the caller, so
                 // the bare name reads the current state and `old p` needs
@@ -3477,7 +3448,7 @@ impl<'a> Interp<'a> {
                     let RtVal::Arr(array) = self.eval_moved(inner, frame)? else {
                         unreachable!("checked: affine Boolean-array option payload")
                     };
-                    debug_assert!(matches!(&*array.borrow(), RtArray::Bool(_)));
+                    debug_assert_eq!(array.borrow().payload(), ValueTy::Bool);
                     Ok(RtVal::AffineOptBoolArray(Some(array)))
                 }
                 _ => unreachable!("checked: option construction"),
@@ -3790,7 +3761,7 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
     Some(match v {
         RtVal::Int(n) => SpecVal::Int(*n),
         RtVal::Bool(b) => SpecVal::Bool(*b),
-        RtVal::Arr(a) => SpecVal::Arr(a.borrow().to_spec()),
+        RtVal::Arr(a) => SpecVal::Arr(a.borrow().to_spec()?),
         RtVal::Opt { payload, value } => SpecVal::Opt {
             payload: Some(*payload),
             value: match value {
@@ -3799,7 +3770,10 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
             },
         },
         RtVal::AffineOptBoolArray(value) => SpecVal::AffineOptBoolArray {
-            value: value.as_ref().map(|array| array.borrow().to_spec()),
+            value: match value {
+                Some(array) => Some(array.borrow().to_spec()?),
+                None => None,
+            },
         },
         RtVal::PtrOpt(_) => return None,
         RtVal::Obj { fields, .. } => SpecVal::Obj(
@@ -3842,6 +3816,38 @@ fn stmt_span(stmt: &Stmt) -> crate::span::Span {
         Stmt::FieldAssign { field_span, .. } => *field_span,
         Stmt::FieldStore { field_span, .. } => *field_span,
     }
+}
+
+/// Payload-tagged constructors for tests, mirroring the spec-side helpers:
+/// a probe states the payload it means instead of relying on an element
+/// representation to imply one.
+#[cfg(test)]
+pub(crate) fn rt_bools(values: &[bool]) -> RtArray {
+    RtArray::from_values(
+        ValueTy::Bool,
+        values.iter().copied().map(RtVal::Bool).collect(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn rt_ints(payload: IntTy, values: &[i128]) -> RtArray {
+    RtArray::from_values(
+        ValueTy::Int(payload),
+        values.iter().copied().map(RtVal::Int).collect(),
+    )
+}
+
+/// The Boolean elements of an array, for assertions about contents rather
+/// than representation.
+#[cfg(test)]
+pub(crate) fn rt_bools_of(array: &RtArray) -> Vec<bool> {
+    array
+        .iter()
+        .map(|value| match value {
+            RtVal::Bool(value) => *value,
+            other => panic!("expected a Boolean element, found {other:?}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4172,7 +4178,7 @@ mod g1_payload_guard_tests {
 
     #[test]
     fn affine_presence_is_nonconsuming_and_take_clears_the_slot_atomically() {
-        let array = Rc::new(RefCell::new(RtArray::Bool(vec![true, false])));
+        let array = Rc::new(RefCell::new(rt_bools(&[true, false])));
         let option = affine_option(Some(array.clone()));
         let mut frame = frame_with(HashMap::from([("pending".into(), option)]));
 
@@ -4216,7 +4222,7 @@ mod g1_payload_guard_tests {
 
     #[test]
     fn dropping_an_affine_option_releases_a_present_payload_once() {
-        let array = Rc::new(RefCell::new(RtArray::Bool(vec![true])));
+        let array = Rc::new(RefCell::new(rt_bools(&[true])));
         let mut frame = frame_with(HashMap::from([(
             "pending".into(),
             affine_option(Some(array.clone())),
@@ -4265,7 +4271,7 @@ mod g1_payload_guard_tests {
 
     #[test]
     fn affine_option_snapshots_detach_proof_data_from_runtime_ownership() {
-        let array = Rc::new(RefCell::new(RtArray::Bool(vec![true, false])));
+        let array = Rc::new(RefCell::new(rt_bools(&[true, false])));
         let mut option = affine_option(Some(array.clone()));
         let snapshot = spec_of(&option).expect("monitor snapshot");
         let RtVal::AffineOptBoolArray(value) = &mut option else {
@@ -4278,14 +4284,14 @@ mod g1_payload_guard_tests {
         assert_eq!(
             snapshot,
             SpecVal::AffineOptBoolArray {
-                value: Some(SpecArray::Bool(vec![true, false])),
+                value: Some(crate::speceval::spec_bools(&[true, false])),
             }
         );
     }
 
     #[test]
     fn dropping_an_array_place_removes_its_binding_and_releases_its_rc() {
-        let storage = Rc::new(RefCell::new(RtArray::Bool(vec![true])));
+        let storage = Rc::new(RefCell::new(rt_bools(&[true])));
         let mut frame = frame_with(HashMap::from([(
             "flags".into(),
             RtVal::Arr(storage.clone()),
@@ -4304,10 +4310,7 @@ mod g1_payload_guard_tests {
 
     #[test]
     fn eval_moved_takes_an_owned_integer_array_place() {
-        let storage = Rc::new(RefCell::new(RtArray::Int {
-            payload: IntTy::U64,
-            values: vec![7],
-        }));
+        let storage = Rc::new(RefCell::new(rt_ints(IntTy::U64, &[7])));
         let mut frame = frame_with(HashMap::from([(
             "values".into(),
             RtVal::Arr(storage.clone()),
@@ -4625,10 +4628,8 @@ mod g1_payload_guard_tests {
         let RtVal::Arr(values) = eval_with_empty_runtime(&literal).unwrap() else {
             panic!("expected an array")
         };
-        assert!(matches!(
-            &*values.borrow(),
-            RtArray::Bool(values) if values == &[true, false]
-        ));
+        assert_eq!(values.borrow().payload(), ValueTy::Bool);
+        assert_eq!(rt_bools_of(&values.borrow()), vec![true, false]);
 
         let allocated = expr(
             ExprKind::AllocArray {
@@ -4658,15 +4659,13 @@ mod g1_payload_guard_tests {
             Ok(RtVal::Bool(false))
         ));
 
-        let empty = RtVal::Arr(Rc::new(RefCell::new(RtArray::Bool(Vec::new()))));
-        assert_eq!(
-            spec_of(&empty),
-            Some(SpecVal::Arr(SpecArray::Bool(Vec::new())))
-        );
+        let empty = RtVal::Arr(Rc::new(RefCell::new(rt_bools(&[]))));
+        assert_eq!(spec_of(&empty), Some(SpecVal::Arr(crate::speceval::spec_bools(&[]))));
         let RtVal::Arr(copied) = deep_copy(&empty) else {
             panic!("expected copied array")
         };
-        assert!(matches!(&*copied.borrow(), RtArray::Bool(values) if values.is_empty()));
+        assert_eq!(copied.borrow().payload(), ValueTy::Bool);
+        assert_eq!(copied.borrow().len(), 0);
     }
 
     #[test]
