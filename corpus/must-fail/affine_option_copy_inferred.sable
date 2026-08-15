@@ -1,0 +1,9 @@
+// expect-error: option.affine_temporary
+// Reading an owning option by name is the copy every other option rule is
+// allowed to make. It is refused at the read itself, so an inferred binding
+// cannot acquire the payload by never naming a type.
+
+fn copy_owner_through_inference(u64 n) {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, false));
+    var alias = pending;
+}

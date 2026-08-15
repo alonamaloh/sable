@@ -14,7 +14,7 @@
 //! a root file covers the whole import DAG (separate verification with
 //! Lean-level imports is the next slice).
 
-use crate::ast::{AffineOptionTy, Program, ResKind, Ty, UseDecl};
+use crate::ast::{Program, ResKind, Ty, UseDecl};
 use crate::diag::Diagnostic;
 use crate::span::{LineMap, Span};
 use crate::{lexer, parser, scan};
@@ -351,9 +351,6 @@ pub(crate) fn walk_ty(
             }
         }
         Ty::Array(element, _) | Ty::Option(element) => {
-            walk_ty(element, span, externs, record_externs, refs)
-        }
-        Ty::AffineOption(AffineOptionTy::Array(element)) => {
             walk_ty(element, span, externs, record_externs, refs)
         }
         Ty::Int(_) | Ty::Param(_) | Ty::Bool | Ty::Raw(_) | Ty::Unit => {}

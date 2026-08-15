@@ -126,7 +126,7 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
     for param in &f.params {
         validate_parameter_ty(&param.ty, &format!("parameter `{}`", param.name))?;
     }
-    if matches!(f.ret, Ty::AffineOption(_)) {
+    if f.ret.is_affine_option() {
         return Err(affine_option_unsupported(
             f.ret.clone(),
             &format!("return type of `{}`", f.name),
@@ -168,10 +168,15 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
 /// any gate seeing it (ADR 0064). Its leaves are the payload gates below,
 /// which are allow-lists and never recurse.
 pub(crate) fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
+    // An option whose present case owns is refused here rather than by the
+    // copyable-option payload gate below, which would name the wrong rule
+    // for a shape its lowering never handles.
+    if ty.is_affine_option() {
+        return Err(affine_option_unsupported(ty, context));
+    }
     match ty {
-        Ty::AffineOption(_) => Err(affine_option_unsupported(ty, context)),
-        Ty::Array(payload, _) => validate_array_payload(*payload, context),
-        Ty::Option(payload) => validate_option_payload(*payload, context),
+        Ty::Array(payload, _) => validate_array_payload(&payload, context),
+        Ty::Option(payload) => validate_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "svm.type_parameter_unsupported: {context} contains an unresolved type parameter"
         )),
@@ -195,7 +200,7 @@ pub(crate) fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
 /// and what a call boundary may transport are separate questions, and the
 /// machine answers them separately for the same type.
 pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String> {
-    if matches!(ty, Ty::AffineOption(_)) {
+    if ty.is_affine_option() {
         return Err(affine_option_unsupported(ty.clone(), context));
     }
     validate_ty_payload(ty.clone(), context)?;
@@ -214,7 +219,7 @@ pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String
 }
 
 fn affine_option_unsupported(ty: Ty, context: &str) -> String {
-    debug_assert!(matches!(ty, Ty::AffineOption(_)));
+    debug_assert!(ty.is_affine_option());
     format!(
         "svm.affine_option_unsupported: {context} has type `{}`; the formal SVM admits only explicit mutable local `option<[bool]>` construction, named `.is_some`, and atomic `.take` into a fresh owned Boolean-array local",
         ty.name()
@@ -228,7 +233,7 @@ fn affine_option_take_position(option: &str) -> String {
 }
 
 fn affine_bool_option_ty() -> Ty {
-    Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
+    Ty::affine_array_option(Ty::Bool)
 }
 
 fn is_affine_bool_option(ty: &Ty) -> bool {
@@ -237,38 +242,33 @@ fn is_affine_bool_option(ty: &Ty) -> bool {
 
 fn reject_named_affine_option(ctx: &LowerCtx<'_>, name: &str, context: &str) -> Result<(), String> {
     if let Some(binding) = ctx.local(name) {
-        if matches!(binding.ty, Ty::AffineOption(_)) {
+        if binding.ty.is_affine_option() {
             return Err(affine_option_unsupported(binding.ty, context));
         }
     }
     Ok(())
 }
 
-/// May the formal machine lower an array with this payload, and if so, the
-/// checked type of one element.
+/// May the formal machine lower an array with this payload.
 ///
 /// A gate: an allow-list ending in a named refusal, which never recurses. The
 /// allow-list is the Rust mirror of `Val.tag?` in `lean/Sable/SVM.lean` — the
 /// machine's element tag is `int | bool`, and this is where that fact is
 /// enforced on the way in.
 ///
-/// Validation and lowering are one function on purpose. A separate lowering
-/// beside the validator is a second entry point nothing guards, which is
-/// exactly how a refusal turns into a silent acceptance.
-pub(crate) fn array_element_ty(payload: Ty, context: &str) -> Result<Ty, String> {
+/// It answers yes or a named error and nothing else, so there is exactly one
+/// entry point: an array holds a full `Ty`, and the type of one element is the
+/// payload its holder already has.
+pub(crate) fn validate_array_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload {
-        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
-        Ty::Bool => Ok(Ty::Bool),
+        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
+        Ty::Bool => Ok(()),
         _ => Err(format!(
             "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
              the SVM currently lowers only concrete integer and Boolean payloads",
             payload.name()
         )),
     }
-}
-
-fn validate_array_payload(payload: Ty, context: &str) -> Result<(), String> {
-    array_element_ty(payload, context).map(|_| ())
 }
 
 fn bool_array_ty(ty: &Ty) -> bool {
@@ -305,7 +305,7 @@ fn resolve_array(
     operation: &str,
 ) -> Result<(Ty, Mutability, bool), String> {
     let binding = ctx.initialized_local(array, operation)?;
-    if matches!(binding.ty, Ty::AffineOption(_)) {
+    if binding.ty.is_affine_option() {
         return Err(affine_option_unsupported(
             binding.ty,
             &format!("{operation} source `{array}`"),
@@ -317,7 +317,7 @@ fn resolve_array(
             binding.ty.name()
         ));
     };
-    validate_array_payload((*payload).clone(), &format!("{operation} of `{array}`"))?;
+    validate_array_payload(&payload, &format!("{operation} of `{array}`"))?;
     Ok((*payload, mutability, binding.mutable))
 }
 
@@ -328,10 +328,9 @@ fn validate_array_index(
     index: &Expr,
 ) -> Result<(), String> {
     let (payload, _, _) = resolve_array(ctx, array, "array index")?;
-    let element = array_element_ty(payload, "array index result")?;
     require_expr_annotation(
         expr,
-        element,
+        payload,
         "svm.array_index_result_type",
         "array index result",
     )?;
@@ -356,15 +355,15 @@ fn validate_alloc_array(
     len: &Expr,
     init: &Expr,
 ) -> Result<(), String> {
-    let element = array_element_ty(elem.clone(), "alloc_array")?;
+    validate_array_payload(&elem, "alloc_array")?;
     require_expr_annotation(
         expr,
-        Ty::Array(Box::new(elem), Mutability::Owned),
+        Ty::Array(Box::new(elem.clone()), Mutability::Owned),
         "svm.array_alloc_result_type",
         "alloc_array result",
     )?;
     validate_sink_type(ctx, Ty::Int(IntTy::U64), len, "alloc_array length")?;
-    validate_sink_type(ctx, element, init, "alloc_array initializer")?;
+    validate_sink_type(ctx, elem, init, "alloc_array initializer")?;
     validate_expr_payloads(ctx, len)?;
     validate_expr_payloads(ctx, init)
 }
@@ -399,12 +398,12 @@ fn validate_array_literal(
             );
         }
     };
-    let element = array_element_ty(*payload.clone(), "array literal")?;
+    validate_array_payload(payload, "array literal")?;
     validate_array_literal_len(*payload.clone(), elements.len())?;
     for (index, value) in elements.iter().enumerate() {
         validate_sink_type(
             ctx,
-            element.clone(),
+            (**payload).clone(),
             value,
             &format!("array literal element {}", index + 1),
         )?;
@@ -502,7 +501,7 @@ fn validate_affine_option_take(
     }
     let source = ctx.initialized_local(option, "affine-option take")?;
     if !is_affine_bool_option(&source.ty) {
-        return if matches!(source.ty, Ty::AffineOption(_)) {
+        return if source.ty.is_affine_option() {
             Err(affine_option_unsupported(
                 source.ty,
                 &format!("`.take` source `{option}`"),
@@ -580,12 +579,7 @@ fn validate_array_store(
         ));
     }
     validate_sink_type(ctx, Ty::Int(IntTy::U64), index, "array store index")?;
-    validate_sink_type(
-        ctx,
-        array_element_ty(payload, "array store value")?,
-        value,
-        "array store value",
-    )?;
+    validate_sink_type(ctx, payload, value, "array store value")?;
     validate_expr_payloads(ctx, index)?;
     validate_expr_payloads(ctx, value)
 }
@@ -617,7 +611,7 @@ fn semantic_expr_ty(
     expected: Ty,
     context: &str,
 ) -> Result<Ty, String> {
-    if let Some(ty @ Ty::AffineOption(_)) = &expr.ty {
+    if let Some(ty) = expr.ty.as_ref().filter(|ty| ty.is_affine_option()) {
         return Err(affine_option_unsupported(ty.clone(), context));
     }
     let semantic = match &expr.kind {
@@ -761,7 +755,7 @@ fn semantic_expr_ty(
         ExprKind::Index { array, index, .. } => {
             validate_array_index(ctx, expr, array, index)?;
             let (payload, _, _) = resolve_array(ctx, array, "array index")?;
-            array_element_ty(payload, "array index result")?
+            payload
         }
         ExprKind::Len { array } => {
             resolve_array(ctx, array, "array length")?;
@@ -773,7 +767,7 @@ fn semantic_expr_ty(
         ExprKind::SomeE(inner) => {
             let repr = svm_option_repr(expr, "some")?;
             let payload = match repr {
-                SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+                SvmOptionRepr::Ordinary(payload) => payload,
                 SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
                 SvmOptionRepr::AffineBoolArray => {
                     unreachable!(
@@ -794,7 +788,7 @@ fn semantic_expr_ty(
         }
         ExprKind::OptValue { operand } => {
             match validate_option_accessor(ctx, expr, operand, true)? {
-                SvmOptionRepr::Ordinary(payload) => ordinary_option_payload_ty(payload)?,
+                SvmOptionRepr::Ordinary(payload) => payload,
                 SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
                 SvmOptionRepr::AffineBoolArray => {
                     unreachable!("affine options have no copying `.value` accessor")
@@ -1052,7 +1046,9 @@ fn validate_allocation_size(ctx: &LowerCtx<'_>, size: &Expr, context: &str) -> R
     Ok(())
 }
 
-fn validate_option_payload(payload: Ty, context: &str) -> Result<(), String> {
+/// May the formal machine lower a copyable option with this payload. A gate
+/// on the same terms as `validate_array_payload`.
+pub(crate) fn validate_option_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
@@ -1066,6 +1062,9 @@ fn validate_option_payload(payload: Ty, context: &str) -> Result<(), String> {
 
 #[derive(Clone)]
 enum SvmOptionRepr {
+    /// The payload of a copyable option, which is also the type of its present
+    /// case. Every construction of this variant runs `validate_option_payload`
+    /// first, so holding one is the evidence that the payload is admitted.
     Ordinary(Ty),
     RawRecord(usize),
     AffineBoolArray,
@@ -1077,15 +1076,15 @@ enum SvmOptionRepr {
 /// the source checker could never produce.
 fn svm_option_repr(expr: &Expr, constructor: &str) -> Result<SvmOptionRepr, String> {
     match &expr.ty {
-        Some(Ty::Option(payload)) => {
-            validate_option_payload(*payload.clone(), &format!("`{constructor}` result"))?;
-            Ok(SvmOptionRepr::Ordinary(*payload.clone()))
-        }
-        Some(Ty::OptionRaw(record)) => Ok(SvmOptionRepr::RawRecord(*record)),
-        Some(ty @ Ty::AffineOption(_)) => Err(affine_option_unsupported(
+        Some(ty) if ty.is_affine_option() => Err(affine_option_unsupported(
             ty.clone(),
             &format!("`{constructor}` result"),
         )),
+        Some(Ty::Option(payload)) => {
+            validate_option_payload(payload, &format!("`{constructor}` result"))?;
+            Ok(SvmOptionRepr::Ordinary(*payload.clone()))
+        }
+        Some(Ty::OptionRaw(record)) => Ok(SvmOptionRepr::RawRecord(*record)),
         Some(ty) => Err(format!(
             "svm.option_constructor_type: `{constructor}` result has type `{}`; \
              expected an ordinary or nullable-raw option annotation",
@@ -1098,25 +1097,10 @@ fn svm_option_repr(expr: &Expr, constructor: &str) -> Result<SvmOptionRepr, Stri
     }
 }
 
-/// May the formal machine lower a copyable option with this payload, and if
-/// so, the checked type of the present case. A gate on the same terms as
-/// `array_element_ty`.
-pub(crate) fn ordinary_option_payload_ty(payload: Ty) -> Result<Ty, String> {
-    match payload {
-        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(Ty::Int(integer)),
-        Ty::Bool => Ok(Ty::Bool),
-        _ => Err(format!(
-            "svm.aggregate_payload_unsupported: option constructor has payload `{}`; \
-             the SVM currently lowers only concrete integer and Boolean option payloads",
-            payload.name()
-        )),
-    }
-}
-
 fn validate_some_constructor(expr: &Expr, inner: &Expr) -> Result<SvmOptionRepr, String> {
     let repr = svm_option_repr(expr, "some")?;
     let expected = match repr {
-        SvmOptionRepr::Ordinary(ref payload) => ordinary_option_payload_ty(payload.clone())?,
+        SvmOptionRepr::Ordinary(ref payload) => payload.clone(),
         SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
         SvmOptionRepr::AffineBoolArray => {
             return Err(
@@ -1164,18 +1148,15 @@ fn validate_option_accessor(
 ) -> Result<SvmOptionRepr, String> {
     let accessor = if value { ".value" } else { ".is_some" };
     let repr = match &operand.ty {
-        Some(Ty::Option(payload)) => {
-            validate_option_payload(*payload.clone(), "option accessor operand")?;
-            SvmOptionRepr::Ordinary(*payload.clone())
-        }
-        Some(Ty::OptionRaw(record)) => SvmOptionRepr::RawRecord(*record),
-        Some(ty @ Ty::AffineOption(_)) if value => {
+        // The owning family is classified first: `.value` on it is a copy,
+        // and the ordinary arm below would hand it the copying lowering.
+        Some(ty) if ty.is_affine_option() && value => {
             return Err(affine_option_unsupported(
                 ty.clone(),
                 "copying `.value` accessor operand",
             ));
         }
-        Some(ty @ Ty::AffineOption(_)) if is_affine_bool_option(&ty.clone()) => {
+        Some(ty) if is_affine_bool_option(ty) => {
             let ExprKind::Var(name) = &operand.kind else {
                 return Err(
                     "svm.affine_option_temporary: `.is_some` requires a named affine-option local"
@@ -1197,12 +1178,17 @@ fn validate_option_accessor(
             }
             SvmOptionRepr::AffineBoolArray
         }
-        Some(ty @ Ty::AffineOption(_)) => {
+        Some(ty) if ty.is_affine_option() => {
             return Err(affine_option_unsupported(
                 ty.clone(),
                 &format!("`{accessor}` operand"),
             ));
         }
+        Some(Ty::Option(payload)) => {
+            validate_option_payload(payload, "option accessor operand")?;
+            SvmOptionRepr::Ordinary(*payload.clone())
+        }
+        Some(Ty::OptionRaw(record)) => SvmOptionRepr::RawRecord(*record),
         Some(ty) => {
             return Err(format!(
                 "svm.option_accessor_operand: `{accessor}` operand has type `{}`; \
@@ -1219,7 +1205,7 @@ fn validate_option_accessor(
     };
     let expected = if value {
         match repr {
-            SvmOptionRepr::Ordinary(ref payload) => ordinary_option_payload_ty(payload.clone())?,
+            SvmOptionRepr::Ordinary(ref payload) => payload.clone(),
             SvmOptionRepr::RawRecord(record) => Ty::RawRecord(record),
             SvmOptionRepr::AffineBoolArray => {
                 unreachable!("affine options have no copying `.value` accessor")
@@ -1259,7 +1245,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                 &format!("{context} parameter `{}`", parameter.name),
             )?;
         }
-        if matches!(function.ret, Ty::AffineOption(_)) {
+        if function.ret.is_affine_option() {
             return Err(affine_option_unsupported(
                 function.ret.clone(),
                 &format!("{context} return type"),
@@ -1272,7 +1258,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         }
         if trait_member {
             if let Ty::Option(payload) = &function.ret {
-                validate_option_payload(*payload.clone(), context)?;
+                validate_option_payload(payload, context)?;
                 return Err(format!(
                     "svm.option_position_unsupported: {context} returns an ordinary option; \
                      trait option returns are not in the SVM model"
@@ -1293,7 +1279,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
     }
     for class in program.classes.iter().chain(&program.class_templates) {
         for field in &class.fields {
-            if matches!(field.ty, Ty::AffineOption(_)) {
+            if field.ty.is_affine_option() {
                 return Err(affine_option_unsupported(
                     field.ty.clone(),
                     &format!("class `{}.{}` field", class.name, field.name),
@@ -1306,7 +1292,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                 ));
             }
             if let Ty::Option(payload) = &field.ty {
-                validate_option_payload(*payload.clone(), &format!("class `{}`", class.name))?;
+                validate_option_payload(payload, &format!("class `{}`", class.name))?;
                 return Err(format!(
                     "svm.option_position_unsupported: class `{}.{}` has an option-typed field; \
                      option-valued fields are not in the SVM model",
@@ -1342,7 +1328,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
         let mut field_names = HashSet::new();
         let mut extents: Vec<(i128, i128, &str)> = Vec::new();
         for field in &record.fields {
-            if matches!(field.ty, Ty::AffineOption(_)) {
+            if field.ty.is_affine_option() {
                 return Err(affine_option_unsupported(
                     field.ty.clone(),
                     &format!("record `{}.{}` field", record.name, field.name),
@@ -1516,7 +1502,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 mutable,
                 ..
             } => {
-                if matches!(ty, Ty::AffineOption(_)) {
+                if ty.is_affine_option() {
                     validate_affine_bool_option_decl(
                         ctx,
                         name,
@@ -1551,7 +1537,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                         "svm.local_type: assignment targets immutable local `{name}`"
                     ));
                 }
-                if matches!(binding.ty, Ty::AffineOption(_)) {
+                if binding.ty.is_affine_option() {
                     return Err(affine_option_unsupported(
                         binding.ty,
                         &format!("whole-option assignment to `{name}`"),
@@ -1620,7 +1606,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                         "svm.affine_option_take_position: inferred declaration `{name}` cannot receive `.take`; use an explicit owned `[bool]` declaration"
                     ));
                 }
-                if matches!(ty, Ty::AffineOption(_)) {
+                if ty.is_affine_option() {
                     return Err(affine_option_unsupported(
                         ty.clone(),
                         &format!("inferred declaration `{name}`"),
@@ -2027,14 +2013,14 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
     if let Some(parameter) = f
         .params
         .iter()
-        .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+        .find(|parameter| parameter.ty.is_affine_option())
     {
         return Err(affine_option_unsupported(
             parameter.ty.clone(),
             &format!("parameter `{}`", parameter.name),
         ));
     }
-    if matches!(f.ret, Ty::AffineOption(_)) {
+    if f.ret.is_affine_option() {
         return Err(affine_option_unsupported(
             f.ret.clone(),
             &format!("return type of `{}`", f.name),
@@ -2119,7 +2105,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             mutable,
             init,
             ..
-        } if matches!(ty, Ty::AffineOption(_)) => {
+        } if ty.is_affine_option() => {
             validate_affine_bool_option_decl(ctx, name, ty.clone(), *mutable, init.as_ref())?;
             let lowered =
                 lower_affine_bool_option_bind(ctx, name, ty.clone(), *mutable, init.as_ref())?;
@@ -2193,7 +2179,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             init: _,
             ty: Some(ty),
             ..
-        } if matches!(ty, Ty::AffineOption(_)) => {
+        } if ty.is_affine_option() => {
             return Err(affine_option_unsupported(
                 ty.clone(),
                 &format!("inferred declaration `{name}`"),
@@ -2350,7 +2336,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                     "svm.local_type: assignment targets immutable local `{name}`"
                 ));
             }
-            if matches!(binding.ty, Ty::AffineOption(_)) {
+            if binding.ty.is_affine_option() {
                 return Err(affine_option_unsupported(
                     binding.ty,
                     &format!("whole-option assignment to `{name}`"),
@@ -3885,8 +3871,8 @@ mod tests {
     #[test]
     fn affine_option_lowering_is_local_atomic_and_fail_closed() {
         let program = empty_program();
-        let affine_bool = Ty::AffineOption(AffineOptionTy::array(Ty::Bool));
-        let affine_integer = Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)));
+        let affine_bool = Ty::affine_array_option(Ty::Bool);
+        let affine_integer = Ty::affine_array_option(Ty::Int(IntTy::I32));
         let bool_array = Ty::array(Ty::Bool, Mutability::Owned);
 
         for ty in [affine_bool.clone(), affine_integer.clone()] {

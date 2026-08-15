@@ -10,8 +10,8 @@
 
 use crate::VerifiedProgram;
 use crate::ast::{
-    AffineOptionTy, BinOp, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl,
-    SelfKind, Stmt, Ty, UnOp,
+    BinOp, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl, SelfKind, Stmt,
+    Ty, UnOp,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -174,7 +174,7 @@ fn select_callables(
         if let Some(parameter) = function
             .params
             .iter()
-            .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+            .find(|parameter| parameter.ty.is_affine_option())
         {
             return Err(vec![affine_option_unsupported(
                 parameter.span,
@@ -182,7 +182,7 @@ fn select_callables(
                 parameter.ty.clone(),
             )]);
         }
-        if matches!(function.ret, Ty::AffineOption(_)) {
+        if function.ret.is_affine_option() {
             return Err(vec![affine_option_unsupported(
                 function.name_span,
                 "LLVM entry return type",
@@ -604,7 +604,7 @@ fn validate_function(
     if let Some(parameter) = function
         .params
         .iter()
-        .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+        .find(|parameter| parameter.ty.is_affine_option())
     {
         return Err(vec![affine_option_unsupported(
             parameter.span,
@@ -612,7 +612,7 @@ fn validate_function(
             parameter.ty.clone(),
         )]);
     }
-    if matches!(function.ret, Ty::AffineOption(_)) {
+    if function.ret.is_affine_option() {
         return Err(vec![affine_option_unsupported(
             function.name_span,
             "function return type",
@@ -892,7 +892,7 @@ fn validate_block(
                 init,
                 mutable,
             } => {
-                if matches!(ty, Ty::AffineOption(_)) {
+                if ty.is_affine_option() {
                     validate_affine_bool_option_decl(
                         program,
                         name,
@@ -980,7 +980,7 @@ fn validate_block(
                     )?;
                     continue;
                 }
-                if matches!(ty, Ty::AffineOption(_)) {
+                if ty.is_affine_option() {
                     return Err(vec![affine_option_unsupported(
                         *name_span,
                         "inferred local",
@@ -1058,7 +1058,7 @@ fn validate_block(
                     locals.moved_classes.remove(name);
                     continue;
                 }
-                if matches!(local.ty, Ty::AffineOption(_)) {
+                if local.ty.is_affine_option() {
                     return Err(vec![affine_option_unsupported(
                         *name_span,
                         &format!("whole-option assignment to `{name}`"),
@@ -1863,7 +1863,7 @@ fn validate_fixed_class_field_base(
 }
 
 fn affine_bool_option_ty() -> Ty {
-    Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
+    Ty::affine_array_option(Ty::Bool)
 }
 
 fn is_affine_bool_option(ty: &Ty) -> bool {
@@ -1877,7 +1877,7 @@ fn reject_named_affine_option(
     role: &str,
 ) -> Result<(), Vec<BackendError>> {
     if let Some(local) = locals.get(name) {
-        if matches!(local.ty, Ty::AffineOption(_)) {
+        if local.ty.is_affine_option() {
             return Err(vec![affine_option_unsupported(span, role, local.ty)]);
         }
     }
@@ -1983,7 +1983,7 @@ fn validate_affine_option_take(
         )]);
     };
     if !is_affine_bool_option(&source.ty) {
-        return if matches!(source.ty, Ty::AffineOption(_)) {
+        return if source.ty.is_affine_option() {
             Err(vec![affine_option_unsupported(
                 option_span,
                 &format!("`.take` source `{option}`"),
@@ -2567,11 +2567,11 @@ fn validate_expr(
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     if let ExprKind::IsSome { operand } = &expression.kind {
-        if matches!(operand.ty, Some(Ty::AffineOption(_))) {
+        if operand.ty.as_ref().is_some_and(Ty::is_affine_option) {
             return validate_affine_option_is_some(expression, operand, locals);
         }
     }
-    if let Some(ty @ Ty::AffineOption(_)) = &expression.ty {
+    if let Some(ty) = expression.ty.as_ref().filter(|ty| ty.is_affine_option()) {
         return Err(vec![affine_option_unsupported(
             expression.span,
             "expression",
@@ -2839,7 +2839,7 @@ fn validate_expr(
             require_expr_type(expression, Ty::Bool, "`.is_some` result")
         }
         ExprKind::OptValue { operand } => {
-            if let Some(ty @ Ty::AffineOption(_)) = &operand.ty {
+            if let Some(ty) = operand.ty.as_ref().filter(|ty| ty.is_affine_option()) {
                 return Err(vec![affine_option_unsupported(
                     operand.span,
                     "copying `.value` accessor operand",
@@ -2866,7 +2866,7 @@ fn validate_expr(
                     format!("array index names unknown or out-of-scope local `{array}`"),
                 )]);
             };
-            if matches!(local.ty, Ty::AffineOption(_)) {
+            if local.ty.is_affine_option() {
                 return Err(vec![affine_option_unsupported(
                     *array_span,
                     "array index base",
@@ -2898,7 +2898,7 @@ fn validate_expr(
                     format!("array length names unknown or out-of-scope local `{array}`"),
                 )]);
             };
-            if matches!(local.ty, Ty::AffineOption(_)) {
+            if local.ty.is_affine_option() {
                 return Err(vec![affine_option_unsupported(
                     expression.span,
                     "array length base",
@@ -3064,7 +3064,7 @@ fn validate_affine_option_is_some(
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     require_expr_type(expression, Ty::Bool, "affine-option `.is_some` result")?;
-    let Some(ref ty @ Ty::AffineOption(_)) = operand.ty else {
+    let Some(ty) = operand.ty.as_ref().filter(|ty| ty.is_affine_option()) else {
         unreachable!("called only for an affine-option operand")
     };
     if !is_affine_bool_option(&ty.clone()) {
@@ -3165,7 +3165,7 @@ fn require_record_value(
         )]);
     }
     for field in &declaration.fields {
-        if matches!(field.ty, Ty::AffineOption(_)) {
+        if field.ty.is_affine_option() {
             return Err(vec![affine_option_unsupported(
                 field.span,
                 &format!("record `{}.{}` field", declaration.name, field.name),
@@ -3198,7 +3198,7 @@ pub(crate) fn require_runtime_type(
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool | Ty::Unit => Ok(()),
         Ty::Option(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
-        Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
+        ty if ty.is_affine_option() => Err(vec![affine_option_unsupported(span, role, ty)]),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
             span,
@@ -3222,7 +3222,7 @@ pub(crate) fn require_local_value(
         Ty::Bool => Ok(()),
         Ty::Option(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
         ty if is_affine_bool_option(&ty.clone()) => Ok(()),
-        Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
+        ty if ty.is_affine_option() => Err(vec![affine_option_unsupported(span, role, ty)]),
         ty if is_owned_native_array(&ty.clone()) => Ok(()),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
@@ -3279,7 +3279,7 @@ pub(crate) fn require_parameter_value(
                 )])
             }
         }
-        Ty::AffineOption(_) => Err(vec![affine_option_unsupported(span, role, ty)]),
+        ty if ty.is_affine_option() => Err(vec![affine_option_unsupported(span, role, ty)]),
         Ty::Record(record) => require_record_value(program, root_span_end, record, span, role),
         _ => Err(vec![unsupported(
             span,
@@ -3819,7 +3819,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             Ty::Class(class) | Ty::ClassRef(class, _) => {
                 self.support.require_class(self.program, class)
             }
-            Ty::AffineOption(_) => {
+            ty if ty.is_affine_option() => {
                 unreachable!("affine option escaped LLVM validation into support collection")
             }
             _ => {}
@@ -5255,7 +5255,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 })
             }
             ExprKind::IsSome { operand } => {
-                if matches!(operand.ty, Some(Ty::AffineOption(_))) {
+                if operand.ty.as_ref().is_some_and(Ty::is_affine_option) {
                     return self.emit_affine_option_is_some(operand);
                 }
                 self.support.require_option_bool();
@@ -6085,7 +6085,7 @@ pub(crate) fn llvm_ty(ty: Ty) -> String {
         Ty::Class(class) => llvm_class_ty(class),
         Ty::ClassRef(_, Mutability::Shared | Mutability::Mut) => "ptr".into(),
         Ty::Record(record) => llvm_record_ty(record),
-        Ty::AffineOption(_) => {
+        ty if ty.is_affine_option() => {
             unreachable!("affine option escaped LLVM validation into type lowering")
         }
         _ => unreachable!("type without an LLVM runtime representation validated out"),
@@ -6135,7 +6135,7 @@ pub(crate) fn type_code(ty: Ty) -> String {
         Ty::ClassRef(class, Mutability::Mut) => format!("c{class}m"),
         Ty::Class(class) => format!("c{class}o"),
         Ty::Record(record) => format!("r{record}"),
-        Ty::AffineOption(_) => {
+        ty if ty.is_affine_option() => {
             unreachable!("affine option escaped LLVM validation into symbol mangling")
         }
         _ => unreachable!("type without an LLVM runtime representation validated out"),
@@ -6540,7 +6540,7 @@ fn unsupported(span: Span, detail: impl Into<String>) -> BackendError {
 }
 
 fn affine_option_unsupported(span: Span, role: &str, ty: Ty) -> BackendError {
-    debug_assert!(matches!(ty, Ty::AffineOption(_)));
+    debug_assert!(ty.is_affine_option());
     diag(
         "backend.affine_option_unsupported",
         "affine option is outside the locals the LLVM backend lowers",
@@ -6593,8 +6593,8 @@ fn diag(
 mod tests {
     use super::*;
     use crate::ast::{
-        AffineOptionTy, ExternInfo, Field, GenericTy, Method, Param, Program, ProofReuse,
-        RecordField, SelfKind, StorageLayout, Ty, TypeArg,
+        ExternInfo, Field, GenericTy, Method, Param, Program, ProofReuse, RecordField, SelfKind,
+        StorageLayout, Ty, TypeArg,
     };
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
@@ -7238,7 +7238,7 @@ mod tests {
 
     #[test]
     fn affine_options_lower_canonical_local_state_atomic_take_and_conditional_drop() {
-        let affine_bool = Ty::AffineOption(AffineOptionTy::array(Ty::Bool));
+        let affine_bool = Ty::affine_array_option(Ty::Bool);
         let subject = function(
             "affine_local",
             Ty::Bool,
@@ -7326,7 +7326,7 @@ mod tests {
     #[test]
     fn affine_option_abi_construction_transport_and_take_fences_stay_closed() {
         let affine_bool = affine_bool_option_ty();
-        let affine_integer = Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)));
+        let affine_integer = Ty::affine_array_option(Ty::Int(IntTy::I32));
         let assert_affine_error = |errors: Vec<BackendError>| {
             assert_eq!(errors[0].name, "backend.affine_option_unsupported");
         };

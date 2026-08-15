@@ -357,7 +357,10 @@ field rather than inherit one. Lifting it out means reworking roughly 89
 `&[t]` for `Array(t, Shared)`, so the snapshot oracle covers the fold when it
 happens.
 
-**2. `AffineOptionTy` is not deleted.** `Ty::AffineOption(AffineOptionTy)`
+**2. `AffineOptionTy` is not deleted.** *(Done in ADR 0065, which also
+narrows the phrasing below: the owning family is read off the payload's
+shape — an owned array — not off `payload.is_affine()`, which would pull
+`option<class>` in and move a matrix cell.)* `Ty::AffineOption(AffineOptionTy)`
 (ADR 0060) is still a constructor separate from `Ty::Option`, with its own
 `name`, `is_concrete`, and substitution arm, and 154 sites across the
 compiler ask for it by constructor. The mechanism that would replace it is
@@ -369,7 +372,10 @@ which is a behavioural change at each one rather than a rename — a site that
 today means "the owning family" and a site that today means "not the copyable
 family" stop coinciding the moment the families merge.
 
-**3. Four validate-and-lower conversions survive.** The plan's decisive
+**3. Four validate-and-lower conversions survive.** *(Done in ADR 0066: all
+four are pure validators and their callers use the payload they hold.
+`interp::option_value_ty` does not join them — its `option<raw<Record>>` arm
+is a real lowering, and it is kept and named.)* The plan's decisive
 consequence was deleting the five per-stage `ValueTy → Ty` conversions and
 leaving a pure validator in each stage. Only `vcgen::vc_option_payload_ty` is
 gone. Four remain, now typed over `Ty` rather than `ValueTy`:

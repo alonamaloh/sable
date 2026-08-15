@@ -14,3 +14,14 @@ fn test_affine_option_none_presence() {
     mut option<[bool]> pending = none;
     /// assert #[label(none_presence)] ¬pending.is_some
 }
+
+fn test_take_leaves_no_aliasing_owner() {
+    mut option<[bool]> pending = some(alloc_array<bool>(2, false));
+    mut [bool] flags = pending.take;
+    flags[0] = true;
+    // The option is empty and the array answers to this local alone: an
+    // owning option that had kept a copy of its payload would leave a second
+    // owner of these cells behind.
+    /// assert #[label(source_empty_after_take)] ¬pending.is_some
+    /// assert #[label(payload_owned_solely)] flags.get 0 = true ∧ flags.len = 2
+}

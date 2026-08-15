@@ -418,45 +418,6 @@ fn push_length_prefixed(out: &mut String, value: &str) {
     out.push_str(value);
 }
 
-/// The ownership-carrying payload shapes represented by an affine option.
-///
-/// This is a distinct family from a copyable `option<T>`: an ordinary option
-/// duplicates its payload whenever it is duplicated, while `option<[T]>`
-/// conditionally owns array storage and therefore needs move, take, join, and
-/// destruction rules.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AffineOptionTy {
-    Array(Box<Ty>),
-}
-
-impl AffineOptionTy {
-    /// `option<[T]>` whose payload owns the array `[element]`.
-    pub fn array(element: Ty) -> AffineOptionTy {
-        AffineOptionTy::Array(Box::new(element))
-    }
-
-    /// The element type of the owned array, for the one payload family there
-    /// is. It is an accessor rather than a pattern because the payload is a
-    /// full type and therefore boxed.
-    pub fn array_element(&self) -> &Ty {
-        match self {
-            AffineOptionTy::Array(element) => element,
-        }
-    }
-
-    pub fn name(&self) -> String {
-        match self {
-            AffineOptionTy::Array(element) => format!("[{}]", element.name()),
-        }
-    }
-
-    pub fn is_concrete(&self) -> bool {
-        match self {
-            AffineOptionTy::Array(element) => element.is_concrete(),
-        }
-    }
-}
-
 /// The language's one type grammar.
 ///
 /// Every checked type is a value of this type: there is no narrower payload
@@ -489,12 +450,13 @@ pub enum Ty {
     /// type: which elements a stage will actually execute, prove, or lower is
     /// each stage's own named gate to state, not this constructor's.
     Array(Box<Ty>, Mutability),
-    /// `option<T>` for a copyable payload. The payload is a full type for the
-    /// same reason an array element is.
+    /// `option<T>`. The payload is a full type for the same reason an array
+    /// element is, so whether the option owns its present case is read off
+    /// the payload (`is_affine`) rather than encoded by the constructor. The
+    /// one payload shape that owns and is admitted anywhere is an owned
+    /// array; `as_affine_option_payload` is the question every rule that must
+    /// route the owning case away from a copy rule asks.
     Option(Box<Ty>),
-    /// An option whose present case owns an affine aggregate. It remains a
-    /// separate type family so no ordinary copy-option rule can reach it.
-    AffineOption(AffineOptionTy),
     /// `option<raw<R>>` for an explicitly laid-out record. This is an
     /// abstract nullable pointer value, not a byte representation.
     OptionRaw(usize),
@@ -968,9 +930,9 @@ impl Ty {
         Ty::Option(Box::new(payload))
     }
 
-    /// An owning `option<[element]>`.
+    /// An owning `option<[element]>`: an option over an owned array.
     pub fn affine_array_option(element: Ty) -> Ty {
-        Ty::AffineOption(AffineOptionTy::array(element))
+        Ty::option(Ty::array(element, Mutability::Owned))
     }
 
     /// The element type and binding mode of an array.
@@ -993,7 +955,7 @@ impl Ty {
         }
     }
 
-    /// The payload of a copyable option.
+    /// The payload of an option, whether or not that payload owns.
     pub fn as_option(&self) -> Option<&Ty> {
         match self {
             Ty::Option(payload) => Some(payload),
@@ -1001,12 +963,34 @@ impl Ty {
         }
     }
 
-    /// The owned array element of an ownership-bearing option.
-    pub fn as_affine_array_option(&self) -> Option<&Ty> {
+    /// The payload of an option whose present case owns storage — the whole
+    /// payload type, not its element.
+    ///
+    /// This is the single question every rule asks when it has to route the
+    /// owning case away from a rule that would copy it. It is deliberately
+    /// narrower than `self.as_option().is_some_and(Ty::is_affine)`:
+    /// `option<class>` has an owning payload too, and it belongs to the
+    /// copyable family's gates, which refuse it by their own name
+    /// (`type.option_payload_unsupported`). The owning family is the shapes
+    /// the ownership rules — move, take, join, destruction — are written for,
+    /// and that is an option over an owned array.
+    ///
+    /// A gate, not a traversal: one level, no recursion.
+    pub fn as_affine_option_payload(&self) -> Option<&Ty> {
         match self {
-            Ty::AffineOption(payload) => Some(payload.array_element()),
+            Ty::Option(payload) if payload.as_owned_array().is_some() => Some(payload),
             _ => None,
         }
+    }
+
+    /// Whether this option's present case owns storage.
+    pub fn is_affine_option(&self) -> bool {
+        self.as_affine_option_payload().is_some()
+    }
+
+    /// The owned array element of an ownership-bearing option.
+    pub fn as_affine_array_option(&self) -> Option<&Ty> {
+        self.as_affine_option_payload().and_then(Ty::as_owned_array)
     }
 
     /// Whether this is an array of exactly `element`, in any binding mode.
@@ -1023,7 +1007,7 @@ impl Ty {
         matches!(self.as_array(), Some((found, Mutability::Owned)) if found == element)
     }
 
-    /// Whether this is a copyable option of exactly `payload`.
+    /// Whether this is an option of exactly `payload`.
     pub fn is_option_of(&self, payload: &Ty) -> bool {
         matches!(self.as_option(), Some(found) if found == payload)
     }
@@ -1049,10 +1033,8 @@ impl Ty {
             Ty::Class(_) | Ty::Res(_) => true,
             Ty::Array(_, Mutability::Owned) => true,
             Ty::Array(_, Mutability::Shared | Mutability::Mut) => false,
-            // An option owns exactly when its present case does. The owning
-            // family's payload is an owned array, so it always does.
+            // An option owns exactly when its present case does.
             Ty::Option(payload) => payload.is_affine(),
-            Ty::AffineOption(_) => true,
             Ty::Int(_)
             | Ty::Bool
             | Ty::Param(_)
@@ -1102,7 +1084,6 @@ impl Ty {
             Ty::Raw(IntTy::TParam(_)) => false,
             Ty::Array(element, _) => element.is_concrete(),
             Ty::Option(payload) => payload.is_concrete(),
-            Ty::AffineOption(payload) => payload.is_concrete(),
             Ty::Int(_)
             | Ty::Bool
             | Ty::Class(_)
@@ -1128,7 +1109,6 @@ impl Ty {
         1 + match self {
             Ty::Array(element, _) => element.structural_depth(),
             Ty::Option(payload) => payload.structural_depth(),
-            Ty::AffineOption(AffineOptionTy::Array(element)) => 1 + element.structural_depth(),
             Ty::Int(_)
             | Ty::Bool
             | Ty::Param(_)
@@ -1173,7 +1153,6 @@ impl Ty {
             Ty::ResRef(k, Mutability::Mut) => format!("resource &mut {}", k.name()),
             Ty::ResRef(k, _) => format!("resource &{}", k.name()),
             Ty::Option(t) => format!("option<{}>", t.name()),
-            Ty::AffineOption(payload) => format!("option<{}>", payload.name()),
             Ty::OptionRaw(_) => "option<raw<record>>".to_string(),
             Ty::Unit => "()".to_string(),
         }
@@ -1922,38 +1901,64 @@ mod generic_ty_tests {
     }
 
     /// Affinity is computed from the shape, so it has to agree with the
-    /// constructors it replaced — for every shape, not for the ones someone
-    /// remembered. The right-hand side is the rule as it was written when
-    /// ownership was a list of constructors.
+    /// ownership rule stated on its own — for every shape, not for the ones
+    /// someone remembered. The right-hand side is that rule, written out
+    /// where a reader can compare it against the language's ownership
+    /// documentation without reading `is_affine`.
     #[test]
-    fn affinity_agrees_with_the_constructors_it_replaces() {
-        for (_, ty) in crate::shape_admission::samples() {
-            let by_constructor = matches!(
-                ty,
-                Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned) | Ty::AffineOption(_)
-            );
-            if ty.is_affine() == by_constructor {
-                continue;
+    fn affinity_agrees_with_the_ownership_rule() {
+        fn owns(ty: &Ty) -> bool {
+            match ty {
+                // A class instance and a resource are the two nominal
+                // owners; an owned array owns its storage; a borrow of
+                // either owns nothing (ADRs 0010, 0023).
+                Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned) => true,
+                // An option owns exactly when its present case does.
+                Ty::Option(payload) => owns(payload),
+                _ => false,
             }
-            // The two can disagree in exactly one place: an option whose
-            // payload owns. The constructor rule could not express that case,
-            // because a copyable option's payload could not be spelled as an
-            // owner — and the copyable-option gate still refuses it, so no
-            // reachable shape changed its answer.
-            let Ty::Option(payload) = &ty else {
-                panic!(
-                    "affinity of `{}` disagrees with the constructors it is read from",
-                    ty.name()
-                );
-            };
-            assert!(payload.is_affine(), "for `{}`", ty.name());
-            assert!(
-                crate::check::option_payload_ty((**payload).clone(), crate::span::Span::new(0, 0))
-                    .is_err(),
-                "`{}` must be refused by the copyable-option gate",
+        }
+        for (_, ty) in crate::shape_admission::samples() {
+            assert_eq!(
+                ty.is_affine(),
+                owns(&ty),
+                "affinity of `{}` disagrees with the ownership rule",
                 ty.name()
             );
         }
+    }
+
+    /// The copyable family and the owning family may not overlap.
+    ///
+    /// An option's payload is a full type, so an option can own. Every rule
+    /// that would duplicate an option reaches its payload through
+    /// `check::option_payload_ty`; every rule that moves, takes, joins, or
+    /// destroys one routes on `Ty::as_affine_option_payload`. If a single
+    /// shape were admitted by the first while owning, a copy rule would
+    /// duplicate an owner with no diagnostic — which is the failure this
+    /// whole partition exists to prevent.
+    ///
+    /// The two are not complements: `option<class>` owns and is in neither
+    /// family, because the copyable gate refuses it. That is why the owning
+    /// family is read as "the payload is an owned array" rather than as "the
+    /// payload is affine".
+    #[test]
+    fn no_owning_option_is_admitted_by_the_copyable_option_gate() {
+        let mut owning = 0;
+        for (_, ty) in crate::shape_admission::samples() {
+            let Ty::Option(payload) = &ty else { continue };
+            if !payload.is_affine() {
+                continue;
+            }
+            owning += 1;
+            assert!(
+                crate::check::option_payload_ty((**payload).clone(), crate::span::Span::new(0, 0))
+                    .is_err(),
+                "`{}` owns its payload, so the copyable-option gate must refuse it",
+                ty.name()
+            );
+        }
+        assert!(owning > 0, "the samples must contain an owning option");
     }
 
     /// The record-field allow-list, checked against the match it replaced.
@@ -2010,10 +2015,29 @@ mod generic_ty_tests {
         assert!(Ty::Bool.is_concrete());
         assert_eq!(Ty::Param(parameter).name(), "<T7>");
         assert_eq!(Ty::option(Ty::Param(parameter)).name(), "option<<T7>>");
-        let affine = AffineOptionTy::array(Ty::Param(parameter));
+        let affine = Ty::affine_array_option(Ty::Param(parameter));
         assert!(!affine.is_concrete());
-        assert_eq!(Ty::AffineOption(affine).name(), "option<[<T7>]>");
-        assert!(AffineOptionTy::array(Ty::Bool).is_concrete());
+        assert_eq!(affine.name(), "option<[<T7>]>");
+        assert!(Ty::affine_array_option(Ty::Bool).is_concrete());
+
+        // An owning option is one constructor over an owned array, and the
+        // owning family is read back off that payload.
+        let owning = Ty::affine_array_option(Ty::Bool);
+        assert_eq!(owning, Ty::option(Ty::array(Ty::Bool, Mutability::Owned)));
+        assert!(owning.is_affine());
+        assert!(owning.is_affine_option());
+        assert!(owning.is_affine_array_option_of(&Ty::Bool));
+        assert_eq!(
+            owning.as_affine_option_payload(),
+            Some(&Ty::array(Ty::Bool, Mutability::Owned))
+        );
+        // A borrowed array payload is representable and does not join the
+        // owning family: a borrow owns nothing.
+        assert!(!Ty::option(Ty::array(Ty::Bool, Mutability::Shared)).is_affine_option());
+        // Neither does an option over another owner the ownership rules are
+        // not written for; the copyable-option gate refuses it by name.
+        assert!(!Ty::option(Ty::Class(0)).is_affine_option());
+        assert!(Ty::option(Ty::Class(0)).is_affine());
 
         // Nesting is representable, and prints exactly as it is spelled. What
         // refuses these shapes is a stage gate with a name, not the grammar.

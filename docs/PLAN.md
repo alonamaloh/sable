@@ -731,7 +731,8 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      **G1.0 — representation and proof provenance (complete):** declaration
      parameters now use `Ty::Param(TypeParamId)`, and aggregate payloads carried
      a narrowed `ValueTy` until ADR 0064 made them full `Ty` values gated per
-     stage. This was an
+     stage; since ADR 0066 each of those gates answers yes or a named error and
+     nothing else, and a caller uses the payload it already holds. This was an
      internal separation of concerns, not a usable Boolean/POD feature: parser
      and checker acceptance was not widened, and concrete Boolean/record arrays
      and options remained fail-closed. Mono validates every declaration
@@ -1024,24 +1025,24 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      carry ownership and destruction correctly through present/absent aggregate
      values without widening the existing copy-option family by accident.
 
-     **G2.0 — representation/fail-closed foundation (complete):** preserve
-     `Ty::Option` for copyable payloads
-     and represent a conditionally owning array option separately as
-     `Ty::AffineOption(AffineOptionTy::Array(..))`. The parser accepts
-     `option<[T]>` for Boolean, integer, or in-scope type-parameter payloads.
-     Monomorphization must validate, substitute, and recheck that identity. The
-     checked representation also carries a record payload case, and
-     module traversal must enforce its nominal visibility for future or
-     synthetic checked-AST inputs; the surface parser does not yet construct
-     that case. Since ADR 0064 both payloads are full `Ty` values
-     (`Ty::Option(Box<Ty>)`, `AffineOptionTy::Array(Box<Ty>)`), and deleting
-     `AffineOptionTy` in favour of affinity read off the payload is recorded
-     there as remaining work.
+     **G2.0 — representation/fail-closed foundation (complete):** a
+     conditionally owning array option is a checked identity no copy-option
+     rule can reach by accident. The parser accepts `option<[T]>` for Boolean,
+     integer, or in-scope type-parameter payloads. Monomorphization must
+     validate, substitute, and recheck that identity. The checked
+     representation also carries a record payload case, and module traversal
+     must enforce its nominal visibility for future or synthetic checked-AST
+     inputs; the surface parser does not yet construct that case. Since
+     ADR 0065 `Ty::Option(Box<Ty>)` is the only option constructor and
+     ownership is computed from the payload (`option<[T]>` is an option over
+     an owned array), so each rule that would duplicate an option asks
+     `Ty::as_affine_option_payload` explicitly instead of relying on a
+     constructor it cannot name.
 
      G2.0 deliberately had no construction, accessor, move, destruction,
      proof, interpreter, machine, or native semantics. The checker, VC
      generator, interpreter, Rust-to-SVM lowerer, and LLVM emitter each rejected
-     `Ty::AffineOption` before copy-option semantics could be selected. At an
+     an owning option before copy-option semantics could be selected. At an
      otherwise-admissible direct ingress they used stable `type`, `vc`,
      `interp`, `svm`, and `backend` `affine_option_unsupported` diagnostics
      respectively. That remains the G2.0 closure claim; G2.1 opens only the

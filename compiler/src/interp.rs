@@ -354,7 +354,7 @@ fn validate_interp_fn(function: &Fn) -> Result<(), String> {
             function.name
         ));
     }
-    if matches!(function.ret, Ty::AffineOption(_)) {
+    if function.ret.is_affine_option() {
         return Err(format!(
             "interp.affine_option_position_unsupported: return type of `{}` is ownership-bearing; affine options are supported only as explicit locals",
             function.name
@@ -372,6 +372,11 @@ fn validate_interp_fn(function: &Fn) -> Result<(), String> {
 /// stored class/record field must not acquire an accidental Option ABI merely
 /// because the interpreter knows how to execute a local `option<bool>`.
 fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(), String> {
+    if ty.is_affine_option() {
+        return Err(format!(
+            "interp.affine_option_position_unsupported: {context} is ownership-bearing; `option<[bool]>` is supported only as an explicit local"
+        ));
+    }
     if matches!(ty, Ty::Option(_)) {
         return Err(format!(
             "interp.option_position_unsupported: {context} is option-valued; \
@@ -384,11 +389,6 @@ fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(),
              Boolean arrays are supported only as owned locals"
         ));
     }
-    if matches!(ty, Ty::AffineOption(_)) {
-        return Err(format!(
-            "interp.affine_option_position_unsupported: {context} is ownership-bearing; `option<[bool]>` is supported only as an explicit local"
-        ));
-    }
     validate_interp_ty(ty, context)
 }
 
@@ -398,19 +398,26 @@ fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(),
 /// compile error rather than a silently executed shape. Its leaves are the
 /// payload gates below, which are allow-lists and never recurse.
 pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
-    match ty {
-        Ty::AffineOption(ref payload) if payload.array_element() == &Ty::Bool => Ok(()),
-        Ty::AffineOption(_) => Err(format!(
+    // An option whose present case owns is answered before the copyable
+    // dispatch below: its payload gate is a different allow-list, and the
+    // copyable one would name the wrong rule.
+    if let Some(payload) = ty.as_affine_option_payload() {
+        if payload.is_owned_array_of(&Ty::Bool) {
+            return Ok(());
+        }
+        return Err(format!(
             "interp.affine_option_payload_unsupported: {context} has type `{}`; the supported affine option is exactly `option<[bool]>`",
             ty.name()
-        )),
+        ));
+    }
+    match ty {
         Ty::Array(ref element, Mutability::Owned) if element.as_ref() == &Ty::Bool => Ok(()),
         Ty::Array(ref element, _) if element.as_ref() == &Ty::Bool => Err(format!(
             "interp.array_position_unsupported: {context} is a borrowed Boolean array; \
              Boolean arrays are supported only as owned locals"
         )),
-        Ty::Array(payload, _) => validate_interp_array_payload(*payload, context),
-        Ty::Option(payload) => validate_interp_option_payload(*payload, context),
+        Ty::Array(payload, _) => validate_interp_array_payload(&payload, context),
+        Ty::Option(payload) => validate_interp_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "interp.type_parameter_unsupported: {context} contains an unresolved type parameter"
         )),
@@ -430,7 +437,7 @@ pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
 
 /// May the interpreter execute an array with this payload. A gate: an
 /// allow-list ending in a named refusal, which never recurses.
-pub(crate) fn validate_interp_array_payload(payload: Ty, context: &str) -> Result<(), String> {
+pub(crate) fn validate_interp_array_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
@@ -444,7 +451,7 @@ pub(crate) fn validate_interp_array_payload(payload: Ty, context: &str) -> Resul
 
 /// May the interpreter execute a copyable option with this payload. A gate,
 /// on the same terms as `validate_interp_array_payload`.
-pub(crate) fn validate_interp_option_payload(payload: Ty, context: &str) -> Result<(), String> {
+pub(crate) fn validate_interp_option_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
@@ -472,7 +479,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                     ));
                 }
                 validate_interp_ty(ty.clone(), &format!("declaration `{name}`"))?;
-                if matches!(ty, Ty::AffineOption(_)) {
+                if ty.is_affine_option() {
                     if !mutable {
                         return Err(format!(
                             "interp.affine_option_immutable: affine option local `{name}` must be declared `mut`"
@@ -509,7 +516,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                 let destination = interp_local_ty(locals, name).ok_or_else(|| {
                     format!("interp.unknown_local: assignment to unknown local `{name}`")
                 })?;
-                if matches!(destination, Ty::AffineOption(_)) {
+                if destination.is_affine_option() {
                     return Err(format!(
                         "interp.affine_option_assignment_unsupported: affine option `{name}` cannot be rebound"
                     ));
@@ -584,7 +591,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                     locals,
                     &format!("declaration `{name}`"),
                 )?;
-                if matches!(inferred, Ty::AffineOption(_)) {
+                if inferred.is_affine_option() {
                     return Err(format!(
                         "interp.affine_option_position_unsupported: inferred declaration `{name}` cannot own an affine option; write an explicit `option<[bool]>` declaration"
                     ));
@@ -621,14 +628,9 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                         "interp.not_array: store target `{array}` is not an array"
                     ));
                 };
-                let element_ty = value_ty(&payload).ok_or_else(|| {
-                    format!(
-                        "interp.aggregate_payload_unsupported: store target `{array}` has unsupported payload `{}`",
-                        payload.name()
-                    )
-                })?;
+                validate_interp_array_payload(&payload, &format!("store target `{array}`"))?;
                 validate_interp_sink(Ty::Int(IntTy::U64), index, locals, "array store index")?;
-                validate_interp_sink(element_ty, value, locals, "array store value")?;
+                validate_interp_sink(*payload, value, locals, "array store value")?;
             }
             Stmt::While { cond, body, .. } => {
                 validate_interp_sink(Ty::Bool, cond, locals, "while condition")?;
@@ -646,7 +648,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                 ..
             } => {
                 match interp_local_ty(locals, array) {
-                    Some(Ty::AffineOption(_)) => {
+                    Some(ref owning) if owning.is_affine_option() => {
                         return Err(format!(
                             "interp.affine_option_position_unsupported: affine option `{array}` cannot be an exposure source"
                         ));
@@ -759,7 +761,7 @@ fn validate_affine_option_initializer(
     locals: &InterpLocals,
     name: &str,
 ) -> Result<(), String> {
-    let expected = Ty::AffineOption(AffineOptionTy::array(Ty::Bool));
+    let expected = Ty::affine_array_option(Ty::Bool);
     require_cached_type(init, expected, "affine option initializer")?;
     match &init.kind {
         ExprKind::NoneE => Ok(()),
@@ -809,25 +811,15 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                 ));
             };
             validate_interp_sink(Ty::Int(IntTy::U64), index, locals, "array index")?;
-            let result_ty = value_ty(&payload).ok_or_else(|| {
-                format!(
-                    "interp.aggregate_payload_unsupported: indexed array `{array}` has unsupported payload `{}`",
-                    payload.name()
-                )
-            })?;
-            require_cached_type(expr, result_ty, "array index result")?;
+            validate_interp_array_payload(&payload, &format!("indexed array `{array}`"))?;
+            require_cached_type(expr, *payload, "array index result")?;
         }
         ExprKind::AllocArray { elem, len, init } => {
-            validate_interp_array_payload(elem.clone(), "alloc_array")?;
+            validate_interp_array_payload(elem, "alloc_array")?;
             let expected = Ty::Array(Box::new(elem.clone()), Mutability::Owned);
             require_cached_type(expr, expected, "alloc_array result")?;
             validate_interp_sink(Ty::Int(IntTy::U64), len, locals, "alloc_array length")?;
-            validate_interp_sink(
-                value_ty(elem).expect("validated concrete interpreter array payload"),
-                init,
-                locals,
-                "alloc_array initializer",
-            )?;
+            validate_interp_sink(elem.clone(), init, locals, "alloc_array initializer")?;
         }
         ExprKind::Widen { target, arg } | ExprKind::Narrow { target, arg } => {
             if matches!(target, IntTy::TParam(_)) {
@@ -885,16 +877,14 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
         },
         ExprKind::IsSome { operand } => {
             let operand_ty = semantic_interp_ty(operand, locals)?;
-            if matches!(operand_ty, Ty::AffineOption(_)) {
+            if operand_ty.is_affine_option() {
                 let ExprKind::Var(name) = &operand.kind else {
                     return Err(
                         "interp.affine_option_temporary: `.is_some` on an affine option requires a named local"
                             .into(),
                     );
                 };
-                if interp_local_ty(locals, name)
-                    != Some(Ty::AffineOption(AffineOptionTy::array(Ty::Bool)))
-                {
+                if interp_local_ty(locals, name) != Some(Ty::affine_array_option(Ty::Bool)) {
                     return Err(format!(
                         "interp.affine_option_payload_unsupported: `{name}` is not an executable `option<[bool]>` local"
                     ));
@@ -902,10 +892,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             } else {
                 validate_interp_expr(operand, locals)?;
             }
-            if !matches!(
-                operand_ty,
-                Ty::Option(_) | Ty::OptionRaw(_) | Ty::AffineOption(_)
-            ) {
+            if !matches!(operand_ty, Ty::Option(_) | Ty::OptionRaw(_)) {
                 return Err(format!(
                     "interp.option_operand: `.is_some` needs an option, found `{}`",
                     operand_ty.name()
@@ -915,7 +902,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
         }
         ExprKind::OptValue { operand } => {
             let operand_ty = semantic_interp_ty(operand, locals)?;
-            if matches!(operand_ty, Ty::AffineOption(_)) {
+            if operand_ty.is_affine_option() {
                 return Err(
                     "interp.affine_option_value_unsupported: `option<[bool]>` has no copying `.value`; use `.take`"
                         .into(),
@@ -931,7 +918,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             require_cached_type(expr, result_ty, "`.value` result")?;
         }
         ExprKind::SomeE(operand) => {
-            if matches!(expr.ty, Some(Ty::AffineOption(_))) {
+            if expr.ty.as_ref().is_some_and(Ty::is_affine_option) {
                 return Err(
                     "interp.affine_option_temporary: affine `some(...)` is valid only as an explicit local initializer"
                         .into(),
@@ -947,7 +934,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             let local = locals.get(option).ok_or_else(|| {
                 format!("interp.unknown_local: `.take` names unknown local `{option}`")
             })?;
-            if local.ty != Ty::AffineOption(AffineOptionTy::array(Ty::Bool)) {
+            if local.ty != Ty::affine_array_option(Ty::Bool) {
                 return Err(format!(
                     "interp.option_operand: `.take` needs `option<[bool]>`, found `{}`",
                     local.ty.clone().name()
@@ -1016,11 +1003,14 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                         .into(),
                 );
             };
-            validate_interp_array_payload(*payload.clone(), "array literal")?;
-            let element_ty =
-                value_ty(payload).expect("validated concrete interpreter array literal payload");
+            validate_interp_array_payload(payload, "array literal")?;
             for element in elements {
-                validate_interp_sink(element_ty.clone(), element, locals, "array literal element")?;
+                validate_interp_sink(
+                    (**payload).clone(),
+                    element,
+                    locals,
+                    "array literal element",
+                )?;
             }
         }
         ExprKind::SelfFieldIndex { index, .. } => {
@@ -1049,7 +1039,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             let ty = interp_local_ty(locals, name).ok_or_else(|| {
                 format!("interp.unknown_local: expression names unknown local `{name}`")
             })?;
-            if matches!(ty, Ty::AffineOption(_)) {
+            if ty.is_affine_option() {
                 return Err(format!(
                     "interp.affine_option_transport_unsupported: affine option local `{name}` cannot be copied or moved as an expression"
                 ));
@@ -1073,7 +1063,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             require_cached_type(expr, Ty::Int(IntTy::U64), "array length")?;
         }
         ExprKind::NoneE => {
-            if matches!(expr.ty, Some(Ty::AffineOption(_))) {
+            if expr.ty.as_ref().is_some_and(Ty::is_affine_option) {
                 return Err(
                     "interp.affine_option_temporary: affine `none` is valid only as an explicit local initializer"
                         .into(),
@@ -1090,7 +1080,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             reject_bool_array_result(expr, "field access")?;
         }
         ExprKind::Borrow { array, .. } => {
-            if matches!(interp_local_ty(locals, array), Some(Ty::AffineOption(_))) {
+            if interp_local_ty(locals, array).is_some_and(|ty| ty.is_affine_option()) {
                 return Err(format!(
                     "interp.affine_option_position_unsupported: affine option `{array}` cannot be borrowed"
                 ));
@@ -1105,21 +1095,17 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
     Ok(())
 }
 
-/// The type of a value the interpreter can hold for this container payload.
-/// An allow-list: a payload with no runtime value has none, and the caller
-/// reports that rather than inventing one.
-pub(crate) fn value_ty(payload: &Ty) -> Option<Ty> {
-    match payload {
-        Ty::Int(IntTy::TParam(_)) => None,
-        Ty::Int(integer) => Some(Ty::Int(*integer)),
-        Ty::Bool => Some(Ty::Bool),
-        _ => None,
-    }
-}
-
+/// The type of the value an option's present case holds.
+///
+/// This one genuinely lowers: a `raw<Record>` option is a nullable pointer,
+/// so its present case has type `raw<Record>` and not the option's own type.
+/// An ordinary option's present case is its payload, admitted by the same
+/// gate that admits the option itself.
 pub(crate) fn option_value_ty(option: Ty) -> Option<Ty> {
     match option {
-        Ty::Option(payload) => value_ty(&payload),
+        Ty::Option(payload) => validate_interp_option_payload(&payload, "option value")
+            .ok()
+            .map(|()| *payload),
         Ty::OptionRaw(record) => Some(Ty::RawRecord(record)),
         _ => None,
     }
@@ -1130,7 +1116,7 @@ fn reject_bool_array_named_receiver(
     locals: &InterpLocals,
     context: &str,
 ) -> Result<(), String> {
-    if matches!(interp_local_ty(locals, name), Some(Ty::AffineOption(_))) {
+    if interp_local_ty(locals, name).is_some_and(|ty| ty.is_affine_option()) {
         return Err(format!(
             "interp.affine_option_position_unsupported: {context} `{name}` is an affine option, not an object"
         ));
@@ -1168,9 +1154,10 @@ fn semantic_interp_ty(expr: &Expr, locals: &InterpLocals) -> Result<Ty, String> 
             format!("interp.unknown_local: expression names unknown local `{name}`")
         }),
         ExprKind::Index { array, .. } => match interp_local_ty(locals, array) {
-            Some(Ty::Array(payload, _)) => value_ty(&payload).ok_or_else(|| {
-                format!("interp.aggregate_payload_unsupported: `{array}` has unsupported payload")
-            }),
+            Some(Ty::Array(payload, _)) => {
+                validate_interp_array_payload(&payload, &format!("indexed local `{array}`"))?;
+                Ok(*payload)
+            }
             _ => Err(format!(
                 "interp.not_array: indexed local `{array}` is not an array"
             )),
@@ -3511,7 +3498,20 @@ impl<'a> Interp<'a> {
                 }
                 Ok(RtVal::Int(v))
             }
+            // The option's runtime representation is chosen by its payload,
+            // and the owning case is matched first: the copyable arm builds
+            // its payload with `eval`, which duplicates the value. For an
+            // owned array that would leave two owners of one allocation,
+            // and `drop_place` — which looks at the value's own constructor
+            // — would see neither of them.
             ExprKind::SomeE(inner) => match &e.ty {
+                Some(option) if option.is_affine_option() => {
+                    let RtVal::Arr(array) = self.eval_moved(inner, frame)? else {
+                        unreachable!("checked: affine Boolean-array option payload")
+                    };
+                    debug_assert_eq!(array.borrow().payload(), Ty::Bool);
+                    Ok(RtVal::AffineOptBoolArray(Some(array)))
+                }
                 Some(Ty::Option(payload)) => {
                     let value = self.eval(inner, frame)?;
                     Ok(RtVal::Opt {
@@ -3525,24 +3525,15 @@ impl<'a> Interp<'a> {
                     };
                     Ok(RtVal::PtrOpt(Some((a, o))))
                 }
-                Some(option) if option.is_affine_array_option_of(&Ty::Bool) => {
-                    let RtVal::Arr(array) = self.eval_moved(inner, frame)? else {
-                        unreachable!("checked: affine Boolean-array option payload")
-                    };
-                    debug_assert_eq!(array.borrow().payload(), Ty::Bool);
-                    Ok(RtVal::AffineOptBoolArray(Some(array)))
-                }
                 _ => unreachable!("checked: option construction"),
             },
             ExprKind::NoneE => match &e.ty {
+                Some(option) if option.is_affine_option() => Ok(RtVal::AffineOptBoolArray(None)),
                 Some(Ty::Option(payload)) => Ok(RtVal::Opt {
                     payload: *payload.clone(),
                     value: None,
                 }),
                 Some(Ty::OptionRaw(_)) => Ok(RtVal::PtrOpt(None)),
-                Some(option) if option.is_affine_array_option_of(&Ty::Bool) => {
-                    Ok(RtVal::AffineOptBoolArray(None))
-                }
                 _ => unreachable!("checked: option construction"),
             },
             ExprKind::ArrayLit(elems) => {
@@ -4027,7 +4018,7 @@ mod payload_guard_tests {
     }
 
     fn affine_bool_option() -> Ty {
-        Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
+        Ty::affine_array_option(Ty::Bool)
     }
 
     fn public_interp_error(program: &Program) -> String {

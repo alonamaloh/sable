@@ -388,8 +388,12 @@ fn lean_array_ty(element: &Ty) -> String {
     }
 }
 
-/// The Lean type of a copyable option with this payload. An allow-list, for
-/// the same reason `lean_array_ty` is.
+/// The Lean type of an option with this payload. An allow-list, for the same
+/// reason `lean_array_ty` is: a payload needs a Lean type whose proof rules
+/// were written for it, whether or not it owns.
+///
+/// The owned array payload is spelled with its parentheses because the result
+/// is one argument: `Option (Sable.Seq Bool)`, never `Option Sable.Seq Bool`.
 fn lean_option_ty(element: &Ty) -> String {
     match element {
         Ty::Bool => "Option Bool".into(),
@@ -397,27 +401,11 @@ fn lean_option_ty(element: &Ty) -> String {
             let _ = adr0009_int_model(element);
             "Option Int".into()
         }
+        owned if owned.is_owned_array_of(&Ty::Bool) => "Option (Sable.Seq Bool)".into(),
         _ => {
             refuse_vc_type(format!(
                 "internal.vcgen.lean_type_unsupported: option payload `{}` has no Lean type",
                 element.name()
-            ));
-            UNSUPPORTED_LEAN_TY.into()
-        }
-    }
-}
-
-/// The Lean type of an ownership-bearing option. An allow-list: an owned
-/// payload needs a Lean type whose proof rules were written for it.
-fn lean_affine_option_ty(payload: &AffineOptionTy) -> String {
-    match payload {
-        AffineOptionTy::Array(element) if element.as_ref() == &Ty::Bool => {
-            "Option (Sable.Seq Bool)".into()
-        }
-        _ => {
-            refuse_vc_type(format!(
-                "internal.vcgen.lean_type_unsupported: owned option payload `{}` has no Lean type",
-                payload.name()
             ));
             UNSUPPORTED_LEAN_TY.into()
         }
@@ -484,12 +472,20 @@ pub(crate) fn validate_vc_payload_ty(
 }
 
 pub(crate) fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
-    match ty {
-        Ty::AffineOption(ref payload) if payload.array_element() == &Ty::Bool => Ok(()),
-        Ty::AffineOption(_) => Err(format!(
+    // An option whose present case owns has its own proof rules, so it is
+    // answered here rather than by the copyable-option payload gate below —
+    // which would report the copyable family's refusal for a shape that
+    // family never handles.
+    if let Some(payload) = ty.as_affine_option_payload() {
+        if payload.is_owned_array_of(&Ty::Bool) {
+            return Ok(());
+        }
+        return Err(format!(
             "vc.affine_option_payload: `{}` has no affine-option proof semantics in {context}; only `option<[bool]>` is admitted",
             ty.name()
-        )),
+        ));
+    }
+    match ty {
         Ty::Param(_) if !allow_param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {context}"
         )),
@@ -542,7 +538,7 @@ pub(crate) fn validate_vc_type_position(
     // position that the checked language currently forbids.
     validate_vc_ty(ty.clone(), allow_param, context)?;
 
-    if matches!(ty, Ty::AffineOption(_)) {
+    if ty.is_affine_option() {
         let position = match position {
             VcTypePosition::Expression | VcTypePosition::Local => return Ok(()),
             VcTypePosition::Parameter => "a function parameter",
@@ -604,7 +600,7 @@ fn is_bool_array(ty: Ty) -> bool {
 }
 
 fn is_affine_bool_option(ty: Ty) -> bool {
-    ty == Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
+    ty == Ty::affine_array_option(Ty::Bool)
 }
 
 fn expr_is_bool_array(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
@@ -671,7 +667,7 @@ fn reject_affine_option_named_source(
     boundary: &str,
     context: &str,
 ) -> Result<(), String> {
-    if matches!(locals.get(name), Some(Ty::AffineOption(_))) {
+    if locals.get(name).is_some_and(Ty::is_affine_option) {
         return Err(format!(
             "vc.affine_option_boundary: affine-option local `{name}` cannot be used as {boundary} in {context}"
         ));
@@ -832,11 +828,7 @@ fn validate_vc_option_operator(
     match &expr.kind {
         ExprKind::IsSome { operand } => {
             let operand = vc_semantic_expr_ty(operand, locals, context)?;
-            if !matches!(
-                operand,
-                Ty::Option(_) | Ty::OptionRaw(_) | Ty::AffineOption(_)
-            ) || result != Ty::Bool
-            {
+            if !matches!(operand, Ty::Option(_) | Ty::OptionRaw(_)) || result != Ty::Bool {
                 return Err(format!(
                     "internal.vcgen.type_error: inconsistent `.is_some` operand/result types in {context}"
                 ));
@@ -863,9 +855,6 @@ fn validate_vc_option_operator(
             let expected = match result {
                 Ty::Option(ref payload) => payload.clone(),
                 Ty::OptionRaw(record) => Box::new(Ty::RawRecord(record)),
-                ref option if option.is_affine_array_option_of(&Ty::Bool) => {
-                    Box::new(Ty::array(Ty::Bool, Mutability::Owned))
-                }
                 _ => {
                     return Err(format!(
                         "internal.vcgen.type_error: `some` requires an option result in {context}"
@@ -877,7 +866,7 @@ fn validate_vc_option_operator(
                     "internal.vcgen.type_error: inconsistent `some` payload type in {context}"
                 ));
             }
-            if matches!(result, Ty::AffineOption(_))
+            if result.is_affine_option()
                 && !matches!(inner.kind, ExprKind::AllocArray { elem: Ty::Bool, .. })
             {
                 return Err(format!(
@@ -886,10 +875,7 @@ fn validate_vc_option_operator(
             }
         }
         ExprKind::NoneE => {
-            if !matches!(
-                result,
-                Ty::Option(_) | Ty::OptionRaw(_) | Ty::AffineOption(_)
-            ) {
+            if !matches!(result, Ty::Option(_) | Ty::OptionRaw(_)) {
                 return Err(format!(
                     "internal.vcgen.type_error: `none` requires an option result in {context}"
                 ));
@@ -944,14 +930,14 @@ fn validate_vc_expr(
         }
         ExprKind::IsSome { operand } => {
             let operand_ty = vc_semantic_expr_ty(operand, locals, context)?;
-            if matches!(operand_ty, Ty::AffineOption(_)) {
+            if operand_ty.is_affine_option() {
                 validate_vc_ty(operand_ty, allow_param, context)?;
                 let ExprKind::Var(option) = &operand.kind else {
                     return Err(format!(
                         "vc.affine_option_temporary: `.is_some` requires a named affine-option local in {context}"
                     ));
                 };
-                if !matches!(locals.get(option), Some(Ty::AffineOption(_))) {
+                if !locals.get(option).is_some_and(Ty::is_affine_option) {
                     return Err(format!(
                         "internal.vcgen.type_error: `.is_some` affine-option place is not an active local in {context}"
                     ));
@@ -967,7 +953,7 @@ fn validate_vc_expr(
             validate_vc_option_operator(expr, context, locals)
         }
         ExprKind::SomeE(operand) => {
-            if matches!(expr.ty, Some(Ty::AffineOption(_))) {
+            if expr.ty.as_ref().is_some_and(Ty::is_affine_option) {
                 validate_vc_option_operator(expr, context, locals)?;
                 validate_vc_expr(operand, allow_param, context, locals)
             } else {
@@ -1117,7 +1103,7 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::Var(name) => {
-            if matches!(locals.get(name), Some(Ty::AffineOption(_))) {
+            if locals.get(name).is_some_and(Ty::is_affine_option) {
                 return Err(format!(
                     "vc.affine_option_value: affine-option local `{name}` cannot be copied as a value in {context}"
                 ));
@@ -1194,7 +1180,7 @@ fn validate_vc_take_initializer(
             "internal.vcgen.type_error: `.take` has an inconsistent owned Boolean-array result in {context}"
         ));
     }
-    if locals.get(option) != Some(&Ty::AffineOption(AffineOptionTy::array(Ty::Bool))) {
+    if locals.get(option) != Some(&Ty::affine_array_option(Ty::Bool)) {
         return Err(format!(
             "vc.option_take_not_local: `.take` source `{option}` is not an active `option<[bool]>` local in {context}"
         ));
@@ -1234,12 +1220,12 @@ fn validate_vc_block_with_mutability(
                         "internal.vcgen.type_error: owned Boolean array local `{name}` must be initialized in {context}"
                     ));
                 }
-                if matches!(ty, Ty::AffineOption(_)) && init.is_none() {
+                if ty.is_affine_option() && init.is_none() {
                     return Err(format!(
                         "vc.affine_option_initializer: affine-option local `{name}` must be initialized in {context}"
                     ));
                 }
-                if matches!(ty, Ty::AffineOption(_)) && !*mutable {
+                if ty.is_affine_option() && !*mutable {
                     return Err(format!(
                         "vc.affine_option_immutable: affine-option local `{name}` must be mutable in {context}"
                     ));
@@ -1315,7 +1301,7 @@ fn validate_vc_block_with_mutability(
                         VcTypePosition::Local,
                         context,
                     )?;
-                    if matches!(ty, Ty::AffineOption(_)) {
+                    if ty.is_affine_option() {
                         return Err(format!(
                             "vc.affine_option_inferred: affine-option local `{name}` requires an explicit type in {context}"
                         ));
@@ -1351,7 +1337,7 @@ fn validate_vc_block_with_mutability(
             }
             Stmt::Assign { name, value, .. } => {
                 validate_vc_expr(value, allow_param, context, locals)?;
-                if matches!(locals.get(name), Some(Ty::AffineOption(_)))
+                if locals.get(name).is_some_and(Ty::is_affine_option)
                     || expr_is_affine_option(value, locals)
                 {
                     return Err(format!(
@@ -1862,9 +1848,6 @@ fn emit_extern_clause_wfs(
             }
             Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
             Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-            Ty::AffineOption(_) => {
-                unreachable!("VC preflight rejects affine-option extern parameters")
-            }
             Ty::Unit => {}
         }
     }
@@ -2472,7 +2455,6 @@ impl<'a> Generator<'a> {
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             Some(Ty::Array(element, _)) => lean_array_ty(&element.clone()),
-            Some(Ty::AffineOption(payload)) => lean_affine_option_ty(&payload.clone()),
             Some(Ty::Unit) | None => unreachable!("checked: value has a Lean binder type"),
         }
     }
@@ -2510,9 +2492,6 @@ impl<'a> Generator<'a> {
                 Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
                 Ty::Option(element) => Some((name.clone(), lean_option_ty(&element.clone()))),
-                Ty::AffineOption(payload) => {
-                    Some((name.clone(), lean_affine_option_ty(&payload.clone())))
-                }
                 Ty::Unit => None,
             })
             .collect();
@@ -2860,12 +2839,9 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
-                Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-                // Affine options remain local-only, so parameter setup can
+                // Options are local-only or returned, so parameter setup can
                 // only reach this arm through a forged post-preflight AST.
-                Ty::AffineOption(_) => {
-                    unreachable!("VC preflight rejects affine-option parameters")
-                }
+                Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
                 Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
@@ -2936,7 +2912,6 @@ impl<'a> Generator<'a> {
             Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(*k, self.records),
             Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
             Ty::Unit => "Unit".into(),
-            Ty::AffineOption(payload) => lean_affine_option_ty(&payload.clone()),
             Ty::Array(..) | Ty::ClassRef(..) => {
                 unreachable!("checked: borrowed values and arrays are not return types")
             }
@@ -3855,11 +3830,6 @@ impl<'a> Generator<'a> {
                         .push((name.clone(), lean_option_ty(&element.clone())));
                     self.env.insert(name.clone(), Val::Opt(name.clone()));
                 }
-                Some(Ty::AffineOption(payload)) => {
-                    self.binders
-                        .push((name.clone(), lean_affine_option_ty(&payload.clone())));
-                    self.env.insert(name.clone(), Val::Opt(name.clone()));
-                }
                 // A record local assigned in the loop is an arbitrary
                 // checked value at the next head. Rebind it just like an
                 // integer local, retaining only the nominal type's implicit
@@ -4071,7 +4041,6 @@ impl<'a> Generator<'a> {
                 let ty = match &e.ty {
                     Some(Ty::Option(element)) => lean_option_ty(element),
                     Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".into(),
-                    Some(Ty::AffineOption(payload)) => lean_affine_option_ty(payload),
                     _ => unreachable!("checked: contextual none has an option type"),
                 };
                 Val::Opt(format!("(none : {ty})"))
@@ -6995,9 +6964,6 @@ impl<'a> Generator<'a> {
                     }
                 }
                 Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-                Ty::AffineOption(_) => {
-                    unreachable!("VC preflight rejects affine-option parameters")
-                }
                 Ty::Unit => {}
             }
         }
@@ -7784,18 +7750,19 @@ mod type_domain_tests {
         );
         assert!(take_vc_type_refusal().is_none(), "the latch is taken once");
 
+        // The one admitted owning payload has a Lean type, parenthesized so
+        // it stays one argument.
         assert_eq!(
             lean_option_ty(&Ty::array(Ty::Bool, Mutability::Owned)),
-            UNSUPPORTED_LEAN_TY
+            "Option (Sable.Seq Bool)"
         );
         assert!(
-            take_vc_type_refusal()
-                .expect("the refusal is latched")
-                .starts_with("internal.vcgen.lean_type_unsupported:")
+            take_vc_type_refusal().is_none(),
+            "an owned payload is not a refusal"
         );
 
         assert_eq!(
-            lean_affine_option_ty(&AffineOptionTy::array(Ty::Int(IntTy::U64))),
+            lean_option_ty(&Ty::array(Ty::Int(IntTy::U64), Mutability::Owned)),
             UNSUPPORTED_LEAN_TY
         );
         assert!(
@@ -7872,7 +7839,7 @@ mod type_domain_tests {
     }
 
     fn affine_bool_option() -> Ty {
-        Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
+        Ty::affine_array_option(Ty::Bool)
     }
 
     fn public_generate_error(program: &Program) -> String {
@@ -8040,7 +8007,7 @@ fn affine_loop(u64 n) {
         assert!(public_generate_error(&immutable).starts_with("vc.affine_option_immutable:"));
 
         let mut nonbool = parsed_program("fn subject() {}");
-        let nonbool_ty = Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::U8)));
+        let nonbool_ty = Ty::affine_array_option(Ty::Int(IntTy::U8));
         nonbool.fns[0].body.push(Stmt::Decl {
             ty: nonbool_ty.clone(),
             name: "pending".into(),

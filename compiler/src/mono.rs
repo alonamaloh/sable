@@ -504,7 +504,6 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
             Ty::Array(element, _) | Ty::Option(element) => {
                 value(*element, arity, span, representation)
             }
-            Ty::AffineOption(payload) => affine_option(payload, arity, span),
             Ty::Raw(integer) => legacy_integer(integer, arity, span, representation, true),
             Ty::Bool
             | Ty::Class(_)
@@ -518,21 +517,12 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
         }
     }
 
-    fn affine_option(ty: AffineOptionTy, arity: usize, span: Span) -> MResult<()> {
-        match ty {
-            AffineOptionTy::Array(element) => {
-                value(*element, arity, span, "affine-option array element type")
-            }
-        }
-    }
-
     fn checked_ty(ty: Ty, arity: usize, span: Span) -> MResult<()> {
         match ty {
             Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, "type"),
             Ty::Int(integer) => legacy_integer(integer, arity, span, "value type", false),
             Ty::Array(element, _) => value(*element, arity, span, "array element type"),
             Ty::Option(element) => value(*element, arity, span, "option payload type"),
-            Ty::AffineOption(payload) => affine_option(payload, arity, span),
             // Raw pointer element types and conversion targets still use the
             // legacy IntTy-shaped syntax in G1.0, so a bounded TParam is the
             // canonical representation in those positions.
@@ -950,7 +940,6 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
             Ty::Param(parameter) => Err(escaped(span, parameter, representation)),
             Ty::Int(integer_ty) => integer(integer_ty, span, representation),
             Ty::Array(element, _) | Ty::Option(element) => value(*element, span, representation),
-            Ty::AffineOption(payload) => affine_option(payload, span),
             Ty::Raw(integer_ty) => integer(integer_ty, span, representation),
             Ty::Bool
             | Ty::Class(_)
@@ -964,21 +953,12 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
         }
     }
 
-    fn affine_option(ty: AffineOptionTy, span: Span) -> MResult<()> {
-        match ty {
-            AffineOptionTy::Array(element) => {
-                value(*element, span, "affine-option array element type")
-            }
-        }
-    }
-
     fn checked_ty(ty: Ty, span: Span) -> MResult<()> {
         match ty {
             Ty::Param(parameter) => Err(escaped(span, parameter, "type")),
             Ty::Int(integer_ty) => integer(integer_ty, span, "integer type"),
             Ty::Array(element, _) => value(*element, span, "array element type"),
             Ty::Option(element) => value(*element, span, "option payload type"),
-            Ty::AffineOption(payload) => affine_option(payload, span),
             Ty::Raw(integer_ty) => integer(integer_ty, span, "raw-pointer element type"),
             Ty::Bool
             | Ty::Class(_)
@@ -2095,7 +2075,6 @@ pub(crate) fn subst_ty(t: &mut Ty, args: &[IntTy], span: Span) -> MResult<()> {
         Ty::Param(parameter) => *t = Ty::Int(type_argument(args, parameter.index(), span)?),
         Ty::Int(integer) => subst_intty(integer, args, span)?,
         Ty::Array(element, _) | Ty::Option(element) => subst_ty(element, args, span)?,
-        Ty::AffineOption(AffineOptionTy::Array(element)) => subst_ty(element, args, span)?,
         // A `raw<...>` element type is a width, and its parameter spelling is
         // canonical there rather than substituted.
         Ty::Raw(_)
@@ -3171,7 +3150,7 @@ fn root(option<[i32]> value) -> option<[i32]> {
             .iter()
             .find(|function| function.name == "hold_i32")
             .expect("concrete affine-option instance");
-        let expected = Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)));
+        let expected = Ty::affine_array_option(Ty::Int(IntTy::I32));
         assert_eq!(instance.params[0].ty, expected);
         assert_eq!(instance.ret, expected);
         validate_concrete_output(&program).expect("affine-option output is fully concrete");
@@ -3182,7 +3161,7 @@ fn root(option<[i32]> value) -> option<[i32]> {
             .find(|function| function.name == "hold")
             .expect("retained affine-option template");
         let parameter = TypeParamId::from_legacy(0);
-        let abstract_ty = Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)));
+        let abstract_ty = Ty::affine_array_option(Ty::Param(parameter));
         assert_eq!(retained.params[0].ty, abstract_ty);
         assert_eq!(retained.ret, abstract_ty);
     }
@@ -3257,10 +3236,10 @@ fn root(i32 value) -> i32 {
         assert_eq!(error.name, "mono.type_param_out_of_bounds");
 
         let mut escaped_affine = parse_program("fn root() {}\n");
-        escaped_affine.fns[0].ret = Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)));
+        escaped_affine.fns[0].ret = Ty::affine_array_option(Ty::Param(parameter));
         let error = validate_concrete_output(&escaped_affine)
             .expect_err("affine-option payload parameters must not escape");
         assert_eq!(error.name, "mono.unsubstituted_type_param");
-        assert!(error.label.contains("affine-option array element type"));
+        assert!(error.label.contains("option payload type"));
     }
 }

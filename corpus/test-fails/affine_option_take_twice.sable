@@ -1,0 +1,11 @@
+// expect-test-failure: `.take` of an empty affine option
+// `.take` moves the payload out and leaves `none`, so the array has exactly
+// one owner at every point. The second take therefore finds an empty option
+// and traps. If the option ever held a copy of its payload instead, this
+// program would succeed and hand out two owners of one allocation.
+
+fn test_take_twice_finds_an_empty_option() {
+    mut option<[bool]> pending = some(alloc_array<bool>(2, true));
+    [bool] first = pending.take;
+    [bool] second = pending.take;
+}

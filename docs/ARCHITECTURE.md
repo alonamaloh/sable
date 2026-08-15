@@ -297,10 +297,12 @@ foreign, or cross-module array ABI.
   (`local_needs_initializer`, the checker's payload, ownership, and layout
   gates) is decided outside the parser. The option families are the sharpest
   case: `option<[T]>` and `option<raw<R>>` are gated by the `OptionPayload` row
-  like any other payload — `lower_option_type` consults it for both before
-  either family is built — but which of the three families an admitted payload
-  names (`Ty::AffineOption`, `Ty::OptionRaw`, or a copyable `Ty::Option`) is
-  read off the payload's syntax afterwards, not from the table.
+  like any other payload — `lower_option_type` consults it for both — and
+  `option<raw<R>>`, one abstract nullable pointer value rather than an option
+  over a pointer, is the only payload whose syntax the lowering still reads to
+  pick a constructor (`Ty::OptionRaw`). Every other payload becomes itself
+  under `Ty::Option`, and whether the result owns is read off that payload
+  afterwards (ADR 0065), not from the table.
   `admitted_shapes_match_their_lowering` pins that a position admits only the
   shapes its lowering has a representation for, so a spelling the table admits
   can never reach an unhandled case. Since ADR 0064 that constraint has force
@@ -354,8 +356,8 @@ foreign, or cross-module array ABI.
   rejected non-integer aggregate payloads; the interpreter and SVM repeated the
   fail-closed guard at their own execution/lowering boundaries. Module
   visibility also descended into container payloads — `modules::walk_ty`
-  recurses into `Ty::Array`, `Ty::Option`, and `Ty::AffineOption` and matches
-  exhaustively — so a nominal payload
+  recurses into every container payload and matches exhaustively — so a
+  nominal payload
   could not bypass a restrictive import. G1.0 therefore changed representation
   and invariants, not the accepted language: Boolean/POD arrays and options
   remained unusable, and existing integer behavior was preserved.
@@ -589,14 +591,16 @@ foreign, or cross-module array ABI.
   slice.** G2.0 is the closed representation/fail-closed checkpoint; G2.1's
   checker/proof/interpreter/monitor slice and G2.2's formal-SVM slice are also
   closed. G2.3's matching LLVM slice is closed as well.
-  `Ty::Option(Box<Ty>)` remains the copyable option family;
-  `option<[T]>` parses to the distinct
-  `Ty::AffineOption(AffineOptionTy::Array(Box<Ty>))`. This keeps every
-  copy-option match honest and makes ownership visible in the checked type.
-  `Ty` is `Clone` rather than `Copy` since container payloads became full types
-  (ADR 0064), so the separate family is no longer what keeps the descriptor
-  small; `Ty::is_affine` already reads affinity off an option's payload, and
-  ADR 0064 records deleting `AffineOptionTy` as remaining work.
+  `Ty::Option(Box<Ty>)` is the only option constructor, and whether an option
+  owns is computed rather than encoded: `Ty::is_affine` reads
+  `Ty::Option(payload) => payload.is_affine()`, so `option<[T]>` is an option
+  over an owned array (ADR 0065). The owning family — the shapes the move,
+  take, join, and destruction rules are written for — is read back with
+  `Ty::as_affine_option_payload`, which asks for an owned-array payload
+  specifically: `option<class>` owns too and belongs to the copyable family's
+  gates, which refuse it by their own name. Every rule that would duplicate an
+  option asks that question explicitly, and wherever a rule dispatches on
+  option shape the owning arm comes first.
 
   The parser preserves Boolean, integer, or in-scope-parameter array payload
   identity rather than pretending every future affine option is Boolean.

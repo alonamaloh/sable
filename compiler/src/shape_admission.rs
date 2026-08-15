@@ -13,9 +13,9 @@
 //! same table diff.
 //!
 //! A gate answers `yes` or a machine-matchable name. A traversal that has no
-//! accept/refuse answer — substitution, visibility collection, the runtime
-//! value type of a payload — records what it produced instead, so losing one
-//! of its recursive arms also moves a cell.
+//! accept/refuse answer — substitution, visibility collection, the present
+//! case of an option — records what it produced instead, so losing one of its
+//! recursive arms also moves a cell.
 //!
 //! A gate that panics is a failure here, not a passing row: "no source
 //! program reaches this" is an argument about the parser, and this table
@@ -26,7 +26,7 @@
 //!
 //! Run with `SABLE_BLESS=1` to rewrite the table after an intended change.
 
-use crate::ast::{AffineOptionTy, IntTy, Mutability, Program, ResKind, Ty, TypeParamId};
+use crate::ast::{IntTy, Mutability, Program, ResKind, Ty, TypeParamId};
 use crate::span::Span;
 use crate::speceval::SpecVal;
 use std::path::{Path, PathBuf};
@@ -46,7 +46,6 @@ fn constructor(ty: &Ty) -> &'static str {
         Ty::Record(_) => "Record",
         Ty::Array(..) => "Array",
         Ty::Option(_) => "Option",
-        Ty::AffineOption(_) => "AffineOption",
         Ty::OptionRaw(_) => "OptionRaw",
         Ty::Res(_) => "Res",
         Ty::Raw(_) => "Raw",
@@ -65,7 +64,6 @@ const CONSTRUCTORS: &[&str] = &[
     "Record",
     "Array",
     "Option",
-    "AffineOption",
     "OptionRaw",
     "Res",
     "Raw",
@@ -119,17 +117,21 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
         ("option<bool>", Ty::option(Ty::Bool)),
         ("option<record>", Ty::option(Ty::Record(0))),
         ("option<type parameter>", Ty::option(Ty::Param(param()))),
-        (
-            "option<[bool]>",
-            Ty::AffineOption(AffineOptionTy::array(Ty::Bool)),
-        ),
+        ("option<[bool]>", Ty::affine_array_option(Ty::Bool)),
         (
             "option<[u64]>",
-            Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::U64))),
+            Ty::affine_array_option(Ty::Int(IntTy::U64)),
+        ),
+        ("option<[record]>", Ty::affine_array_option(Ty::Record(0))),
+        // A borrowed payload owns nothing, so an option over one is not in
+        // the owning family however much it looks like `option<[bool]>`.
+        (
+            "option<&[bool]>",
+            Ty::option(Ty::array(Ty::Bool, Mutability::Shared)),
         ),
         (
-            "option<[record]>",
-            Ty::AffineOption(AffineOptionTy::array(Ty::Record(0))),
+            "option<&mut [bool]>",
+            Ty::option(Ty::array(Ty::Bool, Mutability::Mut)),
         ),
         ("option<raw<record>>", Ty::OptionRaw(0)),
         ("raw<u8>", Ty::Raw(IntTy::U8)),
@@ -289,7 +291,6 @@ const GATES: &[&str] = &[
     "interp type",
     "interp array payload",
     "interp option payload",
-    "interp payload value",
     "interp option value",
     "svm type",
     "svm array payload",
@@ -329,16 +330,13 @@ fn answers(ty: &Ty) -> Vec<Answer> {
     let substitution = from_diagnostic(crate::mono::subst_ty(&mut substituted, &[], SPAN));
 
     vec![
-        match crate::check::array_payload_ty(ty.clone(), SPAN) {
-            Ok(_) => Answer::Accepted,
-            Err(diagnostic) => Answer::Rejected(diagnostic.name),
-        },
+        from_diagnostic(crate::check::validate_array_payload(ty, SPAN)),
         match crate::check::option_payload_ty(ty.clone(), SPAN) {
             Ok(_) => Answer::Accepted,
             Err(diagnostic) => Answer::Rejected(diagnostic.name),
         },
         from_diagnostic(crate::check::affine_option_payload(
-            AffineOptionTy::array(ty.clone()),
+            &Ty::array(ty.clone(), Mutability::Owned),
             SPAN,
         )),
         from_diagnostic(crate::check::validate_aggregate_ty(ty.clone(), SPAN)),
@@ -378,24 +376,20 @@ fn answers(ty: &Ty) -> Vec<Answer> {
         )),
         from_string(crate::interp::validate_interp_ty(ty.clone(), "shape probe")),
         from_string(crate::interp::validate_interp_array_payload(
-            ty.clone(),
+            ty,
             "shape probe",
         )),
         from_string(crate::interp::validate_interp_option_payload(
-            ty.clone(),
+            ty,
             "shape probe",
         )),
-        Answer::Observed(match crate::interp::value_ty(ty) {
-            Some(value) => format!("`{}`", value.name()),
-            None => "none".into(),
-        }),
         Answer::Observed(match crate::interp::option_value_ty(ty.clone()) {
             Some(value) => format!("`{}`", value.name()),
             None => "none".into(),
         }),
         from_string(crate::svm::validate_ty_payload(ty.clone(), "shape probe")),
-        from_string(crate::svm::array_element_ty(ty.clone(), "shape probe").map(|_| ())),
-        from_string(crate::svm::ordinary_option_payload_ty(ty.clone()).map(|_| ())),
+        from_string(crate::svm::validate_array_payload(ty, "shape probe")),
+        from_string(crate::svm::validate_option_payload(ty, "shape probe")),
         from_string(crate::svm::validate_parameter_ty(ty, "shape probe")),
         from_backend(crate::llvm::require_runtime_type(
             &program,
@@ -444,7 +438,7 @@ const PROSE: &str = "# The shape × stage-gate admission table\n\n\
      change to the\ntype representation can silently move. A cell is `yes` when the gate \
      accepted the shape\nand the gate's machine-matchable name when it refused. A stage \
      that is a traversal rather\nthan a gate — substitution, visibility collection, the \
-     runtime value type of a payload —\nrecords what it produced, so a lost recursive arm \
+     present case of an option —\nrecords what it produced, so a lost recursive arm \
      moves a cell too.\n\nEvery stage is asked about every shape: the grammar is one \
      recursive type, so there is no\nshape a stage cannot be handed. A cell that moves is \
      either a refusal that was deleted or\nan admission that was widened, and both need a \

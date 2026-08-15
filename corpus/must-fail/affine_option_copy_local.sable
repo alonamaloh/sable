@@ -1,0 +1,11 @@
+// expect-error: option.affine_initializer
+// An option owns exactly when its payload does, so `option<[bool]>` and
+// `option<bool>` are one constructor apart in the representation and the
+// declaration rule is what keeps them apart. Binding a second option to this
+// one would leave two conditional owners of one array and no rule saying
+// which of them destroys it.
+
+fn duplicate_conditional_owner(u64 n) {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, false));
+    mut option<[bool]> alias = pending;
+}

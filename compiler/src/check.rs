@@ -1381,8 +1381,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 init,
                 mutable,
             } => {
-                if let Ty::AffineOption(payload) = ty {
-                    affine_option_payload(payload.clone(), *name_span)?;
+                if let Some(payload) = ty.as_affine_option_payload() {
+                    affine_option_payload(payload, *name_span)?;
                     if !*mutable {
                         return Err(Diagnostic {
                             name: "mut.option_take_immutable".into(),
@@ -1449,10 +1449,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             if matches!(
                                 &operand.kind,
                                 ExprKind::Var(option)
-                                    if matches!(
-                                        ctx.vars.get(option.as_str()).map(|info| info.ty.clone()),
-                                        Some(Ty::AffineOption(_))
-                                    )
+                                    if ctx
+                                        .vars
+                                        .get(option.as_str())
+                                        .is_some_and(|info| info.ty.is_affine_option())
                             )
                     )
                 });
@@ -1481,8 +1481,12 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let mut must_consume = false;
                 if let Some(e) = init {
                     match (ty.clone(), &e.kind) {
-                        (Ty::AffineOption(payload), _) => {
-                            check_affine_option_initializer(ctx, e, payload)?;
+                        // The owning family is routed away from the copy
+                        // rules by the payload, and it is routed first: the
+                        // arms below build a copyable value out of whatever
+                        // the initializer evaluates to.
+                        (option, _) if option.is_affine_option() => {
+                            check_affine_option_initializer(ctx, e, &option)?;
                         }
                         (owned, ExprKind::OptTake { .. }) if owned.is_owned_array_of(&Ty::Bool) => {
                             check_affine_option_take(ctx, e)?;
@@ -1541,7 +1545,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
-                if matches!(ty, Ty::AffineOption(_)) {
+                if ty.is_affine_option() {
                     return Err(Diagnostic {
                         name: "option.affine_assign".into(),
                         title: format!("cannot assign a whole affine option to `{name}`"),
@@ -1925,7 +1929,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // an affine aggregate could be relabelled as its scalar
                 // initializer and bypass the explicit affine-option boundary.
                 if let Some(cached) = ty {
-                    if matches!(cached, Ty::AffineOption(_)) {
+                    if cached.is_affine_option() {
                         return Err(Diagnostic {
                             name: "option.affine_inferred".into(),
                             title: "an affine-option binding cannot be inferred".into(),
@@ -2171,7 +2175,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let (elem, src_mut, declared_mut) = match ctx.vars.get(array.as_str()) {
                     Some(v) => match &v.ty {
                         Ty::Array(e, m) => (e, m, v.mutable),
-                        Ty::AffineOption(_) => {
+                        owning if owning.is_affine_option() => {
                             return Err(Diagnostic {
                                 name: "option.affine_expose".into(),
                                 title: format!("cannot expose affine option `{array}`"),
@@ -2204,8 +2208,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
-                let elem_ty = array_payload_ty(*elem.clone(), *array_span)?;
-                if elem_ty != Ty::Int(IntTy::U8) {
+                validate_array_payload(elem, *array_span)?;
+                if **elem != Ty::Int(IntTy::U8) {
                     return Err(Diagnostic {
                         name: "expose.element_type".into(),
                         title: format!("cannot expose `[{}]` as bytes yet", elem.name()),
@@ -2434,7 +2438,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 };
                 ctx.require_field_init(field, *field_span)?;
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(array_payload_ty(*elem, *field_span)?))?;
+                validate_array_payload(&elem, *field_span)?;
+                check_expr(ctx, value, Some(*elem))?;
             }
             Stmt::Store {
                 array,
@@ -2507,7 +2512,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     });
                 }
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-                check_expr(ctx, value, Some(array_payload_ty(*elem, *array_span)?))?;
+                validate_array_payload(&elem, *array_span)?;
+                check_expr(ctx, value, Some(*elem))?;
             }
         }
     }
@@ -2584,15 +2590,15 @@ fn bool_array_borrow(span: Span) -> Diagnostic {
     }
 }
 
-/// May a value of this type be an array element, and if so, what is the type
-/// of one indexed element.
+/// May a value of this type be an array element.
 ///
 /// This is a *gate*, not a traversal: an allow-list ending in a named
 /// refusal, which never calls itself — a gate that recursed would admit
-/// arbitrary nesting. Validation and lowering are one function on purpose, so
-/// there is no second, unguarded way to ask for the element type.
+/// arbitrary nesting. It answers yes or a named error and nothing else, so
+/// there is exactly one entry point: an array holds a full `Ty`, and the type
+/// of one element is the payload its holder already has.
 ///
-/// It is load-bearing well beyond the type it returns. Indexing and element
+/// It is load-bearing well beyond the shapes it names. Indexing and element
 /// stores neither move the value nor re-brand it, and they are sound only
 /// because every payload admitted here is copyable. Refusing every owning
 /// payload by name is what keeps that true, and it is the real gate, not the
@@ -2603,12 +2609,10 @@ fn bool_array_borrow(span: Span) -> Diagnostic {
 /// It is deliberately independent of where the array occurs: position policy
 /// below keeps Boolean arrays owned and local, while element checking can
 /// preserve their exact `bool` identity.
-pub(crate) fn array_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
+pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
     match payload {
         Ty::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
-        Ty::Int(integer) => Ok(Ty::Int(integer)),
-        Ty::Param(parameter) => Ok(Ty::Param(parameter)),
-        Ty::Bool => Ok(Ty::Bool),
+        Ty::Int(_) | Ty::Param(_) | Ty::Bool => Ok(()),
         _ => Err(Diagnostic {
             name: "type.array_payload_unsupported".into(),
             title: format!(
@@ -2631,8 +2635,9 @@ pub(crate) fn array_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
 /// May a value of this type be a copyable option payload, and if so, what is
 /// the type of the present case.
 ///
-/// A gate on the same terms as `array_payload_ty`: an allow-list, never
-/// recursive, validating and lowering in one function. Copyable is the whole
+/// A gate on the same terms as `validate_array_payload`: an allow-list that
+/// never recurses. It answers with the present case's type rather than a bare
+/// yes, because a caller needs that type. Copyable is the whole
 /// rule — an option duplicates its payload whenever it is duplicated, so the
 /// owning payloads are the separate `option<[T]>` and `option<raw<Record>>`
 /// families. Retained declaration parameters keep the ADR 0009
@@ -2682,23 +2687,23 @@ fn affine_option_unsupported(ty: Ty, span: Span) -> Diagnostic {
 /// May an owning option carry this payload. A gate: an allow-list ending in a
 /// named refusal, because each owned payload kind needs matching proof,
 /// interpreter, formal-machine, and native destruction semantics.
-pub(crate) fn affine_option_payload(ty: AffineOptionTy, span: Span) -> CResult<()> {
-    match ty {
-        AffineOptionTy::Array(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
-        AffineOptionTy::Array(payload) => Err(Diagnostic {
-            name: "type.affine_option_payload".into(),
-            title: format!(
-                "affine option payload `[{}]` is not supported yet",
-                payload.name()
-            ),
-            span,
-            label: "the affine-option family currently owns only `option<[bool]>`".into(),
-            notes: vec![(
-                "note".into(),
-                "each owned payload kind needs matching proof, interpreter, SVM, and native destruction semantics".into(),
-            )],
-        }),
+pub(crate) fn affine_option_payload(payload: &Ty, span: Span) -> CResult<()> {
+    if payload.is_owned_array_of(&Ty::Bool) {
+        return Ok(());
     }
+    Err(Diagnostic {
+        name: "type.affine_option_payload".into(),
+        title: format!(
+            "affine option payload `{}` is not supported yet",
+            payload.name()
+        ),
+        span,
+        label: "the affine-option family currently owns only `option<[bool]>`".into(),
+        notes: vec![(
+            "note".into(),
+            "each owned payload kind needs matching proof, interpreter, SVM, and native destruction semantics".into(),
+        )],
+    })
 }
 
 fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
@@ -2753,10 +2758,16 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
 /// it. A new constructor must be a compile error, not a silent `Ok`. Each
 /// leaf hands off to the gate that owns the position.
 pub(crate) fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
+    // An option that owns its present case is routed away from the copyable
+    // gate before the dispatch below, and by the payload's shape rather than
+    // by a constructor. Falling through would report the copyable family's
+    // refusal for a shape the copyable rules never handle.
+    if ty.is_affine_option() {
+        return Err(affine_option_unsupported(ty, span));
+    }
     match ty {
-        Ty::Array(payload, _) => array_payload_ty(*payload, span).map(|_| ()),
+        Ty::Array(payload, _) => validate_array_payload(&payload, span),
         Ty::Option(payload) => option_payload_ty(*payload, span).map(|_| ()),
-        Ty::AffineOption(_) => Err(affine_option_unsupported(ty, span)),
         Ty::Int(_)
         | Ty::Bool
         | Ty::Param(_)
@@ -2812,7 +2823,7 @@ fn bool_array_parameter(span: Span) -> Diagnostic {
 /// boundary may transport, which is a separate question with a separate
 /// answer for the same type.
 pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
-    if matches!(ty, Ty::AffineOption(_)) {
+    if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "parameter"));
     }
     if ty.is_array_of(&Ty::Bool) {
@@ -2836,7 +2847,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
         for parameter in &function.params {
             parameter_ty(&parameter.ty, parameter.span)?;
         }
-        if matches!(function.ret, Ty::AffineOption(_)) {
+        if function.ret.is_affine_option() {
             return Err(affine_option_boundary(
                 function.ret.clone(),
                 function.name_span,
@@ -2862,7 +2873,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     }
 
     fn class_field(field: &Field) -> CResult<()> {
-        if matches!(field.ty, Ty::AffineOption(_)) {
+        if field.ty.is_affine_option() {
             return Err(affine_option_boundary(
                 field.ty.clone(),
                 field.span,
@@ -2903,7 +2914,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
         if let Some(parameter) = method
             .params
             .iter()
-            .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+            .find(|parameter| parameter.ty.is_affine_option())
         {
             return Err(affine_option_boundary(
                 parameter.ty.clone(),
@@ -2911,7 +2922,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 "trait",
             ));
         }
-        if matches!(method.ret, Ty::AffineOption(_)) {
+        if method.ret.is_affine_option() {
             return Err(affine_option_boundary(
                 method.ret.clone(),
                 method.name_span,
@@ -2996,11 +3007,9 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     fn affine_decl(stmts: &[Stmt]) -> Option<(Ty, Span)> {
         for stmt in stmts {
             match stmt {
-                Stmt::Decl {
-                    ty: ty @ Ty::AffineOption(_),
-                    name_span,
-                    ..
-                } => return Some((ty.clone(), *name_span)),
+                Stmt::Decl { ty, name_span, .. } if ty.is_affine_option() => {
+                    return Some((ty.clone(), *name_span));
+                }
                 Stmt::If {
                     then_block,
                     else_block,
@@ -3033,7 +3042,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
         if let Some(parameter) = function
             .params
             .iter()
-            .find(|parameter| matches!(parameter.ty, Ty::AffineOption(_)))
+            .find(|parameter| parameter.ty.is_affine_option())
         {
             return Err(affine_option_boundary(
                 parameter.ty.clone(),
@@ -3041,7 +3050,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 "generic",
             ));
         }
-        if matches!(function.ret, Ty::AffineOption(_)) {
+        if function.ret.is_affine_option() {
             return Err(affine_option_boundary(
                 function.ret.clone(),
                 function.name_span,
@@ -3085,7 +3094,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     }
     for record in &program.records {
         for field in &record.fields {
-            if matches!(field.ty, Ty::AffineOption(_)) {
+            if field.ty.is_affine_option() {
                 return Err(affine_option_boundary(
                     field.ty.clone(),
                     field.span,
@@ -3142,10 +3151,12 @@ fn option_take_position(span: Span) -> Diagnostic {
 fn check_affine_option_initializer(
     ctx: &mut Ctx,
     expression: &mut Expr,
-    payload: AffineOptionTy,
+    option_ty: &Ty,
 ) -> CResult<Ty> {
-    affine_option_payload(payload.clone(), expression.span)?;
-    let option_ty = Ty::AffineOption(payload);
+    let payload = option_ty
+        .as_affine_option_payload()
+        .expect("affine-option initializer is dispatched on an owning option");
+    affine_option_payload(payload, expression.span)?;
     match &mut expression.kind {
         ExprKind::NoneE => {}
         ExprKind::SomeE(inner)
@@ -3167,7 +3178,7 @@ fn check_affine_option_initializer(
         }
     }
     expression.ty = Some(option_ty.clone());
-    Ok(option_ty)
+    Ok(option_ty.clone())
 }
 
 fn check_affine_option_local(
@@ -3175,7 +3186,7 @@ fn check_affine_option_local(
     option: &str,
     span: Span,
     operation: &str,
-) -> CResult<(AffineOptionTy, bool)> {
+) -> CResult<(Ty, bool)> {
     let Some(info) = ctx.vars.get(option) else {
         return Err(Diagnostic {
             name: "type.unknown_variable".into(),
@@ -3185,7 +3196,7 @@ fn check_affine_option_local(
             notes: vec![],
         });
     };
-    let Ty::AffineOption(ref payload) = info.ty else {
+    let Some(payload) = info.ty.as_affine_option_payload() else {
         return Err(Diagnostic {
             name: "type.mismatch".into(),
             title: format!("`.{operation}` on `{}`", info.ty.clone().name()),
@@ -3194,7 +3205,7 @@ fn check_affine_option_local(
             notes: vec![],
         });
     };
-    affine_option_payload(payload.clone(), span)?;
+    affine_option_payload(payload, span)?;
     if !info.initialized {
         return Err(Diagnostic {
             name: "type.uninitialized".into(),
@@ -3208,7 +3219,7 @@ fn check_affine_option_local(
     if ctx.is_moved(&place) {
         return Err(moved_out(ctx, &place, span, operation));
     }
-    Ok((payload.clone(), info.mutable))
+    Ok((info.ty.clone(), info.mutable))
 }
 
 fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty> {
@@ -3238,10 +3249,15 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
 }
 
 fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
-    if let Some(ty @ Ty::AffineOption(_)) = &expected {
+    // Every rule below this point may duplicate the value it produces, so an
+    // option whose present case owns is refused here rather than reaching one
+    // of them. The owning family has its own entry points
+    // (`check_affine_option_initializer`, `check_affine_option_local`), which
+    // is why this fence is not a hole in them.
+    if let Some(ty) = expected.as_ref().filter(|ty| ty.is_affine_option()) {
         return Err(affine_option_unsupported(ty.clone(), e.span));
     }
-    if let Some(ty @ Ty::AffineOption(_)) = &e.ty {
+    if let Some(ty) = e.ty.as_ref().filter(|ty| ty.is_affine_option()) {
         return Err(affine_option_unsupported(ty.clone(), e.span));
     }
     let ty = infer_expr(ctx, e, expected.clone())?;
@@ -3317,7 +3333,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
-                if matches!(v.ty, Ty::AffineOption(_)) {
+                if v.ty.is_affine_option() {
                     return Err(Diagnostic {
                         name: "option.affine_temporary".into(),
                         title: format!("affine option `{name}` used as an ordinary value"),
@@ -3439,7 +3455,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         } => {
             let elem = array_elem_ty(ctx, array, *array_span)?;
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            array_payload_ty(elem, *array_span)?
+            validate_array_payload(&elem, *array_span)?;
+            elem
         }
         ExprKind::Len { array } => {
             // `a.len` on a class receiver is the FIELD named `len`
@@ -3547,19 +3564,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::IsSome { operand } => {
             let affine_name = match &operand.kind {
                 ExprKind::Var(option)
-                    if matches!(
-                        ctx.vars.get(option.as_str()).map(|info| info.ty.clone()),
-                        Some(Ty::AffineOption(_))
-                    ) =>
+                    if ctx
+                        .vars
+                        .get(option.as_str())
+                        .is_some_and(|info| info.ty.is_affine_option()) =>
                 {
                     Some(option.clone())
                 }
                 _ => None,
             };
             if let Some(option) = affine_name {
-                let (payload, _) =
+                let (option_ty, _) =
                     check_affine_option_local(ctx, &option, operand.span, "is_some")?;
-                operand.ty = Some(Ty::AffineOption(payload));
+                operand.ty = Some(option_ty);
             } else {
                 match check_expr(ctx, operand, None)? {
                     Ty::Option(_) | Ty::OptionRaw(_) => {}
@@ -3578,10 +3595,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::OptValue { operand } => {
             if let ExprKind::Var(option) = &operand.kind {
-                if matches!(
-                    ctx.vars.get(option.as_str()).map(|info| info.ty.clone()),
-                    Some(Ty::AffineOption(_))
-                ) {
+                if ctx
+                    .vars
+                    .get(option.as_str())
+                    .is_some_and(|info| info.ty.is_affine_option())
+                {
                     return Err(Diagnostic {
                         name: "option.affine_value".into(),
                         title: format!("cannot project the owned payload of `{option}`"),
@@ -3746,7 +3764,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
             };
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            array_payload_ty(*elem, span)?
+            validate_array_payload(&elem, span)?;
+            *elem
         }
         ExprKind::TraitCall {
             param,
@@ -4339,7 +4358,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::AllocArray { elem, len, init } => {
             let elem = elem.clone();
             check_expr(ctx, len, Some(Ty::Int(IntTy::U64)))?;
-            check_expr(ctx, init, Some(array_payload_ty(elem.clone(), span)?))?;
+            validate_array_payload(&elem, span)?;
+            check_expr(ctx, init, Some(elem.clone()))?;
             Ty::Array(Box::new(elem), Mutability::Owned)
         }
         ExprKind::SelfField { field } => {
@@ -4389,7 +4409,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ctx.require_field_init(field, span)?;
             }
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
-            array_payload_ty(*elem, span)?
+            validate_array_payload(&elem, span)?;
+            *elem
         }
         ExprKind::CtorCall {
             class,
@@ -4608,7 +4629,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::ArrayLit(elems) => match expected {
             Some(Ty::Array(t, Mutability::Owned)) => {
-                let element_ty = array_payload_ty((*t).clone(), span)?;
+                validate_array_payload(&t, span)?;
+                let element_ty = (*t).clone();
                 for el in elems {
                     check_expr(ctx, el, Some(element_ty.clone()))?;
                 }
@@ -4630,10 +4652,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             mutable,
         } => {
             if field.is_none()
-                && matches!(
-                    ctx.vars.get(array.as_str()).map(|info| info.ty.clone()),
-                    Some(Ty::AffineOption(_))
-                )
+                && ctx
+                    .vars
+                    .get(array.as_str())
+                    .is_some_and(|info| info.ty.is_affine_option())
             {
                 return Err(Diagnostic {
                     name: "option.affine_borrow".into(),
@@ -6114,7 +6136,7 @@ fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<Ty> {
             if ctx.is_moved(&place) {
                 return Err(moved_out(ctx, &place, span, "array access"));
             }
-            array_payload_ty(*t.clone(), span)?;
+            validate_array_payload(t, span)?;
             Ok(*t.clone())
         }
         Some(v) => Err(Diagnostic {
@@ -6261,7 +6283,7 @@ mod concrete_aggregate_tests {
     }
 
     fn affine_bool_option() -> Ty {
-        Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
+        Ty::affine_array_option(Ty::Bool)
     }
 
     /// The grammar can spell a container of anything; no stage can execute,
@@ -6326,8 +6348,8 @@ mod concrete_aggregate_tests {
             Ty::Res(ResKind::RawSpan),
         ] {
             assert_eq!(
-                array_payload_ty(owner.clone(), span)
-                    .expect_err("an owning payload has no element form")
+                validate_array_payload(&owner, span)
+                    .expect_err("an owning payload is not an array element")
                     .name,
                 "type.array_payload_unsupported",
                 "for `{}`",
@@ -6539,14 +6561,11 @@ fn consume(i32 value) -> bool {
             option_payload_ty(Ty::Bool, Span::new(0, 1)).unwrap(),
             Ty::Bool
         );
-        assert_eq!(
-            array_payload_ty(Ty::Bool, Span::new(0, 1)).unwrap(),
-            Ty::Bool
-        );
+        assert!(validate_array_payload(&Ty::Bool, Span::new(0, 1)).is_ok());
 
         let option_record = option_payload_ty(Ty::Record(0), Span::new(0, 1)).unwrap_err();
         assert_eq!(option_record.name, "type.option_payload_unsupported");
-        let array_record = array_payload_ty(Ty::Record(0), Span::new(0, 1)).unwrap_err();
+        let array_record = validate_array_payload(&Ty::Record(0), Span::new(0, 1)).unwrap_err();
         assert_eq!(array_record.name, "type.array_payload_unsupported");
     }
 

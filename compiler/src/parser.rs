@@ -1572,10 +1572,11 @@ impl<'a> Parser<'a> {
             // `Ty` holds exactly these; `type.array_payload_unsupported`
             // decides which of them the checker gives semantics to.
             P::ArrayElement => matches!(shape, S::Int | S::Bool | S::Param | S::Record),
-            // The copyable payloads `Ty` holds, plus the two spellings
-            // that name an owning option family — `option<[T]>` and
-            // `option<raw<Record>>`. `type.option_payload_unsupported` and
-            // the affine-option boundary decide the rest.
+            // The copyable payloads `Ty` holds, plus the two spellings whose
+            // option is its own family: `option<[T]>`, which owns its payload,
+            // and `option<raw<Record>>`, a nullable pointer that owns nothing.
+            // `type.option_payload_unsupported` and the owning-option boundary
+            // decide the rest.
             P::OptionPayload => matches!(
                 shape,
                 S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw
@@ -1810,10 +1811,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The three option families the representation distinguishes: a
-    /// nullable pointer to a record, an option owning an affine aggregate,
-    /// and a copyable value option. Which family a payload names is decided
-    /// by its shape, which [`Parser::admits`] has already gated.
+    /// `option<raw<R>>` is a nullable pointer: one abstract value, not an
+    /// option over a pointer, so it is its own constructor. Every other
+    /// payload is lowered as itself under `Ty::Option`, and whether the
+    /// result owns is then read off that payload — the parser does not
+    /// choose an ownership family. Which payload shapes are spellable at all
+    /// is [`Parser::admits`]'s table.
     fn lower_option_type(&self, payload: &TypeSyntax, span: Span) -> PResult<Ty> {
         if let TypeSyntaxKind::Named { name, args, .. } = &payload.kind {
             if name == RAW_TYPE_NAME {
@@ -1846,12 +1849,6 @@ impl<'a> Parser<'a> {
                     }),
                 };
             }
-        }
-        if let TypeSyntaxKind::Array(element) = &payload.kind {
-            self.check_admits(TypeShape::Array, TyPos::OptionPayload, payload.span)?;
-            return Ok(Ty::AffineOption(AffineOptionTy::Array(Box::new(
-                self.lower_type(element, TyPos::ArrayElement)?,
-            ))));
         }
         Ok(Ty::Option(Box::new(
             self.lower_type(payload, TyPos::OptionPayload)?,
@@ -4658,7 +4655,7 @@ fn mk_bin(op: BinOp, op_span: Span, lhs: Expr, rhs: Expr) -> Expr {
 fn local_needs_initializer(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::Array(..) | Ty::Option(_) | Ty::AffineOption(_) | Ty::OptionRaw(_) | Ty::Res(_)
+        Ty::Array(..) | Ty::Option(_) | Ty::OptionRaw(_) | Ty::Res(_)
     )
 }
 
@@ -5299,17 +5296,11 @@ fn generic<T>(option<[T]> input) -> option<[T]> {
 "#;
         let program = parse_source(source).unwrap();
         let surface = &program.fns[0];
-        assert_eq!(
-            surface.params[0].ty,
-            Ty::AffineOption(AffineOptionTy::array(Ty::Bool))
-        );
+        assert_eq!(surface.params[0].ty, Ty::affine_array_option(Ty::Bool));
         assert_eq!(surface.params[1].ty, Ty::option(Ty::Bool));
         assert_eq!(surface.params[2].ty, Ty::OptionRaw(0));
         assert_eq!(surface.params[0].ty.name(), "option<[bool]>");
-        assert_eq!(
-            surface.ret,
-            Ty::AffineOption(AffineOptionTy::array(Ty::Int(IntTy::I32)))
-        );
+        assert_eq!(surface.ret, Ty::affine_array_option(Ty::Int(IntTy::I32)));
 
         let Stmt::Decl {
             ty,
@@ -5320,7 +5311,7 @@ fn generic<T>(option<[T]> input) -> option<[T]> {
         else {
             panic!("expected the explicit affine-option local");
         };
-        assert_eq!(*ty, Ty::AffineOption(AffineOptionTy::array(Ty::Bool)));
+        assert_eq!(*ty, Ty::affine_array_option(Ty::Bool));
         assert!(*mutable);
         assert!(matches!(&initializer.kind, ExprKind::NoneE));
 
@@ -5328,12 +5319,9 @@ fn generic<T>(option<[T]> input) -> option<[T]> {
         let generic = &program.fns[1];
         assert_eq!(
             generic.params[0].ty,
-            Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)))
+            Ty::affine_array_option(Ty::Param(parameter))
         );
-        assert_eq!(
-            generic.ret,
-            Ty::AffineOption(AffineOptionTy::array(Ty::Param(parameter)))
-        );
+        assert_eq!(generic.ret, Ty::affine_array_option(Ty::Param(parameter)));
     }
 
     #[test]
