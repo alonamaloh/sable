@@ -17,6 +17,8 @@ pub mod mono;
 pub mod parser;
 pub mod profile;
 pub mod scan;
+#[cfg(test)]
+mod shape_admission;
 pub mod span;
 pub mod speceval;
 pub mod svm;
