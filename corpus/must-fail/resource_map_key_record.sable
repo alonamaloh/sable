@@ -1,0 +1,13 @@
+// expect-error: type.resource_map_key_unsupported
+// A resource-map key is an arena offset, so it is an integer, while the extent
+// a `PointsTo` grants authority over may be a record. The two sit in the same
+// type argument list and are gated separately.
+
+record Cell #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 next;
+    #[offset(8)] u64 size;
+}
+
+fn keyed_by_record(resource ResourceMap<Cell, PointsTo<u64>> cells) -> u64 {
+    return 0;
+}

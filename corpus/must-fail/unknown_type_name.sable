@@ -1,0 +1,9 @@
+// expect-error: parse.unknown_type
+// A type name that names nothing is a distinct failure from a type whose shape
+// the position refuses: the shape gates report what the position admits, while
+// this one reports that no such type exists at all.
+
+fn no_such_type() -> u64 {
+    Widget w = 0;
+    return 0;
+}

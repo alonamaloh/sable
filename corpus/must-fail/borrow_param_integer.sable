@@ -1,0 +1,8 @@
+// expect-error: type.borrow_param_unsupported
+// A borrow is a second name for storage the caller keeps, and only arrays and
+// classes have such storage. An integer parameter is passed by value, so
+// `&mut u64` has nothing to name.
+
+fn bump(&mut u64 n) {
+    n = n + 1;
+}

@@ -1,0 +1,7 @@
+// expect-error: type.borrow_param_unsupported
+// An option is a copied value, so `&option<u64>` names nothing the caller
+// keeps. Passing the option by value is what the position admits.
+
+fn is_present(&option<u64> maybe) -> u64 {
+    return 0;
+}

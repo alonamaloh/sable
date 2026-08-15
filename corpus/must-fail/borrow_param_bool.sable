@@ -1,0 +1,10 @@
+// expect-error: type.borrow_param_unsupported
+// `bool` is a value like an integer: it is copied into the callee, so there is
+// no caller storage for `&bool` to name.
+
+fn read(&bool flag) -> u64 {
+    if (flag) {
+        return 1;
+    }
+    return 0;
+}

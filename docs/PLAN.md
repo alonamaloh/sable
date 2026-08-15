@@ -919,14 +919,14 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      parser cannot spell that form, but the public checked-AST boundary still
      rejects a forged instance rather than relying on the surface grammar.
 
-     **G1.5 — formal SVM Boolean arrays (complete):** the machine value is now
-     `Val.arr ArrayVal`, where
-     `ArrayVal := ints (Seq Int) | bools (Seq Bool)`. This tag remains present
-     at length zero. Length, checked index, allocation, and store are
-     generalized over the two homogeneous domains in both the relational
-     semantics and functional evaluator; evaluator agreement, determinism,
-     totality, and progress remain proved without deferred axioms. Rendering
-     preserves `arr [...]` and adds lowercase Boolean elements.
+     **G1.5 — formal SVM Boolean arrays (complete):** the machine value is
+     `Val.arr (elem : ValTag) (a : Seq Val)` — a payload tag beside ordinary
+     machine values (ADR 0062). The tag remains present at length zero. Length,
+     checked index, allocation, and store are generalized over the admitted
+     payload domains in both the relational semantics and functional evaluator;
+     evaluator agreement, determinism, totality, and progress remain proved
+     without deferred axioms. Rendering preserves `arr [...]` and spells scalar
+     elements bare, lowercase for Booleans.
 
      Evaluation and trap precedence are explicit. Allocation evaluates length,
      then its scalar initializer, then negative-length/capacity geometry. Store
@@ -1415,12 +1415,12 @@ outcome (ADR 0005 res. 1) covering ⊥-reads, type confusion, and out-of-range
 literals, so pillar 1 holds literally. `lean/Sable/SVMEval.lean` adds the
 functional evaluator/stepper with two-directional agreement proofs;
 determinism, totality, and progress are kernel-checked corollaries. Calls and
-frames, byte raw memory, abstract `u64`/POD cells, recursive ordinary options,
-and tagged `ArrayVal.ints`/`ArrayVal.bools` arrays all live in both core
-presentations. G1.5 generalizes length/index/allocation/store, preserves empty
-tags and trap precedence, and adds direct Boolean-array guards. G2.2 adds the
-generic atomic core `optTake` transition and an exact Boolean-array affine
-option bridge. Its full serial gate is green: `cargo check`; Lake 22/22;
+frames, byte raw memory, abstract `u64`/POD cells, recursive options (nullable
+raw pointers included), and tag-carrying arrays of ordinary machine values
+(ADR 0062) all live in both core presentations. G1.5 generalizes
+length/index/allocation/store, preserves empty tags and trap precedence, and
+adds direct Boolean-array guards. G2.2 adds the generic atomic core `optTake`
+transition and an exact Boolean-array affine option bridge. Its full serial gate is green: `cargo check`; Lake 22/22;
 focused SVM units 35/35; Rust library tests 211/211; the 416-subject recursive
 corpus in 270.58s; LLVM CLI 7/7; six-subject O0/O2 native differential 1/1;
 SVM differential 92/92; and the free-list, grind, LSP, docs, formatting,

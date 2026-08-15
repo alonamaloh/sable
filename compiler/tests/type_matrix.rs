@@ -13,16 +13,30 @@
 //! spellings passes; the recorded diagnostic is the one that closed the last
 //! candidate tried, which is the error a reader is most likely to hit.
 //!
+//! A cell must be decided by the position's admissibility, never by the form
+//! of the expression the probe happened to write. Types differ in how they
+//! are constructed — an owned array is born from `alloc_array`, an affine
+//! option from `none` or `some(alloc_array(...))`, a class from its `init` —
+//! so a probe reusing one literal everywhere can report a cell closed when
+//! only its initializer was refused. Each type therefore carries every
+//! construction the language accepts for it, and a position that needs a
+//! value tries them all. A candidate rejected for its initializer form is a
+//! bug in this harness, not a closed cell: if a closing diagnostic names an
+//! expression form rather than the type in the position, the missing
+//! construction belongs in `values`.
+//!
 //! Run with `SABLE_BLESS=1` to rewrite the table after an intended change.
 
 use std::path::{Path, PathBuf};
 
-/// One probed type: how it is spelled, an expression producing a value of
-/// it, and any declaration the spelling depends on.
+/// One probed type: how it is spelled, the expressions that construct a
+/// value of it, and any declaration the spelling depends on. `values` ends
+/// with the most ordinary construction, so a closed cell records the
+/// diagnostic a reader writing the obvious program would meet.
 struct Probe {
     name: &'static str,
     spelling: &'static str,
-    value: &'static str,
+    values: &'static [&'static str],
     decls: &'static str,
 }
 
@@ -46,26 +60,64 @@ class Box {
 ";
 
 const TYPES: &[Probe] = &[
-    Probe { name: "u64", spelling: "u64", value: "7", decls: "" },
-    Probe { name: "bool", spelling: "bool", value: "true", decls: "" },
-    Probe { name: "[u64]", spelling: "[u64]", value: "[1, 2]", decls: "" },
-    Probe { name: "[bool]", spelling: "[bool]", value: "[true, false]", decls: "" },
-    Probe { name: "option<u64>", spelling: "option<u64>", value: "some(7)", decls: "" },
-    Probe { name: "option<bool>", spelling: "option<bool>", value: "some(true)", decls: "" },
-    Probe { name: "record", spelling: "Pair", value: "Pair(1, 2)", decls: RECORD_DECL },
+    Probe { name: "u64", spelling: "u64", values: &["7"], decls: "" },
+    Probe { name: "bool", spelling: "bool", values: &["true"], decls: "" },
+    // Arrays are constructed either by a literal or by `alloc_array`; only
+    // the latter yields the owned array that a sink taking ownership wants.
+    Probe {
+        name: "[u64]",
+        spelling: "[u64]",
+        values: &["alloc_array<u64>(2, 0)", "[1, 2]"],
+        decls: "",
+    },
+    Probe {
+        name: "[bool]",
+        spelling: "[bool]",
+        values: &["alloc_array<bool>(2, true)", "[true, false]"],
+        decls: "",
+    },
+    Probe { name: "option<u64>", spelling: "option<u64>", values: &["none", "some(7)"], decls: "" },
+    Probe {
+        name: "option<bool>",
+        spelling: "option<bool>",
+        values: &["none", "some(true)"],
+        decls: "",
+    },
+    Probe { name: "record", spelling: "Pair", values: &["Pair(1, 2)"], decls: RECORD_DECL },
+    // An affine option admits exactly `none` and a freshly allocated array.
     Probe {
         name: "option<[bool]>",
         spelling: "option<[bool]>",
-        value: "some(alloc_array<bool>(2, true))",
+        values: &["none", "some(alloc_array<bool>(2, true))"],
         decls: "",
     },
-    Probe { name: "class", spelling: "Box", value: "Box::make()", decls: CLASS_DECL },
+    Probe { name: "class", spelling: "Box", values: &["Box::make()"], decls: CLASS_DECL },
 ];
 
 /// One probed position, as a list of candidate programs. A type belongs in
-/// the position when any candidate passes the front end, so a binding form
-/// that only some types need (`var`, `mut`) does not read as a missing cell.
+/// the position when any candidate passes the front end, so neither a
+/// binding form that only some types need (`var`, `mut`) nor a construction
+/// that only some types accept reads as a missing cell.
 type Context = (&'static str, fn(&Probe) -> Vec<String>);
+
+/// Every (spelling, construction) pairing, as the candidate programs built
+/// by `emit`. Positions that name a value must probe the whole product:
+/// closing a cell takes every construction of the type failing, which is
+/// what makes the closure a property of the position and not of one
+/// initializer.
+fn spellings_by_values(
+    p: &Probe,
+    spellings: &[String],
+    emit: impl Fn(&str, &str) -> String,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for spelling in spellings {
+        for value in p.values {
+            out.push(emit(spelling, value));
+        }
+    }
+    out
+}
 
 const CONTEXTS: &[Context] = &[
     ("local", ctx_local),
@@ -80,20 +132,28 @@ const CONTEXTS: &[Context] = &[
 ];
 
 fn ctx_local(p: &Probe) -> Vec<String> {
-    ["var".to_string(), p.spelling.to_string(), format!("mut {}", p.spelling), "mut var".to_string()]
-        .iter()
-        .map(|binding| {
-            format!("{}\nfn probe() -> u64 {{\n    {binding} x = {};\n    return 0;\n}}\n", p.decls, p.value)
-        })
-        .collect()
+    let bindings = [
+        "var".to_string(),
+        p.spelling.to_string(),
+        format!("mut {}", p.spelling),
+        "mut var".to_string(),
+    ];
+    spellings_by_values(p, &bindings, |binding, value| {
+        format!("{}\nfn probe() -> u64 {{\n    {binding} x = {value};\n    return 0;\n}}\n", p.decls)
+    })
 }
 
 fn ctx_return(p: &Probe) -> Vec<String> {
-    vec![format!("{}\nfn probe() -> {} {{\n    return {};\n}}\n", p.decls, p.spelling, p.value)]
+    spellings_by_values(p, &[p.spelling.to_string()], |spelling, value| {
+        format!("{}\nfn probe() -> {spelling} {{\n    return {value};\n}}\n", p.decls)
+    })
 }
 
+/// The borrow spelling comes first so the plain one is tried last: a reader
+/// asking whether a type may be a parameter writes `T x` before `&T x`, and
+/// the recorded diagnostic is the one the last candidate produced.
 fn ctx_param(p: &Probe) -> Vec<String> {
-    [p.spelling.to_string(), format!("&{}", p.spelling)]
+    [format!("&{}", p.spelling), p.spelling.to_string()]
         .iter()
         .map(|param| format!("{}\nfn probe({param} x) -> u64 {{\n    return 0;\n}}\n", p.decls))
         .collect()
@@ -112,41 +172,43 @@ fn ctx_record_field(p: &Probe) -> Vec<String> {
 }
 
 fn ctx_class_field(p: &Probe) -> Vec<String> {
-    vec![format!(
-        "{}\nclass Holder {{\n    {} f;\n\n    init make() {{\n        self.f = {};\n    }}\n}}\n\n\
-         fn probe() -> u64 {{ return 0; }}\n",
-        p.decls, p.spelling, p.value
-    )]
+    spellings_by_values(p, &[p.spelling.to_string()], |spelling, value| {
+        format!(
+            "{}\nclass Holder {{\n    {spelling} f;\n\n    init make() {{\n        \
+             self.f = {value};\n    }}\n}}\n\n\
+             fn probe() -> u64 {{ return 0; }}\n",
+            p.decls
+        )
+    })
 }
 
 fn ctx_array_element(p: &Probe) -> Vec<String> {
-    ["var".to_string(), format!("[{}]", p.spelling), format!("mut [{}]", p.spelling)]
-        .iter()
-        .map(|binding| {
-            format!("{}\nfn probe() -> u64 {{\n    {binding} xs = [{}];\n    return 0;\n}}\n", p.decls, p.value)
-        })
-        .collect()
+    let bindings =
+        ["var".to_string(), format!("[{}]", p.spelling), format!("mut [{}]", p.spelling)];
+    spellings_by_values(p, &bindings, |binding, value| {
+        format!("{}\nfn probe() -> u64 {{\n    {binding} xs = [{value}];\n    return 0;\n}}\n", p.decls)
+    })
 }
 
 fn ctx_option_payload(p: &Probe) -> Vec<String> {
-    [
+    let bindings = [
         "var".to_string(),
         format!("option<{}>", p.spelling),
         format!("mut option<{}>", p.spelling),
-    ]
-    .iter()
-    .map(|binding| {
-        format!("{}\nfn probe() -> u64 {{\n    {binding} o = some({});\n    return 0;\n}}\n", p.decls, p.value)
+    ];
+    spellings_by_values(p, &bindings, |binding, value| {
+        format!("{}\nfn probe() -> u64 {{\n    {binding} o = some({value});\n    return 0;\n}}\n", p.decls)
     })
-    .collect()
 }
 
 fn ctx_generic_arg(p: &Probe) -> Vec<String> {
-    vec![format!(
-        "{}\nfn id<T>(T x) -> T {{\n    return x;\n}}\n\n\
-         fn probe() -> u64 {{\n    var y = id<{}>({});\n    return 0;\n}}\n",
-        p.decls, p.spelling, p.value
-    )]
+    spellings_by_values(p, &[p.spelling.to_string()], |spelling, value| {
+        format!(
+            "{}\nfn id<T>(T x) -> T {{\n    return x;\n}}\n\n\
+             fn probe() -> u64 {{\n    var y = id<{spelling}>({value});\n    return 0;\n}}\n",
+            p.decls
+        )
+    })
 }
 
 /// `Ok` when the position admits the type; `Err` carries the diagnostic
@@ -239,3 +301,4 @@ fn type_matrix_is_pinned() {
         path.display()
     );
 }
+

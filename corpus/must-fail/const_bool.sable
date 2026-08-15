@@ -1,0 +1,9 @@
+// expect-error: type.const_unsupported
+// A `const` is folded into the integer expressions that mention it, so its
+// type stays in the integer domain the folder and the proof translation share.
+
+const bool ENABLED = true;
+
+fn use_it() -> u64 {
+    return 0;
+}

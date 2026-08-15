@@ -1,0 +1,17 @@
+// expect-error: type.class_field_unsupported
+// A class field is owned by its object, so it needs a drop order, an invariant
+// transport rule, and a backend layout. A record has an explicit layout of its
+// own and none of the other two, so it is not yet a field shape.
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+class Holder {
+    Pair p;
+
+    init make() {
+        self.p = Pair(1, 2);
+    }
+}

@@ -29,6 +29,9 @@ foo.sable
   │        attach blocks positionally (doc-comment rule)
   ▼
 parse (compiler/src/parser.rs)        handwritten recursive descent, error recovery;
+  │                                   one recursive type grammar for every position;
+  │                                   admissibility is decided after parsing by the
+  │                                   (shape × position) table `Parser::admits` (ADR 0063);
   │                                   bare string literals desugar here to a hidden
   │                                   [u8] temp + String::from_bytes(&temp) (ADR 0015)
   ▼
@@ -244,14 +247,56 @@ foreign, or cross-module array ABI.
 
 ## Key invariants
 
+- **One type grammar, one gate table** (ADR 0063). The parser has a single
+  recursive type production — nominal records and classes, integers, `bool`,
+  type parameters, `[T]`, `option<T>`, `raw<T>`, resource kinds, and the `&T` /
+  `&mut T` borrow forms — and every declared type goes through one parse
+  (`parse_type_syntax_at`) and one lowering (`Parser::lower_type(syntax, pos)`).
+  Three projections sit on top of that pair and differ only in the result type
+  they narrow to: `Parser::ty` yields `Ty`, `Parser::value_ty` yields `ValueTy`
+  for the element of `alloc_array<T>`, and `Parser::int_ty` yields `IntTy` for
+  `const`, `widen`/`narrow`, and `impl ... for`. A nested position narrows the
+  same way without a second parse — a `ResourceMap` key reaches `lower_int_ty`
+  from the syntax its resource kind already parsed.
+
+  Where a shape may be written is decided *after* parsing, by
+  `Parser::admits(shape, position)`: one match, readable as a table, keyed by
+  the shape of the type and the position it was written in. A position that
+  admits a shape is not promising the program checks; several positions admit a
+  shape deliberately so a downstream rule (record layout, aggregate payloads,
+  the affine-option boundary) owns the rejection and can say more about it than
+  a grammar could. What stays in the table are the rejections with no downstream
+  equivalent — the position's representation cannot hold the shape at all, or
+  admitting it would commit the compiler to semantics it does not have. That set
+  is the match in `Parser::admits`, which this document deliberately does not
+  copy: the table is the enumeration. Borrow and resource prefixes are a
+  separate production from the recursive core precisely because no nested
+  position — array element, option payload, generic argument — has a
+  representation for them, so `[&T]` is a parse error rather than a gate
+  rejection.
+
+  The table decides shapes and nothing else, and says so: which spellings of an
+  admitted shape exist (`raw<u8>` and `raw<Record>` in `lower_raw_type`, the
+  sealed resource kinds in `lower_res_kind`) is decided by the lowering routine
+  for that shape, and what a position demands beyond a spelling
+  (`local_needs_initializer`, the checker's payload, ownership, and layout
+  gates) is decided outside the parser. The option families are the sharpest
+  case: `option<[T]>` and `option<raw<R>>` are gated by the `OptionPayload` row
+  like any other payload — `lower_option_type` consults it for both before
+  either family is built — but which of the three families an admitted payload
+  names (`Ty::AffineOption`, `Ty::OptionRaw`, or a copyable `Ty::Option`) is
+  read off the payload's syntax afterwards, not from the table. Each position admits only
+  the shapes its lowering has a representation for, which a parser unit test
+  pins: a spelling the table admits can never reach an unhandled case.
+
 - **Generic widening starts fail closed.** G0 is complete as a representation,
   parser, identity, and rejection foundation. `GenericTy` and its opaque
   canonical key recurse over integers, `bool`, parameters, records, classes,
   arrays, and options. Each call or constructor `TypeArg` retains the span of
-  its complete outer type. The same bounded parser drives lookahead and AST
-  construction: a recursive path is at most 64 nodes, any argument list at most
-  256 entries, and one outer argument at most 4096 nodes. Imported generic-class
-  arities live in a table separate from checked class indices. None of that
+  its complete outer type. One bounded parser drives lookahead, use-site
+  arguments, and every declared type: a recursive path is at most 64 nodes, any
+  argument list at most 256 entries, and one type at most 4096 nodes. Imported
+  generic-class arities live in a table separate from checked class indices. None of that
   widens v1 semantics: every non-integer shape reaches
   `mono.type_arg_unsupported` before checked types are built. Preparation,
   substitution, and generic-use walks cover record literals, `some(...)`, class
@@ -447,14 +492,14 @@ foreign, or cross-module array ABI.
   corpus repeat was green in 195.71s. Randomized allocator, grind-budget, LSP,
   and documentation gates were green. G1.4b is closed.
 
-- **The formal array value is tagged; the source bridge remains local.** G1.5
-  replaces the integer-specialized `Val.arr` payload with
-  `ArrayVal.ints (Seq Int) | ArrayVal.bools (Seq Bool)`. The tag is retained at
-  length zero. Relational rules and the proved evaluator generalize length,
-  index, allocation, and store without permitting heterogeneous values; all
-  evaluator-agreement, determinism, totality, and progress proofs remain
-  theorem-backed. Canonical rendering stays `arr [...]`, using the historical
-  integer spellings and lowercase Boolean spellings.
+- **The formal array value is tagged; the source bridge remains local**
+  (ADR 0062). The formal array value is `Val.arr (elem : ValTag) (a : Seq Val)`:
+  a payload tag beside ordinary machine values. The tag is retained at length zero.
+  Relational rules and the proved evaluator give length, index, allocation, and
+  store one implementation each, over the tag rather than over the payload,
+  without permitting heterogeneous values; all evaluator-agreement,
+  determinism, totality, and progress proofs remain theorem-backed. Canonical
+  rendering stays `arr [...]`, spelling scalar elements bare.
 
   Store order is index evaluation, value evaluation and scalar-shape check,
   array lookup, payload-tag compatibility, then bounds. Consequently an
@@ -529,10 +574,11 @@ foreign, or cross-module array ABI.
   identity rather than pretending every future affine option is Boolean.
   Monomorphization validates and substitutes parameter payloads and rechecks
   concreteness. The checked representation can additionally carry
-  `ValueTy::Record`; module traversal applies nominal visibility to that future
-  or synthetic checked-AST case even though the surface parser does not yet
-  construct it. At G2.0 those representation paths authorized no payload and
-  every semantic boundary failed closed, including for the Boolean case.
+  `ValueTy::Record`, which the surface grammar spells as `[Pair]`; module
+  traversal applies nominal visibility to it, and
+  `type.array_payload_unsupported` is the semantic gate that keeps it closed. At
+  G2.0 those representation paths authorized no payload and every semantic
+  boundary failed closed, including for the Boolean case.
 
   G2.1 opens only explicit mutable local `option<[bool]>` values. Initialization
   is mandatory and is either `none` or
@@ -924,18 +970,24 @@ two-directional agreement, determinism, and progress results. A bare wrapper
 run renders byte-for-byte like the old core outcome; a selected run extends the
 canonical observation with profile id, oracle cursor, and ordered MMIO trace.
 
-Ordinary options occupy one recursive value form, `Val.opt : Option Val`, in
-both presentations. Generic machine constructors and accessors preserve the
-payload value, while outer-shape confusion is `undef` and extracting absence is
-`Trap.optionNone`. Nullable raw-pointer options remain a distinct value form,
-so an accessor cannot cross the ordinary/raw option boundary accidentally.
+Machine values are orthogonal (ADR 0062): an aggregate carries ordinary values,
+not a hand-specialized copy of them. Options occupy one recursive value form,
+`Val.opt : Option Val`, in both presentations, and it is the *only* option
+form: a nullable raw pointer is an ordinary option whose present case carries a
+`Val.ptr`. Generic machine
+constructors and accessors preserve the payload value, while outer-shape
+confusion is `undef` and extracting absence is `Trap.optionNone`. Which
+payloads may occupy an option in a given source position stays a checker
+question; the machine has one option semantics.
 
-Arrays likewise occupy one tagged form: `Val.arr` contains either
-`ArrayVal.ints (Seq Int)` or `ArrayVal.bools (Seq Bool)`. Empty arrays retain
-that constructor, so later stores still know which scalar domain is legal.
-Length, index, allocation, and store share one formal rule family over the tag;
-wrong-domain stores are `undef`, whereas matching out-of-bounds stores produce
-`Trap.indexOOB`.
+Arrays are `Val.arr (elem : ValTag) (a : Seq Val)` — a payload tag beside a
+sequence of ordinary machine values. The tag is what an empty array retains,
+so later stores still know which scalar domain is legal; it is a *name* for a
+domain rather than a second copy of its values, which is why length, index,
+allocation, and store each have one implementation instead of one arm per
+payload. `Val.tag?` is the single admission gate, and `Val.arrSet?` refuses
+a store whose value does not inhabit the array's tag. Wrong-domain stores are
+`undef`, whereas matching out-of-bounds stores produce `Trap.indexOOB`.
 
 The harness (`compiler/tests/svm_diff.rs`, ADR 0017) lowers every function in
 `corpus/svm-diff/` to Lean terms (`compiler/src/svm.rs`), runs each on both

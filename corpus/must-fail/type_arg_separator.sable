@@ -1,0 +1,8 @@
+// expect-error: parse.type_arg_separator
+// Inside `<...>`, a type is followed by `,` or by the closing `>`. Anything
+// else is a missing separator, not the start of another type, so the list is
+// not silently re-read as a comparison.
+
+fn pick() -> option<u64 u64> {
+    return none;
+}

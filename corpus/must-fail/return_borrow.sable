@@ -1,0 +1,7 @@
+// expect-error: type.return_unsupported
+// A returned borrow would name storage that the callee's frame stops keeping
+// at the return, so the return position admits every shape except a borrow.
+
+fn head(&[u64] xs) -> &[u64] {
+    return xs;
+}

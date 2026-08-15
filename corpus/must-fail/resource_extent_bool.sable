@@ -1,0 +1,7 @@
+// expect-error: type.resource_extent_unsupported
+// The extent a resource kind grants authority over is an integer cell or a
+// laid-out record; `bool` has no sealed operations reading it.
+
+fn boolean_extent(resource PointsTo<bool> cell) -> u64 {
+    return 0;
+}

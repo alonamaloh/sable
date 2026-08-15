@@ -1,0 +1,7 @@
+// expect-error: parse.raw_type_arity
+// `raw` takes exactly one element type. A second argument has no reading:
+// provenance plus a byte offset names one extent.
+
+fn read(raw<u8, u8> p) -> u64 {
+    return 0;
+}

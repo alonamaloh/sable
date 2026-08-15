@@ -1,5 +1,7 @@
-// expect-error: parse.unknown_type
-// Widening array payload syntax must not widen integer loop indices.
+// expect-error: type.for_index_unsupported
+// `bool` is a legal array payload but not a legal `for` index: the loop bound
+// comparison, the synthesized invariant, and the variant are integer facts, so
+// the index stays in the integer proof domain.
 
 fn bool_is_not_an_index_type() {
     for (bool i : range(1)) {}

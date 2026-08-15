@@ -1,0 +1,27 @@
+// A type parameter is the meaning of its name inside the declaration that
+// binds it, even when a class or record of that name is visible (ADR 0063).
+// Resolving binders first is what keeps a declaration coherent with its own
+// body: the `Box` in the signature and the `Box` in a use-site argument
+// denote the same thing.
+
+record Box #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 v;
+}
+
+/// post result = x
+pub fn identity<Box>(Box x) -> Box {
+    return x;
+}
+
+/// post result = 7
+pub fn shadowed_binder_is_the_parameter() -> u64 {
+    return identity<u64>(7);
+}
+
+// The nominal is still reachable from any declaration that does not bind its
+// name, so shadowing is local to the declaration rather than to the module.
+/// post result = 5
+pub fn nominal_outside_the_binder() -> u64 {
+    Box b = Box(5);
+    return b.v;
+}

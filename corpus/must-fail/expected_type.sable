@@ -1,0 +1,8 @@
+// expect-error: parse.expected_type
+// The type grammar starts at a name, `[`, `raw`, or a borrow prefix. A token
+// that begins none of them is reported where the type was expected, with the
+// list of what could have started one.
+
+fn arity() -> 7 {
+    return 7;
+}

@@ -1,0 +1,14 @@
+// expect-error: parse.raw_type_arity
+// The nullable-pointer family `option<raw<Record>>` is settled by the
+// enclosing `option`, so its pointee is read directly rather than through the
+// `raw<...>` value rule. That separate reading applies the same arity rule:
+// `raw` takes exactly one element type.
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+fn maybe(option<raw<Pair, Pair>> p) -> u64 {
+    return 0;
+}

@@ -1,0 +1,11 @@
+// expect-error: type.record_field_unsupported
+// Authority is not data: a resource has no layout, and a record is copied
+// freely, so a resource field could duplicate the authority it holds.
+
+record Cell #[layout(size := 8, align := 8)] {
+    #[offset(0)] resource PointsTo<u64> owned;
+}
+
+fn size() -> u64 {
+    return 8;
+}

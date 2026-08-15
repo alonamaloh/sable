@@ -1,0 +1,8 @@
+// expect-error: parse.array_type_close
+// An array type carries its element type and nothing else: the length is a
+// runtime value, not part of the spelling, so `[u64 4]` has no reading and the
+// missing `]` is reported at the token that was found instead.
+
+fn sized() -> [u64 4] {
+    return [1, 2, 3, 4];
+}

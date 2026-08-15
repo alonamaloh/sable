@@ -1,0 +1,13 @@
+// expect-error: type.borrow_param_unsupported
+// A record is a laid-out value that is copied at a call. Borrowing one would
+// need a referent the callee could write through, which only arrays and
+// classes have.
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+fn widen_left(&mut Pair p) {
+    p.left = p.left + 1;
+}

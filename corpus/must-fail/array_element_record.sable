@@ -1,0 +1,14 @@
+// expect-error: type.array_payload_unsupported
+// A record is a representable array element, so the parser admits it and the
+// checker owns the refusal: elementwise copy and comparison of a laid-out
+// aggregate have no semantics yet. This is the checker's half of the
+// array-payload rule (`array_element_class.sable` pins the parser's half).
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+fn count(&[Pair] pairs) -> u64 {
+    return 0;
+}

@@ -1,0 +1,7 @@
+// expect-error: type.raw_element_unsupported
+// A raw pointer is provenance plus a byte offset, so its element is a byte or
+// a laid-out record. `bool` has neither a width nor a layout to point at.
+
+fn read(raw<bool> p) -> u64 {
+    return 0;
+}

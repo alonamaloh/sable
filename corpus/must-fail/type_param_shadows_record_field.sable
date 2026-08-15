@@ -1,0 +1,16 @@
+// expect-error: type.mismatch
+// The failure direction of ADR 0063's shadowing rule. `Pair` here is the
+// binder, not the record, so the parameter has no fields to project. The
+// rule surfaces as this rejection rather than as a program that keeps
+// compiling with a different meaning, which is what makes binder-first safe
+// to prefer over resolving the nominal.
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 a;
+    #[offset(8)] u64 b;
+}
+
+/// post result = p.a
+pub fn first<Pair>(Pair p) -> u64 {
+    return p.a;
+}

@@ -1,0 +1,20 @@
+// expect-error: type.local_unsupported
+// A class local is introduced by `var`, so that its construction — and
+// therefore its invariant — is visible at the binding. Naming the class as the
+// declared type would let a local claim a class value it never built.
+
+class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+}
+
+fn make() -> u64 {
+    Counter c = Counter::zero();
+    return 0;
+}

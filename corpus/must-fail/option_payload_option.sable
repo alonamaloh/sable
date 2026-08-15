@@ -1,0 +1,11 @@
+// expect-error: type.option_payload_unsupported
+// An option of an option has no payload representation: the copyable payloads
+// are the scalars and the laid-out records, and the two owning families are
+// spelled `option<[T]>` and `option<raw<Record>>`. This is the parser's half
+// of the option-payload rule (`option_payload_record.sable` pins the
+// checker's half).
+
+fn nested() -> u64 {
+    option<option<u64>> maybe = none;
+    return 0;
+}

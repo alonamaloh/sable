@@ -1,0 +1,8 @@
+// expect-error: resource.type_arity
+// `RawSpan` is a nullary resource kind: the extent it grants authority over is
+// part of the kind, not a type argument. Only the parameterized kinds —
+// `PointsTo<...>`, `ResourceMap<..., ...>` — take an argument list.
+
+fn borrow_span(resource RawSpan<u64> span) -> u64 {
+    return 0;
+}

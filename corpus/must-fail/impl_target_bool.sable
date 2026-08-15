@@ -1,0 +1,17 @@
+// expect-error: type.impl_target_unsupported
+// A trait is implemented for an integer type: the bound is carried by the
+// monomorphizer through the integer type arguments a generic can be given.
+
+pub trait Hashable {
+    /// spec hash : int → int
+    /// post 0 ≤ result
+    /// post result = Self::hash x
+    fn hash(Self x) -> u64;
+}
+
+impl Hashable for bool {
+    /// def hash (x : int) : int := x
+    fn hash(bool x) -> u64 {
+        return 0;
+    }
+}

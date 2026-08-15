@@ -1,0 +1,16 @@
+// expect-error: type.option_payload_unsupported
+// A record is a representable option payload, so the parser admits it and the
+// checker owns the refusal: a record option would need a discriminant beside
+// the layout, which the representation does not carry. This is the checker's
+// half of the option-payload rule (`option_payload_option.sable` pins the
+// parser's half).
+
+record Pair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 left;
+    #[offset(8)] u64 right;
+}
+
+fn maybe_pair() -> u64 {
+    option<Pair> maybe = none;
+    return 0;
+}

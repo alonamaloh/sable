@@ -11,13 +11,13 @@ use crate::lexer::{Tok, Token};
 use crate::scan::{Clause, ClauseKind, ProofBlock};
 use crate::span::{LineMap, Span};
 
-const MAX_GENERIC_TYPE_DEPTH: usize = 64;
-const MAX_GENERIC_TYPE_ARGS: usize = 256;
-const MAX_GENERIC_TYPE_NODES: usize = 4096;
+const MAX_TYPE_DEPTH: usize = 64;
+const MAX_TYPE_ARGS: usize = 256;
+const MAX_TYPE_NODES: usize = 4096;
 /// Recovery only needs to see far enough past a hard limit to distinguish a
 /// real generic call from a comparison. This accepts the one-step-over-limit
 /// diagnostics while bounding its own token and frame storage.
-const MAX_GENERIC_RECOVERY_TOKENS: usize = MAX_GENERIC_TYPE_NODES * 4;
+const MAX_GENERIC_RECOVERY_TOKENS: usize = MAX_TYPE_NODES * 4;
 
 /// A nominal class visible while parsing recursive generic arguments.
 ///
@@ -31,31 +31,322 @@ struct GenericClassName {
     arity: usize,
 }
 
+/// A parsed type, before any position rule is applied.
+///
+/// The whole language has one type grammar:
+///
+/// ```text
+/// type := ('&' 'mut'?)? core | 'resource' ('&' 'mut'?)? core | core
+/// core := IDENT ('<' core (',' core)* '>')? | '[' core ']' | 'raw' '<' core '>'
+/// ```
+///
+/// The borrow and resource prefixes are a separate production because no
+/// nested position has a representation for them: an array element, an
+/// option payload, and a generic argument are all `core`. Everything else
+/// about where a shape may be written is decided after parsing, by
+/// [`Parser::admits`].
 #[derive(Debug, Clone)]
-struct GenericTypeSyntax {
-    kind: GenericTypeSyntaxKind,
+struct TypeSyntax {
+    kind: TypeSyntaxKind,
     span: Span,
 }
 
 #[derive(Debug, Clone)]
-enum GenericTypeSyntaxKind {
+enum TypeSyntaxKind {
+    /// `Name`, `Name<A, B>`, and — since `raw` is a keyword the lexer never
+    /// hands back as an identifier — `raw<T>`.
     Named {
         name: String,
         name_span: Span,
-        args: Option<Vec<GenericTypeSyntax>>,
+        args: Option<Vec<TypeSyntax>>,
     },
-    Array(Box<GenericTypeSyntax>),
+    Array(Box<TypeSyntax>),
+    Borrow {
+        mutability: Mutability,
+        referent: Box<TypeSyntax>,
+    },
+    Resource {
+        borrow: Option<Mutability>,
+        kind: Box<TypeSyntax>,
+    },
+}
+
+/// The name `raw<T>` is spelled with. `raw` is a lexer keyword, so no
+/// identifier can collide with it and no program can shadow it.
+const RAW_TYPE_NAME: &str = "raw";
+
+/// What a spelled type denotes, independent of where it was written. This
+/// is the row key of the admissibility table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeShape {
+    Int,
+    Bool,
+    Param,
+    Record,
+    Class,
+    Array,
+    Option,
+    Raw,
+    Resource,
+    Borrow,
+}
+
+impl TypeShape {
+    /// Every shape, in the order a reader of the gate table should meet
+    /// them: scalars, then nominals, then constructed forms.
+    ///
+    /// The order is a chain rather than a list because a list can fall
+    /// behind the enum: [`TypeShape::after`] is an exhaustive match, so a new
+    /// shape has to be given its place here before the compiler accepts it,
+    /// and every sentence read off this enumeration then mentions it.
+    fn all() -> impl Iterator<Item = TypeShape> {
+        std::iter::successors(Some(TypeShape::Int), |shape| shape.after())
+    }
+
+    /// The shape that follows `self` in [`TypeShape::all`]; `None` ends it.
+    fn after(self) -> Option<TypeShape> {
+        Some(match self {
+            TypeShape::Int => TypeShape::Bool,
+            TypeShape::Bool => TypeShape::Param,
+            TypeShape::Param => TypeShape::Record,
+            TypeShape::Record => TypeShape::Class,
+            TypeShape::Class => TypeShape::Array,
+            TypeShape::Array => TypeShape::Option,
+            TypeShape::Option => TypeShape::Raw,
+            TypeShape::Raw => TypeShape::Resource,
+            TypeShape::Resource => TypeShape::Borrow,
+            TypeShape::Borrow => return None,
+        })
+    }
+
+    /// How the shape is named in a diagnostic, as a noun phrase.
+    fn describe(self) -> &'static str {
+        match self {
+            TypeShape::Int => "an integer type",
+            TypeShape::Bool => "`bool`",
+            TypeShape::Param => "a type parameter",
+            TypeShape::Record => "a record type",
+            TypeShape::Class => "a class type",
+            TypeShape::Array => "an array type `[T]`",
+            TypeShape::Option => "an option type `option<T>`",
+            TypeShape::Raw => "a raw pointer type `raw<T>`",
+            TypeShape::Resource => "a resource type",
+            TypeShape::Borrow => "a borrow `&T` or `&mut T`",
+        }
+    }
+
+    /// How the shape is spelled in the list of what a position admits.
+    fn spelling(self) -> &'static str {
+        match self {
+            TypeShape::Int => "`u8`..`u64`, `i8`..`i64`",
+            TypeShape::Bool => "`bool`",
+            TypeShape::Param => "an in-scope type parameter",
+            TypeShape::Record => "a visible record",
+            TypeShape::Class => "a visible class",
+            TypeShape::Array => "`[T]`",
+            TypeShape::Option => "`option<T>`",
+            TypeShape::Raw => "`raw<T>`",
+            TypeShape::Resource => "`resource K`",
+            // Slashed rather than "or", since this spelling is read inside a
+            // list whose own last separator is "or".
+            TypeShape::Borrow => "`&T`/`&mut T`",
+        }
+    }
+}
+
+/// Where a type was written. This is the column key of the admissibility
+/// table, and it is the only thing a caller passes to the one type parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TyPos {
+    Param,
+    /// The referent of a `&`/`&mut` parameter.
+    BorrowParam,
+    Return,
+    Local,
+    RecordField,
+    ClassField,
+    ArrayElement,
+    OptionPayload,
+    ForIndex,
+    Const,
+    CastTarget,
+    TraitImplTarget,
+    /// The element of `raw<...>`.
+    RawElement,
+    /// The extent type a resource kind grants authority over: the argument
+    /// of `PointsTo<...>` / `LeasedPointsTo<...>`, including the one inside
+    /// a `ResourceMap`'s value.
+    ResourceExtent,
+    /// The key of `ResourceMap<..., ...>`. Separate from the extent because
+    /// a key is an arena offset — an integer — while an extent may be a
+    /// record; the two are lowered by different routines with different
+    /// representations.
+    ResourceMapKey,
+}
+
+impl TyPos {
+    /// The stable, machine-matchable name of this position's gate.
+    ///
+    /// Array elements and option payloads share their name with the
+    /// checker's payload rules: the parser rejects the shapes the
+    /// representation cannot hold, the checker rejects the ones it can hold
+    /// but has no semantics for, and a reader asking "what may go here" gets
+    /// one answer either way. The name answers a question about the
+    /// language, not about which stage happened to answer it, so a rule that
+    /// later moves between the two does not rename a diagnostic anyone
+    /// matches on — and `docs/type-matrix.md` records one closing name per
+    /// cell rather than a staging detail.
+    ///
+    /// The cost is that an `expect-error` fence cannot tell the two rules
+    /// apart, so the corpus alone could let a regression in one hide behind
+    /// the other. What keeps each half pinned is not the fence:
+    /// `admitted_shapes_match_their_lowering` pins this table shape by
+    /// shape, so a gate that started admitting a shape its lowering cannot
+    /// hold fails there, and the checker's half has corpus subjects of its
+    /// own for the shapes this table deliberately lets through
+    /// (`array_element_record.sable`, `option_payload_record.sable`, against
+    /// the parser's `array_element_class.sable` and
+    /// `option_payload_option.sable`).
+    fn gate_name(self) -> &'static str {
+        match self {
+            TyPos::Param => "type.param_unsupported",
+            TyPos::BorrowParam => "type.borrow_param_unsupported",
+            TyPos::Return => "type.return_unsupported",
+            TyPos::Local => "type.local_unsupported",
+            TyPos::RecordField => "type.record_field_unsupported",
+            TyPos::ClassField => "type.class_field_unsupported",
+            TyPos::ArrayElement => "type.array_payload_unsupported",
+            TyPos::OptionPayload => "type.option_payload_unsupported",
+            TyPos::ForIndex => "type.for_index_unsupported",
+            TyPos::Const => "type.const_unsupported",
+            TyPos::CastTarget => "type.cast_target_unsupported",
+            TyPos::TraitImplTarget => "type.impl_target_unsupported",
+            TyPos::RawElement => "type.raw_element_unsupported",
+            TyPos::ResourceExtent => "type.resource_extent_unsupported",
+            TyPos::ResourceMapKey => "type.resource_map_key_unsupported",
+        }
+    }
+
+    /// How the position is named in a diagnostic, as a noun phrase.
+    fn describe(self) -> &'static str {
+        match self {
+            TyPos::Param => "a parameter type",
+            TyPos::BorrowParam => "the referent of a borrowed parameter",
+            TyPos::Return => "a return type",
+            TyPos::Local => "the declared type of a local",
+            TyPos::RecordField => "a record field type",
+            TyPos::ClassField => "a class field type",
+            TyPos::ArrayElement => "an array element type",
+            TyPos::OptionPayload => "an option payload type",
+            TyPos::ForIndex => "a `for` index type",
+            TyPos::Const => "a `const` type",
+            TyPos::CastTarget => "a `widen`/`narrow` target",
+            TyPos::TraitImplTarget => "an `impl ... for` type",
+            TyPos::RawElement => "a `raw<...>` element type",
+            TyPos::ResourceExtent => "a resource extent type",
+            TyPos::ResourceMapKey => "a `ResourceMap` key type",
+        }
+    }
+
+    /// Why this position does not admit this shape.
+    ///
+    /// A rejection is a (shape, position) pair, so the note is keyed by
+    /// both: what a reader needs explained is the type they wrote, not the
+    /// position's most common refusal. The arms that name a shape come
+    /// first; a position's closing arm states the rule that covers the rest
+    /// of what it refuses.
+    fn rejection_note(self, shape: TypeShape) -> &'static str {
+        use TyPos as P;
+        use TypeShape as S;
+        match (self, shape) {
+            (P::Param, S::Array) => {
+                "an owned array is borrowed at a call: write `&[T]` or `&mut [T]`, which \
+                 names the caller's storage instead of moving the array into the callee"
+            }
+            (P::Return, S::Borrow) => {
+                "a returned borrow would name storage that the callee's frame stops \
+                 keeping at the return"
+            }
+            (P::BorrowParam, _) => {
+                "a borrow is a second name for storage the caller keeps; only arrays and \
+                 classes have one"
+            }
+            // Every other position stores or names storage of its own, so
+            // none of them has a caller whose storage a borrow could name.
+            (_, S::Borrow) => {
+                "a borrow names storage a call was handed, and only a parameter is handed \
+                 storage"
+            }
+            (P::Param | P::Return, _) => {
+                "a value crossing a call boundary needs a calling convention and an \
+                 ownership rule on both sides"
+            }
+            (P::Local, S::Class) => {
+                "a class local is introduced by `var` so that its construction, and \
+                 therefore its invariant, is visible at the binding"
+            }
+            (P::Local, _) => {
+                "a local names storage of its own, so its declared type has to be one the \
+                 frame can hold"
+            }
+            (P::RecordField, S::Resource) => {
+                "authority is not data: a resource has no layout, and a record is copied \
+                 freely, so a field could duplicate it"
+            }
+            (P::RecordField, _) => {
+                "a record is a checked explicit layout, so every field needs a size, an \
+                 alignment, and a copy rule"
+            }
+            (P::ClassField, _) => {
+                "a class field is owned by its object, so it needs a drop order, an \
+                 invariant transport rule, and a backend layout"
+            }
+            (P::ArrayElement, _) => {
+                "an array element is stored, copied, and compared elementwise, so it \
+                 needs a layout and a copy rule"
+            }
+            (P::OptionPayload, _) => {
+                "a copyable option payload is duplicated whenever the option is, so it \
+                 needs a copy rule; the owning payloads are the separate `option<[T]>` \
+                 and `option<raw<Record>>` families"
+            }
+            (P::ForIndex, _) => {
+                "the loop bound comparison, the synthesized invariant, and the variant \
+                 are all integer facts, so the index stays in the integer proof domain"
+            }
+            (P::Const, _) => {
+                "a `const` names one machine integer value, and a type parameter stands \
+                 for the width of one"
+            }
+            (P::CastTarget, _) => {
+                "`widen` and `narrow` convert between machine integer widths, and a type \
+                 parameter stands for one"
+            }
+            (P::TraitImplTarget, _) => "traits are implemented for integer types",
+            (P::RawElement, _) => {
+                "a raw pointer is provenance plus a byte offset into a laid-out extent"
+            }
+            (P::ResourceExtent, _) => {
+                "resource authority is compiler-defined; its extent types are fixed by \
+                 the sealed operations that read them"
+            }
+            (P::ResourceMapKey, _) => {
+                "a resource-map key is an arena offset, so it is an integer; which \
+                 integer widths a map supports is decided after the shape"
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct ParsedTypeArgList {
-    args: Vec<GenericTypeSyntax>,
+    args: Vec<TypeSyntax>,
     /// Token index immediately after the closing `>`.
     end: usize,
 }
 
 #[derive(Debug, Default)]
-struct GenericTypeBudget {
+struct TypeBudget {
     nodes: usize,
 }
 
@@ -617,6 +908,18 @@ impl<'a> Parser<'a> {
             notes: vec![],
         }
     }
+    /// `error_expected` for the index-based type grammar, which reads tokens
+    /// without moving the cursor.
+    fn token_expected(&self, index: usize, what: &str) -> Diagnostic {
+        let token = self.token_at(index);
+        Diagnostic {
+            name: "parse.expected".into(),
+            title: format!("expected {what}, found {}", token.tok.describe()),
+            span: token.span,
+            label: format!("expected {what}"),
+            notes: vec![],
+        }
+    }
 
     /// The proof block whose last line immediately precedes `line`, if any.
     fn take_block_ending_before(&mut self, line: usize) -> Option<&'a ProofBlock> {
@@ -635,25 +938,22 @@ impl<'a> Parser<'a> {
             .unwrap_or_else(|| self.tokens.last().expect("the lexer emits EOF"))
     }
 
-    fn expected_generic_type(&self, index: usize) -> Diagnostic {
+    fn expected_type(&self, index: usize) -> Diagnostic {
         let token = self.token_at(index);
         Diagnostic {
-            name: "parse.expected_generic_type".into(),
-            title: format!(
-                "expected a generic type, found {}",
-                token.tok.describe()
-            ),
+            name: "parse.expected_type".into(),
+            title: format!("expected a type, found {}", token.tok.describe()),
             span: token.span,
-            label: "expected an integer, `bool`, a type parameter, a visible nominal type, `[T]`, or `option<T>`"
+            label: "expected an integer, `bool`, a type parameter, a visible nominal type, `[T]`, `raw<T>`, or `option<T>`"
                 .into(),
             notes: vec![],
         }
     }
 
-    fn generic_type_separator_error(&self, index: usize) -> Diagnostic {
+    fn type_arg_separator_error(&self, index: usize) -> Diagnostic {
         let token = self.token_at(index);
         Diagnostic {
-            name: "parse.generic_type_separator".into(),
+            name: "parse.type_arg_separator".into(),
             title: format!(
                 "expected `,` or `>` in generic arguments, found {}",
                 token.tok.describe()
@@ -664,26 +964,22 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn generic_type_depth_error(&self, index: usize) -> Diagnostic {
+    fn type_depth_error(&self, index: usize) -> Diagnostic {
         Diagnostic {
-            name: "parse.generic_type_too_deep".into(),
-            title: "generic type is nested too deeply".into(),
+            name: "parse.type_too_deep".into(),
+            title: "type is nested too deeply".into(),
             span: self.token_at(index).span,
-            label: format!(
-                "at most {MAX_GENERIC_TYPE_DEPTH} recursive type nodes may occur on one path"
-            ),
+            label: format!("at most {MAX_TYPE_DEPTH} recursive type nodes may occur on one path"),
             notes: vec![],
         }
     }
 
-    fn generic_type_size_error(&self, index: usize) -> Diagnostic {
+    fn type_size_error(&self, index: usize) -> Diagnostic {
         Diagnostic {
-            name: "parse.generic_type_too_large".into(),
-            title: "generic type is too large".into(),
+            name: "parse.type_too_large".into(),
+            title: "type is too large".into(),
             span: self.token_at(index).span,
-            label: format!(
-                "at most {MAX_GENERIC_TYPE_NODES} nodes are allowed in one outer type argument"
-            ),
+            label: format!("at most {MAX_TYPE_NODES} nodes are allowed in one type"),
             notes: vec![],
         }
     }
@@ -693,25 +989,83 @@ impl<'a> Parser<'a> {
             name: "parse.too_many_type_args".into(),
             title: "too many generic type arguments".into(),
             span: self.token_at(index).span,
-            label: format!("at most {MAX_GENERIC_TYPE_ARGS} arguments are allowed in one list"),
+            label: format!("at most {MAX_TYPE_ARGS} arguments are allowed in one list"),
             notes: vec![],
         }
     }
 
-    /// Parse one bounded recursive type from `index`. This syntax routine is
-    /// shared by lookahead and AST construction, so nested closing `>` tokens
-    /// cannot be interpreted differently by the two paths.
-    fn parse_generic_type_syntax_at(
+    /// Parse one bounded recursive type from `index`, including the borrow
+    /// and resource prefixes. Callers that reach a *nested* type — an array
+    /// element, a type argument, a `raw<...>` element — go to
+    /// [`Parser::parse_type_core_at`] instead, because no nested position has
+    /// a representation for a borrow or for authority.
+    fn parse_type_syntax_at(
         &self,
         index: &mut usize,
         depth: usize,
-        budget: &mut GenericTypeBudget,
-    ) -> PResult<GenericTypeSyntax> {
-        if depth > MAX_GENERIC_TYPE_DEPTH {
-            return Err(self.generic_type_depth_error(*index));
+        budget: &mut TypeBudget,
+    ) -> PResult<TypeSyntax> {
+        let start = self.token_at(*index).span;
+        match self.token_at(*index).tok {
+            Tok::Amp => {
+                *index += 1;
+                let mutability = self.parse_borrow_mutability_at(index);
+                let referent = self.parse_type_core_at(index, depth, budget)?;
+                let span = start.join(referent.span);
+                Ok(TypeSyntax {
+                    kind: TypeSyntaxKind::Borrow {
+                        mutability,
+                        referent: Box::new(referent),
+                    },
+                    span,
+                })
+            }
+            Tok::KwResource => {
+                *index += 1;
+                let borrow = if self.token_at(*index).tok == Tok::Amp {
+                    *index += 1;
+                    Some(self.parse_borrow_mutability_at(index))
+                } else {
+                    None
+                };
+                let kind = self.parse_type_core_at(index, depth, budget)?;
+                let span = start.join(kind.span);
+                Ok(TypeSyntax {
+                    kind: TypeSyntaxKind::Resource {
+                        borrow,
+                        kind: Box::new(kind),
+                    },
+                    span,
+                })
+            }
+            _ => self.parse_type_core_at(index, depth, budget),
         }
-        if budget.nodes == MAX_GENERIC_TYPE_NODES {
-            return Err(self.generic_type_size_error(*index));
+    }
+
+    /// `mut` is a contextual identifier, not a keyword.
+    fn parse_borrow_mutability_at(&self, index: &mut usize) -> Mutability {
+        if matches!(&self.token_at(*index).tok, Tok::Ident(m) if m == "mut") {
+            *index += 1;
+            Mutability::Mut
+        } else {
+            Mutability::Shared
+        }
+    }
+
+    /// The prefix-free core of the type grammar. This syntax routine is
+    /// shared by lookahead and AST construction, so nested closing `>` tokens
+    /// cannot be interpreted differently by the two paths.
+    fn parse_type_core_at(
+        &self,
+        index: &mut usize,
+        depth: usize,
+        budget: &mut TypeBudget,
+    ) -> PResult<TypeSyntax> {
+        if depth > MAX_TYPE_DEPTH {
+            return Err(self.type_depth_error(*index));
+        }
+        if budget.nodes == MAX_TYPE_NODES {
+            return Err(self.type_size_error(*index));
         }
         budget.nodes += 1;
 
@@ -721,15 +1075,14 @@ impl<'a> Parser<'a> {
                 *index += 1;
                 let mut span = token.span;
                 let args = if self.token_at(*index).tok == Tok::Lt {
-                    let (args, close) =
-                        self.parse_nested_generic_type_list(index, depth + 1, budget)?;
+                    let (args, close) = self.parse_type_arg_list_at(index, depth + 1, budget)?;
                     span = span.join(close);
                     Some(args)
                 } else {
                     None
                 };
-                Ok(GenericTypeSyntax {
-                    kind: GenericTypeSyntaxKind::Named {
+                Ok(TypeSyntax {
+                    kind: TypeSyntaxKind::Named {
                         name,
                         name_span: token.span,
                         args,
@@ -737,53 +1090,70 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+            // `raw` is a keyword, so it reaches naming through this arm
+            // alone: no identifier can spell it and no program can shadow it.
+            Tok::KwRaw => {
+                *index += 1;
+                if self.token_at(*index).tok != Tok::Lt {
+                    return Err(self.token_expected(*index, &Tok::Lt.describe()));
+                }
+                let (args, close) = self.parse_type_arg_list_at(index, depth + 1, budget)?;
+                Ok(TypeSyntax {
+                    kind: TypeSyntaxKind::Named {
+                        name: RAW_TYPE_NAME.into(),
+                        name_span: token.span,
+                        args: Some(args),
+                    },
+                    span: token.span.join(close),
+                })
+            }
             Tok::LBracket => {
                 *index += 1;
-                let element = self.parse_generic_type_syntax_at(index, depth + 1, budget)?;
+                let element = self.parse_type_core_at(index, depth + 1, budget)?;
                 if self.token_at(*index).tok != Tok::RBracket {
                     let found = self.token_at(*index);
                     return Err(Diagnostic {
-                        name: "parse.generic_array_close".into(),
+                        name: "parse.array_type_close".into(),
                         title: format!(
-                            "expected `]` after generic array element, found {}",
+                            "expected `]` after the array element type, found {}",
                             found.tok.describe()
                         ),
                         span: found.span,
-                        label: "close the generic array type with `]`".into(),
+                        label: "close the array type with `]`".into(),
                         notes: vec![],
                     });
                 }
                 let close = self.token_at(*index).span;
                 *index += 1;
-                Ok(GenericTypeSyntax {
-                    kind: GenericTypeSyntaxKind::Array(Box::new(element)),
+                Ok(TypeSyntax {
+                    kind: TypeSyntaxKind::Array(Box::new(element)),
                     span: token.span.join(close),
                 })
             }
-            _ => Err(self.expected_generic_type(*index)),
+            _ => Err(self.expected_type(*index)),
         }
     }
 
     /// Parse a nested `<...>` list. Every nested list has its own arity cap,
     /// while all of its nodes charge the enclosing outer-argument budget.
-    fn parse_nested_generic_type_list(
+    fn parse_type_arg_list_at(
         &self,
         index: &mut usize,
         child_depth: usize,
-        budget: &mut GenericTypeBudget,
-    ) -> PResult<(Vec<GenericTypeSyntax>, Span)> {
+        budget: &mut TypeBudget,
+    ) -> PResult<(Vec<TypeSyntax>, Span)> {
         debug_assert_eq!(self.token_at(*index).tok, Tok::Lt);
         *index += 1;
         if self.token_at(*index).tok == Tok::Gt {
-            return Err(self.expected_generic_type(*index));
+            return Err(self.expected_type(*index));
         }
 
         let mut args = Vec::new();
         loop {
-            if args.len() == MAX_GENERIC_TYPE_ARGS {
+            if args.len() == MAX_TYPE_ARGS {
                 return Err(self.too_many_generic_type_args(*index));
             }
-            args.push(self.parse_generic_type_syntax_at(index, child_depth, budget)?);
+            args.push(self.parse_type_core_at(index, child_depth, budget)?);
             match &self.token_at(*index).tok {
                 Tok::Comma => *index += 1,
                 Tok::Gt => {
@@ -791,7 +1161,7 @@ impl<'a> Parser<'a> {
                     *index += 1;
                     return Ok((args, close));
                 }
-                _ => return Err(self.generic_type_separator_error(*index)),
+                _ => return Err(self.type_arg_separator_error(*index)),
             }
         }
     }
@@ -802,23 +1172,23 @@ impl<'a> Parser<'a> {
         debug_assert_eq!(self.token_at(start).tok, Tok::Lt);
         let mut index = start + 1;
         if self.token_at(index).tok == Tok::Gt {
-            return Err(self.expected_generic_type(index));
+            return Err(self.expected_type(index));
         }
 
         let mut args = Vec::new();
         loop {
-            if args.len() == MAX_GENERIC_TYPE_ARGS {
+            if args.len() == MAX_TYPE_ARGS {
                 return Err(self.too_many_generic_type_args(index));
             }
-            let mut budget = GenericTypeBudget::default();
-            args.push(self.parse_generic_type_syntax_at(&mut index, 1, &mut budget)?);
+            let mut budget = TypeBudget::default();
+            args.push(self.parse_type_core_at(&mut index, 1, &mut budget)?);
             match &self.token_at(index).tok {
                 Tok::Comma => index += 1,
                 Tok::Gt => {
                     index += 1;
                     return Ok(ParsedTypeArgList { args, end: index });
                 }
-                _ => return Err(self.generic_type_separator_error(index)),
+                _ => return Err(self.type_arg_separator_error(index)),
             }
         }
     }
@@ -830,7 +1200,7 @@ impl<'a> Parser<'a> {
             .map(|class| class.arity)
     }
 
-    fn generic_type_arity_error(
+    fn type_arity_error(
         &self,
         name: &str,
         expected: usize,
@@ -847,15 +1217,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn lower_generic_type(&self, syntax: &GenericTypeSyntax) -> PResult<GenericTy> {
-        let GenericTypeSyntaxKind::Named {
+    fn lower_generic_type(&self, syntax: &TypeSyntax) -> PResult<GenericTy> {
+        let TypeSyntaxKind::Named {
             name,
             name_span,
             args,
         } = &syntax.kind
         else {
-            let GenericTypeSyntaxKind::Array(element) = &syntax.kind else {
-                unreachable!()
+            let TypeSyntaxKind::Array(element) = &syntax.kind else {
+                unreachable!("a type argument is parsed by the prefix-free core grammar")
             };
             return Ok(GenericTy::Array(Box::new(
                 self.lower_generic_type(element)?,
@@ -865,7 +1235,7 @@ impl<'a> Parser<'a> {
         let actual = args.as_ref().map_or(0, Vec::len);
         if let Some(integer) = IntTy::from_name(name) {
             if args.is_some() {
-                return Err(self.generic_type_arity_error(
+                return Err(self.type_arity_error(
                     name,
                     0,
                     actual,
@@ -877,7 +1247,7 @@ impl<'a> Parser<'a> {
         }
         if name == "bool" {
             if args.is_some() {
-                return Err(self.generic_type_arity_error(
+                return Err(self.type_arity_error(
                     name,
                     0,
                     actual,
@@ -889,7 +1259,7 @@ impl<'a> Parser<'a> {
         }
         if let Some(parameter) = self.tparams.iter().position(|candidate| candidate == name) {
             if args.is_some() {
-                return Err(self.generic_type_arity_error(
+                return Err(self.type_arity_error(
                     name,
                     0,
                     actual,
@@ -904,7 +1274,7 @@ impl<'a> Parser<'a> {
         }
         if name == "option" {
             if actual != 1 {
-                return Err(self.generic_type_arity_error(
+                return Err(self.type_arity_error(
                     name,
                     1,
                     actual,
@@ -924,7 +1294,7 @@ impl<'a> Parser<'a> {
                 } else {
                     "parse.generic_class_arity"
                 };
-                return Err(self.generic_type_arity_error(
+                return Err(self.type_arity_error(
                     name,
                     expected,
                     actual,
@@ -946,7 +1316,7 @@ impl<'a> Parser<'a> {
         }
         if self.record_names.iter().any(|record| record == name) {
             if args.is_some() {
-                return Err(self.generic_type_arity_error(
+                return Err(self.type_arity_error(
                     name,
                     0,
                     actual,
@@ -977,7 +1347,7 @@ impl<'a> Parser<'a> {
         let recovery_end = start.saturating_add(MAX_GENERIC_RECOVERY_TOKENS);
         let mut frames = vec![GenericRecoveryFrame::ListNeedType];
         loop {
-            if index > recovery_end || frames.len() > MAX_GENERIC_TYPE_DEPTH + 1 {
+            if index > recovery_end || frames.len() > MAX_TYPE_DEPTH + 1 {
                 return false;
             }
             let Some(frame) = frames.last().copied() else {
@@ -986,6 +1356,16 @@ impl<'a> Parser<'a> {
             match frame {
                 GenericRecoveryFrame::ListNeedType | GenericRecoveryFrame::ArrayNeedType => {
                     match &self.token_at(index).tok {
+                        // `raw<T>` names a type through the keyword, and its
+                        // argument list is mandatory.
+                        Tok::KwRaw => {
+                            index += 1;
+                            if self.token_at(index).tok != Tok::Lt {
+                                return false;
+                            }
+                            index += 1;
+                            frames.push(GenericRecoveryFrame::ListNeedType);
+                        }
                         Tok::Ident(_) => {
                             index += 1;
                             if self.token_at(index).tok == Tok::Lt {
@@ -1104,105 +1484,595 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn int_ty(&mut self) -> PResult<(IntTy, Span)> {
-        let (name, span) = self.ident()?;
-        if let Some(i) = self.tparams.iter().position(|p| *p == name) {
-            let index = u8::try_from(i)
-                .expect("type_param_list enforces the legacy type-parameter ceiling");
-            return Ok((IntTy::TParam(index), span));
+    /// Which type *shapes* each position admits.
+    ///
+    /// This match is the language's whole shape policy for types: the
+    /// grammar can spell every shape the compiler represents, in every
+    /// position, and this table decides which of those spellings mean
+    /// something where they were written. Every position rule that looks
+    /// only at the shape is here, and a reader sees the whole set at once.
+    ///
+    /// Admitting a shape is not a promise that the program checks. Several
+    /// positions deliberately admit a shape so that a semantic rule
+    /// downstream — record layout, aggregate payloads, the affine-option
+    /// boundary — owns the rejection and can say more about it than a
+    /// grammar could. The rejections that stay here are the ones with no
+    /// downstream equivalent, either because the representation cannot hold
+    /// the shape at all or because letting it through would commit the
+    /// compiler to semantics it does not have.
+    ///
+    /// Two kinds of rule deliberately live outside this table, because they
+    /// look past the shape at the type itself. A reader asking "may this
+    /// type go here" needs the table and both of these:
+    ///
+    /// * which spellings of an admitted shape exist at all —
+    ///   [`Parser::lower_raw_type`] for `raw<...>`, [`Parser::lower_res_kind`]
+    ///   for the sealed resource kinds, and [`Parser::lower_option_type`],
+    ///   which sorts an admitted payload into the three option families;
+    /// * what a position demands beyond a spelling —
+    ///   [`local_needs_initializer`], and the checker's payload, ownership,
+    ///   and layout gates named in the arms below.
+    fn admits(shape: TypeShape, pos: TyPos) -> bool {
+        use TyPos as P;
+        use TypeShape as S;
+        match pos {
+            // `type.option_param`, `type.bool_array_param`, and the
+            // affine-option boundary decide the rest.
+            P::Param => matches!(
+                shape,
+                S::Int
+                    | S::Bool
+                    | S::Param
+                    | S::Record
+                    | S::Class
+                    | S::Option
+                    | S::Raw
+                    | S::Resource
+                    | S::Borrow
+            ),
+            P::BorrowParam => matches!(shape, S::Class | S::Array),
+            // `type.array_return` and the affine-option boundary own the
+            // aggregate cases.
+            P::Return => matches!(
+                shape,
+                S::Int
+                    | S::Bool
+                    | S::Param
+                    | S::Record
+                    | S::Class
+                    | S::Array
+                    | S::Option
+                    | S::Raw
+                    | S::Resource
+            ),
+            P::Local => matches!(
+                shape,
+                S::Int
+                    | S::Bool
+                    | S::Param
+                    | S::Record
+                    | S::Array
+                    | S::Option
+                    | S::Raw
+                    | S::Resource
+            ),
+            // `record.field_type` is the layout rule; everything with a
+            // value spelling reaches it.
+            P::RecordField => matches!(
+                shape,
+                S::Int
+                    | S::Bool
+                    | S::Param
+                    | S::Record
+                    | S::Class
+                    | S::Array
+                    | S::Option
+                    | S::Raw
+            ),
+            // A raw pointer or a record in a class field would need a field
+            // layout and a copy rule that no downstream gate states, so this
+            // one stays here.
+            P::ClassField => matches!(
+                shape,
+                S::Int | S::Bool | S::Param | S::Class | S::Array | S::Option | S::Resource
+            ),
+            // `ValueTy` holds exactly these; `type.array_payload_unsupported`
+            // decides which of them the checker gives semantics to.
+            P::ArrayElement => matches!(shape, S::Int | S::Bool | S::Param | S::Record),
+            // The copyable payloads `ValueTy` holds, plus the two spellings
+            // that name an owning option family — `option<[T]>` and
+            // `option<raw<Record>>`. `type.option_payload_unsupported` and
+            // the affine-option boundary decide the rest.
+            P::OptionPayload => matches!(
+                shape,
+                S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw
+            ),
+            P::ForIndex | P::Const | P::CastTarget | P::TraitImplTarget | P::ResourceMapKey => {
+                matches!(shape, S::Int | S::Param)
+            }
+            P::RawElement | P::ResourceExtent => matches!(shape, S::Int | S::Param | S::Record),
         }
-        IntTy::from_name(&name)
-            .map(|t| (t, span))
-            .ok_or_else(|| Diagnostic {
-                name: "parse.unknown_type".into(),
-                title: format!("unknown integer type `{name}`"),
-                span,
-                label: "expected `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter".into(),
-                notes: vec![],
-            })
     }
 
-    /// The admitted array payload grammar. Unlike `int_ty`, this preserves a
-    /// declaration parameter as `ValueTy::Param`, so later stages cannot infer
-    /// integer semantics from its representation. Boolean is a concrete array
-    /// payload; POD-record arrays remain behind their later representation and
-    /// ownership slice.
-    fn array_payload_ty(&mut self) -> PResult<(ValueTy, Span)> {
-        let (name, span) = self.ident()?;
+    /// What a position admits, read straight off the table so the sentence a
+    /// reader is shown cannot drift from the rule that produced it. The list
+    /// ends in a conjunction, because a bare comma run reads as though it
+    /// were cut off.
+    fn admitted_spellings(pos: TyPos) -> String {
+        let spellings = TypeShape::all()
+            .filter(|candidate| Self::admits(*candidate, pos))
+            .map(TypeShape::spelling)
+            .collect::<Vec<_>>();
+        let Some((last, rest)) = spellings.split_last() else {
+            return String::new();
+        };
+        if rest.is_empty() {
+            return (*last).to_string();
+        }
+        // A serial comma wherever the list needs one to be read as a list:
+        // three or more items, or an item that contains a comma of its own.
+        let serial = rest.len() > 1 || spellings.iter().any(|spelling| spelling.contains(','));
+        format!(
+            "{}{} or {last}",
+            rest.join(", "),
+            if serial { "," } else { "" }
+        )
+    }
+
+    fn check_admits(&self, shape: TypeShape, pos: TyPos, span: Span) -> PResult<()> {
+        if Self::admits(shape, pos) {
+            return Ok(());
+        }
+        Err(Diagnostic {
+            name: pos.gate_name().into(),
+            title: format!("{} is not admitted as {}", shape.describe(), pos.describe()),
+            span,
+            label: format!("expected {}", Self::admitted_spellings(pos)),
+            notes: vec![("note".into(), pos.rejection_note(shape).into())],
+        })
+    }
+
+    /// A lowered type that its position's representation cannot hold.
+    ///
+    /// [`Parser::admits`] admits only shapes the position's lowering has a
+    /// representation for, and `admitted_shapes_match_their_lowering` pins
+    /// that, so this is a backstop for a future table edit rather than a
+    /// reachable rejection — but a spanned diagnostic is never a worse
+    /// failure than a panic.
+    fn unrepresentable(&self, ty: &Ty, pos: TyPos, span: Span) -> Diagnostic {
+        Diagnostic {
+            name: pos.gate_name().into(),
+            title: format!("`{}` is not admitted as {}", ty.name(), pos.describe()),
+            span,
+            label: format!("expected {}", Self::admitted_spellings(pos)),
+            notes: vec![],
+        }
+    }
+
+    fn unknown_type(&self, name: &str, name_span: Span, pos: TyPos) -> Diagnostic {
+        let admitted = Self::admitted_spellings(pos);
+        Diagnostic {
+            name: "parse.unknown_type".into(),
+            title: format!("unknown type `{name}`"),
+            span: name_span,
+            label: format!("{} expects {admitted}", pos.describe()),
+            notes: vec![],
+        }
+    }
+
+    /// Lower one parsed type at one position. This is the single recursive
+    /// implementation behind every checked type in the language: it bottoms
+    /// out at scalars, and each position rule it applies comes from
+    /// [`Parser::admits`].
+    fn lower_type(&self, syntax: &TypeSyntax, pos: TyPos) -> PResult<Ty> {
+        match &syntax.kind {
+            TypeSyntaxKind::Borrow {
+                mutability,
+                referent,
+            } => {
+                self.check_admits(TypeShape::Borrow, pos, syntax.span)?;
+                match self.lower_type(referent, TyPos::BorrowParam)? {
+                    // `&Nat` (ADR 0010) / `&mut Nat` (ADR 0023).
+                    Ty::Class(class) => Ok(Ty::ClassRef(class, *mutability)),
+                    Ty::Array(element, _) => Ok(Ty::Array(element, *mutability)),
+                    other => Err(self.unrepresentable(&other, TyPos::BorrowParam, referent.span)),
+                }
+            }
+            TypeSyntaxKind::Resource { borrow, kind } => {
+                self.check_admits(TypeShape::Resource, pos, syntax.span)?;
+                let kind = self.lower_res_kind(kind)?;
+                Ok(match borrow {
+                    Some(mutability) => Ty::ResRef(kind, *mutability),
+                    None => Ty::Res(kind),
+                })
+            }
+            TypeSyntaxKind::Array(element) => {
+                self.check_admits(TypeShape::Array, pos, syntax.span)?;
+                Ok(Ty::Array(
+                    self.lower_value_ty(element, TyPos::ArrayElement)?,
+                    Mutability::Owned,
+                ))
+            }
+            TypeSyntaxKind::Named {
+                name,
+                name_span,
+                args,
+            } => self.lower_named_type(syntax.span, name, *name_span, args.as_deref(), pos),
+        }
+    }
+
+    /// Resolve a spelled name to a type.
+    ///
+    /// The order below is the language's name resolution rule for types, and
+    /// it is deliberate in both halves:
+    ///
+    /// * the grammar's own names come first — `raw`, `option`, the integer
+    ///   widths, `bool`. They are the names `is_reserved_name` forbids
+    ///   everywhere else, so nothing can be declared that would reach them;
+    /// * a type parameter then shadows a nominal type of the same name,
+    ///   because a declaration's binders are nearer than its module's. This
+    ///   is what makes a signature mean the same thing however the modules
+    ///   around it change: a `use` that brings in a public class `T` cannot
+    ///   capture the `T` in `fn f<T>(T x)`. It also keeps one meaning per
+    ///   name inside a declaration, since `lower_generic_type` resolves the
+    ///   arguments at a use site — the `T` in `g<T>(x)` — the same way.
+    ///
+    /// Generic class templates are deliberately absent from `class_names`
+    /// (see its declaration): a checked type never carries a premature class
+    /// index for a template.
+    fn lower_named_type(
+        &self,
+        span: Span,
+        name: &str,
+        name_span: Span,
+        args: Option<&[TypeSyntax]>,
+        pos: TyPos,
+    ) -> PResult<Ty> {
+        let actual = args.map_or(0, <[TypeSyntax]>::len);
+        let arity = |expected: usize, diagnostic_name: &str| {
+            self.type_arity_error(name, expected, actual, span, diagnostic_name)
+        };
+        let no_args = |diagnostic_name: &str| -> PResult<()> {
+            if args.is_some() {
+                return Err(arity(0, diagnostic_name));
+            }
+            Ok(())
+        };
+
+        if name == RAW_TYPE_NAME {
+            self.check_admits(TypeShape::Raw, pos, span)?;
+            let Some([element]) = args else {
+                return Err(arity(1, "parse.raw_type_arity"));
+            };
+            return self.lower_raw_type(element);
+        }
+        if name == "option" {
+            self.check_admits(TypeShape::Option, pos, span)?;
+            let Some([payload]) = args else {
+                return Err(arity(1, "parse.option_type_arity"));
+            };
+            return self.lower_option_type(payload, span);
+        }
+        if let Some(integer) = IntTy::from_name(name) {
+            self.check_admits(TypeShape::Int, pos, span)?;
+            no_args("parse.primitive_type_args")?;
+            return Ok(Ty::Int(integer));
+        }
         if name == "bool" {
-            return Ok((ValueTy::Bool, span));
+            self.check_admits(TypeShape::Bool, pos, span)?;
+            no_args("parse.primitive_type_args")?;
+            return Ok(Ty::Bool);
         }
-        if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
-            let parameter = TypeParamId::new(index)
-                .expect("type_param_list enforces the type-parameter ceiling");
-            return Ok((ValueTy::Param(parameter), span));
+        if let Some(index) = self.tparams.iter().position(|parameter| parameter == name) {
+            self.check_admits(TypeShape::Param, pos, span)?;
+            no_args("parse.type_parameter_args")?;
+            return Ok(Ty::Param(
+                TypeParamId::new(index).expect("type_param_list enforces the parameter ceiling"),
+            ));
         }
-        IntTy::from_name(&name)
-            .map(|ty| (ValueTy::Int(ty), span))
-            .ok_or_else(|| Diagnostic {
-                name: "parse.unknown_type".into(),
-                title: format!("unknown array payload type `{name}`"),
-                span,
-                label: "expected `bool`, `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter"
-                    .into(),
-                notes: vec![],
-            })
-    }
-
-    /// A `for` index remains in the integer proof domain. Keep this parser
-    /// separate from `array_payload_ty`: widening array payloads must never
-    /// make `for (bool i : range(...))` syntactically meaningful.
-    fn for_index_ty(&mut self) -> PResult<(Ty, Span)> {
-        let (name, span) = self.ident()?;
-        if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
-            let parameter = TypeParamId::new(index)
-                .expect("type_param_list enforces the type-parameter ceiling");
-            return Ok((Ty::Param(parameter), span));
-        }
-        IntTy::from_name(&name)
-            .map(|ty| (Ty::Int(ty), span))
-            .ok_or_else(|| Diagnostic {
-                name: "parse.unknown_type".into(),
-                title: format!("unknown `for` index type `{name}`"),
-                span,
-                label: "expected `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter".into(),
-                notes: vec![],
-            })
-    }
-
-    /// Copyable option payload parsing shares the concrete Boolean identity
-    /// admitted by arrays, and additionally represents visible POD records
-    /// honestly so the checker can reject them at its semantic boundary with a
-    /// stable diagnostic. Affine aggregate payloads are parsed separately by
-    /// `option_ty`; classes are not value payloads here.
-    fn option_value_ty(&mut self) -> PResult<(ValueTy, Span)> {
-        let (name, span) = self.ident()?;
-        if name == "bool" {
-            return Ok((ValueTy::Bool, span));
-        }
-        if let Some(index) = self.tparams.iter().position(|parameter| *parameter == name) {
-            let parameter = TypeParamId::new(index)
-                .expect("type_param_list enforces the type-parameter ceiling");
-            return Ok((ValueTy::Param(parameter), span));
-        }
-        if let Some(ty) = IntTy::from_name(&name) {
-            return Ok((ValueTy::Int(ty), span));
+        if let Some(class) = self.class_names.iter().position(|candidate| candidate == name) {
+            self.check_admits(TypeShape::Class, pos, span)?;
+            no_args("parse.nongeneric_class_type_args")?;
+            return Ok(Ty::Class(class));
         }
         if let Some(record) = self
             .record_names
             .iter()
-            .position(|candidate| *candidate == name)
+            .position(|candidate| candidate == name)
         {
-            return Ok((ValueTy::Record(record), span));
+            self.check_admits(TypeShape::Record, pos, span)?;
+            no_args("parse.record_type_args")?;
+            return Ok(Ty::Record(record));
         }
-        Err(Diagnostic {
-            name: "parse.unknown_type".into(),
-            title: format!("unknown option payload type `{name}`"),
+        Err(self.unknown_type(name, name_span, pos))
+    }
+
+    /// `raw<u8>` is a byte pointer; `raw<R>` is statically tagged with an
+    /// explicitly laid-out record. Both are provenance plus a byte offset.
+    fn lower_raw_type(&self, element: &TypeSyntax) -> PResult<Ty> {
+        match self.lower_type(element, TyPos::RawElement)? {
+            Ty::Record(record) => Ok(Ty::RawRecord(record)),
+            Ty::Int(IntTy::U8) => Ok(Ty::Raw(IntTy::U8)),
+            other => Err(Diagnostic {
+                name: "raw.element_type".into(),
+                title: format!("`raw<{}>` is not supported yet", other.name()),
+                span: element.span,
+                label: "only `raw<u8>` and `raw<Record>` for now".into(),
+                notes: vec![(
+                    "note".into(),
+                    "wider raw access needs typed storage, which is a scheduled \
+                     deliverable; byte-at-a-time comes first so no layout question \
+                     is answered by accident"
+                        .into(),
+                )],
+            }),
+        }
+    }
+
+    /// The three option families the representation distinguishes: a
+    /// nullable pointer to a record, an option owning an affine aggregate,
+    /// and a copyable value option. Which family a payload names is decided
+    /// by its shape, which [`Parser::admits`] has already gated.
+    fn lower_option_type(&self, payload: &TypeSyntax, span: Span) -> PResult<Ty> {
+        if let TypeSyntaxKind::Named { name, args, .. } = &payload.kind {
+            if name == RAW_TYPE_NAME {
+                self.check_admits(TypeShape::Raw, TyPos::OptionPayload, payload.span)?;
+                // The nullable-pointer family is settled by the enclosing
+                // `option`, so the pointee is read directly instead of
+                // through the `raw<...>` value rule twice.
+                let Some([element]) = args.as_deref() else {
+                    return Err(self.type_arity_error(
+                        name,
+                        1,
+                        args.as_ref().map_or(0, Vec::len),
+                        payload.span,
+                        "parse.raw_type_arity",
+                    ));
+                };
+                return match self.lower_raw_type(element)? {
+                    Ty::RawRecord(record) => Ok(Ty::OptionRaw(record)),
+                    _ => Err(Diagnostic {
+                        name: "record.option_pointer_type".into(),
+                        title: "nullable raw pointers require a record pointee".into(),
+                        span,
+                        label: "expected `option<raw<Record>>`".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "integer options remain `option<u8>` through `option<u64>`; raw byte \
+                             pointers do not yet have a nullable storage role"
+                                .into(),
+                        )],
+                    }),
+                };
+            }
+        }
+        if let TypeSyntaxKind::Array(element) = &payload.kind {
+            self.check_admits(TypeShape::Array, TyPos::OptionPayload, payload.span)?;
+            return Ok(Ty::AffineOption(AffineOptionTy::Array(
+                self.lower_value_ty(element, TyPos::ArrayElement)?,
+            )));
+        }
+        Ok(Ty::Option(
+            self.lower_value_ty(payload, TyPos::OptionPayload)?,
+        ))
+    }
+
+    /// The resource kinds the compiler defines. `resource` is a lexer
+    /// keyword, so this is the only path to `Ty::Res`; a program cannot
+    /// declare a resource type, because it must not be able to fabricate
+    /// authority by constructing a view-shaped value. Every kind admitted
+    /// here has sealed operations in the checker, the interpreter, and the
+    /// prelude.
+    fn lower_res_kind(&self, syntax: &TypeSyntax) -> PResult<ResKind> {
+        let TypeSyntaxKind::Named {
+            name,
+            name_span,
+            args,
+        } = &syntax.kind
+        else {
+            return Err(self.unknown_resource_type("this type", syntax.span));
+        };
+        let actual = args.as_ref().map_or(0, Vec::len);
+        match name.as_str() {
+            "ResourceMap" => {
+                let Some([key, value]) = args.as_deref() else {
+                    return Err(self.map_type_error(
+                        syntax.span,
+                        "expected `ResourceMap<u64, PointsTo<u64>>`",
+                        vec![],
+                    ));
+                };
+                // The key is read first so that a map whose key and value are
+                // both wrong reports them in the order they were written.
+                if self.lower_int_ty(key, TyPos::ResourceMapKey)? != IntTy::U64 {
+                    return Err(Diagnostic {
+                        name: "resource.map_type".into(),
+                        title: "this `ResourceMap` instantiation is not supported yet".into(),
+                        span: key.span,
+                        label: "resource-map keys are `u64` arena offsets in v1".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "the one-arena intrusive-list profile deliberately avoids \
+                             cross-allocation pointer keys"
+                                .into(),
+                        )],
+                    });
+                }
+                let TypeSyntaxKind::Named {
+                    name: value_name,
+                    args: value_args,
+                    ..
+                } = &value.kind
+                else {
+                    return Err(self.map_type_error(
+                        value.span,
+                        "expected `PointsTo<u64>` or `PointsTo<Record>`",
+                        vec![],
+                    ));
+                };
+                if value_name != "PointsTo" {
+                    return Err(self.map_type_error(
+                        value.span,
+                        "expected `PointsTo<u64>` or `PointsTo<Record>`",
+                        vec![(
+                            "note".into(),
+                            "the surface is parameterized so later resource kinds reuse the same \
+                             aggregate abstraction; for now only \
+                             `ResourceMap<u64, PointsTo<u64>>` has sealed operations"
+                                .into(),
+                        )],
+                    ));
+                }
+                let Some([element]) = value_args.as_deref() else {
+                    return Err(self.map_type_error(
+                        value.span,
+                        "expected `PointsTo<u64>` or `PointsTo<Record>`",
+                        vec![],
+                    ));
+                };
+                match self.lower_type(element, TyPos::ResourceExtent)? {
+                    Ty::Record(record) => Ok(ResKind::ResourceMapPointsToRecord(record)),
+                    Ty::Int(IntTy::U64) => Ok(ResKind::ResourceMapPointsToU64),
+                    _ => Err(self.map_type_error(
+                        element.span,
+                        "expected `PointsTo<u64>` or `PointsTo<Record>`",
+                        vec![],
+                    )),
+                }
+            }
+            "PointsTo" | "LeasedPointsTo" => {
+                let Some([element]) = args.as_deref() else {
+                    return Err(Diagnostic {
+                        name: "resource.points_to_type".into(),
+                        title: format!("`{name}` needs an extent type"),
+                        span: syntax.span,
+                        label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
+                        notes: vec![],
+                    });
+                };
+                match self.lower_type(element, TyPos::ResourceExtent)? {
+                    Ty::Record(record) if name == "PointsTo" => Ok(ResKind::PointsToRecord(record)),
+                    Ty::Record(_) => Err(Diagnostic {
+                        name: "resource.points_to_type".into(),
+                        title: "allocator leases support only `u64` typed cells".into(),
+                        span: element.span,
+                        label: "use ordinary `PointsTo<Record>` authority".into(),
+                        notes: vec![],
+                    }),
+                    Ty::Int(IntTy::U64) if name == "PointsTo" => Ok(ResKind::PointsToU64),
+                    Ty::Int(IntTy::U64) => Ok(ResKind::LeasedPointsToU64),
+                    other => Err(Diagnostic {
+                        name: "resource.points_to_type".into(),
+                        title: format!("`{name}<{}>` is not supported yet", other.name()),
+                        span: element.span,
+                        label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
+                        notes: vec![],
+                    }),
+                }
+            }
+            _ => {
+                let Some(kind) = ResKind::from_name(name) else {
+                    return Err(self.unknown_resource_type(&format!("`{name}`"), *name_span));
+                };
+                if args.is_some() {
+                    return Err(self.type_arity_error(
+                        name,
+                        0,
+                        actual,
+                        syntax.span,
+                        "resource.type_arity",
+                    ));
+                }
+                Ok(kind)
+            }
+        }
+    }
+
+    fn map_type_error(
+        &self,
+        span: Span,
+        label: &str,
+        notes: Vec<(String, String)>,
+    ) -> Diagnostic {
+        Diagnostic {
+            name: "resource.map_type".into(),
+            title: "this `ResourceMap` value type is not supported yet".into(),
             span,
-            label: "expected `bool`, `u8`..`u64`, `i8`..`i64`, or an in-scope type parameter"
-                .into(),
-            notes: vec![],
-        })
+            label: label.into(),
+            notes,
+        }
+    }
+
+    fn unknown_resource_type(&self, what: &str, span: Span) -> Diagnostic {
+        Diagnostic {
+            name: "resource.unknown_type".into(),
+            title: format!("unknown resource type {what}"),
+            span,
+            label: "expected `RawSpan`, `PointsTo<u64>`, or a built-in resource".into(),
+            notes: vec![(
+                "note".into(),
+                "resource types are compiler-defined; a program may not declare \
+                 one, because it must not be able to fabricate authority by \
+                 constructing a view-shaped value"
+                    .into(),
+            )],
+        }
+    }
+
+    /// `ValueTy` is the payload representation shared by arrays and copyable
+    /// options; the positions that use it admit exactly the shapes it holds,
+    /// plus the two payload spellings `lower_option_type` takes for itself.
+    fn lower_value_ty(&self, syntax: &TypeSyntax, pos: TyPos) -> PResult<ValueTy> {
+        match self.lower_type(syntax, pos)? {
+            Ty::Int(integer) => Ok(ValueTy::Int(integer)),
+            Ty::Bool => Ok(ValueTy::Bool),
+            Ty::Param(parameter) => Ok(ValueTy::Param(parameter)),
+            Ty::Record(record) => Ok(ValueTy::Record(record)),
+            other => Err(self.unrepresentable(&other, pos, syntax.span)),
+        }
+    }
+
+    /// The positions that name a machine integer width. A retained template
+    /// parameter keeps its abstract integer binder (ADR 0009).
+    fn lower_int_ty(&self, syntax: &TypeSyntax, pos: TyPos) -> PResult<IntTy> {
+        match self.lower_type(syntax, pos)? {
+            Ty::Int(integer) => Ok(integer),
+            Ty::Param(parameter) => Ok(IntTy::TParam(
+                u8::try_from(parameter.index())
+                    .expect("type_param_list enforces the legacy parameter ceiling"),
+            )),
+            other => Err(self.unrepresentable(&other, pos, syntax.span)),
+        }
+    }
+
+    /// Parse and lower one type at `pos`. Every declared type in the
+    /// language enters here; `pos` is the only thing that differs between
+    /// call sites.
+    fn ty(&mut self, pos: TyPos) -> PResult<(Ty, Span)> {
+        let mut index = self.pos;
+        let mut budget = TypeBudget::default();
+        let syntax = self.parse_type_syntax_at(&mut index, 1, &mut budget)?;
+        let lowered = self.lower_type(&syntax, pos)?;
+        self.pos = index;
+        Ok((lowered, syntax.span))
+    }
+
+    fn value_ty(&mut self, pos: TyPos) -> PResult<(ValueTy, Span)> {
+        let mut index = self.pos;
+        let mut budget = TypeBudget::default();
+        let syntax = self.parse_type_syntax_at(&mut index, 1, &mut budget)?;
+        let lowered = self.lower_value_ty(&syntax, pos)?;
+        self.pos = index;
+        Ok((lowered, syntax.span))
+    }
+
+    fn int_ty(&mut self, pos: TyPos) -> PResult<(IntTy, Span)> {
+        let mut index = self.pos;
+        let mut budget = TypeBudget::default();
+        let syntax = self.parse_type_syntax_at(&mut index, 1, &mut budget)?;
+        let lowered = self.lower_int_ty(&syntax, pos)?;
+        self.pos = index;
+        Ok((lowered, syntax.span))
     }
 
     /// `<T, U>` / `<K: Hashable, V>` after a declaration name.
@@ -1215,7 +2085,13 @@ impl<'a> Parser<'a> {
         let mut bounds = Vec::new();
         loop {
             let (name, span) = self.ident()?;
-            if IntTy::from_name(&name).is_some() || is_reserved_name(&name) {
+            // A type parameter may take any name a nominal type may take: a
+            // declaration's own binders shadow the module's, so what a
+            // signature means never depends on what another module exports
+            // (see `lower_named_type` for the resolution order). Reserved
+            // names, which include the integer widths and `bool`, are the
+            // exception: they name a type the grammar itself resolves.
+            if is_reserved_name(&name) {
                 return Err(Diagnostic {
                     name: "parse.bad_type_param".into(),
                     title: format!("`{name}` cannot be a type parameter"),
@@ -1260,10 +2136,10 @@ impl<'a> Parser<'a> {
         Ok((out, bounds))
     }
 
-    /// A bounded recursive `<...>` list at a generic use site. Checked `Ty`
-    /// contexts deliberately do not call this routine: G0 only records the
-    /// richer use-site shape, and monomorphization remains the hard semantic
-    /// gate for the currently enabled integer-only domain.
+    /// A bounded recursive `<...>` list at a generic use site. This lowers to
+    /// `GenericTy` rather than `Ty`: a use-site argument records the shape
+    /// as written and monomorphization is the semantic gate that decides
+    /// which shapes can be instantiated.
     fn type_arg_list(&mut self) -> PResult<Vec<TypeArg>> {
         let parsed = self.parse_type_arg_syntax_list_at(self.pos)?;
         let out = parsed
@@ -1278,127 +2154,6 @@ impl<'a> Parser<'a> {
             .collect::<PResult<Vec<_>>>()?;
         self.pos = parsed.end;
         Ok(out)
-    }
-
-    /// A parameter type: scalar, `&C`, `&mut C`, `&[T]`, `&mut [T]`, or a
-    /// resource — `resource R`, `resource &R`, `resource &mut R`.
-    fn param_ty(&mut self) -> PResult<(Ty, Span)> {
-        if self.at(&Tok::KwResource) {
-            return self.resource_ty();
-        }
-        if self.at(&Tok::KwRaw) {
-            return self.raw_ty();
-        }
-        if matches!(self.peek(), Tok::Ident(n) if n == "option") {
-            return self.option_ty();
-        }
-        if self.at(&Tok::Amp) {
-            let start = self.bump().span;
-            let mutability = if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
-                self.bump();
-                Mutability::Mut
-            } else {
-                Mutability::Shared
-            };
-            // `&Nat` (ADR 0010) or `&mut Nat` (ADR 0023) — a class borrow.
-            if let Tok::Ident(n) = self.peek() {
-                if let Some(ci) = self.class_names.iter().position(|c| c == n) {
-                    let end = self.bump().span;
-                    return Ok((Ty::ClassRef(ci, mutability), start.join(end)));
-                }
-            }
-            self.expect(Tok::LBracket)?;
-            let (elem, _) = self.array_payload_ty()?;
-            let end = self.expect(Tok::RBracket)?.span;
-            return Ok((Ty::Array(elem, mutability), start.join(end)));
-        }
-        // `Nat m` — a class taken by value: the argument is moved into
-        // the callee (classes are affine).
-        if let Tok::Ident(n) = self.peek() {
-            if let Some(ci) = self.class_names.iter().position(|c| c == n) {
-                let span = self.bump().span;
-                return Ok((Ty::Class(ci), span));
-            }
-            if let Some(ri) = self.record_names.iter().position(|r| r == n) {
-                let span = self.bump().span;
-                return Ok((Ty::Record(ri), span));
-            }
-        }
-        self.scalar_ty()
-    }
-
-    /// `raw<u8>` — a raw pointer type.
-    fn raw_ty(&mut self) -> PResult<(Ty, Span)> {
-        let start = self.expect(Tok::KwRaw)?.span;
-        self.expect(Tok::Lt)?;
-        if let Tok::Ident(name) = self.peek() {
-            if let Some(ri) = self.record_names.iter().position(|r| r == name) {
-                let elem_span = self.bump().span;
-                let end = self.expect(Tok::Gt)?.span;
-                return Ok((Ty::RawRecord(ri), start.join(elem_span).join(end)));
-            }
-        }
-        let (elem, elem_span) = self.int_ty()?;
-        let end = self.expect(Tok::Gt)?.span;
-        if elem != IntTy::U8 {
-            return Err(Diagnostic {
-                name: "raw.element_type".into(),
-                title: format!("`raw<{}>` is not supported yet", elem.name()),
-                span: elem_span,
-                label: "only `raw<u8>` for now".into(),
-                notes: vec![(
-                    "note".into(),
-                    "wider raw access needs typed storage, which is a scheduled \
-                     deliverable; byte-at-a-time comes first so no layout question \
-                     is answered by accident"
-                        .into(),
-                )],
-            });
-        }
-        Ok((Ty::Raw(elem), start.join(end)))
-    }
-
-    /// The option families represented by the parser: integer/Boolean value
-    /// options (plus retained declaration parameters), affine owned-array
-    /// options, and nullable pointers to explicit records. POD record values
-    /// and affine options reach later stages as honest types while their
-    /// respective semantic boundaries remain closed.
-    fn option_ty(&mut self) -> PResult<(Ty, Span)> {
-        let (name, start) = self.ident()?;
-        debug_assert_eq!(name, "option");
-        self.expect(Tok::Lt)?;
-        if self.at(&Tok::KwRaw) {
-            let (raw, _) = self.raw_ty()?;
-            let end = self.expect(Tok::Gt)?.span;
-            return match raw {
-                Ty::RawRecord(ri) => Ok((Ty::OptionRaw(ri), start.join(end))),
-                _ => Err(Diagnostic {
-                    name: "record.option_pointer_type".into(),
-                    title: "nullable raw pointers require a record pointee".into(),
-                    span: start.join(end),
-                    label: "expected `option<raw<Record>>`".into(),
-                    notes: vec![(
-                        "note".into(),
-                        "integer options remain `option<u8>` through `option<u64>`; raw byte \
-                         pointers do not yet have a nullable storage role"
-                            .into(),
-                    )],
-                }),
-            };
-        }
-        if self.at(&Tok::LBracket) {
-            self.bump();
-            let (element, _) = self.array_payload_ty()?;
-            self.expect(Tok::RBracket)?;
-            let end = self.expect(Tok::Gt)?.span;
-            return Ok((
-                Ty::AffineOption(AffineOptionTy::Array(element)),
-                start.join(end),
-            ));
-        }
-        let (elem, _) = self.option_value_ty()?;
-        let end = self.expect(Tok::Gt)?.span;
-        Ok((Ty::Option(elem), start.join(end)))
     }
 
     fn signed_int_literal(&mut self) -> PResult<(i128, Span)> {
@@ -1423,237 +2178,6 @@ impl<'a> Parser<'a> {
                 notes: vec![],
             }),
         }
-    }
-
-    fn record_field_ty(&mut self) -> PResult<(Ty, Span)> {
-        if self.at(&Tok::KwRaw) {
-            return self.raw_ty();
-        }
-        if matches!(self.peek(), Tok::Ident(n) if n == "option") {
-            return self.option_ty();
-        }
-        self.scalar_ty()
-    }
-
-    /// `resource R` (owned, moved), `resource &R`, or `resource &mut R`.
-    /// The category is written before the borrow marker so that a reader
-    /// sees "this is authority" before anything else about the type.
-    fn resource_ty(&mut self) -> PResult<(Ty, Span)> {
-        let start = self.expect(Tok::KwResource)?.span;
-        let mutability = if self.at(&Tok::Amp) {
-            self.bump();
-            if matches!(self.peek(), Tok::Ident(m) if m == "mut") {
-                self.bump();
-                Some(Mutability::Mut)
-            } else {
-                Some(Mutability::Shared)
-            }
-        } else {
-            None
-        };
-        let (name, name_span) = self.ident()?;
-        let (kind, end_span) = if name == "ResourceMap" {
-            self.expect(Tok::Lt)?;
-            let (key, key_span) = self.int_ty()?;
-            self.expect(Tok::Comma)?;
-            let (value_name, value_span) = self.ident()?;
-            if value_name != "PointsTo" {
-                return Err(Diagnostic {
-                    name: "resource.map_type".into(),
-                    title: "this `ResourceMap` value type is not supported yet".into(),
-                    span: value_span,
-                    label: "the first aggregate slice requires `PointsTo<u64>`".into(),
-                    notes: vec![(
-                        "note".into(),
-                        "the surface is parameterized so later resource kinds reuse the same \
-                         aggregate abstraction; for now only \
-                         `ResourceMap<u64, PointsTo<u64>>` has sealed operations"
-                            .into(),
-                    )],
-                });
-            }
-            self.expect(Tok::Lt)?;
-            let (record_elem, value_elem_span) = if let Tok::Ident(elem) = self.peek() {
-                if let Some(ri) = self.record_names.iter().position(|r| r == elem) {
-                    let span = self.bump().span;
-                    (Some(ri), span)
-                } else {
-                    let (elem, span) = self.int_ty()?;
-                    if elem != IntTy::U64 {
-                        return Err(Diagnostic {
-                            name: "resource.map_type".into(),
-                            title: "this `ResourceMap` value type is not supported yet".into(),
-                            span,
-                            label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
-                            notes: vec![],
-                        });
-                    }
-                    (None, span)
-                }
-            } else {
-                let (elem, span) = self.int_ty()?;
-                if elem != IntTy::U64 {
-                    return Err(Diagnostic {
-                        name: "resource.map_type".into(),
-                        title: "this `ResourceMap` value type is not supported yet".into(),
-                        span,
-                        label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
-                        notes: vec![],
-                    });
-                }
-                (None, span)
-            };
-            self.expect(Tok::Gt)?;
-            let end = self.expect(Tok::Gt)?.span;
-            if key != IntTy::U64 {
-                return Err(Diagnostic {
-                    name: "resource.map_type".into(),
-                    title: "this `ResourceMap` instantiation is not supported yet".into(),
-                    span: key_span,
-                    label: "resource-map keys are `u64` arena offsets in v1".into(),
-                    notes: vec![(
-                        "note".into(),
-                        "the one-arena intrusive-list profile deliberately avoids \
-                         cross-allocation pointer keys"
-                            .into(),
-                    )],
-                });
-            }
-            let _ = value_elem_span;
-            (
-                record_elem.map_or(
-                    ResKind::ResourceMapPointsToU64,
-                    ResKind::ResourceMapPointsToRecord,
-                ),
-                end,
-            )
-        } else if name == "PointsTo" || name == "LeasedPointsTo" {
-            self.expect(Tok::Lt)?;
-            if let Tok::Ident(elem) = self.peek() {
-                if let Some(ri) = self.record_names.iter().position(|r| r == elem) {
-                    let elem_span = self.bump().span;
-                    let end = self.expect(Tok::Gt)?.span;
-                    if name == "LeasedPointsTo" {
-                        return Err(Diagnostic {
-                            name: "resource.points_to_type".into(),
-                            title: "allocator leases support only `u64` typed cells".into(),
-                            span: elem_span,
-                            label: "use ordinary `PointsTo<Record>` authority".into(),
-                            notes: vec![],
-                        });
-                    }
-                    (ResKind::PointsToRecord(ri), end)
-                } else {
-                    let (elem, elem_span) = self.int_ty()?;
-                    let end = self.expect(Tok::Gt)?.span;
-                    if elem != IntTy::U64 {
-                        return Err(Diagnostic {
-                            name: "resource.points_to_type".into(),
-                            title: format!("`PointsTo<{}>` is not supported yet", elem.name()),
-                            span: elem_span,
-                            label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
-                            notes: vec![],
-                        });
-                    }
-                    (
-                        if name == "PointsTo" {
-                            ResKind::PointsToU64
-                        } else {
-                            ResKind::LeasedPointsToU64
-                        },
-                        end,
-                    )
-                }
-            } else {
-                let (elem, elem_span) = self.int_ty()?;
-                let end = self.expect(Tok::Gt)?.span;
-                if elem != IntTy::U64 {
-                    return Err(Diagnostic {
-                        name: "resource.points_to_type".into(),
-                        title: format!("`PointsTo<{}>` is not supported yet", elem.name()),
-                        span: elem_span,
-                        label: "expected `PointsTo<u64>` or `PointsTo<Record>`".into(),
-                        notes: vec![],
-                    });
-                }
-                (
-                    if name == "PointsTo" {
-                        ResKind::PointsToU64
-                    } else {
-                        ResKind::LeasedPointsToU64
-                    },
-                    end,
-                )
-            }
-        } else {
-            let Some(kind) = ResKind::from_name(&name) else {
-                return Err(Diagnostic {
-                    name: "resource.unknown_type".into(),
-                    title: format!("unknown resource type `{name}`"),
-                    span: name_span,
-                    label: "expected `RawSpan`, `PointsTo<u64>`, or a built-in resource".into(),
-                    notes: vec![(
-                        "note".into(),
-                        "resource types are compiler-defined; a program may not declare \
-                         one, because it must not be able to fabricate authority by \
-                         constructing a view-shaped value"
-                            .into(),
-                    )],
-                });
-            };
-            (kind, name_span)
-        };
-        let ty = match mutability {
-            Some(m) => Ty::ResRef(kind, m),
-            None => Ty::Res(kind),
-        };
-        Ok((ty, start.join(end_span)))
-    }
-
-    fn scalar_ty(&mut self) -> PResult<(Ty, Span)> {
-        let (name, span) = self.ident()?;
-        if name == "bool" {
-            return Ok((Ty::Bool, span));
-        }
-        if let Some(i) = self.tparams.iter().position(|p| *p == name) {
-            let parameter =
-                TypeParamId::new(i).expect("type_param_list enforces the type-parameter ceiling");
-            return Ok((Ty::Param(parameter), span));
-        }
-        IntTy::from_name(&name)
-            .map(|t| (Ty::Int(t), span))
-            .ok_or_else(|| Diagnostic {
-                name: "parse.unknown_type".into(),
-                title: format!("unknown type `{name}`"),
-                span,
-                label: "expected `u8`..`u64`, `i8`..`i64`, or `bool`".into(),
-                notes: vec![],
-            })
-    }
-
-    /// A return type: scalar, `option<T>` (including the represented affine
-    /// aggregate form), a class (ADR 0010), or an owned resource (ADR 0024).
-    fn ret_ty(&mut self) -> PResult<Ty> {
-        if self.at(&Tok::KwResource) {
-            return Ok(self.resource_ty()?.0);
-        }
-        if self.at(&Tok::KwRaw) {
-            return Ok(self.raw_ty()?.0);
-        }
-        if let Tok::Ident(name) = self.peek() {
-            if let Some(ci) = self.class_names.iter().position(|c| c == name) {
-                self.bump();
-                return Ok(Ty::Class(ci));
-            }
-            if let Some(ri) = self.record_names.iter().position(|r| r == name) {
-                self.bump();
-                return Ok(Ty::Record(ri));
-            }
-            if name == "option" {
-                return Ok(self.option_ty()?.0);
-            }
-        }
-        Ok(self.scalar_ty()?.0)
     }
 
     /// `class Name { fields... /// invariant ... init ... fn ... deinit }`
@@ -1730,7 +2254,7 @@ impl<'a> Parser<'a> {
                             )],
                         });
                     }
-                    let (ty, _) = self.resource_ty()?;
+                    let (ty, _) = self.ty(TyPos::ClassField)?;
                     let (fname, fspan) = self.ident()?;
                     self.expect(Tok::Semi)?;
                     fields.push(Field {
@@ -1740,46 +2264,10 @@ impl<'a> Parser<'a> {
                         must_consume: true,
                     });
                 }
-                Tok::KwResource => {
-                    let (ty, _) = self.resource_ty()?;
-                    let (fname, fspan) = self.ident()?;
-                    self.expect(Tok::Semi)?;
-                    fields.push(Field {
-                        name: fname,
-                        ty,
-                        span: fspan,
-                        must_consume: false,
-                    });
-                }
-                Tok::LBracket => {
-                    self.bump();
-                    let (elem, _) = self.array_payload_ty()?;
-                    self.expect(Tok::RBracket)?;
-                    let (fname, fspan) = self.ident()?;
-                    self.expect(Tok::Semi)?;
-                    fields.push(Field {
-                        name: fname,
-                        ty: Ty::Array(elem, Mutability::Owned),
-                        span: fspan,
-                        must_consume: false,
-                    });
-                }
-                Tok::Ident(n) => {
-                    // Parse value-option fields honestly so the checker can
-                    // keep their storage boundary closed with a dedicated
-                    // diagnostic. A class-typed field owns its value (and is
-                    // dropped with it, in reverse declaration order).
-                    let ty = if n == "option" && self.peek2() == &Tok::Lt {
-                        self.option_ty()?.0
-                    } else {
-                        match self.class_names.iter().position(|c| *c == n) {
-                            Some(ci) => {
-                                self.bump();
-                                Ty::Class(ci)
-                            }
-                            None => self.scalar_ty()?.0,
-                        }
-                    };
+                // A class field owns its value and is dropped with the
+                // object, in reverse declaration order.
+                Tok::KwResource | Tok::KwRaw | Tok::LBracket | Tok::Amp | Tok::Ident(_) => {
+                    let (ty, _) = self.ty(TyPos::ClassField)?;
                     let (fname, fspan) = self.ident()?;
                     self.expect(Tok::Semi)?;
                     fields.push(Field {
@@ -1917,7 +2405,7 @@ impl<'a> Parser<'a> {
             let (offset, offset_span) = self.signed_int_literal()?;
             self.expect(Tok::RParen)?;
             self.expect(Tok::RBracket)?;
-            let (ty, _) = self.record_field_ty()?;
+            let (ty, _) = self.ty(TyPos::RecordField)?;
             let (field, field_span) = self.ident()?;
             self.expect(Tok::Semi)?;
             fields.push(RecordField {
@@ -2000,7 +2488,7 @@ impl<'a> Parser<'a> {
     /// negated); the const pass checks the range and substitutes uses.
     fn parse_const(&mut self) -> PResult<crate::ast::ConstDecl> {
         let kw = self.bump().span; // `const`
-        let (ty, _) = self.int_ty()?;
+        let (ty, _) = self.int_ty(TyPos::Const)?;
         let (name, name_span) = self.ident()?;
         if is_reserved_name(&name) {
             return Err(reserved_name_error(&name, name_span, "constant"));
@@ -2102,7 +2590,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::RParen)?;
         let ret = if self.at(&Tok::Arrow) {
             self.bump();
-            self.ret_ty()?
+            self.ty(TyPos::Return)?.0
         } else {
             Ty::Unit
         };
@@ -2136,7 +2624,7 @@ impl<'a> Parser<'a> {
             return Ok(params);
         }
         loop {
-            let (ty, tspan) = self.param_ty()?;
+            let (ty, tspan) = self.ty(TyPos::Param)?;
             let (pname, pspan) = self.ident()?;
             if is_reserved_name(&pname) {
                 return Err(reserved_name_error(&pname, pspan, "parameter"));
@@ -2325,7 +2813,7 @@ impl<'a> Parser<'a> {
                         )],
                     });
                 }
-                let (ty, tspan) = self.param_ty()?;
+                let (ty, tspan) = self.ty(TyPos::Param)?;
                 let (pname, pspan) = self.ident()?;
                 if is_reserved_name(&pname) {
                     return Err(reserved_name_error(&pname, pspan, "parameter"));
@@ -2346,7 +2834,7 @@ impl<'a> Parser<'a> {
         self.expect(Tok::RParen)?;
         let ret = if self.at(&Tok::Arrow) {
             self.bump();
-            self.ret_ty()?
+            self.ty(TyPos::Return)?.0
         } else {
             Ty::Unit
         };
@@ -2475,7 +2963,7 @@ impl<'a> Parser<'a> {
             self.expect(Tok::RParen)?;
             let ret = if self.at(&Tok::Arrow) {
                 self.bump();
-                self.ret_ty()?
+                self.ty(TyPos::Return)?.0
             } else {
                 Ty::Unit
             };
@@ -2536,7 +3024,7 @@ impl<'a> Parser<'a> {
         let start = self.bump().span; // `impl`
         let (trait_name, trait_span) = self.ident()?;
         self.expect(Tok::KwFor)?;
-        let (for_ty, for_span) = self.int_ty()?;
+        let (for_ty, for_span) = self.int_ty(TyPos::TraitImplTarget)?;
         self.expect(Tok::LBrace)?;
         let body_first_line = self.peek_line();
         let mut ghosts = Vec::new();
@@ -2553,7 +3041,7 @@ impl<'a> Parser<'a> {
             self.expect(Tok::RParen)?;
             let ret = if self.at(&Tok::Arrow) {
                 self.bump();
-                self.ret_ty()?
+                self.ty(TyPos::Return)?.0
             } else {
                 Ty::Unit
             };
@@ -2732,7 +3220,7 @@ impl<'a> Parser<'a> {
         }
 
         self.expect(Tok::LParen)?;
-        let (loop_ty, _) = self.for_index_ty()?;
+        let (loop_ty, _) = self.ty(TyPos::ForIndex)?;
         let (index, index_span) = self.ident()?;
         if is_reserved_name(&index) {
             return Err(reserved_name_error(&index, index_span, "loop index"));
@@ -3013,6 +3501,48 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// One local declaration, whatever its type. The declared type comes
+    /// from the same grammar every other position uses; what varies is only
+    /// whether definite initialization may supply the value later.
+    fn local_decl_stmt(&mut self) -> PResult<Stmt> {
+        let (ty, ty_span) = self.ty(TyPos::Local)?;
+        if let Ty::ResRef(..) = ty {
+            return Err(Diagnostic {
+                name: "resource.borrow_local".into(),
+                title: "a resource borrow cannot be a local".into(),
+                span: ty_span,
+                label: "declare `resource RawSpan` and borrow it at the call".into(),
+                notes: vec![(
+                    "note".into(),
+                    "borrows are arguments, not values: they live for one call, \
+                     which is what keeps borrow state out of the checker's \
+                     per-statement bookkeeping"
+                        .into(),
+                )],
+            });
+        }
+        let (name, name_span) = self.ident()?;
+        if is_reserved_name(&name) {
+            return Err(reserved_name_error(&name, name_span, "variable"));
+        }
+        let init = if self.at(&Tok::Assign) {
+            self.bump();
+            Some(self.expr()?)
+        } else if local_needs_initializer(&ty) {
+            return Err(self.error_expected(&Tok::Assign.describe()));
+        } else {
+            None
+        };
+        self.expect(Tok::Semi)?;
+        Ok(Stmt::Decl {
+            ty,
+            name,
+            name_span,
+            init,
+            mutable: std::mem::take(&mut self.pending_mut),
+        })
+    }
+
     fn stmt(&mut self) -> PResult<Stmt> {
         match self.peek().clone() {
             // `mut <decl>` — the declared local is mutable (ADR 0016).
@@ -3143,109 +3673,15 @@ impl<'a> Parser<'a> {
                 let body = self.block()?;
                 Ok(Stmt::Unsafe { kw_span, body })
             }
-            Tok::KwResource => {
-                // `resource RawSpan tail = split_off(...);` — an owned
-                // resource local. The category is spelled out at every
-                // binding site: authority is erased at runtime, so a
-                // reader must not have to infer it from a callee's
-                // signature (ADR 0024).
-                let (ty, _) = self.resource_ty()?;
-                if let Ty::ResRef(..) = ty {
-                    return Err(Diagnostic {
-                        name: "resource.borrow_local".into(),
-                        title: "a resource borrow cannot be a local".into(),
-                        span: self.peek_span(),
-                        label: "declare `resource RawSpan` and borrow it at the call".into(),
-                        notes: vec![(
-                            "note".into(),
-                            "borrows are arguments, not values: they live for one call, \
-                             which is what keeps borrow state out of the checker's \
-                             per-statement bookkeeping"
-                                .into(),
-                        )],
-                    });
-                }
-                let (name, name_span) = self.ident()?;
-                if is_reserved_name(&name) {
-                    return Err(reserved_name_error(&name, name_span, "variable"));
-                }
-                self.expect(Tok::Assign)?;
-                let init = self.expr()?;
-                self.expect(Tok::Semi)?;
-                Ok(Stmt::Decl {
-                    ty,
-                    name,
-                    name_span,
-                    init: Some(init),
-                    mutable: std::mem::take(&mut self.pending_mut),
-                })
-            }
-            Tok::KwRaw => {
-                // `raw<u8> p = raw_offset(q, 1);` — a pointer local. It
-                // may also be declared without an initializer, which is
-                // the only way to have one before an exposure exists to
-                // produce a value; definite initialization is what keeps
-                // it from being read early.
-                let (ty, _) = self.raw_ty()?;
-                let (name, name_span) = self.ident()?;
-                if is_reserved_name(&name) {
-                    return Err(reserved_name_error(&name, name_span, "variable"));
-                }
-                let init = if self.at(&Tok::Assign) {
-                    self.bump();
-                    Some(self.expr()?)
-                } else {
-                    None
-                };
-                self.expect(Tok::Semi)?;
-                Ok(Stmt::Decl {
-                    ty,
-                    name,
-                    name_span,
-                    init,
-                    mutable: std::mem::take(&mut self.pending_mut),
-                })
-            }
-            Tok::LBracket => {
-                // `[i32] a = [1, 2, 3];` / `[bool] flags = [true];` — an
-                // owned array local. The checker enforces the positional
-                // boundary for concrete payload kinds.
-                self.bump();
-                let (elem, _) = self.array_payload_ty()?;
-                self.expect(Tok::RBracket)?;
-                let (name, name_span) = self.ident()?;
-                if is_reserved_name(&name) {
-                    return Err(reserved_name_error(&name, name_span, "variable"));
-                }
-                self.expect(Tok::Assign)?;
-                let init = self.expr()?;
-                self.expect(Tok::Semi)?;
-                Ok(Stmt::Decl {
-                    ty: Ty::Array(elem, Mutability::Owned),
-                    name,
-                    name_span,
-                    init: Some(init),
-                    mutable: std::mem::take(&mut self.pending_mut),
-                })
-            }
+            // A local declaration, whatever its type: `resource RawSpan
+            // tail = split_off(...);`, `raw<u8> p;`, `[i32] a = [1, 2, 3];`,
+            // `option<u64> o = some(1);`, `Pair p;`, `u64 n = 0;`. The type
+            // is spelled out at every binding site — authority in
+            // particular is erased at runtime, so a reader must not have to
+            // infer it from a callee's signature (ADR 0024).
+            Tok::KwResource | Tok::KwRaw | Tok::LBracket => self.local_decl_stmt(),
             Tok::Ident(first) if first == "option" && self.peek2() == &Tok::Lt => {
-                // Integer options and nullable record pointers are both
-                // initialized values; neither has an implicit default.
-                let (ty, _) = self.option_ty()?;
-                let (name, name_span) = self.ident()?;
-                if is_reserved_name(&name) {
-                    return Err(reserved_name_error(&name, name_span, "variable"));
-                }
-                self.expect(Tok::Assign)?;
-                let init = self.expr()?;
-                self.expect(Tok::Semi)?;
-                Ok(Stmt::Decl {
-                    ty,
-                    name,
-                    name_span,
-                    init: Some(init),
-                    mutable: std::mem::take(&mut self.pending_mut),
-                })
+                self.local_decl_stmt()
             }
             Tok::Ident(first) if first == "self" && self.peek2() == &Tok::Dot => {
                 // self.f = e;   self.f[i] = e;
@@ -3297,30 +3733,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Ident(first) => {
                 if let Tok::Ident(_) = self.peek2() {
-                    let ty = if let Some(ri) = self.record_names.iter().position(|r| r == &first) {
-                        self.bump();
-                        Ty::Record(ri)
-                    } else {
-                        self.scalar_ty()?.0
-                    };
-                    let (name, name_span) = self.ident()?;
-                    if is_reserved_name(&name) {
-                        return Err(reserved_name_error(&name, name_span, "variable"));
-                    }
-                    let init = if self.at(&Tok::Assign) {
-                        self.bump();
-                        Some(self.expr()?)
-                    } else {
-                        None
-                    };
-                    self.expect(Tok::Semi)?;
-                    Ok(Stmt::Decl {
-                        ty,
-                        name,
-                        name_span,
-                        init,
-                        mutable: std::mem::take(&mut self.pending_mut),
-                    })
+                    self.local_decl_stmt()
                 } else if self.peek2() == &Tok::LParen {
                     let e = self.expr()?;
                     self.expect(Tok::Semi)?;
@@ -3967,7 +4380,7 @@ impl<'a> Parser<'a> {
             Tok::Ident(name) if name == "alloc_array" => {
                 self.bump();
                 self.expect(Tok::Lt)?;
-                let (elem, _) = self.array_payload_ty()?;
+                let (elem, _) = self.value_ty(TyPos::ArrayElement)?;
                 self.expect(Tok::Gt)?;
                 self.expect(Tok::LParen)?;
                 let len = self.expr()?;
@@ -4115,7 +4528,7 @@ impl<'a> Parser<'a> {
                 let is_widen = name == "widen";
                 self.bump();
                 self.expect(Tok::Lt)?;
-                let (target, _) = self.int_ty()?;
+                let (target, _) = self.int_ty(TyPos::CastTarget)?;
                 self.expect(Tok::Gt)?;
                 self.expect(Tok::LParen)?;
                 let arg = self.expr()?;
@@ -4262,6 +4675,17 @@ fn mk_bin(op: BinOp, op_span: Span, lhs: Expr, rhs: Expr) -> Expr {
         span,
         ty: None,
     }
+}
+
+/// Which locals must name their value at the binding. A pointer, a scalar,
+/// or a record is covered by definite initialization, which is what keeps
+/// it from being read early; an aggregate or an authority has no default to
+/// stand in for until its value arrives.
+fn local_needs_initializer(ty: &Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Array(..) | Ty::Option(_) | Ty::AffineOption(_) | Ty::OptionRaw(_) | Ty::Res(_)
+    )
 }
 
 /// Names that would collide with the proof language or generated Lean.
@@ -4721,15 +5145,15 @@ mod generic_type_arg_tests {
 
     #[test]
     fn outer_and_nested_type_argument_lists_are_capped_at_256() {
-        let at_limit = vec!["i32"; MAX_GENERIC_TYPE_ARGS].join(", ");
+        let at_limit = vec!["i32"; MAX_TYPE_ARGS].join(", ");
         let source = format!("fn limit() -> i32 {{ return id<{at_limit}>(0); }}\n");
         let program = parse_source(&source).unwrap();
         assert_eq!(
             return_type_args(&program.fns[0]).len(),
-            MAX_GENERIC_TYPE_ARGS
+            MAX_TYPE_ARGS
         );
 
-        let mut outer = vec!["i32"; MAX_GENERIC_TYPE_ARGS];
+        let mut outer = vec!["i32"; MAX_TYPE_ARGS];
         outer.push("u8");
         let source = format!(
             "fn too_many() -> i32 {{ return id<{}>(0); }}\n",
@@ -4744,7 +5168,7 @@ mod generic_type_arg_tests {
         );
         assert_eq!(diagnostic.span, Span::new(overflow, overflow + 2));
 
-        let mut nested = vec!["i32"; MAX_GENERIC_TYPE_ARGS];
+        let mut nested = vec!["i32"; MAX_TYPE_ARGS];
         nested.push("u8");
         let source = format!(
             "fn too_many() -> i32 {{ return id<option<{}>>(0); }}\n",
@@ -4760,14 +5184,14 @@ mod generic_type_arg_tests {
     fn recursive_type_depth_is_capped_at_64_nodes() {
         let argument = format!(
             "{}i32{}",
-            "option<".repeat(MAX_GENERIC_TYPE_DEPTH),
-            ">".repeat(MAX_GENERIC_TYPE_DEPTH)
+            "option<".repeat(MAX_TYPE_DEPTH),
+            ">".repeat(MAX_TYPE_DEPTH)
         );
         let source = format!("fn deep() -> i32 {{ return id<{argument}>(0); }}\n");
         let diagnostic = parse_source(&source).unwrap_err();
         let leaf = source.rfind("i32").unwrap();
 
-        assert_eq!(diagnostic.name, "parse.generic_type_too_deep");
+        assert_eq!(diagnostic.name, "parse.type_too_deep");
         assert_eq!(
             diagnostic.label,
             "at most 64 recursive type nodes may occur on one path"
@@ -4777,19 +5201,19 @@ mod generic_type_arg_tests {
 
     #[test]
     fn each_outer_type_argument_has_a_4096_node_budget() {
-        let parameters = type_parameter_names(MAX_GENERIC_TYPE_ARGS);
+        let parameters = type_parameter_names(MAX_TYPE_ARGS);
         let branch = format!("{}i32{}", "option<".repeat(16), ">".repeat(16));
-        let argument = format!("Many<{}>", vec![branch; MAX_GENERIC_TYPE_ARGS].join(", "));
+        let argument = format!("Many<{}>", vec![branch; MAX_TYPE_ARGS].join(", "));
         let source = format!(
             "class Many<{parameters}> {{}}\n\
              fn large() -> i32 {{ return id<{argument}>(0); }}\n"
         );
         let diagnostic = parse_source(&source).unwrap_err();
 
-        assert_eq!(diagnostic.name, "parse.generic_type_too_large");
+        assert_eq!(diagnostic.name, "parse.type_too_large");
         assert_eq!(
             diagnostic.label,
-            "at most 4096 nodes are allowed in one outer type argument"
+            "at most 4096 nodes are allowed in one type"
         );
         assert!(matches!(
             &source[diagnostic.span.start..diagnostic.span.end],
@@ -5059,9 +5483,11 @@ fn surface(&[bool] input) {
         };
         assert!(matches!(&value.kind, ExprKind::Index { .. }));
 
+        // The one type grammar can spell `bool` here; the `for` index gate
+        // is what keeps a loop index in the integer proof domain.
         let error = parse_source("fn bad() { for (bool i : range(1)) {} }\n").unwrap_err();
-        assert_eq!(error.name, "parse.unknown_type");
-        assert!(error.title.contains("`for` index"));
+        assert_eq!(error.name, "type.for_index_unsupported");
+        assert!(error.title.contains("`for` index type"));
     }
 
     #[test]
@@ -5122,5 +5548,229 @@ fn unsupported() -> option<Pair> {
             diagnostic.span,
             Span::new(duplicate_start, duplicate_start + 1)
         );
+    }
+}
+
+#[cfg(test)]
+mod type_position_tests {
+    use super::*;
+
+    fn parse_source(source: &str) -> PResult<Program> {
+        let scanned = crate::scan::scan(source);
+        let tokens = crate::lexer::lex(&scanned.program_text).unwrap();
+        let lines = LineMap::new(source);
+        parse(&tokens, &scanned.blocks, &lines, &scanned.program_text)
+    }
+
+    /// Every position the gate table has a row for, as a chain: `after` is
+    /// an exhaustive match, so a new position has to be given its place
+    /// before the compiler accepts it, and the audits below therefore cover
+    /// every row rather than the rows someone remembered to list.
+    fn every_position() -> Vec<TyPos> {
+        fn after(pos: TyPos) -> Option<TyPos> {
+            Some(match pos {
+                TyPos::Param => TyPos::BorrowParam,
+                TyPos::BorrowParam => TyPos::Return,
+                TyPos::Return => TyPos::Local,
+                TyPos::Local => TyPos::RecordField,
+                TyPos::RecordField => TyPos::ClassField,
+                TyPos::ClassField => TyPos::ArrayElement,
+                TyPos::ArrayElement => TyPos::OptionPayload,
+                TyPos::OptionPayload => TyPos::ForIndex,
+                TyPos::ForIndex => TyPos::Const,
+                TyPos::Const => TyPos::CastTarget,
+                TyPos::CastTarget => TyPos::TraitImplTarget,
+                TyPos::TraitImplTarget => TyPos::RawElement,
+                TyPos::RawElement => TyPos::ResourceExtent,
+                TyPos::ResourceExtent => TyPos::ResourceMapKey,
+                TyPos::ResourceMapKey => return None,
+            })
+        }
+
+        let positions: Vec<TyPos> = std::iter::successors(Some(TyPos::Param), |pos| after(*pos))
+            .take(64)
+            .collect();
+        let mut unique = positions.clone();
+        unique.dedup();
+        assert_eq!(positions.len(), unique.len(), "the position order repeats");
+        positions
+    }
+
+    #[test]
+    fn the_shape_enumeration_visits_every_shape_once() {
+        // `TypeShape::after` is exhaustive, so the enumeration cannot omit a
+        // shape; what it could do is repeat one, which would make the
+        // spelling lists say the same thing twice and never terminate.
+        let visited: Vec<TypeShape> = TypeShape::all().take(64).collect();
+        let mut unique = visited.clone();
+        unique.dedup();
+        assert_eq!(visited.len(), unique.len(), "the shape order has a cycle");
+        assert!(visited.len() < 64, "the shape order does not end");
+        assert!(visited.contains(&TypeShape::Int));
+        assert!(visited.contains(&TypeShape::Borrow));
+    }
+
+    #[test]
+    fn admitted_shapes_match_their_lowering() {
+        use TypeShape as S;
+
+        for pos in every_position() {
+            for shape in TypeShape::all() {
+                if !Parser::admits(shape, pos) {
+                    continue;
+                }
+                // Each of these lowerings has a representation narrower than
+                // `Ty`, so its positions may admit only what it can hold.
+                // The table is the only thing standing between a spelling and
+                // that representation.
+                let holds = match pos {
+                    // `lower_int_ty` yields `IntTy`.
+                    TyPos::Const
+                    | TyPos::CastTarget
+                    | TyPos::TraitImplTarget
+                    | TyPos::ResourceMapKey => matches!(shape, S::Int | S::Param),
+                    // `lower_value_ty` yields `ValueTy`.
+                    TyPos::ArrayElement => matches!(shape, S::Int | S::Bool | S::Param | S::Record),
+                    // The copyable payloads `lower_value_ty` yields, plus the
+                    // two spellings `lower_option_type` claims for the owning
+                    // families before the copyable path is reached.
+                    TyPos::OptionPayload => {
+                        matches!(
+                            shape,
+                            S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw
+                        )
+                    }
+                    // A borrow rebinds the referent's mutability, which only
+                    // `Ty::ClassRef` and `Ty::Array` carry.
+                    TyPos::BorrowParam => matches!(shape, S::Class | S::Array),
+                    // `lower_raw_type` and `lower_res_kind` decide which
+                    // spellings of these shapes exist, and both answer with a
+                    // diagnostic rather than a representation.
+                    TyPos::RawElement | TyPos::ResourceExtent => {
+                        matches!(shape, S::Int | S::Param | S::Record)
+                    }
+                    // The rest lower to `Ty`, which holds every shape.
+                    TyPos::Param
+                    | TyPos::Return
+                    | TyPos::Local
+                    | TyPos::RecordField
+                    | TyPos::ClassField
+                    | TyPos::ForIndex => true,
+                };
+                assert!(
+                    holds,
+                    "{pos:?} admits {shape:?}, which its lowering has no representation for"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_position_lists_what_it_admits_with_a_conjunction() {
+        for pos in every_position() {
+            let spellings = Parser::admitted_spellings(pos);
+            assert!(
+                spellings.contains(" or "),
+                "{pos:?} lists `{spellings}` without a terminal conjunction"
+            );
+            assert!(!spellings.ends_with(','));
+        }
+    }
+
+    #[test]
+    fn a_rejection_note_explains_the_shape_that_was_written() {
+        // The note is per (shape, position): a returned borrow is not told
+        // about calling conventions, and an owned array parameter is told the
+        // one thing that fixes it.
+        assert!(TyPos::Return
+            .rejection_note(TypeShape::Borrow)
+            .contains("callee's frame"));
+        assert!(TyPos::Param
+            .rejection_note(TypeShape::Array)
+            .contains("&mut [T]"));
+        assert!(TyPos::Local
+            .rejection_note(TypeShape::Class)
+            .contains("`var`"));
+        assert_ne!(
+            TyPos::Local.rejection_note(TypeShape::Class),
+            TyPos::Local.rejection_note(TypeShape::Borrow)
+        );
+    }
+
+    #[test]
+    fn a_record_resource_map_key_is_a_gate_rejection() {
+        let source = "record Pair #[layout(size := 16, align := 8)] {\n\
+                          #[offset(0)] u64 left;\n\
+                          #[offset(8)] u64 right;\n\
+                      }\n\
+                      fn f(resource ResourceMap<Pair, PointsTo<u64>> cells) -> u64 {\n\
+                          return 0;\n\
+                      }\n";
+        let key = source.find("Pair,").unwrap();
+        let diagnostic = parse_source(source).unwrap_err();
+
+        assert_eq!(diagnostic.name, "type.resource_map_key_unsupported");
+        assert_eq!(diagnostic.span, Span::new(key, key + "Pair".len()));
+        assert_eq!(
+            diagnostic.title,
+            "a record type is not admitted as a `ResourceMap` key type"
+        );
+    }
+
+    #[test]
+    fn a_record_resource_extent_is_admitted() {
+        let source = "record Pair #[layout(size := 16, align := 8)] {\n\
+                          #[offset(0)] u64 left;\n\
+                          #[offset(8)] u64 right;\n\
+                      }\n\
+                      fn f(resource PointsTo<Pair> cell) -> u64 {\n\
+                          return 0;\n\
+                      }\n";
+        let program = parse_source(source).unwrap();
+
+        assert_eq!(
+            program.fns[0].params[0].ty,
+            Ty::Res(ResKind::PointsToRecord(0))
+        );
+    }
+
+    #[test]
+    fn a_type_parameter_shadows_a_class_of_the_same_name() {
+        // A declaration's own binders are nearer than its module's, so a
+        // visible class does not capture a type parameter's name — and an
+        // importer's signature cannot change meaning because a module it
+        // imports gained a public class.
+        let source = "class Box { u64 v; init make() { self.v = 0; } }\n\
+                      fn id<Box>(Box x) -> Box { return x; }\n";
+        let program = parse_source(source).unwrap();
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name == "id")
+            .expect("the generic function is parsed");
+
+        assert_eq!(
+            function.params[0].ty,
+            Ty::Param(TypeParamId::from_legacy(0))
+        );
+        assert_eq!(function.ret, Ty::Param(TypeParamId::from_legacy(0)));
+    }
+
+    #[test]
+    fn the_owning_option_families_are_admitted_payload_spellings() {
+        // `option<[T]>` and `option<raw<R>>` are decided by the payload's
+        // shape, and the gate table is what admits that shape.
+        assert!(Parser::admits(TypeShape::Array, TyPos::OptionPayload));
+        assert!(Parser::admits(TypeShape::Raw, TyPos::OptionPayload));
+
+        let source = "record Pair #[layout(size := 16, align := 8)] {\n\
+                          #[offset(0)] u64 left;\n\
+                          #[offset(8)] u64 right;\n\
+                      }\n\
+                      fn f() -> option<raw<Pair>> { return none; }\n\
+                      fn g() -> u64 { mut option<[bool]> flags = none; return 0; }\n";
+        let program = parse_source(source).unwrap();
+
+        assert_eq!(program.fns[0].ret, Ty::OptionRaw(0));
     }
 }

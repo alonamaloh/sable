@@ -1,0 +1,21 @@
+// expect-error: type.array_payload_unsupported
+// A class has no element form: array payloads are the copyable values, and an
+// object is owned by one name at a time. This is the parser's half of the
+// array-payload rule — the shape has no array-element representation at all,
+// so nothing downstream ever sees it (`array_element_record.sable` pins the
+// checker's half, where the shape is representable but has no semantics).
+
+class Box {
+    u64 v;
+
+    /// invariant v ≤ 100
+
+    /// post self.v = 0
+    init make() {
+        self.v = 0;
+    }
+}
+
+fn count(&[Box] boxes) -> u64 {
+    return 0;
+}

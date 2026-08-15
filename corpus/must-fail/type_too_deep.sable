@@ -1,0 +1,9 @@
+// expect-error: parse.type_too_deep
+// The type grammar is recursive, so a spelling can nest without bound; the
+// parser caps the nesting instead of recursing on the machine stack, which is
+// how a hostile or generated type is answered with a diagnostic rather than a
+// crash. The chain below is 70 arrays deep, past the 64-node cap.
+
+fn deep(&[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[u64]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] xs) -> u64 {
+    return 0;
+}

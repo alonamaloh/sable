@@ -1,0 +1,8 @@
+// expect-error: type.cast_target_unsupported
+// `widen`/`narrow` relate two integer ranges, and their proof obligation is a
+// range fact, so the target is an integer type. Converting an integer to a
+// truth value is a comparison, not a cast.
+
+fn as_flag(u64 n) -> u64 {
+    return widen<bool>(n);
+}
