@@ -266,7 +266,7 @@ Exact resource extent is additionally a verifier obligation. -/
 
 private def nodeFields : List String := ["previous", "next", "payload"]
 private def nodeArgs (p : Expr) (payload : Int) : List Expr :=
-  [.ptrNoneE, .ptrSomeE p, u64 payload]
+  [.noneE, .someE p, u64 payload]
 
 /- Construct, initialize, copy-read, project, take, and return one abstract
 record extent to raw storage. The value is never serialized. -/
@@ -289,26 +289,26 @@ provenance plus offset. -/
   [ .rawAlloc "p" (u64 24),
     .recordMake "node" 0 nodeFields (nodeArgs (.var "p") 7),
     .assign "next" (.recordField (.var "node") "next"),
-    .assign "q" (.ptrValue (.var "next")),
+    .assign "q" (.optValue (.var "next")),
     .ret (.ptrOffset (.var "q")) ]
   = "done int 0"
 
 /- `.value` on an empty option is a defined language trap, not raw-memory
 `undef`; the verifier normally proves this path unreachable. -/
-#guard outcome [ .assign "q" (.ptrValue .ptrNoneE) ] = "trap optionNone"
+#guard outcome [ .assign "q" (.optValue .noneE) ] = "trap optionNone"
 
 /- Missing record fields remain checker-duty type confusion. -/
 #guard outcome
-  [ .recordMake "node" 0 nodeFields [.ptrNoneE, .ptrNoneE, u64 7],
+  [ .recordMake "node" 0 nodeFields [.noneE, .noneE, u64 7],
     .ret (.recordField (.var "node") "missing") ]
   = "undef"
 
 /- Record outcomes expose their declaration-order fields to the differential
 wire format; comparing only the tag would hide value divergences. -/
 #guard outcome
-  [ .recordMake "node" 0 nodeFields [.ptrNoneE, .ptrNoneE, u64 7],
+  [ .recordMake "node" 0 nodeFields [.noneE, .noneE, u64 7],
     .ret (.var "node") ]
-  = "done record 0 {previous=ptrOpt none, next=ptrOpt none, payload=int 7}"
+  = "done record 0 {previous=opt none, next=opt none, payload=int 7}"
 
 /- Dropping then removing a record cell zero-fills its complete raw extent. -/
 #guard outcome

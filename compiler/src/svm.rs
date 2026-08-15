@@ -494,7 +494,7 @@ fn validate_affine_option_take(
     Ok(())
 }
 
-/// Boolean arrays have no call ABI or general first-class transport in G1.5.
+/// Boolean arrays have no call ABI or general first-class transport.
 /// Their sole producer position is the initializer of a fresh owned local.
 /// Keep that positional rule separate from payload classification: the latter
 /// describes the machine representation, while this function describes the
@@ -1100,6 +1100,20 @@ fn validate_some_constructor(expr: &Expr, inner: &Expr) -> Result<SvmOptionRepr,
              expected `{}` from the result annotation",
             expected.name()
         )),
+    }
+}
+
+/// Check whatever the representation still owes the program before an option
+/// is lowered. Only a nullable raw pointer owes anything: it names a record,
+/// and an index outside the checked program is a lowering bug rather than a
+/// value the machine could hold.
+fn check_option_repr(ctx: &LowerCtx<'_>, repr: SvmOptionRepr) -> Result<(), String> {
+    match repr {
+        SvmOptionRepr::Ordinary(_) => Ok(()),
+        SvmOptionRepr::RawRecord(record) => ctx.record(record).map(|_| ()),
+        SvmOptionRepr::AffineBoolArray => {
+            unreachable!("general option classification excludes affine options")
+        }
     }
 }
 
@@ -3434,53 +3448,38 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
         ExprKind::Narrow { target, arg } => {
             format!("(.narrow {} {})", lean_ty(*target)?, lower_expr(ctx, arg)?)
         }
-        ExprKind::SomeE(inner) => match validate_some_constructor(e, inner)? {
-            SvmOptionRepr::RawRecord(record) => {
-                ctx.record(record)?;
-                format!("(.ptrSomeE {})", lower_expr(ctx, inner)?)
-            }
-            SvmOptionRepr::Ordinary(_) => {
-                format!("(.someE {})", lower_expr(ctx, inner)?)
-            }
-            SvmOptionRepr::AffineBoolArray => {
-                unreachable!("affine construction lowers only through an explicit declaration")
-            }
-        },
-        ExprKind::NoneE => match svm_option_repr(e, "none")? {
-            SvmOptionRepr::RawRecord(record) => {
-                ctx.record(record)?;
-                "(.ptrNoneE)".into()
-            }
-            SvmOptionRepr::Ordinary(_) => "(.noneE)".into(),
-            SvmOptionRepr::AffineBoolArray => {
-                unreachable!("affine construction lowers only through an explicit declaration")
-            }
-        },
+        // The machine has one option family (ADR 0062); a nullable raw pointer
+        // is an ordinary option carrying a pointer, so every representation
+        // below emits the same machine constructor. The representation decides
+        // only which payloads and positions are admitted — and, for a raw
+        // pointer, which record tag must be checked against the program.
+        ExprKind::SomeE(inner) => {
+            check_option_repr(ctx, validate_some_constructor(e, inner)?)?;
+            format!("(.someE {})", lower_expr(ctx, inner)?)
+        }
+        ExprKind::NoneE => {
+            check_option_repr(ctx, svm_option_repr(e, "none")?)?;
+            "(.noneE)".into()
+        }
         ExprKind::IsSome { operand } => match validate_option_accessor(ctx, e, operand, false)? {
-            SvmOptionRepr::Ordinary(_) => {
-                format!("(.optIsSome {})", lower_expr(ctx, operand)?)
-            }
-            SvmOptionRepr::RawRecord(record) => {
-                ctx.record(record)?;
-                format!("(.ptrIsSome {})", lower_expr(ctx, operand)?)
-            }
             SvmOptionRepr::AffineBoolArray => {
                 let ExprKind::Var(name) = &operand.kind else {
                     unreachable!("validated named affine-option accessor")
                 };
                 format!("(.optIsSome (.var \"{name}\"))")
             }
+            repr @ (SvmOptionRepr::Ordinary(_) | SvmOptionRepr::RawRecord(_)) => {
+                check_option_repr(ctx, repr)?;
+                format!("(.optIsSome {})", lower_expr(ctx, operand)?)
+            }
         },
         ExprKind::OptValue { operand } => match validate_option_accessor(ctx, e, operand, true)? {
-            SvmOptionRepr::Ordinary(_) => {
-                format!("(.optValue {})", lower_expr(ctx, operand)?)
-            }
-            SvmOptionRepr::RawRecord(record) => {
-                ctx.record(record)?;
-                format!("(.ptrValue {})", lower_expr(ctx, operand)?)
-            }
             SvmOptionRepr::AffineBoolArray => {
                 unreachable!("affine options have no copying `.value` accessor")
+            }
+            repr @ (SvmOptionRepr::Ordinary(_) | SvmOptionRepr::RawRecord(_)) => {
+                check_option_repr(ctx, repr)?;
+                format!("(.optValue {})", lower_expr(ctx, operand)?)
             }
         },
         ExprKind::OptTake { option, .. } => return Err(affine_option_take_position(option)),
@@ -3598,17 +3597,23 @@ pub fn canonical_observed(program: &Program, observed: ObservedRun) -> String {
     )
 }
 
-/// Array elements are spelled bare on the wire — `arr [1, 2]`, `arr [true]` —
-/// because the array already carries the payload. A payload with no bare
-/// spelling falls back to the general value rendering.
+/// Scalars nested inside an aggregate are spelled bare on the wire — `arr
+/// [1, 2]`, `opt some 7` — because the aggregate already names the shape.
+/// Anything else falls back to the general value rendering. One helper
+/// serves array elements and option payloads, mirroring the machine's
+/// `Val.renderInner`, so the two positions cannot drift apart.
+fn render_inner(program: &Program, value: &RtVal) -> String {
+    match value {
+        RtVal::Int(n) => n.to_string(),
+        RtVal::Bool(b) => b.to_string(),
+        other => render_rt_val(program, other),
+    }
+}
+
 fn render_elements(program: &Program, array: &RtArray) -> String {
     array
         .iter()
-        .map(|element| match element {
-            RtVal::Int(n) => n.to_string(),
-            RtVal::Bool(b) => b.to_string(),
-            other => render_rt_val(program, other),
-        })
+        .map(|element| render_inner(program, element))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -3623,20 +3628,19 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
         RtVal::Opt { value: None, .. } => "opt none".into(),
         RtVal::Opt {
             value: Some(value), ..
-        } => match value.as_ref() {
-            // Preserve the established integer-option wire spelling while
-            // adding an unambiguous Boolean spelling for G1.2.
-            RtVal::Int(n) => format!("opt some {n}"),
-            RtVal::Bool(b) => format!("opt some {b}"),
-            value => format!("opt some {}", render_rt_val(program, value)),
-        },
+        } => format!("opt some {}", render_inner(program, value)),
         RtVal::AffineOptBoolArray(None) => "opt none".into(),
         RtVal::AffineOptBoolArray(Some(array)) => format!(
-            "opt some arr [{}]",
-            render_elements(program, &array.borrow())
+            "opt some {}",
+            render_inner(program, &RtVal::Arr(array.clone()))
         ),
-        RtVal::PtrOpt(None) => "ptrOpt none".into(),
-        RtVal::PtrOpt(Some((a, o))) => format!("ptrOpt some {a}+{o}"),
+        // A nullable raw pointer is an ordinary option carrying a pointer,
+        // so it takes the ordinary option spelling.
+        RtVal::PtrOpt(None) => "opt none".into(),
+        RtVal::PtrOpt(Some((allocation, offset))) => format!(
+            "opt some {}",
+            render_inner(program, &RtVal::Ptr(*allocation, *offset))
+        ),
         RtVal::Record { record, fields } => {
             let Some(decl) = program.records.get(*record) else {
                 return format!("unclassified record tag {record}");
@@ -3712,6 +3716,38 @@ fn classify_trap(msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::span::Span;
+
+    /// The wire format is compared against the machine's `Config.render`
+    /// byte for byte, and every option payload is spelled by one helper, so
+    /// a payload's spelling inside an option must equal its spelling bare.
+    #[test]
+    fn option_payloads_are_spelled_like_the_payload_itself() {
+        use crate::interp::{RtVal, rt_bools};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let program = empty_program();
+        let array = Rc::new(RefCell::new(rt_bools(&[true, false])));
+
+        assert_eq!(render_rt_val(&program, &RtVal::Ptr(3, 4)), "ptr 3+4");
+        assert_eq!(
+            render_rt_val(&program, &RtVal::PtrOpt(Some((3, 4)))),
+            "opt some ptr 3+4"
+        );
+        assert_eq!(render_rt_val(&program, &RtVal::PtrOpt(None)), "opt none");
+
+        assert_eq!(
+            render_rt_val(&program, &RtVal::Arr(array.clone())),
+            "arr [true, false]"
+        );
+        assert_eq!(
+            render_rt_val(&program, &RtVal::AffineOptBoolArray(Some(array))),
+            "opt some arr [true, false]"
+        );
+        assert_eq!(
+            render_rt_val(&program, &RtVal::AffineOptBoolArray(None)),
+            "opt none"
+        );
+    }
 
     fn expr(kind: ExprKind, ty: Ty) -> Expr {
         Expr {
@@ -4068,7 +4104,7 @@ mod tests {
 
         let unsupported = expr(ExprKind::NoneE, Ty::Option(ValueTy::Record(0)));
         let error = validate_expr_payloads(&ctx, &unsupported)
-            .expect_err("record option payload must remain outside G1.2");
+            .expect_err("record option payloads remain outside the supported subset");
         assert!(
             error.starts_with("svm.aggregate_payload_unsupported:"),
             "{error}"
@@ -4245,7 +4281,7 @@ mod tests {
         });
 
         let error = lower_fn_entry(&program, &function)
-            .expect_err("G1.2 does not introduce an option parameter ABI");
+            .expect_err("the machine has no option parameter ABI");
         assert!(
             error.starts_with("svm.option_position_unsupported:"),
             "{error}"
@@ -4490,7 +4526,7 @@ mod tests {
             span: Span::new(0, 0),
         });
         let field_error = validate_program_option_positions(&class_program)
-            .expect_err("G1.2 does not introduce option-valued class storage");
+            .expect_err("the machine has no option-valued class storage");
         assert!(
             field_error.starts_with("svm.option_position_unsupported:"),
             "{field_error}"
@@ -4506,7 +4542,7 @@ mod tests {
             span: Span::new(0, 0),
         });
         let trait_error = validate_program_option_positions(&trait_program)
-            .expect_err("G1.2 does not widen trait result semantics");
+            .expect_err("the machine does not model option-valued trait results");
         assert!(
             trait_error.starts_with("svm.option_position_unsupported:"),
             "{trait_error}"

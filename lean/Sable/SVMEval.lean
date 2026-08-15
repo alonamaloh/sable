@@ -53,30 +53,9 @@ theorem EOut.bindPtr_ok_of_ne {v : Val} (f : Int → Int → EOut)
     (hv : ∀ a k, v ≠ .ptr a k) : (EOut.ok v).bindPtr f = .abort .undef := by
   cases v <;> simp [EOut.bindPtr] at * <;> exact absurd rfl (hv _ _)
 
-/-- Continue with a nullable raw pointer; ill-shaped is undef. -/
-def EOut.bindPtrOpt
-    (o : EOut) (f : Option (Int × Int) → EOut) : EOut :=
-  match o with
-  | .ok (.ptrOpt p) => f p
-  | .ok _           => .abort .undef
-  | .abort a        => .abort a
-
-@[simp] theorem EOut.bindPtrOpt_ptrOpt
-    (p : Option (Int × Int)) (f : Option (Int × Int) → EOut) :
-    (EOut.ok (.ptrOpt p)).bindPtrOpt f = f p := rfl
-
-@[simp] theorem EOut.bindPtrOpt_abort
-    (ab : Abort) (f : Option (Int × Int) → EOut) :
-    (EOut.abort ab).bindPtrOpt f = .abort ab := rfl
-
-theorem EOut.bindPtrOpt_ok_of_ne {v : Val}
-    (f : Option (Int × Int) → EOut) (hv : ∀ p, v ≠ .ptrOpt p) :
-    (EOut.ok v).bindPtrOpt f = .abort .undef := by
-  cases v <;> simp [EOut.bindPtrOpt] at * <;> exact absurd rfl (hv _)
-
-/-- Continue with an ordinary option; ill-shaped is undef. The payload is
-itself a machine value, so this helper covers integer, Boolean, and future
-recursive option payloads uniformly. -/
+/-- Continue with an option; ill-shaped is undef. The payload is itself a
+machine value, so this helper covers integer, Boolean, raw-pointer, and
+future recursive option payloads uniformly. -/
 def EOut.bindOpt (o : EOut) (f : Option Val → EOut) : EOut :=
   match o with
   | .ok (.opt value) => f value
@@ -101,26 +80,29 @@ def EOut.bindBool (o : EOut) (f : Bool → EOut) : EOut :=
   | .ok _         => .abort .undef
   | .abort a      => .abort a
 
-/-- Continue with an integer or Boolean array element. The scalar shape is
-checked before allocation geometry (and, for stores, before array lookup),
-preserving the SVM's left-to-right trap precedence. -/
-def EOut.bindArrayElem (o : EOut) (f : ArrayElem → EOut) : EOut :=
+/-- Continue with an array element and the domain it inhabits. The element
+shape is checked before allocation geometry (and, for stores, before array
+lookup), preserving the SVM's left-to-right trap precedence. The value is
+passed through unchanged; only its tag is derived, so admitting another
+payload is one arm of `Val.tag?` rather than a case here. -/
+def EOut.bindArrayElem (o : EOut) (f : Val → ValTag → EOut) : EOut :=
   match o with
   | .ok v =>
-      match v.arrayElem? with
-      | some w => f w
+      match v.tag? with
+      | some t => f v t
       | none => .abort .undef
   | .abort a => .abort a
 
-@[simp] theorem EOut.bindArrayElem_elem (w : ArrayElem) (f : ArrayElem → EOut) :
-    (EOut.ok w.toVal).bindArrayElem f = f w := by
-  cases w <;> rfl
+theorem EOut.bindArrayElem_elem {v : Val} {t : ValTag}
+    (f : Val → ValTag → EOut) (ht : v.tag? = some t) :
+    (EOut.ok v).bindArrayElem f = f v t := by
+  simp [EOut.bindArrayElem, ht]
 
-@[simp] theorem EOut.bindArrayElem_abort (a : Abort) (f : ArrayElem → EOut) :
+@[simp] theorem EOut.bindArrayElem_abort (a : Abort) (f : Val → ValTag → EOut) :
     (EOut.abort a).bindArrayElem f = .abort a := rfl
 
-theorem EOut.bindArrayElem_ok_of_none {v : Val} (f : ArrayElem → EOut)
-    (hv : v.arrayElem? = none) :
+theorem EOut.bindArrayElem_ok_of_none {v : Val} (f : Val → ValTag → EOut)
+    (hv : v.tag? = none) :
     (EOut.ok v).bindArrayElem f = .abort .undef := by
   simp [EOut.bindArrayElem, hv]
 
@@ -196,13 +178,13 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
         else (evalE cap ρ e₂).bindBool fun c => .ok (.bool c)
   | .len x =>
       match ρ x with
-      | some (.arr a) => .ok (.int a.len)
-      | _             => .abort .undef
+      | some (.arr _ a) => .ok (.int a.len)
+      | _               => .abort .undef
   | .index x e =>
       (evalE cap ρ e).bindInt fun n =>
         match ρ x with
-        | some (.arr a) =>
-            if 0 ≤ n ∧ n < a.len then .ok ((a.get n).toVal)
+        | some (.arr _ a) =>
+            if 0 ≤ n ∧ n < a.len then .ok (a.get n)
             else .abort (.trap (.indexOOB n a.len))
         | _ => .abort .undef
   | .widen _ e => (evalE cap ρ e).bindInt fun n => .ok (.int n)
@@ -212,9 +194,9 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
         else .abort (.trap (.narrowOOB dst n))
   | .allocArray e₁ e₂ =>
       (evalE cap ρ e₁).bindInt fun n =>
-        (evalE cap ρ e₂).bindArrayElem fun v =>
+        (evalE cap ρ e₂).bindArrayElem fun v t =>
           if n < 0 then .abort .undef
-          else if n ≤ cap then .ok (.arr (ArrayVal.replicate n v))
+          else if n ≤ cap then .ok (.arr t (Seq.replicate n v))
           else .abort (.trap (.oom n))
   | .ptrAdd ep ed =>
       (evalE cap ρ ep).bindPtr fun a k =>
@@ -232,16 +214,6 @@ def evalE (cap : Int) (ρ : Env) : Expr → EOut
       (evalE cap ρ e).bindOpt fun value =>
         match value with
         | some payload => .ok payload
-        | none => .abort (.trap .optionNone)
-  | .ptrSomeE e =>
-      (evalE cap ρ e).bindPtr fun a k => .ok (.ptrOpt (some (a, k)))
-  | .ptrNoneE => .ok (.ptrOpt none)
-  | .ptrIsSome e =>
-      (evalE cap ρ e).bindPtrOpt fun p => .ok (.bool p.isSome)
-  | .ptrValue e =>
-      (evalE cap ρ e).bindPtrOpt fun p =>
-        match p with
-        | some (a, k) => .ok (.ptr a k)
         | none => .abort (.trap .optionNone)
   | .recordField e field =>
       match evalE cap ρ e with
@@ -336,15 +308,24 @@ theorem Eval.evalE_eq {cap : Int} {ρ : Env} {e : Expr} {out : EOut}
   | narrow_oob h hr ih => simp [evalE, ih, hr]
   | narrow_undef h hv ih => simp [evalE, ih, EOut.bindInt_ok_of_ne _ hv]
   | narrow_abort h ih => simp [evalE, ih]
-  | alloc_ok h₁ h₂ h₀ hc ih₁ ih₂ =>
-      simp only [evalE, ih₁, ih₂, EOut.bindInt_int, EOut.bindArrayElem_elem]
+  | alloc_ok h₁ h₂ ht h₀ hc ih₁ ih₂ =>
+      simp only [evalE, ih₁, ih₂, EOut.bindInt_int,
+        EOut.bindArrayElem_elem _ ht]
       rw [if_neg (by omega), if_pos hc]
-  | alloc_oom h₁ h₂ h₀ hc ih₁ ih₂ =>
-      simp only [evalE, ih₁, ih₂, EOut.bindInt_int, EOut.bindArrayElem_elem]
-      rw [if_neg (by omega), if_neg (by omega)]
-  | alloc_neg h₁ h₂ h₀ ih₁ ih₂ =>
-      simp only [evalE, ih₁, ih₂, EOut.bindInt_int, EOut.bindArrayElem_elem]
-      rw [if_pos h₀]
+  | @alloc_oom _ _ _ v h₁ h₂ ht h₀ hc ih₁ ih₂ =>
+      cases hv : v.tag? with
+      | none => exact absurd hv ht
+      | some t =>
+        simp only [evalE, ih₁, ih₂, EOut.bindInt_int,
+          EOut.bindArrayElem_elem _ hv]
+        rw [if_neg (by omega), if_neg (by omega)]
+  | @alloc_neg _ _ _ v h₁ h₂ ht h₀ ih₁ ih₂ =>
+      cases hv : v.tag? with
+      | none => exact absurd hv ht
+      | some t =>
+        simp only [evalE, ih₁, ih₂, EOut.bindInt_int,
+          EOut.bindArrayElem_elem _ hv]
+        rw [if_pos h₀]
   | ptrAdd_ok hp hd ihp ihd => simp [evalE, ihp, ihd]
   | ptrAdd_undef₁ hp hv ihp => simp [evalE, ihp, EOut.bindPtr_ok_of_ne _ hv]
   | ptrAdd_abort₁ hp ihp => simp [evalE, ihp]
@@ -353,19 +334,6 @@ theorem Eval.evalE_eq {cap : Int} {ρ : Env} {e : Expr} {out : EOut}
   | ptrOffset_ok h ih => simp [evalE, ih]
   | ptrOffset_undef h hv ih => simp [evalE, ih, EOut.bindPtr_ok_of_ne _ hv]
   | ptrOffset_abort h ih => simp [evalE, ih]
-  | ptrSomeE_ok h ih => simp [evalE, ih]
-  | ptrSomeE_undef h hv ih => simp [evalE, ih, EOut.bindPtr_ok_of_ne _ hv]
-  | ptrSomeE_abort h ih => simp [evalE, ih]
-  | ptrNoneE => rfl
-  | ptrIsSome_ok h ih => simp [evalE, ih]
-  | ptrIsSome_undef h hv ih =>
-      simp [evalE, ih, EOut.bindPtrOpt_ok_of_ne _ hv]
-  | ptrIsSome_abort h ih => simp [evalE, ih]
-  | ptrValue_ok h ih => simp [evalE, ih]
-  | ptrValue_none h ih => simp [evalE, ih]
-  | ptrValue_undef h hv ih =>
-      simp [evalE, ih, EOut.bindPtrOpt_ok_of_ne _ hv]
-  | ptrValue_abort h ih => simp [evalE, ih]
   | recordField_ok h hf ih => simp [evalE, ih, hf]
   | recordField_undef h hf ih => simp [evalE, ih, hf]
   | recordField_abort h ih => simp [evalE, ih]
@@ -407,10 +375,9 @@ private theorem eval_bindInt {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → 
     | int n => simpa using Hok n ih
     | unit => simpa [EOut.bindInt] using Hundef _ ih nofun
     | bool b => simpa [EOut.bindInt] using Hundef _ ih nofun
-    | arr a => simpa [EOut.bindInt] using Hundef _ ih nofun
+    | arr t a => simpa [EOut.bindInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindInt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindInt] using Hundef _ ih nofun
-    | ptrOpt p => simpa [EOut.bindInt] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindInt] using Hundef _ ih nofun
 
 private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool → EOut}
@@ -428,34 +395,30 @@ private theorem eval_bindBool {cap : Int} {ρ : Env} {e tgt : Expr} {f : Bool �
     | bool b => simpa using Hok b ih
     | unit => simpa [EOut.bindBool] using Hundef _ ih nofun
     | int n => simpa [EOut.bindBool] using Hundef _ ih nofun
-    | arr a => simpa [EOut.bindBool] using Hundef _ ih nofun
+    | arr t a => simpa [EOut.bindBool] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindBool] using Hundef _ ih nofun
-    | ptrOpt p => simpa [EOut.bindBool] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindBool] using Hundef _ ih nofun
 
+/-- The element scaffold splits on the operand's *domain*, not on its
+constructor: one admitted case and one rejected case, whatever payloads
+`Val.tag?` admits. -/
 private theorem eval_bindArrayElem {cap : Int} {ρ : Env} {e tgt : Expr}
-    {f : ArrayElem → EOut}
+    {f : Val → ValTag → EOut}
     (ih : Eval cap ρ e (evalE cap ρ e))
     (Habort : ∀ a, Eval cap ρ e (.abort a) → Eval cap ρ tgt (.abort a))
-    (Hundef : ∀ v, Eval cap ρ e (.ok v) → v.arrayElem? = none →
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → v.tag? = none →
       Eval cap ρ tgt (.abort .undef))
-    (Hok : ∀ w, Eval cap ρ e (.ok w.toVal) → Eval cap ρ tgt (f w)) :
+    (Hok : ∀ v t, Eval cap ρ e (.ok v) → v.tag? = some t →
+      Eval cap ρ tgt (f v t)) :
     Eval cap ρ tgt ((evalE cap ρ e).bindArrayElem f) := by
   cases ho : evalE cap ρ e with
   | abort a => rw [ho] at ih; simpa using Habort a ih
   | ok v =>
     rw [ho] at ih
-    cases v with
-    | int n => simpa [EOut.bindArrayElem, Val.arrayElem?] using Hok (.int n) ih
-    | bool b => simpa [EOut.bindArrayElem, Val.arrayElem?] using Hok (.bool b) ih
-    | unit => simpa [EOut.bindArrayElem, Val.arrayElem?] using Hundef .unit ih rfl
-    | arr a => simpa [EOut.bindArrayElem, Val.arrayElem?] using Hundef (.arr a) ih rfl
-    | opt o => simpa [EOut.bindArrayElem, Val.arrayElem?] using Hundef (.opt o) ih rfl
-    | ptr a k => simpa [EOut.bindArrayElem, Val.arrayElem?] using Hundef (.ptr a k) ih rfl
-    | ptrOpt p => simpa [EOut.bindArrayElem, Val.arrayElem?] using Hundef (.ptrOpt p) ih rfl
-    | record tag fields =>
-        simpa [EOut.bindArrayElem, Val.arrayElem?] using Hundef (.record tag fields) ih rfl
+    cases ht : v.tag? with
+    | none => simpa [EOut.bindArrayElem, ht] using Hundef v ih ht
+    | some t => simpa [EOut.bindArrayElem, ht] using Hok v t ih ht
 
 private theorem eval_bindPtr {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → Int → EOut}
     (ih : Eval cap ρ e (evalE cap ρ e))
@@ -473,32 +436,9 @@ private theorem eval_bindPtr {cap : Int} {ρ : Env} {e tgt : Expr} {f : Int → 
     | unit => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | int n => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | bool b => simpa [EOut.bindPtr] using Hundef _ ih nofun
-    | arr a => simpa [EOut.bindPtr] using Hundef _ ih nofun
+    | arr t a => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | opt o => simpa [EOut.bindPtr] using Hundef _ ih nofun
-    | ptrOpt p => simpa [EOut.bindPtr] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindPtr] using Hundef _ ih nofun
-
-private theorem eval_bindPtrOpt {cap : Int} {ρ : Env} {e tgt : Expr}
-    {f : Option (Int × Int) → EOut}
-    (ih : Eval cap ρ e (evalE cap ρ e))
-    (Habort : ∀ a, Eval cap ρ e (.abort a) → Eval cap ρ tgt (.abort a))
-    (Hundef : ∀ v, Eval cap ρ e (.ok v) → (∀ p, v ≠ .ptrOpt p) →
-      Eval cap ρ tgt (.abort .undef))
-    (Hok : ∀ p, Eval cap ρ e (.ok (.ptrOpt p)) → Eval cap ρ tgt (f p)) :
-    Eval cap ρ tgt ((evalE cap ρ e).bindPtrOpt f) := by
-  cases ho : evalE cap ρ e with
-  | abort a => rw [ho] at ih; simpa using Habort a ih
-  | ok v =>
-    rw [ho] at ih
-    cases v with
-    | ptrOpt p => simpa using Hok p ih
-    | unit => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
-    | int n => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
-    | bool b => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
-    | arr a => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
-    | opt o => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
-    | ptr a k => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
-    | record tag fields => simpa [EOut.bindPtrOpt] using Hundef _ ih nofun
 
 private theorem eval_bindOpt {cap : Int} {ρ : Env} {e tgt : Expr}
     {f : Option Val → EOut}
@@ -517,9 +457,8 @@ private theorem eval_bindOpt {cap : Int} {ρ : Env} {e tgt : Expr}
     | unit => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | int n => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | bool b => simpa [EOut.bindOpt] using Hundef _ ih nofun
-    | arr a => simpa [EOut.bindOpt] using Hundef _ ih nofun
+    | arr t a => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.bindOpt] using Hundef _ ih nofun
-    | ptrOpt p => simpa [EOut.bindOpt] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.bindOpt] using Hundef _ ih nofun
 
 private theorem eval_bindInt₂ {cap : Int} {ρ : Env} {e₁ e₂ tgt : Expr}
@@ -633,18 +572,11 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
             (fun v h₂ hv => .or_undef₂ h₁ h₂ hv) fun c h₂ => .or_false h₁ h₂
   | len x =>
       cases hx : ρ x with
-      | none => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
+      | none => simpa [evalE, hx] using Eval.len_undef (fun t a h => by simp [hx] at h)
       | some v =>
           cases v with
-          | arr a => simpa [evalE, hx] using Eval.len hx
-          | unit => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
-          | int n => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
-          | bool b => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
-          | ptr a k => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
-          | opt o => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
-          | ptrOpt p => simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
-          | record tag fields =>
-              simpa [evalE, hx] using Eval.len_undef (fun a h => by simp [hx] at h)
+          | arr t a => simpa [evalE, hx] using Eval.len hx
+          | _ => simpa [evalE, hx] using Eval.len_undef (fun t a h => by simp [hx] at h)
   | index x e ih =>
       simp only [evalE]
       refine eval_bindInt ih (fun a h => .index_abort h)
@@ -677,24 +609,6 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
       simp only [evalE]
       exact eval_bindPtr ih (fun ab h => .ptrOffset_abort h)
         (fun v h hv => .ptrOffset_undef h hv) fun a k h => .ptrOffset_ok h
-  | ptrSomeE e ih =>
-      simp only [evalE]
-      exact eval_bindPtr ih (fun ab h => .ptrSomeE_abort h)
-        (fun v h hv => .ptrSomeE_undef h hv) fun a k h => .ptrSomeE_ok h
-  | ptrNoneE => exact .ptrNoneE
-  | ptrIsSome e ih =>
-      simp only [evalE]
-      exact eval_bindPtrOpt ih (fun ab h => .ptrIsSome_abort h)
-        (fun v h hv => .ptrIsSome_undef h hv) fun p h => .ptrIsSome_ok h
-  | ptrValue e ih =>
-      simp only [evalE]
-      refine eval_bindPtrOpt ih (fun ab h => .ptrValue_abort h)
-        (fun v h hv => .ptrValue_undef h hv) fun p h => ?_
-      cases p with
-      | none => exact .ptrValue_none h
-      | some pair =>
-          rcases pair with ⟨a, k⟩
-          exact .ptrValue_ok h
   | recordField e field ih =>
       simp only [evalE]
       cases he : evalE cap ρ e with
@@ -711,13 +625,14 @@ theorem evalE_eval (cap : Int) (ρ : Env) : ∀ e, Eval cap ρ e (evalE cap ρ e
       refine eval_bindInt ih₁ (fun a h => .alloc_abort₁ h)
         (fun v h hv => .alloc_undef₁ h hv) fun n h₁ => ?_
       refine eval_bindArrayElem ih₂ (fun a h₂ => .alloc_abort₂ h₁ h₂)
-        (fun v h₂ hv => .alloc_undef₂ h₁ h₂ hv) fun v h₂ => ?_
+        (fun v h₂ hv => .alloc_undef₂ h₁ h₂ hv) fun v t h₂ ht => ?_
+      have ht' : v.tag? ≠ none := by simp [ht]
       by_cases hneg : n < 0
-      · rw [if_pos hneg]; exact .alloc_neg h₁ h₂ hneg
+      · rw [if_pos hneg]; exact .alloc_neg h₁ h₂ ht' hneg
       · rw [if_neg hneg]
         by_cases hc : n ≤ cap
-        · rw [if_pos hc]; exact .alloc_ok h₁ h₂ (by omega) hc
-        · rw [if_neg hc]; exact .alloc_oom h₁ h₂ (by omega) (by omega)
+        · rw [if_pos hc]; exact .alloc_ok h₁ h₂ ht (by omega) hc
+        · rw [if_neg hc]; exact .alloc_oom h₁ h₂ ht' (by omega) (by omega)
   | someE e ih =>
       cases he : evalE cap ρ e with
       | ok value =>
@@ -829,25 +744,29 @@ theorem EOut.stepBool_ok_of_ne {v : Val} (f : Bool → Config)
     (hv : ∀ b, v ≠ .bool b) : (EOut.ok v).stepBool f = .undef := by
   cases v <;> first | exact absurd rfl (hv _) | rfl
 
-/-- Continue a statement with a scalar array element; every other value
-shape is checker-duty `undef`. -/
-def EOut.stepArrayElem (o : EOut) (f : ArrayElem → Config) : Config :=
+/-- Continue a statement with a value some array could hold; every other
+value shape is checker-duty `undef`. A statement that goes on to consult an
+array checks the element against *that* array's domain, so the gate here is
+admissibility alone, not which domain admitted the value. -/
+def EOut.stepArrayElem (o : EOut) (f : Val → Config) : Config :=
   match o with
   | .ok v =>
-      match v.arrayElem? with
-      | some w => f w
+      match v.tag? with
+      | some _ => f v
       | none => .undef
   | .abort a => a.toConfig
 
-@[simp] theorem EOut.stepArrayElem_elem (w : ArrayElem) (f : ArrayElem → Config) :
-    (EOut.ok w.toVal).stepArrayElem f = f w := by
-  cases w <;> rfl
+theorem EOut.stepArrayElem_elem {v : Val} (f : Val → Config)
+    (ht : v.tag? ≠ none) : (EOut.ok v).stepArrayElem f = f v := by
+  cases hv : v.tag? with
+  | none => exact absurd hv ht
+  | some t => simp [EOut.stepArrayElem, hv]
 
-@[simp] theorem EOut.stepArrayElem_abort (a : Abort) (f : ArrayElem → Config) :
+@[simp] theorem EOut.stepArrayElem_abort (a : Abort) (f : Val → Config) :
     (EOut.abort a).stepArrayElem f = a.toConfig := rfl
 
-theorem EOut.stepArrayElem_ok_of_none {v : Val} (f : ArrayElem → Config)
-    (hv : v.arrayElem? = none) : (EOut.ok v).stepArrayElem f = .undef := by
+theorem EOut.stepArrayElem_ok_of_none {v : Val} (f : Val → Config)
+    (hv : v.tag? = none) : (EOut.ok v).stepArrayElem f = .undef := by
   simp [EOut.stepArrayElem, hv]
 
 /-- Continue with the operand's pointer; ill-shaped is undef. -/
@@ -894,10 +813,10 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
       some ((evalE cap ρ ei).stepInt fun n =>
         (evalE cap ρ ev).stepArrayElem fun w =>
           match ρ x with
-          | some (.arr a) =>
-              match a.set? n w with
+          | some (.arr t a) =>
+              match Val.arrSet? t a n w with
               | some a' =>
-                  if 0 ≤ n ∧ n < a.len then .run k (ρ.update x (.arr a')) σ μ
+                  if 0 ≤ n ∧ n < a.len then .run k (ρ.update x (.arr t a')) σ μ
                   else .trapped (.indexOOB n a.len)
               | none => .undef
           | _ => .undef)
@@ -1043,22 +962,25 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   | recordMake_ok ha hn => simp [stepF, ha.evalArgs_eq, hn]
   | recordMake_undef_arity ha hn => simp [stepF, ha.evalArgs_eq, hn]
   | recordMake_abort ha => simp [stepF, ha.evalArgs_eq]
-  | store_ok hi hv ha hs h₀ h₁ =>
-      simp [stepF, hi.evalE_eq, hv.evalE_eq, ha, hs, h₀, h₁]
-  | store_oob hi hv ha hs hoob =>
+  | store_ok hi hv hw ha hs h₀ h₁ =>
       simp only [stepF, hi.evalE_eq, hv.evalE_eq, EOut.stepInt_int,
-        EOut.stepArrayElem_elem, ha, hs]
+        EOut.stepArrayElem_elem _ hw, ha, hs]
+      rw [if_pos ⟨h₀, h₁⟩]
+  | store_oob hi hv hw ha hs hoob =>
+      simp only [stepF, hi.evalE_eq, hv.evalE_eq, EOut.stepInt_int,
+        EOut.stepArrayElem_elem _ hw, ha, hs]
       rw [if_neg (by omega)]
   | store_abort_idx hi => simp [stepF, hi.evalE_eq]
   | store_undef_idx hi hv => simp [stepF, hi.evalE_eq, EOut.stepInt_ok_of_ne _ hv]
   | store_abort_val hi hv => simp [stepF, hi.evalE_eq, hv.evalE_eq]
   | store_undef_val hi hv hw =>
       simp [stepF, hi.evalE_eq, hv.evalE_eq, EOut.stepArrayElem_ok_of_none _ hw]
-  | store_undef_arr hi hv ha =>
+  | store_undef_arr hi hv hw ha =>
       simp only [stepF, hi.evalE_eq, hv.evalE_eq, EOut.stepInt_int,
-        EOut.stepArrayElem_elem]
-  | store_undef_tag hi hv ha hs =>
-      simp [stepF, hi.evalE_eq, hv.evalE_eq, ha, hs]
+        EOut.stepArrayElem_elem _ hw]
+  | store_undef_tag hi hv hw ha hs =>
+      simp only [stepF, hi.evalE_eq, hv.evalE_eq, EOut.stepInt_int,
+        EOut.stepArrayElem_elem _ hw, ha, hs]
   | ite_true h => simp [stepF, h.evalE_eq]
   | ite_false h => simp [stepF, h.evalE_eq]
   | ite_undef h hv => simp [stepF, h.evalE_eq, EOut.stepBool_ok_of_ne _ hv]
@@ -1204,9 +1126,8 @@ private theorem step_stepInt {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ 
     | unit => simpa [EOut.stepInt] using Hundef _ ih nofun
     | bool b => simpa [EOut.stepInt] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.stepInt] using Hundef _ ih nofun
-    | arr a => simpa [EOut.stepInt] using Hundef _ ih nofun
+    | arr t a => simpa [EOut.stepInt] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepInt] using Hundef _ ih nofun
-    | ptrOpt p => simpa [EOut.stepInt] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.stepInt] using Hundef _ ih nofun
 
 private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
@@ -1225,33 +1146,25 @@ private theorem step_stepBool {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀
     | unit => simpa [EOut.stepBool] using Hundef _ ih nofun
     | int n => simpa [EOut.stepBool] using Hundef _ ih nofun
     | ptr a k => simpa [EOut.stepBool] using Hundef _ ih nofun
-    | arr a => simpa [EOut.stepBool] using Hundef _ ih nofun
+    | arr t a => simpa [EOut.stepBool] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepBool] using Hundef _ ih nofun
-    | ptrOpt p => simpa [EOut.stepBool] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.stepBool] using Hundef _ ih nofun
 
 private theorem step_stepArrayElem {P : Prog} {cap : Int} {ρ : Env} {e : Expr}
-    {c₀ : Config} {f : ArrayElem → Config}
+    {c₀ : Config} {f : Val → Config}
     (Habort : ∀ a, Eval cap ρ e (.abort a) → Step P cap c₀ a.toConfig)
-    (Hundef : ∀ v, Eval cap ρ e (.ok v) → v.arrayElem? = none →
+    (Hundef : ∀ v, Eval cap ρ e (.ok v) → v.tag? = none →
       Step P cap c₀ .undef)
-    (Hok : ∀ w, Eval cap ρ e (.ok w.toVal) → Step P cap c₀ (f w)) :
+    (Hok : ∀ v, Eval cap ρ e (.ok v) → v.tag? ≠ none → Step P cap c₀ (f v)) :
     Step P cap c₀ ((evalE cap ρ e).stepArrayElem f) := by
   have ih := evalE_eval cap ρ e
   cases ho : evalE cap ρ e with
   | abort a => rw [ho] at ih; simpa using Habort a ih
   | ok v =>
     rw [ho] at ih
-    cases v with
-    | int n => simpa [EOut.stepArrayElem, Val.arrayElem?] using Hok (.int n) ih
-    | bool b => simpa [EOut.stepArrayElem, Val.arrayElem?] using Hok (.bool b) ih
-    | unit => simpa [EOut.stepArrayElem, Val.arrayElem?] using Hundef .unit ih rfl
-    | arr a => simpa [EOut.stepArrayElem, Val.arrayElem?] using Hundef (.arr a) ih rfl
-    | opt o => simpa [EOut.stepArrayElem, Val.arrayElem?] using Hundef (.opt o) ih rfl
-    | ptr a k => simpa [EOut.stepArrayElem, Val.arrayElem?] using Hundef (.ptr a k) ih rfl
-    | ptrOpt p => simpa [EOut.stepArrayElem, Val.arrayElem?] using Hundef (.ptrOpt p) ih rfl
-    | record tag fields =>
-        simpa [EOut.stepArrayElem, Val.arrayElem?] using Hundef (.record tag fields) ih rfl
+    cases ht : v.tag? with
+    | none => simpa [EOut.stepArrayElem, ht] using Hundef v ih ht
+    | some t => simpa [EOut.stepArrayElem, ht] using Hok v ih (by simp [ht])
 
 private theorem step_stepPtr {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ : Config}
     {f : Int → Int → Config}
@@ -1269,9 +1182,8 @@ private theorem step_stepPtr {P : Prog} {cap : Int} {ρ : Env} {e : Expr} {c₀ 
     | unit => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | int n => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | bool b => simpa [EOut.stepPtr] using Hundef _ ih nofun
-    | arr a => simpa [EOut.stepPtr] using Hundef _ ih nofun
+    | arr t a => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | opt o => simpa [EOut.stepPtr] using Hundef _ ih nofun
-    | ptrOpt p => simpa [EOut.stepPtr] using Hundef _ ih nofun
     | record tag fields => simpa [EOut.stepPtr] using Hundef _ ih nofun
 
 /-- Everything `stepF` computes is a step. -/
@@ -1335,15 +1247,11 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
                     simpa [hs] using
                       Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
                         heq (by simp [hs])
-                | arr a =>
+                | arr t a =>
                     simpa [hs] using
                       Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
                         heq (by simp [hs])
                 | ptr a offset =>
-                    simpa [hs] using
-                      Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
-                        heq (by simp [hs])
-                | ptrOpt p =>
                     simpa [hs] using
                       Step.optTake_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
                         heq (by simp [hs])
@@ -1369,18 +1277,18 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           refine step_stepInt (fun a hi => .store_abort_idx hi)
             (fun v hi hv => .store_undef_idx hi hv) fun n hi => ?_
           refine step_stepArrayElem (fun a hv => .store_abort_val hi hv)
-            (fun v hv hw => .store_undef_val hi hv hw) fun w hv => ?_
+            (fun v hv hw => .store_undef_val hi hv hw) fun w hv hw => ?_
           split
-          next a ha =>
-            cases hs : a.set? n w with
-            | none => exact .store_undef_tag hi hv ha hs
+          next t a ha =>
+            cases hs : Val.arrSet? t a n w with
+            | none => exact .store_undef_tag hi hv hw ha hs
             | some a' =>
               simp only
               by_cases hb : 0 ≤ n ∧ n < a.len
-              · rw [if_pos hb]; exact .store_ok hi hv ha hs hb.1 hb.2
-              · rw [if_neg hb]; exact .store_oob hi hv ha hs (by omega)
+              · rw [if_pos hb]; exact .store_ok hi hv hw ha hs hb.1 hb.2
+              · rw [if_neg hb]; exact .store_oob hi hv hw ha hs (by omega)
           next hne =>
-            exact .store_undef_arr hi hv fun a ha => hne a ha
+            exact .store_undef_arr hi hv hw fun t a ha => hne t a ha
       | ite c thn els =>
           simp only [stepF, Option.some.injEq] at h
           subst h
@@ -1665,29 +1573,33 @@ def IntTy.render : IntTy → String
   | .i8 => "i8" | .i16 => "i16" | .i32 => "i32" | .i64 => "i64"
   | .u8 => "u8" | .u16 => "u16" | .u32 => "u32" | .u64 => "u64"
 
-def ArrayElem.render : ArrayElem → String
-  | .int n => toString n
-  | .bool b => toString b
+mutual
 
 partial def Val.render : Val → String
   | .unit => "unit"
   | .int n => s!"int {n}"
   | .bool b => s!"bool {b}"
   | .ptr a k => s!"ptr {a}+{k}"
-  | .arr a =>
+  | .arr _ a =>
       "arr [" ++ String.intercalate ", "
-        ((List.range a.len.toNat).map fun i => (a.get (Int.ofNat i)).render) ++ "]"
+        ((List.range a.len.toNat).map fun i => (a.get (Int.ofNat i)).renderInner)
+        ++ "]"
   | .opt none => "opt none"
-  /- Keep the established integer-option spelling byte-for-byte, and give
-  Boolean payloads the same compact scalar spelling. -/
-  | .opt (some (.int n)) => s!"opt some {n}"
-  | .opt (some (.bool b)) => s!"opt some {b}"
-  | .opt (some value) => "opt some " ++ value.render
-  | .ptrOpt none => "ptrOpt none"
-  | .ptrOpt (some (a, k)) => s!"ptrOpt some {a}+{k}"
+  | .opt (some value) => "opt some " ++ value.renderInner
   | .record tag fields =>
       "record " ++ toString tag ++ " {" ++ String.intercalate ", "
         (fields.map fun (name, value) => name ++ "=" ++ value.render) ++ "}"
+
+/-- Scalars nested inside an aggregate drop their shape word: an array
+element and an option payload both read as the bare literal, and anything
+else falls back to the full spelling. One definition serves both positions,
+so they cannot drift apart. -/
+partial def Val.renderInner : Val → String
+  | .int n => toString n
+  | .bool b => toString b
+  | v => v.render
+
+end
 
 def Trap.render : Trap → String
   | .overflow t => s!"trap overflow {t.render}"

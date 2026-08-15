@@ -104,71 +104,63 @@ def IntTy.wrap (t : IntTy) (n : Int) : Int :=
 
 /-! ## Values, traps, and abnormal outcomes -/
 
-/-- The scalar payloads supported by owned SVM arrays. Keeping the tag
-outside `Val` lets allocation retain the element type even at length zero. -/
-inductive ArrayElem where
-  | int (n : Int)
-  | bool (b : Bool)
+/-- The element domains an owned SVM array may carry. A tag is a *name* for
+a domain, not a second copy of its values: it exists so that an array keeps
+its element type at length zero, where no element is left to imply one. -/
+inductive ValTag where
+  | int
+  | bool
   deriving DecidableEq, Repr
-
-/-- A homogeneously typed owned array. The constructor is semantically
-observable at length zero: an empty integer array and an empty Boolean array
-accept different stores. -/
-inductive ArrayVal where
-  | ints (a : Seq Int)
-  | bools (a : Seq Bool)
-
-def ArrayVal.len : ArrayVal → Int
-  | .ints a => a.len
-  | .bools a => a.len
-
-def ArrayVal.get : ArrayVal → Int → ArrayElem
-  | .ints a, i => .int (a.get i)
-  | .bools a, i => .bool (a.get i)
-
-/-- Type-preserving update. `none` is payload-tag confusion; bounds are
-checked separately so a mismatched store wins over an OOB trap, just as the
-value-shape check did in the integer-only machine. -/
-def ArrayVal.set? : ArrayVal → Int → ArrayElem → Option ArrayVal
-  | .ints a, i, .int n => some (.ints (a.set i n))
-  | .bools a, i, .bool b => some (.bools (a.set i b))
-  | _, _, _ => none
-
-def ArrayVal.replicate (len : Int) : ArrayElem → ArrayVal
-  | .int n => .ints ⟨len, fun _ => n⟩
-  | .bool b => .bools ⟨len, fun _ => b⟩
 
 /-- Machine values. Integers are exact (`Int`); their widths live in the
 typed syntax, and per-operation rules enforce representability — the
-value plane never wraps. Arrays carry a homogeneous integer/Boolean payload
-tag. Ordinary options contain machine values recursively, so integer and
-Boolean payloads share one semantics; nullable raw pointers and POD records
+value plane never wraps.
+
+Aggregates hold ordinary machine values, so every stage of the machine has
+one implementation per operation instead of one per (shape × payload) pair:
+an array is a payload tag beside a `Seq Val`, an option is an `Option Val`,
+and a record is a tag beside named `Val` fields. The array tag sits *beside*
+the elements rather than inside their representation, which keeps an empty
+integer array and an empty Boolean array distinguishable — they accept
+different stores — while making what an array may hold a checker question
+rather than a machine one.
+
+Nullable raw pointers are ordinary options whose present case carries a
+`ptr`; there is no separate pointer-option value. Pointers and POD records
 remain distinct abstract values with no byte representation (ADR 0054). -/
 inductive Val where
   | unit
   | int  (n : Int)
   | bool (b : Bool)
-  | arr  (a : ArrayVal)
+  | arr  (elem : ValTag) (a : Seq Val)
   | opt  (o : Option Val)
   /-- A raw pointer: provenance plus a byte offset, never a machine
   address. Two live pointers may name the same address only if they name
   the same allocation, which is what makes `free` able to invalidate
   exactly the pointers derived from what it released. -/
   | ptr  (alloc off : Int)
-  | ptrOpt (o : Option (Int × Int))
   /-- Declaration tag plus fields in declaration order. Names make field
   projection independent of compiler-local record indices; the tag still
   prevents typed-cell confusion. -/
   | record (tag : Int) (fields : List (String × Val))
 
-def ArrayElem.toVal : ArrayElem → Val
-  | .int n => .int n
-  | .bool b => .bool b
-
-def Val.arrayElem? : Val → Option ArrayElem
-  | .int n => some (.int n)
-  | .bool b => some (.bool b)
+/-- The domain a value inhabits, when it inhabits one an array can carry.
+This is the single admission gate for array elements: widening the machine
+to another payload is one arm here, not an arm in every array operation. -/
+def Val.tag? : Val → Option ValTag
+  | .int _ => some .int
+  | .bool _ => some .bool
   | _ => none
+
+/-- Type-preserving update of a `Val.arr`'s fields, one implementation for
+every payload: `Val.arr` spreads its tag and its elements across two
+constructor fields, so the operation takes both. `none` is payload-tag
+confusion; bounds are checked separately so a mismatched store wins over an
+OOB trap. Filling a length-`n` array is `Seq.replicate`, so this is the only
+array operation that needs the tag at all. -/
+def Val.arrSet? (elem : ValTag) (a : Seq Val) (i : Int) (w : Val) :
+    Option (Seq Val) :=
+  if w.tag? = some elem then some (a.set i w) else none
 
 def Val.recordField? : Val → String → Option Val
   | .record _ fields, name =>
@@ -483,14 +475,13 @@ inductive Expr where
   | ptrAdd  (p d : Expr)
   /-- Observe the arena-relative component of a pointer. -/
   | ptrOffset (p : Expr)
+  /-- Option construction and observation. One family serves every payload,
+  nullable raw pointers included: `some(p)` on a pointer is an ordinary
+  option carrying a `ptr`. -/
   | someE   (e : Expr)
   | noneE
   | optIsSome (e : Expr)
   | optValue (e : Expr)
-  | ptrSomeE (e : Expr)
-  | ptrNoneE
-  | ptrIsSome (e : Expr)
-  | ptrValue (e : Expr)
   | recordField (record : Expr) (field : String)
 
 /-- Statements. `while` carries no invariant/variant: loop annotations
@@ -834,18 +825,18 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   -- arrays: length and load; `a.get` is total-with-junk (Sable.Seq) but
   -- the machine only reads it under the bounds check. The index
   -- expression is evaluated before the array lookup (matching stores).
-  | len {ρ : Env} {x : String} {a : ArrayVal}
-      (h : ρ x = some (.arr a)) :
+  | len {ρ : Env} {x : String} {t : ValTag} {a : Seq Val}
+      (h : ρ x = some (.arr t a)) :
       Eval cap ρ (.len x) (.ok (.int a.len))
   | len_undef {ρ : Env} {x : String}
-      (h : ∀ a : ArrayVal, ρ x ≠ some (.arr a)) :
+      (h : ∀ (t : ValTag) (a : Seq Val), ρ x ≠ some (.arr t a)) :
       Eval cap ρ (.len x) (.abort .undef)
-  | index_ok {ρ : Env} {x : String} {e : Expr} {a : ArrayVal} {n : Int}
-      (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr a))
+  | index_ok {ρ : Env} {x : String} {e : Expr} {t : ValTag} {a : Seq Val} {n : Int}
+      (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr t a))
       (h₀ : 0 ≤ n) (h₁ : n < a.len) :
-      Eval cap ρ (.index x e) (.ok ((a.get n).toVal))
-  | index_oob {ρ : Env} {x : String} {e : Expr} {a : ArrayVal} {n : Int}
-      (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr a))
+      Eval cap ρ (.index x e) (.ok (a.get n))
+  | index_oob {ρ : Env} {x : String} {e : Expr} {t : ValTag} {a : Seq Val} {n : Int}
+      (hi : Eval cap ρ e (.ok (.int n))) (ha : ρ x = some (.arr t a))
       (h : n < 0 ∨ a.len ≤ n) :
       Eval cap ρ (.index x e) (.abort (.trap (.indexOOB n a.len)))
   | index_undef_idx {ρ : Env} {x : String} {e : Expr} {v : Val}
@@ -856,7 +847,7 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
       Eval cap ρ (.index x e) (.abort a)
   | index_undef_arr {ρ : Env} {x : String} {e : Expr} {n : Int}
       (hi : Eval cap ρ e (.ok (.int n)))
-      (ha : ∀ a : ArrayVal, ρ x ≠ some (.arr a)) :
+      (ha : ∀ (t : ValTag) (a : Seq Val), ρ x ≠ some (.arr t a)) :
       Eval cap ρ (.index x e) (.abort .undef)
   -- widen: total and, on the exact-Int value plane, the identity
   | widen_ok {ρ : Env} {dst : IntTy} {e : Expr} {n : Int}
@@ -911,38 +902,6 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | ptrOffset_abort {ρ : Env} {e : Expr} {ab : Abort}
       (h : Eval cap ρ e (.abort ab)) :
       Eval cap ρ (.ptrOffset e) (.abort ab)
-  | ptrSomeE_ok {ρ : Env} {e : Expr} {a k : Int}
-      (h : Eval cap ρ e (.ok (.ptr a k))) :
-      Eval cap ρ (.ptrSomeE e) (.ok (.ptrOpt (some (a, k))))
-  | ptrSomeE_undef {ρ : Env} {e : Expr} {v : Val}
-      (h : Eval cap ρ e (.ok v)) (hv : ∀ a k, v ≠ .ptr a k) :
-      Eval cap ρ (.ptrSomeE e) (.abort .undef)
-  | ptrSomeE_abort {ρ : Env} {e : Expr} {ab : Abort}
-      (h : Eval cap ρ e (.abort ab)) :
-      Eval cap ρ (.ptrSomeE e) (.abort ab)
-  | ptrNoneE {ρ : Env} :
-      Eval cap ρ .ptrNoneE (.ok (.ptrOpt none))
-  | ptrIsSome_ok {ρ : Env} {e : Expr} {o : Option (Int × Int)}
-      (h : Eval cap ρ e (.ok (.ptrOpt o))) :
-      Eval cap ρ (.ptrIsSome e) (.ok (.bool o.isSome))
-  | ptrIsSome_undef {ρ : Env} {e : Expr} {v : Val}
-      (h : Eval cap ρ e (.ok v)) (hv : ∀ o, v ≠ .ptrOpt o) :
-      Eval cap ρ (.ptrIsSome e) (.abort .undef)
-  | ptrIsSome_abort {ρ : Env} {e : Expr} {ab : Abort}
-      (h : Eval cap ρ e (.abort ab)) :
-      Eval cap ρ (.ptrIsSome e) (.abort ab)
-  | ptrValue_ok {ρ : Env} {e : Expr} {a k : Int}
-      (h : Eval cap ρ e (.ok (.ptrOpt (some (a, k))))) :
-      Eval cap ρ (.ptrValue e) (.ok (.ptr a k))
-  | ptrValue_none {ρ : Env} {e : Expr}
-      (h : Eval cap ρ e (.ok (.ptrOpt none))) :
-      Eval cap ρ (.ptrValue e) (.abort (.trap .optionNone))
-  | ptrValue_undef {ρ : Env} {e : Expr} {v : Val}
-      (h : Eval cap ρ e (.ok v)) (hv : ∀ o, v ≠ .ptrOpt o) :
-      Eval cap ρ (.ptrValue e) (.abort .undef)
-  | ptrValue_abort {ρ : Env} {e : Expr} {ab : Abort}
-      (h : Eval cap ρ e (.abort ab)) :
-      Eval cap ρ (.ptrValue e) (.abort ab)
   | recordField_ok {ρ : Env} {e : Expr} {field : String} {v value : Val}
       (h : Eval cap ρ e (.ok v)) (hf : v.recordField? field = some value) :
       Eval cap ρ (.recordField e field) (.ok value)
@@ -952,17 +911,21 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
   | recordField_abort {ρ : Env} {e : Expr} {field : String} {ab : Abort}
       (h : Eval cap ρ e (.abort ab)) :
       Eval cap ρ (.recordField e field) (.abort ab)
-  | alloc_ok {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : ArrayElem}
-      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v.toVal))
-      (h₀ : 0 ≤ n) (hc : n ≤ cap) :
-      Eval cap ρ (.allocArray e₁ e₂) (.ok (.arr (ArrayVal.replicate n v)))
-  | alloc_oom {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : ArrayElem}
-      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v.toVal))
-      (h₀ : 0 ≤ n) (hc : cap < n) :
+  | alloc_ok {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : Val} {t : ValTag}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (ht : v.tag? = some t) (h₀ : 0 ≤ n) (hc : n ≤ cap) :
+      Eval cap ρ (.allocArray e₁ e₂) (.ok (.arr t (Seq.replicate n v)))
+  -- The abnormal lengths still demand an admissible element: an element the
+  -- machine cannot put in an array is `undef` (`alloc_undef₂`) whatever the
+  -- length is, so these rules need the element admitted but never need the
+  -- domain it was admitted into.
+  | alloc_oom {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (ht : v.tag? ≠ none) (h₀ : 0 ≤ n) (hc : cap < n) :
       Eval cap ρ (.allocArray e₁ e₂) (.abort (.trap (.oom n)))
-  | alloc_neg {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : ArrayElem}
-      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v.toVal))
-      (h₀ : n < 0) :
+  | alloc_neg {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : Val}
+      (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
+      (ht : v.tag? ≠ none) (h₀ : n < 0) :
       Eval cap ρ (.allocArray e₁ e₂) (.abort .undef)
   | alloc_undef₁ {ρ : Env} {e₁ e₂ : Expr} {v : Val}
       (h₁ : Eval cap ρ e₁ (.ok v)) (hv : ∀ n, v ≠ .int n) :
@@ -972,7 +935,7 @@ inductive Eval (cap : Int) : Env → Expr → EOut → Prop where
       Eval cap ρ (.allocArray e₁ e₂) (.abort a)
   | alloc_undef₂ {ρ : Env} {e₁ e₂ : Expr} {n : Int} {v : Val}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.ok v))
-      (hv : v.arrayElem? = none) :
+      (hv : v.tag? = none) :
       Eval cap ρ (.allocArray e₁ e₂) (.abort .undef)
   | alloc_abort₂ {ρ : Env} {e₁ e₂ : Expr} {n : Int} {a : Abort}
       (h₁ : Eval cap ρ e₁ (.ok (.int n))) (h₂ : Eval cap ρ e₂ (.abort a)) :
@@ -1126,17 +1089,26 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (ha : EvalArgs cap ρ args (.abort ab)) :
       Step P cap (.run (.recordMake dst tag fields args :: k) ρ σ μ) ab.toConfig
-  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
-      {a a' : ArrayVal} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
-      (ha : ρ x = some (.arr a)) (hs : a.set? n w = some a')
+  -- The store rules check the value's shape before they look the array up:
+  -- a value no array can hold is `undef` (`store_undef_val`) before `x` is
+  -- consulted, and a value some array can hold but *this* one cannot is
+  -- `undef` (`store_undef_tag`) even when the index is out of bounds. `hw`
+  -- states that first check in every store rule — in `store_ok`/`store_oob`
+  -- it also follows from `hs` — and no rule needs *which* domain admitted
+  -- the value, only that one did.
+  | store_ok {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : Val}
+      {t : ValTag} {a a' : Seq Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w))
+      (hw : w.tag? ≠ none)
+      (ha : ρ x = some (.arr t a)) (hs : Val.arrSet? t a n w = some a')
       (h₀ : 0 ≤ n) (h₁ : n < a.len) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ)
-        (.run k (ρ.update x (.arr a')) σ μ)
-  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
-      {a a' : ArrayVal} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
-      (ha : ρ x = some (.arr a)) (hs : a.set? n w = some a')
+        (.run k (ρ.update x (.arr t a')) σ μ)
+  | store_oob {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : Val}
+      {t : ValTag} {a a' : Seq Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w))
+      (hw : w.tag? ≠ none)
+      (ha : ρ x = some (.arr t a)) (hs : Val.arrSet? t a n w = some a')
       (h : n < 0 ∨ a.len ≤ n) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) (.trapped (.indexOOB n a.len))
   | store_abort_idx {ρ : Env} {x : String} {ei ev : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
@@ -1150,17 +1122,19 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) a.toConfig
   | store_undef_val {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok v))
-      (hw : v.arrayElem? = none) :
+      (hw : v.tag? = none) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
-  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
+  | store_undef_arr {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : Val}
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
-      (ha : ∀ a : ArrayVal, ρ x ≠ some (.arr a)) :
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w))
+      (hw : w.tag? ≠ none)
+      (ha : ∀ (t : ValTag) (a : Seq Val), ρ x ≠ some (.arr t a)) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
-  | store_undef_tag {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : ArrayElem}
-      {a : ArrayVal} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w.toVal))
-      (ha : ρ x = some (.arr a)) (hs : a.set? n w = none) :
+  | store_undef_tag {ρ : Env} {x : String} {ei ev : Expr} {n : Int} {w : Val}
+      {t : ValTag} {a : Seq Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hi : Eval cap ρ ei (.ok (.int n))) (hv : Eval cap ρ ev (.ok w))
+      (hw : w.tag? ≠ none)
+      (ha : ρ x = some (.arr t a)) (hs : Val.arrSet? t a n w = none) :
       Step P cap (.run (.store x ei ev :: k) ρ σ μ) .undef
   | ite_true {ρ : Env} {c : Expr} {thn els k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ c (.ok (.bool true))) :

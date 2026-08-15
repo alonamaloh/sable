@@ -31,4 +31,8 @@ def Seq.set (s : Seq α) (i : Int) (v : α) : Seq α :=
 @[simp] theorem Seq.get_set (s : Seq α) (i j : Int) (v : α) :
     (s.set i v).get j = if j = i then v else s.get j := rfl
 
+/-- The constant sequence: `v` at every index, including the junk reads
+outside `[0, len)`. This is what `alloc_array(len, v)` produces. -/
+def Seq.replicate (len : Int) (v : α) : Seq α := ⟨len, fun _ => v⟩
+
 end Sable

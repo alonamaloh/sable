@@ -1,4 +1,4 @@
-// G1.2 differential subjects: recursive SVM options distinguish absence,
+// Differential subjects: recursive SVM options distinguish absence,
 // `some(false)`, and `some(true)`, and preserve Boolean payloads through
 // locals, assignment, accessors, and A-normal calls.
 

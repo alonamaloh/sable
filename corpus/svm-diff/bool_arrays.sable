@@ -1,4 +1,4 @@
-// G1.5 SVM differential subjects: owned local Boolean arrays keep a distinct
+// SVM differential subjects: owned local Boolean arrays keep a distinct
 // payload through allocation and empty/nonempty literals. Loads, stores,
 // length, loops, bounds traps, and store evaluation order match interp.rs.
 
