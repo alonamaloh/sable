@@ -1,0 +1,19 @@
+// expect-error: expose.owner_frozen
+// Using the exposed array's bare name as a value inside the body — here as
+// a call argument — would hand a callee the owner while the loan is live.
+// The owner's name is frozen for the body (ADR 0073); the loan is the only
+// name for the bytes until the exposure ends.
+
+/// post result = xs.len
+fn take_len(&[u8] xs) -> u64 {
+    return xs.len;
+}
+
+/// pre a.len ≥ 1
+pub fn owner_as_value(&[u8] a) -> u64 {
+    mut u64 n = 0;
+    unsafe expose &a as (p, resource m) {
+        n = take_len(&a);
+    }
+    return n;
+}

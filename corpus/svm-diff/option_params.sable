@@ -1,0 +1,103 @@
+// SVM differential subjects: copyable option parameters cross the call
+// boundary by value — presence and absence, both payload families —
+// whether the argument is a constructor, a local, or a forwarded
+// parameter, and `.value` of an absent parameter traps in the callee.
+
+fn value_or(option<u64> o, u64 d) -> u64 {
+    if (o.is_some) {
+        return o.value;
+    }
+    return d;
+}
+
+fn flag_or(option<bool> b, bool d) -> bool {
+    if (b.is_some) {
+        return b.value;
+    }
+    return d;
+}
+
+fn unwrap_u64(option<u64> o) -> u64 {
+    return o.value;
+}
+
+fn passthrough(option<u64> o) -> option<u64> {
+    return o;
+}
+
+fn forward(option<u64> o) -> u64 {
+    u64 r = value_or(o, 3);
+    return r;
+}
+
+fn some_u64_param() -> u64 {
+    u64 r = value_or(some(41), 7);
+    return r;
+}
+
+fn none_u64_param() -> u64 {
+    u64 r = value_or(none, 7);
+    return r;
+}
+
+fn some_true_param() -> bool {
+    bool r = flag_or(some(true), false);
+    return r;
+}
+
+fn some_false_param() -> bool {
+    bool r = flag_or(some(false), true);
+    return r;
+}
+
+fn none_bool_param() -> bool {
+    bool r = flag_or(none, false);
+    return r;
+}
+
+fn option_local_as_argument() -> u64 {
+    mut option<u64> o = none;
+    o = some(9);
+    u64 r = value_or(o, 1);
+    return r;
+}
+
+fn forwarded_absence() -> u64 {
+    u64 r = forward(none);
+    return r;
+}
+
+fn forwarded_presence() -> u64 {
+    u64 r = forward(some(25));
+    return r;
+}
+
+fn round_trip_some() -> u64 {
+    var o = passthrough(some(12));
+    if (o.is_some) {
+        return o.value;
+    }
+    return 0;
+}
+
+fn round_trip_none() -> u64 {
+    var o = passthrough(none);
+    if (o.is_some) {
+        return o.value;
+    }
+    return 99;
+}
+
+fn absent_value_traps_in_callee() -> u64 {
+    u64 r = unwrap_u64(none);
+    return r;
+}
+
+fn unwrap_bool(option<bool> b) -> bool {
+    return b.value;
+}
+
+fn absent_bool_value_traps_in_callee() -> bool {
+    bool r = unwrap_bool(none);
+    return r;
+}

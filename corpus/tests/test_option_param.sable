@@ -1,0 +1,96 @@
+// Dynamic checks for copyable option parameters: contracts over
+// `option<u64>` and `option<bool>` parameters are monitored at the call
+// boundary — match-shaped posts over a parameter, `.is_some` pres, and
+// the typed junk convention (an absent option's `.value` reads the
+// payload default, ADR 0008) all evaluate in the monitor exactly as the
+// model reads them. An option argument is a copy: the caller's binding
+// is untouched by the call.
+
+use option_param;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+/// pre ¬b
+fn expect_false(bool b) {
+}
+
+// The imported contracts are monitored here: `value_or` and
+// `flag_or_false` carry match-shaped posts over their parameters,
+// `half_plus_one` and `forward` carry `o.is_some` pres, and `forward`
+// re-passes its parameter as an argument.
+fn test_imported_option_params() {
+    expect_eq(value_or(some(7), 1), 7);
+    expect_eq(value_or(none, 3), 3);
+    expect_true(flag_or_false(some(true)));
+    expect_false(flag_or_false(some(false)));
+    expect_false(flag_or_false(none));
+    expect_eq(half_plus_one(some(8)), 5);
+    expect_eq(forward(some(12)), 12);
+    expect_eq(caller(), 10);
+}
+
+/// post match o with
+///      | some v => result = v + 1
+///      | none   => result = 0
+fn bump_or_zero(option<u64> o) -> u64 {
+    if (o.is_some) {
+        return o.value + 1;
+    }
+    return 0;
+}
+
+/// post match b with
+///      | some v => (result ↔ v)
+///      | none   => ¬result
+fn holds(option<bool> b) -> bool {
+    if (b.is_some) {
+        return b.value;
+    }
+    return false;
+}
+
+fn test_local_option_params() {
+    expect_eq(bump_or_zero(some(41)), 42);
+    expect_eq(bump_or_zero(none), 0);
+    expect_true(holds(some(true)));
+    expect_false(holds(some(false)));
+    expect_false(holds(none));
+}
+
+// The absent case's `.value` in clause text is the typed junk value:
+// `0` for an integer payload, `false` for a Boolean one.
+
+/// pre  ¬o.is_some
+/// post o.value = 0
+fn absent_u64_reads_junk_zero(option<u64> o) {
+}
+
+/// pre  ¬b.is_some
+/// post ¬b.value
+fn absent_bool_reads_junk_false(option<bool> b) {
+}
+
+fn test_absent_junk_values() {
+    absent_u64_reads_junk_zero(none);
+    absent_bool_reads_junk_false(none);
+}
+
+// The callee receives a copy, so the caller's binding still holds its
+// own value after the call returns.
+fn test_option_argument_is_a_copy() {
+    option<u64> o = some(7);
+    expect_eq(value_or(o, 0), 7);
+    /// assert #[label(o_unchanged)] o.is_some ∧ o.value = 7
+    expect_eq(o.value, 7);
+
+    option<bool> b = some(true);
+    expect_true(flag_or_false(b));
+    /// assert #[label(b_unchanged)] b.is_some ∧ b.value
+    expect_true(b.value);
+}

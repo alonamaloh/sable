@@ -1,4 +1,4 @@
-// Dynamic G1.1 checks pin `some(true)`, `some(false)`, typed `none`,
+// Dynamic checks pin `some(true)`, `some(false)`, typed `none`,
 // option equality, and Bool-valued `.value` in the contract monitor.
 
 use option_bool;

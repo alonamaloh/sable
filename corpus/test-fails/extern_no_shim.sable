@@ -9,8 +9,9 @@ extern "C" #[audit(id := "test.absent.v1", reason := "declared, deliberately uni
 fn c_absent(raw<u8> p, u64 n, resource &mut RawSpan mem);
 
 pub fn use_it(&mut [u8] a) {
+    u64 n = a.len;
     unsafe expose &mut a as (p, resource m) {
-        c_absent(p, a.len, &mut m);
+        c_absent(p, n, &mut m);
     }
 }
 

@@ -1,0 +1,14 @@
+// expect-error: expose.owner_frozen
+// A raw store and a direct store into the exposed array's own name would
+// race on exit: reconstruction takes the bytes from the loan, so the
+// direct write would be silently discarded. The owner's name is frozen
+// for the body (ADR 0073).
+/// pre  a.len ≥ 2
+/// post a.get 0 = 5
+/// post a.get 1 = 7
+pub fn two_writers(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        raw_store8(p, 5, &mut m);
+        a[1] = 7;
+    }
+}

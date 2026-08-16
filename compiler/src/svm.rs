@@ -221,12 +221,6 @@ pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String
             "svm.bool_array_position_unsupported: {context} owns a Boolean array; an array crosses a call boundary as a borrow"
         ));
     }
-    if matches!(ty, Ty::Option(_)) {
-        return Err(format!(
-            "svm.option_position_unsupported: {context} is option-typed; \
-             ordinary options are returns and locals only"
-        ));
-    }
     Ok(())
 }
 
@@ -1306,6 +1300,17 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
             ));
         }
         if trait_member {
+            if let Some(parameter) = function
+                .params
+                .iter()
+                .find(|parameter| matches!(parameter.ty, Ty::Option(_)))
+            {
+                return Err(format!(
+                    "svm.option_position_unsupported: {context} parameter `{}` is an ordinary option; \
+                     trait option parameters are not in the SVM model",
+                    parameter.name
+                ));
+            }
             if let Ty::Option(payload) = &function.ret {
                 validate_option_payload(payload, context)?;
                 return Err(format!(
@@ -2090,6 +2095,9 @@ pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
     for p in &f.params {
         match &p.ty {
             Ty::Int(_) | Ty::Bool => {}
+            Ty::Option(payload) => {
+                validate_option_payload(payload, &format!("parameter `{}`", p.name))?;
+            }
             Ty::Record(ri) | Ty::RawRecord(ri) | Ty::OptionRaw(ri) => {
                 lowering_ctx.record(*ri)?;
             }
@@ -4400,20 +4408,47 @@ mod tests {
     }
 
     #[test]
-    fn lowering_rejects_option_parameters_independently() {
+    fn lowering_admits_copyable_option_parameters_and_gates_their_payloads() {
         let program = empty_program();
-        let mut function = checked_fn(Ty::Bool, Vec::new());
-        function.params.push(Param {
+        for payload in [Ty::Bool, Ty::Int(IntTy::U64)] {
+            let mut function = checked_fn(Ty::Unit, Vec::new());
+            function.params.push(Param {
+                name: "choice".into(),
+                ty: Ty::option(payload.clone()),
+                span: Span::new(0, 0),
+                consumes: false,
+            });
+            let entry = lower_fn_entry(&program, &function).unwrap_or_else(|error| {
+                panic!("`option<{}>` is a machine parameter value: {error}", payload.name())
+            });
+            assert!(entry.contains("\"choice\""), "{entry}");
+        }
+
+        let mut generic = checked_fn(Ty::Unit, Vec::new());
+        generic.params.push(Param {
             name: "choice".into(),
-            ty: Ty::option(Ty::Bool),
+            ty: Ty::option(Ty::Param(TypeParamId::from_legacy(0))),
             span: Span::new(0, 0),
             consumes: false,
         });
-
-        let error = lower_fn_entry(&program, &function)
-            .expect_err("the machine has no option parameter ABI");
+        let error = lower_fn_entry(&program, &generic)
+            .expect_err("an unresolved option payload has no machine representation");
         assert!(
-            error.starts_with("svm.option_position_unsupported:"),
+            error.starts_with("svm.aggregate_payload_unsupported:"),
+            "{error}"
+        );
+
+        let mut affine = checked_fn(Ty::Unit, Vec::new());
+        affine.params.push(Param {
+            name: "choice".into(),
+            ty: Ty::affine_array_option(Ty::Bool),
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+        let error = lower_fn_entry(&program, &affine)
+            .expect_err("an ownership-bearing option has no machine call ABI");
+        assert!(
+            error.starts_with("svm.affine_option_unsupported:"),
             "{error}"
         );
     }
@@ -4676,6 +4711,29 @@ mod tests {
         assert!(
             trait_error.starts_with("svm.option_position_unsupported:"),
             "{trait_error}"
+        );
+
+        let mut trait_param_program = empty_program();
+        let mut method = checked_fn(Ty::Unit, Vec::new());
+        method.params.push(Param {
+            name: "choice".into(),
+            ty: Ty::option(Ty::Bool),
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+        trait_param_program.traits.push(TraitDecl {
+            is_pub: false,
+            name: "Chooser".into(),
+            name_span: Span::new(0, 0),
+            specs: Vec::new(),
+            methods: vec![method],
+            span: Span::new(0, 0),
+        });
+        let trait_param_error = validate_program_option_positions(&trait_param_program)
+            .expect_err("the machine does not model option-valued trait parameters");
+        assert!(
+            trait_param_error.starts_with("svm.option_position_unsupported:"),
+            "{trait_param_error}"
         );
     }
 

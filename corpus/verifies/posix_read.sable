@@ -52,8 +52,11 @@ fn posix_close(i32 fd, #[consumes] resource OpenFile fh,
 pub fn read_into(i32 fd, &mut [u8] dst, resource &mut OpenFile fh,
                  resource &mut PosixWorld w) -> i64 {
     mut i64 got = 0;
+    // The exposed array's own name is frozen for the body (ADR 0073), so
+    // the capacity is bound before the loan opens.
+    u64 cap = dst.len;
     unsafe expose &mut dst as (p, resource m) {
-        got = posix_read(fd, p, dst.len, &mut m, &mut fh, &mut w);
+        got = posix_read(fd, p, cap, &mut m, &mut fh, &mut w);
     }
     return got;
 }

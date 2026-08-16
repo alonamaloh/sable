@@ -1169,6 +1169,63 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      such a model would replace. `docs/shape-admission.md` gains a `check
      local` column; `docs/type-matrix.md` does not move, because a borrow has
      no declared local spelling for a source-level probe to write.
+
+     **An exposure freezes its owner (ADR 0073).** The same defect class had
+     one more door: `unsafe expose` left the exposed array's name live in the
+     body, so the owner and the loan were two believed names for one buffer —
+     a direct store beside a raw load proved contradictory postconditions, a
+     direct store beside a raw store was silently discarded by the exit
+     copy-back, and a nested exposure of the same array was accepted (ADR
+     0026's claim that the borrow rules already rejected it was wrong; the
+     borrow-conflict rule is consulted only within one call's argument list).
+     The checker now freezes the owner's name for the body under
+     `expose.owner_frozen` — read, write, index, `.len`, borrow, field move,
+     and re-exposure are all refused; a length the body needs is bound to a
+     local before the loan opens. Six must-fail subjects guard the doors;
+     `copy_prefix`, `fill_all`, `checksum_all`, and `read_into` hoist their
+     lengths and verify unchanged. Neither admission table moves.
+
+     **Checker and VC generation admit copyable option parameters.** An
+     `option<u64>`-family or `option<bool>` parameter now crosses the call
+     boundary by value: the callee binds `Option Int` / `Option Bool` with the
+     accessor/match surface an option local already has, an integer payload
+     carries `h_p_range` over `.value` (sound under ADR 0008's `getD default`
+     junk model — the absent case reads 0, in range for every integer type),
+     and the caller substitutes the parenthesized option chain into the
+     callee's clauses. A return binder still transports only the callee's
+     posts — a deliberate asymmetry recorded at the parameter arm. The
+     type-parameter payload keeps `type.option_param` (no abstract option
+     transport across a call), trait methods extend
+     `type.trait_param_unsupported` to options, init/method parameters stay
+     behind `type.member_param`, the affine family stays behind
+     `type.affine_option_param`, and the LLVM backend lowers the
+     `option<bool>` parameter through the existing `%sable.option.bool`
+     by-value aggregate — `corpus/llvm-diff/option_param.sable` pins literal,
+     local, call-result, and forwarded arguments against Clang at `-O0`/`-O2`
+     — while the `option<u64>`-family parameter keeps `backend.unsupported`
+     (the type has no LLVM representation in any position, so a lone parameter
+     lowering would be incoherent). The interpreter executes option parameters and
+     the monitor checks their contracts at the call boundary — match-shaped
+     posts over a parameter, `.is_some` pres, the absent case's typed junk
+     `.value`, and copy semantics at the argument, pinned at zero skips by
+     `corpus/tests/test_option_param.sable`; a stored option field keeps
+     `interp.option_position_unsupported`.
+     `corpus/verifies/option_param.sable` carries the
+     match-shaped contracts, the payload-fact proof, and the some/none
+     callers; `docs/type-matrix.md` opens `option<u64>` × `param` and
+     `option<bool>` × `param` (35/81 → 37/81) and no other cell;
+     `docs/shape-admission.md` moves exactly `check parameter`,
+     `vc parameter position`, and `svm parameter` for those two shapes, plus
+     `llvm parameter` for `option<bool>` alone.
+     SVM lowering transports the parameter as an ordinary `Arg.byValue`
+     machine value — the untyped `Val.opt` already crosses `call`/`ret`, so
+     the rules, evaluator, and agreement proofs needed no change — with
+     `corpus/svm-diff/option_params.sable` pinning some/none transport,
+     option-local and forwarded-parameter arguments, round trips through an
+     option-returning callee, and the absent-`.value` trap, in both payload
+     families; the program-wide SVM strictness re-check keeps trait option
+     parameters and returns, stored option fields, and the affine family
+     refused by their own names.
    - **G2 — affine options (staged; G2.0–G2.3 complete):**
      carry ownership and destruction correctly through present/absent aggregate
      values without widening the existing copy-option family by accident.

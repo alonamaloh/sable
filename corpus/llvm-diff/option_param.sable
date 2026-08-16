@@ -1,0 +1,51 @@
+// Boolean-option parameters cross the native call boundary by value:
+// literal, local, call-result, and forwarded arguments, with `.is_some`
+// and a someness-guarded `.value` read inside the callee. `some(false)`
+// and `none` must stay distinguishable through a parameter.
+
+fn flag_or_false(option<bool> b) -> bool {
+    if (b.is_some) {
+        return b.value;
+    }
+    return false;
+}
+
+fn is_present(option<bool> b) -> bool {
+    return b.is_some;
+}
+
+fn forward(option<bool> b) -> bool {
+    return flag_or_false(b);
+}
+
+fn make_false() -> option<bool> {
+    return some(false);
+}
+
+fn option_param_entry() -> i32 {
+    option<bool> truth = some(true);
+    option<bool> empty = none;
+
+    if (flag_or_false(some(true))) {
+        if (!flag_or_false(some(false))) {
+            if (is_present(some(false))) {
+                if (!is_present(none)) {
+                    if (flag_or_false(truth)) {
+                        if (!flag_or_false(empty)) {
+                            if (!flag_or_false(make_false())) {
+                                if (is_present(make_false())) {
+                                    if (forward(truth)) {
+                                        if (!forward(empty)) {
+                                            return 42;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}

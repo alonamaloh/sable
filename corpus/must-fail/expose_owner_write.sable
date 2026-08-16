@@ -1,0 +1,18 @@
+// expect-error: expose.owner_frozen
+// An exposed array's own name is frozen for the body (ADR 0073): the
+// loan's pointer and resource are the buffer's only names there. A direct
+// store beside a raw load would be two believed names for one buffer —
+// the two postconditions below cannot both hold, and without the freeze
+// both were proved.
+/// pre  a.len ≥ 1
+/// pre  a.get 0 = 6
+/// post a.get 0 = 1
+/// post result = 6
+pub fn both_names(&mut [u8] a) -> u8 {
+    mut u8 seen = 0;
+    unsafe expose &a as (p, resource m) {
+        a[0] = 1;
+        seen = raw_load8(p, &m);
+    }
+    return seen;
+}

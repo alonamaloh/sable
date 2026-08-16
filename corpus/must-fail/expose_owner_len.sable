@@ -1,0 +1,12 @@
+// expect-error: expose.owner_frozen
+// The freeze covers `.len` too: the rule is that the exposed owner has no
+// spelling at all inside the body, not a list of dangerous spellings. A
+// length the body needs is bound to a local before the exposure opens.
+/// post result = a.len
+pub fn owner_len(&[u8] a) -> u64 {
+    mut u64 n = 0;
+    unsafe expose &a as (p, resource m) {
+        n = a.len;
+    }
+    return n;
+}

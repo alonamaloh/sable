@@ -604,12 +604,19 @@ pub(crate) fn validate_vc_type_position(
         ));
     }
 
-    if let Ty::Option(_) = ty {
+    if let Ty::Option(element) = ty {
+        // A parameter binds `Option Int` / `Option Bool` exactly as a local
+        // or a returned value does, so the concrete value payloads pass. The
+        // type-parameter payload does not: check refuses it first
+        // (`type.option_param`), and this gate stays closed independently.
+        let concrete_value_payload = matches!(element.as_ref(), Ty::Bool)
+            || matches!(element.as_ref(), Ty::Int(it) if !matches!(it, IntTy::TParam(_)));
         let position = match position {
             VcTypePosition::Expression | VcTypePosition::Local | VcTypePosition::Return => {
                 return Ok(());
             }
-            VcTypePosition::Parameter => "option parameters",
+            VcTypePosition::Parameter if concrete_value_payload => return Ok(()),
+            VcTypePosition::Parameter => "non-value-payload option parameters",
             VcTypePosition::TraitParameter => "trait option parameters",
             VcTypePosition::TraitReturn => "trait option returns",
             VcTypePosition::ClassField => "option-valued class fields",
@@ -1887,7 +1894,9 @@ fn emit_extern_clause_wfs(
                 binders.push((p.name.clone(), lean_record_name(&program.records[*ri].name)))
             }
             Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
-            Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
+            // `extern.param_abi` allows no option through the foreign
+            // boundary, so an extern clause never binds one.
+            Ty::Option(_) => unreachable!("extern.param_abi rejects option parameters"),
             Ty::Borrow(..) | Ty::Unit => {}
         }
     }
@@ -2880,9 +2889,28 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
                 }
-                // Options are local-only or returned, so parameter setup can
-                // only reach this arm through a forged post-preflight AST.
-                Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
+                // A value-option parameter binds `Option Int` / `Option
+                // Bool`, the same proof surface an option local or call
+                // result has. An integer payload carries its range fact
+                // over `.value`: a present option holds a checked program
+                // value, and an absent one reads `getD default = 0`, in
+                // range for every integer type (ADR 0008's junk-value
+                // model). `Bool` is its own domain and needs no fact. A
+                // return binder deliberately transports only the callee's
+                // posts; the parameter side carries the range fact because
+                // the callee's arithmetic on `.value` starts from nothing
+                // else.
+                Ty::Option(element) => {
+                    self.binders
+                        .push((p.name.clone(), lean_option_ty(&element.clone())));
+                    if let Ty::Int(it) = element.as_ref() {
+                        self.hyps.push((
+                            format!("h_{}_range", p.name),
+                            self.r_prop(&format!("(({}).value)", p.name), *it),
+                        ));
+                    }
+                    self.env.insert(p.name.clone(), Val::Opt(p.name.clone()));
+                }
                 Ty::Borrow(..) | Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
@@ -6141,6 +6169,9 @@ impl<'a> Generator<'a> {
                         // Class args (by value or borrowed) substitute
                         // as their symbolic structure value (ADR 0020).
                         Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
+                        // Parenthesized as at a function call: dot-notation
+                        // in the init's clauses must bind the whole chain.
+                        Val::Opt(v) => format!("({v})"),
                         Val::Prop(p) => lean_bool_value(&p),
                         _ => unreachable!("checked: ctor args"),
                     })
@@ -6324,7 +6355,10 @@ impl<'a> Generator<'a> {
                     .iter()
                     .map(|a| match self.eval(a) {
                         Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) | Val::Ptr(v) => v,
-                        _ => unreachable!("checked: int/array/class/resource/pointer args"),
+                        // Parenthesized as at a function call: dot-notation
+                        // in the callee's clauses must bind the whole chain.
+                        Val::Opt(v) => format!("({v})"),
+                        _ => unreachable!("checked: int/option/array/class/resource/pointer args"),
                     })
                     .collect();
                 let Some(ci) = self.var_tys.get(recv.as_str()).and_then(Ty::class_index) else {
@@ -6605,6 +6639,11 @@ impl<'a> Generator<'a> {
                         | Val::Record(v)
                         | Val::View(v)
                         | Val::Ptr(v) => v,
+                        // An option argument substitutes as its whole chain,
+                        // parenthesized so dot-notation in the callee's
+                        // clauses binds to the chain: `(some (7)).is_some`,
+                        // never `some ((7).is_some)`.
+                        Val::Opt(v) => format!("({v})"),
                         // Program booleans are propositions in symbolic
                         // execution, while source parameters bind Lean Bool.
                         // Reify at the exact call boundary before substituting
@@ -6614,7 +6653,7 @@ impl<'a> Generator<'a> {
                             unreachable!("checked: a proposition argument has a Bool parameter")
                         }
                         _ => unreachable!(
-                            "checked: int/bool/array/class/record/resource/pointer args"
+                            "checked: int/bool/option/array/class/record/resource/pointer args"
                         ),
                     })
                     .collect();
@@ -7014,7 +7053,9 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), lean_res_view_ty(*k, self.records)));
                     }
                 }
-                Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
+                Ty::Option(element) => {
+                    out.push((p.name.clone(), lean_option_ty(element)));
+                }
                 Ty::Borrow(..) | Ty::Unit => {}
             }
         }
@@ -8247,8 +8288,26 @@ fn affine_loop(u64 n) {
 
     #[test]
     fn unsupported_option_positions_fail_in_vc_preflight() {
+        // A concrete value payload binds as a parameter; every other
+        // position keeps its refusal, and so does the type-parameter
+        // payload, which check refuses first (`type.option_param`).
+        validate_vc_type_position(
+            Ty::option(Ty::Bool),
+            false,
+            VcTypePosition::Parameter,
+            "synthetic declaration",
+        )
+        .expect("a value-payload option parameter binds Option Bool");
+        let error = validate_vc_type_position(
+            Ty::option(Ty::Param(TypeParamId::from_legacy(0))),
+            true,
+            VcTypePosition::Parameter,
+            "synthetic declaration",
+        )
+        .expect_err("a type-parameter option payload has no parameter transport");
+        assert!(error.contains("non-value-payload option parameters"), "{error}");
         for (position, expected) in [
-            (VcTypePosition::Parameter, "option parameters"),
+            (VcTypePosition::TraitParameter, "trait option parameters"),
             (VcTypePosition::TraitReturn, "trait option returns"),
             (VcTypePosition::ClassField, "option-valued class fields"),
         ] {

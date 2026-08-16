@@ -1,0 +1,78 @@
+// Copyable option parameters: `option<u64>` and `option<bool>` cross a
+// call by value, with the same accessor and match surface an option
+// local or call result has. An integer payload carries its range fact
+// over `.value` — the absent case reads the typed junk model
+// (`getD default = 0`, ADR 0008), which is in range for every integer
+// type, and a someness VC keeps program code away from the junk.
+
+/// post match o with
+///      | some v => result = v
+///      | none   => result = d
+pub fn value_or(option<u64> o, u64 d) -> u64 {
+    if (o.is_some) {
+        return o.value;
+    }
+    return d;
+}
+
+/// post match b with
+///      | some v => (result ↔ v = true)
+///      | none   => ¬result
+pub fn flag_or_false(option<bool> b) -> bool {
+    if (b.is_some) {
+        return b.value;
+    }
+    return false;
+}
+
+// The parameter's payload range fact is what makes arithmetic on
+// `o.value` provable: `o.value / 2 + 1 ≤ u64.max` needs both
+// `0 ≤ o.value` and `o.value ≤ u64.max`, and no clause here supplies
+// either bound.
+/// pre  o.is_some
+/// post result = o.value / 2 + 1
+pub fn half_plus_one(option<u64> o) -> u64 {
+    return o.value / 2 + 1;
+}
+
+// An option parameter forwards by value: the callee's match-shaped post,
+// instantiated at the forwarded chain, is what proves the accessor form.
+/// pre  o.is_some
+/// post result = o.value
+pub fn forward(option<u64> o) -> u64 {
+    return value_or(o, 0);
+}
+
+// A match-shaped post about an *abstract* option needs the case split
+// spelled out on the present path; automation handles the constructor
+// forms at every call site above. Obligation names come from the
+// failure output.
+
+/// discharge value_or.post.match_o_with_some_v_result_v_none_result by
+///   cases o with
+///   | none => exact absurd rfl h_path_o_none
+///   | some v => simp_all
+
+/// discharge flag_or_false.post.match_b_with_some_v_result_v_true_none_r by
+///   cases b with
+///   | none => exact absurd rfl h_path_b_none
+///   | some v => simp_all
+
+/// discharge forward.post.result_o_value by
+///   cases o with
+///   | none => exact absurd rfl h_pre_o_is_some
+///   | some v => simp_all
+
+/// post result = 10
+pub fn caller() -> u64 {
+    u64 a = value_or(some(7), 1);
+    u64 b = value_or(none, 3);
+    bool t = flag_or_false(some(true));
+    bool f = flag_or_false(none);
+    if (t) {
+        if (!f) {
+            return a + b;
+        }
+    }
+    return 0;
+}

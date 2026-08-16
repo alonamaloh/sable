@@ -79,6 +79,13 @@ struct Ctx<'a> {
     /// allowed owned arrays / borrows / array-passing (design §9).
     in_test: bool,
     vars: HashMap<String, VarInfo>,
+    /// Arrays whose bytes are on loan to an open exposure body, keyed by
+    /// the owner's name and carrying the loan's pointer and resource
+    /// names for the refusal. While a name is here the loan is the
+    /// storage's only name: reading, writing, borrowing, measuring, or
+    /// re-exposing the owner is refused (`expose.owner_frozen`,
+    /// ADR 0073).
+    exposed: HashMap<String, (String, String)>,
     /// Places moved out of (ADR 0020/0022). Keyed by place rather than
     /// by name: a field is a place in its own right, so moving one out
     /// kills that field and the whole, but not its siblings.
@@ -728,6 +735,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             current_has_variant: f.variant.is_some(),
             in_test: is_test,
             vars: HashMap::new(),
+            exposed: HashMap::new(),
             declared: HashSet::new(),
             moved: HashSet::new(),
             marked_fields: MARKED_NONE,
@@ -793,6 +801,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             current_has_variant: f.variant.is_some(),
             in_test: false,
             vars: HashMap::new(),
+            exposed: HashMap::new(),
             declared: HashSet::new(),
             moved: HashSet::new(),
             marked_fields: MARKED_NONE,
@@ -865,6 +874,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 current_has_variant: false,
                 in_test: false,
                 vars: HashMap::new(),
+                exposed: HashMap::new(),
                 declared: HashSet::new(),
                 moved: HashSet::new(),
                 marked_fields: &marked,
@@ -935,6 +945,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 current_has_variant: false,
                 in_test: false,
                 vars: HashMap::new(),
+                exposed: HashMap::new(),
                 declared: HashSet::new(),
                 moved: HashSet::new(),
                 marked_fields: &marked,
@@ -1011,6 +1022,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 current_has_variant: false,
                 in_test: false,
                 vars: HashMap::new(),
+                exposed: HashMap::new(),
                 declared: HashSet::new(),
                 moved: HashSet::new(),
                 marked_fields: &marked,
@@ -1149,6 +1161,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     current_has_variant: false,
                     in_test: false,
                     vars: HashMap::new(),
+                    exposed: HashMap::new(),
                     declared: HashSet::new(),
                     moved: HashSet::new(),
                     marked_fields: &marked,
@@ -1216,6 +1229,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     current_has_variant: false,
                     in_test: false,
                     vars: HashMap::new(),
+                    exposed: HashMap::new(),
                     declared: HashSet::new(),
                     moved: HashSet::new(),
                     marked_fields: &marked,
@@ -1286,6 +1300,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     current_has_variant: false,
                     in_test: false,
                     vars: HashMap::new(),
+                    exposed: HashMap::new(),
                     declared: HashSet::new(),
                     moved: HashSet::new(),
                     marked_fields: &marked,
@@ -1520,6 +1535,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 name_span,
                 value,
             } => {
+                reject_exposed_owner(ctx, name, *name_span)?;
                 let (ty, was_mutable) = match ctx.vars.get(name.as_str()) {
                     Some(v) => (v.ty.clone(), v.mutable),
                     None => {
@@ -2160,6 +2176,9 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 res_span,
                 body,
             } => {
+                // A nested exposure of an already-exposed array would open
+                // a second loan on one buffer.
+                reject_exposed_owner(ctx, array, *array_span)?;
                 let (elem, src_mut, declared_mut) = match ctx.vars.get(array.as_str()) {
                     Some(v) => match &v.ty {
                         borrowed_or_owned if borrowed_or_owned.as_array().is_some() => {
@@ -2272,6 +2291,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         },
                     );
                 }
+                // The owner's bytes are on loan for the body: freeze its
+                // name, so the loan is the storage's only name until the
+                // exit puts the bytes back.
+                ctx.exposed
+                    .insert(array.clone(), (ptr.clone(), res.clone()));
                 // Raw operations are legal in an exposure body without a
                 // nested `unsafe`: `unsafe expose` already said the word.
                 let outer = ctx.in_unsafe;
@@ -2327,6 +2351,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 ctx.vars.retain(|name, _| declared_before.contains(name));
                 ctx.moved
                     .retain(|p| declared_before.contains(&p.state_key()));
+                // The loan ends with the body: the owner's name thaws.
+                ctx.exposed.remove(array.as_str());
             }
             Stmt::Assert(_) => {
                 // Proof language: elaborated by Lean (well-formedness def)
@@ -2348,6 +2374,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 if let Ty::Array(ref elem) = fty {
                     match &value.kind {
                         ExprKind::Var(name) => {
+                            reject_exposed_owner(ctx, name, value.span)?;
                             let source = Place::local(name);
                             if ctx.is_moved(&source) {
                                 return Err(moved_out(ctx, &source, value.span, "move"));
@@ -2440,6 +2467,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 index,
                 value,
             } => {
+                reject_exposed_owner(ctx, array, *array_span)?;
                 let (elem, mutability, arr_mutable) = match ctx.vars.get(array.as_str()) {
                     Some(VarInfo { ty, mutable, .. }) if ty.as_array().is_some() => {
                         let (element, mode) = ty
@@ -2878,14 +2906,26 @@ pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
         borrow_referent_ty(ty, referent, span)?;
     }
     validate_aggregate_ty(ty.clone(), span)?;
-    if matches!(ty, Ty::Option(_)) {
-        return Err(Diagnostic {
-            name: "type.option_param".into(),
-            title: "option-typed parameters are not supported yet".into(),
-            span,
-            label: "`option<T>` is a return type or local for now".into(),
-            notes: vec![],
-        });
+    // A copyable option with a concrete value payload crosses the call
+    // boundary by value, exactly as it is returned. The type-parameter
+    // payload stays out: a template option parameter would need the
+    // abstract-payload call model that trait-bounded substitution does
+    // not have, so it keeps the named refusal.
+    if let Ty::Option(payload) = ty {
+        if matches!(payload.as_ref(), Ty::Param(_)) {
+            return Err(Diagnostic {
+                name: "type.option_param".into(),
+                title: "generic option-typed parameters are not supported yet".into(),
+                span,
+                label: "an `option` parameter takes a concrete integer or `bool` payload".into(),
+                notes: vec![(
+                    "note".into(),
+                    "`option<u64>`-family and `option<bool>` parameters are supported; a \
+                     template payload has no abstract option transport across a call"
+                        .into(),
+                )],
+            });
+        }
     }
     Ok(())
 }
@@ -2996,12 +3036,16 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
         // value, so a parameter whose value is not one has no meaning at the
         // call. An array is included in any binding mode: `&[T]` lifts to a
         // `Sable.Seq T`, which is exactly what the abstract call cannot pass.
+        // A value option is included on the same terms: its proof value is
+        // `Option Int` / `Option Bool`, not an integer.
         if let Some(parameter) = method.params.iter().find(|parameter| {
-            matches!(parameter.ty, Ty::Bool | Ty::Record(_)) || parameter.ty.as_array().is_some()
+            matches!(parameter.ty, Ty::Bool | Ty::Record(_) | Ty::Option(_))
+                || parameter.ty.as_array().is_some()
         }) {
             return Err(Diagnostic {
                 name: "type.trait_param_unsupported".into(),
-                title: "trait calls do not transport Boolean, POD-record, or array parameters"
+                title: "trait calls do not transport Boolean, POD-record, array, or option \
+                        parameters"
                     .into(),
                 span: parameter.span,
                 label: format!(
@@ -3010,9 +3054,9 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 ),
                 notes: vec![(
                     "note".into(),
-                    "ordinary functions may transport Boolean, POD-record, and borrowed-array \
-                     values, but a retained trait call substitutes integer arguments into an \
-                     abstract contract and has no model for these"
+                    "ordinary functions may transport Boolean, POD-record, borrowed-array, and \
+                     value-option arguments, but a retained trait call substitutes integer \
+                     arguments into an abstract contract and has no model for these"
                         .into(),
                 )],
             });
@@ -3385,6 +3429,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::BoolLit(_) => Ty::Bool,
         ExprKind::Var(name) => match ctx.vars.get(name.as_str()) {
             Some(v) => {
+                reject_exposed_owner(ctx, name, span)?;
                 if v.ty.is_affine_option() {
                     return Err(Diagnostic {
                         name: "option.affine_temporary".into(),
@@ -4717,6 +4762,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             field,
             mutable,
         } => {
+            reject_exposed_owner(ctx, array, span)?;
             if field.is_none()
                 && ctx
                     .vars
@@ -6154,6 +6200,31 @@ fn moved_out(ctx: &Ctx, p: &Place, span: Span, how: &str) -> Diagnostic {
     }
 }
 
+/// While an exposure body is open, its owner has no readable or writable
+/// spelling: the loan's pointer and resource are the storage's only names
+/// there. A second live name would let a direct access and a raw one
+/// disagree about one buffer, with both believed (ADR 0073).
+fn reject_exposed_owner(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
+    let Some((ptr, res)) = ctx.exposed.get(name) else {
+        return Ok(());
+    };
+    Err(Diagnostic {
+        name: "expose.owner_frozen".into(),
+        title: format!("`{name}` is exposed; its bytes are on loan here"),
+        span,
+        label: format!("use the raw operations on `{ptr}` and `{res}` instead"),
+        notes: vec![(
+            "note".into(),
+            format!(
+                "inside the exposure body the loan is the buffer's only \
+                 name; `{name}` gets its bytes back when the body ends. If \
+                 the length is needed, bind `{name}.len` to a local before \
+                 the exposure"
+            ),
+        )],
+    })
+}
+
 /// A resource's *view* is ghost: clauses read `s.len`, program code does
 /// not. That separation is what makes erasure real — a program able to
 /// read the view would need it at runtime, and then the authority would
@@ -6182,6 +6253,7 @@ fn reject_view_read(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
 
 fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<Ty> {
     reject_view_read(ctx, array, span)?;
+    reject_exposed_owner(ctx, array, span)?;
     let Some(v) = ctx.vars.get(array) else {
         return Err(Diagnostic {
             name: "type.unknown_variable".into(),
@@ -6925,12 +6997,21 @@ record Flag #[layout(size := 1, align := 1)] {
 
     #[test]
     fn option_parameters_fields_and_trait_returns_stay_closed() {
-        let mut parameter = monomorphized_program("fn bad(option<bool> value) {}\n");
-        let error = match check(&mut parameter) {
-            Err(error) => error,
-            Ok(_) => panic!("option parameters remain unsupported"),
-        };
-        assert_eq!(error.name, "type.option_param");
+        // Concrete value payloads cross the boundary; the type-parameter
+        // payload keeps the named refusal.
+        let mut admitted = monomorphized_program(
+            "fn fine(option<bool> flag, option<u64> count) -> bool { return flag.is_some; }\n",
+        );
+        check(&mut admitted).expect("concrete value-option parameters are admitted");
+        assert_eq!(
+            parameter_ty(
+                &Ty::option(Ty::Param(TypeParamId::from_legacy(0))),
+                Span::new(0, 0)
+            )
+            .expect_err("a template option payload has no parameter transport")
+            .name,
+            "type.option_param"
+        );
 
         let mut field = monomorphized_program(
             r#"

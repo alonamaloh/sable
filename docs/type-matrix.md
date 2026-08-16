@@ -11,13 +11,13 @@ language admits, not what verifies.
 | `bool` | yes | yes | yes | no | no | yes | yes | yes | no |
 | `[u64]` | yes | no | yes | yes | no | yes | no | no | no |
 | `[bool]` | yes | no | yes | yes | no | no | no | yes | no |
-| `option<u64>` | yes | yes | no | no | no | no | no | no | no |
-| `option<bool>` | yes | yes | no | no | no | no | no | no | no |
+| `option<u64>` | yes | yes | yes | no | no | no | no | no | no |
+| `option<bool>` | yes | yes | yes | no | no | no | no | no | no |
 | `record` | yes | yes | yes | no | no | no | no | no | no |
 | `option<[bool]>` | yes | no | no | no | no | no | no | no | no |
 | `class` | yes | yes | yes | yes | no | yes | no | no | no |
 
-Open cells: 35/81.
+Open cells: 37/81.
 
 ## What closes each cell
 
@@ -37,14 +37,12 @@ Open cells: 35/81.
 | `[bool]` | class field | `type.bool_array_field` |
 | `[bool]` | array element | `type.array_payload_unsupported` |
 | `[bool]` | generic arg | `mono.type_arg_unsupported` |
-| `option<u64>` | param | `type.option_param` |
 | `option<u64>` | param &mut | `type.borrow_param_unsupported` |
 | `option<u64>` | record field | `record.field_type` |
 | `option<u64>` | class field | `type.option_field` |
 | `option<u64>` | array element | `type.array_payload_unsupported` |
 | `option<u64>` | option payload | `type.option_payload_unsupported` |
 | `option<u64>` | generic arg | `mono.type_arg_unsupported` |
-| `option<bool>` | param | `type.option_param` |
 | `option<bool>` | param &mut | `type.borrow_param_unsupported` |
 | `option<bool>` | record field | `record.field_type` |
 | `option<bool>` | class field | `type.option_field` |

@@ -1,6 +1,0 @@
-// expect-error: type.option_param
-// G1.1 does not introduce an Option ABI or ownership rule for parameters.
-
-fn option_bool_parameter(option<bool> value) -> bool {
-    return value.is_some;
-}

@@ -1,0 +1,16 @@
+// expect-error: expose.owner_frozen
+// A nested exposure of an already-exposed array would open two loans on
+// one buffer, and the inner loan's writes would be discarded when the
+// outer exit reconstructs the array from the outer loan. The owner's
+// frozen name refuses the inner `expose` (ADR 0073). Nested exposure of
+// *distinct* arrays remains legal (`copy_prefix`).
+/// pre  a.len ≥ 1
+/// post a.get 0 = 1
+pub fn nested(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        unsafe expose &mut a as (q, resource inner) {
+            raw_store8(q, 2, &mut inner);
+        }
+        raw_store8(p, 1, &mut m);
+    }
+}

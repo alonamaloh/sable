@@ -20,9 +20,12 @@
 /// post #[label(copied)] ∀ i, 0 ≤ i → i < src.len → dst.get i = src.get i
 /// post #[label(kept)]   ∀ i, src.len ≤ i → i < dst.len → dst.get i = (old dst).get i
 pub fn copy_prefix(&[u8] src, &mut [u8] dst) {
+    // An exposed array's own name is frozen for the body (ADR 0073), so a
+    // length the body needs is bound before the loan opens.
+    u64 n = src.len;
     unsafe expose &src as (sp, resource smem) {
         unsafe expose &mut dst as (dp, resource dmem) {
-            raw_copy_nonoverlapping(sp, dp, src.len, &smem, &mut dmem);
+            raw_copy_nonoverlapping(sp, dp, n, &smem, &mut dmem);
         }
     }
 }
@@ -107,8 +110,9 @@ fn c_fill(raw<u8> p, u64 n, u8 value, resource &mut RawSpan mem);
 // from trusting the compiler.
 /// post ∀ i, 0 ≤ i → i < a.len → a.get i = v
 pub fn fill_all(&mut [u8] a, u8 v) {
+    u64 n = a.len;
     unsafe expose &mut a as (p, resource m) {
-        c_fill(p, a.len, v, &mut m);
+        c_fill(p, n, v, &mut m);
     }
 }
 
@@ -130,8 +134,9 @@ fn c_checksum(raw<u8> p, u64 n, resource &RawSpan mem) -> u64;
 /// post ∀ i, 0 ≤ i → i < a.len → a.get i = (old a).get i
 pub fn checksum_all(&mut [u8] a) -> u64 {
     mut u64 s = 0;
+    u64 n = a.len;
     unsafe expose &mut a as (p, resource m) {
-        s = c_checksum(p, a.len, &m);
+        s = c_checksum(p, n, &m);
     }
     return s;
 }

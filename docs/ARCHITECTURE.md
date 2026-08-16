@@ -191,11 +191,13 @@ payloads, and the common trap helper still invokes mandatory `llvm.trap` after
 the weak diagnostic hook returns. The `ob` mangling component is internal and
 versionable like the named IR type.
 
-The validation boundary stays narrower than the IR type: no option parameter,
-entry, or extern ABI exists; option-valued fields and trait methods,
-classes/method calls, residual generic forms, and every non-Boolean option
-payload remain rejected. The combined closure evidence appears with G1.2/G1.3
-below.
+The validation boundary stays narrower than the IR type: an `option<bool>`
+parameter now crosses an internal call as the same by-value aggregate a
+return or local uses (still no source or C ABI — the layout and the `ob`
+mangling component stay versionable), while no option entry or extern ABI
+exists; option-valued fields and trait methods, classes/method calls,
+residual generic forms, and every non-Boolean option payload remain rejected.
+The combined closure evidence appears with G1.2/G1.3 below.
 
 G1.4a adds a second internal aggregate family: each supported root-owned POD
 declaration with integer fields becomes a named LLVM aggregate. Construction,
@@ -405,9 +407,28 @@ foreign, or cross-module array ABI.
   independently fenced.** G1.1 admits `option<bool>` returns on ordinary
   functions and inherent class methods, plus explicit and inferred locals,
   contextual `some(bool-expression)` and `none`, assignment, calls returning
-  the type, `.is_some`, and `.value` on a path that proves someness. It does not
-  admit option-typed parameters, option-valued class or record fields, trait or
-  impl method option returns, Boolean arrays or `alloc_array<bool>`, record or
+  the type, `.is_some`, and `.value` on a path that proves someness. The
+  checker and VC generation have since widened one position: an
+  `option<u64>`-family or `option<bool>` *parameter* crosses the call boundary
+  by value, binding `Option Int` / `Option Bool` with an integer payload's
+  range fact over `.value` (the absent case reads `getD default = 0`, in range
+  for every integer type). The interpreter executes the position and the
+  monitor checks its contracts at the call boundary; SVM lowering transports it
+  as an ordinary `Arg.byValue` machine value (the untyped `Val.opt` already
+  crosses `call`/`ret`, so no rule, evaluator, or agreement-proof change was
+  needed) with `corpus/svm-diff/option_params.sable` pinning some/none
+  transport, forwarding, round trips, and the absent-`.value` trap in both
+  payload families; the native backend lowers the `option<bool>` parameter
+  through the existing `%sable.option.bool` by-value aggregate (pinned against
+  Clang at `-O0`/`-O2` by `corpus/llvm-diff/option_param.sable`), keeps
+  refusing the integer-payload parameter under `backend.unsupported` — the
+  type has no LLVM representation in any position — and a stored option field
+  keeps `interp.option_position_unsupported`. Not admitted
+  anywhere: option parameters with a type-parameter payload
+  (`type.option_param`), trait-method option parameters
+  (`type.trait_param_unsupported`), init/method option parameters
+  (`type.member_param`), option-valued class or record fields, trait or impl
+  method option returns, Boolean arrays or `alloc_array<bool>`, record or
   nested option payloads, or Boolean generic arguments. These position fences
   are checked before execution as well as at the individual checker/VC
   boundaries.
@@ -448,12 +469,12 @@ foreign, or cross-module array ABI.
 
   That uniform formal representation is not permission for a recursive source
   aggregate. The Rust lowerer admits only the ordinary-function intersection
-  already checked in G1.1: concrete integer/Boolean option returns and locals,
-  contextual constructors, assignment and A-normal call-result transport, and
-  ordinary accessors. It independently rejects option parameters and fields,
-  trait option returns, record and nested payloads, residual or Boolean generic
-  arguments, Boolean arrays, classes and method calls, and the audited extern
-  ABI. Thus the formal core can grow without an unreviewed compiler path
+  already checked in G1.1: concrete integer/Boolean option returns, parameters,
+  and locals, contextual constructors, assignment and A-normal call-result
+  transport, and ordinary accessors. It independently rejects option fields,
+  trait option parameters and returns, record and nested payloads, residual or
+  Boolean generic arguments, Boolean arrays, classes and method calls, and the
+  audited extern ABI. Thus the formal core can grow without an unreviewed compiler path
   inheriting that generality. At the G1.2 checkpoint LLVM remained fail closed.
 
   The initial focused gate passed a one-job Lake build covering `SVM`,
@@ -1123,7 +1144,7 @@ foreign, or cross-module array ABI.
   Two corollaries about *where* a value dies: a discarded class-valued result is a temporary with no place, destroyed at the end of its statement, and **`unsafe { ... }` is a marker while an exposure body is a scope** — the block grants vocabulary and has no lifetime (its locals belong to the enclosing function, and the interpreter runs it through `exec_open_block`), while an exposure *is* a lifetime, so the loan's bindings and everything the body declared end at its closing brace. Scope exit rejects a disappearing local that still holds a must-consume token.
 - **Non-memory resources, and an explicit world** (ADR 0028). `resource OpenFile` is the authority to use one descriptor (position in the view, as POSIX has it); `resource PosixWorld` is the outside, and any foreign operation touching global state must receive it explicitly — which is what replaces a `modifies` clause over the universe, and lets a caller see from a signature whether a function can reach outside. Authority for a descriptor is carved from the world (`open_file(&mut w, fd)`) with *availability* as a precondition — open, and not already handed out — and carving **spends** it (`PosixWorldView.claimed`, updated functionally as `w.claim fd`), since affinity governs a token that exists and would not stop a second being minted beside it (ADR 0030). The checker tracks tokens, the VCs track the state of the outside. `posix_world(script)` is confined to `test_` functions — the one place authority appears from nothing — and the script is how a test author controls short reads and I/O errors, which the *view* deliberately does not model because no contract can predict them.
 - **Foreign contracts are audited, and the build says so** (ADR 0027). `extern "C" #[audit(id := ..., reason := ...)] fn f(...);` owes no obligations — there is no body to check — but its clauses still get well-formedness defs, and the audit metadata is mandatory. Effects are structural: only a passed `resource &mut R` may change, so there is no `modifies` clause in the language. Resource erasure at this boundary is governed by an explicit ABI whitelist (`RawSpan`, `OpenFile`, and `PosixWorld`), not a permissive “all resources erase” rule; sealed allocator authorities and profile capabilities such as `Uart` cannot cross an extern. **Nonescape sits on the audited side of the boundary**: that a callee unable to *return* storage cannot retain it is compiler-checked for a verified callee (no globals, so the pointer dies with the frame) and an audited promise for a foreign one, since nothing stops C stashing it in a foreign global — part of what the audit id covers (ADR 0030). The trust manifest is emitted **into** the hashed Lean content, so changing an audit id invalidates an artifact exactly as changing a proof does (ADR 0018's hash is over bytes); importers inherit it through the flat merge. Status reads `verified relative to audited boundary`, never `fully verified`, whenever an extern assumption remains. `sable test` supplies deterministic shims keyed on the *audit id*; an unknown id traps rather than running the empty body.
-- **A safe `[u8]` reaches raw memory through a lexical construct, not a proof** (ADR 0026). `unsafe expose &a / &mut a as (p, resource m) { ... }` lends the array's bytes for the body and takes them back: entry binds a span whose bytes are the array's elements, exit makes the array what the bytes say, under generated obligations (the whole extent came back; every byte is present and in `u8` range). Hidden *loan brands* do nonescape with no lifetime syntax — branded values cannot be returned, assigned outside the body, or passed to a user function — and the brand follows provenance through `raw_offset`/`split_off`/`join` but not onto loaded bytes. Raw operations pair a pointer with a resource borrow (`Ty::Raw`, `Val::Ptr`, `SpanView.namesByte`) and live inside `unsafe`; `unsafe regions: N` is reported in build output. `raw_copy_nonoverlapping` carries **no nonoverlap premise**: two distinct affine tokens *are* separation.
+- **A safe `[u8]` reaches raw memory through a lexical construct, not a proof** (ADR 0026). `unsafe expose &a / &mut a as (p, resource m) { ... }` lends the array's bytes for the body and takes them back: entry binds a span whose bytes are the array's elements, exit makes the array what the bytes say, under generated obligations (the whole extent came back; every byte is present and in `u8` range). The owner's name is *frozen* for the body (`expose.owner_frozen`, ADR 0073): reading, writing, indexing, `.len`, borrowing, or re-exposing the exposed array is refused, so the loan is the storage's only name and copy-in/copy-out is faithful; a length the body needs is bound to a local before the exposure. Hidden *loan brands* do nonescape with no lifetime syntax — branded values cannot be returned, assigned outside the body, or passed to a user function — and the brand follows provenance through `raw_offset`/`split_off`/`join` but not onto loaded bytes. Raw operations pair a pointer with a resource borrow (`Ty::Raw`, `Val::Ptr`, `SpanView.namesByte`) and live inside `unsafe`; `unsafe regions: N` is reported in build output. `raw_copy_nonoverlapping` carries **no nonoverlap premise**: two distinct affine tokens *are* separation.
 - **A resource is authority, and only its *view* reaches Lean.** `resource RawSpan` / `resource &RawSpan` / `resource &mut RawSpan` are affine in the checker and erased from runtime signatures; vcgen binds a `Sable.SpanView` and nothing else, so no generated VC mentions a heap, a capability, or disjointness (ADR 0022/0024). The split is enforced by the two languages disagreeing: a clause may read `s.len`, program code may not (`resource.view_is_ghost`) — a program that could read the view would need it at runtime, and a runtime view is forgeable. `resource &mut R` reuses the `&mut` array machinery: entry state as the binder, current state in the env, `old s` resolving to the binder. U10 closed the stale-view cases in nested operations and effectful loop conditions and restored the pre-condition affine-shape rule. The correction exposed every free-list search proof that had depended on stale state; `free_list_walk_unchanged` now states the `state = old state` frame and restored chain, while insert-location and first-fit transport their current stored-chain facts through it. Serial checks are green for 33/33 obligations across the walk helper/caller, 13/13 across the insert-location pair, and 22/22 across the first-fit pair; the complete corpus is green as well.
 - **Aggregate authority is one affine map token, not a source-level heap assertion** (ADR 0053). `ResourceMapView<K,V>` is a pure partial map; hidden context validity owns the pairwise-separated composition of its entries. Sealed `resource_map_take` and `resource_map_put` move one exact resource between an entry and an ordinary affine place, with presence/absence as the only visible VCs. The first compiler instance is `ResourceMap<u64, PointsTo<u64>>`: its verified three-function round trip proves pointer/value preservation through contracted calls and exact root release. The interpreter keeps a key-only sanitizer shadow to catch invalid unverified tests, including across Sable calls; the machine and ABI still receive no aggregate authority value.
 - **Raw-storable records are explicit POD values, not restricted classes** (ADRs 0054–0056). A declaration fixes positive size and power-of-two alignment; the outer alignment must be a multiple of each field alignment, and field offsets must be aligned, in bounds, and pairwise disjoint. This makes the aligned-base guarantee sufficient for every field address. The initial fields are fixed integers, typed raw pointers, and nullable typed raw pointers; none receives a byte encoding. `PointsTo<Record>` carries an abstract record-tagged cell state, and occupied extents exclude byte access. The U9 acceptance subject stores two real intrusive nodes in one arena and relates their runtime links to an abstract sequence over `ResourceMap<u64, PointsTo<IntrusiveNode>>`; take/put is the only visible permission movement, and teardown reconstructs the exact releasable root. The formal SVM mirrors this with tagged abstract values and cells plus per-byte extent ownership, preserving evaluator/rule agreement while excluding byte and `u64` overlap. Cross-allocation pointer comparison remains outside the rule actually exercised.

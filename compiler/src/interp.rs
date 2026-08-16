@@ -305,7 +305,7 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 
     for class in &program.classes {
         for field in &class.fields {
-            validate_interp_nonlocal_option_position(
+            validate_interp_field_ty(
                 field.ty.clone(),
                 &format!("field `{}.{}`", class.name, field.name),
             )?;
@@ -323,7 +323,7 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 
     for record in &program.records {
         for field in &record.fields {
-            validate_interp_nonlocal_option_position(
+            validate_interp_field_ty(
                 field.ty.clone(),
                 &format!("field `{}.{}`", record.name, field.name),
             )?;
@@ -336,7 +336,7 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 fn validate_interp_fn(function: &Fn) -> Result<(), String> {
     let mut locals = HashMap::new();
     for param in &function.params {
-        validate_interp_nonlocal_option_position(
+        validate_interp_param_ty(
             param.ty.clone(),
             &format!("parameter `{}`", param.name),
         )?;
@@ -367,20 +367,15 @@ fn validate_interp_fn(function: &Fn) -> Result<(), String> {
     validate_interp_stmts(&function.body, &mut locals)
 }
 
-/// Ordinary value options have local/return semantics only. Keep raw
-/// `Program` callers behind the same boundary as the checker: a parameter or
-/// stored class/record field must not acquire an accidental Option ABI merely
-/// because the interpreter knows how to execute a local `option<bool>`.
-fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(), String> {
+/// A parameter is a value binding, so a copyable option crosses a call the
+/// way it lives in a local: by value, its payload gated below. What has no
+/// parameter ABI is ownership at the boundary — an affine option and an
+/// owned Boolean array are refused here independently of the checker, so a
+/// raw `Program` caller meets the same fence a checked program does.
+fn validate_interp_param_ty(ty: Ty, context: &str) -> Result<(), String> {
     if ty.is_affine_option() {
         return Err(format!(
             "interp.affine_option_position_unsupported: {context} is ownership-bearing; `option<[bool]>` is supported only as an explicit local"
-        ));
-    }
-    if matches!(ty, Ty::Option(_)) {
-        return Err(format!(
-            "interp.option_position_unsupported: {context} is option-valued; \
-             ordinary options are supported only as returns and locals"
         ));
     }
     // Only an *owner* is position-restricted. A borrowed Boolean array is a
@@ -396,6 +391,21 @@ fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(),
     }
     validate_interp_ty(ty, context)
 }
+
+/// A stored class/record field is a position boundary: an ordinary option is
+/// a value — a parameter, a return, a local — and must not acquire a
+/// stored-field ABI merely because the interpreter knows how to execute it.
+fn validate_interp_field_ty(ty: Ty, context: &str) -> Result<(), String> {
+    if matches!(ty, Ty::Option(_)) && !ty.is_affine_option() {
+        return Err(format!(
+            "interp.option_position_unsupported: {context} is option-valued; \
+             ordinary options are supported as parameters, returns, and locals, \
+             not stored fields"
+        ));
+    }
+    validate_interp_param_ty(ty, context)
+}
+
 
 /// Check every container payload inside a type the interpreter will execute.
 ///
@@ -4608,11 +4618,11 @@ mod payload_guard_tests {
         ] {
             validate_interp_ty(ty.clone(), "Boolean array borrow")
                 .expect("a borrowed Boolean array is an executable value");
-            validate_interp_nonlocal_option_position(ty, "parameter `m`")
+            validate_interp_param_ty(ty, "parameter `m`")
                 .expect("a borrowed Boolean array is an ordinary parameter");
         }
         assert!(
-            validate_interp_nonlocal_option_position(Ty::array(Ty::Bool), "parameter `flags`",)
+            validate_interp_param_ty(Ty::array(Ty::Bool), "parameter `flags`")
                 .unwrap_err()
                 .starts_with("interp.array_position_unsupported:")
         );
@@ -4702,12 +4712,29 @@ mod payload_guard_tests {
     }
 
     #[test]
-    fn option_parameters_and_stored_fields_remain_outside_g1_1() {
-        for context in ["parameter `value`", "field `Box.value`"] {
-            let error = validate_interp_nonlocal_option_position(Ty::option(Ty::Bool), context)
-                .expect_err("options must not acquire a parameter/field ABI");
+    fn option_parameters_execute_and_stored_option_fields_stay_refused() {
+        for payload in [Ty::Bool, Ty::Int(IntTy::U64)] {
+            validate_interp_param_ty(Ty::option(payload.clone()), "parameter `value`")
+                .expect("a copyable option parameter is an executable value");
+            let error = validate_interp_field_ty(
+                Ty::option(payload),
+                "field `Box.value`",
+            )
+            .expect_err("options must not acquire a stored-field ABI");
             assert!(error.starts_with("interp.option_position_unsupported:"));
         }
+        let affine = validate_interp_param_ty(
+            Ty::option(Ty::array(Ty::Bool)),
+            "parameter `value`",
+        )
+        .expect_err("an affine option has no parameter ABI");
+        assert!(affine.starts_with("interp.affine_option_position_unsupported:"));
+        let generic = validate_interp_param_ty(
+            Ty::option(Ty::Param(TypeParamId::from_legacy(0))),
+            "parameter `value`",
+        )
+        .expect_err("an unresolved option payload is not executable");
+        assert!(generic.starts_with("interp.aggregate_payload_unsupported:"));
     }
 
     #[test]

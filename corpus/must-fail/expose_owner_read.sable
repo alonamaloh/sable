@@ -1,0 +1,14 @@
+// expect-error: expose.owner_frozen
+// Reading an exposed array through its own name inside the body is a
+// second believed name for the loaned bytes: a raw store through the
+// resource and a direct read would disagree about one buffer. The owner's
+// name is frozen for the body (ADR 0073); read through the loan instead.
+/// pre  a.len ≥ 1
+/// post result = a.get 0
+pub fn owner_read(&[u8] a) -> u8 {
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        r = a[0];
+    }
+    return r;
+}

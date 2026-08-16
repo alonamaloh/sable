@@ -3279,6 +3279,13 @@ pub(crate) fn require_parameter_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
+        // A Boolean option crosses the call as the internal
+        // `%sable.option.bool` aggregate by value, the same representation a
+        // return or local of the type already uses. The aggregate's layout is
+        // module-internal and versionable, not a source or C ABI. Integer
+        // options have no LLVM representation in any position, so they fall
+        // through to the named refusal below.
+        Ty::Option(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
         // A borrowed array is its descriptor, passed by value. The callee
         // cannot change the length or the allocation, so a `&mut` callee's
         // element writes reach the caller's storage through the shared data
@@ -3328,7 +3335,7 @@ pub(crate) fn require_parameter_value(
         _ => Err(vec![unsupported(
             span,
             format!(
-                "{role} type `{}` has no LLVM value representation; the backend lowers concrete integers, `bool`, borrowed `u32` and `bool` arrays, fixed-owner classes, and integer-field records as values",
+                "{role} type `{}` has no LLVM value representation; the backend lowers concrete integers, `bool`, `option<bool>`, borrowed `u32` and `bool` arrays, fixed-owner classes, and integer-field records as values",
                 ty.name()
             ),
         )]),
@@ -7896,22 +7903,87 @@ mod tests {
     }
 
     #[test]
-    fn boolean_option_does_not_open_parameters_entries_or_other_payloads() {
+    fn boolean_option_parameters_lower_and_other_option_positions_stay_closed() {
         let option = Ty::option(Ty::Bool);
         let bool_array = Ty::array(Ty::Bool);
         let mut parameterized = function(
             "parameterized",
+            Ty::Bool,
+            vec![
+                Stmt::If {
+                    cond: expression(
+                        ExprKind::IsSome {
+                            operand: Box::new(bool_option_variable("value")),
+                        },
+                        Ty::Bool,
+                    ),
+                    then_block: vec![Stmt::Return {
+                        value: Some(expression(
+                            ExprKind::OptValue {
+                                operand: Box::new(bool_option_variable("value")),
+                            },
+                            Ty::Bool,
+                        )),
+                        span: Span::new(0, 1),
+                    }],
+                    else_block: None,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                    span: Span::new(0, 1),
+                },
+            ],
+        );
+        parameterized.params = vec![parameter("value", option.clone())];
+        let caller = function(
+            "call_it",
+            Ty::Bool,
+            vec![Stmt::Return {
+                value: Some(call_with(
+                    "parameterized",
+                    Ty::Bool,
+                    vec![bool_option(ExprKind::NoneE)],
+                )),
+                span: Span::new(0, 1),
+            }],
+        );
+        let ir = emit_program(
+            &program(vec![parameterized, caller]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap();
+        assert!(ir.contains(
+            "define internal i1 @__sable_v0_f_13_parameterized__p_ob__r_b(%sable.option.bool %p0)"
+        ));
+        assert!(ir.contains("store %sable.option.bool %p0, ptr"));
+        assert!(ir.contains(
+            "call i1 @__sable_v0_f_13_parameterized__p_ob__r_b(%sable.option.bool zeroinitializer)"
+        ));
+
+        let mut integer_parameterized = function(
+            "integer_parameterized",
             Ty::Bool,
             vec![Stmt::Return {
                 value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
                 span: Span::new(0, 1),
             }],
         );
-        parameterized.params = vec![parameter("value", option.clone())];
-        let parameter_error =
-            emit_program(&program(vec![parameterized]), 1, &EmitOptions::default()).unwrap_err();
+        integer_parameterized.params =
+            vec![parameter("value", Ty::option(Ty::Int(IntTy::U64)))];
+        let parameter_error = emit_program(
+            &program(vec![integer_parameterized]),
+            1,
+            &EmitOptions::default(),
+        )
+        .unwrap_err();
         assert_eq!(parameter_error[0].name, "backend.unsupported");
         assert!(parameter_error[0].label.contains("function parameter"));
+        assert!(
+            parameter_error[0]
+                .label
+                .contains("no LLVM value representation")
+        );
 
         let local_array = function(
             "bool_array_local",

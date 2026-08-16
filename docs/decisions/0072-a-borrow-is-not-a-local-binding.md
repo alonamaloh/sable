@@ -131,6 +131,10 @@ this rule, one scope wider: freeze the exposed array for the body. It is not in
 this change, and until it lands the defect class is fenced for borrows and open
 for exposure.
 
+> **Amendment (ADR 0073).** The exposure gap this paragraph leaves open is
+> closed: an open exposure now freezes its owner's name for the body
+> (`expose.owner_frozen`), which also refuses nested exposure of one array.
+
 The alternative was to make the environment resolve through an alias relation:
 bind a borrow local to a place, canonicalise to the owner at every write-back
 site (all five of them), re-derive aliases from the fresh owner binder at each

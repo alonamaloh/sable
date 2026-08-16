@@ -41,6 +41,11 @@ const CASES: &[Case] = &[
         entry: "option_entry",
     },
     Case {
+        label: "option-bool-params",
+        source: "option_param.sable",
+        entry: "option_param_entry",
+    },
+    Case {
         label: "pod-record",
         source: "pod_record.sable",
         entry: "pod_record_entry",

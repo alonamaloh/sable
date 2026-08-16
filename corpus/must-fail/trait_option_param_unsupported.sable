@@ -1,0 +1,7 @@
+// expect-error: type.trait_param_unsupported
+// A retained trait call substitutes integer arguments into an abstract
+// contract; an `Option Int` argument has no place in that model.
+
+trait Pickable {
+    fn pick(Self value, option<u64> fallback) -> Self;
+}

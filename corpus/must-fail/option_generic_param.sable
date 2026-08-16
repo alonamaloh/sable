@@ -1,0 +1,10 @@
+// expect-error: type.option_param
+// An option parameter takes a concrete integer or `bool` payload; a
+// template payload has no abstract option transport across a call.
+
+fn pick<T>(option<T> x, T d) -> T {
+    if (x.is_some) {
+        return x.value;
+    }
+    return d;
+}

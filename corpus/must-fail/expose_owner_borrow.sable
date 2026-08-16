@@ -1,0 +1,20 @@
+// expect-error: expose.owner_frozen
+// Passing the exposed array to a callee would hand out the frozen name:
+// the callee reads storage whose bytes are on loan, so its view and the
+// loan's could disagree. The borrow of the owner is refused inside the
+// body (ADR 0073).
+/// pre  b.len ≥ 1
+/// post result = b.get 0
+pub fn peek(&[u8] b) -> u8 {
+    return b[0];
+}
+
+/// pre  a.len ≥ 1
+/// post result = a.get 0
+pub fn owner_borrow(&[u8] a) -> u8 {
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        r = peek(&a);
+    }
+    return r;
+}
