@@ -44,6 +44,9 @@ recursive lowering. The three entries — `Parser::ty`, `Parser::value_ty`,
 bounds become the bounds on every declared type: at most 64 nodes deep, at most
 256 entries in an argument list, at most 4096 nodes in one type.
 
+> **ADR 0064 supersedes the `Parser::value_ty` entry in that list.** `ValueTy`
+> is deleted; the surviving entries are `Parser::ty` and `Parser::int_ty`.
+
 **Admissibility is an explicit table.** `Parser::admits(shape, pos) -> bool` is
 one match, keyed by the shape of the type and the position it was written in,
 and it is the language's whole shape policy for types. It is a table rather

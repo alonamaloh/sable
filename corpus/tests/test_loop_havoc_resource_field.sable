@@ -1,0 +1,9 @@
+// Run half of the resource-field loop-havoc pair: the destructor's loop
+// really carves, rejoins, and reassigns the field twice at runtime.
+
+use loop_havoc_resource_field;
+
+fn test_recycle() {
+    u64 r = recycle();
+    /// assert r = 3
+}

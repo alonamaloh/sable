@@ -152,12 +152,43 @@ impl TypeShape {
             TypeShape::Borrow => "`&T`/`&mut T`",
         }
     }
+    /// The shape's short tag, as the coverage guards spell it.
+    fn tag(self) -> &'static str {
+        match self {
+            TypeShape::Int => "Int",
+            TypeShape::Bool => "Bool",
+            TypeShape::Param => "Param",
+            TypeShape::Record => "Record",
+            TypeShape::Class => "Class",
+            TypeShape::Array => "Array",
+            TypeShape::Option => "Option",
+            TypeShape::Raw => "Raw",
+            TypeShape::Resource => "Resource",
+            TypeShape::Borrow => "Borrow",
+        }
+    }
+}
+
+/// Every spellable type shape, by tag. This is the row axis a complete
+/// (type × context) measurement has to cover, exposed so the guard over
+/// `docs/type-matrix.md` goes red when the grammar grows a shape the matrix
+/// has no row for.
+pub fn type_shape_names() -> Vec<&'static str> {
+    TypeShape::all().map(TypeShape::tag).collect()
+}
+
+/// Every position a type can be written in, by short name. This is the
+/// column axis a complete (type × context) measurement has to cover,
+/// exposed so the guard over `docs/type-matrix.md` goes red when the
+/// grammar grows a position the matrix has no context for.
+pub fn type_position_names() -> Vec<&'static str> {
+    TyPos::all().map(TyPos::short_name).collect()
 }
 
 /// Where a type was written. This is the column key of the admissibility
 /// table, and it is the only thing a caller passes to the one type parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TyPos {
+pub(crate) enum TyPos {
     Param,
     /// The referent of a `&`/`&mut` parameter.
     BorrowParam,
@@ -185,6 +216,60 @@ enum TyPos {
 }
 
 impl TyPos {
+    /// Every position, in declaration order.
+    ///
+    /// A chain rather than a list, for the same reason as
+    /// [`TypeShape::all`]: [`TyPos::after`] is an exhaustive match, so a new
+    /// position has to be given its place here before the compiler accepts
+    /// it — and every enumeration read off this chain then mentions it,
+    /// including the exhaustiveness guards over `docs/type-matrix.md` and
+    /// `docs/shape-admission.md`.
+    pub(crate) fn all() -> impl Iterator<Item = TyPos> {
+        std::iter::successors(Some(TyPos::Param), |pos| pos.after())
+    }
+
+    /// The position that follows `self` in [`TyPos::all`]; `None` ends it.
+    fn after(self) -> Option<TyPos> {
+        Some(match self {
+            TyPos::Param => TyPos::BorrowParam,
+            TyPos::BorrowParam => TyPos::Return,
+            TyPos::Return => TyPos::Local,
+            TyPos::Local => TyPos::RecordField,
+            TyPos::RecordField => TyPos::ClassField,
+            TyPos::ClassField => TyPos::ArrayElement,
+            TyPos::ArrayElement => TyPos::OptionPayload,
+            TyPos::OptionPayload => TyPos::ForIndex,
+            TyPos::ForIndex => TyPos::Const,
+            TyPos::Const => TyPos::CastTarget,
+            TyPos::CastTarget => TyPos::TraitImplTarget,
+            TyPos::TraitImplTarget => TyPos::RawElement,
+            TyPos::RawElement => TyPos::ResourceExtent,
+            TyPos::ResourceExtent => TyPos::ResourceMapKey,
+            TyPos::ResourceMapKey => return None,
+        })
+    }
+
+    /// The position's short name, as the coverage guards spell it.
+    pub(crate) fn short_name(self) -> &'static str {
+        match self {
+            TyPos::Param => "param",
+            TyPos::BorrowParam => "borrow param",
+            TyPos::Return => "return",
+            TyPos::Local => "local",
+            TyPos::RecordField => "record field",
+            TyPos::ClassField => "class field",
+            TyPos::ArrayElement => "array element",
+            TyPos::OptionPayload => "option payload",
+            TyPos::ForIndex => "for index",
+            TyPos::Const => "const",
+            TyPos::CastTarget => "cast target",
+            TyPos::TraitImplTarget => "trait-impl target",
+            TyPos::RawElement => "raw element",
+            TyPos::ResourceExtent => "resource extent",
+            TyPos::ResourceMapKey => "resource map key",
+        }
+    }
+
     /// The stable, machine-matchable name of this position's gate.
     ///
     /// Array elements and option payloads share their name with the

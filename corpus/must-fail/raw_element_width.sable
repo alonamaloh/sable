@@ -1,0 +1,8 @@
+// expect-error: raw.element_type
+// A raw pointer is provenance plus a byte offset, so its element is a byte
+// or an explicitly laid-out record. A wider integer element would answer a
+// layout question the language has not: byte-at-a-time access comes first.
+
+fn read(raw<u16> p) -> u64 {
+    return 0;
+}

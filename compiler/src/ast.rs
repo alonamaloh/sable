@@ -1139,11 +1139,6 @@ impl Ty {
         self.as_affine_option_payload().is_some()
     }
 
-    /// The owned array element of an ownership-bearing option.
-    pub fn as_affine_array_option(&self) -> Option<&Ty> {
-        self.as_affine_option_payload().and_then(Ty::as_owned_array)
-    }
-
     /// Whether this is an array of exactly `element`, in any binding mode.
     ///
     /// A payload is compared rather than pattern-matched because it is boxed,
@@ -1158,14 +1153,24 @@ impl Ty {
         matches!(self.as_owned_array(), Some(found) if found == element)
     }
 
-    /// Whether this is an option of exactly `payload`.
-    pub fn is_option_of(&self, payload: &Ty) -> bool {
-        matches!(self.as_option(), Some(found) if found == payload)
+    /// A Boolean array in any binding mode.
+    ///
+    /// Borrow-transparent, because it answers representation questions: the
+    /// descriptor an owner and a borrow both carry, and the element bytes
+    /// both address.
+    pub fn is_bool_array(&self) -> bool {
+        self.is_array_of(&Ty::Bool)
     }
 
-    /// Whether this is an owning option of exactly `[element]`.
-    pub fn is_affine_array_option_of(&self, element: &Ty) -> bool {
-        matches!(self.as_affine_array_option(), Some(found) if found == element)
+    /// A Boolean array whose storage this scope owns and must free.
+    ///
+    /// Strict about the binding mode, because it answers ownership questions:
+    /// which declarations allocate, which enter the cleanup registry, and
+    /// which call the free hook. `&[bool]` and `&mut [bool]` are deliberately
+    /// not owned Boolean arrays: they name a sequence their caller owns and
+    /// transport exactly as `&[T]` does.
+    pub fn is_owned_bool_array(&self) -> bool {
+        self.is_owned_array_of(&Ty::Bool)
     }
 
     /// Values that can be transferred but not duplicated.
@@ -2201,10 +2206,13 @@ mod generic_ty_tests {
         assert_eq!(owning, Ty::option(Ty::array(Ty::Bool)));
         assert!(owning.is_affine());
         assert!(owning.is_affine_option());
-        assert!(owning.is_affine_array_option_of(&Ty::Bool));
         assert_eq!(
             owning.as_affine_option_payload(),
             Some(&Ty::array(Ty::Bool))
+        );
+        assert_eq!(
+            owning.as_affine_option_payload().and_then(Ty::as_owned_array),
+            Some(&Ty::Bool)
         );
         // A borrowed array payload is representable and does not join the
         // owning family: a borrow owns nothing.

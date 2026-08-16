@@ -1,0 +1,14 @@
+// pair: same-lean
+// A store through a `&mut [bool]` parameter reifies its program-Boolean
+// value across the Prop-to-Bool bridge exactly once, whether the stored
+// expression is written inline or first bound to a local name. The
+// halves differ only in that binding, so their obligations — bounds,
+// the updated-sequence post, the preserved length — must be identical.
+
+/// pre  i < m.len
+/// pre  x > 0
+/// post m.get i = true
+/// post m.len = (old m).len
+pub fn mark(&mut [bool] m, u64 i, u64 x) {
+    m[i] = x > 0;
+}

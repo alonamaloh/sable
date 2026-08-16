@@ -1,0 +1,18 @@
+// pair: same-lean
+// A program-Boolean call argument crosses the Prop-to-Bool bridge at
+// the call boundary, whether the argument expression is written inline
+// or first bound to a local name. The halves differ only in that
+// binding, so the call-site obligation (the callee's pre over the
+// reified argument) and the propagated post must be identical.
+
+/// pre  b
+/// post result
+fn require_true(bool b) -> bool {
+    return b;
+}
+
+/// pre  x > 0
+/// post result
+pub fn call_inline(u64 x) -> bool {
+    return require_true(x > 0);
+}

@@ -1,0 +1,11 @@
+// pair: same-lean
+// A copyable option parameter is a value: binding it to a local name
+// before the someness-guarded access must change nothing about the
+// emitted obligations — the someness VC and the payload's range fact
+// travel with the value, not with the spelling.
+
+/// pre  o.is_some
+/// post result = o.value
+pub fn get(option<u64> o) -> u64 {
+    return o.value;
+}

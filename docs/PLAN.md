@@ -1226,6 +1226,77 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      families; the program-wide SVM strictness re-check keeps trait option
      parameters and returns, stored option fields, and the affine family
      refused by their own names.
+     **A havoc path is exhaustive or it is wrong (ADR 0074).** An audit of VC
+     generation confirmed five defects with one common cause: "fresh symbolic
+     state for a type" existed as several divergent `match`es over `Ty`, and
+     every wildcard arm silently kept a stale chain — the prover then read
+     pre-loop or pre-call values as post-mutation state. Two were false
+     proofs (`sable check` said `fully verified` about contracts `sable test`
+     refutes): a class-valued field reassigned in an init loop was never
+     havocked, and a `raw<u8>` local mutated in a loop kept its pre-loop
+     chain, so a proved-trap-free program trapped. One was fail-open: sealed
+     resource ops destructured borrow arguments ignoring `field`, so a
+     destructor's `&mut self.<field>` panicked `split_off` at an
+     `unreachable!` and would have clobbered `self` in the other arms — now a
+     named checker refusal, `resource.field_borrow_op`, with the local-move
+     rewrite in the note and a fail-closed latch in every arm. One was a
+     wrong-layer error: a deinit whose loop assigns a field hit a
+     generated-Lean identifier error; `Cctx::Deinit` now joins the method
+     case (fresh `_self_loop`, field facts, no class invariant). And one was
+     a landmine: the method-call arm lacked the plain-call arm's `&mut [T]`
+     argument havoc, unreachable only because `type.member_param` — then
+     pinned by zero corpus subjects — refuses the spelling. The fix vehicle
+     is `Generator::fresh_state_for(ty, binder, base, len)`: parameter
+     entry, the one call-site havoc (`havoc_mut_borrow_args`, now used for
+     arrays too, by ordinary, method, and constructor calls alike), and both
+     loop-havoc branches all consume it, and its dispatch over `Ty` has no
+     wildcard — a shape with no fresh-state story latches `refuse_vc_type`.
+     Both false-proof reproducers flipped from `fully verified` to unproved;
+     each defect carries corpus subjects in both directions (must-fail +
+     test-fails for the false contracts, verifies + tests for the sound
+     rewrites), and `type.member_param` gained one must-fail per refused
+     family. Neither admission table moves a cell.
+
+     The havoc dispatch is additionally guarded by a per-arm loop corpus:
+     every type a loop body can mutate has a `corpus/verifies/loop_havoc_*`
+     subject whose contract observes the post-loop state, with a
+     `corpus/tests/test_loop_havoc_*` twin running the same contracts at
+     zero unfenced skips — integer, Boolean, template-parameter, copyable
+     option, owning option (loop `.take`; whole-option reassignment stays
+     refused), nullable-pointer option, record, class, owned
+     integer/Boolean array, resource-view parameter, and resource-field
+     arms, plus named runners for the raw-pointer and init-loop
+     class-field shapes and a `type.array_assign` must-fail for the one
+     refused loop mutation (whole-array rebinding). `&mut`
+     array/class/resource parameters mutated in loops and method-context
+     field loops were already held by `insertion_sort`,
+     `bool_array_params`, `class_values`, `free_list_walk`, and
+     `hashmap`. A new arm added to `Ty` without a
+     battery pair is a compile error first (`fresh_state_for` is
+     wildcard-free) and a missing-subject review question second.
+
+     **The exposure copy-back model is pinned, and the LLVM `expose`
+     refusal is load-bearing.** Proof, interpreter, and formal machine all
+     model `unsafe expose` as copy-in/copy-out — the loan takes the
+     owner's bytes at entry, a mutable exit rebuilds the owner from the
+     loan's final bytes — and that model is faithful only because ADR
+     0073's freeze makes the loan the storage's sole name for the body.
+     `corpus/verifies/expose_copy_back.sable` and its test twin pin the
+     observable in both directions: a `raw_store8` through the loan is
+     seen through the owner after the body, and every other byte
+     survives. The third consumer, `llvm.rs`, refuses `Stmt::Expose`
+     under `backend.unsupported`, and that refusal is what keeps the
+     three-way agreement true: a native lowering that handed the body a
+     real pointer into the owner's storage would falsify the copy model
+     the proofs and both executables share. It must not be lifted until
+     (a) the ADR 0073 freeze is enforced on whatever the native path
+     admits, so no second name can reach the storage while the loan is
+     out, and (b) exposure has a genuine aliasing story — a decided
+     semantics for the loan *being* the owner's storage, carried through
+     the machine rules, the evaluator, the agreement proofs, and the
+     differential gates together — rather than an unreviewed switch from
+     copies to pointers.
+
    - **G2 — affine options (staged; G2.0–G2.3 complete):**
      carry ownership and destruction correctly through present/absent aggregate
      values without widening the existing copy-option family by accident.

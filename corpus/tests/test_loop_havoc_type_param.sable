@@ -1,0 +1,9 @@
+// Run half of the type-parameter loop-havoc pair, through a concrete
+// instantiation.
+
+use loop_havoc_type_param;
+
+fn test_relay_seven() {
+    u32 r = relay_seven();
+    /// assert r = 7
+}

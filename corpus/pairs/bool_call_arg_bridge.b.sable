@@ -1,0 +1,16 @@
+// pair: same-lean
+// See bool_call_arg_bridge.a.sable: naming the argument must change
+// nothing.
+
+/// pre  b
+/// post result
+fn require_true(bool b) -> bool {
+    return b;
+}
+
+/// pre  x > 0
+/// post result
+pub fn call_inline(u64 x) -> bool {
+    bool c = x > 0;
+    return require_true(c);
+}

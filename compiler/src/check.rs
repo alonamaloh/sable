@@ -535,31 +535,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             let scalar_params = |params: &[Param], allow_shared_arrays: bool| -> CResult<()> {
                 check_uart_params(params)?;
                 for p in params {
-                    // Class parameters: by value (moved in) or borrowed
-                    // (ADR 0020, ADR 0023), and resources — a class that
-                    // owns authority takes it in through an init
-                    // (ADR 0029).
-                    let ok = matches!(p.ty, Ty::Int(_))
-                        || p.ty.class_index().is_some()
-                        || p.ty.is_resource()
-                        || (allow_shared_arrays
-                            && matches!(p.ty.as_array_borrow(), Some((_, Mutability::Shared))));
-                    if !ok {
-                        return Err(Diagnostic {
-                            name: "type.member_param".into(),
-                            title: "init/method parameters must be integers for now".into(),
-                            span: p.span,
-                            label: format!("this has type `{}`", p.ty.clone().name()),
-                            notes: vec![],
-                        });
-                    }
+                    member_param_ty(&p.ty, p.span, allow_shared_arrays)?;
                 }
                 Ok(())
             };
             let mut inits = Vec::new();
             for i in &c.inits {
-                // Inits additionally take `&[T]` (the bignum from_prefix
-                // shape: build a class value from computed limbs).
                 scalar_params(&i.params, true)?;
                 inits.push((i.name.clone(), i.params.clone()));
             }
@@ -2930,155 +2911,177 @@ pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
     Ok(())
 }
 
+/// The declared type of a class `init` or method parameter.
+///
+/// Class parameters: by value (moved in) or borrowed (ADR 0020, ADR 0023),
+/// and resources — a class that owns authority takes it in through an init
+/// (ADR 0029). Inits additionally take `&[T]` (the bignum from_prefix
+/// shape: build a class value from computed limbs); methods do not.
+pub(crate) fn member_param_ty(ty: &Ty, span: Span, allow_shared_arrays: bool) -> CResult<()> {
+    let ok = matches!(ty, Ty::Int(_))
+        || ty.class_index().is_some()
+        || ty.is_resource()
+        || (allow_shared_arrays
+            && matches!(ty.as_array_borrow(), Some((_, Mutability::Shared))));
+    if !ok {
+        return Err(Diagnostic {
+            name: "type.member_param".into(),
+            title: "init/method parameters must be integers for now".into(),
+            span,
+            label: format!("this has type `{}`", ty.clone().name()),
+            notes: vec![],
+        });
+    }
+    Ok(())
+}
+
+/// The declared return type of an ordinary function or class method.
+pub(crate) fn return_ty(ty: &Ty, fn_name: &str, span: Span) -> CResult<()> {
+    if ty.is_affine_option() {
+        return Err(affine_option_boundary(ty.clone(), span, "return"));
+    }
+    validate_aggregate_ty(ty.clone(), span)?;
+    if matches!(ty, Ty::Array(..)) {
+        return Err(Diagnostic {
+            name: "type.array_return".into(),
+            title: format!("function `{fn_name}` returns an array"),
+            span,
+            label: "arrays cannot be returned yet".into(),
+            notes: vec![(
+                "note".into(),
+                "an owned array local has no ownership-transfer rule across a return \
+                 boundary"
+                    .into(),
+            )],
+        });
+    }
+    Ok(())
+}
+
+/// The declared type of a class field.
+pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
+    if ty.is_affine_option() {
+        return Err(affine_option_boundary(ty.clone(), span, "field"));
+    }
+    if ty.is_array_of(&Ty::Bool) {
+        return Err(Diagnostic {
+            name: "type.bool_array_field".into(),
+            title: "Boolean arrays cannot be stored in class fields yet".into(),
+            span,
+            label: "keep `[bool]` as an owned local".into(),
+            notes: vec![(
+                "note".into(),
+                "field ownership, invariant transport, and backend layout must be enabled \
+                 together before a class can retain a Boolean array"
+                    .into(),
+            )],
+        });
+    }
+    validate_aggregate_ty(ty.clone(), span)?;
+    if matches!(ty, Ty::Option(_)) {
+        return Err(Diagnostic {
+            name: "type.option_field".into(),
+            title: "option-valued class fields are not supported yet".into(),
+            span,
+            label: "`option<T>` lives in returns and locals".into(),
+            notes: vec![(
+                "note".into(),
+                "field storage must land together with aggregate ownership and lowering".into(),
+            )],
+        });
+    }
+    Ok(())
+}
+
+/// The declared type of a trait-method parameter.
+///
+/// An abstract trait call evaluates each argument as an integer proof
+/// value, so a parameter whose value is not one has no meaning at the
+/// call. An array is included in any binding mode: `&[T]` lifts to a
+/// `Sable.Seq T`, which is exactly what the abstract call cannot pass.
+/// A value option is included on the same terms: its proof value is
+/// `Option Int` / `Option Bool`, not an integer.
+pub(crate) fn trait_param_ty(ty: &Ty, span: Span) -> CResult<()> {
+    if ty.is_affine_option() {
+        return Err(affine_option_boundary(ty.clone(), span, "trait"));
+    }
+    parameter_ty(ty, span)?;
+    if matches!(ty, Ty::Bool | Ty::Record(_) | Ty::Option(_)) || ty.as_array().is_some() {
+        return Err(Diagnostic {
+            name: "type.trait_param_unsupported".into(),
+            title: "trait calls do not transport Boolean, POD-record, array, or option \
+                    parameters"
+                .into(),
+            span,
+            label: format!(
+                "`{}` is not supported in a trait method parameter",
+                ty.clone().name()
+            ),
+            notes: vec![(
+                "note".into(),
+                "ordinary functions may transport Boolean, POD-record, borrowed-array, and \
+                 value-option arguments, but a retained trait call substitutes integer \
+                 arguments into an abstract contract and has no model for these"
+                    .into(),
+            )],
+        });
+    }
+    Ok(())
+}
+
+/// The declared result type of a trait method.
+pub(crate) fn trait_return_ty(ty: &Ty, method_name: &str, span: Span) -> CResult<()> {
+    if ty.is_affine_option() {
+        return Err(affine_option_boundary(ty.clone(), span, "trait"));
+    }
+    return_ty(ty, method_name, span)?;
+    if matches!(ty, Ty::Option(_)) {
+        return Err(Diagnostic {
+            name: "type.trait_option_return".into(),
+            title: "trait methods may not return value options yet".into(),
+            span,
+            label: "trait calls retain the ADR 0009 integer proof domain".into(),
+            notes: vec![(
+                "note".into(),
+                "ordinary functions and class methods may return `option<bool>`; trait \
+                 proof reuse needs a separate widening decision"
+                    .into(),
+            )],
+        });
+    }
+    if matches!(ty, Ty::Bool | Ty::Record(_)) {
+        return Err(Diagnostic {
+            name: "type.trait_return_unsupported".into(),
+            title: "trait calls do not return Boolean or POD-record values".into(),
+            span,
+            label: format!(
+                "`{}` is not supported as a trait method result",
+                ty.clone().name()
+            ),
+            notes: vec![(
+                "note".into(),
+                "ordinary functions may return Boolean and POD-record values, but retained \
+                 trait calls do not yet model those result kinds"
+                    .into(),
+            )],
+        });
+    }
+    Ok(())
+}
+
 fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     fn function(function: &Fn) -> CResult<()> {
         for parameter in &function.params {
             parameter_ty(&parameter.ty, parameter.span)?;
         }
-        if function.ret.is_affine_option() {
-            return Err(affine_option_boundary(
-                function.ret.clone(),
-                function.name_span,
-                "return",
-            ));
-        }
-        validate_aggregate_ty(function.ret.clone(), function.name_span)?;
-        if matches!(function.ret, Ty::Array(..)) {
-            return Err(Diagnostic {
-                name: "type.array_return".into(),
-                title: format!("function `{}` returns an array", function.name),
-                span: function.name_span,
-                label: "arrays cannot be returned yet".into(),
-                notes: vec![(
-                    "note".into(),
-                    "an owned array local has no ownership-transfer rule across a return \
-                     boundary"
-                        .into(),
-                )],
-            });
-        }
-        Ok(())
-    }
-
-    fn class_field(field: &Field) -> CResult<()> {
-        if field.ty.is_affine_option() {
-            return Err(affine_option_boundary(
-                field.ty.clone(),
-                field.span,
-                "field",
-            ));
-        }
-        if field.ty.is_array_of(&Ty::Bool) {
-            return Err(Diagnostic {
-                name: "type.bool_array_field".into(),
-                title: "Boolean arrays cannot be stored in class fields yet".into(),
-                span: field.span,
-                label: "keep `[bool]` as an owned local".into(),
-                notes: vec![(
-                    "note".into(),
-                    "field ownership, invariant transport, and backend layout must be enabled \
-                     together before a class can retain a Boolean array"
-                        .into(),
-                )],
-            });
-        }
-        validate_aggregate_ty(field.ty.clone(), field.span)?;
-        if matches!(field.ty, Ty::Option(_)) {
-            return Err(Diagnostic {
-                name: "type.option_field".into(),
-                title: "option-valued class fields are not supported yet".into(),
-                span: field.span,
-                label: "`option<T>` lives in returns and locals".into(),
-                notes: vec![(
-                    "note".into(),
-                    "field storage must land together with aggregate ownership and lowering".into(),
-                )],
-            });
-        }
-        Ok(())
+        return_ty(&function.ret, &function.name, function.name_span)
     }
 
     fn trait_method(method: &Fn) -> CResult<()> {
-        if let Some(parameter) = method
-            .params
-            .iter()
-            .find(|parameter| parameter.ty.is_affine_option())
-        {
-            return Err(affine_option_boundary(
-                parameter.ty.clone(),
-                parameter.span,
-                "trait",
-            ));
+        for parameter in &method.params {
+            trait_param_ty(&parameter.ty, parameter.span)?;
         }
-        if method.ret.is_affine_option() {
-            return Err(affine_option_boundary(
-                method.ret.clone(),
-                method.name_span,
-                "trait",
-            ));
-        }
-        function(method)?;
-        if matches!(method.ret, Ty::Option(_)) {
-            return Err(Diagnostic {
-                name: "type.trait_option_return".into(),
-                title: "trait methods may not return value options yet".into(),
-                span: method.name_span,
-                label: "trait calls retain the ADR 0009 integer proof domain".into(),
-                notes: vec![(
-                    "note".into(),
-                    "ordinary functions and class methods may return `option<bool>`; trait \
-                     proof reuse needs a separate widening decision"
-                        .into(),
-                )],
-            });
-        }
-        // An abstract trait call evaluates each argument as an integer proof
-        // value, so a parameter whose value is not one has no meaning at the
-        // call. An array is included in any binding mode: `&[T]` lifts to a
-        // `Sable.Seq T`, which is exactly what the abstract call cannot pass.
-        // A value option is included on the same terms: its proof value is
-        // `Option Int` / `Option Bool`, not an integer.
-        if let Some(parameter) = method.params.iter().find(|parameter| {
-            matches!(parameter.ty, Ty::Bool | Ty::Record(_) | Ty::Option(_))
-                || parameter.ty.as_array().is_some()
-        }) {
-            return Err(Diagnostic {
-                name: "type.trait_param_unsupported".into(),
-                title: "trait calls do not transport Boolean, POD-record, array, or option \
-                        parameters"
-                    .into(),
-                span: parameter.span,
-                label: format!(
-                    "`{}` is not supported in a trait method parameter",
-                    parameter.ty.clone().name()
-                ),
-                notes: vec![(
-                    "note".into(),
-                    "ordinary functions may transport Boolean, POD-record, borrowed-array, and \
-                     value-option arguments, but a retained trait call substitutes integer \
-                     arguments into an abstract contract and has no model for these"
-                        .into(),
-                )],
-            });
-        }
-        if matches!(method.ret, Ty::Bool | Ty::Record(_)) {
-            return Err(Diagnostic {
-                name: "type.trait_return_unsupported".into(),
-                title: "trait calls do not return Boolean or POD-record values".into(),
-                span: method.name_span,
-                label: format!(
-                    "`{}` is not supported as a trait method result",
-                    method.ret.clone().name()
-                ),
-                notes: vec![(
-                    "note".into(),
-                    "ordinary functions may return Boolean and POD-record values, but retained \
-                     trait calls do not yet model those result kinds"
-                        .into(),
-                )],
-            });
-        }
-        Ok(())
+        trait_return_ty(&method.ret, &method.name, method.name_span)
     }
 
     fn class_method(method: &Fn) -> CResult<()> {
@@ -3179,7 +3182,7 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
     }
     for class in program.class_templates.iter().chain(&program.classes) {
         for field in &class.fields {
-            class_field(field)?;
+            class_field_ty(&field.ty, field.span)?;
         }
         for initializer in &class.inits {
             function(initializer)?;
@@ -3975,6 +3978,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            refuse_sealed_field_borrows(op.name(), args)?;
             let raw = Ty::Raw(IntTy::U8);
             let u8t = Ty::Int(IntTy::U8);
             let u64t = Ty::Int(IntTy::U64);
@@ -4158,6 +4162,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            refuse_sealed_field_borrows(op.name(), args)?;
             let uart = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::Uart));
             let want = match op {
                 DeviceOp::UartStatus => vec![uart],
@@ -4211,6 +4216,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            refuse_sealed_field_borrows(op.name(), args)?;
             match op {
                 // `split_off(&mut whole, n)` — the prefix stays in the
                 // borrowed token, the suffix leaves in the returned one.
@@ -5506,6 +5512,39 @@ fn check_borrow_conflicts(
                     )],
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// A sealed raw/resource/device operation writes its fresh state back under
+/// its borrow argument's ROOT name. A *field* borrow (`&mut self.mem` — the
+/// destructor's field-borrow allowance, ADR 0029) has no root of its own:
+/// threading the fresh view back into the owning object is a rule no sealed
+/// operation states, and keying by the root would overwrite the whole object.
+/// Refuse the shape by name, before any per-operation typing (ADR 0074).
+fn refuse_sealed_field_borrows(op: &str, args: &[Expr]) -> CResult<()> {
+    for arg in args {
+        if let ExprKind::Borrow {
+            array,
+            field: Some(f),
+            ..
+        } = &arg.kind
+        {
+            return Err(Diagnostic {
+                name: "resource.field_borrow_op".into(),
+                title: format!("`{op}` cannot borrow the field `{array}.{f}`"),
+                span: arg.span,
+                label: "sealed operations take whole named resources".into(),
+                notes: vec![(
+                    "note".into(),
+                    "move the field into a local resource binding first (a destructor \
+                     may move fields out); a sealed operation's fresh state is written \
+                     back under the borrow's root name, and a field has no root of its \
+                     own"
+                        .into(),
+                )],
+            });
         }
     }
     Ok(())

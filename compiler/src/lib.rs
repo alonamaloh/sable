@@ -190,6 +190,58 @@ pub fn load_checked(
     Ok((program, mods))
 }
 
+/// Lean-free front end plus VC generation over a file and its imports:
+/// the exact obligation list `sable check` would send to Lean, computed
+/// in process without invoking it. This is the entry the differential-pair
+/// harness (`compiler/tests/pairs.rs`) compares across equivalent-program
+/// rewrites; it accepts only a source path, so the pipeline's own mono and
+/// checking stages still gate everything VC generation sees.
+pub fn load_obligations(
+    path: &Path,
+    opts: &Options,
+) -> Result<(ast::Program, modules::ModuleSet, vcgen::VcResult), Vec<Failure>> {
+    let (mut program, mods) = modules::load(path, &opts.module_paths).map_err(|(d, partial)| {
+        vec![Failure {
+            name: d.name.clone(),
+            rendered: partial.render(&d),
+        }]
+    })?;
+    let render = |d: &Diagnostic| Failure {
+        name: d.name.clone(),
+        rendered: mods.render(d),
+    };
+    consts::apply(&mut program).map_err(|d| vec![render(&d)])?;
+    mono::monomorphize(&mut program).map_err(|d| vec![render(&d)])?;
+    let checked = check::check(&mut program).map_err(|d| vec![render(&d)])?;
+    let Some(repo_root) =
+        lean::find_repo_root(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+            .or_else(|| lean::find_repo_root(&std::env::current_dir().ok()?))
+    else {
+        return Err(vec![Failure {
+            name: "internal.no_lean_dir".into(),
+            rendered: "cannot locate the Sable Lean prelude (no ancestor directory \
+                       contains lean/lean-toolchain)"
+                .into(),
+        }]);
+    };
+    let vc = vcgen::generate(&program, &checked.sigs, &mods.combined_source, &repo_root).map_err(
+        |message| {
+            // Fail-closed vcgen refusals carry their name as a `name:` prefix.
+            let name = message
+                .split(':')
+                .next()
+                .filter(|head| head.contains('.') && !head.contains(char::is_whitespace))
+                .unwrap_or("internal.vcgen")
+                .to_string();
+            vec![Failure {
+                name,
+                rendered: message,
+            }]
+        },
+    )?;
+    Ok((program, mods, vc))
+}
+
 /// Run the front end and the dynamic test interpreter (`sable test`).
 /// Never invokes Lean; contracts are checked dynamically (design §9).
 pub fn test_file(path: &Path, opts: &Options) -> Result<Vec<interp::TestReport>, Vec<Failure>> {

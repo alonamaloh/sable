@@ -1,0 +1,22 @@
+// Loop-havoc coverage, copyable option local: an `option<u64>`
+// reassigned inside a loop is a fresh `Option Int` at the loop head, with
+// the payload range fact over `.value` (ADR 0074); the invariant carries
+// someness and the payload to the post-loop observation.
+
+/// pre  x ≤ 100
+/// post result = x + 1
+pub fn retag(u64 x) -> u64 {
+    mut option<u64> cur = none;
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant i ≥ 1 → (cur.is_some ∧ cur.value = x + 1)
+    /// variant   3 - i
+    while (i < 3) {
+        cur = some(x + 1);
+        i = i + 1;
+    }
+    if (cur.is_some) {
+        return cur.value;
+    }
+    return 0;
+}

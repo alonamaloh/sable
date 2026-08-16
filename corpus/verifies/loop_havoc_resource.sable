@@ -1,0 +1,36 @@
+// Loop-havoc coverage, resource view: the `resource &mut` parameter is a
+// fresh view at every loop head (ADR 0074), so the invariants restate the
+// shape and contents the stores established. The wrapper observes the
+// store through the owner after the exposure ends.
+
+/// pre  #[label(names)] p.alloc = mem.alloc ∧ p.off = mem.off
+/// pre  #[label(fits)]  1 ≤ mem.len
+/// pre  #[label(whole)] Sable.SpanView.reconstructible mem
+/// post #[label(shape)] mem.alloc = (old mem).alloc ∧ mem.off = (old mem).off ∧ mem.len = (old mem).len
+/// post #[label(set)]   mem.bytes.get 0 = Sable.ByteState.init 7
+/// post #[label(kept)]  ∀ k, 1 ≤ k → mem.bytes.get k = (old mem).bytes.get k
+/// post #[label(whole)] Sable.SpanView.reconstructible mem
+fn stamp_head(raw<u8> p, resource &mut RawSpan mem) {
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant mem.alloc = (old mem).alloc ∧ mem.off = (old mem).off ∧ mem.len = (old mem).len
+    /// invariant i ≥ 1 → mem.bytes.get 0 = Sable.ByteState.init 7
+    /// invariant ∀ k, 1 ≤ k → mem.bytes.get k = (old mem).bytes.get k
+    /// invariant Sable.SpanView.reconstructible mem
+    /// variant   3 - i
+    while (i < 3) {
+        unsafe {
+            raw_store8(p, 7, &mut mem);
+        }
+        i = i + 1;
+    }
+}
+
+/// pre  a.len ≥ 1
+/// post #[label(head)] a.get 0 = 7
+/// post #[label(rest)] ∀ k, 1 ≤ k → k < a.len → a.get k = (old a).get k
+pub fn stamp_first(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        stamp_head(p, &mut m);
+    }
+}

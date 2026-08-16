@@ -1,0 +1,16 @@
+// The raw-pointer arm of the loop coverage, run against the sound loop
+// subject: the pointer is reassigned in the loop, the invariants pin
+// where it sits, and the load after the loop reads the byte the contract
+// names.
+
+// Raw-pointer invariants are proof vocabulary; the monitor has no runtime
+// provenance/offset value to evaluate them against.
+// expect-skip: q.alloc = p.alloc
+
+use raw_loop_pointer;
+
+fn test_pointer_survives_the_loop() {
+    mut [u8] a = [5, 1];
+    u8 r = first_via_loop(&a);
+    /// assert r = 5
+}

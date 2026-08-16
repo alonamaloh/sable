@@ -1,0 +1,29 @@
+// pair: same-lean
+// A loop-mutated `raw<u8>` local is a fresh, unconstrained pointer at the
+// loop head (ADR 0074). The halves differ only in the dead pre-loop chain
+// of `q` — the bare loan versus a computed offset from it — so the load
+// after the loop must emit the same obligation over the fresh binder in
+// both. A havoc dispatch that skipped the raw-pointer shape would leak
+// the differing chains into that obligation. No invariant relates `q` to
+// the span, so the load's obligation is deliberately not provable and is
+// deferred to its runtime trap: this pair pins what is emitted.
+
+/// pre a.len ≥ 1
+pub fn last_load(&[u8] a) -> u8 {
+    u64 n = a.len;
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        mut raw<u8> q = p;
+        mut u64 i = 0;
+        /// invariant i ≤ n
+        /// variant   n - i
+        while (i < n) {
+            q = p;
+            i = i + 1;
+        }
+        r = raw_load8(q, &m);
+    }
+    return r;
+}
+
+/// defer last_load.load8.raw_load8_q_m

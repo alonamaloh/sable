@@ -1,0 +1,28 @@
+// expect-test-failure: raw_load8 out of bounds or after free
+// The false half of the raw-pointer loop havoc pair: the loop walks the
+// pointer one past the end of the span, and the load through it traps at
+// run time exactly as `sable check` now refuses to prove it safe
+// (must-fail/raw_loop_stale_pointer).
+
+/// pre a.len ≥ 1
+fn walk_off_end(&[u8] a) -> u8 {
+    u64 n = a.len;
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        mut raw<u8> q = p;
+        mut u64 i = 0;
+        /// invariant i ≤ n
+        /// variant   n - i
+        while (i < n) {
+            q = raw_offset(q, 1);
+            i = i + 1;
+        }
+        r = raw_load8(q, &m);
+    }
+    return r;
+}
+
+fn test_stale_pointer_traps() {
+    mut [u8] a = [1, 2];
+    u8 r = walk_off_end(&a);
+}

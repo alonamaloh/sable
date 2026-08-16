@@ -1,0 +1,17 @@
+// pair: same-run
+// See reborrow_forward_vs_direct.a.sable: the same subject with the
+// store made directly by the first callee.
+
+/// pre  m.len ≥ 1
+/// post m.get 0 = 5
+/// post m.len = (old m).len
+fn set_direct(&mut [u32] m) {
+    m[0] = 5;
+}
+
+/// post result = 5
+pub fn subject() -> u32 {
+    mut [u32] a = alloc_array<u32>(2, 0);
+    set_direct(&mut a);
+    return a[0];
+}

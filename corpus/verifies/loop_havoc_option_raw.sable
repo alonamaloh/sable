@@ -1,0 +1,28 @@
+// Loop-havoc coverage, nullable record pointer local: an
+// `option<raw<R>>` reassigned inside a loop is a fresh
+// `Option Sable.RawPtr` at the loop head (ADR 0074) — unconstrained, so
+// the invariant is what relates it back to its source.
+
+record LoopCell #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 v;
+}
+
+fn relink(option<raw<LoopCell>> q) {
+    mut option<raw<LoopCell>> cur = q;
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant cur.is_some ↔ q.is_some
+    /// variant   3 - i
+    while (i < 3) {
+        cur = q;
+        i = i + 1;
+    }
+    /// assert cur.is_some ↔ q.is_some
+}
+
+/// post result = 3
+pub fn relink_none() -> u64 {
+    option<raw<LoopCell>> q = none;
+    relink(q);
+    return 3;
+}

@@ -1,0 +1,52 @@
+// pair: same-lean
+// An init whose loop reassigns `self` fields: at the loop head every
+// tracked field is a fresh state (ADR 0074). This pair pins the scalar
+// arm; a dead class-field value cannot vary between same-lean halves,
+// because its constructor call leaves a hypothesis behind, so the
+// class-valued arm is pinned by the corpus instead
+// (`init_loop_class_field_stale`). The halves differ only in the dead pre-loop value of
+// `self.count`, so the obligations after the loop must be identical; a
+// field havoc that skipped a field's type would keep the pre-loop chain
+// and leak the difference.
+
+pub class Inner {
+    u64 v;
+
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+pub class Outer {
+    Inner inner;
+    u64 count;
+
+    /// post self.inner.v = 5
+    init build() {
+        self.inner = Inner::make(5);
+        self.count = 1;
+        mut u64 i = 0;
+        /// invariant i ≤ 3
+        /// invariant self.inner.v = 5
+        /// variant   3 - i
+        while (i < 3) {
+            self.inner = Inner::make(5);
+            self.count = i;
+            i = i + 1;
+        }
+        /// assert self.count ≤ u64.max
+    }
+}
+
+/// post result = i.v
+pub fn inner_value(&Inner i) -> u64 {
+    return i.v;
+}
+
+/// post result = 5
+pub fn build_and_read() -> u64 {
+    var o = Outer::build();
+    u64 r = inner_value(&o.inner);
+    return r;
+}

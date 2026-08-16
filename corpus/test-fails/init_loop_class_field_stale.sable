@@ -1,0 +1,37 @@
+// expect-test-failure: post of `Outer::build` violated
+// The false contract of the init-loop field havoc pair: the loop
+// reassigns `self.inner`, so a post pinning the field to its pre-loop
+// value is refuted at run time exactly as `sable check` now refuses to
+// prove it (must-fail/init_loop_class_field_stale).
+
+class Inner {
+    u64 v;
+
+    /// invariant v ≤ 1000
+
+    /// pre  x ≤ 1000
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+class Outer {
+    Inner inner;
+
+    /// post #[label(stale)] self.inner.v = 1
+    init build() {
+        self.inner = Inner::make(1);
+        mut u64 i = 0;
+        /// invariant i ≤ 3
+        /// variant   3 - i
+        while (i < 3) {
+            self.inner = Inner::make(5);
+            i = i + 1;
+        }
+    }
+}
+
+fn test_stale_field_post_is_refuted() {
+    var o = Outer::build();
+}

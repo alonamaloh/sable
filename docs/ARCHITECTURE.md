@@ -783,6 +783,29 @@ foreign, or cross-module array ABI.
   per shape; `docs/type-matrix.md` cannot see it, because a borrow has no
   declared local spelling for a source-level probe to write.
 
+- **A havoc path is exhaustive or it is wrong; fresh-state-for-a-type exists
+  once** (ADR 0074). `Generator::fresh_state_for(ty, binder, base, len)` is
+  the single answer to "what is a fresh symbolic state for a value of this
+  type": one binder of the type's Lean shape, the facts every checked
+  inhabitant satisfies, and the environment value that holds it. Parameter
+  entry, the one call-site havoc (`havoc_mut_borrow_args`, used by ordinary,
+  method, and constructor calls alike — `&mut [T]` arguments included), and
+  both loop-head havoc branches (the generic name branch and the init-field
+  branch) all consume it. The dispatch over `Ty` has no wildcard, so a new
+  constructor is a compile error in every havoc path at once, and a shape
+  with no fresh-state story latches a named `refuse_vc_type` refusal instead
+  of leaving a stale chain the prover would read as post-mutation state —
+  the false-proof mechanism behind the audited init-loop class-field and
+  loop-mutated raw-pointer holes. Site policy stays at the site: binder
+  names, the array length relation (entry states are bounded; havoc
+  preserves the replaced state's length), and the binding-mode filters. The
+  destructor context joins the method context in the loop havoc's `self`
+  branch (fresh state, field facts, no class invariant — ADR 0029), and
+  sealed raw/resource/device operations refuse a *field* borrow argument by
+  name (`resource.field_borrow_op`) rather than write a view back over the
+  whole object, with `sealed_borrow_root` as the arms' fail-closed second
+  layer.
+
 - **Affine options have a checked ownership identity and an exact local native
   slice.** G2.0 is the closed representation/fail-closed checkpoint; G2.1's
   checker/proof/interpreter/monitor slice and G2.2's formal-SVM slice are also
@@ -1237,10 +1260,14 @@ precedence. UART success, budget exhaustion, readiness clearing, ordered
 traces, invalid writes, profile reselection (including its precedence over
 script-expression traps), and all three selection contexts remain covered.
 The lowerer treats the formal array representation as an owned-local bridge,
-not a call/storage ABI. G1.5's complete one-worker closure is green: 175/175
-Rust library tests, the 394-subject corpus, LLVM CLI 6/6, exact native
-differential 1/1, SVM differential 86/86, and the allocator, grind-budget, LSP,
-and documentation gates.
+not a call/storage ABI. That boundary's complete one-worker closure was green at the time it was
+drawn — library tests, the then-394-subject corpus, the LLVM CLI and native
+differentials, the SVM differential, and the allocator, grind-budget, LSP,
+and documentation gates; the corpus has since grown well past that count.
+
+## The differential-pair harness
+
+`compiler/tests/pairs.rs` runs a second, Lean-free differential: each `corpus/pairs/` pair `<stem>.a.sable`/`<stem>.b.sable` holds two spellings of one program whose first-line marker says what must agree — `// pair: same-lean` compares front-end diagnostic-name sets and per-file α-normalized obligation multisets from the in-process emission path, `// pair: same-run` compares diagnostic names and the interpreter outcome of every zero-argument function — because treating two spellings of one program differently is the shape a false-proof defect takes before Lean ever sees it.
 
 ## Repo layout
 
@@ -1261,6 +1288,10 @@ corpus/test-fails/ dynamic tests that must be caught, annotated with the message
 corpus/svm-diff/   differential subjects: every function runs on interp.rs and on
                    the Lean SVM evaluator; outcomes must agree exactly (traps are
                    expected outcomes here, so this dir is never verified)
+corpus/pairs/      differential pairs <stem>.a.sable / <stem>.b.sable: equivalent
+                   spellings of one program, compared Lean-free by
+                   compiler/tests/pairs.rs per the first-line marker
+                   (// pair: same-lean | same-run)
 docs/notes/        probe files and audit notes (SVM draft findings, class encoding)
 editors/           Neovim setup + VS Code extension
 .sable-out/        immutable roots, module artifacts, proof-env source/build

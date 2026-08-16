@@ -1,0 +1,9 @@
+// pair: same-lean
+// See name_a_value.a.sable: naming the read must change nothing.
+
+/// pre  i < m.len
+/// post result = m.get i
+pub fn read_at(&[u32] m, u64 i) -> u32 {
+    u32 t = m[i];
+    return t;
+}

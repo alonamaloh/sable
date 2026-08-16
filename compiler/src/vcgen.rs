@@ -320,6 +320,41 @@ fn take_vc_type_refusal() -> Option<String> {
     VC_TYPE_REFUSAL.with(|latch| latch.borrow_mut().take())
 }
 
+/// The root name a sealed raw/resource operation's borrow argument writes its
+/// fresh state back under.
+///
+/// Every sealed-op arm keys its write-back by this name, so a *field* borrow
+/// (`&mut self.mem` — spellable in a destructor, ADR 0029) has no honest
+/// answer here: using the root would overwrite the whole object with a view.
+/// The checker refuses the shape first (`resource.field_borrow_op`); this is
+/// the same refusal at the arm, fail-closed (ADR 0074) — latch and return a
+/// key no environment entry uses, so nothing is clobbered before `generate`
+/// fails on the latch.
+fn sealed_borrow_root(arg: &Expr, op: &str) -> String {
+    match &arg.kind {
+        ExprKind::Borrow { array, field: None, .. } => array.clone(),
+        ExprKind::Borrow {
+            array,
+            field: Some(f),
+            ..
+        } => {
+            refuse_vc_type(format!(
+                "internal.vcgen.sealed_field_borrow: a borrow of the field `{array}.{f}` \
+                 reached sealed `{op}`; the checker's `resource.field_borrow_op` gate \
+                 refuses this shape first"
+            ));
+            format!("_refused_{op}")
+        }
+        _ => {
+            refuse_vc_type(format!(
+                "internal.vcgen.sealed_borrow_shape: sealed `{op}` needs an explicit \
+                 borrow argument"
+            ));
+            format!("_refused_{op}")
+        }
+    }
+}
+
 /// The Lean type name used where a payload has none. It does not exist in the
 /// prelude, so it cannot elaborate even if the latch were somehow ignored.
 const UNSUPPORTED_LEAN_TY: &str = "Sable.UnsupportedPayload";
@@ -584,12 +619,9 @@ pub(crate) fn validate_vc_type_position(
     // and the positions a borrow may be *written* in stay the parser's row
     // and `check::borrow_referent_ty`'s to state.
     if ty.is_owned_array_of(&Ty::Bool) {
-        if matches!(position, VcTypePosition::Expression | VcTypePosition::Local) {
-            return Ok(());
-        }
         let position = match position {
             VcTypePosition::Expression | VcTypePosition::Local => {
-                unreachable!("an owned Boolean array is admitted as a local value")
+                return Ok(());
             }
             VcTypePosition::Parameter => "a function parameter",
             VcTypePosition::TraitParameter => "a trait parameter",
@@ -2361,6 +2393,20 @@ pub(crate) fn generate(
     Ok(result)
 }
 
+/// The length relation a site supplies for a fresh array state. The facts
+/// every inhabitant of a type satisfies do not include one: what a fresh
+/// length equals depends on where the fresh state is made — a parameter's
+/// entry state is merely representable, while a havoc preserves the length
+/// of the state it replaces (stores are the only array mutation).
+enum LenFact {
+    /// `0 ≤ len ∧ len ≤ u64.max` — a parameter's entry state.
+    Bounded,
+    /// `len = (<prior>.len)` — a havoc that replaces a still-nameable state.
+    Eq(String),
+    /// No usable relation (the prior chain died with a body-local name).
+    Skip,
+}
+
 #[derive(Debug, Clone)]
 enum Val {
     Int(String),
@@ -2601,7 +2647,30 @@ impl<'a> Generator<'a> {
                     self.push_class_state_facts(&inner, &path);
                     self.push_invariant_hyps(&inner, &path);
                 }
-                _ => {}
+                // A resource field contributes its view's well-formedness:
+                // every view a field can hold carried it at the binding
+                // site the value came from (a parameter, an allocation, or
+                // a sealed operation's fresh state).
+                Ty::Res(k) => {
+                    let path = format!("({binder}.{})", fld.name);
+                    for (h, prop) in
+                        view_wf_hyps(*k, &format!("field_{}", fld.name), &path, self.records)
+                    {
+                        self.push_hyp_unique(h, prop);
+                    }
+                }
+                // No representability fact exists for the rest: `Bool` is
+                // its own complete domain, a raw pointer is unconstrained
+                // data, and an option's payload fact lives with its
+                // accessors.
+                Ty::Bool
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Record(_)
+                | Ty::Unit
+                | Ty::Borrow(..) => {}
             }
         }
     }
@@ -2653,6 +2722,147 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// What a fresh symbolic state for a value of a type *is*: one binder of
+    /// the type's Lean shape, the facts every checked inhabitant satisfies,
+    /// and the environment value that holds it. Parameter entry, the
+    /// call-site havoc, and both loop-head havoc branches all read their
+    /// answer here — the three divergent copies of this dispatch are where
+    /// every stale-chain hole has lived (ADR 0074).
+    ///
+    /// Exhaustive over `Ty` with no wildcard: a shape with no fresh-state
+    /// story latches a named fail-closed refusal instead of leaving a
+    /// pre-havoc chain in the environment, and a new `Ty` constructor is a
+    /// compile error here rather than a shape no havoc ever looked at.
+    ///
+    /// `binder` is the fresh binder's name — that is site policy (`_old_p`,
+    /// `_selfN_f`, `_arrN`, a source-hinted symbol) and never decides the
+    /// Lean shape. `base` anchors hypothesis names (`h_{base}_range`,
+    /// `h_{base}_len`, ...), so discharge scripts survive where the sites
+    /// already agreed on them.
+    fn fresh_state_for(&mut self, ty: &Ty, binder: &str, base: &str, len: LenFact) -> Val {
+        // Dispatch on what the type *names*: `&mut [T]`'s fresh state is a
+        // sequence exactly as `[T]`'s is, and how the storage is bound was
+        // the caller's question (a shared borrow is never havocked, and a
+        // unique borrow's binder name is the caller's choice).
+        match ty.referent() {
+            Ty::Int(it) => {
+                let it = *it;
+                self.binders.push((binder.to_string(), "Int".into()));
+                self.push_hyp_unique(format!("h_{base}_range"), self.r_prop(binder, it));
+                Val::Int(binder.to_string())
+            }
+            Ty::Param(parameter) => {
+                let model = adr0009_ty_int_model(Ty::Param(*parameter));
+                self.binders.push((binder.to_string(), "Int".into()));
+                self.push_hyp_unique(format!("h_{base}_range"), self.r_prop(binder, model));
+                Val::Int(binder.to_string())
+            }
+            Ty::Bool => {
+                self.binders.push((binder.to_string(), "Bool".into()));
+                Val::Prop(format!("({binder} = true)"))
+            }
+            // A fresh option holds a checked program value when present, so
+            // an integer payload carries its range fact over `.value` (the
+            // absent case reads `getD default = 0`, in range for every
+            // integer type — ADR 0008's junk-value model). `Bool` is its own
+            // complete domain and needs no fact.
+            Ty::Option(element) => {
+                let element = element.as_ref().clone();
+                self.binders
+                    .push((binder.to_string(), lean_option_ty(&element)));
+                if let Ty::Int(it) = element {
+                    self.push_hyp_unique(
+                        format!("h_{base}_range"),
+                        self.r_prop(&format!("(({binder}).value)"), it),
+                    );
+                }
+                Val::Opt(binder.to_string())
+            }
+            Ty::OptionRaw(_) => {
+                self.binders
+                    .push((binder.to_string(), "Option Sable.RawPtr".into()));
+                Val::Opt(binder.to_string())
+            }
+            Ty::Record(ri) => {
+                let record = lean_record_name(&self.records[*ri].name);
+                self.binders.push((binder.to_string(), record.clone()));
+                // Nominal well-formedness is an implicit checked-type
+                // postcondition: every record value a program can hold was
+                // built through the checked constructor.
+                self.push_hyp_unique(format!("h_{base}_wf"), format!("{record}.wf {binder}"));
+                Val::Record(binder.to_string())
+            }
+            // A fresh class state carries its field facts and the class
+            // invariant: class values only arise from init/method exits,
+            // each of which re-establishes it. (The one state that may NOT
+            // assume the invariant — mid-member `self` — is versioned by the
+            // havoc's own `self` branch, never through here.)
+            Ty::Class(ci) => {
+                let cd = &self.classes[*ci];
+                self.binders
+                    .push((binder.to_string(), lean_class_name(&cd.name)));
+                self.push_class_state_facts(cd, binder);
+                self.push_invariant_hyps(cd, binder);
+                Val::Obj(binder.to_string())
+            }
+            // A fresh resource state is a fresh *view* with the view's own
+            // well-formedness; the token it belongs to is a checker property
+            // and appears nowhere here (ADR 0024).
+            Ty::Res(k) => {
+                let k = *k;
+                self.binders
+                    .push((binder.to_string(), lean_res_view_ty(k, self.records)));
+                for (h, prop) in view_wf_hyps(k, base, binder, self.records) {
+                    self.push_hyp_unique(h, prop);
+                }
+                Val::View(binder.to_string())
+            }
+            // A raw pointer is data — provenance and an offset, no
+            // authority. A fresh one is unconstrained: whatever is known
+            // about it must come from the site's own facts or invariants.
+            Ty::Raw(_) | Ty::RawRecord(_) => {
+                self.binders.push((binder.to_string(), "Sable.RawPtr".into()));
+                Val::Ptr(binder.to_string())
+            }
+            Ty::Array(element) => {
+                let element = element.as_ref().clone();
+                self.binders
+                    .push((binder.to_string(), lean_array_ty(&element)));
+                match len {
+                    LenFact::Bounded => self.push_hyp_unique(
+                        format!("h_{base}_len"),
+                        format!("0 ≤ {binder}.len ∧ {binder}.len ≤ u64.max"),
+                    ),
+                    LenFact::Eq(prior) => self.push_hyp_unique(
+                        format!("h_{base}_len"),
+                        format!("({binder}.len) = ({prior}.len)"),
+                    ),
+                    LenFact::Skip => {}
+                }
+                if let Some(prop) = self.array_element_range_prop(binder, &element) {
+                    self.push_hyp_unique(format!("h_{base}_elems"), prop);
+                }
+                Val::Arr(binder.to_string())
+            }
+            Ty::Unit => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.fresh_state_unsupported: `()` has no fresh symbolic \
+                     state (for `{base}`)"
+                ));
+                Val::Unit
+            }
+            // `referent` looks through one borrow, so this arm is a borrow
+            // of a borrow — a shape no checked program holds storage under.
+            Ty::Borrow(..) => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.fresh_state_unsupported: a borrow of a borrow reached \
+                     a havoc path (for `{base}`)"
+                ));
+                Val::Unit
+            }
+        }
+    }
+
     /// `&mut C` arguments come back in a fresh state — the callee may have
     /// mutated them within its posts, and keeping the pre-call symbol
     /// would assert those posts over storage the callee changed. Assuming
@@ -2666,87 +2876,101 @@ impl<'a> Generator<'a> {
     /// the caller still owns after the call, and what a loop's shape check
     /// preserves across a backedge (ADR 0024).
     ///
+    /// A `&mut [T]` argument is the same move again with a sequence: the
+    /// callee may have stored into it arbitrarily (within its posts), and
+    /// omitting this havoc asserts posts over the pre-call state and yields
+    /// inconsistent hypotheses. Length and element ranges are preserved by
+    /// construction (stores are the only mutation); the callee's posts,
+    /// substituted over the fresh symbol, say the rest.
+    ///
     /// Returns param name → post-call state, for the callee's posts.
     fn havoc_mut_borrow_args(&mut self, params: &[Param], args: &[Expr]) -> Vec<(String, String)> {
-        enum Target {
-            Class(usize),
-            View(ResKind),
-        }
         // The borrowed *place*, which may be a field: `&mut self.w` names
         // `w` inside `self`, so the fresh state has to be written back into
         // the object rather than replacing it. Getting this wrong replaced
         // `self` with a view and lost the whole self-chain.
-        let targets: Vec<(String, String, Option<String>, Target)> = params
+        //
+        // Only a *unique* borrow lets the callee change storage the caller
+        // still names, so only these come back fresh. That is a
+        // binding-mode filter; the dispatch over what the borrow names is
+        // `fresh_state_for`'s, and is exhaustive (ADR 0074).
+        let targets: Vec<(String, Ty, String, Option<String>)> = params
             .iter()
             .zip(args.iter())
             .filter_map(|(p, arg)| {
+                let referent = p.ty.as_unique_borrow()?.clone();
                 let ExprKind::Borrow { array, field, .. } = &arg.kind else {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.mut_borrow_arg_shape: `&mut` parameter `{}` was \
+                         passed a non-borrow argument",
+                        p.name
+                    ));
                     return None;
                 };
-                // Only a *unique* borrow lets the callee change storage the
-                // caller still names, so only these need the invariant
-                // re-established at the call.
-                match p.ty.as_unique_borrow() {
-                    Some(Ty::Class(aci)) => Some((
-                        p.name.clone(),
-                        array.clone(),
-                        field.clone(),
-                        Target::Class(*aci),
-                    )),
-                    Some(Ty::Res(k)) => Some((
-                        p.name.clone(),
-                        array.clone(),
-                        field.clone(),
-                        Target::View(*k),
-                    )),
-                    _ => None,
-                }
+                Some((p.name.clone(), referent, array.clone(), field.clone()))
             })
             .collect();
         let mut out = Vec::new();
-        for (pname, array, field, target) in targets {
+        for (pname, referent, array, field) in targets {
             let hint = match &field {
                 Some(f) => format!("{array}_{f}"),
                 None => array.clone(),
             };
-            let b = match target {
-                Target::Class(aci) => {
-                    let aname = self.classes[aci].name.clone();
-                    let b = self.hinted_sym("_obj", Some(hint));
-                    self.binders.push((b.clone(), lean_class_name(&aname)));
-                    let acd = &self.classes[aci];
-                    self.push_class_state_facts(acd, &b);
-                    self.push_invariant_hyps(acd, &b);
-                    b
+            // Binder naming is site policy: an array keeps its positional
+            // `_arrN` name, a class state or view its source-anchored hint.
+            // (The `_st` fallback names shapes `fresh_state_for` refuses.)
+            let (b, len) = match &referent {
+                Ty::Array(_) => {
+                    let chain = match (&field, self.env.get(array.as_str())) {
+                        (None, Some(Val::Arr(s))) => Some(s.clone()),
+                        (Some(f), Some(Val::Obj(base))) => Some(project_field(base, f)),
+                        _ => None,
+                    };
+                    let len = match chain {
+                        Some(chain) => LenFact::Eq(chain),
+                        None => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.mut_borrow_arg_state: `&mut` array \
+                                 argument `{hint}` has no pre-call sequence state"
+                            ));
+                            LenFact::Skip
+                        }
+                    };
+                    self.fresh += 1;
+                    (format!("_arr{}", self.fresh), len)
                 }
-                Target::View(k) => {
-                    let b = self.hinted_sym("_view", Some(hint));
-                    self.binders
-                        .push((b.clone(), lean_res_view_ty(k, self.records)));
-                    for (h, prop) in view_wf_hyps(k, &array, &b, self.records) {
-                        self.push_hyp_unique(h, prop);
-                    }
-                    b
-                }
+                Ty::Class(_) => (self.hinted_sym("_obj", Some(hint)), LenFact::Skip),
+                Ty::Res(_) => (self.hinted_sym("_view", Some(hint)), LenFact::Skip),
+                _ => (self.hinted_sym("_st", Some(hint)), LenFact::Skip),
             };
+            let fresh = self.fresh_state_for(&referent, &b, &array, len);
             match field {
                 // A whole place: the name now holds the fresh state.
                 None => {
-                    let v = match target {
-                        Target::Class(_) => Val::Obj(b.clone()),
-                        Target::View(_) => Val::View(b.clone()),
-                    };
-                    self.env.insert(array, v);
+                    self.env.insert(array, fresh);
                 }
                 // A field place: write the fresh state back into the base,
                 // leaving every sibling where it was.
                 Some(f) => {
+                    let vs = match &fresh {
+                        Val::Int(s)
+                        | Val::Opt(s)
+                        | Val::Arr(s)
+                        | Val::Obj(s)
+                        | Val::Record(s)
+                        | Val::View(s)
+                        | Val::Ptr(s) => s.clone(),
+                        Val::Prop(p) => lean_bool_value(p),
+                        // `fresh_state_for` refused the shape and latched;
+                        // leave the base untouched rather than write junk.
+                        Val::Unit => continue,
+                    };
                     let base = match self.env.get(array.as_str()) {
                         Some(Val::Obj(chain)) => chain.clone(),
                         _ => array.clone(),
                     };
                     self.env
-                        .insert(array, Val::Obj(format!("{{ {base} with {f} := {b} }}")));
+                        .insert(array, Val::Obj(format!("{{ {base} with {f} := {vs} }}")));
                 }
             }
             out.push((pname, b));
@@ -2780,141 +3004,24 @@ impl<'a> Generator<'a> {
         }
         for p in &self.f.params {
             self.var_tys.insert(p.name.clone(), p.ty.clone());
-            // Dispatch on what the parameter names; how it is bound decides
-            // the binder's *name* below, never its Lean type.
-            match p.ty.referent() {
-                Ty::Class(ci) => {
-                    // A class borrow (ADR 0010, ADR 0023) or a class
-                    // taken by value (ADR 0020): the class value with its
-                    // field facts and invariant — the method-entry
-                    // treatment, re-aimed. A move and a borrow differ in
-                    // the affine discipline and at runtime, not in the
-                    // logic.
-                    //
-                    // A `&mut C`'s binder is the *entry* state `_old_p`,
-                    // exactly as a `&mut` array's is: the current state
-                    // lives in the symbolic env and is replaced whenever
-                    // a `&mut self` method is called on it, and `old p`
-                    // in clauses resolves to the binder.
-                    let cd = &self.classes[*ci];
-                    let binder = if p.ty.is_unique_borrow() {
-                        let b = format!("_old_{}", p.name);
-                        self.entry_states.insert(p.name.clone(), b.clone());
-                        b
-                    } else {
-                        p.name.clone()
-                    };
-                    self.binders
-                        .push((binder.clone(), lean_class_name(&cd.name)));
-                    self.push_class_state_facts(cd, &binder);
-                    self.push_invariant_hyps(cd, &binder);
-                    self.env.insert(p.name.clone(), Val::Obj(binder));
-                }
-                Ty::Record(ri) => {
-                    let lean_record = lean_record_name(&self.records[*ri].name);
-                    self.binders.push((p.name.clone(), lean_record.clone()));
-                    self.hyps.push((
-                        format!("h_{}_wf", p.name),
-                        format!("{lean_record}.wf {}", p.name),
-                    ));
-                    self.env.insert(p.name.clone(), Val::Record(p.name.clone()));
-                }
-                // A resource parameter binds its *view* and nothing
-                // else: the authority it carries is a checker property,
-                // and no generated VC ever mentions it (ADR 0022/0024).
-                // A `resource &mut R` follows the `&mut` array rule —
-                // entry state as the binder, current state in the env.
-                Ty::Res(k) => {
-                    let binder = if p.ty.is_unique_borrow() {
-                        let b = format!("_old_{}", p.name);
-                        self.entry_states.insert(p.name.clone(), b.clone());
-                        b
-                    } else {
-                        p.name.clone()
-                    };
-                    self.binders
-                        .push((binder.clone(), lean_res_view_ty(*k, self.records)));
-                    for (h, prop) in view_wf_hyps(*k, &p.name, &binder, self.records) {
-                        self.hyps.push((h, prop));
-                    }
-                    self.env.insert(p.name.clone(), Val::View(binder));
-                }
-                Ty::Raw(_) | Ty::RawRecord(_) => {
-                    self.binders.push((p.name.clone(), "Sable.RawPtr".into()));
-                    self.env.insert(p.name.clone(), Val::Ptr(p.name.clone()));
-                }
-                Ty::OptionRaw(_) => {
-                    self.binders
-                        .push((p.name.clone(), "Option Sable.RawPtr".into()));
-                    self.env.insert(p.name.clone(), Val::Opt(p.name.clone()));
-                }
-                Ty::Int(it) => {
-                    self.binders.push((p.name.clone(), "Int".into()));
-                    self.hyps
-                        .push((format!("h_{}_range", p.name), self.r_prop(&p.name, *it)));
-                    self.env.insert(p.name.clone(), Val::Int(p.name.clone()));
-                }
-                Ty::Param(parameter) => {
-                    let model = adr0009_ty_int_model(Ty::Param(*parameter));
-                    self.binders.push((p.name.clone(), "Int".into()));
-                    self.hyps
-                        .push((format!("h_{}_range", p.name), self.r_prop(&p.name, model)));
-                    self.env.insert(p.name.clone(), Val::Int(p.name.clone()));
-                }
-                Ty::Bool => {
-                    self.binders.push((p.name.clone(), "Bool".into()));
-                    self.env
-                        .insert(p.name.clone(), Val::Prop(format!("({} = true)", p.name)));
-                }
-                Ty::Array(elem) => {
-                    // A &mut array's binder is the *entry* state `_old_a`;
-                    // the current state lives in the symbolic env (a `.set`
-                    // chain), and `old a` in clauses resolves to the binder.
-                    let binder = match p.ty.binding_mode() {
-                        BindingMode::Mut => format!("_old_{}", p.name),
-                        BindingMode::Shared => p.name.clone(),
-                        BindingMode::Owned => unreachable!("owned arrays are test-only locals"),
-                    };
-                    self.binders
-                        .push((binder.clone(), lean_array_ty(&elem.clone())));
-                    self.hyps.push((
-                        format!("h_{}_len", p.name),
-                        format!("0 ≤ {binder}.len ∧ {binder}.len ≤ u64.max"),
-                    ));
-                    if let Some(prop) = self.array_element_range_prop(&binder, &elem.clone()) {
-                        self.hyps.push((format!("h_{}_elems", p.name), prop));
-                    }
-                    if p.ty.is_unique_borrow() {
-                        self.entry_states.insert(p.name.clone(), binder.clone());
-                    }
-                    self.env.insert(p.name.clone(), Val::Arr(binder));
-                }
-                // A value-option parameter binds `Option Int` / `Option
-                // Bool`, the same proof surface an option local or call
-                // result has. An integer payload carries its range fact
-                // over `.value`: a present option holds a checked program
-                // value, and an absent one reads `getD default = 0`, in
-                // range for every integer type (ADR 0008's junk-value
-                // model). `Bool` is its own domain and needs no fact. A
-                // return binder deliberately transports only the callee's
-                // posts; the parameter side carries the range fact because
-                // the callee's arithmetic on `.value` starts from nothing
-                // else.
-                Ty::Option(element) => {
-                    self.binders
-                        .push((p.name.clone(), lean_option_ty(&element.clone())));
-                    if let Ty::Int(it) = element.as_ref() {
-                        self.hyps.push((
-                            format!("h_{}_range", p.name),
-                            self.r_prop(&format!("(({}).value)", p.name), *it),
-                        ));
-                    }
-                    self.env.insert(p.name.clone(), Val::Opt(p.name.clone()));
-                }
-                Ty::Borrow(..) | Ty::Unit => {
-                    unreachable!("checked: no such params")
-                }
-            }
+            // How a parameter is bound decides the binder's *name*, never
+            // its Lean shape — `fresh_state_for` reads the shape off what
+            // the type names. A unique borrow's binder is the *entry* state
+            // `_old_p`, exactly as a `&mut` array's or a `&mut C`'s is: the
+            // current state lives in the symbolic env and is replaced by
+            // stores, `&mut self` method calls, and havoc, while `old p` in
+            // clauses resolves to the binder (ADR 0023).
+            let binder = if p.ty.is_unique_borrow() {
+                let b = format!("_old_{}", p.name);
+                self.entry_states.insert(p.name.clone(), b.clone());
+                b
+            } else {
+                p.name.clone()
+            };
+            let ty = p.ty.clone();
+            let name = p.name.clone();
+            let value = self.fresh_state_for(&ty, &binder, &name, LenFact::Bounded);
+            self.env.insert(name, value);
         }
         let f = self.f;
         for (i, pre) in f.pres.iter().enumerate() {
@@ -3797,208 +3904,167 @@ impl<'a> Generator<'a> {
 
         for name in &havoc_names {
             let name = *name;
-            // Mid-method self-mutation in a loop: fresh state binder,
-            // field facts only (the class invariant is NOT in force
-            // mid-method, design §7).
             if name == "self" {
-                if let Cctx::Method(class, _) = self.cctx {
-                    let b = self.hinted_sym("_self", Some("_self_loop".to_string()));
-                    self.binders.push((b.clone(), lean_class_name(&class.name)));
-                    self.push_class_state_facts(class, &b);
-                    self.env.insert("self".to_string(), Val::Obj(b));
-                    continue;
-                }
-                if let Cctx::Init(class) = self.cctx {
+                match self.cctx {
+                    // Mid-member self-mutation in a loop: fresh state
+                    // binder, field facts only. The class invariant is NOT
+                    // in force mid-method (design §7), and a destructor's
+                    // entry invariant is likewise not re-established once
+                    // its body has run (ADR 0029) — loop invariants carry
+                    // whatever the continuation needs.
+                    Cctx::Method(class, _) | Cctx::Deinit(class) => {
+                        let b = self.hinted_sym("_self", Some("_self_loop".to_string()));
+                        self.binders.push((b.clone(), lean_class_name(&class.name)));
+                        self.push_class_state_facts(class, &b);
+                        self.env.insert("self".to_string(), Val::Obj(b));
+                        continue;
+                    }
                     // Init loops mutate fields through `self.<field>` env
                     // entries (there is no whole-object state yet): version
-                    // each mutated field individually — stores preserve
-                    // length and element ranges, mirroring the owned-array
-                    // treatment. Leaving the chains in place would let the
-                    // pre-loop field value survive the loop (same class of
-                    // bug as must-fail/owned_loop_stale).
-                    for fld in &class.fields {
-                        let key = format!("self.{}", fld.name);
-                        match (fld.ty.clone(), self.env.get(&key).cloned()) {
-                            (Ty::Array(elem), Some(Val::Arr(chain))) => {
-                                let prior = substitute(&chain, &stale_map, None);
-                                self.fresh += 1;
-                                let b = format!("_self{}_{}", self.fresh, fld.name);
-                                self.binders.push((b.clone(), lean_array_ty(&elem)));
-                                if !havoc_set
-                                    .iter()
-                                    .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
-                                {
-                                    self.push_hyp_unique(
-                                        format!("h_self_{}_len", fld.name),
-                                        format!("({b}.len) = ({prior}.len)"),
-                                    );
+                    // every tracked field — leaving ANY field's chain in
+                    // place would let the pre-loop value survive the loop
+                    // (same class of bug as must-fail/owned_loop_stale),
+                    // and `fresh_state_for` is exhaustive over the field's
+                    // type, so a field with no fresh-state story refuses
+                    // rather than keeping its chain.
+                    Cctx::Init(class) => {
+                        for fld in &class.fields {
+                            let key = format!("self.{}", fld.name);
+                            let Some(prior_value) = self.env.get(&key).cloned() else {
+                                continue;
+                            };
+                            self.fresh += 1;
+                            let b = format!("_self{}_{}", self.fresh, fld.name);
+                            // Stores preserve length, so an array field
+                            // keeps its relation to the pre-loop chain when
+                            // that chain survives the havoc (rewritten to
+                            // the stale binder names).
+                            let len = match &prior_value {
+                                Val::Arr(chain) => {
+                                    let prior = substitute(chain, &stale_map, None);
+                                    if havoc_set.iter().any(|h| {
+                                        !stale_map.contains_key(h) && mentions(&prior, h)
+                                    }) {
+                                        LenFact::Skip
+                                    } else {
+                                        LenFact::Eq(prior)
+                                    }
                                 }
-                                if let Some(prop) = self.array_element_range_prop(&b, &elem) {
-                                    self.push_hyp_unique(
-                                        format!("h_self_{}_elems", fld.name),
-                                        prop,
-                                    );
-                                }
-                                self.env.insert(key, Val::Arr(b));
-                            }
-                            (Ty::Int(it), Some(Val::Int(_))) => {
-                                self.fresh += 1;
-                                let b = format!("_self{}_{}", self.fresh, fld.name);
-                                self.binders.push((b.clone(), "Int".into()));
-                                self.push_hyp_unique(
-                                    format!("h_self_{}_range", fld.name),
-                                    self.r_prop(&b, it),
-                                );
-                                self.env.insert(key, Val::Int(b));
-                            }
-                            (Ty::Param(parameter), Some(Val::Int(_))) => {
-                                self.fresh += 1;
-                                let b = format!("_self{}_{}", self.fresh, fld.name);
-                                self.binders.push((b.clone(), "Int".into()));
-                                self.push_hyp_unique(
-                                    format!("h_self_{}_range", fld.name),
-                                    self.r_prop(&b, adr0009_ty_int_model(Ty::Param(parameter))),
-                                );
-                                self.env.insert(key, Val::Int(b));
-                            }
-                            (Ty::Bool, Some(Val::Prop(_))) => {
-                                self.fresh += 1;
-                                let b = format!("_self{}_{}", self.fresh, fld.name);
-                                self.binders.push((b.clone(), "Bool".into()));
-                                self.env.insert(key, Val::Prop(format!("({b} = true)")));
-                            }
-                            _ => {}
+                                _ => LenFact::Skip,
+                            };
+                            let ty = fld.ty.clone();
+                            let base = format!("self_{}", fld.name);
+                            let value = self.fresh_state_for(&ty, &b, &base, len);
+                            self.env.insert(key, value);
                         }
+                        continue;
                     }
+                    Cctx::None => {}
+                }
+            }
+            // A composite key (`self.<field>`) versions through its base's
+            // branch above. One that reaches here alone was pulled in by
+            // the cascade: its place was not assigned in the loop, but its
+            // chain mentions a havocked name, so rewrite the chain to the
+            // stale binders — the pre-loop value is intact and that is its
+            // name now. A chain over a body-local (no stale binder) has no
+            // pre-loop spelling at all: refuse rather than keep it.
+            if name.contains('.') {
+                let base = name.split('.').next().expect("split yields a first piece");
+                if havoc_set.contains(base) {
                     continue;
                 }
+                let Some(value) = self.env.get(name).cloned() else {
+                    continue;
+                };
+                let rewrite = |s: &String| substitute(s, &stale_map, None);
+                let (chain, rebuilt) = match &value {
+                    Val::Int(s) => (rewrite(s), Val::Int(rewrite(s))),
+                    Val::Prop(s) => (rewrite(s), Val::Prop(rewrite(s))),
+                    Val::Opt(s) => (rewrite(s), Val::Opt(rewrite(s))),
+                    Val::Arr(s) => (rewrite(s), Val::Arr(rewrite(s))),
+                    Val::Obj(s) => (rewrite(s), Val::Obj(rewrite(s))),
+                    Val::Record(s) => (rewrite(s), Val::Record(rewrite(s))),
+                    Val::View(s) => (rewrite(s), Val::View(rewrite(s))),
+                    Val::Ptr(s) => (rewrite(s), Val::Ptr(rewrite(s))),
+                    Val::Unit => continue,
+                };
+                if havoc_set
+                    .iter()
+                    .any(|h| !stale_map.contains_key(h) && mentions(&chain, h))
+                {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.havoc_stale_chain: `{name}` depends on a loop-body \
+                         local with no pre-loop state"
+                    ));
+                    continue;
+                }
+                self.env.insert(name.clone(), rebuilt);
+                continue;
             }
+            let Some(ty) = self.var_tys.get(name).cloned() else {
+                // A body-local declaration: it has no pre-loop state to go
+                // stale, so there is nothing to version. A pre-loop env
+                // entry under an untyped name would be a chain about to be
+                // recaptured by the fresh binders — refuse, fail closed.
+                if self.env.contains_key(name) {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.havoc_untyped_name: `{name}` is havocked at a \
+                         loop head but has no declared type"
+                    ));
+                }
+                continue;
+            };
             // A shared borrow names storage the loop cannot write, so it is
-            // never havocked; every arm below is an owned local or a unique
-            // borrow. Filtering here rather than in each arm keeps that rule
-            // in one place, since binding mode is a question about the type
-            // rather than a field of it.
-            let bound = self
-                .var_tys
-                .get(name)
-                .filter(|ty| ty.binding_mode() != BindingMode::Shared);
-            match bound.map(Ty::referent) {
-                Some(Ty::Int(it)) => {
-                    let it = *it;
-                    self.binders.push((name.clone(), "Int".into()));
-                    self.hyps
-                        .push((format!("h_{name}_range"), self.r_prop(name, it)));
-                    self.env.insert(name.clone(), Val::Int(name.clone()));
-                }
-                Some(Ty::Param(parameter)) => {
-                    let model = adr0009_ty_int_model(Ty::Param(*parameter));
-                    self.binders.push((name.clone(), "Int".into()));
-                    self.hyps
-                        .push((format!("h_{name}_range"), self.r_prop(name, model)));
-                    self.env.insert(name.clone(), Val::Int(name.clone()));
-                }
-                Some(Ty::Bool) => {
-                    self.binders.push((name.clone(), "Bool".into()));
-                    self.env
-                        .insert(name.clone(), Val::Prop(format!("({name} = true)")));
-                }
-                Some(Ty::Option(element)) => {
-                    self.binders
-                        .push((name.clone(), lean_option_ty(&element.clone())));
-                    self.env.insert(name.clone(), Val::Opt(name.clone()));
-                }
-                // A record local assigned in the loop is an arbitrary
-                // checked value at the next head. Rebind it just like an
-                // integer local, retaining only the nominal type's implicit
-                // well-formedness postcondition.
-                Some(Ty::Record(ri)) => {
-                    let record = lean_record_name(&self.records[*ri].name);
-                    self.binders.push((name.clone(), record.clone()));
-                    self.push_hyp_unique(format!("h_{name}_wf"), format!("{record}.wf {name}"));
-                    self.env.insert(name.clone(), Val::Record(name.clone()));
-                }
-                // A loop body called &mut methods on this class value (or,
-                // for a local, reassigned it from a call result): fresh
-                // state. The invariant held at each method exit (and
-                // ret_inv at each returning call), so it is sound to
-                // assume at the havoc point. A `&mut C` parameter is the
-                // same story: the loop may only rebind its *view*, never
-                // the borrow itself.
-                Some(Ty::Class(ci)) => {
-                    let cd = &self.classes[*ci];
-                    self.binders.push((name.clone(), lean_class_name(&cd.name)));
-                    self.push_class_state_facts(cd, name);
-                    self.push_invariant_hyps(cd, name);
-                    self.env.insert(name.clone(), Val::Obj(name.clone()));
-                }
-                // A loop body transformed this resource's view. The
-                // *token* is what the backedge shape check preserves; the
-                // view is havocked like any other mutated state, and the
-                // loop invariant is what carries it across. Confusing the
-                // two would make every loop drop the authority it carries.
-                Some(Ty::Res(k)) => {
-                    let k = *k;
-                    self.binders
-                        .push((name.clone(), lean_res_view_ty(k, self.records)));
-                    for (h, prop) in view_wf_hyps(k, name, name, self.records) {
-                        self.hyps.push((h, prop));
-                    }
-                    self.env.insert(name.clone(), Val::View(name.clone()));
-                }
-                Some(Ty::Array(elem)) => {
-                    let elem = elem.clone();
-                    self.binders.push((name.clone(), lean_array_ty(&elem)));
-                    // Stores are the only mutation and preserve length, so a
-                    // length fact is sound to assume at havoc. What it is
-                    // equated to differs by binding mode: a `&mut` parameter
-                    // has an entry-state binder, and an owned local has the
-                    // pre-havoc `.set` chain instead.
-                    if bound.is_some_and(Ty::is_unique_borrow) {
-                        // Only a parameter has an entry state, and only a
-                        // parameter can be a unique borrow here: a borrow is
-                        // not a local binding (ADR 0072). If some other name
-                        // reaches this arm the length relation has nothing to
-                        // be relative to, so refuse rather than index.
-                        match self.entry_states.get(name.as_str()).cloned() {
-                            Some(entry) => self.hyps.push((
-                                format!("h_{name}_len"),
-                                format!("({name}.len) = ({entry}.len)"),
-                            )),
-                            None => refuse_vc_type(format!(
-                                "internal.vcgen.borrow_without_entry_state: unique borrow \
-                                 `{name}` is live at a loop head with no entry state; a \
-                                 borrow is a parameter binding mode, not a local"
-                            )),
-                        }
-                    } else {
-                        // The prior chain may reference renamed binders
-                        // (alloc binders carry the source name): rewrite to
-                        // the stale names rather than dropping. It is kept
-                        // only when it does not itself mention a havocked
-                        // name (else drop to range facts).
-                        let prior = match self.env.get(name) {
-                            Some(Val::Arr(s)) => Some(substitute(s, &stale_map, None)),
-                            _ => None,
-                        };
-                        if let Some(prior) = prior {
-                            if !havoc_set
-                                .iter()
-                                .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
-                            {
-                                self.hyps.push((
-                                    format!("h_{name}_len"),
-                                    format!("({name}.len) = ({prior}.len)"),
-                                ));
-                            }
-                        }
-                    }
-                    if let Some(prop) = self.array_element_range_prop(name, &elem) {
-                        self.hyps.push((format!("h_{name}_elems"), prop));
-                    }
-                    self.env.insert(name.clone(), Val::Arr(name.clone()));
-                }
-                _ => {}
+            // never havocked; every fresh state below is an owned local or
+            // a unique borrow. This is a binding-mode filter — the dispatch
+            // over what the type names is `fresh_state_for`'s, exhaustive
+            // with no wildcard (ADR 0074).
+            if ty.binding_mode() == BindingMode::Shared {
+                continue;
             }
+            // Stores are the only array mutation and preserve length, so a
+            // length fact is sound to assume at havoc. What it is equated
+            // to differs by binding mode: a `&mut` parameter has an
+            // entry-state binder, and an owned local has the pre-havoc
+            // `.set` chain instead (rewritten to the stale names — alloc
+            // binders carry the source name — and kept only when it does
+            // not itself mention a havocked body-local).
+            let len = if ty.is_unique_borrow() {
+                // Only a parameter has an entry state, and only a
+                // parameter can be a unique borrow here: a borrow is not a
+                // local binding (ADR 0072). If some other name reaches this
+                // point the length relation has nothing to be relative to,
+                // so refuse rather than index.
+                match self.entry_states.get(name.as_str()).cloned() {
+                    Some(entry) => LenFact::Eq(entry),
+                    None => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.borrow_without_entry_state: unique borrow \
+                             `{name}` is live at a loop head with no entry state; a \
+                             borrow is a parameter binding mode, not a local"
+                        ));
+                        LenFact::Skip
+                    }
+                }
+            } else {
+                match self.env.get(name) {
+                    Some(Val::Arr(s)) => {
+                        let prior = substitute(s, &stale_map, None);
+                        if havoc_set
+                            .iter()
+                            .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
+                        {
+                            LenFact::Skip
+                        } else {
+                            LenFact::Eq(prior)
+                        }
+                    }
+                    _ => LenFact::Skip,
+                }
+            };
+            let value = self.fresh_state_for(&ty, name, name, len);
+            self.env.insert(name.clone(), value);
         }
     }
 
@@ -4218,9 +4284,7 @@ impl<'a> Generator<'a> {
                             format!("Sable.SpanView.namesByte ({m}) ({p}) {k}"),
                         );
                         self.push_obligation(ob);
-                        let ExprKind::Borrow { array: mname, .. } = &args[2].kind else {
-                            unreachable!("checked: borrow arg")
-                        };
+                        let mname = sealed_borrow_root(&args[2], op.name());
                         let m2 = self.hinted_sym("_view", Some(mname.clone()));
                         self.binders
                             .push((m2.clone(), ResKind::RawSpan.view_ty().into()));
@@ -4286,9 +4350,7 @@ impl<'a> Generator<'a> {
                             ),
                         );
                         self.push_obligation(ob);
-                        let ExprKind::Borrow { array: dname, .. } = &args[4].kind else {
-                            unreachable!("checked: borrow arg")
-                        };
+                        let dname = sealed_borrow_root(&args[4], op.name());
                         let d2 = self.hinted_sym("_view", Some(dname.clone()));
                         self.binders
                             .push((d2.clone(), ResKind::RawSpan.view_ty().into()));
@@ -4443,9 +4505,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array: name, .. } = &args[2].kind else {
-                            unreachable!("checked: borrow arg")
-                        };
+                        let name = sealed_borrow_root(&args[2], op.name());
                         let c2 = self.hinted_sym("_cell", Some(name.clone()));
                         let kind = if leased {
                             ResKind::LeasedPointsToU64
@@ -4510,9 +4570,7 @@ impl<'a> Generator<'a> {
                             range_prop(&value, IntTy::U64),
                         );
                         if matches!(op, RawOp::CellTakeU64) {
-                            let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
-                                unreachable!("checked: borrow arg")
-                            };
+                            let name = sealed_borrow_root(&args[1], op.name());
                             let c2 = self.hinted_sym("_cell", Some(name.clone()));
                             let kind = if leased {
                                 ResKind::LeasedPointsToU64
@@ -4560,9 +4618,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
-                            unreachable!("checked: borrow arg")
-                        };
+                        let name = sealed_borrow_root(&args[1], op.name());
                         let c2 = self.hinted_sym("_cell", Some(name.clone()));
                         let kind = if leased {
                             ResKind::LeasedPointsToU64
@@ -4682,9 +4738,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array: name, .. } = &args[2].kind else {
-                            unreachable!("checked: record cell borrow")
-                        };
+                        let name = sealed_borrow_root(&args[2], op.name());
                         let next = self.hinted_sym("_cell", Some(name.clone()));
                         self.binders.push((
                             next.clone(),
@@ -4741,9 +4795,7 @@ impl<'a> Generator<'a> {
                             format!("{record}.wf {value}"),
                         );
                         if taking {
-                            let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
-                                unreachable!("checked: record cell borrow")
-                            };
+                            let name = sealed_borrow_root(&args[1], op.name());
                             let next = self.hinted_sym("_cell", Some(name.clone()));
                             self.binders.push((
                                 next.clone(),
@@ -4787,9 +4839,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
-                            unreachable!("checked: record cell borrow")
-                        };
+                        let name = sealed_borrow_root(&args[1], op.name());
                         let next = self.hinted_sym("_cell", Some(name.clone()));
                         let record = lean_record_name(&self.records[*ri].name);
                         self.binders.push((
@@ -4911,9 +4961,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array: name, .. } = &args[3].kind else {
-                            unreachable!("checked: free header borrow")
-                        };
+                        let name = sealed_borrow_root(&args[3], op.name());
                         let h2 = self.hinted_sym("_header", Some(name.clone()));
                         self.binders
                             .push((h2.clone(), ResKind::FreeHeader.view_ty().into()));
@@ -4993,9 +5041,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
-                            unreachable!("checked: free header borrow")
-                        };
+                        let name = sealed_borrow_root(&args[1], op.name());
                         let h2 = self.hinted_sym("_header", Some(name.clone()));
                         self.binders
                             .push((h2.clone(), ResKind::FreeHeader.view_ty().into()));
@@ -5019,9 +5065,7 @@ impl<'a> Generator<'a> {
                         let Val::View(old) = self.eval(&args[0]) else {
                             unreachable!("checked: UART borrow")
                         };
-                        let ExprKind::Borrow { array: name, .. } = &args[0].kind else {
-                            unreachable!("checked: explicit mutable UART borrow")
-                        };
+                        let name = sealed_borrow_root(&args[0], op.name());
                         let status = self.hinted_sym("_uart_status", hint);
                         self.binders.push((status.clone(), "Int".into()));
                         self.push_hyp_unique(
@@ -5062,9 +5106,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&ready);
-                        let ExprKind::Borrow { array: name, .. } = &args[1].kind else {
-                            unreachable!("checked: explicit mutable UART borrow")
-                        };
+                        let name = sealed_borrow_root(&args[1], op.name());
                         let next = self.hinted_sym("_uart", Some(name.clone()));
                         self.binders
                             .push((next.clone(), ResKind::Uart.view_ty().into()));
@@ -5109,9 +5151,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: borrow arg")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let prefix = self.hinted_sym("_view", Some(array.clone()));
                         self.binders
                             .push((prefix.clone(), ResKind::RawSpan.view_ty().into()));
@@ -5205,9 +5245,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: borrow arg")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let w2 = self.hinted_sym("_world", Some(array.clone()));
                         self.binders
                             .push((w2.clone(), ResKind::PosixWorld.view_ty().into()));
@@ -5319,9 +5357,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: resource map borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let residual = self.hinted_sym("_resource_map", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), lean_res_view_ty(map_kind, self.records)));
@@ -5329,7 +5365,7 @@ impl<'a> Generator<'a> {
                             format!("h_{array}_take"),
                             format!("{residual} = Sable.ResourceMapView.erase ({map}) {key}"),
                         );
-                        for (h, prop) in view_wf_hyps(map_kind, array, &residual, self.records) {
+                        for (h, prop) in view_wf_hyps(map_kind, &array, &residual, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                         self.env.insert(array.clone(), Val::View(residual.clone()));
@@ -5382,9 +5418,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: resource map borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let restored = self.hinted_sym("_resource_map", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), lean_res_view_ty(map_kind, self.records)));
@@ -5399,7 +5433,7 @@ impl<'a> Generator<'a> {
                             format!("h_{array}_entry"),
                             format!("({restored}).entries {key} = some {cell}"),
                         );
-                        for (h, prop) in view_wf_hyps(map_kind, array, &restored, self.records) {
+                        for (h, prop) in view_wf_hyps(map_kind, &array, &restored, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                         self.env.insert(array.clone(), Val::View(restored));
@@ -5497,9 +5531,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: allocator borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5538,9 +5570,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: allocator borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5567,9 +5597,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: allocator borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5616,9 +5644,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: allocator borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5659,9 +5685,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: allocator borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5710,9 +5734,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: allocator borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5755,9 +5777,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: allocator borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5804,9 +5824,7 @@ impl<'a> Generator<'a> {
                         ob.hyps.retain(|(name, _)| !name.ends_with("_owner"));
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let ExprKind::Borrow { array, .. } = &args[0].kind else {
-                            unreachable!("checked: free block borrow")
-                        };
+                        let array = sealed_borrow_root(&args[0], op.name());
                         let prefix = self.hinted_sym("_free", Some(array.clone()));
                         self.binders
                             .push((prefix.clone(), ResKind::FreeBlock.view_ty().into()));
@@ -6189,7 +6207,10 @@ impl<'a> Generator<'a> {
                     .zip(arg_vals.iter().cloned())
                     .collect();
                 for p in &iparams {
-                    if matches!(p.ty.as_unique_borrow(), Some(Ty::Class(_) | Ty::Res(_))) {
+                    // `old p` of a `&mut` argument is its pre-call state —
+                    // one question, one pattern, for every referent a unique
+                    // borrow can name (ADR 0074).
+                    if p.ty.is_unique_borrow() {
                         subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
                     }
                 }
@@ -6458,8 +6479,32 @@ impl<'a> Generator<'a> {
                             self.push_hyp_unique(h, prop);
                         }
                     }
+                    Ty::OptionRaw(_) => {
+                        self.binders
+                            .push((ret_sym.clone(), "Option Sable.RawPtr".into()));
+                    }
+                    Ty::Raw(_) | Ty::RawRecord(_) => {
+                        self.binders.push((ret_sym.clone(), "Sable.RawPtr".into()));
+                    }
                     Ty::Unit => {}
-                    _ => unreachable!(),
+                    returned @ (Ty::Record(_)
+                    | Ty::Array(..)
+                    | Ty::Borrow(..)
+                    | Ty::Res(_)) => {
+                        // Spelled out so a new constructor is a compile error
+                        // here, and a return type with no fresh-state story
+                        // refuses rather than binding nothing (ADR 0074).
+                        // `Res` is caught by the resource guard above; a
+                        // method returning a record has no member signature
+                        // that admits it.
+                        refuse_vc_type(format!(
+                            "internal.vcgen.call_return_unsupported: `{}` has no \
+                             call-result state",
+                            returned.name()
+                        ));
+                        self.binders
+                            .push((ret_sym.clone(), UNSUPPORTED_LEAN_TY.into()));
+                    }
                 }
                 let fresh_args = self.havoc_mut_borrow_args(&mparams, args);
                 let cd = &self.classes[ci];
@@ -6471,8 +6516,10 @@ impl<'a> Generator<'a> {
                 let mut post_map = self.class_state_map(cd, &final_state);
                 for (p, a) in m.f.params.iter().zip(arg_vals.iter()) {
                     post_map.insert(p.name.clone(), a.clone());
-                    // `old p` of a `&mut` argument is its pre-call state.
-                    if matches!(p.ty.as_unique_borrow(), Some(Ty::Class(_) | Ty::Res(_))) {
+                    // `old p` of a `&mut` argument is its pre-call state —
+                    // one question, one pattern, for every referent a unique
+                    // borrow can name (ADR 0074).
+                    if p.ty.is_unique_borrow() {
                         post_map.insert(format!("_old_{}", p.name), a.clone());
                     }
                 }
@@ -6504,13 +6551,27 @@ impl<'a> Generator<'a> {
                         post.line_span,
                     ));
                 }
+                // Same payload fact as `fresh_state_for`, emitted after the
+                // posts for the same motive-capture reason as the free call.
+                if let Ty::Option(element) = &m.f.ret {
+                    if let Ty::Int(it) = element.as_ref() {
+                        self.push_hyp_unique(
+                            format!("h_{}_range", ret_sym.trim_start_matches('_')),
+                            self.r_prop(&format!("(({ret_sym}).value)"), *it),
+                        );
+                    }
+                }
                 match m.f.ret {
-                    Ty::Option(_) => Val::Opt(ret_sym),
+                    Ty::Option(_) | Ty::OptionRaw(_) => Val::Opt(ret_sym),
                     Ty::Unit => Val::Unit,
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
                     ref returned if returned.is_resource() => Val::View(ret_sym),
+                    Ty::Raw(_) | Ty::RawRecord(_) => Val::Ptr(ret_sym),
                     Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
+                    // A return shape with no value story latched a refusal
+                    // in the binder match above; the placeholder keeps the
+                    // walk total until generation fails on the latch.
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -6707,35 +6768,11 @@ impl<'a> Generator<'a> {
                     self.push_obligation(ob);
                 }
 
-                // &mut array arguments come back in a FRESH state — the
-                // callee may have mutated them arbitrarily (within its
-                // posts). Length and element ranges are preserved by
-                // construction (stores are the only mutation); the callee's
-                // posts, substituted over the fresh symbol, say the rest.
-                // Omitting this havoc asserts posts over the pre-call state
-                // and yields inconsistent hypotheses.
-                for (p, arg) in sig.params.iter().zip(args.iter()) {
-                    let Some(elem) = p.ty.as_unique_borrow().and_then(Ty::as_owned_array) else {
-                        continue;
-                    };
-                    let ExprKind::Borrow { array, .. } = &arg.kind else {
-                        unreachable!("checked: borrow args")
-                    };
-                    let old_chain = subst_map[&p.name].clone();
-                    self.fresh += 1;
-                    let b = format!("_arr{}", self.fresh);
-                    self.binders.push((b.clone(), lean_array_ty(elem)));
-                    self.hyps.push((
-                        format!("h_{array}_len"),
-                        format!("({b}.len) = ({old_chain}.len)"),
-                    ));
-                    if let Some(prop) = self.array_element_range_prop(&b, elem) {
-                        self.hyps.push((format!("h_{array}_elems"), prop));
-                    }
-                    self.env.insert(array.clone(), Val::Arr(b.clone()));
-                    subst_map.insert(p.name.clone(), b);
-                }
-
+                // Every `&mut` argument — array, class, or resource — comes
+                // back in a FRESH state through the one call-site havoc
+                // (ADR 0074): the callee may have mutated it arbitrarily
+                // within its posts, and omitting the havoc asserts those
+                // posts over the pre-call state.
                 for (pname, fresh) in self.havoc_mut_borrow_args(&params, args) {
                     subst_map.insert(pname, fresh);
                 }
@@ -6792,12 +6829,29 @@ impl<'a> Generator<'a> {
                         }
                     }
                     // A returned pointer is an opaque `RawPtr`: what is
-                    // known about it is whatever the post says.
-                    Ty::Raw(_) => {
+                    // known about it is whatever the post says. The nullable
+                    // record pointer is the same value under an `Option`.
+                    Ty::Raw(_) | Ty::RawRecord(_) => {
                         self.binders.push((ret_sym.clone(), "Sable.RawPtr".into()));
                     }
+                    Ty::OptionRaw(_) => {
+                        self.binders
+                            .push((ret_sym.clone(), "Option Sable.RawPtr".into()));
+                    }
                     Ty::Unit => {}
-                    _ => unreachable!(),
+                    returned @ (Ty::Array(..) | Ty::Borrow(..) | Ty::Res(_)) => {
+                        // Spelled out so a new constructor is a compile error
+                        // here, and a return type with no fresh-state story
+                        // refuses rather than binding nothing (ADR 0074).
+                        // `Res` is caught by the resource guard above.
+                        refuse_vc_type(format!(
+                            "internal.vcgen.call_return_unsupported: `{}` has no \
+                             call-result state",
+                            returned.name()
+                        ));
+                        self.binders
+                            .push((ret_sym.clone(), UNSUPPORTED_LEAN_TY.into()));
+                    }
                 }
                 for post in callee_fn.posts.iter() {
                     let ret_ref = if sig.ret == Ty::Unit {
@@ -6816,15 +6870,31 @@ impl<'a> Generator<'a> {
                         post.line_span,
                     ));
                 }
+                // The payload fact every fresh option state carries
+                // (`fresh_state_for`): an integer payload's `.value` is in
+                // range whether present or junk-on-none. Emitted after the
+                // callee's posts, so a `match`-shaped post's motive does not
+                // capture it and user scripts can case on the result.
+                if let Ty::Option(element) = &sig.ret {
+                    if let Ty::Int(it) = element.as_ref() {
+                        self.push_hyp_unique(
+                            format!("h_{}_range", ret_sym.trim_start_matches('_')),
+                            self.r_prop(&format!("(({ret_sym}).value)"), *it),
+                        );
+                    }
+                }
                 match sig.ret {
-                    Ty::Option(_) => Val::Opt(ret_sym),
+                    Ty::Option(_) | Ty::OptionRaw(_) => Val::Opt(ret_sym),
                     Ty::Unit => Val::Unit,
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
                     Ty::Record(_) => Val::Record(ret_sym),
                     ref returned if returned.is_resource() => Val::View(ret_sym),
-                    Ty::Raw(_) => Val::Ptr(ret_sym),
+                    Ty::Raw(_) | Ty::RawRecord(_) => Val::Ptr(ret_sym),
                     Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
+                    // A return shape with no value story latched a refusal
+                    // in the binder match above; the placeholder keeps the
+                    // walk total until generation fails on the latch.
                     _ => Val::Int(ret_sym),
                 }
             }
@@ -8791,6 +8861,350 @@ fn bool_array_loop(u64 n, bool seed) {
                 && !proposition.contains("≤ bits.get")
                 && !proposition.contains("bits.get k ≤")
         }));
+    }
+
+    fn minimal_fn() -> Fn {
+        Fn {
+            is_pub: false,
+            extern_info: None,
+            name: "probe".to_string(),
+            name_span: Span::new(0, 0),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            requires: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            params: Vec::new(),
+            ret: Ty::Unit,
+            pres: Vec::new(),
+            posts: Vec::new(),
+            variant: None,
+            body: Vec::new(),
+            span: Span::new(0, 0),
+        }
+    }
+
+    fn empty_result() -> VcResult {
+        VcResult {
+            ghosts: Vec::new(),
+            classes: Vec::new(),
+            records: Vec::new(),
+            clause_wfs: Vec::new(),
+            obligations: Vec::new(),
+            trust: TrustManifest::default(),
+            machine: MachineManifest::default(),
+        }
+    }
+
+    /// Drive a bare generator (no program around it) so the havoc helpers
+    /// can be probed on shapes no checked source program can spell.
+    fn with_generator<R>(probe: impl FnOnce(&mut Generator) -> R) -> R {
+        let f = minimal_fn();
+        let classes: Vec<ClassDecl> = Vec::new();
+        let records: Vec<RecordDecl> = Vec::new();
+        let sigs: HashMap<String, FnSig> = HashMap::new();
+        let fn_map: HashMap<&str, &Fn> = HashMap::new();
+        let class_map: HashMap<&str, &ClassDecl> = HashMap::new();
+        let mut out = empty_result();
+        let mut generator = Generator {
+            f: &f,
+            fname: "probe".to_string(),
+            cctx: Cctx::None,
+            classes: &classes,
+            records: &records,
+            sigs: &sigs,
+            fn_map: &fn_map,
+            class_map: &class_map,
+            source: "",
+            binders: Vec::new(),
+            hyps: Vec::new(),
+            context: Vec::new(),
+            env: HashMap::new(),
+            var_tys: HashMap::new(),
+            entry_states: HashMap::new(),
+            fresh: 0,
+            tparams: Vec::new(),
+            trait_ctx: HashMap::new(),
+            name_hint: None,
+            name_counts: HashMap::new(),
+            out: &mut out,
+        };
+        probe(&mut generator)
+    }
+
+    fn borrow_expr(array: &str, field: Option<&str>) -> Expr {
+        Expr {
+            kind: ExprKind::Borrow {
+                array: array.to_string(),
+                field: field.map(str::to_string),
+                mutable: true,
+            },
+            span: Span::new(0, 0),
+            ty: None,
+        }
+    }
+
+    #[test]
+    fn sealed_ops_refuse_field_borrows_fail_closed() {
+        let _ = take_vc_type_refusal();
+
+        // A whole-place borrow answers with its root name and no refusal.
+        let root = sealed_borrow_root(&borrow_expr("mem", None), "split_off");
+        assert_eq!(root, "mem");
+        assert!(take_vc_type_refusal().is_none());
+
+        // A field borrow latches: the arm's write-back key would be the
+        // whole object. The checker's `resource.field_borrow_op` refuses
+        // the shape first; this is the arm's own fail-closed layer.
+        let refused = sealed_borrow_root(&borrow_expr("self", Some("mem")), "split_off");
+        assert_eq!(refused, "_refused_split_off");
+        let latched = take_vc_type_refusal().expect("the field borrow is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.sealed_field_borrow:"),
+            "{latched}"
+        );
+
+        // A non-borrow argument latches under its own name.
+        let not_a_borrow = Expr {
+            kind: ExprKind::IntLit(0),
+            span: Span::new(0, 0),
+            ty: None,
+        };
+        let refused = sealed_borrow_root(&not_a_borrow, "join");
+        assert_eq!(refused, "_refused_join");
+        let latched = take_vc_type_refusal().expect("the shape is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.sealed_borrow_shape:"),
+            "{latched}"
+        );
+    }
+
+    #[test]
+    fn fresh_state_refuses_shapes_with_no_story() {
+        let _ = take_vc_type_refusal();
+        with_generator(|generator| {
+            let value = generator.fresh_state_for(&Ty::Unit, "u", "u", LenFact::Skip);
+            assert!(matches!(value, Val::Unit));
+            let latched = take_vc_type_refusal().expect("unit has no fresh state");
+            assert!(
+                latched.starts_with("internal.vcgen.fresh_state_unsupported:"),
+                "{latched}"
+            );
+
+            let nested = Ty::borrow(
+                Mutability::Mut,
+                Ty::borrow(Mutability::Shared, Ty::Int(IntTy::U64)),
+            );
+            let value = generator.fresh_state_for(&nested, "b", "b", LenFact::Skip);
+            assert!(matches!(value, Val::Unit));
+            let latched = take_vc_type_refusal().expect("a borrow of a borrow has no state");
+            assert!(
+                latched.starts_with("internal.vcgen.fresh_state_unsupported:"),
+                "{latched}"
+            );
+        });
+    }
+
+    #[test]
+    fn call_site_havoc_gives_a_unique_array_borrow_a_fresh_state() {
+        // The one call-site havoc covers `&mut [T]` for every caller —
+        // ordinary calls, method calls, and constructor calls all go
+        // through `havoc_mut_borrow_args` — so admitting a `&mut [T]`
+        // member parameter later cannot silently skip the havoc. The
+        // `type.member_param` corpus fences pin the gate itself.
+        let _ = take_vc_type_refusal();
+        with_generator(|generator| {
+            generator
+                .env
+                .insert("xs".to_string(), Val::Arr("xs".to_string()));
+            generator
+                .var_tys
+                .insert("xs".to_string(), Ty::array(Ty::Int(IntTy::U32)));
+            let params = vec![Param {
+                name: "m".to_string(),
+                ty: Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut),
+                span: Span::new(0, 0),
+                consumes: false,
+            }];
+            let args = vec![borrow_expr("xs", None)];
+            let fresh = generator.havoc_mut_borrow_args(&params, &args);
+            assert_eq!(fresh, vec![("m".to_string(), "_arr1".to_string())]);
+            assert!(matches!(
+                generator.env.get("xs"),
+                Some(Val::Arr(state)) if state == "_arr1"
+            ));
+            assert!(generator
+                .binders
+                .iter()
+                .any(|(b, ty)| b == "_arr1" && ty == "Sable.Seq Int"));
+            assert!(generator
+                .hyps
+                .iter()
+                .any(|(h, prop)| h == "h_xs_len" && prop == "(_arr1.len) = (xs.len)"));
+            assert!(generator.hyps.iter().any(|(h, _)| h == "h_xs_elems"));
+        });
+        assert!(take_vc_type_refusal().is_none());
+
+        // A unique-borrow parameter fed a non-borrow argument is latched,
+        // never silently skipped.
+        with_generator(|generator| {
+            let params = vec![Param {
+                name: "m".to_string(),
+                ty: Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut),
+                span: Span::new(0, 0),
+                consumes: false,
+            }];
+            let args = vec![Expr {
+                kind: ExprKind::IntLit(3),
+                span: Span::new(0, 0),
+                ty: None,
+            }];
+            let fresh = generator.havoc_mut_borrow_args(&params, &args);
+            assert!(fresh.is_empty());
+        });
+        let latched = take_vc_type_refusal().expect("the argument shape is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.mut_borrow_arg_shape:"),
+            "{latched}"
+        );
+
+        // A borrowed array place with no pre-call sequence state is
+        // latched too: a length relation with nothing to be relative to is
+        // not a fact.
+        with_generator(|generator| {
+            let params = vec![Param {
+                name: "m".to_string(),
+                ty: Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut),
+                span: Span::new(0, 0),
+                consumes: false,
+            }];
+            let args = vec![borrow_expr("xs", None)];
+            let _ = generator.havoc_mut_borrow_args(&params, &args);
+        });
+        let latched = take_vc_type_refusal().expect("the missing state is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.mut_borrow_arg_state:"),
+            "{latched}"
+        );
+    }
+
+    #[test]
+    fn loop_havoc_refuses_untyped_and_stale_chained_names() {
+        let _ = take_vc_type_refusal();
+        let cond = Expr {
+            kind: ExprKind::BoolLit(false),
+            span: Span::new(0, 0),
+            ty: None,
+        };
+        let assign_x = Stmt::Assign {
+            name: "x".to_string(),
+            name_span: Span::new(0, 0),
+            value: Expr {
+                kind: ExprKind::IntLit(1),
+                span: Span::new(0, 0),
+                ty: None,
+            },
+        };
+
+        // An assigned name with a pre-loop env entry but no declared type
+        // has no fresh-state story: latch, never a stale chain.
+        with_generator(|generator| {
+            generator
+                .env
+                .insert("x".to_string(), Val::Int("0".to_string()));
+            generator.havoc(&cond, std::slice::from_ref(&assign_x));
+        });
+        let latched = take_vc_type_refusal().expect("the untyped name is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.havoc_untyped_name:"),
+            "{latched}"
+        );
+
+        // A composite key whose chain depends on a havocked name with no
+        // stale binder has no pre-loop spelling: latch, never a chain that
+        // the fresh binders would recapture.
+        with_generator(|generator| {
+            generator
+                .var_tys
+                .insert("x".to_string(), Ty::Int(IntTy::U64));
+            generator
+                .env
+                .insert("x".to_string(), Val::Int("x".to_string()));
+            generator
+                .env
+                .insert("b.f".to_string(), Val::Int("x".to_string()));
+            generator.havoc(&cond, std::slice::from_ref(&assign_x));
+        });
+        let latched = take_vc_type_refusal().expect("the dead chain is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.havoc_stale_chain:"),
+            "{latched}"
+        );
+    }
+
+    /// A call whose return type has no fresh-state story latches a named
+    /// refusal instead of aborting. No `.sable` source reaches this — the
+    /// checker refuses such return types first — so the `internal.` name's
+    /// corpus exemption is earned here (ADR 0064, ADR 0074).
+    #[test]
+    fn a_call_return_with_no_state_story_latches_a_named_refusal() {
+        let _ = take_vc_type_refusal();
+        let f = minimal_fn();
+        let mut callee = minimal_fn();
+        callee.name = "g".to_string();
+        callee.ret = Ty::array(Ty::Int(IntTy::U64));
+        let classes: Vec<ClassDecl> = Vec::new();
+        let records: Vec<RecordDecl> = Vec::new();
+        let mut sigs: HashMap<String, FnSig> = HashMap::new();
+        sigs.insert(
+            "g".to_string(),
+            FnSig {
+                params: Vec::new(),
+                ret: Ty::array(Ty::Int(IntTy::U64)),
+            },
+        );
+        let mut fn_map: HashMap<&str, &Fn> = HashMap::new();
+        fn_map.insert("g", &callee);
+        let class_map: HashMap<&str, &ClassDecl> = HashMap::new();
+        let mut out = empty_result();
+        let mut generator = Generator {
+            f: &f,
+            fname: "probe".to_string(),
+            cctx: Cctx::None,
+            classes: &classes,
+            records: &records,
+            sigs: &sigs,
+            fn_map: &fn_map,
+            class_map: &class_map,
+            source: "",
+            binders: Vec::new(),
+            hyps: Vec::new(),
+            context: Vec::new(),
+            env: HashMap::new(),
+            var_tys: HashMap::new(),
+            entry_states: HashMap::new(),
+            fresh: 0,
+            tparams: Vec::new(),
+            trait_ctx: HashMap::new(),
+            name_hint: None,
+            name_counts: HashMap::new(),
+            out: &mut out,
+        };
+        let call = Expr {
+            kind: ExprKind::Call {
+                callee: "g".to_string(),
+                callee_span: Span::new(0, 0),
+                type_args: Vec::new(),
+                args: Vec::new(),
+            },
+            span: Span::new(0, 0),
+            ty: Some(Ty::array(Ty::Int(IntTy::U64))),
+        };
+        generator.eval(&call);
+        let latched = take_vc_type_refusal().expect("the return shape is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.call_return_unsupported:"),
+            "{latched}"
+        );
     }
 
     #[test]

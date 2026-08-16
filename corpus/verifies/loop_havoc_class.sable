@@ -1,0 +1,36 @@
+// Loop-havoc coverage, class local: a class value reassigned inside a
+// loop (a move-in that drops the previous owner) is a fresh state with
+// its field facts and class invariant at the loop head (ADR 0074); the
+// conditional invariant carries the rebuilt field out.
+
+pub class Slot {
+    u64 v;
+
+    /// invariant v ≤ 9
+
+    /// pre  x ≤ 9
+    /// post self.v = x
+    init put(u64 x) {
+        self.v = x;
+    }
+
+    /// post result = self.v
+    fn get(&self) -> u64 {
+        return self.v;
+    }
+}
+
+/// post result = 4
+pub fn rebuild_slot() -> u64 {
+    var mut s = Slot::put(1);
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant i ≥ 1 → s.v = 4
+    /// variant   3 - i
+    while (i < 3) {
+        s = Slot::put(4);
+        i = i + 1;
+    }
+    u64 r = s.get();
+    return r;
+}

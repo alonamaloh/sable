@@ -1,0 +1,17 @@
+// pair: same-run
+// See exposure_vs_owner_store.a.sable: the same subjects write through
+// the owner's own name, with no exposure.
+
+/// post result = 9
+pub fn subject() -> u8 {
+    mut [u8] a = alloc_array<u8>(2, 0);
+    a[1] = 9;
+    return a[1];
+}
+
+/// post result = 0
+pub fn untouched() -> u8 {
+    mut [u8] a = alloc_array<u8>(2, 0);
+    a[1] = 9;
+    return a[0];
+}

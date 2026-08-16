@@ -1,0 +1,24 @@
+// pair: same-run
+// A loop store into an owned Boolean array overwrites whatever a dead
+// pre-loop store put there; the halves differ only in that dead store,
+// and both the final element and the length the loop leaves behind must
+// agree. (On the proof side the loop-head havoc keeps the length
+// relation *relative to the replaced state's exact term*, so the dead
+// store legitimately remains visible inside that hypothesis — which is
+// why this pair compares runs, not obligations.)
+
+/// post result
+pub fn churn() -> bool {
+    mut [bool] a = alloc_array<bool>(2, false);
+    a[0] = true;
+    mut u64 i = 0;
+    /// invariant i ≤ 2
+    /// invariant a.len = 2
+    /// invariant i ≥ 1 → a.get 0 = true
+    /// variant   2 - i
+    while (i < 2) {
+        a[0] = true;
+        i = i + 1;
+    }
+    return a[0];
+}

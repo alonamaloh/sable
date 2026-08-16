@@ -1,0 +1,10 @@
+// Run half of the owning-option loop pair: the loop really takes the
+// payload, the source is empty afterwards, and the payload's length is
+// what the taken array reports.
+
+use loop_havoc_affine_option;
+
+fn test_drain_pending() {
+    u64 r = drain_pending(3);
+    /// assert r = 3
+}

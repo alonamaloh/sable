@@ -1,0 +1,46 @@
+// pair: same-lean
+// See init_loop_field_havoc_erases_history.a.sable: only the dead
+// pre-loop value of `self.count` differs, and the init-branch field
+// havoc must erase it.
+
+pub class Inner {
+    u64 v;
+
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+pub class Outer {
+    Inner inner;
+    u64 count;
+
+    /// post self.inner.v = 5
+    init build() {
+        self.inner = Inner::make(5);
+        self.count = 2;
+        mut u64 i = 0;
+        /// invariant i ≤ 3
+        /// invariant self.inner.v = 5
+        /// variant   3 - i
+        while (i < 3) {
+            self.inner = Inner::make(5);
+            self.count = i;
+            i = i + 1;
+        }
+        /// assert self.count ≤ u64.max
+    }
+}
+
+/// post result = i.v
+pub fn inner_value(&Inner i) -> u64 {
+    return i.v;
+}
+
+/// post result = 5
+pub fn build_and_read() -> u64 {
+    var o = Outer::build();
+    u64 r = inner_value(&o.inner);
+    return r;
+}

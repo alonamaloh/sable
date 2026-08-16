@@ -1,0 +1,17 @@
+// Loop-havoc coverage, integer local: a `u64` reassigned inside a loop
+// is a fresh binder at the loop head (ADR 0074), and the invariant is
+// what carries its value to the post-loop observation.
+
+/// post result = 6
+pub fn sum_twos() -> u64 {
+    mut u64 acc = 0;
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant acc = 2 * i
+    /// variant   3 - i
+    while (i < 3) {
+        acc = acc + 2;
+        i = i + 1;
+    }
+    return acc;
+}

@@ -1,0 +1,23 @@
+// Run half of the exposure copy-back pin: the interpreter's loan is a
+// separate allocation whose final bytes are copied back into the owner,
+// so a store through the loan must land in the owner after the body and
+// every other byte must survive. If exposure ever lowers to a real
+// pointer instead, this is the observable the copy model must keep.
+
+use expose_copy_back;
+
+fn test_owner_sees_the_store() {
+    u8 r = owner_sees_the_store();
+    /// assert r = 5
+}
+
+fn test_other_bytes_survive() {
+    mut [u8] a = [3, 4, 6];
+    store_through_loan(&mut a);
+    u8 head = a[0];
+    u8 mid = a[1];
+    u8 tail = a[2];
+    /// assert head = 5
+    /// assert mid = 4
+    /// assert tail = 6
+}

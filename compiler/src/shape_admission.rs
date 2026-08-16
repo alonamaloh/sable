@@ -506,6 +506,12 @@ const GATES: &[&str] = &[
     "check aggregate",
     "check parameter",
     "check local",
+    "check return",
+    "check class field",
+    "check init param",
+    "check method param",
+    "check trait param",
+    "check trait return",
     "record field",
     "vc type",
     "vc array payload",
@@ -566,6 +572,12 @@ fn answers(ty: &Ty) -> Vec<Answer> {
         from_diagnostic(crate::check::validate_aggregate_ty(ty.clone(), SPAN)),
         from_diagnostic(crate::check::parameter_ty(ty, SPAN)),
         from_diagnostic(crate::check::local_ty(ty, SPAN)),
+        from_diagnostic(crate::check::return_ty(ty, "probe", SPAN)),
+        from_diagnostic(crate::check::class_field_ty(ty, SPAN)),
+        from_diagnostic(crate::check::member_param_ty(ty, SPAN, true)),
+        from_diagnostic(crate::check::member_param_ty(ty, SPAN, false)),
+        from_diagnostic(crate::check::trait_param_ty(ty, SPAN)),
+        from_diagnostic(crate::check::trait_return_ty(ty, "probe", SPAN)),
         match crate::check::record_field_layout(ty, "probe", SPAN) {
             Ok(_) => Answer::Accepted,
             Err(diagnostic) => Answer::Rejected(diagnostic.name),
@@ -667,7 +679,10 @@ const PROSE: &str = "# The shape × stage-gate admission table\n\n\
      moves a cell too.\n\nEvery stage is asked about every shape: the grammar is one \
      recursive type, so there is no\nshape a stage cannot be handed. A cell that moves is \
      either a refusal that was deleted or\nan admission that was widened, and both need a \
-     reason.\n\n";
+     reason.\n\nA gate that answers per position is asked once per position: the member-param \
+     gate as\n`check init param` and `check method param`, because an init additionally \
+     admits shared\narray borrows, and the trait-signature gate as `check trait param` and \
+     `check trait\nreturn`.\n\n";
 
 fn render() -> String {
     let mut out = String::from(PROSE);
@@ -793,6 +808,56 @@ fn first_difference(recorded: &str, rendered: &str) -> Option<String> {
         return Some("every cell agrees; the surrounding prose differs".into());
     }
     None
+}
+
+/// Every checker rule guarding a source type position has a column.
+///
+/// The positions are enumerated by the parser's `TyPos`, so this match is
+/// exhaustive by construction: a new position does not compile until it is
+/// given its columns here — either the checker gates that watch it, or the
+/// explicit statement that the parser's admissibility table and the lowering
+/// routines are the whole rule (those positions are probed as contexts in
+/// `docs/type-matrix.md` instead, which has its own coverage guard).
+#[test]
+fn every_checker_position_gate_has_a_column() {
+    use crate::parser::TyPos;
+    for pos in TyPos::all() {
+        let columns: &'static [&'static str] = match pos {
+            TyPos::Param => &[
+                "check parameter",
+                "check init param",
+                "check method param",
+                "check trait param",
+            ],
+            // Which referents a borrow may name is decided inside
+            // `check::parameter_ty` (ADR 0067).
+            TyPos::BorrowParam => &["check parameter"],
+            TyPos::Return => &["check return", "check trait return"],
+            TyPos::Local => &["check local"],
+            TyPos::RecordField => &["record field"],
+            TyPos::ClassField => &["check class field"],
+            TyPos::ArrayElement => &["check array payload"],
+            TyPos::OptionPayload => &["check option payload", "check affine payload"],
+            // Integer-narrowed positions: the admissibility table plus
+            // `lower_int_ty` / `lower_raw_type` / `lower_res_kind` are the
+            // whole rule, and no checker gate exists to probe.
+            TyPos::ForIndex
+            | TyPos::Const
+            | TyPos::CastTarget
+            | TyPos::TraitImplTarget
+            | TyPos::RawElement
+            | TyPos::ResourceExtent
+            | TyPos::ResourceMapKey => &[],
+        };
+        for column in columns {
+            assert!(
+                GATES.contains(column),
+                "position `{}` names the shape-admission column `{column}`, which does not \
+                 exist: the checker gate watching this position is unprobed",
+                pos.short_name()
+            );
+        }
+    }
 }
 
 #[test]

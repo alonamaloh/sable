@@ -1,0 +1,17 @@
+// pair: same-run
+// See lend_vs_owner_store.a.sable: the same subjects write through the
+// owner's own name, with no call.
+
+/// post result
+pub fn subject() -> bool {
+    mut [bool] a = alloc_array<bool>(3, false);
+    a[0] = true;
+    return a[0];
+}
+
+/// post result = 7
+pub fn subject_u32() -> u32 {
+    mut [u32] a = alloc_array<u32>(3, 0);
+    a[0] = 7;
+    return a[0];
+}

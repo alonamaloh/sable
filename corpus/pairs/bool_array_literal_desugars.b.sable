@@ -1,0 +1,27 @@
+// pair: same-run
+// See bool_array_literal_desugars.a.sable: the literal's documented
+// expansion, written by hand.
+
+/// post result
+pub fn first() -> bool {
+    mut [bool] a = alloc_array<bool>(2, false);
+    a[0] = true;
+    a[1] = false;
+    return a[0];
+}
+
+/// post ¬result
+pub fn second() -> bool {
+    mut [bool] a = alloc_array<bool>(2, false);
+    a[0] = true;
+    a[1] = false;
+    return a[1];
+}
+
+/// post result = 2
+pub fn length() -> u64 {
+    mut [bool] a = alloc_array<bool>(2, false);
+    a[0] = true;
+    a[1] = false;
+    return a.len;
+}

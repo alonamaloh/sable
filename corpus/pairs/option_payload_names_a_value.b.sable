@@ -1,0 +1,9 @@
+// pair: same-lean
+// See option_payload_names_a_value.a.sable: naming the payload must
+// change nothing.
+
+/// post result.is_some
+pub fn wrap(u64 x) -> option<bool> {
+    bool c = x > 0;
+    return some(c);
+}

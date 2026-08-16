@@ -1,0 +1,8 @@
+// Run half of the record loop-havoc pair.
+
+use loop_havoc_record;
+
+fn test_rebuild_pair() {
+    u64 r = rebuild_pair();
+    /// assert r = 9
+}

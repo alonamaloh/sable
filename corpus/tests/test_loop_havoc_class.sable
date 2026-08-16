@@ -1,0 +1,9 @@
+// Run half of the class-local loop-havoc pair: each iteration drops the
+// previous owner and moves a fresh one in.
+
+use loop_havoc_class;
+
+fn test_rebuild_slot() {
+    u64 r = rebuild_slot();
+    /// assert r = 4
+}

@@ -1,0 +1,16 @@
+// expect-error: type.member_param
+// A POD record member parameter is refused even though ordinary functions
+// carry nominal record values across calls.
+
+record Pair #[layout(size := 8, align := 4)] {
+    #[offset(0)] u32 a;
+    #[offset(4)] u32 b;
+}
+
+pub class C {
+    u64 v;
+
+    init make(Pair p) {
+        self.v = 0;
+    }
+}

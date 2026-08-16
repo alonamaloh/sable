@@ -1,0 +1,35 @@
+// Loop-havoc coverage, resource field: a destructor loop that moves its
+// resource field out, carves and rejoins it, and reassigns the field. At
+// the loop head `self` is a fresh state whose field facts include the
+// resource view's well-formedness (ADR 0074), which is what lets the
+// carve's own precondition prove again each iteration.
+
+pub class Recycler {
+    resource RawSpan mem;
+
+    init grab(resource RawSpan m) {
+        self.mem = m;
+    }
+
+    deinit {
+        mut u64 i = 0;
+        /// invariant i ≤ 2
+        /// variant   2 - i
+        while (i < 2) {
+            mut resource RawSpan whole = self.mem;
+            unsafe {
+                resource RawSpan tail = split_off(&mut whole, 0);
+                resource RawSpan back = join(whole, tail);
+                self.mem = back;
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/// post result = 3
+pub fn recycle() -> u64 {
+    unsafe static_alloc(8) as (p, resource span);
+    var r = Recycler::grab(span);
+    return 3;
+}

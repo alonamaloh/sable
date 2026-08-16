@@ -1,0 +1,20 @@
+// A call returning a nullable record pointer binds a fresh
+// `Option Sable.RawPtr` in the caller, on the same terms as every other
+// returnable shape (ADR 0074): presence is inspectable, and the value
+// carries no facts beyond what the callee's posts say.
+
+record Node #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 v;
+}
+
+pub fn give() -> option<raw<Node>> {
+    return none;
+}
+
+pub fn take() -> u64 {
+    option<raw<Node>> p = give();
+    if (p.is_some) {
+        return 1;
+    }
+    return 0;
+}

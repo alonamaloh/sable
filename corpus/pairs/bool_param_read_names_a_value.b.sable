@@ -1,0 +1,10 @@
+// pair: same-lean
+// See bool_param_read_names_a_value.a.sable: naming the read must
+// change nothing.
+
+/// pre  i < m.len
+/// post result = m.get i
+pub fn read_at(&[bool] m, u64 i) -> bool {
+    bool t = m[i];
+    return t;
+}

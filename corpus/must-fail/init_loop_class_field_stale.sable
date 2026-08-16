@@ -1,0 +1,33 @@
+// expect-error: Outer::build.post.stale
+// A class-valued field reassigned inside an init loop is a fresh state at
+// the loop head, like every other mutated field: the pre-loop constructor
+// chain must not survive the loop, so a post pinning the field to its
+// pre-loop value is unprovable (ADR 0074).
+
+pub class Inner {
+    u64 v;
+
+    /// invariant v ≤ 1000
+
+    /// pre  x ≤ 1000
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+pub class Outer {
+    Inner inner;
+
+    /// post #[label(stale)] self.inner.v = 1
+    init build() {
+        self.inner = Inner::make(1);
+        mut u64 i = 0;
+        /// invariant i ≤ 3
+        /// variant   3 - i
+        while (i < 3) {
+            self.inner = Inner::make(5);
+            i = i + 1;
+        }
+    }
+}

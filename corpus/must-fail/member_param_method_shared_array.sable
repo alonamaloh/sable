@@ -1,0 +1,15 @@
+// expect-error: type.member_param
+// Shared array borrows are admitted for inits (the from_prefix shape)
+// and deliberately not for methods.
+
+pub class C {
+    u64 v;
+
+    init make() {
+        self.v = 0;
+    }
+
+    fn peek(&self, &[u32] xs) -> u64 {
+        return self.v;
+    }
+}

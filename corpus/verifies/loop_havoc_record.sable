@@ -1,0 +1,22 @@
+// Loop-havoc coverage, record local: a POD record reassigned inside a
+// loop is a fresh nominal binder with its `wf` fact at the loop head
+// (ADR 0074); the invariant carries the field values out.
+
+record LoopPair #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 first;
+    #[offset(8)] u64 second;
+}
+
+/// post result = 9
+pub fn rebuild_pair() -> u64 {
+    mut LoopPair pair = LoopPair(1, 2);
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant i ≥ 1 → (pair.first = 4 ∧ pair.second = 5)
+    /// variant   3 - i
+    while (i < 3) {
+        pair = LoopPair(4, 5);
+        i = i + 1;
+    }
+    return pair.first + pair.second;
+}

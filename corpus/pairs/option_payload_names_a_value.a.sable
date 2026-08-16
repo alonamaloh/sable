@@ -1,0 +1,10 @@
+// pair: same-lean
+// Building `some(...)` from a program-Boolean expression reifies the
+// proposition into the payload exactly once, whether the expression is
+// inline or first bound to a name. The halves differ only in that
+// binding, so the constructed option's obligations must be identical.
+
+/// post result.is_some
+pub fn wrap(u64 x) -> option<bool> {
+    return some(x > 0);
+}

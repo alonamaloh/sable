@@ -1,0 +1,23 @@
+// pair: same-run
+// A Boolean array literal executes as a false-filled allocation plus
+// ordered element stores; this pair holds the literal against that
+// spelled-out program, so the two constructions can never disagree
+// about an element.
+
+/// post result
+pub fn first() -> bool {
+    mut [bool] a = [true, false];
+    return a[0];
+}
+
+/// post ¬result
+pub fn second() -> bool {
+    mut [bool] a = [true, false];
+    return a[1];
+}
+
+/// post result = 2
+pub fn length() -> u64 {
+    mut [bool] a = [true, false];
+    return a.len;
+}

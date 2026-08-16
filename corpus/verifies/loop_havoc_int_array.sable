@@ -1,0 +1,22 @@
+// Loop-havoc coverage, owned integer array local: an element store
+// inside a loop makes the array a fresh sequence at the loop head, with
+// its length preserved and element ranges kept (ADR 0074); the
+// conditional invariant carries the stored element out. Whole-array
+// rebinding is refused (`type.array_assign`, pinned by
+// corpus/must-fail/loop_havoc_array_reassign.sable) — stores are the only
+// array mutation.
+
+/// post result = 5
+pub fn stamp_slot() -> u64 {
+    mut [u64] a = alloc_array<u64>(4, 0);
+    mut u64 i = 0;
+    /// invariant a.len = 4
+    /// invariant i ≤ 4
+    /// invariant i ≥ 1 → a.get 0 = 5
+    /// variant   4 - i
+    while (i < 4) {
+        a[0] = 5;
+        i = i + 1;
+    }
+    return a[0];
+}

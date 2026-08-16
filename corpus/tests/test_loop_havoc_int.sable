@@ -1,0 +1,10 @@
+// Run half of the integer loop-havoc pair: the loop executes and the
+// monitor checks the invariants and the post against the values the loop
+// actually produced.
+
+use loop_havoc_int;
+
+fn test_sum_twos() {
+    u64 r = sum_twos();
+    /// assert r = 6
+}

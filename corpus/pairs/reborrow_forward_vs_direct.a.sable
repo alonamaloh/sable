@@ -1,0 +1,26 @@
+// pair: same-run
+// A `&mut` reborrow written at a call forwards the same storage the
+// parameter already lends (ADR 0069): a callee that hands its borrowed
+// array on to a second callee and one that stores directly must leave
+// the owner identical — two stacked loans, one write-back chain.
+
+/// pre  m.len ≥ 1
+/// post m.get 0 = 5
+/// post m.len = (old m).len
+fn set_first(&mut [u32] m) {
+    m[0] = 5;
+}
+
+/// pre  m.len ≥ 1
+/// post m.get 0 = 5
+/// post m.len = (old m).len
+fn set_via_forward(&mut [u32] m) {
+    set_first(&mut m);
+}
+
+/// post result = 5
+pub fn subject() -> u32 {
+    mut [u32] a = alloc_array<u32>(2, 0);
+    set_via_forward(&mut a);
+    return a[0];
+}

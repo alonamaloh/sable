@@ -1,0 +1,24 @@
+// pair: same-lean
+// See raw_loop_havoc_erases_history.a.sable: only the dead pre-loop
+// pointer chain differs, and the loop-head havoc must erase it. The
+// load's obligation is deferred there and here alike.
+
+/// pre a.len ≥ 1
+pub fn last_load(&[u8] a) -> u8 {
+    u64 n = a.len;
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        mut raw<u8> q = raw_offset(p, 1);
+        mut u64 i = 0;
+        /// invariant i ≤ n
+        /// variant   n - i
+        while (i < n) {
+            q = p;
+            i = i + 1;
+        }
+        r = raw_load8(q, &m);
+    }
+    return r;
+}
+
+/// defer last_load.load8.raw_load8_q_m

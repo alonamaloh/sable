@@ -1,0 +1,17 @@
+// The run half of the init-loop field havoc pair: the constructor whose
+// loop reassigns a class-valued field executes, and the monitor checks
+// its post and loop invariants against the values the loop actually
+// produced.
+
+use init_loop_class_field;
+
+fn test_build_and_read() {
+    var o = Outer::build();
+    u64 v = inner_value(&o.inner);
+    /// assert v = 5
+}
+
+fn test_read_rebuilt() {
+    u64 r = read_rebuilt();
+    /// assert r = 5
+}

@@ -1,0 +1,12 @@
+// pair: same-lean
+// See bool_param_store_names_a_value.a.sable: naming the stored value
+// must change nothing.
+
+/// pre  i < m.len
+/// pre  x > 0
+/// post m.get i = true
+/// post m.len = (old m).len
+pub fn mark(&mut [bool] m, u64 i, u64 x) {
+    bool v = x > 0;
+    m[i] = v;
+}

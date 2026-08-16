@@ -1,0 +1,40 @@
+// pair: same-lean
+// A destructor whose loop assigns a field: at the loop head `self` is a
+// fresh state with its field facts (ADR 0074, ADR 0029 — no class
+// invariant is assumed mid-destructor). The halves differ only in the
+// dead pre-loop value of `self.level`, so the destructor's post-loop
+// obligations must be identical; a loop havoc without a destructor
+// `self` branch would leave the stale chain visible.
+
+pub class Draining {
+    u64 level;
+
+    /// post self.level = n
+    init fill(u64 n) {
+        self.level = n;
+    }
+
+    deinit {
+        self.level = 1;
+        mut u64 i = 0;
+        /// invariant i ≤ 4
+        /// variant   4 - i
+        while (i < 4) {
+            self.level = 0;
+            i = i + 1;
+        }
+        /// assert self.level ≤ u64.max
+    }
+}
+
+/// post result = d.level
+pub fn level_of(&Draining d) -> u64 {
+    return d.level;
+}
+
+/// post result = 7
+pub fn fill_and_read() -> u64 {
+    var d = Draining::fill(7);
+    u64 r = level_of(&d);
+    return r;
+}

@@ -1,0 +1,28 @@
+// The exposure copy-back pin. Proof, interpreter, and formal machine all
+// model `unsafe expose` as copy-in/copy-out: the loan receives the
+// owner's bytes at entry, and a mutable exit rebuilds the owner from the
+// loan's final bytes. A store through the loan is therefore visible
+// through the owner's name after the body — the cross-name behavior this
+// subject asserts in both directions (proved here, run by its test
+// twin). The model is faithful because the owner's name is frozen for
+// the body (ADR 0073), so the loan is the storage's only name. The LLVM
+// backend refuses `expose` (`backend.unsupported`); that refusal is
+// load-bearing — a native lowering handing out a real pointer into the
+// owner's storage would make the copy model false. docs/PLAN.md records
+// what must land before it is lifted.
+
+/// pre  a.len ≥ 2
+/// post #[label(stored)] a.get 0 = 5
+/// post #[label(rest)]   ∀ k, 1 ≤ k → k < a.len → a.get k = (old a).get k
+pub fn store_through_loan(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        raw_store8(p, 5, &mut m);
+    }
+}
+
+/// post result = 5
+pub fn owner_sees_the_store() -> u8 {
+    mut [u8] a = [9, 8];
+    store_through_loan(&mut a);
+    return a[0];
+}

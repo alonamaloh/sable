@@ -1,0 +1,28 @@
+// The sound spelling of a destructor that carves its resource field: move
+// the field into a local binding first (a destructor may move fields out,
+// ADR 0029), then hand the *local* to the sealed operation. A sealed
+// operation writes its fresh state back under the borrow's root name,
+// which is why borrowing the field directly is refused
+// (resource.field_borrow_op).
+
+pub class Arena {
+    resource RawSpan mem;
+
+    init grab(resource RawSpan m) {
+        self.mem = m;
+    }
+
+    deinit {
+        mut resource RawSpan whole = self.mem;
+        unsafe {
+            resource RawSpan tail = split_off(&mut whole, 0);
+        }
+    }
+}
+
+/// post result = 3
+pub fn build_and_drop() -> u64 {
+    unsafe static_alloc(8) as (p, resource span);
+    var a = Arena::grab(span);
+    return 3;
+}

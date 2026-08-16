@@ -133,7 +133,7 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
         ));
     }
     validate_ty_payload(f.ret.clone(), &format!("return type of `{}`", f.name))?;
-    if bool_array_ty(&f.ret.clone()) {
+    if f.ret.is_bool_array() {
         return Err(format!(
             "svm.bool_array_position_unsupported: `{}` returns a Boolean array; Boolean arrays are owned locals only",
             f.name
@@ -209,14 +209,11 @@ fn validate_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
 /// and what a call boundary may transport are separate questions, and the
 /// machine answers them separately for the same type.
 pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String> {
-    if ty.is_affine_option() {
-        return Err(affine_option_unsupported(ty.clone(), context));
-    }
     validate_ty_payload(ty.clone(), context)?;
     // The owner is what a call boundary may not carry: an array reaches a
     // callee as `&[T]` or `&mut [T]`, which the machine transports as an
     // argument value and, for a unique borrow, a loan returned at the pop.
-    if owned_bool_array_ty(ty) {
+    if ty.is_owned_bool_array() {
         return Err(format!(
             "svm.bool_array_position_unsupported: {context} owns a Boolean array; an array crosses a call boundary as a borrow"
         ));
@@ -275,14 +272,6 @@ pub(crate) fn validate_array_payload(payload: &Ty, context: &str) -> Result<(), 
             payload.name()
         )),
     }
-}
-
-fn bool_array_ty(ty: &Ty) -> bool {
-    ty.is_array_of(&Ty::Bool)
-}
-
-fn owned_bool_array_ty(ty: &Ty) -> bool {
-    ty.is_owned_array_of(&Ty::Bool)
 }
 
 fn require_expr_annotation(
@@ -545,7 +534,7 @@ fn validate_fresh_bool_array_initializer(
     initializer: &Expr,
     local: &str,
 ) -> Result<(), String> {
-    if !owned_bool_array_ty(&declared_ty.clone()) {
+    if !declared_ty.is_owned_bool_array() {
         return Err(format!(
             "svm.bool_array_position_unsupported: local `{local}` has type `{}`; \
              Boolean arrays must be fresh owned locals",
@@ -631,7 +620,7 @@ fn semantic_expr_ty(
     let semantic = match &expr.kind {
         ExprKind::Var(name) => {
             let ty = ctx.initialized_local(name, context)?.ty;
-            if owned_bool_array_ty(&ty.clone()) {
+            if ty.is_owned_bool_array() {
                 return Err(format!(
                     "svm.bool_array_transport_unsupported: {context} moves Boolean array local `{name}`; an owner is accessed by index or length and lent by borrow"
                 ));
@@ -886,7 +875,7 @@ fn validate_local_var(
     operation: &str,
 ) -> Result<LocalBinding, String> {
     let binding = ctx.initialized_local(name, operation)?;
-    if owned_bool_array_ty(&binding.ty) {
+    if binding.ty.is_owned_bool_array() {
         return Err(format!(
             "svm.bool_array_transport_unsupported: {operation} moves Boolean array local `{name}`; an owner is accessed by index or length and lent by borrow"
         ));
@@ -1294,7 +1283,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                 &format!("{context} return type"),
             ));
         }
-        if bool_array_ty(&function.ret.clone()) {
+        if function.ret.is_bool_array() {
             return Err(format!(
                 "svm.bool_array_position_unsupported: {context} returns a Boolean array; Boolean arrays are owned locals only"
             ));
@@ -1339,7 +1328,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                     &format!("class `{}.{}` field", class.name, field.name),
                 ));
             }
-            if bool_array_ty(&field.ty.clone()) {
+            if field.ty.is_bool_array() {
                 return Err(format!(
                     "svm.bool_array_position_unsupported: class `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
                     class.name, field.name
@@ -1388,7 +1377,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                     &format!("record `{}.{}` field", record.name, field.name),
                 ));
             }
-            if bool_array_ty(&field.ty.clone()) {
+            if field.ty.is_bool_array() {
                 return Err(format!(
                     "svm.bool_array_position_unsupported: record `{}.{}` has a Boolean-array-typed field; Boolean arrays are owned locals only",
                     record.name, field.name
@@ -1564,7 +1553,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                         *mutable,
                         init.as_ref(),
                     )?;
-                } else if bool_array_ty(&ty.clone()) {
+                } else if ty.is_bool_array() {
                     let Some(init) = init else {
                         return Err(format!(
                             "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
@@ -1667,7 +1656,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                     ));
                 }
                 validate_ty_payload(ty.clone(), &format!("inferred declaration `{name}`"))?;
-                if bool_array_ty(&ty.clone()) {
+                if ty.is_bool_array() {
                     validate_fresh_bool_array_initializer(ctx, ty.clone(), init, name)?;
                 } else {
                     validate_expr_payloads(ctx, init)?;
@@ -1840,7 +1829,7 @@ fn validate_call_signature(
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
     if let Some(ty) = &expr.ty {
         validate_ty_payload(ty.clone(), "expression annotation")?;
-        if owned_bool_array_ty(&ty.clone())
+        if ty.is_owned_bool_array()
             && !matches!(
                 &expr.kind,
                 ExprKind::OptTake { .. } | ExprKind::OptValue { .. }
@@ -2169,7 +2158,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             mutable,
             init,
             ..
-        } if bool_array_ty(&ty.clone()) => {
+        } if ty.is_bool_array() => {
             let Some(initializer) = init else {
                 return Err(format!(
                     "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
@@ -2242,7 +2231,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             ty: Some(ty),
             mutable,
             ..
-        } if bool_array_ty(&ty.clone()) => {
+        } if ty.is_bool_array() => {
             let lowered = lower_fresh_bool_array_bind(ctx, name, ty.clone(), init)?;
             ctx.insert_local(name, ty.clone(), *mutable, true)?;
             Some(lowered)

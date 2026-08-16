@@ -1,0 +1,10 @@
+// Run half of the copyable-option loop-havoc pair. The owning option
+// family's loop behavior (`.take` inside a loop) is run by
+// test_affine_options.
+
+use loop_havoc_option;
+
+fn test_retag() {
+    u64 r = retag(41);
+    /// assert r = 42
+}

@@ -1,0 +1,13 @@
+// Run half of the nullable-record-pointer loop-havoc pair: the option
+// value round-trips the loop.
+
+// A nullable record pointer is provenance, not a program value the
+// monitor can evaluate; its someness invariant is proof vocabulary.
+// expect-skip: cur.is_some ↔ q.is_some
+
+use loop_havoc_option_raw;
+
+fn test_relink_none() {
+    u64 r = relink_none();
+    /// assert r = 3
+}

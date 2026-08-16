@@ -1,0 +1,26 @@
+// pair: same-run
+// An option argument forwarded through an intermediate call must reach
+// the callee as the same value the direct call passes — presence, the
+// payload, and the absent case alike. A transport that rebuilt or
+// defaulted the payload along the forwarding hop would diverge here.
+// The subjects carry no contracts: the run outcome is the whole claim.
+
+fn value_or(option<u64> o, u64 d) -> u64 {
+    if (o.is_some) {
+        return o.value;
+    }
+    return d;
+}
+
+fn forward(option<u64> o, u64 d) -> u64 {
+    return value_or(o, d);
+}
+
+pub fn present() -> u64 {
+    return forward(some(7), 3);
+}
+
+pub fn absent() -> u64 {
+    option<u64> o = none;
+    return forward(o, 3);
+}

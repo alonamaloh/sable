@@ -1,0 +1,25 @@
+// pair: same-run
+// Exposure is copy-in/copy-out over an owner no other name may reach
+// while the loan is open (ADR 0073); its faithfulness premise is that
+// the bytes written through the loan are exactly what the owner holds
+// at the exit. The halves write one element through a mutable exposure
+// and through the owner's own name; the owner's contents afterwards —
+// the written element and the untouched one — must agree.
+
+/// post result = 9
+pub fn subject() -> u8 {
+    mut [u8] a = alloc_array<u8>(2, 0);
+    unsafe expose &mut a as (p, resource m) {
+        raw_store8(raw_offset(p, 1), 9, &mut m);
+    }
+    return a[1];
+}
+
+/// post result = 0
+pub fn untouched() -> u8 {
+    mut [u8] a = alloc_array<u8>(2, 0);
+    unsafe expose &mut a as (p, resource m) {
+        raw_store8(raw_offset(p, 1), 9, &mut m);
+    }
+    return a[0];
+}

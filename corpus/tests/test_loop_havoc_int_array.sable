@@ -1,0 +1,8 @@
+// Run half of the owned-integer-array loop-havoc pair.
+
+use loop_havoc_int_array;
+
+fn test_stamp_slot() {
+    u64 r = stamp_slot();
+    /// assert r = 5
+}

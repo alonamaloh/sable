@@ -1,0 +1,23 @@
+// Loop-havoc coverage, owning option local: the owning family cannot be
+// reassigned (`option.affine_assign`), so the loop mutation that exists
+// for it is atomic `.take`, and at the loop head the option is a fresh
+// `Option (Sable.Seq Bool)` whose someness and payload shape the
+// invariants carry (ADR 0074).
+
+/// post result = n
+pub fn drain_pending(u64 n) -> u64 {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, true));
+    mut u64 remaining = 1;
+    mut u64 got = 0;
+    /// invariant remaining ≤ 1
+    /// invariant remaining = 1 → pending ≠ none
+    /// invariant match pending with | some payload => payload.len = n | none => True
+    /// invariant remaining = 0 → got = n
+    /// variant   remaining
+    while (remaining == 1) {
+        [bool] flags = pending.take;
+        got = flags.len;
+        remaining = 0;
+    }
+    return got;
+}

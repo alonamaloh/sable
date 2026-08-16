@@ -1,0 +1,15 @@
+// expect-error: type.array_assign
+// An owned array local cannot be rebound, inside a loop or out of one;
+// element stores are the only array mutation, so the loop havoc's length
+// preservation is justified by construction.
+
+fn rebind_in_loop() {
+    mut [u64] a = alloc_array<u64>(2, 0);
+    mut u64 i = 0;
+    /// invariant i ≤ 1
+    /// variant   1 - i
+    while (i < 1) {
+        a = alloc_array<u64>(2, 0);
+        i = i + 1;
+    }
+}

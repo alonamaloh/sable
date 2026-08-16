@@ -16,14 +16,27 @@
 //! A cell must be decided by the position's admissibility, never by the form
 //! of the expression the probe happened to write. Types differ in how they
 //! are constructed — an owned array is born from `alloc_array`, an affine
-//! option from `none` or `some(alloc_array(...))`, a class from its `init` —
-//! so a probe reusing one literal everywhere can report a cell closed when
-//! only its initializer was refused. Each type therefore carries every
-//! construction the language accepts for it, and a position that needs a
-//! value tries them all. A candidate rejected for its initializer form is a
-//! bug in this harness, not a closed cell: if a closing diagnostic names an
-//! expression form rather than the type in the position, the missing
-//! construction belongs in `values`.
+//! option from `none` or `some(alloc_array(...))`, a class from its `init`,
+//! a raw pointer only from an unsafe exposure or another raw value — so a
+//! probe reusing one literal everywhere can report a cell closed when only
+//! its initializer was refused. Each type therefore carries every
+//! construction the language accepts for it, and a type whose values no
+//! ordinary expression can create carries a `feed` parameter that hands the
+//! probe one. A candidate rejected for its initializer form is a bug in this
+//! harness, not a closed cell: if a closing diagnostic names an expression
+//! form rather than the type in the position, the missing construction
+//! belongs in `values`.
+//!
+//! Each binding-mode column probes one spelling: `param` is the owned
+//! spelling, and `param &` / `param &mut` are the borrow spellings, so an
+//! open borrow cell says the language admits lending the type, never that
+//! an owned value of it crosses the call. The `init param` / `method param`
+//! pairs read the same way.
+//!
+//! Two coverage guards keep the grid honest as the grammar grows: every
+//! spellable type shape must be probed (as a row, or as the binding-mode
+//! columns for borrows) and every type position must be probed as a
+//! context. A new shape or position turns them red until the matrix sees it.
 //!
 //! Run with `SABLE_BLESS=1` to rewrite the table after an intended change.
 
@@ -32,12 +45,15 @@ use std::path::{Path, PathBuf};
 /// One probed type: how it is spelled, the expressions that construct a
 /// value of it, and any declaration the spelling depends on. `values` ends
 /// with the most ordinary construction, so a closed cell records the
-/// diagnostic a reader writing the obvious program would meet.
+/// diagnostic a reader writing the obvious program would meet. `feed` is a
+/// parameter list added to value-consuming probe functions, for types whose
+/// values only a caller can supply.
 struct Probe {
     name: &'static str,
     spelling: &'static str,
     values: &'static [&'static str],
     decls: &'static str,
+    feed: &'static str,
 }
 
 const RECORD_DECL: &str = "\
@@ -65,12 +81,14 @@ const TYPES: &[Probe] = &[
         spelling: "u64",
         values: &["7"],
         decls: "",
+        feed: "",
     },
     Probe {
         name: "bool",
         spelling: "bool",
         values: &["true"],
         decls: "",
+        feed: "",
     },
     // Arrays are constructed either by a literal or by `alloc_array`; only
     // the latter yields the owned array that a sink taking ownership wants.
@@ -79,30 +97,35 @@ const TYPES: &[Probe] = &[
         spelling: "[u64]",
         values: &["alloc_array<u64>(2, 0)", "[1, 2]"],
         decls: "",
+        feed: "",
     },
     Probe {
         name: "[bool]",
         spelling: "[bool]",
         values: &["alloc_array<bool>(2, true)", "[true, false]"],
         decls: "",
+        feed: "",
     },
     Probe {
         name: "option<u64>",
         spelling: "option<u64>",
         values: &["none", "some(7)"],
         decls: "",
+        feed: "",
     },
     Probe {
         name: "option<bool>",
         spelling: "option<bool>",
         values: &["none", "some(true)"],
         decls: "",
+        feed: "",
     },
     Probe {
         name: "record",
         spelling: "Pair",
         values: &["Pair(1, 2)"],
         decls: RECORD_DECL,
+        feed: "",
     },
     // An affine option admits exactly `none` and a freshly allocated array.
     Probe {
@@ -110,12 +133,23 @@ const TYPES: &[Probe] = &[
         spelling: "option<[bool]>",
         values: &["none", "some(alloc_array<bool>(2, true))"],
         decls: "",
+        feed: "",
     },
     Probe {
         name: "class",
         spelling: "Box",
         values: &["Box::make()"],
         decls: CLASS_DECL,
+        feed: "",
+    },
+    // A raw pointer is born inside an unsafe exposure; no ordinary
+    // expression creates one, so value-consuming probes are fed one.
+    Probe {
+        name: "raw<u8>",
+        spelling: "raw<u8>",
+        values: &["src"],
+        decls: "",
+        feed: "raw<u8> src",
     },
 ];
 
@@ -148,12 +182,24 @@ const CONTEXTS: &[Context] = &[
     ("local", ctx_local),
     ("return", ctx_return),
     ("param", ctx_param),
+    ("param &", ctx_param_shared),
     ("param &mut", ctx_param_mut),
     ("record field", ctx_record_field),
     ("class field", ctx_class_field),
     ("array element", ctx_array_element),
     ("option payload", ctx_option_payload),
     ("generic arg", ctx_generic_arg),
+    ("for index", ctx_for_index),
+    ("const", ctx_const),
+    ("cast target", ctx_cast_target),
+    ("trait-impl target", ctx_trait_impl_target),
+    ("raw element", ctx_raw_element),
+    ("resource extent", ctx_resource_extent),
+    ("resource map key", ctx_resource_map_key),
+    ("init param", ctx_init_param),
+    ("init param &", ctx_init_param_shared),
+    ("method param", ctx_method_param),
+    ("method param &", ctx_method_param_shared),
 ];
 
 fn ctx_local(p: &Probe) -> Vec<String> {
@@ -165,8 +211,8 @@ fn ctx_local(p: &Probe) -> Vec<String> {
     ];
     spellings_by_values(p, &bindings, |binding, value| {
         format!(
-            "{}\nfn probe() -> u64 {{\n    {binding} x = {value};\n    return 0;\n}}\n",
-            p.decls
+            "{}\nfn probe({}) -> u64 {{\n    {binding} x = {value};\n    return 0;\n}}\n",
+            p.decls, p.feed
         )
     })
 }
@@ -174,25 +220,24 @@ fn ctx_local(p: &Probe) -> Vec<String> {
 fn ctx_return(p: &Probe) -> Vec<String> {
     spellings_by_values(p, &[p.spelling.to_string()], |spelling, value| {
         format!(
-            "{}\nfn probe() -> {spelling} {{\n    return {value};\n}}\n",
-            p.decls
+            "{}\nfn probe({}) -> {spelling} {{\n    return {value};\n}}\n",
+            p.decls, p.feed
         )
     })
 }
 
-/// The borrow spelling comes first so the plain one is tried last: a reader
-/// asking whether a type may be a parameter writes `T x` before `&T x`, and
-/// the recorded diagnostic is the one the last candidate produced.
 fn ctx_param(p: &Probe) -> Vec<String> {
-    [format!("&{}", p.spelling), p.spelling.to_string()]
-        .iter()
-        .map(|param| {
-            format!(
-                "{}\nfn probe({param} x) -> u64 {{\n    return 0;\n}}\n",
-                p.decls
-            )
-        })
-        .collect()
+    vec![format!(
+        "{}\nfn probe({} x) -> u64 {{\n    return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
+}
+
+fn ctx_param_shared(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\nfn probe(&{} x) -> u64 {{\n    return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
 }
 
 fn ctx_param_mut(p: &Probe) -> Vec<String> {
@@ -229,8 +274,8 @@ fn ctx_array_element(p: &Probe) -> Vec<String> {
     ];
     spellings_by_values(p, &bindings, |binding, value| {
         format!(
-            "{}\nfn probe() -> u64 {{\n    {binding} xs = [{value}];\n    return 0;\n}}\n",
-            p.decls
+            "{}\nfn probe({}) -> u64 {{\n    {binding} xs = [{value}];\n    return 0;\n}}\n",
+            p.decls, p.feed
         )
     })
 }
@@ -243,8 +288,8 @@ fn ctx_option_payload(p: &Probe) -> Vec<String> {
     ];
     spellings_by_values(p, &bindings, |binding, value| {
         format!(
-            "{}\nfn probe() -> u64 {{\n    {binding} o = some({value});\n    return 0;\n}}\n",
-            p.decls
+            "{}\nfn probe({}) -> u64 {{\n    {binding} o = some({value});\n    return 0;\n}}\n",
+            p.decls, p.feed
         )
     })
 }
@@ -253,10 +298,114 @@ fn ctx_generic_arg(p: &Probe) -> Vec<String> {
     spellings_by_values(p, &[p.spelling.to_string()], |spelling, value| {
         format!(
             "{}\nfn id<T>(T x) -> T {{\n    return x;\n}}\n\n\
-             fn probe() -> u64 {{\n    var y = id<{spelling}>({value});\n    return 0;\n}}\n",
+             fn probe({}) -> u64 {{\n    var y = id<{spelling}>({value});\n    return 0;\n}}\n",
+            p.decls, p.feed
+        )
+    })
+}
+
+fn ctx_for_index(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\nfn probe() -> u64 {{\n    mut u64 t = 0;\n    \
+         for ({} i : range(2)) {{\n        t = t + 1;\n    }}\n    return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
+}
+
+fn ctx_const(p: &Probe) -> Vec<String> {
+    spellings_by_values(p, &[p.spelling.to_string()], |spelling, value| {
+        format!(
+            "{}\nconst {spelling} K = {value};\n\nfn probe() -> u64 {{\n    return 0;\n}}\n",
             p.decls
         )
     })
+}
+
+fn ctx_cast_target(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\nfn probe() -> u64 {{\n    u32 a = 1;\n    var x = widen<{}>(a);\n    \
+         return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
+}
+
+fn ctx_trait_impl_target(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\ntrait Marked {{\n    fn mark(Self x) -> u64;\n}}\n\n\
+         impl Marked for {spelling} {{\n    fn mark({spelling} x) -> u64 {{\n        \
+         return 0;\n    }}\n}}\n\nfn probe() -> u64 {{\n    return 0;\n}}\n",
+        p.decls,
+        spelling = p.spelling
+    )]
+}
+
+fn ctx_raw_element(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\nfn probe(raw<{}> x) -> u64 {{\n    return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
+}
+
+fn ctx_resource_extent(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\nfn probe(resource &mut PointsTo<{}> c) -> u64 {{\n    return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
+}
+
+fn ctx_resource_map_key(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\nfn probe(resource &mut ResourceMap<{}, PointsTo<u64>> m) -> u64 {{\n    \
+         return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
+}
+
+fn member_probe(decls: &str, member: &str) -> String {
+    format!(
+        "{decls}\nclass Holder {{\n    u64 v;\n\n    init make() {{\n        \
+         self.v = 0;\n    }}\n{member}}}\n\nfn probe() -> u64 {{ return 0; }}\n"
+    )
+}
+
+fn ctx_init_param(p: &Probe) -> Vec<String> {
+    vec![member_probe(
+        p.decls,
+        &format!(
+            "\n    init with({} x) {{\n        self.v = 0;\n    }}\n",
+            p.spelling
+        ),
+    )]
+}
+
+fn ctx_init_param_shared(p: &Probe) -> Vec<String> {
+    vec![member_probe(
+        p.decls,
+        &format!(
+            "\n    init with(&{} x) {{\n        self.v = 0;\n    }}\n",
+            p.spelling
+        ),
+    )]
+}
+
+fn ctx_method_param(p: &Probe) -> Vec<String> {
+    vec![member_probe(
+        p.decls,
+        &format!(
+            "\n    fn poke(&self, {} x) -> u64 {{\n        return 0;\n    }}\n",
+            p.spelling
+        ),
+    )]
+}
+
+fn ctx_method_param_shared(p: &Probe) -> Vec<String> {
+    vec![member_probe(
+        p.decls,
+        &format!(
+            "\n    fn poke(&self, &{} x) -> u64 {{\n        return 0;\n    }}\n",
+            p.spelling
+        ),
+    )]
 }
 
 /// `Ok` when the position admits the type; `Err` carries the diagnostic
@@ -287,7 +436,11 @@ fn render(results: &[Vec<Result<(), String>>]) -> String {
          `compiler/tests/type_matrix.rs`;\nrewrite it with `SABLE_BLESS=1 cargo test \
          --test type_matrix`. A cell is `yes` when the\nLean-free front end accepts \
          some spelling of that type in that position, so it answers what the\nlanguage \
-         admits, not what verifies.\n\n",
+         admits, not what verifies.\n\nEach binding-mode column probes one spelling: \
+         `param` is the owned spelling, and\n`param &` / `param &mut` are the borrow \
+         spellings, so an open borrow cell says the\nlanguage admits lending the type, \
+         never that an owned value of it crosses the call.\nThe `init param` / `method \
+         param` pairs read the same way.\n\n",
     );
 
     out.push_str("| type |");
@@ -356,6 +509,124 @@ fn type_matrix_is_pinned() {
             path.display(),
             describe_drift(&recorded, &rendered)
         );
+    }
+}
+
+/// How a spellable type shape is witnessed by the matrix.
+enum ShapeWitness {
+    /// Rows whose spelling has this shape.
+    Rows(&'static [&'static str]),
+    /// Contexts that apply this shape to every row.
+    Contexts(&'static [&'static str]),
+    /// Deliberately not in the grid; the reason names what watches it.
+    Elsewhere(&'static str),
+}
+
+/// Every spellable type shape is probed.
+///
+/// The shapes come from the parser's own enumeration, so a new shape in the
+/// grammar is red here until this map says how the matrix sees it — as a
+/// row, as a context that wraps every row, or as a recorded decision naming
+/// the measurement that watches it instead.
+#[test]
+fn every_spellable_type_shape_is_probed() {
+    for shape in sable::parser::type_shape_names() {
+        let witness = match shape {
+            "Int" => ShapeWitness::Rows(&["u64"]),
+            "Bool" => ShapeWitness::Rows(&["bool"]),
+            "Record" => ShapeWitness::Rows(&["record"]),
+            "Class" => ShapeWitness::Rows(&["class"]),
+            "Array" => ShapeWitness::Rows(&["[u64]", "[bool]"]),
+            "Option" => ShapeWitness::Rows(&["option<u64>", "option<bool>", "option<[bool]>"]),
+            "Raw" => ShapeWitness::Rows(&["raw<u8>"]),
+            // A borrow is a binding-mode wrapper (ADR 0067), so it is
+            // probed as a mode of every row rather than as a row.
+            "Borrow" => ShapeWitness::Contexts(&[
+                "param &",
+                "param &mut",
+                "init param &",
+                "method param &",
+            ]),
+            // A type parameter is in scope only inside a template; the
+            // `generic arg` context probes instantiation, and the
+            // shape-admission table's `type parameter` rows watch every
+            // stage gate directly.
+            "Param" => ShapeWitness::Elsewhere(
+                "docs/shape-admission.md rows `type parameter` and `[type parameter]`",
+            ),
+            // A resource value is born only from sealed operations under
+            // consumption discipline, so no minimal probe program owns one;
+            // the resource-prefix grammar keeps the shape out of nested
+            // positions, the `resource extent` / `resource map key`
+            // contexts probe its own positions, and the shape-admission
+            // table's resource rows watch every stage gate directly.
+            "Resource" => ShapeWitness::Elsewhere(
+                "docs/shape-admission.md rows `resource`, `resource<record>`, `resource &`, \
+                 `resource &mut`",
+            ),
+            other => panic!(
+                "type shape `{other}` has no witness in the matrix: add a row for it (or a \
+                 recorded decision here) so the grid measures it"
+            ),
+        };
+        match witness {
+            ShapeWitness::Rows(rows) => {
+                for row in rows {
+                    assert!(
+                        TYPES.iter().any(|probe| probe.name == *row),
+                        "shape `{shape}` names the matrix row `{row}`, which does not exist"
+                    );
+                }
+            }
+            ShapeWitness::Contexts(contexts) => {
+                for context in contexts {
+                    assert!(
+                        CONTEXTS.iter().any(|(name, _)| name == context),
+                        "shape `{shape}` names the matrix context `{context}`, which does \
+                         not exist"
+                    );
+                }
+            }
+            ShapeWitness::Elsewhere(_) => {}
+        }
+    }
+}
+
+/// Every position a type can be written in is probed as a context.
+///
+/// The positions come from the parser's own enumeration, so a new `TyPos`
+/// is red here until the matrix grows a context for it.
+#[test]
+fn every_type_position_is_probed() {
+    for position in sable::parser::type_position_names() {
+        let contexts: &[&str] = match position {
+            "param" => &["param"],
+            "borrow param" => &["param &", "param &mut"],
+            "return" => &["return"],
+            "local" => &["local"],
+            "record field" => &["record field"],
+            "class field" => &["class field"],
+            "array element" => &["array element"],
+            "option payload" => &["option payload"],
+            "for index" => &["for index"],
+            "const" => &["const"],
+            "cast target" => &["cast target"],
+            "trait-impl target" => &["trait-impl target"],
+            "raw element" => &["raw element"],
+            "resource extent" => &["resource extent"],
+            "resource map key" => &["resource map key"],
+            other => panic!(
+                "type position `{other}` has no matrix context: add one so the grid \
+                 measures it"
+            ),
+        };
+        for context in contexts {
+            assert!(
+                CONTEXTS.iter().any(|(name, _)| name == context),
+                "position `{position}` names the matrix context `{context}`, which does \
+                 not exist"
+            );
+        }
     }
 }
 

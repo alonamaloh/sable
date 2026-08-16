@@ -1,0 +1,24 @@
+// A `raw<u8>` local reassigned inside a loop is a fresh unconstrained
+// pointer at each loop head (ADR 0074), so the loop invariant is what
+// keeps it usable: state where the pointer sits relative to the span, and
+// the load after the loop has its names-a-byte proof again.
+
+/// pre  a.len ≥ 1
+/// post result = a.get 0
+pub fn first_via_loop(&[u8] a) -> u8 {
+    u64 n = a.len;
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        mut raw<u8> q = p;
+        mut u64 i = 0;
+        /// invariant q.alloc = p.alloc ∧ q.off = p.off
+        /// invariant i ≤ n
+        /// variant   n - i
+        while (i < n) {
+            q = raw_offset(q, 0);
+            i = i + 1;
+        }
+        r = raw_load8(q, &m);
+    }
+    return r;
+}

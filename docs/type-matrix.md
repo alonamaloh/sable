@@ -5,65 +5,180 @@ rewrite it with `SABLE_BLESS=1 cargo test --test type_matrix`. A cell is `yes` w
 Lean-free front end accepts some spelling of that type in that position, so it answers what the
 language admits, not what verifies.
 
-| type | local | return | param | param &mut | record field | class field | array element | option payload | generic arg |
-|---|---|---|---|---|---|---|---|---|---|
-| `u64` | yes | yes | yes | no | yes | yes | yes | yes | yes |
-| `bool` | yes | yes | yes | no | no | yes | yes | yes | no |
-| `[u64]` | yes | no | yes | yes | no | yes | no | no | no |
-| `[bool]` | yes | no | yes | yes | no | no | no | yes | no |
-| `option<u64>` | yes | yes | yes | no | no | no | no | no | no |
-| `option<bool>` | yes | yes | yes | no | no | no | no | no | no |
-| `record` | yes | yes | yes | no | no | no | no | no | no |
-| `option<[bool]>` | yes | no | no | no | no | no | no | no | no |
-| `class` | yes | yes | yes | yes | no | yes | no | no | no |
+Each binding-mode column probes one spelling: `param` is the owned spelling, and
+`param &` / `param &mut` are the borrow spellings, so an open borrow cell says the
+language admits lending the type, never that an owned value of it crosses the call.
+The `init param` / `method param` pairs read the same way.
 
-Open cells: 37/81.
+| type | local | return | param | param & | param &mut | record field | class field | array element | option payload | generic arg | for index | const | cast target | trait-impl target | raw element | resource extent | resource map key | init param | init param & | method param | method param & |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `u64` | yes | yes | yes | no | no | yes | yes | yes | yes | yes | yes | yes | yes | yes | no | yes | yes | yes | no | yes | no |
+| `bool` | yes | yes | yes | no | no | no | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no |
+| `[u64]` | yes | no | no | yes | yes | no | yes | no | no | no | no | no | no | no | no | no | no | no | yes | no | no |
+| `[bool]` | yes | no | no | yes | yes | no | no | no | yes | no | no | no | no | no | no | no | no | no | yes | no | no |
+| `option<u64>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
+| `option<bool>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
+| `record` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | yes | yes | no | no | no | no | no |
+| `option<[bool]>` | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
+| `class` | yes | yes | yes | yes | yes | no | yes | no | no | no | no | no | no | no | no | no | no | yes | yes | yes | yes |
+| `raw<u8>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
+
+Open cells: 57/210.
 
 ## What closes each cell
 
 | type | context | diagnostic |
 |---|---|---|
+| `u64` | param & | `type.borrow_param_unsupported` |
 | `u64` | param &mut | `type.borrow_param_unsupported` |
+| `u64` | raw element | `raw.element_type` |
+| `u64` | init param & | `type.borrow_param_unsupported` |
+| `u64` | method param & | `type.borrow_param_unsupported` |
+| `bool` | param & | `type.borrow_param_unsupported` |
 | `bool` | param &mut | `type.borrow_param_unsupported` |
 | `bool` | record field | `record.field_type` |
 | `bool` | generic arg | `mono.type_arg_unsupported` |
+| `bool` | for index | `type.for_index_unsupported` |
+| `bool` | const | `type.const_unsupported` |
+| `bool` | cast target | `type.cast_target_unsupported` |
+| `bool` | trait-impl target | `type.impl_target_unsupported` |
+| `bool` | raw element | `type.raw_element_unsupported` |
+| `bool` | resource extent | `type.resource_extent_unsupported` |
+| `bool` | resource map key | `type.resource_map_key_unsupported` |
+| `bool` | init param | `type.member_param` |
+| `bool` | init param & | `type.borrow_param_unsupported` |
+| `bool` | method param | `type.member_param` |
+| `bool` | method param & | `type.borrow_param_unsupported` |
 | `[u64]` | return | `type.array_return` |
+| `[u64]` | param | `type.param_unsupported` |
 | `[u64]` | record field | `record.field_type` |
 | `[u64]` | array element | `type.array_payload_unsupported` |
 | `[u64]` | option payload | `type.affine_option_payload` |
 | `[u64]` | generic arg | `mono.type_arg_unsupported` |
+| `[u64]` | for index | `type.for_index_unsupported` |
+| `[u64]` | const | `type.const_unsupported` |
+| `[u64]` | cast target | `type.cast_target_unsupported` |
+| `[u64]` | trait-impl target | `type.impl_target_unsupported` |
+| `[u64]` | raw element | `type.raw_element_unsupported` |
+| `[u64]` | resource extent | `type.resource_extent_unsupported` |
+| `[u64]` | resource map key | `type.resource_map_key_unsupported` |
+| `[u64]` | init param | `type.param_unsupported` |
+| `[u64]` | method param | `type.param_unsupported` |
+| `[u64]` | method param & | `type.member_param` |
 | `[bool]` | return | `type.array_return` |
+| `[bool]` | param | `type.param_unsupported` |
 | `[bool]` | record field | `record.field_type` |
 | `[bool]` | class field | `type.bool_array_field` |
 | `[bool]` | array element | `type.array_payload_unsupported` |
 | `[bool]` | generic arg | `mono.type_arg_unsupported` |
+| `[bool]` | for index | `type.for_index_unsupported` |
+| `[bool]` | const | `type.const_unsupported` |
+| `[bool]` | cast target | `type.cast_target_unsupported` |
+| `[bool]` | trait-impl target | `type.impl_target_unsupported` |
+| `[bool]` | raw element | `type.raw_element_unsupported` |
+| `[bool]` | resource extent | `type.resource_extent_unsupported` |
+| `[bool]` | resource map key | `type.resource_map_key_unsupported` |
+| `[bool]` | init param | `type.param_unsupported` |
+| `[bool]` | method param | `type.param_unsupported` |
+| `[bool]` | method param & | `type.member_param` |
+| `option<u64>` | param & | `type.borrow_param_unsupported` |
 | `option<u64>` | param &mut | `type.borrow_param_unsupported` |
 | `option<u64>` | record field | `record.field_type` |
 | `option<u64>` | class field | `type.option_field` |
 | `option<u64>` | array element | `type.array_payload_unsupported` |
 | `option<u64>` | option payload | `type.option_payload_unsupported` |
 | `option<u64>` | generic arg | `mono.type_arg_unsupported` |
+| `option<u64>` | for index | `type.for_index_unsupported` |
+| `option<u64>` | const | `type.const_unsupported` |
+| `option<u64>` | cast target | `type.cast_target_unsupported` |
+| `option<u64>` | trait-impl target | `type.impl_target_unsupported` |
+| `option<u64>` | raw element | `type.raw_element_unsupported` |
+| `option<u64>` | resource extent | `type.resource_extent_unsupported` |
+| `option<u64>` | resource map key | `type.resource_map_key_unsupported` |
+| `option<u64>` | init param | `type.member_param` |
+| `option<u64>` | init param & | `type.borrow_param_unsupported` |
+| `option<u64>` | method param | `type.member_param` |
+| `option<u64>` | method param & | `type.borrow_param_unsupported` |
+| `option<bool>` | param & | `type.borrow_param_unsupported` |
 | `option<bool>` | param &mut | `type.borrow_param_unsupported` |
 | `option<bool>` | record field | `record.field_type` |
 | `option<bool>` | class field | `type.option_field` |
 | `option<bool>` | array element | `type.array_payload_unsupported` |
 | `option<bool>` | option payload | `type.option_payload_unsupported` |
 | `option<bool>` | generic arg | `mono.type_arg_unsupported` |
+| `option<bool>` | for index | `type.for_index_unsupported` |
+| `option<bool>` | const | `type.const_unsupported` |
+| `option<bool>` | cast target | `type.cast_target_unsupported` |
+| `option<bool>` | trait-impl target | `type.impl_target_unsupported` |
+| `option<bool>` | raw element | `type.raw_element_unsupported` |
+| `option<bool>` | resource extent | `type.resource_extent_unsupported` |
+| `option<bool>` | resource map key | `type.resource_map_key_unsupported` |
+| `option<bool>` | init param | `type.member_param` |
+| `option<bool>` | init param & | `type.borrow_param_unsupported` |
+| `option<bool>` | method param | `type.member_param` |
+| `option<bool>` | method param & | `type.borrow_param_unsupported` |
+| `record` | param & | `type.borrow_param_unsupported` |
 | `record` | param &mut | `type.borrow_param_unsupported` |
 | `record` | record field | `record.field_type` |
 | `record` | class field | `type.class_field_unsupported` |
 | `record` | array element | `type.array_payload_unsupported` |
 | `record` | option payload | `type.option_payload_unsupported` |
 | `record` | generic arg | `mono.type_arg_unsupported` |
+| `record` | for index | `type.for_index_unsupported` |
+| `record` | const | `type.const_unsupported` |
+| `record` | cast target | `type.cast_target_unsupported` |
+| `record` | trait-impl target | `type.impl_target_unsupported` |
+| `record` | resource map key | `type.resource_map_key_unsupported` |
+| `record` | init param | `type.member_param` |
+| `record` | init param & | `type.borrow_param_unsupported` |
+| `record` | method param | `type.member_param` |
+| `record` | method param & | `type.borrow_param_unsupported` |
 | `option<[bool]>` | return | `type.affine_option_return` |
 | `option<[bool]>` | param | `type.affine_option_param` |
+| `option<[bool]>` | param & | `type.borrow_param_unsupported` |
 | `option<[bool]>` | param &mut | `type.borrow_param_unsupported` |
 | `option<[bool]>` | record field | `type.affine_option_field` |
 | `option<[bool]>` | class field | `type.affine_option_field` |
 | `option<[bool]>` | array element | `type.array_payload_unsupported` |
 | `option<[bool]>` | option payload | `type.option_payload_unsupported` |
 | `option<[bool]>` | generic arg | `mono.type_arg_unsupported` |
+| `option<[bool]>` | for index | `type.for_index_unsupported` |
+| `option<[bool]>` | const | `type.const_unsupported` |
+| `option<[bool]>` | cast target | `type.cast_target_unsupported` |
+| `option<[bool]>` | trait-impl target | `type.impl_target_unsupported` |
+| `option<[bool]>` | raw element | `type.raw_element_unsupported` |
+| `option<[bool]>` | resource extent | `type.resource_extent_unsupported` |
+| `option<[bool]>` | resource map key | `type.resource_map_key_unsupported` |
+| `option<[bool]>` | init param | `type.affine_option_param` |
+| `option<[bool]>` | init param & | `type.borrow_param_unsupported` |
+| `option<[bool]>` | method param | `type.affine_option_param` |
+| `option<[bool]>` | method param & | `type.borrow_param_unsupported` |
 | `class` | record field | `record.field_type` |
 | `class` | array element | `type.array_payload_unsupported` |
 | `class` | option payload | `type.option_payload_unsupported` |
 | `class` | generic arg | `mono.type_arg_unsupported` |
+| `class` | for index | `type.for_index_unsupported` |
+| `class` | const | `type.const_unsupported` |
+| `class` | cast target | `type.cast_target_unsupported` |
+| `class` | trait-impl target | `type.impl_target_unsupported` |
+| `class` | raw element | `type.raw_element_unsupported` |
+| `class` | resource extent | `type.resource_extent_unsupported` |
+| `class` | resource map key | `type.resource_map_key_unsupported` |
+| `raw<u8>` | param & | `type.borrow_param_unsupported` |
+| `raw<u8>` | param &mut | `type.borrow_param_unsupported` |
+| `raw<u8>` | record field | `record.field_type` |
+| `raw<u8>` | class field | `type.class_field_unsupported` |
+| `raw<u8>` | array element | `type.array_payload_unsupported` |
+| `raw<u8>` | option payload | `record.option_pointer_type` |
+| `raw<u8>` | generic arg | `parse.expected` |
+| `raw<u8>` | for index | `type.for_index_unsupported` |
+| `raw<u8>` | const | `type.const_unsupported` |
+| `raw<u8>` | cast target | `type.cast_target_unsupported` |
+| `raw<u8>` | trait-impl target | `type.impl_target_unsupported` |
+| `raw<u8>` | raw element | `type.raw_element_unsupported` |
+| `raw<u8>` | resource extent | `type.resource_extent_unsupported` |
+| `raw<u8>` | resource map key | `type.resource_map_key_unsupported` |
+| `raw<u8>` | init param | `type.member_param` |
+| `raw<u8>` | init param & | `type.borrow_param_unsupported` |
+| `raw<u8>` | method param | `type.member_param` |
+| `raw<u8>` | method param & | `type.borrow_param_unsupported` |

@@ -1,0 +1,19 @@
+// pair: same-run
+// See bool_array_loop_havoc_erases_history.a.sable: only the dead
+// pre-loop store differs, and the loop's stores decide the outcome.
+
+/// post result
+pub fn churn() -> bool {
+    mut [bool] a = alloc_array<bool>(2, false);
+    a[0] = false;
+    mut u64 i = 0;
+    /// invariant i ≤ 2
+    /// invariant a.len = 2
+    /// invariant i ≥ 1 → a.get 0 = true
+    /// variant   2 - i
+    while (i < 2) {
+        a[0] = true;
+        i = i + 1;
+    }
+    return a[0];
+}

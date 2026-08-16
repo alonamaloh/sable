@@ -1,0 +1,10 @@
+// pair: same-lean
+// See option_names_a_value.a.sable: naming the option must change
+// nothing.
+
+/// pre  o.is_some
+/// post result = o.value
+pub fn get(option<u64> o) -> u64 {
+    var t = o;
+    return t.value;
+}

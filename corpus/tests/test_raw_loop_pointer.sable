@@ -1,0 +1,16 @@
+// The run half of the raw-pointer loop havoc pair: the loop reassigns the
+// pointer, the invariants pin where it sits, and the load after the loop
+// reads the byte the contract names.
+
+// Raw-pointer and resource-view invariants are proof vocabulary; the
+// monitor has no runtime value for a provenance/offset view to evaluate
+// them against.
+// expect-skip: q.alloc = p.alloc
+
+use raw_loop_pointer;
+
+fn test_first_byte_survives_the_loop() {
+    mut [u8] a = [9, 4, 7];
+    u8 r = first_via_loop(&a);
+    /// assert r = 9
+}

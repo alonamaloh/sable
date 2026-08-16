@@ -1,0 +1,24 @@
+// expect-error: walk_off_end.load8
+// A `raw<u8>` local reassigned inside a loop is a fresh unconstrained
+// pointer at the loop head (ADR 0074): nothing relates it to the span any
+// longer, so a load through it owes a names-a-byte proof the pre-loop
+// chain can no longer supply. Running this would trap: the loop walks the
+// pointer one past the end of the span.
+
+/// pre a.len ≥ 1
+pub fn walk_off_end(&[u8] a) -> u8 {
+    u64 n = a.len;
+    mut u8 r = 0;
+    unsafe expose &a as (p, resource m) {
+        mut raw<u8> q = p;
+        mut u64 i = 0;
+        /// invariant i ≤ n
+        /// variant   n - i
+        while (i < n) {
+            q = raw_offset(q, 1);
+            i = i + 1;
+        }
+        r = raw_load8(q, &m);
+    }
+    return r;
+}

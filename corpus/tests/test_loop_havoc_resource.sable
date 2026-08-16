@@ -1,0 +1,24 @@
+// Run half of the resource-view loop-havoc pair: the loop stores through
+// the pointer, and the owner shows the byte after the exposure ends.
+
+// Raw-pointer and resource-view clauses are proof vocabulary; the monitor
+// has no runtime provenance/offset/byte view to evaluate them against.
+// expect-skip: p.alloc = mem.alloc
+// expect-skip: 1 ≤ mem.len
+// expect-skip: Sable.SpanView.reconstructible mem
+// expect-skip: mem.alloc = (old mem).alloc
+// expect-skip: mem.bytes.get 0 = Sable.ByteState.init 7
+// expect-skip: mem.bytes.get k = (old mem).bytes.get k
+
+use loop_havoc_resource;
+
+fn test_stamp_first() {
+    mut [u8] a = [1, 2, 3];
+    stamp_first(&mut a);
+    u8 head = a[0];
+    u8 mid = a[1];
+    u8 tail = a[2];
+    /// assert head = 7
+    /// assert mid = 2
+    /// assert tail = 3
+}

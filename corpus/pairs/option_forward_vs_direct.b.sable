@@ -1,0 +1,19 @@
+// pair: same-run
+// See option_forward_vs_direct.a.sable: the same subjects call the
+// callee directly, with no forwarding hop.
+
+fn value_or(option<u64> o, u64 d) -> u64 {
+    if (o.is_some) {
+        return o.value;
+    }
+    return d;
+}
+
+pub fn present() -> u64 {
+    return value_or(some(7), 3);
+}
+
+pub fn absent() -> u64 {
+    option<u64> o = none;
+    return value_or(o, 3);
+}

@@ -1,0 +1,8 @@
+// expect-error: record.option_pointer_type
+// A nullable raw pointer is one abstract value over a record pointee, not an
+// option wrapped around any pointer. A byte pointer has no nullable storage
+// role, so `option<raw<u8>>` is refused by name.
+
+fn read(option<raw<u8>> p) -> u64 {
+    return 0;
+}

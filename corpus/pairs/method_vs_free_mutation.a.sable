@@ -1,0 +1,36 @@
+// pair: same-run
+// A method call on the owner and a free function lent the owner are two
+// spellings of one mutation: member calls and plain calls share one
+// call-site havoc and write-back for unique-borrow arguments
+// (ADR 0074), and the runtime must agree — the owner holds the callee's
+// writes either way.
+
+pub class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+
+    /// post result = self.n
+    fn get(&self) -> u64 {
+        return self.n;
+    }
+}
+
+/// post result = 2
+pub fn subject() -> u64 {
+    mut var c = Counter::zero();
+    c.bump();
+    c.bump();
+    return c.get();
+}

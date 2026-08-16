@@ -918,7 +918,7 @@ fn validate_block(
                             format!("owned array local `{name}` has no initializer"),
                         )]);
                     };
-                    if is_owned_bool_array(&ty.clone()) {
+                    if ty.is_owned_bool_array() {
                         validate_fresh_bool_array_initializer(
                             program,
                             value,
@@ -1003,7 +1003,7 @@ fn validate_block(
                     "inferred local",
                 )?;
                 if is_owned_native_array(&ty.clone()) {
-                    if is_owned_bool_array(&ty.clone()) {
+                    if ty.is_owned_bool_array() {
                         validate_fresh_bool_array_initializer(
                             program,
                             init,
@@ -1277,24 +1277,6 @@ fn validate_block(
     Ok(returned)
 }
 
-/// A Boolean array whose storage this scope owns and must free.
-///
-/// Strict about the binding mode, because it answers ownership questions:
-/// which declarations allocate, which enter the cleanup registry, and which
-/// call the free hook.
-fn is_owned_bool_array(ty: &Ty) -> bool {
-    ty.is_owned_array_of(&Ty::Bool)
-}
-
-/// A Boolean array in any binding mode.
-///
-/// Borrow-transparent, because it answers representation questions: the
-/// descriptor an owner and a borrow both carry, and the element bytes both
-/// address. The `u32` pair below is the same distinction.
-fn is_bool_array(ty: &Ty) -> bool {
-    ty.is_array_of(&Ty::Bool)
-}
-
 fn is_owned_u32_array(ty: Ty) -> bool {
     ty.is_owned_array_of(&Ty::Int(IntTy::U32))
 }
@@ -1304,12 +1286,12 @@ fn is_u32_array(ty: &Ty) -> bool {
 }
 
 fn is_owned_native_array(ty: &Ty) -> bool {
-    is_owned_bool_array(&ty.clone()) || is_owned_u32_array(ty.clone())
+    ty.is_owned_bool_array() || is_owned_u32_array(ty.clone())
 }
 
 /// An array the backend has a descriptor for, in any binding mode.
 fn is_native_array(ty: &Ty) -> bool {
-    is_bool_array(ty) || is_u32_array(ty)
+    ty.is_bool_array() || is_u32_array(ty)
 }
 
 fn require_fixed_class<'a>(
@@ -2170,7 +2152,7 @@ fn validate_native_array_store(
     }
     validate_expr(program, index, root_span_end, locals)?;
     require_expr_type(index, Ty::Int(IntTy::U64), "array store index")?;
-    if is_bool_array(&local.ty) {
+    if local.ty.is_bool_array() {
         validate_bool_expr(
             program,
             value,
@@ -2918,7 +2900,7 @@ fn validate_expr(
             }
             validate_expr(program, index, root_span_end, locals)?;
             require_expr_type(index, Ty::Int(IntTy::U64), "array index")?;
-            let element_ty = if is_bool_array(&local.ty) {
+            let element_ty = if local.ty.is_bool_array() {
                 Ty::Bool
             } else {
                 Ty::Int(IntTy::U32)
@@ -3882,7 +3864,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             Ty::Option(payload) if payload.as_ref() == &Ty::Bool => {
                 self.support.require_option_bool()
             }
-            ty if is_bool_array(&ty.clone()) => self.support.require_array_bool(),
+            ty if ty.is_bool_array() => self.support.require_array_bool(),
             ty if is_u32_array(&ty.clone()) => self.support.require_array_u32(),
             ty if is_affine_bool_option(&ty.clone()) => {
                 self.support.require_affine_option_bool_array()
@@ -4095,7 +4077,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .push(OwnedCleanup::FixedClass(name.to_owned(), class));
                 return Ok(());
             }
-            let value = if is_owned_bool_array(&ty.clone()) {
+            let value = if ty.is_owned_bool_array() {
                 match &init.kind {
                     ExprKind::OptTake { option, .. } => self.emit_affine_option_take(option)?,
                     _ => self.emit_fresh_bool_array(init)?,
@@ -4116,7 +4098,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 "store {stored} {}, ptr {slot}",
                 value.operand.expect("local initializer is non-unit")
             ));
-            if is_owned_bool_array(&ty.clone()) {
+            if ty.is_owned_bool_array() {
                 self.cleanup_scopes
                     .last_mut()
                     .expect("array declaration has a lexical cleanup scope")
@@ -4828,7 +4810,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .expect("validated native array local")
             .ty
             .clone();
-        if is_bool_array(&ty) {
+        if ty.is_bool_array() {
             return self.emit_bool_array_store(array, index, value);
         }
         self.emit_u32_array_store(array, index, value)
@@ -5134,7 +5116,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .operand
                     .expect("validated Boolean array index");
                 let ty = self.locals[array].ty.clone();
-                if is_bool_array(&ty) {
+                if ty.is_bool_array() {
                     let (ptr, len) = self.load_bool_array_parts(array);
                     self.emit_bool_array_bounds_guard(&index, &len);
                     let address = self.new_temp();
@@ -5166,7 +5148,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             }
             ExprKind::Len { array } => {
                 let ty = self.locals[array].ty.clone();
-                let (_, len) = if is_bool_array(&ty) {
+                let (_, len) = if ty.is_bool_array() {
                     self.load_bool_array_parts(array)
                 } else {
                     self.load_u32_array_parts(array)
@@ -6222,7 +6204,7 @@ pub(crate) fn llvm_ty(ty: Ty) -> Option<String> {
         Ty::Bool => "i1".into(),
         Ty::Unit => "void".into(),
         Ty::Option(payload) if payload.as_ref() == &Ty::Bool => LLVM_OPTION_BOOL.into(),
-        ty if is_bool_array(&ty.clone()) => LLVM_ARRAY_BOOL.into(),
+        ty if ty.is_bool_array() => LLVM_ARRAY_BOOL.into(),
         ty if is_u32_array(&ty.clone()) => LLVM_ARRAY_U32.into(),
         ty if is_affine_bool_option(&ty.clone()) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
         Ty::Class(class) => llvm_class_ty(class),

@@ -1,0 +1,11 @@
+// expect-error: type.member_param
+// A raw pointer member parameter is refused: members have no raw-memory
+// proof surface.
+
+pub class C {
+    u64 v;
+
+    init make(raw<u8> p) {
+        self.v = 0;
+    }
+}

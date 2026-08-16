@@ -1,0 +1,8 @@
+// Run half of the Boolean loop-havoc pair.
+
+use loop_havoc_bool;
+
+fn test_latch_true() {
+    bool b = latch_true();
+    /// assert b = true
+}

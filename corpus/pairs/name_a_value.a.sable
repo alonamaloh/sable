@@ -1,0 +1,12 @@
+// pair: same-lean
+// A local name for a value is transparent: binding an array read to a
+// name and returning the name must emit exactly the obligations the
+// inline read emits. The symbolic environment is keyed by source name,
+// and that model is sound only while a name is a term, never a second
+// door to storage (ADR 0072); this pair pins the term half of that rule.
+
+/// pre  i < m.len
+/// post result = m.get i
+pub fn read_at(&[u32] m, u64 i) -> u32 {
+    return m[i];
+}

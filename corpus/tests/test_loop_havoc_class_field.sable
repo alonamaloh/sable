@@ -1,0 +1,11 @@
+// The class-valued-field arm of the loop coverage, run against the sound
+// init-loop subject: the constructor's loop reassigns the field and the
+// post observes the value the loop left.
+
+use init_loop_class_field;
+
+fn test_field_survives_the_init_loop() {
+    var o = Outer::build();
+    u64 v = inner_value(&o.inner);
+    /// assert v = 5
+}

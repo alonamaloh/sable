@@ -3,9 +3,10 @@
 #
 # Two artifacts, both derived from the corpus:
 #
-#   lean.snap  the generated Lean for every `corpus/verifies` subject, which
-#              contains every mangled declaration name, every emitted Lean
-#              type, and every obligation statement;
+#   lean.snap  the generated Lean for every `corpus/verifies`, `corpus/tests`,
+#              and `corpus/test-fails` subject, which contains every mangled
+#              declaration name, every emitted Lean type, and every obligation
+#              statement;
 #   diag.snap  the rendered diagnostic for every `corpus/must-fail` subject,
 #              which contains every type name the compiler prints.
 #
@@ -25,10 +26,12 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 mkdir -p "$outdir"
 
 : > "$outdir/lean.snap"
-for subject in "$root"/corpus/verifies/*.sable; do
-    printf '===== %s\n' "${subject#"$root"/}" >> "$outdir/lean.snap"
-    "$binary" check --emit-lean -M "$root/corpus/verifies" "$subject" \
-        >> "$outdir/lean.snap" 2>&1 || true
+for dir in verifies tests test-fails; do
+    for subject in "$root"/corpus/"$dir"/*.sable; do
+        printf '===== %s\n' "${subject#"$root"/}" >> "$outdir/lean.snap"
+        "$binary" check --emit-lean -M "$root/corpus/verifies" "$subject" \
+            >> "$outdir/lean.snap" 2>&1 || true
+    done
 done
 
 : > "$outdir/diag.snap"

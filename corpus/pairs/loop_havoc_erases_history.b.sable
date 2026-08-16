@@ -1,0 +1,17 @@
+// pair: same-lean
+// See loop_havoc_erases_history.a.sable: only the dead pre-loop value of
+// `x` differs, and the loop-head havoc must erase it.
+
+/// post result ≤ u64.max
+pub fn walk() -> u64 {
+    mut u64 x = 2;
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// variant   3 - i
+    while (i < 3) {
+        x = i;
+        i = i + 1;
+    }
+    u64 y = x + 0;
+    return y;
+}

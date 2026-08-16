@@ -1,0 +1,37 @@
+// pair: same-lean
+// See deinit_loop_self_havoc_erases_history.a.sable: only the dead
+// pre-loop value of `self.level` differs, and the destructor's loop-head
+// `self` havoc must erase it.
+
+pub class Draining {
+    u64 level;
+
+    /// post self.level = n
+    init fill(u64 n) {
+        self.level = n;
+    }
+
+    deinit {
+        self.level = 2;
+        mut u64 i = 0;
+        /// invariant i ≤ 4
+        /// variant   4 - i
+        while (i < 4) {
+            self.level = 0;
+            i = i + 1;
+        }
+        /// assert self.level ≤ u64.max
+    }
+}
+
+/// post result = d.level
+pub fn level_of(&Draining d) -> u64 {
+    return d.level;
+}
+
+/// post result = 7
+pub fn fill_and_read() -> u64 {
+    var d = Draining::fill(7);
+    u64 r = level_of(&d);
+    return r;
+}

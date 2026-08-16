@@ -1,0 +1,12 @@
+// pair: same-lean
+// A read through a `&[bool]` parameter crosses the Bool-to-Prop bridge
+// (`get i = true`) exactly once, whether or not the read is first bound
+// to a local name. The halves differ only in that binding, so their
+// obligations must be identical — a bridge that reified differently on
+// the named path would show up here.
+
+/// pre  i < m.len
+/// post result = m.get i
+pub fn read_at(&[bool] m, u64 i) -> bool {
+    return m[i];
+}

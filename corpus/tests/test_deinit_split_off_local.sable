@@ -1,0 +1,10 @@
+// The run half of the sealed-op field-borrow pair: the destructor moves
+// its resource field into a local and carves through the local — the
+// spelling resource.field_borrow_op points at — and executes cleanly.
+
+use deinit_split_off_local;
+
+fn test_build_and_drop() {
+    u64 r = build_and_drop();
+    /// assert r = 3
+}

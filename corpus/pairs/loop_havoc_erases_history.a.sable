@@ -1,0 +1,20 @@
+// pair: same-lean
+// A loop-mutated integer local is a fresh binder at the loop head, so the
+// two halves — which differ only in the dead pre-loop value of `x` — must
+// emit identical obligations after the loop. If any havoc path kept the
+// pre-loop symbolic chain instead of replacing it (ADR 0074), the dead
+// value would leak into the post-loop goals and the halves would diverge.
+
+/// post result ≤ u64.max
+pub fn walk() -> u64 {
+    mut u64 x = 1;
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// variant   3 - i
+    while (i < 3) {
+        x = i;
+        i = i + 1;
+    }
+    u64 y = x + 0;
+    return y;
+}

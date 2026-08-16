@@ -1,0 +1,16 @@
+// The run half of the destructor-loop pair: the deinit whose loop assigns
+// a field executes at scope exit with its loop invariants and variant
+// monitored.
+
+use deinit_loop_field;
+
+fn test_deinit_loop_runs() {
+    var d = Draining::fill(7);
+    u64 r = level_of(&d);
+    /// assert r = 7
+}
+
+fn test_drain_one() {
+    u64 r = drain_one();
+    /// assert r = 7
+}

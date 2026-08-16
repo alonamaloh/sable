@@ -1,0 +1,19 @@
+// Loop-havoc coverage, owned Boolean array local: an element store
+// inside a loop makes the array a fresh `Sable.Seq Bool` at the loop
+// head with its length preserved (ADR 0074); the conditional invariant
+// carries the stored element out through the Prop↔Bool bridge.
+
+/// post result = true
+pub fn stamp_flag() -> bool {
+    mut [bool] flags = alloc_array<bool>(3, false);
+    mut u64 i = 0;
+    /// invariant flags.len = 3
+    /// invariant i ≤ 3
+    /// invariant i ≥ 1 → flags.get 1 = true
+    /// variant   3 - i
+    while (i < 3) {
+        flags[1] = true;
+        i = i + 1;
+    }
+    return flags[1];
+}

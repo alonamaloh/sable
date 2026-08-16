@@ -1,0 +1,23 @@
+// Loop-havoc coverage, template type parameter: a `T`-typed local
+// reassigned inside a loop of a retained generic template (ADR 0009) is a
+// fresh binder over the abstract integer model at the loop head
+// (ADR 0074); the invariant carries its value out.
+
+/// post result = x
+fn relay<T>(T x) -> T {
+    mut T cur = x;
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant cur = x
+    /// variant   3 - i
+    while (i < 3) {
+        cur = x;
+        i = i + 1;
+    }
+    return cur;
+}
+
+/// post result = 7
+pub fn relay_seven() -> u32 {
+    return relay<u32>(7);
+}

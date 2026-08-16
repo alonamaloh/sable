@@ -1,0 +1,46 @@
+// A class-valued field reassigned inside an init loop: the field is a
+// fresh state at the loop head, and the loop invariant is what carries
+// its value across (ADR 0074). The nested value's own class invariant is
+// still assumed for the fresh state — a class value only ever comes from
+// an init or method exit, each of which re-establishes it.
+
+pub class Inner {
+    u64 v;
+
+    /// invariant v ≤ 1000
+
+    /// pre  x ≤ 1000
+    /// post self.v = x
+    init make(u64 x) {
+        self.v = x;
+    }
+}
+
+pub class Outer {
+    Inner inner;
+
+    /// post self.inner.v = 5
+    init build() {
+        self.inner = Inner::make(5);
+        mut u64 i = 0;
+        /// invariant i ≤ 3
+        /// invariant self.inner.v = 5
+        /// variant   3 - i
+        while (i < 3) {
+            self.inner = Inner::make(5);
+            i = i + 1;
+        }
+    }
+}
+
+/// post result = 5
+pub fn read_rebuilt() -> u64 {
+    var o = Outer::build();
+    u64 r = inner_value(&o.inner);
+    return r;
+}
+
+/// post result = i.v
+pub fn inner_value(&Inner i) -> u64 {
+    return i.v;
+}

@@ -1,0 +1,13 @@
+// expect-error: type.member_param
+// A `&mut [T]` member parameter is refused: admitting it must arrive
+// together with the member-call-site argument havoc (the callee may store
+// arbitrarily through it), which `Generator::havoc_mut_borrow_args`
+// already supplies for every unique borrow (ADR 0074).
+
+pub class C {
+    u64 v;
+
+    init make(&mut [u32] xs) {
+        self.v = 0;
+    }
+}

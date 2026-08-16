@@ -1,0 +1,17 @@
+// Loop-havoc coverage, Boolean local: a `bool` reassigned inside a loop
+// is a fresh `Bool` binder at the loop head (ADR 0074); the conditional
+// invariant carries the latch to the post-loop observation.
+
+/// post result = true
+pub fn latch_true() -> bool {
+    mut bool hit = false;
+    mut u64 i = 0;
+    /// invariant i ≤ 3
+    /// invariant i ≥ 1 → hit = true
+    /// variant   3 - i
+    while (i < 3) {
+        hit = true;
+        i = i + 1;
+    }
+    return hit;
+}

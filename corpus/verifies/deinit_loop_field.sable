@@ -1,0 +1,41 @@
+// A destructor whose loop assigns a field. The construct verifies like
+// the method case: at the loop head `self` is a fresh state with its
+// field facts, and the loop invariants — not the class invariant, which a
+// destructor body is free to have already broken (ADR 0029) — are what
+// carry the working facts across the backedge (ADR 0074).
+
+pub class Draining {
+    u64 level;
+
+    /// invariant level ≤ 100
+
+    /// pre  n ≤ 100
+    /// post self.level = n
+    init fill(u64 n) {
+        self.level = n;
+    }
+
+    deinit {
+        mut u64 i = 0;
+        /// invariant i ≤ 4
+        /// invariant self.level ≤ 100
+        /// variant   4 - i
+        while (i < 4) {
+            self.level = 0;
+            i = i + 1;
+        }
+        /// assert self.level ≤ 100
+    }
+}
+
+/// post result = 7
+pub fn drain_one() -> u64 {
+    var d = Draining::fill(7);
+    u64 r = level_of(&d);
+    return r;
+}
+
+/// post result = d.level
+pub fn level_of(&Draining d) -> u64 {
+    return d.level;
+}

@@ -1,0 +1,8 @@
+// Run half of the owned-Boolean-array loop-havoc pair.
+
+use loop_havoc_bool_array;
+
+fn test_stamp_flag() {
+    bool b = stamp_flag();
+    /// assert b = true
+}

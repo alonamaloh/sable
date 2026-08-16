@@ -1,0 +1,35 @@
+// pair: same-run
+// A `&mut` argument is the caller's storage: writing the first element
+// through a lent callee and writing it through the owner's own name are
+// the same program (ADR 0072's rewrites of the refused borrow local).
+// The two halves must agree on what the owner holds afterwards — a
+// callee writing into a copy, or a write-back landing under the wrong
+// name, would diverge here.
+
+/// pre  m.len ≥ 1
+/// post m.get 0 = true
+/// post m.len = (old m).len
+fn set_first(&mut [bool] m) {
+    m[0] = true;
+}
+
+/// post result
+pub fn subject() -> bool {
+    mut [bool] a = alloc_array<bool>(3, false);
+    set_first(&mut a);
+    return a[0];
+}
+
+/// pre  m.len ≥ 1
+/// post m.get 0 = 7
+/// post m.len = (old m).len
+fn set_first_u32(&mut [u32] m) {
+    m[0] = 7;
+}
+
+/// post result = 7
+pub fn subject_u32() -> u32 {
+    mut [u32] a = alloc_array<u32>(3, 0);
+    set_first_u32(&mut a);
+    return a[0];
+}
