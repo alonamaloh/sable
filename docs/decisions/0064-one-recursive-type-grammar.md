@@ -347,7 +347,11 @@ payload by name is the load-bearing line, not the parser table.
 Three pieces of the plan this decision was drawn from are **not** in the tree.
 They are recorded here as remaining work.
 
-**1. `Ty::Borrow(Mutability, Box<Ty>)` does not exist.** Mutability is still
+**1. `Ty::Borrow(Mutability, Box<Ty>)` does not exist.** *(Done in ADR 0067,
+which also reverses the `ResRef` sentence under "What stays non-orthogonal, on
+purpose": nothing computes a `TypeShape` from a `Ty`, so folding the checked
+representation cannot make a shape function disagree with `Parser::admits`.)*
+Mutability is still
 carried inline by the constructor that can be borrowed: `Ty::Array(Box<Ty>,
 Mutability)` and `Ty::ClassRef(usize, Mutability)`. So `&Nat` and `&[u64]` are
 two unrelated shapes in the representation even though they are one shape in the

@@ -147,7 +147,8 @@ name.
 
 ## What did not land
 
-**`Ty::Borrow(Mutability, Box<Ty>)` still does not exist**, and
+**`Ty::Borrow(Mutability, Box<Ty>)` still does not exist** *(done in ADR
+0067)*, and
 `check::option_payload_ty` and `interp::option_value_ty` still return a type.
 `option_value_ty` has a reason to (above); `option_payload_ty` is waiting on
 its callers.

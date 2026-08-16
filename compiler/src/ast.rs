@@ -438,18 +438,16 @@ pub enum Ty {
     Param(TypeParamId),
     /// A class value (owned local); index into `Program::classes`.
     Class(usize),
-    /// A borrow of a class: `&Nat` (shared — ADR 0010) or `&mut Nat`
-    /// (unique, mutable through the class's own `&mut self` methods —
-    /// ADR 0023). Parameters only.
-    ClassRef(usize, Mutability),
     /// A plain, copyable record value with compiler-checked explicit
     /// layout. Records are deliberately distinct from affine classes:
     /// they have no invariant, methods, resources, or destructor (ADR 0054).
     Record(usize),
-    /// `[T]` owned, or `&[T]` / `&mut [T]` borrowed. The element is a full
-    /// type: which elements a stage will actually execute, prove, or lower is
-    /// each stage's own named gate to state, not this constructor's.
-    Array(Box<Ty>, Mutability),
+    /// `[T]` — an owned array. The element is a full type: which elements a
+    /// stage will actually execute, prove, or lower is each stage's own named
+    /// gate to state, not this constructor's.
+    ///
+    /// A bare type owns. `&[T]` and `&mut [T]` are `Ty::Borrow` over this.
+    Array(Box<Ty>),
     /// `option<T>`. The payload is a full type for the same reason an array
     /// element is, so whether the option owns its present case is read off
     /// the payload (`is_affine`) rather than encoded by the constructor. The
@@ -475,13 +473,21 @@ pub enum Ty {
     /// A statically tagged pointer to an explicitly laid-out record.
     /// Runtime representation remains provenance plus byte offset.
     RawRecord(usize),
-    /// `resource &R` / `resource &mut R` — a borrow of that authority.
+    /// `&T` (shared — ADR 0010) or `&mut T` (unique — ADR 0023): a second
+    /// name for storage the caller keeps.
     ///
-    /// Distinct from a borrowed value type because resource borrow-ness is
-    /// spelled with the `resource` keyword and classified as its own shape:
-    /// folding it in would make a shape function disagree with
-    /// `Parser::admits` about the same spelling.
-    ResRef(ResKind, Mutability),
+    /// Binding mode lives here and nowhere else, so a shape and a mode are
+    /// never the same constructor and "does this own" is answerable
+    /// structurally: `is_affine` is `false` for every borrow whatever its
+    /// referent. Which referents may actually be borrowed, and where, is
+    /// stated by `Parser::admits` at `TyPos::BorrowParam` and by each stage's
+    /// own named gate — not by which referents this constructor can hold.
+    ///
+    /// `resource &K` is a borrow of `Ty::Res(K)`. It keeps its own syntactic
+    /// shape (`TypeShape::Resource`), because the spelling puts the borrow
+    /// marker after the keyword; `Ty::name` renders that spelling from the
+    /// referent.
+    Borrow(Mutability, Box<Ty>),
     /// No return value (procedures like in-place sorts).
     Unit,
 }
@@ -911,18 +917,61 @@ impl ResKind {
     }
 }
 
+/// How much a borrow may do through the storage it names.
+///
+/// This is a property of a borrow and of nothing else: there is no "owned"
+/// mutability, because owning is the absence of a borrow. Ask
+/// [`Ty::binding_mode`] for the three-way question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mutability {
     Shared,
     Mut,
-    /// A test-function local created by an array literal.
+}
+
+/// How a type binds the storage it names: outright, or through a borrow.
+///
+/// Derived from the shape — `Ty::Borrow` carries the two borrowed cases and
+/// every other constructor owns — so it is a *question* about a type, never a
+/// field of one. A rule that must give owned, shared, and unique three
+/// different answers matches on this; a rule that only asks "does this own"
+/// asks [`Ty::is_affine`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingMode {
     Owned,
+    Shared,
+    Mut,
+}
+
+impl BindingMode {
+    /// The type `referent` has when it is bound this way.
+    pub fn bind(self, referent: Ty) -> Ty {
+        match self {
+            BindingMode::Owned => referent,
+            BindingMode::Shared => Ty::borrow(Mutability::Shared, referent),
+            BindingMode::Mut => Ty::borrow(Mutability::Mut, referent),
+        }
+    }
+
+    /// The three modes, for a battery that must cover all of them.
+    pub fn all() -> [BindingMode; 3] {
+        [BindingMode::Owned, BindingMode::Shared, BindingMode::Mut]
+    }
 }
 
 impl Ty {
-    /// `[element]` owned, or `&[element]` / `&mut [element]` borrowed.
-    pub fn array(element: Ty, mutability: Mutability) -> Ty {
-        Ty::Array(Box::new(element), mutability)
+    /// `[element]` — an owned array.
+    pub fn array(element: Ty) -> Ty {
+        Ty::Array(Box::new(element))
+    }
+
+    /// `&referent` / `&mut referent`.
+    pub fn borrow(mutability: Mutability, referent: Ty) -> Ty {
+        Ty::Borrow(mutability, Box::new(referent))
+    }
+
+    /// `&[element]` / `&mut [element]`.
+    pub fn array_ref(element: Ty, mutability: Mutability) -> Ty {
+        Ty::borrow(mutability, Ty::array(element))
     }
 
     /// A copyable `option<payload>`.
@@ -932,25 +981,127 @@ impl Ty {
 
     /// An owning `option<[element]>`: an option over an owned array.
     pub fn affine_array_option(element: Ty) -> Ty {
-        Ty::option(Ty::array(element, Mutability::Owned))
+        Ty::option(Ty::array(element))
     }
 
-    /// The element type and binding mode of an array.
+    /// What a borrow names, or the type itself when it owns.
+    ///
+    /// One level only: `&&[T]` is a borrow whose referent is a borrow, and
+    /// this returns the inner borrow rather than the array.
+    ///
+    /// Use it where the binding mode is asked *separately* — a rule that
+    /// looks through a borrow without also asking [`Ty::binding_mode`] is a
+    /// rule that treats a borrow as its referent, which is how an owner is
+    /// duplicated.
+    pub fn referent(&self) -> &Ty {
+        match self {
+            Ty::Borrow(_, referent) => referent,
+            owned => owned,
+        }
+    }
+
+    /// How this type binds its storage.
+    pub fn binding_mode(&self) -> BindingMode {
+        match self {
+            Ty::Borrow(Mutability::Shared, _) => BindingMode::Shared,
+            Ty::Borrow(Mutability::Mut, _) => BindingMode::Mut,
+            _ => BindingMode::Owned,
+        }
+    }
+
+    /// What a borrow names, and how much it may do through it.
+    pub fn as_borrow(&self) -> Option<(Mutability, &Ty)> {
+        match self {
+            Ty::Borrow(mutability, referent) => Some((*mutability, referent)),
+            _ => None,
+        }
+    }
+
+    /// What a *unique* borrow `&mut T` names.
+    ///
+    /// This is the one question the `old` snapshots, the loop havoc, and the
+    /// call-site havoc all ask: a unique borrow is the only type through which
+    /// a callee can change storage its caller still names.
+    pub fn as_unique_borrow(&self) -> Option<&Ty> {
+        match self {
+            Ty::Borrow(Mutability::Mut, referent) => Some(referent),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a unique borrow `&mut T`.
+    pub fn is_unique_borrow(&self) -> bool {
+        self.as_unique_borrow().is_some()
+    }
+
+    /// The element type and binding mode of an array, owned or borrowed.
     ///
     /// Container payloads are read through accessors rather than nested
     /// patterns because they are boxed. A caller that wants an exact payload
     /// compares the result: `ty.as_array() == Some((&Ty::Bool, ...))`.
-    pub fn as_array(&self) -> Option<(&Ty, Mutability)> {
-        match self {
-            Ty::Array(element, mutability) => Some((element, *mutability)),
+    pub fn as_array(&self) -> Option<(&Ty, BindingMode)> {
+        match self.referent() {
+            Ty::Array(element) => Some((element, self.binding_mode())),
             _ => None,
         }
     }
 
     /// The element type of an owned array, ignoring borrowed ones.
+    ///
+    /// Strict: `&[T]` is not an owned array, and this is what keeps the
+    /// owning-option family (`as_affine_option_payload`) and the runtime's
+    /// owned-storage cleanup from ever naming a borrow.
     pub fn as_owned_array(&self) -> Option<&Ty> {
         match self {
-            Ty::Array(element, Mutability::Owned) => Some(element),
+            Ty::Array(element) => Some(element),
+            _ => None,
+        }
+    }
+
+    /// The element type and mutability of a *borrowed* array `&[T]`/`&mut [T]`.
+    pub fn as_array_borrow(&self) -> Option<(&Ty, Mutability)> {
+        match self {
+            Ty::Borrow(mutability, referent) => referent
+                .as_owned_array()
+                .map(|element| (element, *mutability)),
+            _ => None,
+        }
+    }
+
+    /// The class a class value or a borrow of one names.
+    pub fn class_index(&self) -> Option<usize> {
+        match self.referent() {
+            Ty::Class(class) => Some(*class),
+            _ => None,
+        }
+    }
+
+    /// The class a class borrow `&C`/`&mut C` names, and its mutability.
+    pub fn as_class_borrow(&self) -> Option<(usize, Mutability)> {
+        match self {
+            Ty::Borrow(mutability, referent) => match **referent {
+                Ty::Class(class) => Some((class, *mutability)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The resource kind an owned resource or a borrow of one names.
+    pub fn res_kind(&self) -> Option<ResKind> {
+        match self.referent() {
+            Ty::Res(kind) => Some(*kind),
+            _ => None,
+        }
+    }
+
+    /// The resource kind a resource borrow names, and its mutability.
+    pub fn as_res_borrow(&self) -> Option<(ResKind, Mutability)> {
+        match self {
+            Ty::Borrow(mutability, referent) => match **referent {
+                Ty::Res(kind) => Some((kind, *mutability)),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1004,7 +1155,7 @@ impl Ty {
 
     /// Whether this is an owned array of exactly `element`.
     pub fn is_owned_array_of(&self, element: &Ty) -> bool {
-        matches!(self.as_array(), Some((found, Mutability::Owned)) if found == element)
+        matches!(self.as_owned_array(), Some(found) if found == element)
     }
 
     /// Whether this is an option of exactly `payload`.
@@ -1030,20 +1181,23 @@ impl Ty {
     /// an owner as copyable.
     pub fn is_affine(&self) -> bool {
         match self {
-            Ty::Class(_) | Ty::Res(_) => true,
-            Ty::Array(_, Mutability::Owned) => true,
-            Ty::Array(_, Mutability::Shared | Mutability::Mut) => false,
+            Ty::Class(_) | Ty::Res(_) | Ty::Array(_) => true,
             // An option owns exactly when its present case does.
             Ty::Option(payload) => payload.is_affine(),
+            // Terminal, and deliberately *not* `referent.is_affine()`. A
+            // borrow is a second name for storage someone else owns, so it
+            // owns nothing however affine its referent is. Recursing here
+            // would make `&mut [T]` affine, which would move the borrow's
+            // place into the moved set and hand the runtime's owned-storage
+            // cleanup the caller's buffer.
+            Ty::Borrow(..) => false,
             Ty::Int(_)
             | Ty::Bool
             | Ty::Param(_)
             | Ty::Record(_)
-            | Ty::ClassRef(..)
             | Ty::OptionRaw(_)
             | Ty::Raw(_)
             | Ty::RawRecord(_)
-            | Ty::ResRef(..)
             | Ty::Unit => false,
         }
     }
@@ -1069,7 +1223,7 @@ impl Ty {
     /// Resources are erased from runtime signatures and layout: authority
     /// is a static notion with no value to pass (ADR 0024).
     pub fn is_resource(&self) -> bool {
-        matches!(self, Ty::Res(_) | Ty::ResRef(..))
+        matches!(self.referent(), Ty::Res(_))
     }
 
     /// Whether this type contains no type parameter, including the
@@ -1082,18 +1236,17 @@ impl Ty {
         match self {
             Ty::Int(IntTy::TParam(_)) | Ty::Param(_) => false,
             Ty::Raw(IntTy::TParam(_)) => false,
-            Ty::Array(element, _) => element.is_concrete(),
+            Ty::Array(element) => element.is_concrete(),
             Ty::Option(payload) => payload.is_concrete(),
+            Ty::Borrow(_, referent) => referent.is_concrete(),
             Ty::Int(_)
             | Ty::Bool
             | Ty::Class(_)
-            | Ty::ClassRef(..)
             | Ty::Record(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
             | Ty::Raw(_)
             | Ty::RawRecord(_)
-            | Ty::ResRef(..)
             | Ty::Unit => true,
         }
     }
@@ -1107,19 +1260,18 @@ impl Ty {
     /// too, not only on the written one.
     pub fn structural_depth(&self) -> usize {
         1 + match self {
-            Ty::Array(element, _) => element.structural_depth(),
+            Ty::Array(element) => element.structural_depth(),
             Ty::Option(payload) => payload.structural_depth(),
+            Ty::Borrow(_, referent) => referent.structural_depth(),
             Ty::Int(_)
             | Ty::Bool
             | Ty::Param(_)
             | Ty::Class(_)
-            | Ty::ClassRef(..)
             | Ty::Record(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
             | Ty::Raw(_)
             | Ty::RawRecord(_)
-            | Ty::ResRef(..)
             | Ty::Unit => 0,
         }
     }
@@ -1140,22 +1292,34 @@ impl Ty {
             Ty::Int(t) => t.name().to_string(),
             Ty::Bool => "bool".to_string(),
             Ty::Param(parameter) => format!("<T{}>", parameter.index()),
-            Ty::Array(t, Mutability::Shared) => format!("&[{}]", t.name()),
-            Ty::Array(t, Mutability::Mut) => format!("&mut [{}]", t.name()),
-            Ty::Array(t, Mutability::Owned) => format!("[{}]", t.name()),
+            Ty::Array(t) => format!("[{}]", t.name()),
             Ty::Class(_) => "class".to_string(),
-            Ty::ClassRef(_, Mutability::Mut) => "&mut class".to_string(),
-            Ty::ClassRef(..) => "&class".to_string(),
             Ty::Record(_) => "record".to_string(),
             Ty::Raw(t) => format!("raw<{}>", t.name()),
             Ty::RawRecord(_) => "raw<record>".to_string(),
             Ty::Res(k) => format!("resource {}", k.name()),
-            Ty::ResRef(k, Mutability::Mut) => format!("resource &mut {}", k.name()),
-            Ty::ResRef(k, _) => format!("resource &{}", k.name()),
+            Ty::Borrow(mutability, referent) => borrow_name(*mutability, referent),
             Ty::Option(t) => format!("option<{}>", t.name()),
             Ty::OptionRaw(_) => "option<raw<record>>".to_string(),
             Ty::Unit => "()".to_string(),
         }
+    }
+}
+
+/// How a borrow of `referent` is spelled.
+///
+/// The marker is a prefix on the referent's own name, so the printing stays
+/// compositional and every new referent shape prints without an edit here.
+/// The one exception is the spelling the language actually uses for a
+/// resource borrow: `resource &K` puts the marker *after* the keyword.
+fn borrow_name(mutability: Mutability, referent: &Ty) -> String {
+    let marker = match mutability {
+        Mutability::Shared => "&",
+        Mutability::Mut => "&mut ",
+    };
+    match referent {
+        Ty::Res(kind) => format!("resource {marker}{}", kind.name()),
+        other => format!("{marker}{}", other.name()),
     }
 }
 
@@ -1905,18 +2069,29 @@ mod generic_ty_tests {
     /// someone remembered. The right-hand side is that rule, written out
     /// where a reader can compare it against the language's ownership
     /// documentation without reading `is_affine`.
+    ///
+    /// It is derived from the *spelling* rather than from the constructor
+    /// list `is_affine` matches on. A second copy is only worth having if it
+    /// can be wrong differently: two copies that both enumerate constructors
+    /// can be edited identically-wrong in one sitting, and this test would
+    /// still pass.
     #[test]
     fn affinity_agrees_with_the_ownership_rule() {
         fn owns(ty: &Ty) -> bool {
-            match ty {
-                // A class instance and a resource are the two nominal
-                // owners; an owned array owns its storage; a borrow of
-                // either owns nothing (ADRs 0010, 0023).
-                Ty::Class(_) | Ty::Res(_) | Ty::Array(_, Mutability::Owned) => true,
-                // An option owns exactly when its present case does.
-                Ty::Option(payload) => owns(payload),
-                _ => false,
+            let spelled = ty.name();
+            // A borrow is written with a `&` — at the head of a value
+            // borrow, and after the keyword in `resource &K`. Either way it
+            // names storage someone else owns (ADRs 0010, 0023, 0024).
+            if spelled.starts_with('&') || spelled.starts_with("resource &") {
+                return false;
             }
+            // An option owns exactly when its present case does.
+            if let Some(payload) = ty.as_option() {
+                return owns(payload);
+            }
+            // What is left owns when it names a class, a resource, or an
+            // array: `class`, `resource K`, `[T]`.
+            spelled == "class" || spelled.starts_with("resource ") || spelled.starts_with('[')
         }
         for (_, ty) in crate::shape_admission::samples() {
             assert_eq!(
@@ -2023,17 +2198,17 @@ mod generic_ty_tests {
         // An owning option is one constructor over an owned array, and the
         // owning family is read back off that payload.
         let owning = Ty::affine_array_option(Ty::Bool);
-        assert_eq!(owning, Ty::option(Ty::array(Ty::Bool, Mutability::Owned)));
+        assert_eq!(owning, Ty::option(Ty::array(Ty::Bool)));
         assert!(owning.is_affine());
         assert!(owning.is_affine_option());
         assert!(owning.is_affine_array_option_of(&Ty::Bool));
         assert_eq!(
             owning.as_affine_option_payload(),
-            Some(&Ty::array(Ty::Bool, Mutability::Owned))
+            Some(&Ty::array(Ty::Bool))
         );
         // A borrowed array payload is representable and does not join the
         // owning family: a borrow owns nothing.
-        assert!(!Ty::option(Ty::array(Ty::Bool, Mutability::Shared)).is_affine_option());
+        assert!(!Ty::option(Ty::array_ref(Ty::Bool, Mutability::Shared)).is_affine_option());
         // Neither does an option over another owner the ownership rules are
         // not written for; the copyable-option gate refuses it by name.
         assert!(!Ty::option(Ty::Class(0)).is_affine_option());
@@ -2041,32 +2216,15 @@ mod generic_ty_tests {
 
         // Nesting is representable, and prints exactly as it is spelled. What
         // refuses these shapes is a stage gate with a name, not the grammar.
-        assert_eq!(
-            Ty::array(
-                Ty::array(Ty::Int(IntTy::U64), Mutability::Owned),
-                Mutability::Owned
-            )
-            .name(),
-            "[[u64]]"
-        );
+        assert_eq!(Ty::array(Ty::array(Ty::Int(IntTy::U64))).name(), "[[u64]]");
         assert_eq!(
             Ty::option(Ty::option(Ty::Int(IntTy::U64))).name(),
             "option<option<u64>>"
         );
-        assert_eq!(Ty::array(Ty::Class(0), Mutability::Owned).name(), "[class]");
-        assert!(
-            !Ty::array(
-                Ty::array(Ty::Param(parameter), Mutability::Owned),
-                Mutability::Owned
-            )
-            .is_concrete()
-        );
+        assert_eq!(Ty::array(Ty::Class(0)).name(), "[class]");
+        assert!(!Ty::array(Ty::array(Ty::Param(parameter))).is_concrete());
         assert_eq!(
-            Ty::array(
-                Ty::array(Ty::Int(IntTy::U64), Mutability::Owned),
-                Mutability::Owned
-            )
-            .structural_depth(),
+            Ty::array(Ty::array(Ty::Int(IntTy::U64))).structural_depth(),
             3
         );
     }

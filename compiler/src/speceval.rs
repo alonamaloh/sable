@@ -1369,7 +1369,7 @@ mod option_monitor_tests {
         for payload in [
             Ty::Record(0),
             Ty::Class(0),
-            Ty::array(Ty::Bool, crate::ast::Mutability::Owned),
+            Ty::array(Ty::Bool),
             Ty::option(Ty::Int(IntTy::U64)),
         ] {
             assert_eq!(

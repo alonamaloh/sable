@@ -174,8 +174,18 @@ pub(crate) fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
     if ty.is_affine_option() {
         return Err(affine_option_unsupported(ty, context));
     }
+    // A borrow carries no payload of its own, so what is gated is the
+    // referent's: `&[[u64]]` meets the array payload rule exactly as
+    // `[[u64]]` does.
+    validate_container_payloads(ty.referent().clone(), context)
+}
+
+/// The payload rules for one type's own containers, exhaustive with no
+/// wildcard so a new `Ty` constructor is a compile error here rather than a
+/// shape that reaches the machine without any gate seeing it.
+fn validate_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
-        Ty::Array(payload, _) => validate_array_payload(&payload, context),
+        Ty::Array(payload) => validate_array_payload(&payload, context),
         Ty::Option(payload) => validate_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "svm.type_parameter_unsupported: {context} contains an unresolved type parameter"
@@ -183,13 +193,12 @@ pub(crate) fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
         Ty::Int(_)
         | Ty::Bool
         | Ty::Class(_)
-        | Ty::ClassRef(..)
         | Ty::Record(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
         | Ty::Raw(_)
         | Ty::RawRecord(_)
-        | Ty::ResRef(..)
+        | Ty::Borrow(..)
         | Ty::Unit => Ok(()),
     }
 }
@@ -299,11 +308,17 @@ fn require_expr_annotation(
     }
 }
 
+/// The element type, binding mode, and declared mutability of an array place.
+///
+/// The binding mode is *derived* from the type rather than read out of a
+/// field: an array owns unless a borrow names it, and this is the one place
+/// the machine turns that shape question into the three-way answer its
+/// writability rules need.
 fn resolve_array(
     ctx: &LowerCtx<'_>,
     array: &str,
     operation: &str,
-) -> Result<(Ty, Mutability, bool), String> {
+) -> Result<(Ty, BindingMode, bool), String> {
     let binding = ctx.initialized_local(array, operation)?;
     if binding.ty.is_affine_option() {
         return Err(affine_option_unsupported(
@@ -311,14 +326,15 @@ fn resolve_array(
             &format!("{operation} source `{array}`"),
         ));
     }
-    let Ty::Array(payload, mutability) = binding.ty else {
+    let Some((payload, mode)) = binding.ty.as_array() else {
         return Err(format!(
             "svm.array_place_type: {operation} names `{array}` of type `{}`; expected an array",
             binding.ty.name()
         ));
     };
+    let payload = payload.clone();
     validate_array_payload(&payload, &format!("{operation} of `{array}`"))?;
-    Ok((*payload, mutability, binding.mutable))
+    Ok((payload, mode, binding.mutable))
 }
 
 fn validate_array_index(
@@ -358,7 +374,7 @@ fn validate_alloc_array(
     validate_array_payload(&elem, "alloc_array")?;
     require_expr_annotation(
         expr,
-        Ty::Array(Box::new(elem.clone()), Mutability::Owned),
+        Ty::Array(Box::new(elem.clone())),
         "svm.array_alloc_result_type",
         "alloc_array result",
     )?;
@@ -384,7 +400,7 @@ fn validate_array_literal(
     elements: &[Expr],
 ) -> Result<(), String> {
     let payload = match &expr.ty {
-        Some(Ty::Array(payload, Mutability::Owned)) => payload,
+        Some(Ty::Array(payload)) => payload,
         Some(actual) => {
             return Err(format!(
                 "svm.array_literal_result_type: array literal is annotated `{}`; expected a supported owned array",
@@ -440,7 +456,7 @@ fn validate_affine_bool_option_initializer(
             validate_alloc_array(ctx, payload, elem.clone(), len, init)?;
             require_expr_annotation(
                 payload,
-                Ty::array(Ty::Bool, Mutability::Owned),
+                Ty::array(Ty::Bool),
                 "svm.affine_option_payload_type",
                 &format!("payload of affine option `{local}`"),
             )
@@ -485,7 +501,7 @@ fn validate_affine_option_take(
 ) -> Result<(), String> {
     require_expr_annotation(
         initializer,
-        Ty::array(Ty::Bool, Mutability::Owned),
+        Ty::array(Ty::Bool),
         "svm.affine_option_take_result",
         &format!("`.take` initializer of `{destination}`"),
     )?;
@@ -572,10 +588,11 @@ fn validate_array_store(
     value: &Expr,
 ) -> Result<(), String> {
     let (payload, mutability, declared_mutable) = resolve_array(ctx, array, "array store")?;
-    if mutability == Mutability::Shared || (mutability == Mutability::Owned && !declared_mutable) {
+    if mutability == BindingMode::Shared || (mutability == BindingMode::Owned && !declared_mutable)
+    {
         return Err(format!(
             "svm.array_store_place: array store targets non-writable `{array}` of type `{}`",
-            Ty::Array(Box::new(payload), mutability).name()
+            mutability.bind(Ty::array(payload)).name()
         ));
     }
     validate_sink_type(ctx, Ty::Int(IntTy::U64), index, "array store index")?;
@@ -624,9 +641,9 @@ fn semantic_expr_ty(
             }
             ty
         }
-        ExprKind::AllocArray { elem, .. } => Ty::Array(Box::new(elem.clone()), Mutability::Owned),
+        ExprKind::AllocArray { elem, .. } => Ty::Array(Box::new(elem.clone())),
         ExprKind::ArrayLit(_) => match &expr.ty {
-            Some(ty @ Ty::Array(_, Mutability::Owned)) => ty,
+            Some(ty @ Ty::Array(_)) => ty,
             Some(actual) => {
                 return Err(format!(
                     "svm.sink_type: {context} is an array literal annotated `{}`",
@@ -796,7 +813,7 @@ fn semantic_expr_ty(
             }
         }
         _ => {
-            if matches!(expr.ty, Some(Ty::Array(..))) {
+            if expr.ty.as_ref().is_some_and(|ty| ty.as_array().is_some()) {
                 return Err(format!(
                     "svm.sink_type: {context} has an expression shape that cannot produce an array"
                 ));
@@ -952,10 +969,10 @@ fn validate_sink_type(
 }
 
 fn validate_array_rebind(ctx: &LowerCtx<'_>, name: &str) -> Result<(), String> {
-    if matches!(
-        ctx.local(name).map(|binding| binding.ty),
-        Some(Ty::Array(..))
-    ) {
+    if ctx
+        .local(name)
+        .is_some_and(|binding| binding.ty.as_array().is_some())
+    {
         return Err(format!(
             "svm.array_rebind_unsupported: checked array `{name}` is rebound; arrays may only be mutated by element store"
         ));
@@ -981,12 +998,12 @@ fn validate_array_exposure(ctx: &LowerCtx<'_>, array: &str, mutable: bool) -> Re
     if payload != Ty::Int(IntTy::U8) {
         return Err(format!(
             "svm.array_expose_type: exposure names `{array}` of type `{}`; only byte arrays have SVM exposure semantics",
-            Ty::Array(Box::new(payload), mutability).name()
+            mutability.bind(Ty::array(payload)).name()
         ));
     }
     if mutable
-        && (mutability == Mutability::Shared
-            || (mutability == Mutability::Owned && !declared_mutable))
+        && (mutability == BindingMode::Shared
+            || (mutability == BindingMode::Owned && !declared_mutable))
     {
         return Err(format!(
             "svm.array_expose_type: mutable exposure targets non-writable `{array}`"
@@ -2606,7 +2623,10 @@ fn resolved_resource_place_ty(
                     }
                     kind
                 }
-                Ty::ResRef(kind, source_mutability) => {
+                ref borrowed if borrowed.as_res_borrow().is_some() => {
+                    let (kind, source_mutability) = borrowed
+                        .as_res_borrow()
+                        .expect("the arm's guard already matched this shape");
                     if *mutable && source_mutability != Mutability::Mut {
                         return Err(format!(
                             "svm.resource_operand_type: {operation} mutably reborrows shared resource local `{array}`"
@@ -2621,7 +2641,7 @@ fn resolved_resource_place_ty(
                     ));
                 }
             };
-            Ty::ResRef(kind, requested)
+            Ty::borrow(requested, Ty::Res(kind))
         }
         ExprKind::Borrow { field: Some(_), .. } | ExprKind::SelfField { .. } => {
             return Err(format!(
@@ -2684,7 +2704,7 @@ fn sealed_resource_operand_types(
         ));
     }
 
-    let mutable_ref = |kind| Ty::ResRef(kind, Mutability::Mut);
+    let mutable_ref = |kind| Ty::borrow(Mutability::Mut, Ty::Res(kind));
     let owned = Ty::Res;
     let u64_ty = Ty::Int(IntTy::U64);
     let result = match op {
@@ -2720,11 +2740,11 @@ fn sealed_resource_operand_types(
         ResOp::ResourceMapTake | ResOp::ResourceMapPut => {
             let map_ty =
                 resolved_resource_place_ty(ctx, &args[0], &format!("`{}` operand 1", op.name()))?;
-            let Ty::ResRef(
+            let Some((
                 map_kind
                 @ (ResKind::ResourceMapPointsToU64 | ResKind::ResourceMapPointsToRecord(_)),
                 Mutability::Mut,
-            ) = map_ty
+            )) = map_ty.as_res_borrow()
             else {
                 return Err(format!(
                     "svm.resource_operand_type: `{}` operand 1 must be a mutable supported resource-map borrow",
@@ -2797,11 +2817,11 @@ fn semantic_res_op_ty(
         },
         ResOp::ResourceMapTake => {
             let map = resolved_resource_place_ty(ctx, &args[0], "resource_map_take operand 1")?;
-            match map {
-                Ty::ResRef(ResKind::ResourceMapPointsToU64, Mutability::Mut) => {
+            match map.as_res_borrow() {
+                Some((ResKind::ResourceMapPointsToU64, Mutability::Mut)) => {
                     Ty::Res(ResKind::PointsToU64)
                 }
-                Ty::ResRef(ResKind::ResourceMapPointsToRecord(record), Mutability::Mut) => {
+                Some((ResKind::ResourceMapPointsToRecord(record), Mutability::Mut)) => {
                     Ty::Res(ResKind::PointsToRecord(record))
                 }
                 _ => unreachable!("sealed resource operand validation checked map kind"),
@@ -2844,8 +2864,8 @@ fn raw_op_signature(ctx: &LowerCtx<'_>, op: RawOp, args: &[Expr]) -> Result<(Vec
     let raw = Ty::Raw(IntTy::U8);
     let u8_ty = Ty::Int(IntTy::U8);
     let u64_ty = Ty::Int(IntTy::U64);
-    let shared = |kind| Ty::ResRef(kind, Mutability::Shared);
-    let mutable = |kind| Ty::ResRef(kind, Mutability::Mut);
+    let shared = |kind| Ty::borrow(Mutability::Shared, Ty::Res(kind));
+    let mutable = |kind| Ty::borrow(Mutability::Mut, Ty::Res(kind));
     let owned = Ty::Res;
     let resource_kind = |index: usize| -> Option<ResKind> {
         resolved_resource_place_ty(
@@ -2854,10 +2874,7 @@ fn raw_op_signature(ctx: &LowerCtx<'_>, op: RawOp, args: &[Expr]) -> Result<(Vec
             &format!("`{}` operand {}", op.name(), index + 1),
         )
         .ok()
-        .and_then(|ty| match ty {
-            Ty::Res(kind) | Ty::ResRef(kind, _) => Some(kind),
-            _ => None,
-        })
+        .and_then(|ty| ty.res_kind())
     };
     let leased = match op {
         RawOp::IntoCellU64 | RawOp::FromCellU64 => resource_kind(1),
@@ -3032,13 +3049,13 @@ fn validate_raw_op(ctx: &LowerCtx<'_>, op: RawOp, args: &[Expr]) -> Result<Ty, S
 fn validate_device_op(ctx: &LowerCtx<'_>, op: DeviceOp, args: &[Expr]) -> Result<Ty, String> {
     let (expected, result) = match op {
         DeviceOp::UartStatus => (
-            vec![Ty::ResRef(ResKind::Uart, Mutability::Mut)],
+            vec![Ty::borrow(Mutability::Mut, Ty::Res(ResKind::Uart))],
             Ty::Int(IntTy::U8),
         ),
         DeviceOp::UartWrite => (
             vec![
                 Ty::Int(IntTy::U8),
-                Ty::ResRef(ResKind::Uart, Mutability::Mut),
+                Ty::borrow(Mutability::Mut, Ty::Res(ResKind::Uart)),
             ],
             Ty::Unit,
         ),
@@ -3873,7 +3890,7 @@ mod tests {
         let program = empty_program();
         let affine_bool = Ty::affine_array_option(Ty::Bool);
         let affine_integer = Ty::affine_array_option(Ty::Int(IntTy::I32));
-        let bool_array = Ty::array(Ty::Bool, Mutability::Owned);
+        let bool_array = Ty::array(Ty::Bool);
 
         for ty in [affine_bool.clone(), affine_integer.clone()] {
             let error = lower_fn(&program, &checked_fn(ty.clone(), Vec::new()))
@@ -4344,7 +4361,7 @@ mod tests {
     #[test]
     fn lowering_rejects_boolean_arrays_outside_fresh_owned_locals() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
 
         let mut parameter = checked_fn(Ty::Bool, Vec::new());
         parameter.params.push(Param {
@@ -4622,7 +4639,7 @@ mod tests {
     fn lowering_materializes_fresh_boolean_array_allocations_and_literals() {
         let program = empty_program();
         let ctx = LowerCtx::bare(&program);
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let allocation = expr(
             ExprKind::AllocArray {
                 elem: Ty::Bool,
@@ -4678,7 +4695,7 @@ mod tests {
     #[test]
     fn boolean_arrays_reject_uninitialized_alias_rebind_borrow_and_exposure() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let literal = || {
             expr(
                 ExprKind::ArrayLit(vec![expr(ExprKind::BoolLit(true), Ty::Bool)]),
@@ -4796,12 +4813,12 @@ mod tests {
                 len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                 init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
             },
-            Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
+            Ty::array(Ty::Int(IntTy::U8)),
         );
         let function = checked_fn(
             Ty::Unit,
             vec![Stmt::Decl {
-                ty: Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
+                ty: Ty::array(Ty::Int(IntTy::U8)),
                 name: "values".into(),
                 name_span: Span::new(0, 0),
                 init: Some(allocation),
@@ -4833,7 +4850,7 @@ mod tests {
             Ty::Unit,
             vec![
                 Stmt::Decl {
-                    ty: Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
+                    ty: Ty::array(Ty::Int(IntTy::U8)),
                     name: "values".into(),
                     name_span: Span::new(0, 0),
                     init: Some(expr(
@@ -4842,7 +4859,7 @@ mod tests {
                             len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                             init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
                         },
-                        Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
+                        Ty::array(Ty::Int(IntTy::U8)),
                     )),
                     mutable: false,
                 },
@@ -4868,7 +4885,7 @@ mod tests {
     fn array_constructors_require_coherent_checked_annotations() {
         let program = empty_program();
         let ctx = LowerCtx::bare(&program);
-        let u8_array = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let u8_array = Ty::array(Ty::Int(IntTy::U8));
         let allocation = |len: Expr, init: Expr, ty: Option<Ty>| Expr {
             kind: ExprKind::AllocArray {
                 elem: Ty::Int(IntTy::U8),
@@ -4890,11 +4907,7 @@ mod tests {
 
         let malformed = [
             (
-                allocation(
-                    length(),
-                    byte(),
-                    Some(Ty::array(Ty::Int(IntTy::I32), Mutability::Owned)),
-                ),
+                allocation(length(), byte(), Some(Ty::array(Ty::Int(IntTy::I32)))),
                 "svm.array_alloc_result_type:",
             ),
             (
@@ -4952,7 +4965,7 @@ mod tests {
     #[test]
     fn array_integer_operands_reject_forged_boolean_annotations() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let forged_bool = |ty| expr(ExprKind::BoolLit(true), ty);
         let length = || expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64));
         let byte = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8));
@@ -5045,7 +5058,7 @@ mod tests {
     #[test]
     fn boolean_array_operands_require_exact_boolean_types() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let mut ctx = LowerCtx::bare(&program);
         ctx.insert_local("bits", array_ty.clone(), true, true)
             .unwrap();
@@ -5134,7 +5147,7 @@ mod tests {
     #[test]
     fn boolean_literal_evaluates_trapping_elements_before_allocation() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let mut ctx = LowerCtx::bare(&program);
         ctx.insert_local("source", array_ty.clone(), false, true)
             .unwrap();
@@ -5163,7 +5176,7 @@ mod tests {
     #[test]
     fn named_array_operations_resolve_their_checked_local_type() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let mut ctx = LowerCtx::bare(&program);
         ctx.insert_local("bytes", array_ty, true, true).unwrap();
         let index_operand = || expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64));
@@ -5236,7 +5249,7 @@ mod tests {
     #[test]
     fn array_stores_and_bindings_recheck_destination_payloads() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let allocation = expr(
             ExprKind::AllocArray {
                 elem: Ty::Int(IntTy::U8),
@@ -5321,7 +5334,7 @@ mod tests {
                         len: Box::new(expr(ExprKind::IntLit(2), Ty::Int(IntTy::U64))),
                         init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::I32))),
                     },
-                    Ty::array(Ty::Int(IntTy::I32), Mutability::Owned),
+                    Ty::array(Ty::Int(IntTy::I32)),
                 )),
                 mutable: false,
             }],
@@ -5350,7 +5363,7 @@ mod tests {
         };
         lower_fn(&program, &array_return(array_ty.clone()))
             .expect("coherent integer-array return remains lowerable");
-        let wrong_return = array_return(Ty::array(Ty::Int(IntTy::I32), Mutability::Owned));
+        let wrong_return = array_return(Ty::array(Ty::Int(IntTy::I32)));
         let error = lower_fn(&program, &wrong_return)
             .expect_err("array result annotations must match the function return type");
         assert!(error.starts_with("svm.local_type:"), "{error}");
@@ -5359,7 +5372,7 @@ mod tests {
     #[test]
     fn array_sinks_reject_forged_scalar_array_crossings() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let allocation = || {
             expr(
                 ExprKind::AllocArray {
@@ -5445,7 +5458,7 @@ mod tests {
     #[test]
     fn array_places_follow_source_order_and_scopes() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let allocation = || {
             expr(
                 ExprKind::AllocArray {
@@ -5559,7 +5572,7 @@ mod tests {
     #[test]
     fn unsafe_array_local_remains_in_the_enclosing_scope() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let allocation = expr(
             ExprKind::AllocArray {
                 elem: Ty::Int(IntTy::U8),
@@ -5664,7 +5677,7 @@ mod tests {
                 .contains("uninitialized")
         );
 
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let allocation = expr(
             ExprKind::AllocArray {
                 elem: Ty::Int(IntTy::U8),
@@ -5708,7 +5721,7 @@ mod tests {
     #[test]
     fn exposure_rejects_nested_return_before_generated_cleanup() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let function = checked_fn(
             Ty::Int(IntTy::I32),
             vec![
@@ -5755,7 +5768,7 @@ mod tests {
     #[test]
     fn nested_scalar_vars_follow_source_order() {
         let program = empty_program();
-        let array_ty = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let array_ty = Ty::array(Ty::Int(IntTy::U8));
         let function = checked_fn(
             Ty::Unit,
             vec![
@@ -5906,7 +5919,7 @@ mod tests {
                 field: None,
                 mutable: true,
             },
-            Ty::ResRef(ResKind::RawSpan, Mutability::Mut),
+            Ty::borrow(Mutability::Mut, Ty::Res(ResKind::RawSpan)),
         );
         let one = expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64));
         let zero = expr(ExprKind::IntLit(0), Ty::Int(IntTy::U64));

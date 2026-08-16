@@ -320,7 +320,7 @@ pub(crate) fn walk_ty(
     refs: &mut Vec<(ItemNamespace, String, Span)>,
 ) {
     match ty {
-        Ty::Class(index) | Ty::ClassRef(index, _) => {
+        Ty::Class(index) => {
             if let Some(name) = externs.get(*index) {
                 refs.push((ItemNamespace::Runtime, name.clone(), span));
             }
@@ -328,7 +328,7 @@ pub(crate) fn walk_ty(
         Ty::Record(index) | Ty::RawRecord(index) | Ty::OptionRaw(index) => {
             push_record_ref(*index, span, record_externs, refs);
         }
-        Ty::Res(kind) | Ty::ResRef(kind, _) => {
+        Ty::Res(kind) => {
             let record = match kind {
                 ResKind::PointsToRecord(index) | ResKind::ResourceMapPointsToRecord(index) => {
                     Some(*index)
@@ -350,7 +350,9 @@ pub(crate) fn walk_ty(
                 push_record_ref(index, span, record_externs, refs);
             }
         }
-        Ty::Array(element, _) | Ty::Option(element) => {
+        // A borrow names whatever its referent names, so the traversal
+        // recurses through it exactly as it does through a container.
+        Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
             walk_ty(element, span, externs, record_externs, refs)
         }
         Ty::Int(_) | Ty::Param(_) | Ty::Bool | Ty::Raw(_) | Ty::Unit => {}
@@ -1302,7 +1304,7 @@ mod tests {
                     .iter_mut()
                     .find(|function| function.name == "aggregate")
                     .expect("aggregate function exists");
-                function.params[0].ty = Ty::array(Ty::Record(record_index), Mutability::Shared);
+                function.params[0].ty = Ty::array_ref(Ty::Record(record_index), Mutability::Shared);
             }
             AggregateRecordSite::OptionReturn => {
                 let function = root

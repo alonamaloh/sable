@@ -26,7 +26,7 @@
 //!
 //! Run with `SABLE_BLESS=1` to rewrite the table after an intended change.
 
-use crate::ast::{IntTy, Mutability, Program, ResKind, Ty, TypeParamId};
+use crate::ast::{BindingMode, IntTy, Mutability, Program, ResKind, Ty, TypeParamId};
 use crate::span::Span;
 use crate::speceval::SpecVal;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,6 @@ fn constructor(ty: &Ty) -> &'static str {
         Ty::Bool => "Bool",
         Ty::Param(_) => "Param",
         Ty::Class(_) => "Class",
-        Ty::ClassRef(..) => "ClassRef",
         Ty::Record(_) => "Record",
         Ty::Array(..) => "Array",
         Ty::Option(_) => "Option",
@@ -50,7 +49,7 @@ fn constructor(ty: &Ty) -> &'static str {
         Ty::Res(_) => "Res",
         Ty::Raw(_) => "Raw",
         Ty::RawRecord(_) => "RawRecord",
-        Ty::ResRef(..) => "ResRef",
+        Ty::Borrow(..) => "Borrow",
         Ty::Unit => "Unit",
     }
 }
@@ -60,7 +59,6 @@ const CONSTRUCTORS: &[&str] = &[
     "Bool",
     "Param",
     "Class",
-    "ClassRef",
     "Record",
     "Array",
     "Option",
@@ -68,7 +66,7 @@ const CONSTRUCTORS: &[&str] = &[
     "Res",
     "Raw",
     "RawRecord",
-    "ResRef",
+    "Borrow",
     "Unit",
 ];
 
@@ -90,29 +88,32 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
         ("bool", Ty::Bool),
         ("type parameter", Ty::Param(param())),
         ("class", Ty::Class(0)),
-        ("&class", Ty::ClassRef(0, Mutability::Shared)),
-        ("&mut class", Ty::ClassRef(0, Mutability::Mut)),
+        ("&class", Ty::borrow(Mutability::Shared, Ty::Class(0))),
+        ("&mut class", Ty::borrow(Mutability::Mut, Ty::Class(0))),
         ("record", Ty::Record(0)),
-        ("[u64]", Ty::array(Ty::Int(IntTy::U64), Mutability::Owned)),
-        ("&[u64]", Ty::array(Ty::Int(IntTy::U64), Mutability::Shared)),
+        ("[u64]", Ty::array(Ty::Int(IntTy::U64))),
+        (
+            "&[u64]",
+            Ty::array_ref(Ty::Int(IntTy::U64), Mutability::Shared),
+        ),
         (
             "&mut [u64]",
-            Ty::array(Ty::Int(IntTy::U64), Mutability::Mut),
+            Ty::array_ref(Ty::Int(IntTy::U64), Mutability::Mut),
         ),
-        ("[u32]", Ty::array(Ty::Int(IntTy::U32), Mutability::Owned)),
-        ("&[u32]", Ty::array(Ty::Int(IntTy::U32), Mutability::Shared)),
+        ("[u32]", Ty::array(Ty::Int(IntTy::U32))),
+        (
+            "&[u32]",
+            Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Shared),
+        ),
         (
             "&mut [u32]",
-            Ty::array(Ty::Int(IntTy::U32), Mutability::Mut),
+            Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut),
         ),
-        ("[bool]", Ty::array(Ty::Bool, Mutability::Owned)),
-        ("&[bool]", Ty::array(Ty::Bool, Mutability::Shared)),
-        ("&mut [bool]", Ty::array(Ty::Bool, Mutability::Mut)),
-        ("[record]", Ty::array(Ty::Record(0), Mutability::Owned)),
-        (
-            "[type parameter]",
-            Ty::array(Ty::Param(param()), Mutability::Owned),
-        ),
+        ("[bool]", Ty::array(Ty::Bool)),
+        ("&[bool]", Ty::array_ref(Ty::Bool, Mutability::Shared)),
+        ("&mut [bool]", Ty::array_ref(Ty::Bool, Mutability::Mut)),
+        ("[record]", Ty::array(Ty::Record(0))),
+        ("[type parameter]", Ty::array(Ty::Param(param()))),
         ("option<u64>", Ty::option(Ty::Int(IntTy::U64))),
         ("option<bool>", Ty::option(Ty::Bool)),
         ("option<record>", Ty::option(Ty::Record(0))),
@@ -127,11 +128,11 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
         // the owning family however much it looks like `option<[bool]>`.
         (
             "option<&[bool]>",
-            Ty::option(Ty::array(Ty::Bool, Mutability::Shared)),
+            Ty::option(Ty::array_ref(Ty::Bool, Mutability::Shared)),
         ),
         (
             "option<&mut [bool]>",
-            Ty::option(Ty::array(Ty::Bool, Mutability::Mut)),
+            Ty::option(Ty::array_ref(Ty::Bool, Mutability::Mut)),
         ),
         ("option<raw<record>>", Ty::OptionRaw(0)),
         ("raw<u8>", Ty::Raw(IntTy::U8)),
@@ -140,34 +141,198 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
         ("resource<record>", Ty::Res(ResKind::PointsToRecord(0))),
         (
             "resource &",
-            Ty::ResRef(ResKind::RawSpan, Mutability::Shared),
+            Ty::borrow(Mutability::Shared, Ty::Res(ResKind::RawSpan)),
         ),
         (
             "resource &mut",
-            Ty::ResRef(ResKind::RawSpan, Mutability::Mut),
+            Ty::borrow(Mutability::Mut, Ty::Res(ResKind::RawSpan)),
         ),
         ("()", Ty::Unit),
-        // The nesting battery: shapes the representation holds and no stage
-        // has semantics for. Each must be refused by name.
+        // Every referent a borrow can hold. Binding mode is orthogonal
+        // to shape in the representation, so `&T` exists for every `T`; what
+        // keeps the language's set of borrowable referents small is a rule,
+        // and these rows are where that rule is measured. Each must show a
+        // named refusal wherever the owned form was admitted.
+        ("&u64", Ty::borrow(Mutability::Shared, Ty::Int(IntTy::U64))),
+        ("&mut u64", Ty::borrow(Mutability::Mut, Ty::Int(IntTy::U64))),
         (
-            "[[u64]]",
-            Ty::array(
-                Ty::array(Ty::Int(IntTy::U64), Mutability::Owned),
-                Mutability::Owned,
+            "&u64 (non-canonical parameter)",
+            Ty::borrow(Mutability::Shared, Ty::Int(IntTy::TParam(0))),
+        ),
+        (
+            "&mut u64 (non-canonical parameter)",
+            Ty::borrow(Mutability::Mut, Ty::Int(IntTy::TParam(0))),
+        ),
+        ("&bool", Ty::borrow(Mutability::Shared, Ty::Bool)),
+        ("&mut bool", Ty::borrow(Mutability::Mut, Ty::Bool)),
+        (
+            "&type parameter",
+            Ty::borrow(Mutability::Shared, Ty::Param(param())),
+        ),
+        (
+            "&mut type parameter",
+            Ty::borrow(Mutability::Mut, Ty::Param(param())),
+        ),
+        ("&record", Ty::borrow(Mutability::Shared, Ty::Record(0))),
+        ("&mut record", Ty::borrow(Mutability::Mut, Ty::Record(0))),
+        (
+            "&option<u64>",
+            Ty::borrow(Mutability::Shared, Ty::option(Ty::Int(IntTy::U64))),
+        ),
+        (
+            "&mut option<u64>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::Int(IntTy::U64))),
+        ),
+        (
+            "&option<bool>",
+            Ty::borrow(Mutability::Shared, Ty::option(Ty::Bool)),
+        ),
+        (
+            "&mut option<bool>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::Bool)),
+        ),
+        (
+            "&option<record>",
+            Ty::borrow(Mutability::Shared, Ty::option(Ty::Record(0))),
+        ),
+        (
+            "&mut option<record>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::Record(0))),
+        ),
+        (
+            "&option<type parameter>",
+            Ty::borrow(Mutability::Shared, Ty::option(Ty::Param(param()))),
+        ),
+        (
+            "&mut option<type parameter>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::Param(param()))),
+        ),
+        (
+            "&option<[bool]>",
+            Ty::borrow(Mutability::Shared, Ty::affine_array_option(Ty::Bool)),
+        ),
+        (
+            "&mut option<[bool]>",
+            Ty::borrow(Mutability::Mut, Ty::affine_array_option(Ty::Bool)),
+        ),
+        (
+            "&option<[u64]>",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::affine_array_option(Ty::Int(IntTy::U64)),
             ),
         ),
         (
-            "[[bool]]",
-            Ty::array(Ty::array(Ty::Bool, Mutability::Owned), Mutability::Owned),
+            "&mut option<[u64]>",
+            Ty::borrow(
+                Mutability::Mut,
+                Ty::affine_array_option(Ty::Int(IntTy::U64)),
+            ),
         ),
-        ("[class]", Ty::array(Ty::Class(0), Mutability::Owned)),
         (
-            "[option<u64>]",
-            Ty::array(Ty::option(Ty::Int(IntTy::U64)), Mutability::Owned),
+            "&option<[record]>",
+            Ty::borrow(Mutability::Shared, Ty::affine_array_option(Ty::Record(0))),
         ),
+        (
+            "&mut option<[record]>",
+            Ty::borrow(Mutability::Mut, Ty::affine_array_option(Ty::Record(0))),
+        ),
+        (
+            "&option<&[bool]>",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::option(Ty::array_ref(Ty::Bool, Mutability::Shared)),
+            ),
+        ),
+        (
+            "&mut option<&[bool]>",
+            Ty::borrow(
+                Mutability::Mut,
+                Ty::option(Ty::array_ref(Ty::Bool, Mutability::Shared)),
+            ),
+        ),
+        (
+            "&option<&mut [bool]>",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::option(Ty::array_ref(Ty::Bool, Mutability::Mut)),
+            ),
+        ),
+        (
+            "&mut option<&mut [bool]>",
+            Ty::borrow(
+                Mutability::Mut,
+                Ty::option(Ty::array_ref(Ty::Bool, Mutability::Mut)),
+            ),
+        ),
+        (
+            "&option<raw<record>>",
+            Ty::borrow(Mutability::Shared, Ty::OptionRaw(0)),
+        ),
+        (
+            "&mut option<raw<record>>",
+            Ty::borrow(Mutability::Mut, Ty::OptionRaw(0)),
+        ),
+        (
+            "&raw<u8>",
+            Ty::borrow(Mutability::Shared, Ty::Raw(IntTy::U8)),
+        ),
+        (
+            "&mut raw<u8>",
+            Ty::borrow(Mutability::Mut, Ty::Raw(IntTy::U8)),
+        ),
+        (
+            "&raw<record>",
+            Ty::borrow(Mutability::Shared, Ty::RawRecord(0)),
+        ),
+        (
+            "&mut raw<record>",
+            Ty::borrow(Mutability::Mut, Ty::RawRecord(0)),
+        ),
+        ("&()", Ty::borrow(Mutability::Shared, Ty::Unit)),
+        ("&mut ()", Ty::borrow(Mutability::Mut, Ty::Unit)),
+        (
+            "&option<option<u64>>",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::option(Ty::option(Ty::Int(IntTy::U64))),
+            ),
+        ),
+        (
+            "&mut option<option<u64>>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::option(Ty::Int(IntTy::U64)))),
+        ),
+        (
+            "&option<class>",
+            Ty::borrow(Mutability::Shared, Ty::option(Ty::Class(0))),
+        ),
+        (
+            "&mut option<class>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::Class(0))),
+        ),
+        (
+            "&option<[[bool]]>",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::affine_array_option(Ty::array(Ty::Bool)),
+            ),
+        ),
+        (
+            "&mut option<[[bool]]>",
+            Ty::borrow(
+                Mutability::Mut,
+                Ty::affine_array_option(Ty::array(Ty::Bool)),
+            ),
+        ),
+        // The nesting battery: shapes the representation holds and no stage
+        // has semantics for. Each must be refused by name.
+        ("[[u64]]", Ty::array(Ty::array(Ty::Int(IntTy::U64)))),
+        ("[[bool]]", Ty::array(Ty::array(Ty::Bool))),
+        ("[class]", Ty::array(Ty::Class(0))),
+        ("[option<u64>]", Ty::array(Ty::option(Ty::Int(IntTy::U64)))),
         (
             "[option<[bool]>]",
-            Ty::array(Ty::affine_array_option(Ty::Bool), Mutability::Owned),
+            Ty::array(Ty::affine_array_option(Ty::Bool)),
         ),
         (
             "option<option<u64>>",
@@ -176,13 +341,22 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
         ("option<class>", Ty::option(Ty::Class(0))),
         (
             "option<[[bool]]>",
-            Ty::affine_array_option(Ty::array(Ty::Bool, Mutability::Owned)),
+            Ty::affine_array_option(Ty::array(Ty::Bool)),
         ),
         (
             "&[[u64]]",
-            Ty::array(
-                Ty::array(Ty::Int(IntTy::U64), Mutability::Owned),
+            Ty::borrow(
                 Mutability::Shared,
+                Ty::array(Ty::array(Ty::Int(IntTy::U64))),
+            ),
+        ),
+        // A borrow of a borrow: the referent of a `Ty::Borrow` is a full
+        // type, so this is representable and nothing but a rule keeps it out.
+        (
+            "&&[u64]",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::array_ref(Ty::Int(IntTy::U64), Mutability::Shared),
             ),
         ),
     ]
@@ -336,7 +510,7 @@ fn answers(ty: &Ty) -> Vec<Answer> {
             Err(diagnostic) => Answer::Rejected(diagnostic.name),
         },
         from_diagnostic(crate::check::affine_option_payload(
-            &Ty::array(ty.clone(), Mutability::Owned),
+            &Ty::array(ty.clone()),
             SPAN,
         )),
         from_diagnostic(crate::check::validate_aggregate_ty(ty.clone(), SPAN)),
@@ -588,54 +762,57 @@ fn every_constructor_has_a_sample() {
 
 /// Every binding mode a stage answers differently for is a sample.
 ///
-/// Owned-versus-borrowed is decided separately from the element type, so an
-/// element that appears in one binding mode only cannot catch the loss of
-/// another mode's refusal. Rather than fix a list, this asks the stages: for
-/// each array element type in the samples, if two binding modes get different
-/// answers, both must be probed. The audit therefore widens itself the day a
-/// stage starts distinguishing a mode it used to ignore.
+/// Binding mode is decided separately from what a type names, so a shape that
+/// appears in one mode only cannot catch the loss of another mode's refusal.
+/// Rather than fix a list, this asks the stages: for every shape in the
+/// samples that owns, if two binding modes get different answers, each
+/// distinguished mode must itself be probed. The audit therefore widens
+/// itself the day a stage starts distinguishing a mode it ignores today —
+/// and, because `Ty::Borrow` holds every referent, it ranges over the whole
+/// grammar rather than over array elements alone.
 #[test]
 fn every_distinguished_binding_mode_is_probed() {
-    let modes = [Mutability::Owned, Mutability::Shared, Mutability::Mut];
-    let elements: Vec<Ty> = samples()
+    let referents: Vec<Ty> = samples()
         .iter()
-        .filter_map(|(_, ty)| match ty {
-            Ty::Array(element, _) => Some(element.as_ref().clone()),
-            _ => None,
-        })
+        .filter(|(_, ty)| ty.binding_mode() == BindingMode::Owned)
+        .map(|(_, ty)| ty.clone())
         .collect();
     let probed = |ty: &Ty| samples().iter().any(|(_, other)| other == ty);
+    let mut unwatched: Vec<String> = Vec::new();
 
-    for element in &elements {
-        let rendered: Vec<(Mutability, Vec<String>)> = modes
+    for referent in &referents {
+        let rendered: Vec<(BindingMode, Vec<String>)> = BindingMode::all()
             .iter()
-            .map(|mutability| {
-                let array = Ty::array(element.clone(), *mutability);
+            .map(|mode| {
                 (
-                    *mutability,
-                    answers(&array)
+                    *mode,
+                    answers(&mode.bind(referent.clone()))
                         .iter()
                         .map(|answer| answer.render())
                         .collect(),
                 )
             })
             .collect();
-        for (mutability, answers) in &rendered {
+        for (mode, answers) in &rendered {
             let distinguished = rendered
                 .iter()
                 .any(|(_, other)| other != answers)
-                .then_some(*mutability);
-            let Some(mutability) = distinguished else {
+                .then_some(*mode);
+            let Some(mode) = distinguished else {
                 continue;
             };
-            assert!(
-                probed(&Ty::array(element.clone(), mutability)),
-                "a stage answers `{}` differently when it is bound {mutability:?}, and no sample \
-                 probes it: that mode's answer is unwatched",
-                Ty::array(element.clone(), mutability).name()
-            );
+            let shape = mode.bind(referent.clone());
+            if !probed(&shape) {
+                unwatched.push(shape.name());
+            }
         }
     }
+    assert!(
+        unwatched.is_empty(),
+        "a stage answers these shapes differently from their other binding modes, and no sample \
+         probes them, so those answers are unwatched: {}",
+        unwatched.join(", ")
+    );
 }
 
 /// The LLVM type lowering is total on every shape the backend admits.

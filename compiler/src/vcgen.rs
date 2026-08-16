@@ -114,7 +114,7 @@ pub struct RecordFieldEmit {
 
 fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
     fn is_uart_ty(ty: Ty) -> bool {
-        matches!(ty, Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _))
+        ty.res_kind() == Some(ResKind::Uart)
     }
 
     fn signature_uses_uart(function: &Fn) -> bool {
@@ -485,6 +485,15 @@ pub(crate) fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result
             ty.name()
         ));
     }
+    // A borrow carries no payload of its own, so what is gated is the
+    // referent's: the proof model of `&[T]` is the proof model of `[T]`.
+    validate_vc_container_payloads(ty.referent().clone(), allow_param, context)
+}
+
+/// The payload rules for one type's own containers, exhaustive with no
+/// wildcard so a new constructor is a compile error rather than a shape the
+/// proof preflight never looked at.
+fn validate_vc_container_payloads(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
     match ty {
         Ty::Param(_) if !allow_param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {context}"
@@ -492,7 +501,7 @@ pub(crate) fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result
         Ty::Int(IntTy::TParam(_)) => Err(format!(
             "internal.vcgen.type_error: non-canonical legacy scalar parameter in {context}"
         )),
-        Ty::Array(element, _) => {
+        Ty::Array(element) => {
             validate_vc_payload_ty(&element, allow_param, VcAggregateKind::Array, context)
         }
         Ty::Option(element) => {
@@ -502,13 +511,12 @@ pub(crate) fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result
         | Ty::Bool
         | Ty::Param(_)
         | Ty::Class(_)
-        | Ty::ClassRef(..)
         | Ty::Record(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
         | Ty::Raw(_)
         | Ty::RawRecord(_)
-        | Ty::ResRef(..)
+        | Ty::Borrow(..)
         | Ty::Unit => Ok(()),
     }
 }
@@ -556,7 +564,7 @@ pub(crate) fn validate_vc_type_position(
 
     if let Some((&Ty::Bool, mutability)) = ty.as_array() {
         if matches!(position, VcTypePosition::Expression | VcTypePosition::Local)
-            && mutability == Mutability::Owned
+            && mutability == BindingMode::Owned
         {
             return Ok(());
         }
@@ -621,7 +629,7 @@ fn expr_is_affine_option(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
 }
 
 fn is_fresh_bool_array_value(expr: &Expr) -> bool {
-    expr.ty == Some(Ty::array(Ty::Bool, Mutability::Owned))
+    expr.ty == Some(Ty::array(Ty::Bool))
         && matches!(
             expr.kind,
             ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. }
@@ -629,8 +637,7 @@ fn is_fresh_bool_array_value(expr: &Expr) -> bool {
 }
 
 fn is_affine_option_take(expr: &Expr) -> bool {
-    expr.ty == Some(Ty::array(Ty::Bool, Mutability::Owned))
-        && matches!(expr.kind, ExprKind::OptTake { .. })
+    expr.ty == Some(Ty::array(Ty::Bool)) && matches!(expr.kind, ExprKind::OptTake { .. })
 }
 
 fn reject_bool_array_value(
@@ -1001,7 +1008,7 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::ArrayLit(elements) => {
-            let Some(Ty::Array(ref element, Mutability::Owned)) = expr.ty else {
+            let Some(Ty::Array(ref element)) = expr.ty else {
                 return Err(format!(
                     "internal.vcgen.type_error: array literal lacks an owned array type in {context}"
                 ));
@@ -1022,11 +1029,15 @@ fn validate_vc_expr(
         ExprKind::Index { array, index, .. } => {
             validate_vc_expr(index, allow_param, context, locals)?;
             require_vc_expr_ty(index, Ty::Int(IntTy::U64), locals, "array index", context)?;
-            let Some(Ty::Array(element, _)) = locals.get(array).cloned() else {
+            let Some(element) = locals
+                .get(array)
+                .and_then(|ty| ty.as_array().map(|(element, _)| element.clone()))
+            else {
                 return Err(format!(
                     "internal.vcgen.type_error: index source `{array}` is not an active array in {context}"
                 ));
             };
+            let element = Box::new(element);
             if vc_semantic_expr_ty(expr, locals, context)? != *element {
                 return Err(format!(
                     "internal.vcgen.type_error: array index has an inconsistent result type in {context}"
@@ -1066,7 +1077,7 @@ fn validate_vc_expr(
         }
         ExprKind::AllocArray { elem, len, init } => {
             validate_vc_payload_ty(elem, allow_param, VcAggregateKind::Array, context)?;
-            if expr.ty != Some(Ty::Array(Box::new(elem.clone()), Mutability::Owned)) {
+            if expr.ty != Some(Ty::Array(Box::new(elem.clone()))) {
                 return Err(format!(
                     "internal.vcgen.type_error: array allocation has an inconsistent result type in {context}"
                 ));
@@ -1144,11 +1155,11 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::Len { array } => {
-            let Some(Ty::Array(_, _)) = locals.get(array) else {
+            if locals.get(array).is_none_or(|ty| ty.as_array().is_none()) {
                 return Err(format!(
                     "internal.vcgen.type_error: length source `{array}` is not an active array in {context}"
                 ));
-            };
+            }
             if locals
                 .get(array)
                 .as_ref()
@@ -1175,7 +1186,7 @@ fn validate_vc_take_initializer(
             "internal.vcgen.type_error: expected an affine-option take initializer in {context}"
         ));
     };
-    if expr.ty != Some(Ty::array(Ty::Bool, Mutability::Owned)) {
+    if expr.ty != Some(Ty::array(Ty::Bool)) {
         return Err(format!(
             "internal.vcgen.type_error: `.take` has an inconsistent owned Boolean-array result in {context}"
         ));
@@ -1215,7 +1226,7 @@ fn validate_vc_block_with_mutability(
                     ));
                 }
                 validate_vc_type_position(ty.clone(), allow_param, VcTypePosition::Local, context)?;
-                if *ty == Ty::array(Ty::Bool, Mutability::Owned) && init.is_none() {
+                if *ty == Ty::array(Ty::Bool) && init.is_none() {
                     return Err(format!(
                         "internal.vcgen.type_error: owned Boolean array local `{name}` must be initialized in {context}"
                     ));
@@ -1233,7 +1244,7 @@ fn validate_vc_block_with_mutability(
                 if let Some(init) = init {
                     let is_take = matches!(init.kind, ExprKind::OptTake { .. });
                     if is_take {
-                        if *ty != Ty::array(Ty::Bool, Mutability::Owned) {
+                        if *ty != Ty::array(Ty::Bool) {
                             return Err(format!(
                                 "vc.option_take_position: `.take` must initialize an explicit owned Boolean-array local in {context}"
                             ));
@@ -1242,9 +1253,8 @@ fn validate_vc_block_with_mutability(
                     } else {
                         validate_vc_expr(init, allow_param, context, locals)?;
                     }
-                    let declaration_is_bool_array = *ty == Ty::array(Ty::Bool, Mutability::Owned);
-                    let initializer_is_bool_array =
-                        init.ty == Some(Ty::array(Ty::Bool, Mutability::Owned));
+                    let declaration_is_bool_array = *ty == Ty::array(Ty::Bool);
+                    let initializer_is_bool_array = init.ty == Some(Ty::array(Ty::Bool));
                     if declaration_is_bool_array != initializer_is_bool_array {
                         return Err(format!(
                             "internal.vcgen.type_error: Boolean array declaration has an incompatible initializer in {context}"
@@ -1306,9 +1316,8 @@ fn validate_vc_block_with_mutability(
                             "vc.affine_option_inferred: affine-option local `{name}` requires an explicit type in {context}"
                         ));
                     }
-                    let declaration_is_bool_array = *ty == Ty::array(Ty::Bool, Mutability::Owned);
-                    let initializer_is_bool_array =
-                        init.ty == Some(Ty::array(Ty::Bool, Mutability::Owned));
+                    let declaration_is_bool_array = *ty == Ty::array(Ty::Bool);
+                    let initializer_is_bool_array = init.ty == Some(Ty::array(Ty::Bool));
                     if declaration_is_bool_array != initializer_is_bool_array {
                         return Err(format!(
                             "internal.vcgen.type_error: inferred Boolean array declaration has an incompatible initializer in {context}"
@@ -1347,7 +1356,7 @@ fn validate_vc_block_with_mutability(
                 let target_is_bool_array = locals
                     .get(name)
                     .is_some_and(|ty| ty.is_owned_array_of(&Ty::Bool));
-                let value_is_bool_array = value.ty == Some(Ty::array(Ty::Bool, Mutability::Owned));
+                let value_is_bool_array = value.ty == Some(Ty::array(Ty::Bool));
                 if target_is_bool_array {
                     return Err(format!(
                         "internal.vcgen.type_error: Boolean array local `{name}` cannot be rebound in {context}"
@@ -1442,11 +1451,15 @@ fn validate_vc_block_with_mutability(
                 )?;
                 reject_affine_option_value(value, locals, "an array-store value", context)?;
                 validate_vc_expr(value, allow_param, context, locals)?;
-                let Some(Ty::Array(element, _)) = locals.get(array).cloned() else {
+                let Some(element) = locals
+                    .get(array)
+                    .and_then(|ty| ty.as_array().map(|(element, _)| element.clone()))
+                else {
                     return Err(format!(
                         "internal.vcgen.type_error: array-store target `{array}` is not an active array in {context}"
                     ));
                 };
+                let element = Box::new(element);
                 require_vc_expr_ty(
                     value,
                     element.as_ref().clone(),
@@ -1493,7 +1506,7 @@ fn validate_vc_block_with_mutability(
                             "internal.vcgen.type_error: Boolean array exposure is not supported in {context}"
                         ));
                     }
-                    Some(Ty::Array(element, _)) if matches!(**element, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) =>
+                    Some(found) if matches!(found.as_array(), Some((Ty::Int(integer), _)) if !matches!(integer, IntTy::TParam(_))) =>
                         {}
                     _ => {
                         return Err(format!(
@@ -1760,20 +1773,25 @@ fn validate_vc_type_domain(program: &Program) -> Result<(), String> {
     Ok(())
 }
 
+/// A field's Lean type. Binding mode does not reach Lean: `[T]`, `&[T]`, and
+/// `&mut [T]` are one `Sable.Seq T`, and a class or resource borrow is the
+/// same structure or view its owner is. What mutability decides is binder
+/// naming and havoc, never the type — so this dispatches on what the type
+/// names and never on how it is bound.
 fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> String {
-    match ty {
+    match ty.referent() {
         Ty::Int(_) | Ty::Param(_) => "Int".into(),
         Ty::Bool => "Bool".into(),
-        Ty::Array(element, _) => lean_array_ty(&element),
+        Ty::Array(element) => lean_array_ty(element),
         // A class-valued field is a nested structure (ADR 0020).
-        Ty::Class(ci) => lean_class_name(&classes[ci].name),
-        Ty::Record(ri) => lean_record_name(&records[ri].name),
+        Ty::Class(ci) => lean_class_name(&classes[*ci].name),
+        Ty::Record(ri) => lean_record_name(&records[*ri].name),
         // A resource field contributes its *view* to the structure. The
         // authority it carries stays a checker property, so the class
         // gains a value and no obligation (ADR 0024/0029).
-        Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(k, records),
+        Ty::Res(k) => lean_res_view_ty(*k, records),
         Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
-        Ty::Option(element) => lean_option_ty(&element),
+        Ty::Option(element) => lean_option_ty(element),
         Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
         _ => unreachable!("checked: field types"),
     }
@@ -1824,23 +1842,21 @@ fn emit_extern_clause_wfs(
     let _ = trait_map;
     let mut binders: Vec<(String, String)> = Vec::new();
     for p in &f.params {
-        match &p.ty {
+        match p.ty.referent() {
             Ty::Int(_) | Ty::Param(_) => binders.push((p.name.clone(), "Int".into())),
             Ty::Bool => binders.push((p.name.clone(), "Bool".into())),
             Ty::Raw(_) | Ty::RawRecord(_) => binders.push((p.name.clone(), "Sable.RawPtr".into())),
-            Ty::Res(k) | Ty::ResRef(k, _) => {
+            Ty::Res(k) => {
                 binders.push((p.name.clone(), lean_res_view_ty(*k, &program.records)));
-                if matches!(p.ty, Ty::ResRef(_, Mutability::Mut)) {
+                if p.ty.is_unique_borrow() {
                     binders.push((
                         format!("_old_{}", p.name),
                         lean_res_view_ty(*k, &program.records),
                     ));
                 }
             }
-            Ty::Array(element, _) => {
-                binders.push((p.name.clone(), lean_array_ty(&element.clone())))
-            }
-            Ty::Class(ci) | Ty::ClassRef(ci, _) => {
+            Ty::Array(element) => binders.push((p.name.clone(), lean_array_ty(element))),
+            Ty::Class(ci) => {
                 binders.push((p.name.clone(), lean_class_name(&program.classes[*ci].name)))
             }
             Ty::Record(ri) => {
@@ -1848,7 +1864,7 @@ fn emit_extern_clause_wfs(
             }
             Ty::OptionRaw(_) => binders.push((p.name.clone(), "Option Sable.RawPtr".into())),
             Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-            Ty::Unit => {}
+            Ty::Borrow(..) | Ty::Unit => {}
         }
     }
     for (i, c) in f.pres.iter().enumerate() {
@@ -2443,19 +2459,19 @@ impl<'a> Generator<'a> {
 
     /// The Lean binder type of a local or parameter.
     fn lean_ty_of(&self, name: &str) -> String {
-        match self.var_tys.get(name) {
-            Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => {
-                lean_class_name(&self.classes[*ci].name)
-            }
+        match self.var_tys.get(name).map(Ty::referent) {
+            Some(Ty::Class(ci)) => lean_class_name(&self.classes[*ci].name),
             Some(Ty::Record(ri)) => lean_record_name(&self.records[*ri].name),
-            Some(Ty::Res(k)) | Some(Ty::ResRef(k, _)) => lean_res_view_ty(*k, self.records),
+            Some(Ty::Res(k)) => lean_res_view_ty(*k, self.records),
             Some(Ty::Raw(_)) | Some(Ty::RawRecord(_)) => "Sable.RawPtr".to_string(),
             Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".to_string(),
-            Some(Ty::Option(element)) => lean_option_ty(&element.clone()),
+            Some(Ty::Option(element)) => lean_option_ty(element),
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
-            Some(Ty::Array(element, _)) => lean_array_ty(&element.clone()),
-            Some(Ty::Unit) | None => unreachable!("checked: value has a Lean binder type"),
+            Some(Ty::Array(element)) => lean_array_ty(element),
+            Some(Ty::Unit) | Some(Ty::Borrow(..)) | None => {
+                unreachable!("checked: value has a Lean binder type")
+            }
         }
     }
 
@@ -2476,23 +2492,19 @@ impl<'a> Generator<'a> {
         let mut vars: Vec<(String, String)> = self
             .var_tys
             .iter()
-            .filter_map(|(name, ty)| match ty {
+            .filter_map(|(name, ty)| match ty.referent() {
                 Ty::Int(_) | Ty::Param(_) => Some((name.clone(), "Int".to_string())),
                 Ty::Bool => Some((name.clone(), "Bool".to_string())),
-                Ty::Array(element, _) => Some((name.clone(), lean_array_ty(&element.clone()))),
-                Ty::Class(ci) | Ty::ClassRef(ci, _) => {
-                    Some((name.clone(), lean_class_name(&self.classes[*ci].name)))
-                }
+                Ty::Array(element) => Some((name.clone(), lean_array_ty(element))),
+                Ty::Class(ci) => Some((name.clone(), lean_class_name(&self.classes[*ci].name))),
                 Ty::Record(ri) => Some((name.clone(), lean_record_name(&self.records[*ri].name))),
                 // A resource binds its *view*; the authority it names is
                 // a checker property and appears nowhere in Lean.
-                Ty::Res(k) | Ty::ResRef(k, _) => {
-                    Some((name.clone(), lean_res_view_ty(*k, self.records)))
-                }
+                Ty::Res(k) => Some((name.clone(), lean_res_view_ty(*k, self.records))),
                 Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
-                Ty::Option(element) => Some((name.clone(), lean_option_ty(&element.clone()))),
-                Ty::Unit => None,
+                Ty::Option(element) => Some((name.clone(), lean_option_ty(element))),
+                Ty::Borrow(..) | Ty::Unit => None,
             })
             .collect();
         vars.sort();
@@ -2538,7 +2550,7 @@ impl<'a> Generator<'a> {
                         self.r_prop(&format!("({binder}.{})", fld.name), model),
                     );
                 }
-                Ty::Array(elem, _) => {
+                Ty::Array(elem) => {
                     let path = format!("({binder}.{})", fld.name);
                     self.push_hyp_unique(
                         format!("h_field_{}_len", fld.name),
@@ -2582,9 +2594,9 @@ impl<'a> Generator<'a> {
         let borrowed: Vec<(String, usize, String)> = params
             .iter()
             .zip(arg_vals.iter())
-            .filter_map(|(p, aval)| match p.ty {
-                Ty::ClassRef(aci, _) => Some((p.name.clone(), aci, aval.clone())),
-                _ => None,
+            .filter_map(|(p, aval)| {
+                p.ty.as_class_borrow()
+                    .map(|(aci, _)| (p.name.clone(), aci, aval.clone()))
             })
             .collect();
         for (pname, aci, aval) in borrowed {
@@ -2638,18 +2650,21 @@ impl<'a> Generator<'a> {
                 let ExprKind::Borrow { array, field, .. } = &arg.kind else {
                     return None;
                 };
-                match p.ty {
-                    Ty::ClassRef(aci, Mutability::Mut) => Some((
+                // Only a *unique* borrow lets the callee change storage the
+                // caller still names, so only these need the invariant
+                // re-established at the call.
+                match p.ty.as_unique_borrow() {
+                    Some(Ty::Class(aci)) => Some((
                         p.name.clone(),
                         array.clone(),
                         field.clone(),
-                        Target::Class(aci),
+                        Target::Class(*aci),
                     )),
-                    Ty::ResRef(k, Mutability::Mut) => Some((
+                    Some(Ty::Res(k)) => Some((
                         p.name.clone(),
                         array.clone(),
                         field.clone(),
-                        Target::View(k),
+                        Target::View(*k),
                     )),
                     _ => None,
                 }
@@ -2732,8 +2747,10 @@ impl<'a> Generator<'a> {
         }
         for p in &self.f.params {
             self.var_tys.insert(p.name.clone(), p.ty.clone());
-            match &p.ty {
-                Ty::Class(ci) | Ty::ClassRef(ci, _) => {
+            // Dispatch on what the parameter names; how it is bound decides
+            // the binder's *name* below, never its Lean type.
+            match p.ty.referent() {
+                Ty::Class(ci) => {
                     // A class borrow (ADR 0010, ADR 0023) or a class
                     // taken by value (ADR 0020): the class value with its
                     // field facts and invariant — the method-entry
@@ -2747,7 +2764,7 @@ impl<'a> Generator<'a> {
                     // a `&mut self` method is called on it, and `old p`
                     // in clauses resolves to the binder.
                     let cd = &self.classes[*ci];
-                    let binder = if p.ty == Ty::ClassRef(*ci, Mutability::Mut) {
+                    let binder = if p.ty.is_unique_borrow() {
                         let b = format!("_old_{}", p.name);
                         self.entry_states.insert(p.name.clone(), b.clone());
                         b
@@ -2774,8 +2791,8 @@ impl<'a> Generator<'a> {
                 // and no generated VC ever mentions it (ADR 0022/0024).
                 // A `resource &mut R` follows the `&mut` array rule —
                 // entry state as the binder, current state in the env.
-                Ty::Res(k) | Ty::ResRef(k, _) => {
-                    let binder = if matches!(p.ty, Ty::ResRef(_, Mutability::Mut)) {
+                Ty::Res(k) => {
+                    let binder = if p.ty.is_unique_borrow() {
                         let b = format!("_old_{}", p.name);
                         self.entry_states.insert(p.name.clone(), b.clone());
                         b
@@ -2816,14 +2833,14 @@ impl<'a> Generator<'a> {
                     self.env
                         .insert(p.name.clone(), Val::Prop(format!("({} = true)", p.name)));
                 }
-                Ty::Array(elem, mutability) => {
+                Ty::Array(elem) => {
                     // A &mut array's binder is the *entry* state `_old_a`;
                     // the current state lives in the symbolic env (a `.set`
                     // chain), and `old a` in clauses resolves to the binder.
-                    let binder = match mutability {
-                        Mutability::Mut => format!("_old_{}", p.name),
-                        Mutability::Shared => p.name.clone(),
-                        Mutability::Owned => unreachable!("owned arrays are test-only locals"),
+                    let binder = match p.ty.binding_mode() {
+                        BindingMode::Mut => format!("_old_{}", p.name),
+                        BindingMode::Shared => p.name.clone(),
+                        BindingMode::Owned => unreachable!("owned arrays are test-only locals"),
                     };
                     self.binders
                         .push((binder.clone(), lean_array_ty(&elem.clone())));
@@ -2834,7 +2851,7 @@ impl<'a> Generator<'a> {
                     if let Some(prop) = self.array_element_range_prop(&binder, &elem.clone()) {
                         self.hyps.push((format!("h_{}_elems", p.name), prop));
                     }
-                    if *mutability == Mutability::Mut {
+                    if p.ty.is_unique_borrow() {
                         self.entry_states.insert(p.name.clone(), binder.clone());
                     }
                     self.env.insert(p.name.clone(), Val::Arr(binder));
@@ -2842,7 +2859,7 @@ impl<'a> Generator<'a> {
                 // Options are local-only or returned, so parameter setup can
                 // only reach this arm through a forged post-preflight AST.
                 Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-                Ty::Unit => {
+                Ty::Borrow(..) | Ty::Unit => {
                     unreachable!("checked: no such params")
                 }
             }
@@ -2909,10 +2926,10 @@ impl<'a> Generator<'a> {
             Ty::Record(ri) => lean_record_name(&self.records[*ri].name),
             // A returned resource is its view: the authority moves, and
             // the logic sees only what the view says (ADR 0024).
-            Ty::Res(k) | Ty::ResRef(k, _) => lean_res_view_ty(*k, self.records),
+            Ty::Res(k) => lean_res_view_ty(*k, self.records),
             Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
             Ty::Unit => "Unit".into(),
-            Ty::Array(..) | Ty::ClassRef(..) => {
+            Ty::Array(..) | Ty::Borrow(..) => {
                 unreachable!("checked: borrowed values and arrays are not return types")
             }
         }
@@ -3402,8 +3419,8 @@ impl<'a> Generator<'a> {
                     (Some(ref found), Val::Prop(prop)) if found.is_array_of(&Ty::Bool) => {
                         lean_bool_value(&prop)
                     }
-                    (Some(Ty::Array(ref element, _)), Val::Int(value))
-                        if matches!(**element, Ty::Int(_) | Ty::Param(_)) =>
+                    (Some(ref found), Val::Int(value))
+                        if matches!(found.as_array(), Some((Ty::Int(_) | Ty::Param(_), _))) =>
                     {
                         value
                     }
@@ -3617,10 +3634,10 @@ impl<'a> Generator<'a> {
                 Cctx::None => None,
             };
             let resolver = |recv: &str, method: &str| {
-                let cd = match var_tys.get(recv) {
-                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Some(&classes[*ci]),
-                    _ if recv == "self" => cctx_class,
-                    _ => None,
+                let cd = match var_tys.get(recv).and_then(Ty::class_index) {
+                    Some(ci) => Some(&classes[ci]),
+                    None if recv == "self" => cctx_class,
+                    None => None,
                 };
                 match cd.and_then(|cd| cd.methods.iter().find(|m| m.f.name == method)) {
                     Some(m) => m.self_kind == SelfKind::Mut,
@@ -3653,11 +3670,10 @@ impl<'a> Generator<'a> {
                     Val::Unit => continue,
                 };
                 if havoc_set.iter().any(|h| mentions(s, h)) {
-                    // Shared arrays map to their own name and never change.
-                    if !matches!(
-                        self.var_tys.get(name),
-                        Some(Ty::Array(_, Mutability::Shared))
-                    ) {
+                    // A shared borrow maps to its own name and never
+                    // changes, so a name that mentions a havocked one does
+                    // not itself need a fresh binder.
+                    if self.var_tys.get(name).map(Ty::binding_mode) != Some(BindingMode::Shared) {
                         havoc_set.insert(name.clone());
                         grew = true;
                         break;
@@ -3751,7 +3767,7 @@ impl<'a> Generator<'a> {
                     for fld in &class.fields {
                         let key = format!("self.{}", fld.name);
                         match (fld.ty.clone(), self.env.get(&key).cloned()) {
-                            (Ty::Array(elem, _), Some(Val::Arr(chain))) => {
+                            (Ty::Array(elem), Some(Val::Arr(chain))) => {
                                 let prior = substitute(&chain, &stale_map, None);
                                 self.fresh += 1;
                                 let b = format!("_self{}_{}", self.fresh, fld.name);
@@ -3805,7 +3821,16 @@ impl<'a> Generator<'a> {
                     continue;
                 }
             }
-            match self.var_tys.get(name) {
+            // A shared borrow names storage the loop cannot write, so it is
+            // never havocked; every arm below is an owned local or a unique
+            // borrow. Filtering here rather than in each arm keeps that rule
+            // in one place, since binding mode is a question about the type
+            // rather than a field of it.
+            let bound = self
+                .var_tys
+                .get(name)
+                .filter(|ty| ty.binding_mode() != BindingMode::Shared);
+            match bound.map(Ty::referent) {
                 Some(Ty::Int(it)) => {
                     let it = *it;
                     self.binders.push((name.clone(), "Int".into()));
@@ -3847,7 +3872,7 @@ impl<'a> Generator<'a> {
                 // assume at the havoc point. A `&mut C` parameter is the
                 // same story: the loop may only rebind its *view*, never
                 // the borrow itself.
-                Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, Mutability::Mut)) => {
+                Some(Ty::Class(ci)) => {
                     let cd = &self.classes[*ci];
                     self.binders.push((name.clone(), lean_class_name(&cd.name)));
                     self.push_class_state_facts(cd, name);
@@ -3859,7 +3884,7 @@ impl<'a> Generator<'a> {
                 // view is havocked like any other mutated state, and the
                 // loop invariant is what carries it across. Confusing the
                 // two would make every loop drop the authority it carries.
-                Some(Ty::Res(k)) | Some(Ty::ResRef(k, Mutability::Mut)) => {
+                Some(Ty::Res(k)) => {
                     let k = *k;
                     self.binders
                         .push((name.clone(), lean_res_view_ty(k, self.records)));
@@ -3868,47 +3893,42 @@ impl<'a> Generator<'a> {
                     }
                     self.env.insert(name.clone(), Val::View(name.clone()));
                 }
-                Some(Ty::Array(elem, Mutability::Owned)) => {
-                    // Owned local mutated by the loop body: fresh state.
-                    // Stores preserve length, so equate to the pre-havoc
-                    // chain — but only when that chain does not itself
-                    // mention a havocked name (else drop to range facts).
+                Some(Ty::Array(elem)) => {
                     let elem = elem.clone();
-                    // The prior chain may reference renamed binders
-                    // (alloc binders carry the source name): rewrite to
-                    // the stale names rather than dropping.
-                    let prior = match self.env.get(name) {
-                        Some(Val::Arr(s)) => Some(substitute(s, &stale_map, None)),
-                        _ => None,
-                    };
                     self.binders.push((name.clone(), lean_array_ty(&elem)));
-                    if let Some(prior) = prior {
-                        if !havoc_set
-                            .iter()
-                            .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
-                        {
-                            self.hyps.push((
-                                format!("h_{name}_len"),
-                                format!("({name}.len) = ({prior}.len)"),
-                            ));
+                    // Stores are the only mutation and preserve length, so a
+                    // length fact is sound to assume at havoc. What it is
+                    // equated to differs by binding mode: a `&mut` parameter
+                    // has an entry-state binder, and an owned local has the
+                    // pre-havoc `.set` chain instead.
+                    if bound.is_some_and(Ty::is_unique_borrow) {
+                        let entry = self.entry_states[name.as_str()].clone();
+                        self.hyps.push((
+                            format!("h_{name}_len"),
+                            format!("({name}.len) = ({entry}.len)"),
+                        ));
+                    } else {
+                        // The prior chain may reference renamed binders
+                        // (alloc binders carry the source name): rewrite to
+                        // the stale names rather than dropping. It is kept
+                        // only when it does not itself mention a havocked
+                        // name (else drop to range facts).
+                        let prior = match self.env.get(name) {
+                            Some(Val::Arr(s)) => Some(substitute(s, &stale_map, None)),
+                            _ => None,
+                        };
+                        if let Some(prior) = prior {
+                            if !havoc_set
+                                .iter()
+                                .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
+                            {
+                                self.hyps.push((
+                                    format!("h_{name}_len"),
+                                    format!("({name}.len) = ({prior}.len)"),
+                                ));
+                            }
                         }
                     }
-                    if let Some(prop) = self.array_element_range_prop(name, &elem) {
-                        self.hyps.push((format!("h_{name}_elems"), prop));
-                    }
-                    self.env.insert(name.clone(), Val::Arr(name.clone()));
-                }
-                Some(Ty::Array(elem, Mutability::Mut)) => {
-                    // Stores are the only mutation and preserve length and
-                    // element ranges by construction, so both facts are
-                    // sound to assume at havoc.
-                    let elem = elem.clone();
-                    let entry = self.entry_states[name.as_str()].clone();
-                    self.binders.push((name.clone(), lean_array_ty(&elem)));
-                    self.hyps.push((
-                        format!("h_{name}_len"),
-                        format!("({name}.len) = ({entry}.len)"),
-                    ));
                     if let Some(prop) = self.array_element_range_prop(name, &elem) {
                         self.hyps.push((format!("h_{name}_elems"), prop));
                     }
@@ -5863,8 +5883,8 @@ impl<'a> Generator<'a> {
                 // A field borrow names the field's own place; whether
                 // that place is an object or an array is what the
                 // checker recorded on the expression (ADR 0020).
-                let place = |v: String| match e.ty {
-                    Some(Ty::Array(..)) => Val::Arr(v),
+                let place = |v: String| match &e.ty {
+                    Some(ty) if ty.as_array().is_some() => Val::Arr(v),
                     _ => Val::Obj(v),
                 };
                 match (base, field) {
@@ -5886,7 +5906,7 @@ impl<'a> Generator<'a> {
             ExprKind::ArrayLit(elems) => {
                 let hint = self.name_hint.take();
                 let b = self.hinted_sym("_lit", hint);
-                let Some(Ty::Array(ref element, _)) = e.ty else {
+                let Some(Ty::Array(ref element)) = e.ty else {
                     unreachable!("checked: array literal has an array type")
                 };
                 self.binders
@@ -6038,9 +6058,9 @@ impl<'a> Generator<'a> {
                 // field on to something that consumes it (ADR 0029).
                 Cctx::Method(..) | Cctx::Deinit(_) => {
                     let projected = project_field(&self.self_chain(), field);
-                    match e.ty {
-                        Some(Ty::Res(_)) | Some(Ty::ResRef(..)) => Val::View(projected),
-                        Some(Ty::Class(_)) | Some(Ty::ClassRef(..)) => Val::Obj(projected),
+                    match e.ty.as_ref().map(Ty::referent) {
+                        Some(Ty::Res(_)) => Val::View(projected),
+                        Some(Ty::Class(_)) => Val::Obj(projected),
                         Some(Ty::Raw(_)) => Val::Ptr(projected),
                         Some(Ty::Array(..)) => Val::Arr(projected),
                         Some(Ty::Bool) => Val::Prop(format!("({projected} = true)")),
@@ -6103,10 +6123,7 @@ impl<'a> Generator<'a> {
                     .zip(arg_vals.iter().cloned())
                     .collect();
                 for p in &iparams {
-                    if matches!(
-                        p.ty,
-                        Ty::ClassRef(_, Mutability::Mut) | Ty::ResRef(_, Mutability::Mut)
-                    ) {
+                    if matches!(p.ty.as_unique_borrow(), Some(Ty::Class(_) | Ty::Res(_))) {
                         subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
                     }
                 }
@@ -6275,9 +6292,7 @@ impl<'a> Generator<'a> {
                         _ => unreachable!("checked: int/array/class/resource/pointer args"),
                     })
                     .collect();
-                let Some(Ty::Class(ci) | Ty::ClassRef(ci, _)) =
-                    self.var_tys.get(recv.as_str()).cloned()
-                else {
+                let Some(ci) = self.var_tys.get(recv.as_str()).and_then(Ty::class_index) else {
                     unreachable!("checked: class receiver")
                 };
                 let cd = &self.classes[ci];
@@ -6364,10 +6379,13 @@ impl<'a> Generator<'a> {
                         self.push_class_state_facts(&rcd, &ret_sym);
                         self.push_invariant_hyps(&rcd, &ret_sym);
                     }
-                    Ty::Res(k) | Ty::ResRef(k, _) => {
+                    returned if returned.is_resource() => {
+                        let k = returned
+                            .res_kind()
+                            .expect("the arm's guard already matched this shape");
                         self.binders
-                            .push((ret_sym.clone(), lean_res_view_ty(*k, self.records)));
-                        for (h, prop) in view_wf_hyps(*k, &ret_sym, &ret_sym, self.records) {
+                            .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
+                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                     }
@@ -6385,10 +6403,7 @@ impl<'a> Generator<'a> {
                 for (p, a) in m.f.params.iter().zip(arg_vals.iter()) {
                     post_map.insert(p.name.clone(), a.clone());
                     // `old p` of a `&mut` argument is its pre-call state.
-                    if matches!(
-                        p.ty,
-                        Ty::ClassRef(_, Mutability::Mut) | Ty::ResRef(_, Mutability::Mut)
-                    ) {
+                    if matches!(p.ty.as_unique_borrow(), Some(Ty::Class(_) | Ty::Res(_))) {
                         post_map.insert(format!("_old_{}", p.name), a.clone());
                     }
                 }
@@ -6425,7 +6440,7 @@ impl<'a> Generator<'a> {
                     Ty::Unit => Val::Unit,
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
-                    Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
+                    ref returned if returned.is_resource() => Val::View(ret_sym),
                     Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
                     _ => Val::Int(ret_sym),
                 }
@@ -6580,12 +6595,11 @@ impl<'a> Generator<'a> {
                 // `old p` in the callee's contracts means the argument's
                 // pre-call state.
                 for p in &sig.params {
-                    if matches!(
-                        p.ty,
-                        Ty::Array(_, Mutability::Mut)
-                            | Ty::ClassRef(_, Mutability::Mut)
-                            | Ty::ResRef(_, Mutability::Mut)
-                    ) {
+                    // One question, one pattern: a unique borrow is the only
+                    // type through which a callee can change storage the
+                    // caller still names, so it is the only one with an
+                    // entry-state twin.
+                    if p.ty.is_unique_borrow() {
                         subst_map.insert(format!("_old_{}", p.name), subst_map[&p.name].clone());
                     }
                 }
@@ -6628,7 +6642,7 @@ impl<'a> Generator<'a> {
                 // and yields inconsistent hypotheses — the soundness bug
                 // caught by the quicksort agent on 2026-08-09.
                 for (p, arg) in sig.params.iter().zip(args.iter()) {
-                    let Ty::Array(ref elem, Mutability::Mut) = p.ty else {
+                    let Some(elem) = p.ty.as_unique_borrow().and_then(Ty::as_owned_array) else {
                         continue;
                     };
                     let ExprKind::Borrow { array, .. } = &arg.kind else {
@@ -6694,10 +6708,13 @@ impl<'a> Generator<'a> {
                     // A returned resource: a fresh view binder. The
                     // authority that came with it is the checker's
                     // business, and appears nowhere here (ADR 0024).
-                    Ty::Res(k) | Ty::ResRef(k, _) => {
+                    returned if returned.is_resource() => {
+                        let k = returned
+                            .res_kind()
+                            .expect("the arm's guard already matched this shape");
                         self.binders
-                            .push((ret_sym.clone(), lean_res_view_ty(*k, self.records)));
-                        for (h, prop) in view_wf_hyps(*k, &ret_sym, &ret_sym, self.records) {
+                            .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
+                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym, self.records) {
                             self.push_hyp_unique(h, prop);
                         }
                     }
@@ -6732,7 +6749,7 @@ impl<'a> Generator<'a> {
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
                     Ty::Record(_) => Val::Record(ret_sym),
-                    Ty::Res(_) | Ty::ResRef(..) => Val::View(ret_sym),
+                    ref returned if returned.is_resource() => Val::View(ret_sym),
                     Ty::Raw(_) => Val::Ptr(ret_sym),
                     Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
                     _ => Val::Int(ret_sym),
@@ -6935,10 +6952,10 @@ impl<'a> Generator<'a> {
             }
         }
         for p in &self.f.params {
-            match &p.ty {
+            match p.ty.referent() {
                 Ty::Int(_) | Ty::Param(_) => out.push((p.name.clone(), "Int".into())),
                 Ty::Bool => out.push((p.name.clone(), "Bool".into())),
-                Ty::Class(ci) | Ty::ClassRef(ci, _) => {
+                Ty::Class(ci) => {
                     let lean = lean_class_name(&self.classes[*ci].name);
                     out.push((p.name.clone(), lean.clone()));
                     if let Some(entry) = self.entry_states.get(&p.name) {
@@ -6948,8 +6965,8 @@ impl<'a> Generator<'a> {
                 Ty::Record(ri) => {
                     out.push((p.name.clone(), lean_record_name(&self.records[*ri].name)))
                 }
-                Ty::Array(element, _) => {
-                    let lean_ty = lean_array_ty(&element.clone());
+                Ty::Array(element) => {
+                    let lean_ty = lean_array_ty(element);
                     out.push((p.name.clone(), lean_ty.clone()));
                     if let Some(entry) = self.entry_states.get(&p.name) {
                         out.push((entry.clone(), lean_ty));
@@ -6957,14 +6974,14 @@ impl<'a> Generator<'a> {
                 }
                 Ty::Raw(_) | Ty::RawRecord(_) => out.push((p.name.clone(), "Sable.RawPtr".into())),
                 Ty::OptionRaw(_) => out.push((p.name.clone(), "Option Sable.RawPtr".into())),
-                Ty::Res(k) | Ty::ResRef(k, _) => {
+                Ty::Res(k) => {
                     out.push((p.name.clone(), lean_res_view_ty(*k, self.records)));
                     if let Some(entry) = self.entry_states.get(&p.name) {
                         out.push((entry.clone(), lean_res_view_ty(*k, self.records)));
                     }
                 }
                 Ty::Option(_) => unreachable!("VC preflight rejects option parameters"),
-                Ty::Unit => {}
+                Ty::Borrow(..) | Ty::Unit => {}
             }
         }
         match self.cctx {
@@ -7380,10 +7397,7 @@ fn vc_resource_kind(var_tys: &HashMap<String, Ty>, e: &Expr) -> Option<ResKind> 
         ),
         _ => None,
     }?;
-    match var_tys.get(name.as_str()).cloned()? {
-        Ty::Res(kind) | Ty::ResRef(kind, _) => Some(kind),
-        _ => None,
-    }
+    var_tys.get(name.as_str())?.res_kind()
 }
 
 fn view_wf_hyps(
@@ -7572,12 +7586,10 @@ pub fn substitute(text: &str, map: &HashMap<String, String>, result: Option<&str
 fn preprocess_old_params(text: &str, params: &[Param]) -> String {
     let mut out = text.to_string();
     for p in params {
-        if !matches!(
-            p.ty,
-            Ty::Array(_, Mutability::Mut)
-                | Ty::ClassRef(_, Mutability::Mut)
-                | Ty::ResRef(_, Mutability::Mut)
-        ) {
+        // A unique borrow is the only parameter whose storage the callee
+        // can change while the caller still names it, so it is the only one
+        // whose `old p` needs an entry-state binder.
+        if !p.ty.is_unique_borrow() {
             continue;
         }
         // Token-aware replace of the two-token sequence `old <name>`.
@@ -7753,7 +7765,7 @@ mod type_domain_tests {
         // The one admitted owning payload has a Lean type, parenthesized so
         // it stays one argument.
         assert_eq!(
-            lean_option_ty(&Ty::array(Ty::Bool, Mutability::Owned)),
+            lean_option_ty(&Ty::array(Ty::Bool)),
             "Option (Sable.Seq Bool)"
         );
         assert!(
@@ -7762,7 +7774,7 @@ mod type_domain_tests {
         );
 
         assert_eq!(
-            lean_option_ty(&Ty::array(Ty::Int(IntTy::U64), Mutability::Owned)),
+            lean_option_ty(&Ty::array(Ty::Int(IntTy::U64))),
             UNSUPPORTED_LEAN_TY
         );
         assert!(
@@ -7791,7 +7803,7 @@ mod type_domain_tests {
             for shape in [
                 Ty::Record(0),
                 Ty::Class(0),
-                Ty::array(Ty::Int(IntTy::U64), Mutability::Owned),
+                Ty::array(Ty::Int(IntTy::U64)),
                 Ty::option(Ty::Int(IntTy::U64)),
                 Ty::Int(IntTy::TParam(0)),
                 Ty::Param(TypeParamId::from_legacy(0)),
@@ -7975,10 +7987,10 @@ fn affine_loop(u64 n) {
                 option_span: span,
             },
             span,
-            ty: Some(Ty::array(Ty::Bool, Mutability::Owned)),
+            ty: Some(Ty::array(Ty::Bool)),
         };
         let statement = Stmt::Decl {
-            ty: Ty::array(Ty::Bool, Mutability::Owned),
+            ty: Ty::array(Ty::Bool),
             name: "flags".into(),
             name_span: span,
             init: Some(take_expr),
@@ -8039,7 +8051,7 @@ fn affine_loop(u64 n) {
                 mutable: true,
             },
             Stmt::Decl {
-                ty: Ty::array(Ty::Bool, Mutability::Owned),
+                ty: Ty::array(Ty::Bool),
                 name: "pending".into(),
                 name_span: span,
                 init: Some(Expr {
@@ -8048,7 +8060,7 @@ fn affine_loop(u64 n) {
                         option_span: span,
                     },
                     span,
-                    ty: Some(Ty::array(Ty::Bool, Mutability::Owned)),
+                    ty: Some(Ty::array(Ty::Bool)),
                 }),
                 mutable: false,
             },
@@ -8193,12 +8205,9 @@ fn affine_loop(u64 n) {
             validate_vc_ty(Ty::option(Ty::Record(0)), false, "unused ordinary function")
                 .expect_err("POD-record options are represented but have no proof semantics");
         assert!(record_error.contains("POD-record option payload"));
-        let array_error = validate_vc_ty(
-            Ty::array(Ty::Record(0), Mutability::Owned),
-            false,
-            "unused ordinary function",
-        )
-        .expect_err("POD-record arrays are represented but have no proof semantics");
+        let array_error =
+            validate_vc_ty(Ty::array(Ty::Record(0)), false, "unused ordinary function")
+                .expect_err("POD-record arrays are represented but have no proof semantics");
         assert!(array_error.contains("POD-record array payload"));
     }
 
@@ -8224,7 +8233,7 @@ fn affine_loop(u64 n) {
     fn bool_arrays_are_owned_local_only_in_vc_preflight() {
         assert!(
             validate_vc_type_position(
-                Ty::array(Ty::Bool, Mutability::Owned),
+                Ty::array(Ty::Bool),
                 false,
                 VcTypePosition::Local,
                 "synthetic local",
@@ -8234,27 +8243,18 @@ fn affine_loop(u64 n) {
 
         for (ty, position) in [
             (
-                Ty::array(Ty::Bool, Mutability::Shared),
+                Ty::array_ref(Ty::Bool, Mutability::Shared),
                 VcTypePosition::Parameter,
             ),
             (
-                Ty::array(Ty::Bool, Mutability::Mut),
+                Ty::array_ref(Ty::Bool, Mutability::Mut),
                 VcTypePosition::TraitParameter,
             ),
+            (Ty::array(Ty::Bool), VcTypePosition::Return),
+            (Ty::array(Ty::Bool), VcTypePosition::ClassField),
+            (Ty::array(Ty::Bool), VcTypePosition::RecordField),
             (
-                Ty::array(Ty::Bool, Mutability::Owned),
-                VcTypePosition::Return,
-            ),
-            (
-                Ty::array(Ty::Bool, Mutability::Owned),
-                VcTypePosition::ClassField,
-            ),
-            (
-                Ty::array(Ty::Bool, Mutability::Owned),
-                VcTypePosition::RecordField,
-            ),
-            (
-                Ty::array(Ty::Bool, Mutability::Shared),
+                Ty::array_ref(Ty::Bool, Mutability::Shared),
                 VcTypePosition::Borrow,
             ),
         ] {
@@ -8265,7 +8265,7 @@ fn affine_loop(u64 n) {
 
         for payload in [Ty::Record(0), Ty::Param(TypeParamId::from_legacy(0))] {
             let error = validate_vc_type_position(
-                Ty::array(payload.clone(), Mutability::Owned),
+                Ty::array(payload.clone()),
                 false,
                 VcTypePosition::Local,
                 "synthetic local",
@@ -8282,7 +8282,7 @@ fn affine_loop(u64 n) {
     #[test]
     fn bool_array_preflight_rejects_forged_borrow_and_exposure() {
         let span = Span::new(0, 1);
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let mut locals = HashMap::from([("bits".to_string(), array_ty.clone())]);
         let borrowed = Expr {
             kind: ExprKind::Borrow {
@@ -8291,7 +8291,7 @@ fn affine_loop(u64 n) {
                 mutable: false,
             },
             span,
-            ty: Some(Ty::array(Ty::Bool, Mutability::Shared)),
+            ty: Some(Ty::array_ref(Ty::Bool, Mutability::Shared)),
         };
         let error = validate_vc_expr(&borrowed, false, "forged borrow", &locals)
             .expect_err("forged Boolean array borrow must fail closed");
@@ -8351,7 +8351,7 @@ fn subject() {
         let parameter = TypeParamId::from_legacy(0);
         assert!(
             validate_vc_type_position(
-                Ty::array(Ty::Param(parameter), Mutability::Owned),
+                Ty::array(Ty::Param(parameter)),
                 true,
                 VcTypePosition::Local,
                 "retained template",
@@ -8386,7 +8386,7 @@ fn subject() {
         *second = Expr {
             kind: ExprKind::Var("first".into()),
             span: first_span,
-            ty: Some(Ty::array(Ty::Bool, Mutability::Owned)),
+            ty: Some(Ty::array(Ty::Bool)),
         };
         let error = validate_vc_type_domain(&aliased)
             .expect_err("Boolean array alias initialization must fail closed");
@@ -8399,7 +8399,7 @@ fn subject() {
             value: Expr {
                 kind: ExprKind::Var("second".into()),
                 span: first_span,
-                ty: Some(Ty::array(Ty::Bool, Mutability::Owned)),
+                ty: Some(Ty::array(Ty::Bool)),
             },
         });
         let error = validate_vc_type_domain(&rebound)
@@ -8410,7 +8410,7 @@ fn subject() {
     #[test]
     fn bool_array_preflight_rejects_option_operator_laundering() {
         let span = Span::new(0, 1);
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let locals = HashMap::from([("bits".to_string(), array_ty.clone())]);
         let bits = || Expr {
             kind: ExprKind::Var("bits".into()),
@@ -8459,7 +8459,7 @@ fn subject() {
     #[test]
     fn bool_array_preflight_rejects_scalar_operator_laundering() {
         let span = Span::new(0, 1);
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let locals = HashMap::from([("bits".to_string(), array_ty.clone())]);
         let bits = || Expr {
             kind: ExprKind::Var("bits".into()),
@@ -8555,8 +8555,8 @@ fn subject() {
     #[test]
     fn bool_array_preflight_rejects_scalar_statement_operands() {
         let span = Span::new(0, 1);
-        let bool_array = Ty::array(Ty::Bool, Mutability::Owned);
-        let int_array = Ty::array(Ty::Int(IntTy::U64), Mutability::Owned);
+        let bool_array = Ty::array(Ty::Bool);
+        let int_array = Ty::array(Ty::Int(IntTy::U64));
         let mut locals = HashMap::from([
             ("bits".to_string(), bool_array.clone()),
             ("numbers".to_string(), int_array),

@@ -117,16 +117,16 @@ struct Ctx<'a> {
 /// param).
 fn class_of(ctx: &Ctx, name: &str, span: Span) -> CResult<usize> {
     reject_view_read(ctx, name, span)?;
-    match ctx.vars.get(name).map(|v| v.ty.clone()) {
-        Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Ok(ci),
-        _ => Err(Diagnostic {
+    ctx.vars
+        .get(name)
+        .and_then(|v| v.ty.class_index())
+        .ok_or_else(|| Diagnostic {
             name: "type.mismatch".into(),
             title: format!("`{name}` is not a class value"),
             span,
             label: "field access needs a class-typed receiver".into(),
             notes: vec![],
-        }),
-    }
+        })
 }
 
 fn tbounds_of(params: &[String], bounds: &[Option<String>]) -> HashMap<String, (String, u8)> {
@@ -149,12 +149,10 @@ fn class_tbounds(c: &ClassDecl) -> HashMap<String, (String, u8)> {
 /// views while both executable semantics operate on the singleton device.
 fn check_uart_params(params: &[Param]) -> CResult<()> {
     let mut first: Option<&Param> = None;
-    for param in params.iter().filter(|param| {
-        matches!(
-            param.ty,
-            Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
-        )
-    }) {
+    for param in params
+        .iter()
+        .filter(|param| param.ty.res_kind() == Some(ResKind::Uart))
+    {
         if let Some(first) = first {
             return Err(Diagnostic {
                 name: "uart.multiple_authority".into(),
@@ -184,12 +182,11 @@ fn check_uart_params(params: &[Param]) -> CResult<()> {
 fn check_uart_trait_methods(traits: &[TraitDecl]) -> CResult<()> {
     for tr in traits {
         for method in &tr.methods {
-            if let Some(param) = method.params.iter().find(|param| {
-                matches!(
-                    param.ty,
-                    Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
-                )
-            }) {
+            if let Some(param) = method
+                .params
+                .iter()
+                .find(|param| param.ty.res_kind() == Some(ResKind::Uart))
+            {
                 return Err(Diagnostic {
                     name: "uart.trait_unsupported".into(),
                     title: "UART authority is not supported in trait methods".into(),
@@ -203,10 +200,7 @@ fn check_uart_trait_methods(traits: &[TraitDecl]) -> CResult<()> {
                     )],
                 });
             }
-            if matches!(
-                method.ret,
-                Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
-            ) {
+            if method.ret.res_kind() == Some(ResKind::Uart) {
                 return Err(Diagnostic {
                     name: "uart.trait_unsupported".into(),
                     title: "UART authority is not supported in trait methods".into(),
@@ -259,11 +253,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
         });
     }
     for p in &f.params {
-        if matches!(p.ty, Ty::Res(kind) | Ty::ResRef(kind, _) if kind.sealed_terminal()) {
-            let kind = match p.ty {
-                Ty::Res(kind) | Ty::ResRef(kind, _) => kind,
-                _ => unreachable!(),
-            };
+        if let Some(kind) = p.ty.res_kind().filter(|kind| kind.sealed_terminal()) {
             return Err(Diagnostic {
                 name: "resource.release_sealed".into(),
                 title: format!("{} authority may not cross an extern boundary", kind.name()),
@@ -281,10 +271,9 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
         // Explicit resource whitelist: a new resource kind must make a
         // deliberate ABI decision. In particular, device-profile authority
         // is meaningful only to compiler intrinsics and may not cross FFI.
-        let ok = match p.ty {
-            Ty::Int(_) | Ty::Raw(_) | Ty::RawRecord(_) => true,
-            Ty::Res(kind) | Ty::ResRef(kind, _) => kind.extern_abi_allowed(),
-            _ => false,
+        let ok = match p.ty.res_kind() {
+            Some(kind) => kind.extern_abi_allowed(),
+            None => matches!(p.ty, Ty::Int(_) | Ty::Raw(_) | Ty::RawRecord(_)),
         };
         if !ok {
             return Err(Diagnostic {
@@ -519,10 +508,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         notes: vec![],
                     });
                 }
-                if matches!(
-                    fld.ty,
-                    Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
-                ) {
+                if fld.ty.res_kind() == Some(ResKind::Uart) {
                     return Err(Diagnostic {
                         name: "uart.field_unsupported".into(),
                         title: "the singleton UART capability may not be stored in a class".into(),
@@ -546,11 +532,11 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     // (ADR 0020, ADR 0023), and resources — a class that
                     // owns authority takes it in through an init
                     // (ADR 0029).
-                    let ok = matches!(
-                        p.ty,
-                        Ty::Int(_) | Ty::Class(_) | Ty::ClassRef(..) | Ty::Res(_) | Ty::ResRef(..)
-                    ) || (allow_shared_arrays
-                        && matches!(p.ty, Ty::Array(_, Mutability::Shared)));
+                    let ok = matches!(p.ty, Ty::Int(_))
+                        || p.ty.class_index().is_some()
+                        || p.ty.is_resource()
+                        || (allow_shared_arrays
+                            && matches!(p.ty.as_array_borrow(), Some((_, Mutability::Shared))));
                     if !ok {
                         return Err(Diagnostic {
                             name: "type.member_param".into(),
@@ -654,10 +640,20 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             sig.params.first().map(|p| p.ty.clone()),
             sig.params.get(1).map(|p| p.ty.clone()),
         ) {
-            (
-                Some(Ty::ClassRef(a, Mutability::Shared)),
-                Some(Ty::ClassRef(b, Mutability::Shared)),
-            ) if sig.params.len() == 2 => (a, b),
+            (Some(a), Some(b))
+                if sig.params.len() == 2
+                    && matches!(
+                        (a.as_class_borrow(), b.as_class_borrow()),
+                        (Some((_, Mutability::Shared)), Some((_, Mutability::Shared)))
+                    ) =>
+            {
+                (
+                    a.class_index()
+                        .expect("a shared class borrow names a class"),
+                    b.class_index()
+                        .expect("a shared class borrow names a class"),
+                )
+            }
             _ => return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`")),
         };
         if ci_a != ci_b {
@@ -1093,10 +1089,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         notes: vec![],
                     });
                 }
-                if matches!(
-                    fld.ty,
-                    Ty::Res(ResKind::Uart) | Ty::ResRef(ResKind::Uart, _)
-                ) {
+                if fld.ty.res_kind() == Some(ResKind::Uart) {
                     return Err(Diagnostic {
                         name: "uart.field_unsupported".into(),
                         title: "the singleton UART capability may not be stored in a class".into(),
@@ -1411,11 +1404,11 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
                 if matches!(
                     ty.as_array(),
-                    Some((&Ty::Bool, Mutability::Shared | Mutability::Mut))
+                    Some((&Ty::Bool, BindingMode::Shared | BindingMode::Mut))
                 ) {
                     return Err(bool_array_borrow(*name_span));
                 }
-                if *ty == Ty::array(Ty::Bool, Mutability::Owned) && init.is_none() {
+                if *ty == Ty::array(Ty::Bool) && init.is_none() {
                     return Err(Diagnostic {
                         name: "type.bool_array_initializer".into(),
                         title: format!("Boolean array local `{name}` needs an initializer"),
@@ -1467,7 +1460,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         | Some(ExprKind::ArrayLit(_))
                         | Some(ExprKind::OptTake { .. })
                 );
-                if matches!(ty, Ty::Array(_, Mutability::Owned)) && !ctx.in_test && !alloc_init {
+                if matches!(ty, Ty::Array(_)) && !ctx.in_test && !alloc_init {
                     return Err(Diagnostic {
                         name: "type.owned_array_outside_test".into(),
                         title: "owned arrays exist only in test functions for now".into(),
@@ -1593,7 +1586,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     // brought, and no longer the previous one.
                     v.obligation = carries;
                 } else {
-                    if matches!(ty, Ty::Array(..)) {
+                    if ty.as_array().is_some() {
                         return Err(Diagnostic {
                             name: "type.array_assign".into(),
                             title: format!("cannot assign to array `{name}`"),
@@ -1891,7 +1884,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             }
             Stmt::ExprStmt(e) => {
                 let ty = check_expr(ctx, e, None)?;
-                if ty == Ty::array(Ty::Bool, Mutability::Owned) {
+                if ty == Ty::array(Ty::Bool) {
                     return Err(Diagnostic {
                         name: "type.bool_array_temporary".into(),
                         title: "discarding a Boolean array temporary".into(),
@@ -2174,7 +2167,12 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             } => {
                 let (elem, src_mut, declared_mut) = match ctx.vars.get(array.as_str()) {
                     Some(v) => match &v.ty {
-                        Ty::Array(e, m) => (e, m, v.mutable),
+                        borrowed_or_owned if borrowed_or_owned.as_array().is_some() => {
+                            let (element, mode) = borrowed_or_owned
+                                .as_array()
+                                .expect("the arm's guard already matched this shape");
+                            (element, mode, v.mutable)
+                        }
                         owning if owning.is_affine_option() => {
                             return Err(Diagnostic {
                                 name: "option.affine_expose".into(),
@@ -2209,7 +2207,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     }
                 };
                 validate_array_payload(elem, *array_span)?;
-                if **elem != Ty::Int(IntTy::U8) {
+                if *elem != Ty::Int(IntTy::U8) {
                     return Err(Diagnostic {
                         name: "expose.element_type".into(),
                         title: format!("cannot expose `[{}]` as bytes yet", elem.name()),
@@ -2224,7 +2222,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     });
                 }
                 if *mutable {
-                    if *src_mut == Mutability::Shared {
+                    if src_mut == BindingMode::Shared {
                         return Err(Diagnostic {
                             name: "expose.mutate_shared".into(),
                             title: format!("cannot expose `{array}` mutably"),
@@ -2233,7 +2231,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             notes: vec![],
                         });
                     }
-                    if *src_mut == Mutability::Owned && !declared_mut {
+                    if src_mut == BindingMode::Owned && !declared_mut {
                         return Err(Diagnostic {
                             name: "mut.borrow_immutable".into(),
                             title: format!("`&mut` exposure of immutable local `{array}`"),
@@ -2352,7 +2350,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // performs the moved-place check explicitly before stamping
                 // the contextual owned type.
                 let mut checked = false;
-                if let Ty::Array(ref elem, _) = fty {
+                if let Ty::Array(ref elem) = fty {
                     match &value.kind {
                         ExprKind::Var(name) => {
                             let source = Place::local(name);
@@ -2360,8 +2358,8 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                                 return Err(moved_out(ctx, &source, value.span, "move"));
                             }
                             match ctx.vars.get(name.as_str()).map(|v| v.ty.clone()) {
-                                Some(Ty::Array(e2, Mutability::Owned)) if e2 == *elem => {
-                                    value.ty = Some(Ty::Array(e2, Mutability::Owned));
+                                Some(Ty::Array(e2)) if e2 == *elem => {
+                                    value.ty = Some(Ty::Array(e2));
                                     checked = true;
                                 }
                                 _ => {
@@ -2427,7 +2425,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 value,
             } => {
                 let fty = ctx.self_field_ty(field, *field_span, true)?;
-                let Ty::Array(elem, _) = fty else {
+                let Ty::Array(elem) = fty else {
                     return Err(Diagnostic {
                         name: "type.not_an_array".into(),
                         title: format!("field `{field}` is not an array"),
@@ -2448,11 +2446,12 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 value,
             } => {
                 let (elem, mutability, arr_mutable) = match ctx.vars.get(array.as_str()) {
-                    Some(VarInfo {
-                        ty: Ty::Array(t, m),
-                        mutable,
-                        ..
-                    }) => (t.clone(), *m, *mutable),
+                    Some(VarInfo { ty, mutable, .. }) if ty.as_array().is_some() => {
+                        let (element, mode) = ty
+                            .as_array()
+                            .expect("the arm's guard already matched this shape");
+                        (element.clone(), mode, *mutable)
+                    }
                     Some(v) => {
                         return Err(Diagnostic {
                             name: "type.not_an_array".into(),
@@ -2472,7 +2471,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 };
-                if mutability == Mutability::Owned && !arr_mutable {
+                if mutability == BindingMode::Owned && !arr_mutable {
                     return Err(Diagnostic {
                         name: "mut.store_immutable".into(),
                         title: format!("store into immutable local `{array}`"),
@@ -2481,7 +2480,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         notes: vec![],
                     });
                 }
-                if mutability == Mutability::Shared {
+                if mutability == BindingMode::Shared {
                     return Err(Diagnostic {
                         name: "type.store_shared".into(),
                         title: format!("cannot store through shared borrow `&[{}]`", elem.name()),
@@ -2513,7 +2512,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 }
                 check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
                 validate_array_payload(&elem, *array_span)?;
-                check_expr(ctx, value, Some(*elem))?;
+                check_expr(ctx, value, Some(elem))?;
             }
         }
     }
@@ -2559,10 +2558,7 @@ fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
         }
         _ => e.ty.clone(),
     }?;
-    match ty {
-        Ty::Res(kind) | Ty::ResRef(kind, _) => Some(kind),
-        _ => None,
-    }
+    ty.res_kind()
 }
 
 fn noncanonical_aggregate_payload(span: Span) -> Diagnostic {
@@ -2750,13 +2746,34 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
     }
 }
 
-/// Check every container payload inside a type.
+/// The payload rules for one type's own containers.
 ///
-/// This is a *traversal*, and the match is exhaustive with no wildcard on
-/// purpose: a wildcard here is fail-open, because a shape nested under a
-/// constructor nobody thought about would be admitted without any gate seeing
-/// it. A new constructor must be a compile error, not a silent `Ok`. Each
-/// leaf hands off to the gate that owns the position.
+/// One-level dispatch, exhaustive with no wildcard on purpose: a wildcard
+/// here is fail-open, because a shape nested under a constructor nobody
+/// thought about would be admitted without any gate seeing it. A new
+/// constructor must be a compile error, not a silent `Ok`. One level is
+/// enough because the payload gate it hands off to is an atom allow-list.
+fn validate_container_payloads(ty: Ty, span: Span) -> CResult<()> {
+    match ty {
+        Ty::Array(payload) => validate_array_payload(&payload, span),
+        Ty::Option(payload) => option_payload_ty(*payload, span).map(|_| ()),
+        // A borrow holds no payload of its own; `validate_aggregate_ty` is
+        // what strips the borrow marker before this runs.
+        Ty::Borrow(..)
+        | Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Unit => Ok(()),
+    }
+}
+
+/// Check every container payload inside a type.
 pub(crate) fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
     // An option that owns its present case is routed away from the copyable
     // gate before the dispatch below, and by the payload's shape rather than
@@ -2765,22 +2782,11 @@ pub(crate) fn validate_aggregate_ty(ty: Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_unsupported(ty, span));
     }
-    match ty {
-        Ty::Array(payload, _) => validate_array_payload(&payload, span),
-        Ty::Option(payload) => option_payload_ty(*payload, span).map(|_| ()),
-        Ty::Int(_)
-        | Ty::Bool
-        | Ty::Param(_)
-        | Ty::Class(_)
-        | Ty::ClassRef(..)
-        | Ty::Record(_)
-        | Ty::OptionRaw(_)
-        | Ty::Res(_)
-        | Ty::Raw(_)
-        | Ty::RawRecord(_)
-        | Ty::ResRef(..)
-        | Ty::Unit => Ok(()),
-    }
+    // A borrow carries no payload of its own, so what this gates is the
+    // referent's: `&[[u64]]` must meet the array payload rule exactly as
+    // `[[u64]]` does. Whether a borrow may sit where it was written is a
+    // position question, and `parameter_ty` asks it.
+    validate_container_payloads(ty.referent().clone(), span)
 }
 
 /// May a record field hold this type, and if so with what storage geometry.
@@ -2818,6 +2824,47 @@ fn bool_array_parameter(span: Span) -> Diagnostic {
     }
 }
 
+/// What a borrow may name.
+///
+/// A gate: an allow-list ending in a named refusal, and it never calls
+/// itself — a borrow of a borrow names storage the callee was never handed.
+/// Binding mode is orthogonal to shape in the representation, so this is the
+/// rule that says which referents a `&` may be written on, and without it
+/// every shape would be borrowable.
+///
+/// It carries the name `Parser::admits` uses at `TyPos::BorrowParam`, because
+/// a reader asking "what may `&` be written on" should get one answer
+/// whichever rule happened to answer it (ADR 0063).
+fn borrow_referent_ty(borrowed: &Ty, referent: &Ty, span: Span) -> CResult<()> {
+    match referent {
+        // `&Nat` / `&mut Nat` (ADRs 0010, 0023), `&[T]` / `&mut [T]`
+        // (ADR 0023), and `resource &K` / `resource &mut K` (ADR 0024).
+        Ty::Class(_) | Ty::Array(_) | Ty::Res(_) => Ok(()),
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Record(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => Err(Diagnostic {
+            name: "type.borrow_param_unsupported".into(),
+            title: format!("`{}` is not admitted as a parameter type", borrowed.name()),
+            span,
+            label: "expected `&C`/`&mut C`, `&[T]`/`&mut [T]`, or `resource &K`/`resource &mut K`"
+                .into(),
+            notes: vec![(
+                "note".into(),
+                "a borrow is a second name for storage the caller keeps; only arrays, classes, \
+                 and resource authority have one"
+                    .into(),
+            )],
+        }),
+    }
+}
+
 /// May a parameter carry this type. A position gate: the payload traversal
 /// decides what the type may contain, and these refusals decide what the call
 /// boundary may transport, which is a separate question with a separate
@@ -2828,6 +2875,12 @@ pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
     }
     if ty.is_array_of(&Ty::Bool) {
         return Err(bool_array_parameter(span));
+    }
+    // Before the payload traversal: what a borrow may name is a question
+    // about the borrow, and reporting an inner payload rule for `&record`
+    // would name a rule the reader did not break.
+    if let Some((_, referent)) = ty.as_borrow() {
+        borrow_referent_ty(ty, referent, span)?;
     }
     validate_aggregate_ty(ty.clone(), span)?;
     if matches!(ty, Ty::Option(_)) {
@@ -3162,7 +3215,7 @@ fn check_affine_option_initializer(
         ExprKind::SomeE(inner)
             if matches!(&inner.kind, ExprKind::AllocArray { elem: Ty::Bool, .. }) =>
         {
-            check_expr(ctx, inner, Some(Ty::array(Ty::Bool, Mutability::Owned)))?;
+            check_expr(ctx, inner, Some(Ty::array(Ty::Bool)))?;
         }
         _ => {
             return Err(Diagnostic {
@@ -3243,7 +3296,7 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
             )],
         });
     }
-    let ty = Ty::array(Ty::Bool, Mutability::Owned);
+    let ty = Ty::array(Ty::Bool);
     expression.ty = Some(ty.clone());
     Ok(ty)
 }
@@ -3413,7 +3466,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     });
                 }
-                if matches!(v.ty, Ty::Array(..)) {
+                if v.ty.as_array().is_some() {
                     return Err(Diagnostic {
                         name: "type.array_value".into(),
                         title: format!("array `{name}` used as a value"),
@@ -3461,10 +3514,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Len { array } => {
             // `a.len` on a class receiver is the FIELD named `len`
             // (ADR 0010) — rewrite and re-check.
-            if matches!(
-                ctx.vars.get(array.as_str()).map(|v| v.ty.clone()),
-                Some(Ty::Class(_)) | Some(Ty::ClassRef(..))
-            ) {
+            if ctx
+                .vars
+                .get(array.as_str())
+                .is_some_and(|v| v.ty.class_index().is_some())
+            {
                 let obj = array.clone();
                 e.kind = ExprKind::ClassField {
                     obj,
@@ -3752,7 +3806,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let ci = class_of(ctx, obj, *obj_span)?;
             let meta = &ctx.class_metas[ci];
             let elem = match meta.fields.iter().find(|(n, _)| n == field) {
-                Some((_, Ty::Array(el, _))) => el.clone(),
+                Some((_, Ty::Array(el))) => el.clone(),
                 _ => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
@@ -3812,10 +3866,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         Ty::Param(TypeParamId::from_legacy(pidx))
                     }
                     Ty::Int(IntTy::TParam(0)) => Ty::Param(TypeParamId::from_legacy(pidx)),
-                    Ty::Array(payload, mutability) => {
-                        Ty::Array(Box::new(remap_payload(*payload)), mutability)
-                    }
+                    Ty::Array(payload) => Ty::array(remap_payload(*payload)),
                     Ty::Option(payload) => Ty::Option(Box::new(remap_payload(*payload))),
+                    // A borrow's referent is remapped in place: `&[<T>]` is
+                    // the same remap `[<T>]` gets, one marker further out.
+                    Ty::Borrow(mutability, referent) => Ty::borrow(
+                        mutability,
+                        match *referent {
+                            Ty::Array(payload) => Ty::array(remap_payload(*payload)),
+                            other => other,
+                        },
+                    ),
                     other => other,
                 }
             };
@@ -3873,18 +3934,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let raw = Ty::Raw(IntTy::U8);
             let u8t = Ty::Int(IntTy::U8);
             let u64t = Ty::Int(IntTy::U64);
-            let shared = Ty::ResRef(ResKind::RawSpan, Mutability::Shared);
-            let unique = Ty::ResRef(ResKind::RawSpan, Mutability::Mut);
+            let shared = Ty::borrow(Mutability::Shared, Ty::Res(ResKind::RawSpan));
+            let unique = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::RawSpan));
             let span = Ty::Res(ResKind::RawSpan);
             let cell = Ty::Res(ResKind::PointsToU64);
-            let cell_shared = Ty::ResRef(ResKind::PointsToU64, Mutability::Shared);
-            let cell_unique = Ty::ResRef(ResKind::PointsToU64, Mutability::Mut);
+            let cell_shared = Ty::borrow(Mutability::Shared, Ty::Res(ResKind::PointsToU64));
+            let cell_unique = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::PointsToU64));
             let leased = Ty::Res(ResKind::BlockLease);
             let leased_cell = Ty::Res(ResKind::LeasedPointsToU64);
             let free_block = Ty::Res(ResKind::FreeBlock);
             let free_header = Ty::Res(ResKind::FreeHeader);
-            let free_header_shared = Ty::ResRef(ResKind::FreeHeader, Mutability::Shared);
-            let free_header_unique = Ty::ResRef(ResKind::FreeHeader, Mutability::Mut);
+            let free_header_shared = Ty::borrow(Mutability::Shared, Ty::Res(ResKind::FreeHeader));
+            let free_header_unique = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::FreeHeader));
             let arg_kind = |i: usize| resource_arg_kind(ctx, &args[i]);
             let cell_kind = match op {
                 RawOp::IntoCellU64 => arg_kind(1),
@@ -3903,8 +3964,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 cell_kind,
                 Some(ResKind::BlockLease | ResKind::LeasedPointsToU64)
             );
-            let leased_cell_shared = Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Shared);
-            let leased_cell_unique = Ty::ResRef(ResKind::LeasedPointsToU64, Mutability::Mut);
+            let leased_cell_shared =
+                Ty::borrow(Mutability::Shared, Ty::Res(ResKind::LeasedPointsToU64));
+            let leased_cell_unique =
+                Ty::borrow(Mutability::Mut, Ty::Res(ResKind::LeasedPointsToU64));
             let want: Vec<Ty> = match op {
                 RawOp::Offset => vec![raw.clone(), u64t.clone()],
                 RawOp::Load8 => vec![raw.clone(), shared],
@@ -3958,15 +4021,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::CellInitRecord(ri) => vec![
                     Ty::RawRecord(ri),
                     Ty::Record(ri),
-                    Ty::ResRef(ResKind::PointsToRecord(ri), Mutability::Mut),
+                    Ty::borrow(Mutability::Mut, Ty::Res(ResKind::PointsToRecord(ri))),
                 ],
                 RawOp::CellReadRecord(ri) => vec![
                     Ty::RawRecord(ri),
-                    Ty::ResRef(ResKind::PointsToRecord(ri), Mutability::Shared),
+                    Ty::borrow(Mutability::Shared, Ty::Res(ResKind::PointsToRecord(ri))),
                 ],
                 RawOp::CellTakeRecord(ri) | RawOp::CellDropRecord(ri) => vec![
                     Ty::RawRecord(ri),
-                    Ty::ResRef(ResKind::PointsToRecord(ri), Mutability::Mut),
+                    Ty::borrow(Mutability::Mut, Ty::Res(ResKind::PointsToRecord(ri))),
                 ],
                 RawOp::CastRecord(_) => vec![raw.clone()],
                 RawOp::PointerOffsetRecord(ri) => vec![Ty::RawRecord(ri)],
@@ -4051,7 +4114,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            let uart = Ty::ResRef(ResKind::Uart, Mutability::Mut);
+            let uart = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::Uart));
             let want = match op {
                 DeviceOp::UartStatus => vec![uart],
                 DeviceOp::UartWrite => vec![Ty::Int(IntTy::U8), uart],
@@ -4110,7 +4173,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 // No product type is needed: one side is written back
                 // through the borrow (ADR 0024).
                 ResOp::SplitOff => {
-                    let want = Ty::ResRef(ResKind::RawSpan, Mutability::Mut);
+                    let want = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::RawSpan));
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     let got = check_expr(ctx, &mut args[0], Some(want.clone()))?;
                     debug_assert_eq!(got, want);
@@ -4142,7 +4205,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 // not a checker rule: the checker tracks tokens, not the
                 // state of the outside world (ADR 0028).
                 ResOp::OpenFileOf => {
-                    let want = Ty::ResRef(ResKind::PosixWorld, Mutability::Mut);
+                    let want = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::PosixWorld));
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::I32)))?;
@@ -4205,7 +4268,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(ResKind::RawSpan)
                 }
                 ResOp::AllocatorTake => {
-                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    let want = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::AllocatorState));
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
@@ -4213,7 +4276,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(ResKind::BlockLease)
                 }
                 ResOp::AllocatorPut => {
-                    let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    let state = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::AllocatorState));
                     require_explicit_borrow(ctx, &args[0], state.clone())?;
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let lease = Ty::Res(ResKind::BlockLease);
@@ -4223,7 +4286,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Unit
                 }
                 ResOp::AllocatorTakeFree => {
-                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    let want = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::AllocatorState));
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
@@ -4231,7 +4294,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(ResKind::FreeBlock)
                 }
                 ResOp::AllocatorPutFree => {
-                    let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    let state = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::AllocatorState));
                     require_explicit_borrow(ctx, &args[0], state.clone())?;
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let block = Ty::Res(ResKind::FreeBlock);
@@ -4241,7 +4304,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Unit
                 }
                 ResOp::AllocatorTakeHeader => {
-                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    let want = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::AllocatorState));
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
@@ -4249,7 +4312,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(ResKind::FreeHeader)
                 }
                 ResOp::AllocatorPutHeader => {
-                    let state = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    let state = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::AllocatorState));
                     require_explicit_borrow(ctx, &args[0], state.clone())?;
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let header = Ty::Res(ResKind::FreeHeader);
@@ -4259,7 +4322,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Unit
                 }
                 ResOp::AllocatorStepHeader => {
-                    let want = Ty::ResRef(ResKind::AllocatorState, Mutability::Mut);
+                    let want = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::AllocatorState));
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
@@ -4268,7 +4331,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     Ty::Res(ResKind::FreeHeader)
                 }
                 ResOp::FreeBlockSplit => {
-                    let block = Ty::ResRef(ResKind::FreeBlock, Mutability::Mut);
+                    let block = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::FreeBlock));
                     require_explicit_borrow(ctx, &args[0], block.clone())?;
                     check_expr(ctx, &mut args[0], Some(block))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
@@ -4314,7 +4377,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             notes: vec![],
                         });
                     };
-                    let map = Ty::ResRef(map_kind, Mutability::Mut);
+                    let map = Ty::borrow(Mutability::Mut, Ty::Res(map_kind));
                     require_explicit_borrow(ctx, &args[0], map.clone())?;
                     check_expr(ctx, &mut args[0], Some(map))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
@@ -4339,7 +4402,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             notes: vec![],
                         });
                     };
-                    let map = Ty::ResRef(map_kind, Mutability::Mut);
+                    let map = Ty::borrow(Mutability::Mut, Ty::Res(map_kind));
                     require_explicit_borrow(ctx, &args[0], map.clone())?;
                     check_expr(ctx, &mut args[0], Some(map))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
@@ -4360,7 +4423,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             check_expr(ctx, len, Some(Ty::Int(IntTy::U64)))?;
             validate_array_payload(&elem, span)?;
             check_expr(ctx, init, Some(elem.clone()))?;
-            Ty::Array(Box::new(elem), Mutability::Owned)
+            Ty::Array(Box::new(elem))
         }
         ExprKind::SelfField { field } => {
             let fty = ctx.self_field_ty(field, span, false)?;
@@ -4396,7 +4459,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::SelfFieldIndex { field, index } => {
             let fty = ctx.self_field_ty(field, span, false)?;
-            let Ty::Array(elem, _) = fty else {
+            let Ty::Array(elem) = fty else {
                 return Err(Diagnostic {
                     name: "type.not_an_array".into(),
                     title: format!("field `{field}` is not an array"),
@@ -4467,7 +4530,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 // a brand could leave in.
                 let escapes = launders.then(|| ("be passed to a constructor", arg.span));
                 match &p.ty {
-                    Ty::Array(elem, m) => {
+                    borrowed_array if borrowed_array.as_array_borrow().is_some() => {
+                        let (_, m) = borrowed_array
+                            .as_array_borrow()
+                            .expect("the arm's guard already matched this shape");
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
                             return Err(Diagnostic {
                                 name: "type.array_arg_borrow".into(),
@@ -4475,18 +4541,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                                 span: arg.span,
                                 label: format!(
                                     "write `{}name`",
-                                    if *m == Mutability::Mut { "&mut " } else { "&" }
+                                    if m == Mutability::Mut { "&mut " } else { "&" }
                                 ),
                                 notes: vec![],
                             });
                         }
                         let got = check_expr(ctx, arg, None)?;
-                        if got != Ty::Array(elem.clone(), *m) {
+                        if got != *borrowed_array {
                             return Err(Diagnostic {
                                 name: "type.mismatch".into(),
                                 title: format!(
                                     "expected `{}`, found `{}`",
-                                    Ty::Array(elem.clone(), *m).name(),
+                                    borrowed_array.name(),
                                     got.name()
                                 ),
                                 span: arg.span,
@@ -4495,7 +4561,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    Ty::ClassRef(..) | Ty::ResRef(..) => {
+                    borrowed if borrowed.as_borrow().is_some() => {
                         require_explicit_borrow(ctx, arg, p.ty.clone())?;
                         check_expr(ctx, arg, Some(p.ty.clone()))?;
                     }
@@ -4524,10 +4590,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     mutable,
                     ..
                 }) => (*ci, *mutable, true),
-                Some(VarInfo {
-                    ty: Ty::ClassRef(ci, m),
-                    ..
-                }) => (*ci, *m == Mutability::Mut, false),
+                Some(VarInfo { ty, .. }) if ty.as_class_borrow().is_some() => {
+                    let (ci, m) = ty
+                        .as_class_borrow()
+                        .expect("the arm's guard already matched this shape");
+                    (ci, m == Mutability::Mut, false)
+                }
                 Some(v) => {
                     return Err(Diagnostic {
                         name: "type.not_a_class".into(),
@@ -4603,9 +4671,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // A method is a callee like any other: it can launder a brand
             // only if its signature can give storage back.
             let launders = match ret {
-                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Res(_) | Ty::ResRef(..) => {
-                    true
-                }
+                ref ty if ty.is_resource() => true,
+                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
                 _ => false,
@@ -4628,13 +4695,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             ret
         }
         ExprKind::ArrayLit(elems) => match expected {
-            Some(Ty::Array(t, Mutability::Owned)) => {
+            Some(Ty::Array(t)) => {
                 validate_array_payload(&t, span)?;
                 let element_ty = (*t).clone();
                 for el in elems {
                     check_expr(ctx, el, Some(element_ty.clone()))?;
                 }
-                Ty::Array(t, Mutability::Owned)
+                Ty::Array(t)
             }
             _ => {
                 return Err(Diagnostic {
@@ -4708,7 +4775,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 let base = if array == "self" {
                     match ctx.in_class {
-                        Some((ci, _)) => Ty::ClassRef(ci, Mutability::Shared),
+                        Some((ci, _)) => Ty::borrow(Mutability::Shared, Ty::Class(ci)),
                         None => {
                             return Err(Diagnostic {
                                 name: "type.self_outside_class".into(),
@@ -4733,7 +4800,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         }
                     }
                 };
-                let (Ty::Class(bci) | Ty::ClassRef(bci, _)) = base else {
+                let Some(bci) = base.class_index() else {
                     return Err(Diagnostic {
                         name: "type.not_a_class".into(),
                         title: format!("`{array}` is not a class value"),
@@ -4754,25 +4821,23 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     })?;
                 let borrowed_ty = match &fld.1 {
-                    Ty::Class(fci) => Ok(Ty::ClassRef(*fci, Mutability::Shared)),
+                    Ty::Class(fci) => Ok(Ty::borrow(Mutability::Shared, Ty::Class(*fci))),
                     // A resource field is a place too. Its mutability is
                     // the borrow's: shared anywhere, and unique only in a
                     // destructor, where the invariant it could break no
                     // longer has to hold (ADR 0029).
-                    Ty::Res(k) => Ok(Ty::ResRef(
-                        *k,
+                    Ty::Res(k) => Ok(Ty::borrow(
                         if *mutable {
                             Mutability::Mut
                         } else {
                             Mutability::Shared
                         },
+                        Ty::Res(*k),
                     )),
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
-                    Ty::Array(elem, _) if elem.as_ref() == &Ty::Bool => {
-                        Err(bool_array_borrow(span))
-                    }
-                    Ty::Array(elem, _) => Ok(Ty::Array(elem.clone(), Mutability::Shared)),
+                    Ty::Array(elem) if elem.as_ref() == &Ty::Bool => Err(bool_array_borrow(span)),
+                    Ty::Array(elem) => Ok(Ty::borrow(Mutability::Shared, Ty::Array(elem.clone()))),
                     _ => Err(Diagnostic {
                         name: "type.not_a_place".into(),
                         title: format!("field `{fname}` is not a borrowable place"),
@@ -4789,10 +4854,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // rules are the class rules: unique access is only ever
             // narrowed, and a mutable borrow needs a `mut` local.
             if let Some(v) = ctx.vars.get(array.as_str()) {
-                if let Ty::Res(k) | Ty::ResRef(k, _) = v.ty {
-                    let (src_mut, is_local) = match v.ty {
-                        Ty::ResRef(_, m) => (m, false),
-                        _ => (Mutability::Mut, true),
+                if let Some(k) = v.ty.res_kind() {
+                    let (src_mut, is_local) = match v.ty.as_res_borrow() {
+                        Some((_, m)) => (m, false),
+                        None => (Mutability::Mut, true),
                     };
                     let declared_mut = v.mutable;
                     if *mutable {
@@ -4818,13 +4883,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    let borrowed_ty = Ty::ResRef(
-                        k,
+                    let borrowed_ty = Ty::borrow(
                         if *mutable {
                             Mutability::Mut
                         } else {
                             Mutability::Shared
                         },
+                        Ty::Res(k),
                     );
                     e.ty = Some(borrowed_ty.clone());
                     return Ok(borrowed_ty);
@@ -4835,10 +4900,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // A shared re-borrow of a `&mut C` is fine; the other
             // direction would manufacture unique access out of shared.
             if let Some(v) = ctx.vars.get(array.as_str()) {
-                if let Ty::Class(ci) | Ty::ClassRef(ci, _) = v.ty {
-                    let (src_mut, is_local) = match v.ty {
-                        Ty::ClassRef(_, m) => (m, false),
-                        _ => (Mutability::Mut, true),
+                if let Some(ci) = v.ty.class_index() {
+                    let (src_mut, is_local) = match v.ty.as_class_borrow() {
+                        Some((_, m)) => (m, false),
+                        None => (Mutability::Mut, true),
                     };
                     let declared_mut = v.mutable;
                     if *mutable {
@@ -4864,13 +4929,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    let borrowed_ty = Ty::ClassRef(
-                        ci,
+                    let borrowed_ty = Ty::borrow(
                         if *mutable {
                             Mutability::Mut
                         } else {
                             Mutability::Shared
                         },
+                        Ty::Class(ci),
                     );
                     e.ty = Some(borrowed_ty.clone());
                     return Ok(borrowed_ty);
@@ -4881,11 +4946,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 return Err(bool_array_borrow(span));
             }
             let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty.clone()) {
-                Some(Ty::Array(_, m)) => m,
+                Some(ty) if ty.as_array().is_some() => ty.binding_mode(),
                 _ => unreachable!("array_elem_ty checked"),
             };
             if *mutable
-                && src_mut == Mutability::Owned
+                && src_mut == BindingMode::Owned
                 && !ctx.vars.get(array.as_str()).is_some_and(|v| v.mutable)
             {
                 return Err(Diagnostic {
@@ -4896,7 +4961,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            if *mutable && src_mut == Mutability::Shared {
+            if *mutable && src_mut == BindingMode::Shared {
                 return Err(Diagnostic {
                     name: "type.mut_borrow_shared".into(),
                     title: format!("cannot mutably borrow `{array}` through `&[_]`"),
@@ -4905,8 +4970,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            Ty::Array(
-                Box::new(elem),
+            Ty::array_ref(
+                elem,
                 if *mutable {
                     Mutability::Mut
                 } else {
@@ -4993,8 +5058,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // only ever see the ordinary call.
             let class_of = |ctx: &Ctx, e: &Expr| match &e.kind {
                 ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) {
-                    Some(Ty::Class(ci)) | Some(Ty::ClassRef(ci, _)) => Some((n.clone(), ci)),
-                    _ => None,
+                    Some(ty) => ty.class_index().map(|ci| (n.clone(), ci)),
+                    None => None,
                 },
                 _ => None,
             };
@@ -5188,9 +5253,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // stops C stashing the pointer in a foreign global — and it is
             // part of what the contract's audit id covers.
             let launders = match ret {
-                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Res(_) | Ty::ResRef(..) => {
-                    true
-                }
+                ref ty if ty.is_resource() => true,
+                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
                 _ => false,
@@ -5198,7 +5262,10 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             for (arg, pty) in args.iter_mut().zip(param_tys) {
                 let escapes = launders.then(|| ("be passed to a function", arg.span));
                 match pty {
-                    Ty::Array(elem, m) => {
+                    ref borrowed_array if borrowed_array.as_array_borrow().is_some() => {
+                        let (_, m) = borrowed_array
+                            .as_array_borrow()
+                            .expect("the arm's guard already matched this shape");
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
                             return Err(Diagnostic {
                                 name: "type.array_arg_borrow".into(),
@@ -5212,12 +5279,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                         let got = check_expr(ctx, arg, None)?;
-                        if got != Ty::Array(elem.clone(), m) {
+                        if got != *borrowed_array {
                             return Err(Diagnostic {
                                 name: "type.mismatch".into(),
                                 title: format!(
                                     "expected `{}`, found `{}`",
-                                    Ty::Array(elem, m).name(),
+                                    borrowed_array.name(),
                                     got.name()
                                 ),
                                 span: arg.span,
@@ -5226,7 +5293,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             });
                         }
                     }
-                    Ty::ClassRef(..) | Ty::ResRef(..) => {
+                    ref borrowed if borrowed.as_borrow().is_some() => {
                         require_explicit_borrow(ctx, arg, pty.clone())?;
                         check_expr(ctx, arg, Some(pty))?;
                     }
@@ -5345,11 +5412,17 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
             }
             Some((p, *mutable))
         }
+        // A borrowed class or resource parameter is itself a place that can
+        // be re-borrowed. A borrowed array is not: its element storage is
+        // named by an index, which `Place` has no path for.
         ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) {
-            Some(Ty::ClassRef(_, m)) | Some(Ty::ResRef(_, m)) => {
-                Some((Place::local(n), m == Mutability::Mut))
-            }
-            _ => None,
+            Some(ty) => match ty.as_borrow() {
+                Some((m, Ty::Class(_) | Ty::Res(_))) => {
+                    Some((Place::local(n), m == Mutability::Mut))
+                }
+                _ => None,
+            },
+            None => None,
         },
         _ => None,
     }
@@ -5403,13 +5476,16 @@ fn check_borrow_conflicts(
 /// follow (ADR 0023, ADR 0024). Passing along a borrow already held at
 /// the same mutability hands over nothing new and needs no `&`.
 fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
-    let (m, owner, flipped) = match pty {
-        Ty::ClassRef(ci, m) => (
+    // Only a class or resource borrow names an owner a diagnostic can
+    // print. An array borrow is written `&`/`&mut` at the call site by its
+    // own rule, and a borrow of anything else is refused before this runs.
+    let (m, owner, flipped) = match pty.as_borrow() {
+        Some((m, Ty::Class(ci))) => (
             m,
-            ctx.class_metas[ci].name.clone(),
-            Ty::ClassRef(ci, flip(m)),
+            ctx.class_metas[*ci].name.clone(),
+            Ty::borrow(flip(m), Ty::Class(*ci)),
         ),
-        Ty::ResRef(k, m) => (m, k.name().to_string(), Ty::ResRef(k, flip(m))),
+        Some((m, Ty::Res(k))) => (m, k.name().to_string(), Ty::borrow(flip(m), Ty::Res(*k))),
         _ => return Ok(()),
     };
     // Passing along a *shared* borrow already held under the same type:
@@ -5458,7 +5534,7 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
 fn flip(m: Mutability) -> Mutability {
     match m {
         Mutability::Mut => Mutability::Shared,
-        _ => Mutability::Mut,
+        Mutability::Shared => Mutability::Mut,
     }
 }
 
@@ -5835,8 +5911,7 @@ impl<'a> Ctx<'a> {
     /// Whether this place names an owned array, whose moves are affine for
     /// a different reason: the elements are shared storage, not authority.
     fn is_array_place(&self, p: &Place) -> bool {
-        self.place_ty(p)
-            .is_some_and(|t| matches!(t, Ty::Array(_, Mutability::Owned)))
+        self.place_ty(p).is_some_and(|t| matches!(t, Ty::Array(_)))
     }
 
     /// Which affine category a place belongs to, as the prefix its
@@ -5942,7 +6017,8 @@ fn class_holds_storage(metas: &[ClassMeta], ci: usize, depth: usize) -> bool {
         return true;
     }
     metas[ci].fields.iter().any(|(_, ty)| match ty {
-        Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Res(_) | Ty::ResRef(..) => true,
+        ty if ty.is_resource() => true,
+        Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) => true,
         Ty::Class(fci) => class_holds_storage(metas, *fci, depth + 1),
         // Records cannot currently be class fields, but treating one as a
         // storage container is the conservative answer if that surface grows.
@@ -6006,13 +6082,8 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
     if !ty.is_some_and(|t| {
         matches!(
             t,
-            Ty::Raw(_)
-                | Ty::RawRecord(_)
-                | Ty::OptionRaw(_)
-                | Ty::Record(_)
-                | Ty::Res(_)
-                | Ty::ResRef(..)
-        )
+            Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Record(_)
+        ) || t.is_resource()
     }) {
         return Ok(());
     }
@@ -6096,7 +6167,7 @@ fn reject_view_read(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
     let Some(v) = ctx.vars.get(name) else {
         return Ok(());
     };
-    let (Ty::Res(k) | Ty::ResRef(k, _)) = v.ty else {
+    let Some(k) = v.ty.res_kind() else {
         return Ok(());
     };
     Err(Diagnostic {
@@ -6116,44 +6187,41 @@ fn reject_view_read(ctx: &Ctx, name: &str, span: Span) -> CResult<()> {
 
 fn array_elem_ty(ctx: &Ctx, array: &str, span: Span) -> CResult<Ty> {
     reject_view_read(ctx, array, span)?;
-    match ctx.vars.get(array) {
-        Some(
-            v @ VarInfo {
-                ty: Ty::Array(t, _),
-                ..
-            },
-        ) => {
-            if !v.initialized {
-                return Err(Diagnostic {
-                    name: "type.uninitialized".into(),
-                    title: format!("array `{array}` may be used before initialization"),
-                    span,
-                    label: "not initialized on every path to this point".into(),
-                    notes: vec![],
-                });
-            }
-            let place = Place::local(array);
-            if ctx.is_moved(&place) {
-                return Err(moved_out(ctx, &place, span, "array access"));
-            }
-            validate_array_payload(t, span)?;
-            Ok(*t.clone())
-        }
-        Some(v) => Err(Diagnostic {
-            name: "type.not_an_array".into(),
-            title: format!("`{array}` is not an array"),
-            span,
-            label: format!("this has type `{}`", v.ty.clone().name()),
-            notes: vec![],
-        }),
-        None => Err(Diagnostic {
+    let Some(v) = ctx.vars.get(array) else {
+        return Err(Diagnostic {
             name: "type.unknown_variable".into(),
             title: format!("unknown variable `{array}`"),
             span,
             label: "not declared".into(),
             notes: vec![],
-        }),
+        });
+    };
+    // Owned or borrowed: indexing reads through either, and how the array is
+    // bound is the store rule's question rather than this one's.
+    let Some((element, _)) = v.ty.as_array() else {
+        return Err(Diagnostic {
+            name: "type.not_an_array".into(),
+            title: format!("`{array}` is not an array"),
+            span,
+            label: format!("this has type `{}`", v.ty.clone().name()),
+            notes: vec![],
+        });
+    };
+    if !v.initialized {
+        return Err(Diagnostic {
+            name: "type.uninitialized".into(),
+            title: format!("array `{array}` may be used before initialization"),
+            span,
+            label: "not initialized on every path to this point".into(),
+            notes: vec![],
+        });
     }
+    let place = Place::local(array);
+    if ctx.is_moved(&place) {
+        return Err(moved_out(ctx, &place, span, "array access"));
+    }
+    validate_array_payload(element, span)?;
+    Ok(element.clone())
 }
 
 /// Infer a same-typed integer pair, letting a literal side adopt the other
@@ -6294,30 +6362,26 @@ mod concrete_aggregate_tests {
     #[test]
     fn preconstructed_nested_payloads_are_refused_by_name() {
         let span = Span::new(0, 0);
-        let owned = Mutability::Owned;
         let cases: [(Ty, &str); 8] = [
             (
-                Ty::array(Ty::array(Ty::Int(IntTy::U64), owned), owned),
+                Ty::array(Ty::array(Ty::Int(IntTy::U64))),
                 "type.array_payload_unsupported",
             ),
             (
-                Ty::array(Ty::array(Ty::Bool, owned), owned),
+                Ty::array(Ty::array(Ty::Bool)),
+                "type.array_payload_unsupported",
+            ),
+            (Ty::array(Ty::Class(0)), "type.array_payload_unsupported"),
+            (
+                Ty::array(Ty::option(Ty::Int(IntTy::U64))),
                 "type.array_payload_unsupported",
             ),
             (
-                Ty::array(Ty::Class(0), owned),
+                Ty::array(Ty::affine_array_option(Ty::Bool)),
                 "type.array_payload_unsupported",
             ),
             (
-                Ty::array(Ty::option(Ty::Int(IntTy::U64)), owned),
-                "type.array_payload_unsupported",
-            ),
-            (
-                Ty::array(Ty::affine_array_option(Ty::Bool), owned),
-                "type.array_payload_unsupported",
-            ),
-            (
-                Ty::array(Ty::Res(ResKind::RawSpan), owned),
+                Ty::array(Ty::Res(ResKind::RawSpan)),
                 "type.array_payload_unsupported",
             ),
             (
@@ -6334,6 +6398,55 @@ mod concrete_aggregate_tests {
         }
     }
 
+    /// A borrow may name a class, an array, or resource authority, and
+    /// nothing else.
+    ///
+    /// Binding mode is orthogonal to shape in the representation, so `&T`
+    /// exists for every `T` and only a rule keeps the borrowable set small.
+    /// `Parser::admits` states it at `TyPos::BorrowParam` for what a program
+    /// can spell; this is the same rule at the checker's parameter position,
+    /// under the same machine-matchable name, for a type that reached it
+    /// some other way.
+    #[test]
+    fn a_borrow_of_an_unborrowable_referent_is_refused_by_name() {
+        let span = Span::new(0, 0);
+        for referent in [
+            Ty::Int(IntTy::U64),
+            Ty::Bool,
+            Ty::Record(0),
+            Ty::option(Ty::Int(IntTy::U64)),
+            Ty::OptionRaw(0),
+            Ty::Raw(IntTy::U8),
+            Ty::RawRecord(0),
+            Ty::Unit,
+            Ty::array_ref(Ty::Int(IntTy::U64), Mutability::Shared),
+        ] {
+            for mutability in [Mutability::Shared, Mutability::Mut] {
+                let borrowed = Ty::borrow(mutability, referent.clone());
+                let refusal = parameter_ty(&borrowed, span)
+                    .expect_err(&format!("`{}` must be refused by name", borrowed.name()));
+                assert_eq!(
+                    refusal.name,
+                    "type.borrow_param_unsupported",
+                    "for `{}`",
+                    borrowed.name()
+                );
+            }
+        }
+        // The three referents a borrow may name stay admitted.
+        for referent in [
+            Ty::Class(0),
+            Ty::array(Ty::Int(IntTy::U64)),
+            Ty::Res(ResKind::RawSpan),
+        ] {
+            for mutability in [Mutability::Shared, Mutability::Mut] {
+                let borrowed = Ty::borrow(mutability, referent.clone());
+                parameter_ty(&borrowed, span)
+                    .unwrap_or_else(|_| panic!("`{}` is a borrowable referent", borrowed.name()));
+            }
+        }
+    }
+
     /// Every owning payload is refused by name, and that refusal — not the
     /// parser table — is what keeps indexing and element stores sound: they
     /// neither move the value nor re-brand it, and `Place` has no index
@@ -6343,7 +6456,7 @@ mod concrete_aggregate_tests {
         let span = Span::new(0, 0);
         for owner in [
             Ty::Class(0),
-            Ty::array(Ty::Bool, Mutability::Owned),
+            Ty::array(Ty::Bool),
             Ty::affine_array_option(Ty::Bool),
             Ty::Res(ResKind::RawSpan),
         ] {
@@ -6429,7 +6542,7 @@ fn consume(u64 count) -> bool {
         let ExprKind::SomeE(array) = &ready.kind else {
             panic!("expected some allocation");
         };
-        assert_eq!(array.ty, Some(Ty::array(Ty::Bool, Mutability::Owned)));
+        assert_eq!(array.ty, Some(Ty::array(Ty::Bool)));
 
         let Stmt::Decl {
             init: Some(take), ..
@@ -6437,7 +6550,7 @@ fn consume(u64 count) -> bool {
         else {
             panic!("expected take destination");
         };
-        assert_eq!(take.ty, Some(Ty::array(Ty::Bool, Mutability::Owned)));
+        assert_eq!(take.ty, Some(Ty::array(Ty::Bool)));
         assert!(matches!(
             &take.kind,
             ExprKind::OptTake { option, .. } if option == "ready"
@@ -6619,7 +6732,7 @@ fn select(u64 index) -> bool {
         check(&mut program).expect("the owned-local Boolean-array surface should typecheck");
 
         let function = &program.fns[0];
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         let Stmt::Decl {
             ty,
             init: Some(literal),
@@ -6755,7 +6868,7 @@ fn bad() {
         assert_eq!(check_error(&mut exposed).name, "expose.element_type");
 
         let mut returned = monomorphized_program("fn bad() {}\n");
-        returned.fns[0].ret = Ty::array(Ty::Bool, Mutability::Owned);
+        returned.fns[0].ret = Ty::array(Ty::Bool);
         assert_eq!(check_error(&mut returned).name, "type.array_return");
     }
 
@@ -6765,7 +6878,7 @@ fn bad() {
         let Stmt::Decl { ty, .. } = &mut borrowed_local.fns[0].body[0] else {
             panic!("expected the explicit array local");
         };
-        *ty = Ty::array(Ty::Bool, Mutability::Shared);
+        *ty = Ty::array_ref(Ty::Bool, Mutability::Shared);
         assert_eq!(
             check_error(&mut borrowed_local).name,
             "type.bool_array_borrow"
@@ -6778,11 +6891,11 @@ record Flag #[layout(size := 1, align := 1)] {
 }
 "#,
         );
-        record.records[0].fields[0].ty = Ty::array(Ty::Bool, Mutability::Owned);
+        record.records[0].fields[0].ty = Ty::array(Ty::Bool);
         assert_eq!(check_error(&mut record).name, "record.field_type");
 
         let mut owned_parameter = monomorphized_program("fn bad(u8 value) {}\n");
-        owned_parameter.fns[0].params[0].ty = Ty::array(Ty::Bool, Mutability::Owned);
+        owned_parameter.fns[0].params[0].ty = Ty::array(Ty::Bool);
         assert_eq!(
             check_error(&mut owned_parameter).name,
             "type.bool_array_param"

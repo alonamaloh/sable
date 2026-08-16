@@ -198,7 +198,8 @@ unchanged, so no fence and no ratchet cell moves.
 is the resulting type" in one function, as ADR 0064 recorded. Nothing here
 changed them.
 
-**`Ty::Borrow(Mutability, Box<Ty>)` still does not exist.** Mutability is
+**`Ty::Borrow(Mutability, Box<Ty>)` still does not exist.** *(Done in ADR
+0067.)* Mutability is
 carried inline by `Ty::Array` and `Ty::ClassRef`, so `&Nat` and `&[u64]`
 remain two unrelated shapes in the representation. That fold is what would
 make `option<&[bool]>` a borrow under an option rather than a mutability field

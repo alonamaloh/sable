@@ -10,8 +10,8 @@
 
 use crate::VerifiedProgram;
 use crate::ast::{
-    BinOp, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl, SelfKind, Stmt,
-    Ty, UnOp,
+    BinOp, BindingMode, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl,
+    SelfKind, Stmt, Ty, UnOp,
 };
 use crate::diag::Diagnostic;
 use crate::span::Span;
@@ -414,9 +414,10 @@ fn callable_dependencies(
                     )]
                 })?
         };
-        let class = match receiver_ty {
-            Ty::Class(class) | Ty::ClassRef(class, _) => class,
-            other => {
+        let class = match receiver_ty.class_index() {
+            Some(class) => class,
+            None => {
+                let other = receiver_ty;
                 return Err(vec![diag(
                     "backend.class_unsupported",
                     "method receiver has a non-class checked type",
@@ -768,7 +769,7 @@ fn validate_method(
     locals.insert(
         "self".into(),
         ValidationLocal {
-            ty: Ty::ClassRef(class, Mutability::Mut),
+            ty: Ty::borrow(Mutability::Mut, Ty::Class(class)),
             mutable: true,
         },
         method.f.name_span,
@@ -1311,7 +1312,7 @@ fn require_fixed_class<'a>(
     let nat_supported = declaration.name == "Nat"
         && declaration.fields.len() == 1
         && declaration.fields[0].name == "limbs"
-        && declaration.fields[0].ty == Ty::array(Ty::Int(IntTy::U32), Mutability::Owned)
+        && declaration.fields[0].ty == Ty::array(Ty::Int(IntTy::U32))
         && declaration.methods.is_empty()
         && matches!(declaration.deinit.as_deref(), Some([]));
     let integer_supported = declaration.name == "Integer"
@@ -1355,7 +1356,7 @@ fn require_fixed_class<'a>(
             && child_declaration.proof_reuse.is_none()
             && child_declaration.fields.len() == 1
             && child_declaration.fields[0].name == "limbs"
-            && child_declaration.fields[0].ty == Ty::array(Ty::Int(IntTy::U32), Mutability::Owned)
+            && child_declaration.fields[0].ty == Ty::array(Ty::Int(IntTy::U32))
             && !child_declaration.fields[0].must_consume
             && child_declaration.methods.is_empty()
             && matches!(child_declaration.deinit.as_deref(), Some([]));
@@ -1381,7 +1382,9 @@ fn require_initializer_parameter(
     span: Span,
 ) -> Result<(), Vec<BackendError>> {
     match ty {
-        Ty::Array(element, Mutability::Shared) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+        ref borrowed
+            if borrowed.as_array_borrow() == Some((&Ty::Int(IntTy::U32), Mutability::Shared)) =>
+        {
             Ok(())
         }
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
@@ -1579,11 +1582,14 @@ fn validate_moving_arguments(
             Ty::Class(class) => {
                 validate_fixed_class_initializer(program, *class, argument, root_span_end, locals)?;
             }
-            Ty::ClassRef(..) => {
+            class_borrow if class_borrow.as_class_borrow().is_some() => {
                 validate_class_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
             }
-            Ty::Array(element, Mutability::Shared | Mutability::Mut)
-                if element.as_ref() == &Ty::Int(IntTy::U32) =>
+            array_borrow
+                if matches!(
+                    array_borrow.as_array_borrow(),
+                    Some((&Ty::Int(IntTy::U32), _))
+                ) =>
             {
                 validate_u32_array_borrow_argument(program, argument, parameter.ty.clone(), locals)?
             }
@@ -1648,14 +1654,11 @@ fn validate_call_arguments(
         )]);
     }
     for (argument, parameter) in args.iter().zip(&function.params) {
-        if matches!(
-            parameter.ty,
-            Ty::ClassRef(_, Mutability::Shared | Mutability::Mut)
-        ) {
+        if parameter.ty.as_class_borrow().is_some() {
             validate_class_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
         } else if matches!(
-            parameter.ty.as_array(),
-            Some((&Ty::Int(IntTy::U32), Mutability::Shared | Mutability::Mut))
+            parameter.ty.as_array_borrow(),
+            Some((&Ty::Int(IntTy::U32), _))
         ) {
             validate_u32_array_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
         } else {
@@ -1713,7 +1716,7 @@ fn validate_initializer_field_assign(
             )]);
         }
         match &declaration_field.ty {
-            Ty::Array(element, Mutability::Owned) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+            Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
                 validate_fresh_u32_array_initializer(program, value, root_span_end, locals)?;
             }
             Ty::Class(child) => {
@@ -1799,7 +1802,7 @@ fn validate_initializer_field_store(
             format!("class `{}` has no field `{field}`", declaration.name),
         )]);
     };
-    if declaration_field.ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned)
+    if declaration_field.ty != Ty::array(Ty::Int(IntTy::U32))
         || !initializer.fields_initialized[field_index]
     {
         return Err(vec![diag(
@@ -1834,9 +1837,9 @@ fn validate_fixed_class_field_base(
     if matches!(local.ty, Ty::Class(_)) {
         locals.require_live_class(object, span, "class field access")?;
     }
-    let class = match local.ty {
-        Ty::Class(class) | Ty::ClassRef(class, Mutability::Shared | Mutability::Mut) => class,
-        _ => {
+    let class = match local.ty.class_index() {
+        Some(class) => class,
+        None => {
             return Err(vec![diag(
                 "backend.class_unsupported",
                 "class field access has a non-class base",
@@ -1923,11 +1926,7 @@ fn validate_affine_bool_option_decl(
     match &init.kind {
         ExprKind::NoneE => Ok(()),
         ExprKind::SomeE(payload) => {
-            require_expr_type(
-                payload,
-                Ty::array(Ty::Bool, Mutability::Owned),
-                "affine-option payload",
-            )?;
+            require_expr_type(payload, Ty::array(Ty::Bool), "affine-option payload")?;
             let ExprKind::AllocArray { elem, len, init } = &payload.kind else {
                 return Err(vec![affine_option_initializer_unsupported(init.span, name)]);
             };
@@ -1955,11 +1954,7 @@ fn validate_affine_option_take(
     option_span: Span,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    require_expr_type(
-        expression,
-        Ty::array(Ty::Bool, Mutability::Owned),
-        "affine-option take result",
-    )?;
+    require_expr_type(expression, Ty::array(Ty::Bool), "affine-option take result")?;
     if destination == option {
         return Err(vec![diag(
             "backend.affine_option_unsupported",
@@ -2020,7 +2015,7 @@ fn validate_fresh_bool_array_initializer(
     local: &str,
     allow_take: bool,
 ) -> Result<(), Vec<BackendError>> {
-    let expected = Ty::array(Ty::Bool, Mutability::Owned);
+    let expected = Ty::array(Ty::Bool);
     require_expr_type(expression, expected, "owned Boolean-array initializer")?;
     match &expression.kind {
         ExprKind::ArrayLit(elements) => {
@@ -2079,7 +2074,7 @@ fn validate_fresh_u32_array_initializer(
     root_span_end: usize,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let expected = Ty::array(Ty::Int(IntTy::U32), Mutability::Owned);
+    let expected = Ty::array(Ty::Int(IntTy::U32));
     require_expr_type(expression, expected, "owned `u32`-array initializer")?;
     match &expression.kind {
         ExprKind::ArrayLit(elements) => {
@@ -2131,7 +2126,7 @@ fn validate_native_array_store(
         )]);
     };
     if !is_owned_native_array(&local.ty)
-        && local.ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Mut)
+        && local.ty != Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut)
     {
         return Err(vec![unsupported(
             array_span,
@@ -2169,15 +2164,15 @@ fn validate_u32_array_borrow_argument(
     expected: Ty,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let Some((&Ty::Int(IntTy::U32), expected_mutability)) = expected.as_array() else {
+    let Some((&Ty::Int(IntTy::U32), _)) = expected.as_array() else {
         unreachable!("called only for a checked `u32` array borrow parameter")
     };
-    if !matches!(expected_mutability, Mutability::Shared | Mutability::Mut) {
+    let Some((_, expected_mutability)) = expected.as_array_borrow() else {
         return Err(vec![unsupported(
             argument.span,
             "owned arrays cannot cross an LLVM call boundary",
         )]);
-    }
+    };
     require_expr_type(argument, expected, "`u32` array borrow argument")?;
     let ExprKind::Borrow {
         array,
@@ -2218,7 +2213,7 @@ fn validate_u32_array_borrow_argument(
         }
         let (_, _, field_ty) =
             validate_fixed_class_field_base(program, locals, array, field, argument.span)?;
-        if field_ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned) {
+        if field_ty != Ty::array(Ty::Int(IntTy::U32)) {
             return Err(vec![diag(
                 "backend.class_unsupported",
                 "array field borrow has the wrong native type",
@@ -2235,8 +2230,8 @@ fn validate_u32_array_borrow_argument(
         )]);
     };
     if *mutable
-        && (source_mutability == Mutability::Shared
-            || (source_mutability == Mutability::Owned && !source.mutable))
+        && (source_mutability == BindingMode::Shared
+            || (source_mutability == BindingMode::Owned && !source.mutable))
     {
         return Err(vec![unsupported(
             argument.span,
@@ -2252,9 +2247,7 @@ fn validate_class_borrow_argument(
     expected: Ty,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let Ty::ClassRef(class, expected_mutability @ (Mutability::Shared | Mutability::Mut)) =
-        expected
-    else {
+    let Some((class, expected_mutability)) = expected.as_class_borrow() else {
         return Err(vec![diag(
             "backend.class_unsupported",
             "class borrow is outside the fixed-owner class shapes the LLVM backend lowers",
@@ -2274,7 +2267,7 @@ fn validate_class_borrow_argument(
                 format!("class reference names unknown local `{name}`"),
             )]);
         };
-        if !matches!(source.ty, Ty::ClassRef(source_class, source_mutability)
+        if !matches!(source.ty.as_class_borrow(), Some((source_class, source_mutability))
             if source_class == class
                 && (source_mutability == expected_mutability
                     || (source_mutability == Mutability::Mut
@@ -2345,8 +2338,7 @@ fn validate_class_borrow_argument(
         }
         return Ok(());
     }
-    if !matches!(source.ty, Ty::Class(source_class) | Ty::ClassRef(source_class, _) if source_class == class)
-    {
+    if source.ty.class_index() != Some(class) {
         return Err(vec![diag(
             "backend.class_unsupported",
             "class borrow source has the wrong nominal type",
@@ -2358,10 +2350,9 @@ fn validate_class_borrow_argument(
             ),
         )]);
     }
-    let mutable_source = match source.ty {
-        Ty::Class(_) => source.mutable,
-        Ty::ClassRef(_, Mutability::Mut) => true,
-        _ => false,
+    let mutable_source = match source.ty.as_class_borrow() {
+        Some((_, mutability)) => mutability == Mutability::Mut,
+        None => matches!(source.ty, Ty::Class(_)) && source.mutable,
     };
     if expected_mutability == Mutability::Mut && !mutable_source {
         return Err(vec![diag(
@@ -2383,7 +2374,7 @@ fn validate_borrow_aliases(
     for (argument, parameter) in args.iter().zip(params) {
         let mut places = Vec::new();
         collect_argument_borrow_places(argument, locals, &mut places);
-        if matches!(parameter.ty, Ty::ClassRef(_, Mutability::Mut)) {
+        if matches!(parameter.ty.as_unique_borrow(), Some(Ty::Class(_))) {
             if let Some((_, mutable, _)) = places.first_mut() {
                 *mutable = true;
             }
@@ -2472,15 +2463,21 @@ fn collect_argument_borrow_places(
             collect_argument_borrow_places(len, locals, places);
             collect_argument_borrow_places(init, locals, places);
         }
-        ExprKind::Var(name) => match locals.get(name).map(|local| local.ty) {
-            Some(Ty::Class(_)) | Some(Ty::ClassRef(_, Mutability::Mut)) => {
-                places.push((name.clone(), true, expression.span));
+        ExprKind::Var(name) => {
+            // A class place aliases; a shared borrow of one aliases without
+            // writing. Anything else is a value the call cannot write through.
+            if let Some(ty) = locals.get(name).map(|local| local.ty) {
+                match (ty.class_index(), ty.binding_mode()) {
+                    (Some(_), BindingMode::Owned | BindingMode::Mut) => {
+                        places.push((name.clone(), true, expression.span));
+                    }
+                    (Some(_), BindingMode::Shared) => {
+                        places.push((name.clone(), false, expression.span));
+                    }
+                    (None, _) => {}
+                }
             }
-            Some(Ty::ClassRef(_, Mutability::Shared)) => {
-                places.push((name.clone(), false, expression.span));
-            }
-            _ => {}
-        },
+        }
         ExprKind::IntLit(_)
         | ExprKind::BoolLit(_)
         | ExprKind::NoneE
@@ -2507,16 +2504,13 @@ fn validate_native_method_call(
     if matches!(local.ty, Ty::Class(_)) {
         locals.require_live_class(receiver, receiver_span, "method receiver")?;
     }
-    let class = match local.ty {
-        Ty::Class(class) | Ty::ClassRef(class, _) => class,
-        other => {
-            return Err(vec![diag(
-                "backend.class_unsupported",
-                "native method receiver is not a class",
-                receiver_span,
-                format!("`{receiver}` has type `{}`", other.name()),
-            )]);
-        }
+    let Some(class) = local.ty.class_index() else {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "native method receiver is not a class",
+            receiver_span,
+            format!("`{receiver}` has type `{}`", local.ty.name()),
+        )]);
     };
     let declaration = require_fixed_class(program, class, receiver_span, "method receiver")?;
     let Some(method) = declaration
@@ -2544,10 +2538,10 @@ fn validate_native_method_call(
             "the backend lowers only the zero-argument unit method `Integer::flip_sign`",
         )]);
     }
-    let receiver_is_mutable = match local.ty {
-        Ty::Class(_) => local.mutable,
-        Ty::ClassRef(_, Mutability::Mut) => true,
-        _ => false,
+    let receiver_is_mutable = match local.ty.binding_mode() {
+        BindingMode::Owned => matches!(local.ty, Ty::Class(_)) && local.mutable,
+        BindingMode::Mut => matches!(local.ty.referent(), Ty::Class(_)),
+        BindingMode::Shared => false,
     };
     if !receiver_is_mutable {
         return Err(vec![diag(
@@ -2596,7 +2590,7 @@ fn validate_expr(
                     format!("expression names unknown or out-of-scope local `{name}`"),
                 )]);
             };
-            if matches!(local.ty, Ty::Array(..)) {
+            if local.ty.as_array().is_some() {
                 return Err(vec![unsupported(
                     expression.span,
                     format!("array local `{name}` cannot be transported as a value"),
@@ -2994,7 +2988,7 @@ fn validate_expr(
         } => {
             let (_, _, field_ty) =
                 validate_fixed_class_field_base(program, locals, obj, field, *obj_span)?;
-            if field_ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned) {
+            if field_ty != Ty::array(Ty::Int(IntTy::U32)) {
                 return Err(vec![diag(
                     "backend.class_unsupported",
                     "indexed class field is not the native `u32` array",
@@ -3009,7 +3003,7 @@ fn validate_expr(
         ExprKind::ClassFieldLen { obj, field } => {
             let (_, _, field_ty) =
                 validate_fixed_class_field_base(program, locals, obj, field, expression.span)?;
-            if field_ty != Ty::array(Ty::Int(IntTy::U32), Mutability::Owned) {
+            if field_ty != Ty::array(Ty::Int(IntTy::U32)) {
                 return Err(vec![diag(
                     "backend.class_unsupported",
                     "class `.len` field is not the native `u32` array",
@@ -3245,9 +3239,7 @@ pub(crate) fn require_parameter_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
-        Ty::Array(element, Mutability::Shared | Mutability::Mut)
-            if element.as_ref() == &Ty::Int(IntTy::U32) =>
-        {
+        ref borrowed if matches!(borrowed.as_array_borrow(), Some((&Ty::Int(IntTy::U32), _))) => {
             Ok(())
         }
         Ty::Class(class) => {
@@ -3263,12 +3255,15 @@ pub(crate) fn require_parameter_value(
                 )])
             }
         }
-        Ty::ClassRef(class, Mutability::Shared) => {
-            require_fixed_class(program, class, span, role).map(|_| ())
-        }
-        Ty::ClassRef(class, Mutability::Mut) => {
+        borrowed if borrowed.as_class_borrow().is_some() => {
+            let (class, mutability) = borrowed
+                .as_class_borrow()
+                .expect("the arm's guard already matched a class borrow");
             let declaration = require_fixed_class(program, class, span, role)?;
-            if declaration.name == "Integer" {
+            // A shared reference is uniform across the fixed-owner classes; a
+            // mutable one reaches a `&mut self` method, and only `Integer` has
+            // one in the native ABI.
+            if mutability == Mutability::Shared || declaration.name == "Integer" {
                 Ok(())
             } else {
                 Err(vec![diag(
@@ -3462,9 +3457,7 @@ impl ModuleSupport {
         }
         for field in &program.classes[class].fields {
             match &field.ty {
-                Ty::Array(element, Mutability::Owned)
-                    if element.as_ref() == &Ty::Int(IntTy::U32) =>
-                {
+                Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
                     self.require_array_u32();
                 }
                 Ty::Class(child) => self.require_class(program, *child),
@@ -3816,7 +3809,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 self.support.require_affine_option_bool_array()
             }
             Ty::Record(record) => self.support.require_record(record),
-            Ty::Class(class) | Ty::ClassRef(class, _) => {
+            ref named if named.class_index().is_some() => {
+                let class = named
+                    .class_index()
+                    .expect("the arm's guard already matched this shape");
                 self.support.require_class(self.program, class)
             }
             ty if ty.is_affine_option() => {
@@ -3949,9 +3945,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     let (field_index, field_ty) = self.class_field(class, field);
                     let field_slot = self.emit_class_field_slot(class, "%self", field_index);
                     match field_ty {
-                        Ty::Array(element, Mutability::Owned)
-                            if element.as_ref() == &Ty::Int(IntTy::U32) =>
-                        {
+                        Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
                             let value = self.emit_fresh_u32_array(value)?;
                             self.instruction(format!(
                                 "store {LLVM_ARRAY_U32} {}, ptr {field_slot}",
@@ -4297,14 +4291,16 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .expect("validated fixed-owner class base");
         let ty = local.ty.clone();
         let slot = local.slot.clone();
-        match ty {
-            Ty::Class(class) => (class, slot),
-            Ty::ClassRef(class, Mutability::Shared | Mutability::Mut) => {
+        match (ty.class_index(), ty.binding_mode()) {
+            (Some(class), BindingMode::Owned) => (class, slot),
+            // A class borrow's slot holds the pointer, so the base is one
+            // load further in.
+            (Some(class), BindingMode::Shared | BindingMode::Mut) => {
                 let pointer = self.new_temp();
                 self.instruction(format!("{pointer} = load ptr, ptr {slot}"));
                 (class, pointer)
             }
-            _ => unreachable!("validated fixed-owner class base type"),
+            (None, _) => unreachable!("validated fixed-owner class base type"),
         }
     }
 
@@ -4430,7 +4426,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             "store {LLVM_AFFINE_OPTION_BOOL_ARRAY} zeroinitializer, ptr {source_slot}"
         ));
         Ok(Value {
-            ty: Ty::array(Ty::Bool, Mutability::Owned),
+            ty: Ty::array(Ty::Bool),
             operand: Some(payload),
         })
     }
@@ -4481,7 +4477,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let len = elements.len() as u64;
         if len == 0 {
             return Ok(Value {
-                ty: Ty::array(Ty::Bool, crate::ast::Mutability::Owned),
+                ty: Ty::array(Ty::Bool),
                 operand: Some("zeroinitializer".into()),
             });
         }
@@ -4589,7 +4585,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let len = elements.len() as u64;
         if len == 0 {
             return Ok(Value {
-                ty: Ty::array(Ty::Int(IntTy::U32), Mutability::Owned),
+                ty: Ty::array(Ty::Int(IntTy::U32)),
                 operand: Some("zeroinitializer".into()),
             });
         }
@@ -4699,7 +4695,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             "{descriptor} = insertvalue {LLVM_ARRAY_BOOL} {with_ptr}, i64 {len}, 1"
         ));
         Value {
-            ty: Ty::array(Ty::Bool, crate::ast::Mutability::Owned),
+            ty: Ty::array(Ty::Bool),
             operand: Some(descriptor),
         }
     }
@@ -4714,7 +4710,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             "{descriptor} = insertvalue {LLVM_ARRAY_U32} {with_ptr}, i64 {len}, 1"
         ));
         Value {
-            ty: Ty::array(Ty::Int(IntTy::U32), Mutability::Owned),
+            ty: Ty::array(Ty::Int(IntTy::U32)),
             operand: Some(descriptor),
         }
     }
@@ -4924,9 +4920,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         for (field_index, field_ty) in fields.into_iter().rev() {
             let field_slot = self.emit_class_field_slot(class, slot, field_index);
             match field_ty {
-                Ty::Array(element, Mutability::Owned)
-                    if element.as_ref() == &Ty::Int(IntTy::U32) =>
-                {
+                Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
                     self.emit_u32_array_drop_from_slot(&field_slot);
                 }
                 Ty::Class(child) => self.emit_fixed_class_drop_from_slot(&field_slot, child),
@@ -5380,7 +5374,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 })
             }
             ExprKind::Borrow { array, field, .. }
-                if matches!(expression.ty, Some(Ty::ClassRef(_, _))) =>
+                if expression
+                    .ty
+                    .as_ref()
+                    .is_some_and(|ty| ty.as_class_borrow().is_some()) =>
             {
                 let (_, pointer) = if let Some(field) = field {
                     let (field_ty, slot) = self.class_field_slot(array, field);
@@ -6083,7 +6080,10 @@ pub(crate) fn llvm_ty(ty: Ty) -> String {
         ty if is_u32_array(&ty.clone()) => LLVM_ARRAY_U32.into(),
         ty if is_affine_bool_option(&ty.clone()) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
         Ty::Class(class) => llvm_class_ty(class),
-        Ty::ClassRef(_, Mutability::Shared | Mutability::Mut) => "ptr".into(),
+        // A class borrow is a pointer whichever way it is bound: the IR type
+        // is blind to mutability, and only the mangled symbol distinguishes
+        // the two (see `type_code`).
+        ref borrowed if borrowed.as_class_borrow().is_some() => "ptr".into(),
         Ty::Record(record) => llvm_record_ty(record),
         ty if ty.is_affine_option() => {
             unreachable!("affine option escaped LLVM validation into type lowering")
@@ -6125,14 +6125,28 @@ pub(crate) fn type_code(ty: Ty) -> String {
         Ty::Bool => "b".into(),
         Ty::Unit => "v".into(),
         Ty::Option(payload) if payload.as_ref() == &Ty::Bool => "ob".into(),
-        Ty::Array(element, Mutability::Shared) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+        // The mangled symbol *is* mutability-sensitive, unlike the IR type:
+        // two functions differing only in a parameter's borrow mutability are
+        // two different native entry points.
+        ref borrowed
+            if borrowed.as_array_borrow() == Some((&Ty::Int(IntTy::U32), Mutability::Shared)) =>
+        {
             "au32s".into()
         }
-        Ty::Array(element, Mutability::Mut) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+        ref borrowed
+            if borrowed.as_array_borrow() == Some((&Ty::Int(IntTy::U32), Mutability::Mut)) =>
+        {
             "au32m".into()
         }
-        Ty::ClassRef(class, Mutability::Shared) => format!("c{class}s"),
-        Ty::ClassRef(class, Mutability::Mut) => format!("c{class}m"),
+        ref borrowed if borrowed.as_class_borrow().is_some() => {
+            let (class, mutability) = borrowed
+                .as_class_borrow()
+                .expect("the arm's guard already matched this shape");
+            match mutability {
+                Mutability::Shared => format!("c{class}s"),
+                Mutability::Mut => format!("c{class}m"),
+            }
+        }
         Ty::Class(class) => format!("c{class}o"),
         Ty::Record(record) => format!("r{record}"),
         ty if ty.is_affine_option() => {
@@ -6667,7 +6681,7 @@ mod tests {
     }
 
     fn bool_array_ty() -> Ty {
-        Ty::array(Ty::Bool, crate::ast::Mutability::Owned)
+        Ty::array(Ty::Bool)
     }
 
     fn bool_array_literal(values: &[bool]) -> Expr {
@@ -6693,8 +6707,8 @@ mod tests {
         )
     }
 
-    fn u32_array_ty(mutability: Mutability) -> Ty {
-        Ty::array(Ty::Int(IntTy::U32), mutability)
+    fn u32_array_ty(mutability: BindingMode) -> Ty {
+        mutability.bind(Ty::array(Ty::Int(IntTy::U32)))
     }
 
     fn u32_array_literal(values: &[u32]) -> Expr {
@@ -6705,7 +6719,7 @@ mod tests {
                     .map(|value| expression(ExprKind::IntLit((*value).into()), Ty::Int(IntTy::U32)))
                     .collect(),
             ),
-            u32_array_ty(Mutability::Owned),
+            u32_array_ty(BindingMode::Owned),
         )
     }
 
@@ -6716,7 +6730,7 @@ mod tests {
                 len: Box::new(len),
                 init: Box::new(init),
             },
-            u32_array_ty(Mutability::Owned),
+            u32_array_ty(BindingMode::Owned),
         )
     }
 
@@ -6727,7 +6741,7 @@ mod tests {
                 field: None,
                 mutable: mutability == Mutability::Mut,
             },
-            u32_array_ty(mutability),
+            Ty::array_ref(Ty::Int(IntTy::U32), mutability),
         )
     }
 
@@ -6751,7 +6765,7 @@ mod tests {
                 field: None,
                 mutable: false,
             },
-            Ty::ClassRef(0, Mutability::Shared),
+            Ty::borrow(Mutability::Shared, Ty::Class(0)),
         )
     }
 
@@ -6787,7 +6801,10 @@ mod tests {
                 },
             ],
         );
-        inspect.params = vec![parameter("value", Ty::ClassRef(0, Mutability::Shared))];
+        inspect.params = vec![parameter(
+            "value",
+            Ty::borrow(Mutability::Shared, Ty::Class(0)),
+        )];
         let entry = function(
             "entry",
             Ty::Int(IntTy::I32),
@@ -6820,7 +6837,7 @@ mod tests {
             proof_reuse: ProofReuse::None,
             fields: vec![Field {
                 name: "limbs".into(),
-                ty: u32_array_ty(Mutability::Owned),
+                ty: u32_array_ty(BindingMode::Owned),
                 span: Span::new(0, 1),
                 must_consume: false,
             }],
@@ -7716,7 +7733,7 @@ mod tests {
     #[test]
     fn boolean_option_does_not_open_parameters_entries_or_other_payloads() {
         let option = Ty::option(Ty::Bool);
-        let bool_array = Ty::array(Ty::Bool, crate::ast::Mutability::Owned);
+        let bool_array = Ty::array(Ty::Bool);
         let mut parameterized = function(
             "parameterized",
             Ty::Bool,
@@ -7819,9 +7836,9 @@ mod tests {
 
     #[test]
     fn u32_arrays_lower_typed_unaligned_storage_borrows_and_logical_oom_payloads() {
-        let owned = u32_array_ty(Mutability::Owned);
-        let shared = u32_array_ty(Mutability::Shared);
-        let mutable = u32_array_ty(Mutability::Mut);
+        let owned = u32_array_ty(BindingMode::Owned);
+        let shared = u32_array_ty(BindingMode::Shared);
+        let mutable = u32_array_ty(BindingMode::Mut);
         let u32_ty = Ty::Int(IntTy::U32);
         let u64_ty = Ty::Int(IntTy::U64);
 
@@ -7995,9 +8012,9 @@ mod tests {
 
     #[test]
     fn u32_array_backend_revalidates_borrow_positions_capabilities_and_aliases() {
-        let owned = u32_array_ty(Mutability::Owned);
-        let shared = u32_array_ty(Mutability::Shared);
-        let mutable = u32_array_ty(Mutability::Mut);
+        let owned = u32_array_ty(BindingMode::Owned);
+        let shared = u32_array_ty(BindingMode::Shared);
+        let mutable = u32_array_ty(BindingMode::Mut);
         let u32_ty = Ty::Int(IntTy::U32);
 
         let mut sink = function(
@@ -8615,7 +8632,7 @@ mod tests {
         );
         unrelated.params = vec![parameter(
             "values",
-            Ty::array(Ty::Int(IntTy::I32), crate::ast::Mutability::Shared),
+            Ty::array_ref(Ty::Int(IntTy::I32), crate::ast::Mutability::Shared),
         )];
         let program = program(vec![entry, unrelated]);
 
@@ -8641,7 +8658,7 @@ mod tests {
             Ty::Bool,
             vec![
                 Stmt::Decl {
-                    ty: Ty::array(Ty::Int(IntTy::I32), crate::ast::Mutability::Owned),
+                    ty: Ty::array(Ty::Int(IntTy::I32)),
                     name: "values".into(),
                     name_span: Span::new(0, 1),
                     init: None,
@@ -9352,7 +9369,10 @@ mod tests {
                 span: Span::new(0, 1),
             }],
         );
-        refresh.params = vec![parameter("old", Ty::ClassRef(0, Mutability::Shared))];
+        refresh.params = vec![parameter(
+            "old",
+            Ty::borrow(Mutability::Shared, Ty::Class(0)),
+        )];
         result.fns.push(refresh);
 
         let entry = &mut result.fns[1];
@@ -9448,7 +9468,7 @@ mod tests {
             }],
         );
         overlap.params = vec![
-            parameter("borrowed", Ty::ClassRef(0, Mutability::Shared)),
+            parameter("borrowed", Ty::borrow(Mutability::Shared, Ty::Class(0))),
             parameter("owned", Ty::Class(0)),
         ];
         overlapping_move.fns.push(overlap);
@@ -9533,10 +9553,10 @@ mod tests {
             }],
         );
         alias.params = vec![
-            parameter("left", Ty::ClassRef(1, Mutability::Mut)),
-            parameter("right", Ty::ClassRef(1, Mutability::Mut)),
+            parameter("left", Ty::borrow(Mutability::Mut, Ty::Class(1))),
+            parameter("right", Ty::borrow(Mutability::Mut, Ty::Class(1))),
         ];
-        let mutable_reference = Ty::ClassRef(1, Mutability::Mut);
+        let mutable_reference = Ty::borrow(Mutability::Mut, Ty::Class(1));
         let mut forward = function(
             "forward_alias",
             Ty::Unit,
@@ -9761,7 +9781,10 @@ mod tests {
                 Ty::Unit,
             ))],
         );
-        bad_method.params = vec![parameter("receiver", Ty::ClassRef(99, Mutability::Mut))];
+        bad_method.params = vec![parameter(
+            "receiver",
+            Ty::borrow(Mutability::Mut, Ty::Class(99)),
+        )];
         invalid_receiver.fns.push(bad_method);
         let error = callable_dependencies(&invalid_receiver, Callable::Function(2))
             .expect_err("invalid receiver class indices must diagnose before emission");

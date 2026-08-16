@@ -410,13 +410,30 @@ pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
             ty.name()
         ));
     }
+    // A Boolean array is an owned local and nothing else: the interpreter
+    // has no transport for a borrowed one.
+    if let Some((element, mode)) = ty.as_array() {
+        if element == &Ty::Bool {
+            return match mode {
+                BindingMode::Owned => Ok(()),
+                BindingMode::Shared | BindingMode::Mut => Err(format!(
+                    "interp.array_position_unsupported: {context} is a borrowed Boolean array; \
+                     Boolean arrays are supported only as owned locals"
+                )),
+            };
+        }
+    }
+    // A borrow carries no payload of its own, so what is gated is the
+    // referent's.
+    validate_interp_container_payloads(ty.referent().clone(), context)
+}
+
+/// The payload rules for one type's own containers, exhaustive with no
+/// wildcard so a new constructor is a compile error rather than a silently
+/// executed shape.
+fn validate_interp_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
-        Ty::Array(ref element, Mutability::Owned) if element.as_ref() == &Ty::Bool => Ok(()),
-        Ty::Array(ref element, _) if element.as_ref() == &Ty::Bool => Err(format!(
-            "interp.array_position_unsupported: {context} is a borrowed Boolean array; \
-             Boolean arrays are supported only as owned locals"
-        )),
-        Ty::Array(payload, _) => validate_interp_array_payload(&payload, context),
+        Ty::Array(payload) => validate_interp_array_payload(&payload, context),
         Ty::Option(payload) => validate_interp_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "interp.type_parameter_unsupported: {context} contains an unresolved type parameter"
@@ -424,13 +441,12 @@ pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
         Ty::Int(_)
         | Ty::Bool
         | Ty::Class(_)
-        | Ty::ClassRef(..)
         | Ty::Record(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
         | Ty::Raw(_)
         | Ty::RawRecord(_)
-        | Ty::ResRef(..)
+        | Ty::Borrow(..)
         | Ty::Unit => Ok(()),
     }
 }
@@ -623,14 +639,15 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                 let array_ty = interp_local_ty(locals, array).ok_or_else(|| {
                     format!("interp.unknown_local: store names unknown array `{array}`")
                 })?;
-                let Ty::Array(payload, _) = array_ty else {
+                let Some((payload, _)) = array_ty.as_array() else {
                     return Err(format!(
                         "interp.not_array: store target `{array}` is not an array"
                     ));
                 };
+                let payload = payload.clone();
                 validate_interp_array_payload(&payload, &format!("store target `{array}`"))?;
                 validate_interp_sink(Ty::Int(IntTy::U64), index, locals, "array store index")?;
-                validate_interp_sink(*payload, value, locals, "array store value")?;
+                validate_interp_sink(payload, value, locals, "array store value")?;
             }
             Stmt::While { cond, body, .. } => {
                 validate_interp_sink(Ty::Bool, cond, locals, "while condition")?;
@@ -658,7 +675,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                             "interp.array_position_unsupported: exposure of Boolean array `{array}`; Boolean arrays are safe owned locals only"
                         ));
                     }
-                    Some(Ty::Array(ref element, _)) if matches!(**element, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_))) =>
+                    Some(ref found) if matches!(found.as_array(), Some((Ty::Int(integer), _)) if !matches!(integer, IntTy::TParam(_))) =>
                         {}
                     _ => {
                         return Err(format!(
@@ -769,11 +786,7 @@ fn validate_affine_option_initializer(
             if matches!(inner.kind, ExprKind::AllocArray { elem: Ty::Bool, .. }) =>
         {
             validate_interp_expr(inner, locals)?;
-            require_cached_type(
-                inner,
-                Ty::array(Ty::Bool, Mutability::Owned),
-                "affine option payload",
-            )
+            require_cached_type(inner, Ty::array(Ty::Bool), "affine option payload")
         }
         _ => Err(format!(
             "interp.affine_option_initializer: affine option local `{name}` must be initialized with `none` or `some(alloc_array<bool>(...))`"
@@ -805,18 +818,19 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             let array_ty = interp_local_ty(locals, array).ok_or_else(|| {
                 format!("interp.unknown_local: index names unknown array `{array}`")
             })?;
-            let Ty::Array(payload, _) = array_ty else {
+            let Some((payload, _)) = array_ty.as_array() else {
                 return Err(format!(
                     "interp.not_array: indexed local `{array}` is not an array"
                 ));
             };
+            let payload = payload.clone();
             validate_interp_sink(Ty::Int(IntTy::U64), index, locals, "array index")?;
             validate_interp_array_payload(&payload, &format!("indexed array `{array}`"))?;
-            require_cached_type(expr, *payload, "array index result")?;
+            require_cached_type(expr, payload, "array index result")?;
         }
         ExprKind::AllocArray { elem, len, init } => {
             validate_interp_array_payload(elem, "alloc_array")?;
-            let expected = Ty::Array(Box::new(elem.clone()), Mutability::Owned);
+            let expected = Ty::Array(Box::new(elem.clone()));
             require_cached_type(expr, expected, "alloc_array result")?;
             validate_interp_sink(Ty::Int(IntTy::U64), len, locals, "alloc_array length")?;
             validate_interp_sink(elem.clone(), init, locals, "alloc_array initializer")?;
@@ -945,11 +959,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                     "interp.affine_option_immutable: `.take` needs mutable local `{option}`"
                 ));
             }
-            require_cached_type(
-                expr,
-                Ty::array(Ty::Bool, Mutability::Owned),
-                "affine option take result",
-            )?;
+            require_cached_type(expr, Ty::array(Ty::Bool), "affine option take result")?;
         }
         ExprKind::Binary { op, lhs, rhs, .. } => match op {
             BinOp::And | BinOp::Or => {
@@ -997,7 +1007,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             reject_bool_array_result(expr, "method result")?;
         }
         ExprKind::ArrayLit(elements) => {
-            let Some(Ty::Array(ref payload, Mutability::Owned)) = expr.ty else {
+            let Some(Ty::Array(ref payload)) = expr.ty else {
                 return Err(
                     "interp.array_literal_type: array literal must have an owned array annotation"
                         .into(),
@@ -1055,7 +1065,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             }
         }
         ExprKind::Len { array } => {
-            if !matches!(interp_local_ty(locals, array), Some(Ty::Array(..))) {
+            if interp_local_ty(locals, array).is_none_or(|ty| ty.as_array().is_none()) {
                 return Err(format!(
                     "interp.unknown_local: length names unknown or non-array local `{array}`"
                 ));
@@ -1085,7 +1095,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                     "interp.affine_option_position_unsupported: affine option `{array}` cannot be borrowed"
                 ));
             }
-            if interp_local_ty(locals, array) == Some(Ty::array(Ty::Bool, Mutability::Owned)) {
+            if interp_local_ty(locals, array) == Some(Ty::array(Ty::Bool)) {
                 return Err(format!(
                     "interp.array_position_unsupported: borrow of Boolean array `{array}`; Boolean arrays are owned locals only"
                 ));
@@ -1154,18 +1164,21 @@ fn semantic_interp_ty(expr: &Expr, locals: &InterpLocals) -> Result<Ty, String> 
             format!("interp.unknown_local: expression names unknown local `{name}`")
         }),
         ExprKind::Index { array, .. } => match interp_local_ty(locals, array) {
-            Some(Ty::Array(payload, _)) => {
+            Some(ref found) if found.as_array().is_some() => {
+                let payload = found
+                    .as_array()
+                    .expect("the arm's guard already matched this shape")
+                    .0
+                    .clone();
                 validate_interp_array_payload(&payload, &format!("indexed local `{array}`"))?;
-                Ok(*payload)
+                Ok(payload)
             }
             _ => Err(format!(
                 "interp.not_array: indexed local `{array}` is not an array"
             )),
         },
         ExprKind::Len { .. } => Ok(Ty::Int(IntTy::U64)),
-        ExprKind::AllocArray { elem, .. } => {
-            Ok(Ty::Array(Box::new(elem.clone()), Mutability::Owned))
-        }
+        ExprKind::AllocArray { elem, .. } => Ok(Ty::Array(Box::new(elem.clone()))),
         ExprKind::ArrayLit(_) => expr
             .ty
             .clone()
@@ -1280,11 +1293,8 @@ fn reject_bool_array_result(expr: &Expr, context: &str) -> Result<(), String> {
 /// though no backend ABI receives it.
 fn has_resource_shadow(ty: Ty) -> bool {
     matches!(
-        ty,
-        Ty::Res(ResKind::ResourceMapPointsToU64)
-            | Ty::ResRef(ResKind::ResourceMapPointsToU64, _)
-            | Ty::Res(ResKind::ResourceMapPointsToRecord(_))
-            | Ty::ResRef(ResKind::ResourceMapPointsToRecord(_), _)
+        ty.res_kind(),
+        Some(ResKind::ResourceMapPointsToU64) | Some(ResKind::ResourceMapPointsToRecord(_))
     )
 }
 
@@ -1794,7 +1804,7 @@ impl<'a> Interp<'a> {
             .zip(args)
         {
             match (&v, p.ty.clone()) {
-                (RtVal::Arr(a), Ty::Array(_, Mutability::Mut)) => {
+                (RtVal::Arr(a), ty) if ty.is_unique_borrow() => {
                     if let Some(snapshot) = a.borrow().to_spec() {
                         frame.olds.insert(p.name.clone(), SpecVal::Arr(snapshot));
                     }
@@ -1802,7 +1812,7 @@ impl<'a> Interp<'a> {
                 // `&mut C`: the borrow shares storage with the caller, so
                 // the bare name reads the current state and `old p` needs
                 // the value it had at entry. `spec_of` copies.
-                (obj @ RtVal::Obj { .. }, Ty::ClassRef(_, Mutability::Mut)) => {
+                (obj @ RtVal::Obj { .. }, ty) if ty.is_unique_borrow() => {
                     if let Some(sv) = spec_of(obj) {
                         frame.olds.insert(p.name.clone(), sv);
                     }
@@ -1854,7 +1864,12 @@ impl<'a> Interp<'a> {
     /// in which case its place is already empty.
     fn drop_owned_params(&mut self, params: &[Param], frame: &mut Frame) -> IResult<()> {
         for p in params.iter().rev() {
-            if matches!(p.ty, Ty::Class(_) | Ty::Array(_, Mutability::Owned)) {
+            // Bare constructors only. A borrow's runtime value is the same
+            // `Rc` the caller holds (`ExprKind::Borrow` clones the handle),
+            // so a rule that looked through `Ty::Borrow` here would free the
+            // caller's storage. `Ty::Borrow` being a separate constructor is
+            // what makes that unwritable rather than merely unwritten.
+            if matches!(p.ty, Ty::Class(_) | Ty::Array(_)) {
                 self.drop_place(&RtPlace::Local(p.name.clone()), frame)?;
             }
         }
@@ -2625,7 +2640,7 @@ impl<'a> Interp<'a> {
         };
         for (p, v) in ifn.params.iter().zip(args) {
             match (&v, p.ty.clone()) {
-                (obj @ RtVal::Obj { .. }, Ty::ClassRef(_, Mutability::Mut)) => {
+                (obj @ RtVal::Obj { .. }, ty) if ty.is_unique_borrow() => {
                     if let Some(sv) = spec_of(obj) {
                         frame.olds.insert(p.name.clone(), sv);
                     }
@@ -2701,7 +2716,7 @@ impl<'a> Interp<'a> {
             match (&v, p.ty.clone()) {
                 // `&mut C`: the borrow shares storage with the caller, so
                 // `old p` needs the value it had at entry. `spec_of` copies.
-                (obj @ RtVal::Obj { .. }, Ty::ClassRef(_, Mutability::Mut)) => {
+                (obj @ RtVal::Obj { .. }, ty) if ty.is_unique_borrow() => {
                     if let Some(sv) = spec_of(obj) {
                         frame.olds.insert(p.name.clone(), sv);
                     }
@@ -3537,7 +3552,7 @@ impl<'a> Interp<'a> {
                 _ => unreachable!("checked: option construction"),
             },
             ExprKind::ArrayLit(elems) => {
-                let Some(Ty::Array(ref payload, Mutability::Owned)) = e.ty else {
+                let Some(Ty::Array(ref payload)) = e.ty else {
                     unreachable!("checked: owned array literal type")
                 };
                 let mut values = Vec::with_capacity(elems.len());
@@ -4086,7 +4101,7 @@ mod payload_guard_tests {
                     mutable: true,
                 },
                 Stmt::Decl {
-                    ty: Ty::array(Ty::Bool, Mutability::Owned),
+                    ty: Ty::array(Ty::Bool),
                     name: "pending".into(),
                     name_span: span,
                     init: Some(affine_take("pending")),
@@ -4218,7 +4233,7 @@ mod payload_guard_tests {
     }
 
     fn bool_array_decl(name: &str) -> Stmt {
-        let ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let ty = Ty::array(Ty::Bool);
         Stmt::Decl {
             ty: ty.clone(),
             name: name.into(),
@@ -4262,12 +4277,12 @@ mod payload_guard_tests {
                 option: name.into(),
                 option_span: Span::new(0, 0),
             },
-            Some(Ty::array(Ty::Bool, Mutability::Owned)),
+            Some(Ty::array(Ty::Bool)),
         )
     }
 
     fn affine_some_decl(name: &str) -> Stmt {
-        let array_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let array_ty = Ty::array(Ty::Bool);
         Stmt::Decl {
             ty: affine_bool_option(),
             name: name.into(),
@@ -4428,7 +4443,7 @@ mod payload_guard_tests {
         )]));
         let read = expr(
             ExprKind::Var("values".into()),
-            Some(Ty::array(Ty::Int(IntTy::U64), Mutability::Owned)),
+            Some(Ty::array(Ty::Int(IntTy::U64))),
         );
 
         let value = with_empty_interpreter(|interpreter| {
@@ -4557,7 +4572,7 @@ mod payload_guard_tests {
             "subject",
             Ty::Unit,
             vec![Stmt::Decl {
-                ty: Ty::array(Ty::Bool, Mutability::Owned),
+                ty: Ty::array(Ty::Bool),
                 name: "flags".into(),
                 name_span: Span::new(0, 0),
                 init: Some(expr(
@@ -4566,7 +4581,7 @@ mod payload_guard_tests {
                         len: Box::new(int_lit(0)),
                         init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
                     },
-                    Some(Ty::array(Ty::Bool, Mutability::Owned)),
+                    Some(Ty::array(Ty::Bool)),
                 )),
                 mutable: true,
             }],
@@ -4575,8 +4590,8 @@ mod payload_guard_tests {
         validate_interp_program(&program)
             .expect("owned local Boolean arrays have interpreter semantics");
         for ty in [
-            Ty::array(Ty::Bool, Mutability::Shared),
-            Ty::array(Ty::Bool, Mutability::Mut),
+            Ty::array_ref(Ty::Bool, Mutability::Shared),
+            Ty::array_ref(Ty::Bool, Mutability::Mut),
         ] {
             assert!(
                 validate_interp_ty(ty, "Boolean array borrow")
@@ -4585,12 +4600,9 @@ mod payload_guard_tests {
             );
         }
         assert!(
-            validate_interp_nonlocal_option_position(
-                Ty::array(Ty::Bool, Mutability::Owned),
-                "parameter `flags`",
-            )
-            .unwrap_err()
-            .starts_with("interp.array_position_unsupported:")
+            validate_interp_nonlocal_option_position(Ty::array(Ty::Bool), "parameter `flags`",)
+                .unwrap_err()
+                .starts_with("interp.array_position_unsupported:")
         );
     }
 
@@ -4676,14 +4688,14 @@ mod payload_guard_tests {
                 len: Box::new(int_lit(1)),
                 init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
             },
-            Some(Ty::array(Ty::Bool, Mutability::Owned)),
+            Some(Ty::array(Ty::Bool)),
         );
         let mut program = empty_program();
         program.fns.push(function(
             "subject",
             Ty::Unit,
             vec![Stmt::Decl {
-                ty: Ty::array(Ty::Bool, Mutability::Owned),
+                ty: Ty::array(Ty::Bool),
                 name: "values".into(),
                 name_span: Span::new(0, 0),
                 init: Some(allocation),
@@ -4710,12 +4722,12 @@ mod payload_guard_tests {
             Ty::Unit,
             vec![
                 Stmt::Decl {
-                    ty: Ty::array(Ty::Bool, Mutability::Owned),
+                    ty: Ty::array(Ty::Bool),
                     name: "values".into(),
                     name_span: Span::new(0, 0),
                     init: Some(expr(
                         ExprKind::ArrayLit(vec![expr(ExprKind::BoolLit(true), Some(Ty::Bool))]),
-                        Some(Ty::array(Ty::Bool, Mutability::Owned)),
+                        Some(Ty::array(Ty::Bool)),
                     )),
                     mutable: false,
                 },
@@ -4728,7 +4740,7 @@ mod payload_guard_tests {
 
     #[test]
     fn boolean_array_literal_allocation_index_store_and_snapshots_are_typed() {
-        let bool_ty = Ty::array(Ty::Bool, Mutability::Owned);
+        let bool_ty = Ty::array(Ty::Bool);
         let literal = expr(
             ExprKind::ArrayLit(vec![
                 expr(ExprKind::BoolLit(true), Some(Ty::Bool)),
@@ -4787,7 +4799,7 @@ mod payload_guard_tests {
 
     #[test]
     fn boolean_array_guard_rejects_forged_payloads_indices_stores_and_transports() {
-        let bool_array = Ty::array(Ty::Bool, Mutability::Owned);
+        let bool_array = Ty::array(Ty::Bool);
         let bad_alloc = expr(
             ExprKind::AllocArray {
                 elem: Ty::Bool,
@@ -4804,7 +4816,7 @@ mod payload_guard_tests {
                 len: Box::new(int_lit(1)),
                 init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
             },
-            Some(Ty::array(Ty::Int(IntTy::U8), Mutability::Owned)),
+            Some(Ty::array(Ty::Int(IntTy::U8))),
         );
         assert!(validate_interp_expr(&bad_outer, &HashMap::new()).is_err());
 
@@ -4848,7 +4860,7 @@ mod payload_guard_tests {
 
     #[test]
     fn boolean_array_guard_rejects_object_option_and_scalar_operator_laundering() {
-        let bool_array = Ty::array(Ty::Bool, Mutability::Owned);
+        let bool_array = Ty::array(Ty::Bool);
         let locals = HashMap::from([("flags".into(), local(bool_array.clone()))]);
         let span = Span::new(0, 0);
         let receiver_uses = [
@@ -4981,8 +4993,8 @@ mod payload_guard_tests {
     #[test]
     fn boolean_array_guard_rejects_scalar_statement_sinks() {
         let span = Span::new(0, 0);
-        let bool_array = Ty::array(Ty::Bool, Mutability::Owned);
-        let int_array = Ty::array(Ty::Int(IntTy::U8), Mutability::Owned);
+        let bool_array = Ty::array(Ty::Bool);
+        let int_array = Ty::array(Ty::Int(IntTy::U8));
         let bool_var = || expr(ExprKind::Var("bits".into()), Some(bool_array.clone()));
         let byte = || expr(ExprKind::IntLit(1), Some(Ty::Int(IntTy::U8)));
         let base = HashMap::from([

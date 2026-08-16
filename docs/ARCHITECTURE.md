@@ -307,10 +307,39 @@ foreign, or cross-module array ABI.
   shapes its lowering has a representation for, so a spelling the table admits
   can never reach an unhandled case. Since ADR 0064 that constraint has force
   only where the lowering narrows to something other than `Ty` — `lower_int_ty`,
-  the borrow rebinding, `lower_raw_type`, and `lower_res_kind`. For every
-  position that lowers to a plain `Ty` the row would restate the table it is
-  checking; what a container payload may be is decided by the checker's payload
-  gates and pinned by `docs/shape-admission.md`.
+  `lower_raw_type`, and `lower_res_kind`. For every position that lowers to a
+  plain `Ty` the row would restate the table it is checking; what a container
+  payload may be is decided by the checker's payload gates and pinned by
+  `docs/shape-admission.md`. `BorrowParam` is in that second group since ADR
+  0067: `Ty::Borrow` holds every referent, so which referents a borrow may name
+  is a rule — stated by the `BorrowParam` row and again by
+  `check::parameter_ty`, both under `type.borrow_param_unsupported`.
+
+- **One borrow constructor; ownership is structural** (ADR 0067). `&T` and
+  `&mut T` are `Ty::Borrow(Mutability, Box<Ty>)` for every referent, and a bare
+  type owns. No constructor carries both a shape and a binding mode: `Ty::Array`
+  holds only its element, and `resource &K` is a borrow of `Ty::Res(K)` that
+  keeps its own syntactic shape because the spelling puts the marker after the
+  keyword. `Mutability` has two cases, `Shared` and `Mut`, because owning is the
+  absence of a borrow; a rule that needs the three-way answer asks
+  `Ty::binding_mode()`, which computes it.
+
+  `Ty::is_affine` is then structural: a class, a resource, and an array own, an
+  option owns exactly when its payload does, and `Ty::Borrow` is a **terminal**
+  `false` — never `referent.is_affine()`, which would move a borrow's place into
+  the moved set and hand the runtime's owned-storage cleanup the caller's
+  buffer. `interp::drop_owned_params` matches the bare constructors for the same
+  reason: a borrow's runtime value is the same `Rc` the caller holds, so
+  `Ty::Borrow` being a separate constructor is what makes the double free
+  unwritable rather than merely unwritten.
+
+  Three named accessors carry what used to be pattern-matching on a constructor:
+  `Ty::binding_mode` (owned / shared / unique), `Ty::as_unique_borrow` (the one
+  question the `old` snapshots, the loop havoc, and the call-site havoc all
+  ask), and `Ty::referent` (what a borrow names, for the stages whose answer
+  does not depend on binding mode — `lean_ty` is one, so `&[T]`, `&mut [T]`, and
+  `[T]` are all one `Sable.Seq T`). The LLVM *IR type* is blind to mutability
+  too; the mangled symbol is not, and `type_code` is where that lives.
 
 - **Generic widening starts fail closed.** G0 is complete as a representation,
   parser, identity, and rejection foundation. `GenericTy` and its opaque

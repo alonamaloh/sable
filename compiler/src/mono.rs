@@ -501,18 +501,16 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, representation),
             Ty::Int(integer) => legacy_integer(integer, arity, span, representation, false),
-            Ty::Array(element, _) | Ty::Option(element) => {
+            Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
                 value(*element, arity, span, representation)
             }
             Ty::Raw(integer) => legacy_integer(integer, arity, span, representation, true),
             Ty::Bool
             | Ty::Class(_)
-            | Ty::ClassRef(..)
             | Ty::Record(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
             | Ty::RawRecord(_)
-            | Ty::ResRef(..)
             | Ty::Unit => Ok(()),
         }
     }
@@ -521,8 +519,11 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, "type"),
             Ty::Int(integer) => legacy_integer(integer, arity, span, "value type", false),
-            Ty::Array(element, _) => value(*element, arity, span, "array element type"),
+            Ty::Array(element) => value(*element, arity, span, "array element type"),
             Ty::Option(element) => value(*element, arity, span, "option payload type"),
+            // A borrow is checked as whatever it names, so `&[T]` reports the
+            // array element position the reader wrote.
+            Ty::Borrow(_, referent) => checked_ty(*referent, arity, span),
             // Raw pointer element types and conversion targets still use the
             // legacy IntTy-shaped syntax in G1.0, so a bounded TParam is the
             // canonical representation in those positions.
@@ -531,12 +532,10 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
             }
             Ty::Bool
             | Ty::Class(_)
-            | Ty::ClassRef(..)
             | Ty::Record(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
             | Ty::RawRecord(_)
-            | Ty::ResRef(..)
             | Ty::Unit => Ok(()),
         }
     }
@@ -939,16 +938,16 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter) => Err(escaped(span, parameter, representation)),
             Ty::Int(integer_ty) => integer(integer_ty, span, representation),
-            Ty::Array(element, _) | Ty::Option(element) => value(*element, span, representation),
+            Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
+                value(*element, span, representation)
+            }
             Ty::Raw(integer_ty) => integer(integer_ty, span, representation),
             Ty::Bool
             | Ty::Class(_)
-            | Ty::ClassRef(..)
             | Ty::Record(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
             | Ty::RawRecord(_)
-            | Ty::ResRef(..)
             | Ty::Unit => Ok(()),
         }
     }
@@ -957,17 +956,16 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter) => Err(escaped(span, parameter, "type")),
             Ty::Int(integer_ty) => integer(integer_ty, span, "integer type"),
-            Ty::Array(element, _) => value(*element, span, "array element type"),
+            Ty::Array(element) => value(*element, span, "array element type"),
             Ty::Option(element) => value(*element, span, "option payload type"),
+            Ty::Borrow(_, referent) => checked_ty(*referent, span),
             Ty::Raw(integer_ty) => integer(integer_ty, span, "raw-pointer element type"),
             Ty::Bool
             | Ty::Class(_)
-            | Ty::ClassRef(..)
             | Ty::Record(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
             | Ty::RawRecord(_)
-            | Ty::ResRef(..)
             | Ty::Unit => Ok(()),
         }
     }
@@ -2074,18 +2072,18 @@ pub(crate) fn subst_ty(t: &mut Ty, args: &[IntTy], span: Span) -> MResult<()> {
     match t {
         Ty::Param(parameter) => *t = Ty::Int(type_argument(args, parameter.index(), span)?),
         Ty::Int(integer) => subst_intty(integer, args, span)?,
-        Ty::Array(element, _) | Ty::Option(element) => subst_ty(element, args, span)?,
+        Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
+            subst_ty(element, args, span)?
+        }
         // A `raw<...>` element type is a width, and its parameter spelling is
         // canonical there rather than substituted.
         Ty::Raw(_)
         | Ty::Bool
         | Ty::Class(_)
-        | Ty::ClassRef(..)
         | Ty::Record(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
         | Ty::RawRecord(_)
-        | Ty::ResRef(..)
         | Ty::Unit => {}
     }
     Ok(())
@@ -2340,7 +2338,7 @@ mod tests {
     fn a_parameter_without_an_argument_is_a_named_diagnostic() {
         let parameter = TypeParamId::new(3).expect("index 3 is within the parameter ceiling");
         let span = Span::new(7, 11);
-        let mut ty = Ty::array(Ty::Param(parameter), Mutability::Owned);
+        let mut ty = Ty::array(Ty::Param(parameter));
         let diagnostic = subst_ty(&mut ty, &[IntTy::U32], span)
             .expect_err("parameter #3 has no argument in a one-argument instantiation");
         assert_eq!(diagnostic.name, "internal.mono.type_arg_arity");
@@ -2364,14 +2362,13 @@ mod tests {
     #[test]
     fn substitution_never_deepens_a_checked_type() {
         let parameter = TypeParamId::new(0).expect("index 0 is within the parameter ceiling");
-        let owned = Mutability::Owned;
         for original in [
             Ty::Param(parameter),
             Ty::Int(IntTy::TParam(0)),
-            Ty::array(Ty::Param(parameter), owned),
+            Ty::array(Ty::Param(parameter)),
             Ty::option(Ty::Param(parameter)),
             Ty::affine_array_option(Ty::Param(parameter)),
-            Ty::array(Ty::array(Ty::Param(parameter), owned), owned),
+            Ty::array(Ty::array(Ty::Param(parameter))),
         ] {
             let mut substituted = original.clone();
             subst_ty(&mut substituted, &[IntTy::U32], Span::new(0, 0))
@@ -3109,7 +3106,7 @@ fn root() -> option<u16> {
         else {
             panic!("expected instantiated array declaration");
         };
-        assert_eq!(*ty, Ty::array(Ty::Int(IntTy::U16), Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Int(IntTy::U16)));
         let ExprKind::AllocArray { elem, .. } = &initializer.kind else {
             panic!("expected instantiated allocation");
         };
@@ -3214,7 +3211,7 @@ fn root(i32 value) -> i32 {
         let Stmt::Decl { ty, .. } = &mut noncanonical_array.fns[0].body[0] else {
             panic!("expected array declaration");
         };
-        *ty = Ty::array(Ty::Int(IntTy::TParam(0)), Mutability::Owned);
+        *ty = Ty::array(Ty::Int(IntTy::TParam(0)));
         let error = monomorphize(&mut noncanonical_array)
             .expect_err("legacy parameter in a value type must not escape");
         assert_eq!(error.name, "mono.type_param_out_of_bounds");

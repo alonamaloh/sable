@@ -732,7 +732,10 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      parameters now use `Ty::Param(TypeParamId)`, and aggregate payloads carried
      a narrowed `ValueTy` until ADR 0064 made them full `Ty` values gated per
      stage; since ADR 0066 each of those gates answers yes or a named error and
-     nothing else, and a caller uses the payload it already holds. This was an
+     nothing else, and a caller uses the payload it already holds. ADR 0067
+     lifted binding mode out of the shape constructors: `&T`/`&mut T` are one
+     `Ty::Borrow`, a bare type owns, and `Ty::is_affine` reads ownership off
+     the shape. This was an
      internal separation of concerns, not a usable Boolean/POD feature: parser
      and checker acceptance was not widened, and concrete Boolean/record arrays
      and options remained fail-closed. Mono validates every declaration

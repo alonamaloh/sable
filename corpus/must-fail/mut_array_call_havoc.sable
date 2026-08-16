@@ -1,0 +1,22 @@
+// expect-error: relies_on_stale.post.xs_get_0_1
+// A `&mut [T]` argument names storage the callee writes, so after the call
+// the caller knows only what the callee's `post` says — and it says it about
+// a *fresh* array state, not the one the caller handed over.
+//
+// Without that fresh state the callee's post would be asserted over the
+// pre-call array, contradicting this function's own `pre` about the same
+// term. An inconsistent hypothesis set proves anything, so the false
+// postcondition below would go green and the loss would be silent. It is
+// here so the loss is loud instead.
+
+/// pre  xs.len ≥ 1
+/// post xs.get 0 = 9
+fn set_first(&mut [u32] xs) {
+    xs[0] = 9;
+}
+
+/// pre  xs.len ≥ 1 ∧ xs.get 0 = 1
+/// post xs.get 0 = 1
+fn relies_on_stale(&mut [u32] xs) {
+    set_first(&mut xs);
+}

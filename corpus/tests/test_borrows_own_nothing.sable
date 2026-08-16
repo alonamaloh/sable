@@ -1,0 +1,59 @@
+// A borrow is a second name for storage the caller keeps, so it owns
+// nothing: passing one hands nothing over, and the callee destroys nothing
+// it was lent. `corpus/tests/test_ownership.sable` is the other half — it
+// shows that a value which *is* handed over dies exactly once.
+//
+// Every subject here fails if a rule reads a borrow as its referent. The
+// checker would call the second lend a use-after-move; the interpreter
+// would run `Token`'s destructor on storage the caller still names, and
+// the third lend would then trap on the invariant the first drop
+// falsified.
+
+use ownership;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+// A shared class borrow: the callee reads through the caller's object.
+fn glance(&Token t) -> u64 {
+    return t.v;
+}
+
+// A shared array borrow: the callee reads through the caller's storage.
+fn first(&[u32] xs) -> u32 {
+    return xs[0];
+}
+
+// A unique array borrow: the callee writes through it and hands it back.
+fn bump(&mut [u32] xs) {
+    xs[0] = xs[0] + 1;
+}
+
+// Lending a class three times is three borrows and no transfer. The token
+// is destroyed once, at the end of this scope.
+fn test_lending_a_class_transfers_nothing() {
+    var t = Token::make();
+    expect_eq(glance(&t), 1);
+    expect_eq(glance(&t), 1);
+    expect_eq(glance(&t), 1);
+}
+
+// Reading through a shared array borrow leaves the array where it was.
+fn test_lending_an_array_transfers_nothing() {
+    mut [u32] xs = alloc_array<u32>(2, 4);
+    u32 a = first(&xs);
+    u32 b = first(&xs);
+    /// assert #[label(shared_borrow_reads_agree)] a = 4 ∧ b = 4
+    /// assert #[label(shared_borrow_leaves_the_array)] xs.get 0 = 4
+}
+
+// A unique borrow writes through the caller's storage and is not consumed
+// by having been passed, so two calls compose.
+fn test_unique_borrow_writes_through_and_composes() {
+    mut [u32] xs = alloc_array<u32>(2, 0);
+    bump(&mut xs);
+    bump(&mut xs);
+    /// assert #[label(unique_borrow_writes_through)] xs.get 0 = 2
+    /// assert #[label(unique_borrow_leaves_the_rest)] xs.get 1 = 0
+}

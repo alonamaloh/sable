@@ -1669,27 +1669,25 @@ impl<'a> Parser<'a> {
                 referent,
             } => {
                 self.check_admits(TypeShape::Borrow, pos, syntax.span)?;
-                match self.lower_type(referent, TyPos::BorrowParam)? {
-                    // `&Nat` (ADR 0010) / `&mut Nat` (ADR 0023).
-                    Ty::Class(class) => Ok(Ty::ClassRef(class, *mutability)),
-                    Ty::Array(element, _) => Ok(Ty::Array(element, *mutability)),
-                    other => Err(self.unrepresentable(&other, TyPos::BorrowParam, referent.span)),
-                }
+                // `&Nat` (ADR 0010) / `&mut Nat` (ADR 0023), `&[T]`/`&mut [T]`.
+                // The referent lowers at its own position and is wrapped
+                // unchanged: which referents may be borrowed is
+                // `Parser::admits`'s `BorrowParam` row, not a question of
+                // which referents the representation can wrap.
+                let referent = self.lower_type(referent, TyPos::BorrowParam)?;
+                Ok(Ty::borrow(*mutability, referent))
             }
             TypeSyntaxKind::Resource { borrow, kind } => {
                 self.check_admits(TypeShape::Resource, pos, syntax.span)?;
                 let kind = self.lower_res_kind(kind)?;
                 Ok(match borrow {
-                    Some(mutability) => Ty::ResRef(kind, *mutability),
+                    Some(mutability) => Ty::borrow(*mutability, Ty::Res(kind)),
                     None => Ty::Res(kind),
                 })
             }
             TypeSyntaxKind::Array(element) => {
                 self.check_admits(TypeShape::Array, pos, syntax.span)?;
-                Ok(Ty::Array(
-                    Box::new(self.lower_type(element, TyPos::ArrayElement)?),
-                    Mutability::Owned,
-                ))
+                Ok(Ty::array(self.lower_type(element, TyPos::ArrayElement)?))
             }
             TypeSyntaxKind::Named {
                 name,
@@ -3477,7 +3475,7 @@ impl<'a> Parser<'a> {
     /// whether definite initialization may supply the value later.
     fn local_decl_stmt(&mut self) -> PResult<Stmt> {
         let (ty, ty_span) = self.ty(TyPos::Local)?;
-        if let Ty::ResRef(..) = ty {
+        if ty.as_res_borrow().is_some() {
             return Err(Diagnostic {
                 name: "resource.borrow_local".into(),
                 title: "a resource borrow cannot be a local".into(),
@@ -3578,7 +3576,7 @@ impl<'a> Parser<'a> {
                         })
                         .collect();
                     self.pending.push(Stmt::Decl {
-                        ty: Ty::array(Ty::Int(IntTy::U8), Mutability::Owned),
+                        ty: Ty::array(Ty::Int(IntTy::U8)),
                         name: temp.clone(),
                         name_span: lit_span,
                         init: Some(Expr {
@@ -5216,7 +5214,7 @@ fn plumbing<T>(&[T] input, T value) -> option<T> {
 
         assert_eq!(
             function.params[0].ty,
-            Ty::array(Ty::Param(parameter), Mutability::Shared)
+            Ty::array_ref(Ty::Param(parameter), Mutability::Shared)
         );
         assert_eq!(function.params[1].ty, Ty::Param(parameter));
         assert_eq!(function.ret, Ty::option(Ty::Param(parameter)));
@@ -5229,7 +5227,7 @@ fn plumbing<T>(&[T] input, T value) -> option<T> {
         else {
             panic!("expected the owned array declaration");
         };
-        assert_eq!(*ty, Ty::array(Ty::Param(parameter), Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Param(parameter)));
         let ExprKind::AllocArray { elem, .. } = &initializer.kind else {
             panic!("expected alloc_array initializer");
         };
@@ -5342,7 +5340,7 @@ fn consume(u64 count) {
         else {
             panic!("expected the owned array declaration");
         };
-        assert_eq!(*ty, Ty::array(Ty::Bool, Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Bool));
         let ExprKind::OptTake {
             option,
             option_span,
@@ -5409,7 +5407,7 @@ fn surface(&[bool] input) {
         let function = &program.fns[0];
         assert_eq!(
             function.params[0].ty,
-            Ty::array(Ty::Bool, Mutability::Shared)
+            Ty::array_ref(Ty::Bool, Mutability::Shared)
         );
 
         let Stmt::Decl {
@@ -5421,7 +5419,7 @@ fn surface(&[bool] input) {
         else {
             panic!("expected an explicit Boolean-array local");
         };
-        assert_eq!(*ty, Ty::array(Ty::Bool, Mutability::Owned));
+        assert_eq!(*ty, Ty::array(Ty::Bool));
         assert!(*mutable);
         assert!(matches!(&initializer.kind, ExprKind::ArrayLit(_)));
 
@@ -5591,9 +5589,6 @@ mod type_position_tests {
                     | TyPos::CastTarget
                     | TyPos::TraitImplTarget
                     | TyPos::ResourceMapKey => matches!(shape, S::Int | S::Param),
-                    // The borrow lowering rebinds the referent's mutability,
-                    // which only a class reference and an array carry.
-                    TyPos::BorrowParam => matches!(shape, S::Class | S::Array),
                     // `lower_raw_type` and `lower_res_kind` decide which
                     // spellings of these shapes exist, and both answer with a
                     // diagnostic rather than a representation.
@@ -5601,7 +5596,17 @@ mod type_position_tests {
                         matches!(shape, S::Int | S::Param | S::Record)
                     }
                     // The rest lower to `Ty`, which holds every shape.
-                    TyPos::Param
+                    //
+                    // `BorrowParam` belongs here: `Ty::Borrow` holds every
+                    // referent, so which referents a borrow may name is a
+                    // rule rather than a property of the representation, and
+                    // it is stated twice — by this table's `BorrowParam` row
+                    // and by `check::parameter_ty`, both under
+                    // `type.borrow_param_unsupported`. What pins that set is
+                    // `docs/shape-admission.md`, which has a row for every
+                    // referent, rather than this test.
+                    TyPos::BorrowParam
+                    | TyPos::Param
                     | TyPos::Return
                     | TyPos::Local
                     | TyPos::RecordField
