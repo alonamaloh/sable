@@ -1402,12 +1402,6 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 } else {
                     validate_aggregate_ty(ty.clone(), *name_span)?;
                 }
-                if matches!(
-                    ty.as_array(),
-                    Some((&Ty::Bool, BindingMode::Shared | BindingMode::Mut))
-                ) {
-                    return Err(bool_array_borrow(*name_span));
-                }
                 if *ty == Ty::array(Ty::Bool) && init.is_none() {
                     return Err(Diagnostic {
                         name: "type.bool_array_initializer".into(),
@@ -1988,6 +1982,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     }
                     None => check_expr(ctx, init, None)?,
                 };
+                local_ty(&t, init.span)?;
                 // A declaration takes the value like any other sink, and
                 // is not an escape: the new local inherits the brand
                 // rather than laundering it — which only works if the
@@ -2571,21 +2566,6 @@ fn noncanonical_aggregate_payload(span: Span) -> Diagnostic {
     }
 }
 
-fn bool_array_borrow(span: Span) -> Diagnostic {
-    Diagnostic {
-        name: "type.bool_array_borrow".into(),
-        title: "Boolean arrays cannot be borrowed yet".into(),
-        span,
-        label: "use this `[bool]` through its owned local name".into(),
-        notes: vec![(
-            "note".into(),
-            "an owned Boolean array supports local indexing, length, and stores; borrowed \
-             transport stays closed until every backend models it"
-                .into(),
-        )],
-    }
-}
-
 /// May a value of this type be an array element.
 ///
 /// This is a *gate*, not a traversal: an allow-list ending in a named
@@ -2809,21 +2789,6 @@ pub(crate) fn record_field_layout(ty: &Ty, field: &str, span: Span) -> CResult<S
     })
 }
 
-fn bool_array_parameter(span: Span) -> Diagnostic {
-    Diagnostic {
-        name: "type.bool_array_param".into(),
-        title: "Boolean arrays cannot cross a call boundary yet".into(),
-        span,
-        label: "keep `[bool]` as an owned local; borrowed Boolean arrays are deferred".into(),
-        notes: vec![(
-            "note".into(),
-            "an owned Boolean array has local proof and execution semantics only; parameter \
-             transport must land together in every backend"
-                .into(),
-        )],
-    }
-}
-
 /// What a borrow may name.
 ///
 /// A gate: an allow-list ending in a named refusal, and it never calls
@@ -2869,12 +2834,42 @@ fn borrow_referent_ty(borrowed: &Ty, referent: &Ty, span: Span) -> CResult<()> {
 /// decides what the type may contain, and these refusals decide what the call
 /// boundary may transport, which is a separate question with a separate
 /// answer for the same type.
+/// The rule for a local binding's type.
+///
+/// A borrow is an argument form and a parameter binding mode; it is not a
+/// local binding (ADR 0072). Every stage that reasons about borrowed storage
+/// — the symbolic environment, the call-site and loop-head havoc, the `old`
+/// snapshots, the ownership `Place`s — keys that storage by the *name* it
+/// arrives under, and each such name is assumed to be the only one. A borrow
+/// local is a second name for storage that already has one: the two entries
+/// then carry independent state and both are believed, which is a false
+/// contract with a proof behind it.
+///
+/// The rule is keyed on the binding mode, not on the referent, so it holds
+/// for an array of any payload, a class, a class field, a resource, and any
+/// reborrow of those. `Ty::binding_mode` is the whole test.
+pub(crate) fn local_ty(ty: &Ty, span: Span) -> CResult<()> {
+    if ty.binding_mode() == BindingMode::Owned {
+        return Ok(());
+    }
+    Err(Diagnostic {
+        name: "type.borrow_local_unsupported".into(),
+        title: "a borrow cannot be bound to a local".into(),
+        span,
+        label: "this is a borrow, not a value".into(),
+        notes: vec![(
+            "note".into(),
+            "write the borrow where it is used — `f(&mut a)` at the call — and read or \
+             write the storage through the name that owns it, `a[i]` and `a.len`; the \
+             compiler tracks storage by that one name (ADR 0072)"
+                .into(),
+        )],
+    })
+}
+
 pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "parameter"));
-    }
-    if ty.is_array_of(&Ty::Bool) {
-        return Err(bool_array_parameter(span));
     }
     // Before the payload traversal: what a borrow may name is a question
     // about the borrow, and reporting an inner payload rule for `&record`
@@ -2997,14 +2992,17 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 )],
             });
         }
-        if let Some(parameter) = method
-            .params
-            .iter()
-            .find(|parameter| matches!(parameter.ty, Ty::Bool | Ty::Record(_)))
-        {
+        // An abstract trait call evaluates each argument as an integer proof
+        // value, so a parameter whose value is not one has no meaning at the
+        // call. An array is included in any binding mode: `&[T]` lifts to a
+        // `Sable.Seq T`, which is exactly what the abstract call cannot pass.
+        if let Some(parameter) = method.params.iter().find(|parameter| {
+            matches!(parameter.ty, Ty::Bool | Ty::Record(_)) || parameter.ty.as_array().is_some()
+        }) {
             return Err(Diagnostic {
                 name: "type.trait_param_unsupported".into(),
-                title: "trait calls do not transport Boolean or POD-record parameters".into(),
+                title: "trait calls do not transport Boolean, POD-record, or array parameters"
+                    .into(),
                 span: parameter.span,
                 label: format!(
                     "`{}` is not supported in a trait method parameter",
@@ -3012,8 +3010,9 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                 ),
                 notes: vec![(
                     "note".into(),
-                    "ordinary functions may transport Boolean and POD-record values, but \
-                     retained trait calls do not yet model those value kinds"
+                    "ordinary functions may transport Boolean, POD-record, and borrowed-array \
+                     values, but a retained trait call substitutes integer arguments into an \
+                     abstract contract and has no model for these"
                         .into(),
                 )],
             });
@@ -4836,7 +4835,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     )),
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
-                    Ty::Array(elem) if elem.as_ref() == &Ty::Bool => Err(bool_array_borrow(span)),
                     Ty::Array(elem) => Ok(Ty::borrow(Mutability::Shared, Ty::Array(elem.clone()))),
                     _ => Err(Diagnostic {
                         name: "type.not_a_place".into(),
@@ -4942,9 +4940,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
             }
             let elem = array_elem_ty(ctx, array, span)?;
-            if elem == Ty::Bool {
-                return Err(bool_array_borrow(span));
-            }
             let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty.clone()) {
                 Some(ty) if ty.as_array().is_some() => ty.binding_mode(),
                 _ => unreachable!("array_elem_ty checked"),
@@ -6803,37 +6798,65 @@ class Twin {
         assert_eq!(error.name, "array.use_after_move");
     }
 
+    /// A borrowed Boolean array is an ordinary parameter, and every boundary
+    /// that still refuses it refuses `&[u64]` for the same reason — the rule
+    /// is about the boundary, not about the payload.
     #[test]
-    fn bool_array_call_boundaries_are_rejected_before_member_or_abi_lowering() {
-        let sources = [
-            "fn bad(&[bool] values) {}\n",
-            r#"
+    fn a_borrowed_bool_array_is_a_parameter_and_closed_boundaries_say_why() {
+        let mut ordinary = monomorphized_program("fn ok(&[bool] values) {}\n");
+        check(&mut ordinary).expect("a borrowed Boolean array is an ordinary parameter");
+
+        let boundaries = [
+            (
+                r#"
 class Holder {
     init new() {}
 
     fn bad(&self, &[bool] values) {}
 }
 "#,
-            r#"
+                "type.member_param",
+            ),
+            (
+                r#"
 trait Bad {
     fn bad(Self value, &[bool] values);
 }
 "#,
-            r#"
+                "type.trait_param_unsupported",
+            ),
+            (
+                r#"
 extern "C" #[audit(id := "test.bool-array.v1", reason := "boundary stays closed")]
 fn bad(&[bool] values);
 "#,
+                "extern.param_abi",
+            ),
         ];
 
-        for source in sources {
+        for (source, expected) in boundaries {
             let mut program = monomorphized_program(source);
             let error = check_error(&mut program);
-            assert_eq!(error.name, "type.bool_array_param");
+            assert_eq!(error.name, expected);
         }
+
+        // The trait rule is about the abstract call, not the payload: an
+        // integer array has no substitution into a trait contract either.
+        let mut integer_trait = monomorphized_program(
+            r#"
+trait Bad {
+    fn bad(Self value, &[u64] values);
+}
+"#,
+        );
+        assert_eq!(
+            check_error(&mut integer_trait).name,
+            "type.trait_param_unsupported"
+        );
     }
 
     #[test]
-    fn bool_array_fields_borrows_exposure_and_returns_stay_closed() {
+    fn bool_array_fields_exposure_and_returns_stay_closed() {
         let mut field = monomorphized_program(
             r#"
 class Holder {
@@ -6846,16 +6869,6 @@ class Holder {
 "#,
         );
         assert_eq!(check_error(&mut field).name, "type.bool_array_field");
-
-        let mut borrowed = monomorphized_program(
-            r#"
-fn bad() {
-    [bool] flags = [true];
-    var view = &flags;
-}
-"#,
-        );
-        assert_eq!(check_error(&mut borrowed).name, "type.bool_array_borrow");
 
         let mut exposed = monomorphized_program(
             r#"
@@ -6874,16 +6887,6 @@ fn bad() {
 
     #[test]
     fn synthetic_bool_array_positions_fail_closed() {
-        let mut borrowed_local = monomorphized_program("fn bad() { [bool] flags = [true]; }\n");
-        let Stmt::Decl { ty, .. } = &mut borrowed_local.fns[0].body[0] else {
-            panic!("expected the explicit array local");
-        };
-        *ty = Ty::array_ref(Ty::Bool, Mutability::Shared);
-        assert_eq!(
-            check_error(&mut borrowed_local).name,
-            "type.bool_array_borrow"
-        );
-
         let mut record = monomorphized_program(
             r#"
 record Flag #[layout(size := 1, align := 1)] {
@@ -6893,13 +6896,6 @@ record Flag #[layout(size := 1, align := 1)] {
         );
         record.records[0].fields[0].ty = Ty::array(Ty::Bool);
         assert_eq!(check_error(&mut record).name, "record.field_type");
-
-        let mut owned_parameter = monomorphized_program("fn bad(u8 value) {}\n");
-        owned_parameter.fns[0].params[0].ty = Ty::array(Ty::Bool);
-        assert_eq!(
-            check_error(&mut owned_parameter).name,
-            "type.bool_array_param"
-        );
 
         let mut uninitialized = monomorphized_program("fn test_bad() { [bool] flags = [true]; }\n");
         let Stmt::Decl { init, .. } = &mut uninitialized.fns[0].body[0] else {

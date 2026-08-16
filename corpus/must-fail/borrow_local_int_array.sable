@@ -1,0 +1,11 @@
+// expect-error: type.borrow_local_unsupported
+// The rule is keyed on the binding mode, not on what the borrow names, so an
+// integer array reaches it exactly as a Boolean one does. A refusal that held
+// for one payload and not another is the arrangement this replaces.
+
+fn borrow_local() -> u32 {
+    mut [u32] a = alloc_array<u32>(3, 0);
+    var view = &mut a;
+    view[0] = 7;
+    return a[0];
+}

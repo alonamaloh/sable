@@ -1,0 +1,13 @@
+// expect-error: type.borrow_local_unsupported
+// A borrow is an argument form and a parameter binding mode, not a local
+// binding (ADR 0072). `view` would be a second name for storage `a` already
+// names, and every stage that reasons about that storage — the symbolic
+// environment, the loop and call-site havoc, the ownership places — keys it
+// by one name. Write `f(&mut a)` at the call and `a[i]` here.
+
+fn borrow_local() -> bool {
+    mut [bool] a = alloc_array<bool>(3, false);
+    var view = &mut a;
+    view[0] = true;
+    return a[0];
+}

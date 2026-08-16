@@ -1516,8 +1516,8 @@ impl<'a> Parser<'a> {
         use TyPos as P;
         use TypeShape as S;
         match pos {
-            // `type.option_param`, `type.bool_array_param`, and the
-            // affine-option boundary decide the rest.
+            // `type.option_param` and the affine-option boundary decide the
+            // rest.
             P::Param => matches!(
                 shape,
                 S::Int

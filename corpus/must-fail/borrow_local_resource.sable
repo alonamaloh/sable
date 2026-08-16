@@ -1,0 +1,13 @@
+// expect-error: type.borrow_local_unsupported
+// A resource borrow is a borrow too, and the view is what all the logic
+// sees: binding `&mut m` would give the authority a second name whose view
+// stops tracking the one the raw operations transform.
+
+/// pre  a.len ≥ 1
+/// post a.get 0 = 9
+fn borrow_local(&mut [u8] a) {
+    unsafe expose &mut a as (p, resource m) {
+        var r = &mut m;
+        raw_store8(p, 9, &mut r);
+    }
+}

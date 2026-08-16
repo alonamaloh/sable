@@ -1,9 +1,12 @@
 /-
 SVM: operational semantics for a core Sable subset (design §10, ADR 0005).
 
-The scope is deliberately partial — classes, borrows as distinct values,
-function calls, ghost state, and the heap are scoped out with notes; the
-findings the first draft forced are resolved in ADR 0005 and design §10.
+The scope is deliberately partial — classes, ghost state, and the safe
+heap are scoped out with notes; the findings the first draft forced are
+resolved in ADR 0005 and design §10. A borrow is not a value here: a
+unique one is an argument form (`Arg.lend`, ADR 0069) whose exit value
+returns to the caller's local when the frame pops, and a shared one is
+the value it names.
 
 Shape:
 
@@ -484,6 +487,39 @@ inductive Expr where
   | optValue (e : Expr)
   | recordField (record : Expr) (field : String)
 
+/-- A call argument. `byValue` transports whatever its expression
+produces. `lend` is the machine's **unique borrow**: it names a caller
+local, and the callee's exit value for the parameter that receives it
+returns to that local when the frame pops.
+
+Both forms supply the same entry value — `Arg.toExpr` says so — because a
+borrow is a second name for storage, not a second kind of value. What
+lending adds is only where the value goes back.
+
+Copying in and copying out is faithful precisely because a unique borrow
+is exclusive: while the callee runs, no other name reaches that storage,
+so no observer can distinguish a cell written through from one restored
+at the return. A shared borrow therefore needs no constructor at all —
+its whole promise is that the callee does not write, and `byValue` is
+exactly that promise. -/
+inductive Arg where
+  | byValue (e : Expr)
+  | lend    (x : String)
+
+/-- The entry value of an argument: lending a local is reading it. -/
+def Arg.toExpr : Arg → Expr
+  | .byValue e => e
+  | .lend x => .var x
+
+/-- Pair each lent argument with the parameter that receives it: the
+callee's exit value for `p` returns to the caller's `x`. Positional like
+`Env.bind`, and a length mismatch is checker duty — every rule that uses
+this has already checked arity. -/
+def Arg.loans : List String → List Arg → List (String × String)
+  | p :: ps, .lend x :: as => (p, x) :: Arg.loans ps as
+  | _ :: ps, _ :: as => Arg.loans ps as
+  | _, _ => []
+
 /-- Statements. `while` carries no invariant/variant: loop annotations
 are ghost and erased (§4); the machine runs the loop, the verifier proves
 it. `check` is the compiled form of `defer P` (§9): evaluate the
@@ -508,7 +544,7 @@ inductive Stmt where
   | while  (c : Expr) (body : List Stmt)
   | ret    (e : Expr)
   | check  (name : String) (c : Expr)
-  | call   (dst : Option String) (f : String) (args : List Expr)
+  | call   (dst : Option String) (f : String) (args : List Arg)
   /-- `dst = alloc(size)` — a fresh root allocation of `size`
   uninitialized bytes, and a pointer to its start. Provenance comes from
   a deterministic counter, so a released id is never handed out twice. -/
@@ -577,6 +613,21 @@ def Env.bindDst (ρ : Env) (dst : Option String) (v : Val) : Env :=
   match dst with
   | some x => ρ.update x v
   | none => ρ
+
+/-- Return each lent parameter's exit value to the caller's local
+(`Arg.lend`). The callee's frame is discarded at the same transition, so
+this is the whole trace a unique borrow leaves in the machine.
+
+A parameter is bound when the frame is entered and every statement that
+touches it leaves it bound, so `none` is unreachable; leaving the caller's
+own binding in place is the total answer that invents no value. -/
+def Env.restore (caller : Env) (loans : List (String × String)) (callee : Env) : Env :=
+  match loans with
+  | [] => caller
+  | (p, x) :: rest =>
+      (match callee p with
+       | some v => caller.update x v
+       | none => caller).restore rest callee
 
 /-! ## Programs
 
@@ -994,12 +1045,14 @@ inductive EvalArgs (cap : Int) (ρ : Env) : List Expr → AOut → Prop where
 
 /-! ## Configurations and the small-step relation -/
 
-/-- A suspended caller: where the result goes, what runs next, and the
-caller's locals. -/
+/-- A suspended caller: where the result goes, what runs next, the
+caller's locals, and where this call's lent arguments return to
+(`Arg.loans`). -/
 structure Frame where
   dst : Option String
   k   : List Stmt
   ρ   : Env
+  loans : List (String × String)
 
 /-- A configuration: either running (a continuation of statements, the
 current frame's locals, the stack of suspended callers, and the raw
@@ -1036,11 +1089,15 @@ Normative decisions (ADR 0005):
 - `call`: callee looked up first (an unknown callee is `undef` before
   any argument runs), then arguments left-to-right, then the arity
   check (a mismatch is checker duty, hence `undef`); the callee starts
-  from an empty frame with only its parameters bound.
-- `ret` in a callee pops the caller's frame and binds the destination;
-  at the bottom of the stack it is the program's answer. Falling off
-  the end of a body returns `unit` the same two ways (procedures are
-  blessed, cf. `swap` §5).
+  from an empty frame with only its parameters bound. A lent argument
+  (`Arg.lend`) enters as the value of the local it names and is recorded
+  in the frame as a loan.
+- `ret` in a callee returns its loans to the caller's locals, pops the
+  caller's frame, and binds the destination; at the bottom of the stack
+  it is the program's answer. Falling off the end of a body returns
+  `unit` the same two ways (procedures are blessed, cf. `swap` §5), and
+  returns its loans the same way — a `&mut` parameter is written through
+  by a procedure at least as often as by a function.
 -/
 inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
   | assign_ok {ρ : Env} {x : String} {e : Expr} {v : Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
@@ -1174,28 +1231,30 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
       (h : Eval cap ρ c (.abort a)) :
       Step P cap (.run (.check name c :: k) ρ σ μ) a.toConfig
   -- calls (A-normal, ADR 0005): lookup, then arguments, then arity
-  | call_undef_fn {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+  | call_undef_fn {ρ : Env} {dst : Option String} {f : String} {args : List Arg} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (hf : P f = none) :
       Step P cap (.run (.call dst f args :: k) ρ σ μ) .undef
-  | call_abort {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hf : P f = some fd) (ha : EvalArgs cap ρ args (.abort a)) :
+  | call_abort {ρ : Env} {dst : Option String} {f : String} {args : List Arg} {fd : FnDef} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hf : P f = some fd) (ha : EvalArgs cap ρ (args.map Arg.toExpr) (.abort a)) :
       Step P cap (.run (.call dst f args :: k) ρ σ μ) a.toConfig
-  | call_undef_arity {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hf : P f = some fd) (ha : EvalArgs cap ρ args (.ok vs))
+  | call_undef_arity {ρ : Env} {dst : Option String} {f : String} {args : List Arg} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hf : P f = some fd) (ha : EvalArgs cap ρ (args.map Arg.toExpr) (.ok vs))
       (hn : fd.params.length ≠ vs.length) :
       Step P cap (.run (.call dst f args :: k) ρ σ μ) .undef
-  | call_enter {ρ : Env} {dst : Option String} {f : String} {args : List Expr} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
-      (hf : P f = some fd) (ha : EvalArgs cap ρ args (.ok vs))
+  | call_enter {ρ : Env} {dst : Option String} {f : String} {args : List Arg} {fd : FnDef} {vs : List Val} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hf : P f = some fd) (ha : EvalArgs cap ρ (args.map Arg.toExpr) (.ok vs))
       (hn : fd.params.length = vs.length) :
       Step P cap (.run (.call dst f args :: k) ρ σ μ)
-        (.run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ) μ)
+        (.run fd.body (Env.empty.bind fd.params vs)
+          (⟨dst, k, ρ, Arg.loans fd.params args⟩ :: σ) μ)
   -- returns: pop a caller, or answer the program
   | ret_ok {ρ : Env} {e : Expr} {v : Val} {k : List Stmt} {μ : RawHeap}
       (h : Eval cap ρ e (.ok v)) :
       Step P cap (.run (.ret e :: k) ρ [] μ) (.done v)
   | ret_pop {ρ : Env} {e : Expr} {v : Val} {k : List Stmt} {fr : Frame} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.ok v)) :
-      Step P cap (.run (.ret e :: k) ρ (fr :: σ) μ) (.run fr.k (fr.ρ.bindDst fr.dst v) σ μ)
+      Step P cap (.run (.ret e :: k) ρ (fr :: σ) μ)
+        (.run fr.k ((fr.ρ.restore fr.loans ρ).bindDst fr.dst v) σ μ)
   | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
       Step P cap (.run (.ret e :: k) ρ σ μ) a.toConfig
@@ -1555,7 +1614,8 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
   | nil_ret {ρ : Env} {μ : RawHeap} :
       Step P cap (.run [] ρ [] μ) (.done .unit)
   | nil_pop {ρ : Env} {fr : Frame} {σ : List Frame} {μ : RawHeap} :
-      Step P cap (.run [] ρ (fr :: σ) μ) (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ μ)
+      Step P cap (.run [] ρ (fr :: σ) μ)
+        (.run fr.k ((fr.ρ.restore fr.loans ρ).bindDst fr.dst .unit) σ μ)
 
 /-- Reflexive-transitive closure of `Step`. -/
 inductive Steps (P : Prog) (cap : Int) : Config → Config → Prop where
@@ -1666,7 +1726,7 @@ example : ReachesUndef P₀ 1000 [.ret (.var "x")] ρ₀ :=
 return through the frame, resume the caller. -/
 example :
     Returns (Prog.ofList [("id", ⟨["a"], [.ret (.var "a")]⟩)]) 1000
-      [.call (some "x") "id" [.intLit .i32 41],
+      [.call (some "x") "id" [.byValue (.intLit .i32 41)],
        .ret (.arith .add .i32 (.var "x") (.intLit .i32 1))]
       ρ₀ (.int 42) := by
   have hf : Prog.ofList [("id", ⟨["a"], [.ret (.var "a")]⟩)] "id"
@@ -1675,7 +1735,8 @@ example :
     .cons_ok (.intLit (by decide)) .nil
   have ha : (Env.empty.bind ["a"] [.int 41]) "a" = some (.int 41) := by
     simp [Env.bind, Env.update]
-  have hx : (ρ₀.bindDst (some "x") (.int 41)) "x" = some (.int 41) := by
+  have hx : ((ρ₀.restore [] (Env.empty.bind ["a"] [.int 41])).bindDst (some "x")
+      (.int 41)) "x" = some (.int 41) := by
     simp [Env.bindDst, Env.update]
   refine .head (.call_enter hf hargs rfl) (.head (.ret_pop (.var ha)) (.head (.ret_ok ?_) .refl))
   exact .arith_ok (.var hx) (.intLit (by decide)) (by decide)

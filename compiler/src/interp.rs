@@ -383,10 +383,15 @@ fn validate_interp_nonlocal_option_position(ty: Ty, context: &str) -> Result<(),
              ordinary options are supported only as returns and locals"
         ));
     }
-    if ty.is_array_of(&Ty::Bool) {
+    // Only an *owner* is position-restricted. A borrowed Boolean array is a
+    // second name for storage its caller keeps, so it is a parameter exactly
+    // as `&[T]` is: `ExprKind::Borrow` hands the callee the same `Rc`, and
+    // `drop_owned_params` matches the bare constructors, so nothing here
+    // acquires an owner.
+    if ty.is_owned_array_of(&Ty::Bool) {
         return Err(format!(
-            "interp.array_position_unsupported: {context} is a Boolean array; \
-             Boolean arrays are supported only as owned locals"
+            "interp.array_position_unsupported: {context} is an owned Boolean array; \
+             an owned Boolean array is a local value"
         ));
     }
     validate_interp_ty(ty, context)
@@ -410,19 +415,12 @@ pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
             ty.name()
         ));
     }
-    // A Boolean array is an owned local and nothing else: the interpreter
-    // has no transport for a borrowed one.
-    if let Some((element, mode)) = ty.as_array() {
-        if element == &Ty::Bool {
-            return match mode {
-                BindingMode::Owned => Ok(()),
-                BindingMode::Shared | BindingMode::Mut => Err(format!(
-                    "interp.array_position_unsupported: {context} is a borrowed Boolean array; \
-                     Boolean arrays are supported only as owned locals"
-                )),
-            };
-        }
-    }
+    // A Boolean array has no clause of its own here, in either binding mode:
+    // the runtime array carries its payload tag beside its elements, so
+    // `.len`, an index read, and an element store are one implementation over
+    // the tag, and `Ty::Bool` is an ordinary array payload below. Which
+    // positions may *hold* one is decided above and by the checker.
+    //
     // A borrow carries no payload of its own, so what is gated is the
     // referent's.
     validate_interp_container_payloads(ty.referent().clone(), context)
@@ -546,11 +544,11 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
             }
             Stmt::ExprStmt(value) => {
                 validate_interp_expr(value, locals)?;
-                reject_bool_array_transport(value, locals, "expression statement")?;
+                reject_owned_bool_array_transport(value, locals, "expression statement")?;
             }
             Stmt::FieldAssign { value, .. } => {
                 validate_interp_expr(value, locals)?;
-                reject_bool_array_transport(value, locals, "field assignment")?;
+                reject_owned_bool_array_transport(value, locals, "field assignment")?;
             }
             Stmt::If {
                 cond,
@@ -578,7 +576,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                         );
                     }
                     validate_interp_expr(value, locals)?;
-                    reject_bool_array_transport(value, locals, "return")?;
+                    reject_owned_bool_array_transport(value, locals, "return")?;
                 }
             }
             Stmt::Assert(_) => {}
@@ -628,7 +626,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                     "array field store index",
                 )?;
                 validate_interp_expr(value, locals)?;
-                reject_bool_array_transport(value, locals, "array field store")?;
+                reject_owned_bool_array_transport(value, locals, "array field store")?;
             }
             Stmt::Store {
                 array,
@@ -798,7 +796,14 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
     if let Some(ty) = &expr.ty {
         validate_interp_ty(ty.clone(), "expression annotation")?;
     }
-    if expr.ty.as_ref().is_some_and(|ty| ty.is_array_of(&Ty::Bool))
+    // The producers of an *owner* are enumerated, because an owner has to
+    // come from somewhere the destruction rules know about. A borrowed
+    // Boolean array is not produced at all — it names storage that already
+    // exists — so it is no more restricted here than `&[T]` is.
+    if expr
+        .ty
+        .as_ref()
+        .is_some_and(|ty| ty.is_owned_array_of(&Ty::Bool))
         && !matches!(
             expr.kind,
             ExprKind::ArrayLit(_)
@@ -868,7 +873,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             }
             for arg in args {
                 validate_interp_expr(arg, locals)?;
-                reject_bool_array_transport(arg, locals, "call argument")?;
+                reject_owned_bool_array_transport(arg, locals, "call argument")?;
             }
             reject_bool_array_result(expr, "call result")?;
         }
@@ -939,7 +944,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                 );
             }
             validate_interp_expr(operand, locals)?;
-            reject_bool_array_transport(operand, locals, "option payload")?;
+            reject_owned_bool_array_transport(operand, locals, "option payload")?;
         }
         ExprKind::OptTake {
             option,
@@ -994,7 +999,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
         | ExprKind::RecordLit { args, .. } => {
             for arg in args {
                 validate_interp_expr(arg, locals)?;
-                reject_bool_array_transport(arg, locals, "operation argument")?;
+                reject_owned_bool_array_transport(arg, locals, "operation argument")?;
             }
             reject_bool_array_result(expr, "operation result")?;
         }
@@ -1002,7 +1007,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             reject_bool_array_named_receiver(recv, locals, "method receiver")?;
             for arg in args {
                 validate_interp_expr(arg, locals)?;
-                reject_bool_array_transport(arg, locals, "method argument")?;
+                reject_owned_bool_array_transport(arg, locals, "method argument")?;
             }
             reject_bool_array_result(expr, "method result")?;
         }
@@ -1093,11 +1098,6 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             if interp_local_ty(locals, array).is_some_and(|ty| ty.is_affine_option()) {
                 return Err(format!(
                     "interp.affine_option_position_unsupported: affine option `{array}` cannot be borrowed"
-                ));
-            }
-            if interp_local_ty(locals, array) == Some(Ty::array(Ty::Bool)) {
-                return Err(format!(
-                    "interp.array_position_unsupported: borrow of Boolean array `{array}`; Boolean arrays are owned locals only"
                 ));
             }
         }
@@ -1218,20 +1218,24 @@ fn validate_interp_sink(
             actual.name()
         ));
     }
-    if expected.is_array_of(&Ty::Bool)
+    if expected.is_owned_array_of(&Ty::Bool)
         && !matches!(
             expr.kind,
             ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } | ExprKind::OptTake { .. }
         )
     {
         return Err(format!(
-            "interp.array_position_unsupported: {context} receives a Boolean array through an unsupported transport; only owned literals and allocations are executable"
+            "interp.array_position_unsupported: {context} receives an owned Boolean array through an unsupported transport; only owned literals and allocations are executable"
         ));
     }
     Ok(())
 }
 
-fn reject_bool_array_transport(
+/// Reject an *owned* Boolean array crossing a boundary that would give a
+/// second place a claim on the same storage. Lending one is not that: a
+/// borrow hands over a name, and `drop_owned_params` destroys only the bare
+/// constructors, so `&[bool]` crosses a call boundary exactly as `&[T]` does.
+fn reject_owned_bool_array_transport(
     expr: &Expr,
     locals: &InterpLocals,
     context: &str,
@@ -1241,15 +1245,18 @@ fn reject_bool_array_transport(
     // needs to recognize Boolean-array transport, so do not demand unrelated
     // scalar/resource metadata here.  Named locals are resolved from the
     // active environment to prevent a forged cache from hiding an array.
-    let transports_bool_array = match &expr.kind {
+    let transports_owned_bool_array = match &expr.kind {
         ExprKind::Var(name) => {
-            interp_local_ty(locals, name).is_some_and(|ty| ty.is_array_of(&Ty::Bool))
+            interp_local_ty(locals, name).is_some_and(|ty| ty.is_owned_array_of(&Ty::Bool))
         }
-        _ => expr.ty.as_ref().is_some_and(|ty| ty.is_array_of(&Ty::Bool)),
+        _ => expr
+            .ty
+            .as_ref()
+            .is_some_and(|ty| ty.is_owned_array_of(&Ty::Bool)),
     };
-    if transports_bool_array {
+    if transports_owned_bool_array {
         return Err(format!(
-            "interp.array_position_unsupported: {context} transports a Boolean array; Boolean arrays are owned locals only"
+            "interp.array_position_unsupported: {context} transports an owned Boolean array; an owned Boolean array is a local value"
         ));
     }
     Ok(())
@@ -4565,8 +4572,14 @@ mod payload_guard_tests {
         }
     }
 
+    /// An owned Boolean array is a local value; a borrowed one is a second
+    /// name for a caller's storage and runs wherever `&[T]` runs. The
+    /// interpreter's array is payload-tagged and a borrow's value is the
+    /// caller's own `Rc`, so length, index, and store are one implementation
+    /// over the tag — which is why the mode, not the element type, is what
+    /// the position gate reads.
     #[test]
-    fn permits_owned_local_boolean_arrays_but_not_nonlocal_positions() {
+    fn an_owned_bool_array_is_a_local_value_and_a_borrowed_one_is_a_parameter() {
         let mut program = empty_program();
         program.fns.push(function(
             "subject",
@@ -4593,16 +4606,98 @@ mod payload_guard_tests {
             Ty::array_ref(Ty::Bool, Mutability::Shared),
             Ty::array_ref(Ty::Bool, Mutability::Mut),
         ] {
-            assert!(
-                validate_interp_ty(ty, "Boolean array borrow")
-                    .unwrap_err()
-                    .starts_with("interp.array_position_unsupported:")
-            );
+            validate_interp_ty(ty.clone(), "Boolean array borrow")
+                .expect("a borrowed Boolean array is an executable value");
+            validate_interp_nonlocal_option_position(ty, "parameter `m`")
+                .expect("a borrowed Boolean array is an ordinary parameter");
         }
         assert!(
             validate_interp_nonlocal_option_position(Ty::array(Ty::Bool), "parameter `flags`",)
                 .unwrap_err()
                 .starts_with("interp.array_position_unsupported:")
+        );
+    }
+
+    /// A `&mut [bool]` argument names the caller's storage, so the callee's
+    /// store is visible to the caller with no write-back step: the borrow
+    /// hands over the same handle, and the owner — not the callee — destroys
+    /// the array. Both halves are what makes lending a Boolean array
+    /// different from moving one.
+    #[test]
+    fn a_unique_bool_array_borrow_writes_through_to_its_owner() {
+        let bool_array = Ty::array(Ty::Bool);
+        let mut program = empty_program();
+
+        let mut writer = function(
+            "writer",
+            Ty::Unit,
+            vec![Stmt::Store {
+                array: "m".into(),
+                array_span: Span::new(0, 0),
+                index: int_lit(1),
+                value: expr(ExprKind::BoolLit(true), Some(Ty::Bool)),
+            }],
+        );
+        writer.params.push(Param {
+            name: "m".into(),
+            ty: Ty::array_ref(Ty::Bool, Mutability::Mut),
+            span: Span::new(0, 0),
+            consumes: false,
+        });
+        program.fns.push(writer);
+
+        program.fns.push(function(
+            "subject",
+            Ty::Bool,
+            vec![
+                Stmt::Decl {
+                    ty: bool_array.clone(),
+                    name: "flags".into(),
+                    name_span: Span::new(0, 0),
+                    init: Some(expr(
+                        ExprKind::AllocArray {
+                            elem: Ty::Bool,
+                            len: Box::new(int_lit(2)),
+                            init: Box::new(expr(ExprKind::BoolLit(false), Some(Ty::Bool))),
+                        },
+                        Some(bool_array.clone()),
+                    )),
+                    mutable: true,
+                },
+                Stmt::ExprStmt(expr(
+                    ExprKind::Call {
+                        callee: "writer".into(),
+                        callee_span: Span::new(0, 0),
+                        type_args: vec![],
+                        args: vec![expr(
+                            ExprKind::Borrow {
+                                array: "flags".into(),
+                                field: None,
+                                mutable: true,
+                            },
+                            Some(Ty::array_ref(Ty::Bool, Mutability::Mut)),
+                        )],
+                    },
+                    Some(Ty::Unit),
+                )),
+                Stmt::Return {
+                    value: Some(expr(
+                        ExprKind::Index {
+                            array: "flags".into(),
+                            array_span: Span::new(0, 0),
+                            index: Box::new(int_lit(1)),
+                        },
+                        Some(Ty::Bool),
+                    )),
+                    span: Span::new(0, 0),
+                },
+            ],
+        ));
+
+        let modules = crate::modules::ModuleSet::single("synthetic".into(), String::new());
+        assert!(
+            matches!(run_fn(&program, &modules, "subject"), Ok(RtVal::Bool(true))),
+            "a store through a unique borrow must be visible to the owner"
         );
     }
 
@@ -4986,7 +5081,7 @@ mod payload_guard_tests {
         let resource_locals =
             HashMap::from([("authority".into(), local(Ty::Res(ResKind::RawSpan)))]);
         let erased_place = expr(ExprKind::Var("authority".into()), None);
-        reject_bool_array_transport(&erased_place, &resource_locals, "sealed operand")
+        reject_owned_bool_array_transport(&erased_place, &resource_locals, "sealed operand")
             .expect("an intentionally unannotated resource place is not a Boolean array");
     }
 

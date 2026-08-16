@@ -391,7 +391,9 @@ declaration/scope cleanup across branches, loop iterations, and early returns.
 This does not define an array ABI. Owned-array parameters or returns,
 array-valued entries, fields, classes, methods, externs, public/cross-module
 transport, Boolean borrows, other integer widths, whole-array movement or
-rebinding, generic/option containment, and exposure remain rejected. Existing
+rebinding, generic/option containment, and exposure remain rejected. (ADR 0070
+supersedes the Boolean-borrow item: a borrowed Boolean array parameter is
+admitted, still without an array ABI.) Existing
 VC generation, interpreter semantics, and formal tagged integer-array values
 already cover the source behavior, so N0 changes no Lean proof model.
 

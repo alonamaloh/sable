@@ -1,0 +1,21 @@
+// expect-error: type.trait_param_unsupported
+// An abstract trait call substitutes integer arguments into the trait's
+// contract. A borrowed array is a `Sable.Seq T` value, which that
+// substitution has no way to carry, so the signature is refused where it is
+// written rather than at the call that would need the missing model.
+
+trait Sum {
+    /// post 0 ≤ result
+    fn total(Self seed, &[u64] xs) -> u64;
+}
+
+impl Sum for u64 {
+    fn total(u64 seed, &[u64] xs) -> u64 {
+        return seed + xs.len;
+    }
+}
+
+/// post 0 ≤ result
+fn use_sum<K: Sum>(K a, &[u64] xs) -> u64 {
+    return K::total(a, &xs);
+}

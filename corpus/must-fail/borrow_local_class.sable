@@ -1,0 +1,32 @@
+// expect-error: type.borrow_local_unsupported
+// A class borrow is a borrow. Mutating through `r` and reading through `c`
+// would be two independent symbolic states of one object.
+
+pub class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+
+    /// post result = self.n
+    fn get(&self) -> u64 {
+        return self.n;
+    }
+}
+
+fn borrow_local() -> u64 {
+    mut var c = Counter::zero();
+    var r = &mut c;
+    r.bump();
+    return c.get();
+}

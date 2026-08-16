@@ -790,7 +790,8 @@ theorem EOut.stepPtr_ok_of_ne {v : Val} (f : Int → Int → Config)
 `none` exactly on terminal configurations. -/
 def stepF (P : Prog) (cap : Int) : Config → Option Config
   | .run [] _ [] _ => some (.done .unit)
-  | .run [] _ (fr :: σ) μ => some (.run fr.k (fr.ρ.bindDst fr.dst .unit) σ μ)
+  | .run [] ρ (fr :: σ) μ =>
+      some (.run fr.k ((fr.ρ.restore fr.loans ρ).bindDst fr.dst .unit) σ μ)
   | .run (.assign x e :: k) ρ σ μ =>
       some (match evalE cap ρ e with
         | .ok v => .run k (ρ.update x v) σ μ
@@ -831,7 +832,7 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
         | .ok v =>
             match σ with
             | [] => .done v
-            | fr :: σ' => .run fr.k (fr.ρ.bindDst fr.dst v) σ' μ
+            | fr :: σ' => .run fr.k ((fr.ρ.restore fr.loans ρ).bindDst fr.dst v) σ' μ
         | .abort a => a.toConfig)
   | .run (.check name c :: k) ρ σ μ =>
       some ((evalE cap ρ c).stepBool fun b =>
@@ -840,11 +841,12 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
       some (match P f with
         | none => .undef
         | some fd =>
-            match evalArgs cap ρ args with
+            match evalArgs cap ρ (args.map Arg.toExpr) with
             | .abort a => a.toConfig
             | .ok vs =>
                 if fd.params.length = vs.length then
-                  .run fd.body (Env.empty.bind fd.params vs) (⟨dst, k, ρ⟩ :: σ) μ
+                  .run fd.body (Env.empty.bind fd.params vs)
+                    (⟨dst, k, ρ, Arg.loans fd.params args⟩ :: σ) μ
                 else .undef)
   | .run (.rawAlloc dst e :: k) ρ σ μ =>
       some ((evalE cap ρ e).stepInt fun n =>
@@ -1328,16 +1330,17 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           cases hf : P f with
           | none => exact .call_undef_fn hf
           | some fd =>
-              cases ha : evalArgs cap ρ args with
-              | abort a => exact .call_abort hf (ha ▸ evalArgs_evalArgs cap ρ args)
+              cases ha : evalArgs cap ρ (args.map Arg.toExpr) with
+              | abort a =>
+                  exact .call_abort hf (ha ▸ evalArgs_evalArgs cap ρ (args.map Arg.toExpr))
               | ok vs =>
                   by_cases hn : fd.params.length = vs.length
                   · simpa [hn] using
                       Step.call_enter (P := P) (k := k) (σ := σ) hf
-                        (ha ▸ evalArgs_evalArgs cap ρ args) hn
+                        (ha ▸ evalArgs_evalArgs cap ρ (args.map Arg.toExpr)) hn
                   · simpa [hn] using
                       Step.call_undef_arity (P := P) (k := k) (σ := σ) (dst := dst) hf
-                        (ha ▸ evalArgs_evalArgs cap ρ args) hn
+                        (ha ▸ evalArgs_evalArgs cap ρ (args.map Arg.toExpr)) hn
       | rawAlloc dst e =>
           simp only [stepF, Option.some.injEq] at h
           subst h

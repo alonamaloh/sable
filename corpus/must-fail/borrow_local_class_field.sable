@@ -1,0 +1,30 @@
+// expect-error: type.borrow_local_unsupported
+// `&b.cells` is a borrow of a field place. Binding it names the field's
+// storage a second time, and a `&mut self` method of `b` then writes the
+// first name while the second keeps the value it was bound to.
+
+pub class Buf {
+    [u32] cells;
+
+    /// invariant cells.len ≥ 1
+
+    /// pre  1 ≤ n
+    /// post self.cells.len = n
+    /// post self.cells.get 0 = 0
+    init filled(u64 n) {
+        self.cells = alloc_array<u32>(n, 0);
+    }
+
+    /// pre  self.cells.len ≥ 1
+    /// post self.cells.get 0 = 5
+    fn poke(&mut self) {
+        self.cells[0] = 5;
+    }
+}
+
+fn borrow_local() -> u32 {
+    mut var b = Buf::filled(3);
+    var cells = &b.cells;
+    b.poke();
+    return cells[0];
+}

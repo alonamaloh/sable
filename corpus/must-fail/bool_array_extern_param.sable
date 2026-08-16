@@ -1,5 +1,6 @@
-// expect-error: type.bool_array_param
-// The owned-local slice does not create a foreign Boolean-array ABI.
+// expect-error: extern.param_abi
+// A borrowed Boolean array is an ordinary call argument, not an ABI type:
+// nothing about `Sable.Seq Bool` fixes a foreign element encoding.
 
 extern "C" #[audit(id := "test.bool-array-param.v1", reason := "no Boolean-array ABI")]
 fn c_take_bool_array(&[bool] flags);

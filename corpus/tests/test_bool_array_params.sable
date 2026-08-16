@@ -1,0 +1,89 @@
+// A borrowed Boolean array at run time. `corpus/verifies/bool_array_params.sable`
+// proves the contracts; this file runs them.
+//
+// The point of a borrow is that it names storage someone else keeps, so the
+// two halves to observe dynamically are aliasing and ownership. A `&mut`
+// argument writes through to the caller's array; a `&` argument leaves it
+// alone; and a lent array is destroyed by its owner at the end of the owner's
+// scope, never by the callee — the same rule
+// `corpus/tests/test_borrows_own_nothing.sable` states for `[u32]`.
+//
+// Every clause here is monitored. The runtime array carries its Boolean
+// payload beside its elements, so a snapshot of it is an ordinary
+// specification value: `m.len`, `m.get k`, a bounded `∀`, and the entry
+// snapshot `old m` on a unique borrow all evaluate without a skip.
+
+use bool_array_params;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+// Reading through a shared borrow: the callee sees the caller's elements and
+// changes nothing. `count_true`'s own post (`result ≤ m.len`) and its loop
+// invariant are checked on each call.
+fn test_shared_borrow_reads_the_callers_elements() {
+    mut [bool] flags = [true, false, true, true];
+    expect_eq(count_true(&flags), 3);
+    flags[1] = true;
+    expect_eq(count_true(&flags), 4);
+    /// assert #[label(shared_borrow_leaves_the_array)] flags.len = 4 ∧ flags.get 0 = true
+}
+
+// A shared borrow lent on to a second callee is the same storage again, so
+// the reborrowed call agrees with the direct one.
+fn test_a_reborrow_names_the_same_storage() {
+    [bool] flags = [false, true, true];
+    expect_eq(count_if(&flags, true), 2);
+    expect_eq(count_if(&flags, false), 0);
+    /// assert #[label(reborrow_agrees)] flags.get 0 = false ∧ flags.get 1 = true
+}
+
+// A unique borrow writes through to the caller. `set_all`'s posts speak about
+// the sequence after the call and about `old m`'s length at entry; both are
+// evaluated against the snapshot the frame took when the call was made.
+fn test_unique_borrow_writes_through_to_the_caller() {
+    mut [bool] flags = alloc_array<bool>(3, false);
+    /// assert #[label(before_the_call)] flags.get 0 = false ∧ flags.get 2 = false
+    set_all(&mut flags);
+    /// assert #[label(writes_are_visible_to_the_caller)] flags.get 0 = true ∧ flags.get 1 = true ∧ flags.get 2 = true
+    /// assert #[label(length_is_preserved)] flags.len = 3
+    expect_eq(count_true(&flags), 3);
+}
+
+// Lending twice is not moving: the array is still the caller's after each
+// call, and `all_true` reads back what `set_all` wrote.
+fn test_lending_a_bool_array_transfers_nothing() {
+    mut [bool] flags = alloc_array<bool>(2, false);
+    set_all(&mut flags);
+    set_all(&mut flags);
+    bool every = all_true(&flags);
+    /// assert #[label(all_true_agrees_with_the_elements)] every = true ∧ flags.get 0 = true ∧ flags.get 1 = true
+}
+
+// `all_true` on an array with a false element: the post is an `↔`, so the
+// monitor checks the negative direction here.
+fn test_all_true_is_false_when_an_element_is() {
+    [bool] flags = [true, true, false];
+    bool every = all_true(&flags);
+    /// assert #[label(a_false_element_is_seen)] every = false
+}
+
+// An empty borrowed array keeps its Boolean payload, so `∀ k < 0` holds
+// vacuously and the count is zero.
+fn test_an_empty_borrowed_array_keeps_its_payload() {
+    mut [bool] empty = alloc_array<bool>(0, true);
+    expect_eq(count_true(&empty), 0);
+    set_all(&mut empty);
+    bool every = all_true(&empty);
+    /// assert #[label(empty_is_vacuously_all_true)] every = true ∧ empty.len = 0
+}
+
+// The owner lends a literal, and the whole round trip runs inside the
+// verified subject: `count_literal` borrows a local it owns, and
+// `set_then_check` hands a `&mut` on and reads the result back.
+fn test_an_owner_lends_and_still_owns() {
+    expect_eq(count_literal(), 3);
+    bool checked = set_then_check();
+    /// assert #[label(the_round_trip_reads_back_what_it_wrote)] checked = true
+}

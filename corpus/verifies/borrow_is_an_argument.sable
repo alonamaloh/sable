@@ -1,0 +1,116 @@
+// What to write instead of a borrow local (ADR 0072).
+//
+// A borrow names storage a second time. Every stage that reasons about that
+// storage — the symbolic environment, the call-site and loop-head havoc, the
+// `old` snapshots, the ownership places — keys it by the one name that owns
+// it, so a borrow gets a name only where the compiler already relates it to
+// that owner: at a call, as an argument, bound to a parameter for the length
+// of the call. `type.borrow_local_unsupported` refuses every other spelling,
+// and every refused program has a rewrite here.
+//
+// The two rewrites are the whole rule. Instead of naming the borrow and using
+// the name, either use the owner's own name, or write the borrow at the call.
+
+// Instead of `var view = &mut a; view[0] = true;` — write through `a`.
+/// post result
+pub fn store_through_the_owner() -> bool {
+    mut [bool] a = alloc_array<bool>(3, false);
+    a[0] = true;
+    return a[0];
+}
+
+/// pre  m.len ≥ 1
+/// post m.get 0 = true
+/// post m.len = (old m).len
+fn set_first(&mut [bool] m) {
+    m[0] = true;
+}
+
+/// pre  m.len ≥ 1
+/// post result = m.get 0
+fn first(&[bool] m) -> bool {
+    return m[0];
+}
+
+// Instead of `var view = &mut a; g(&mut view);` — write the borrow at the
+// call. The owner is `a` throughout, so the callee's post lands on the
+// sequence the caller goes on reading.
+/// post result
+pub fn lend_at_the_call() -> bool {
+    mut [bool] a = alloc_array<bool>(3, false);
+    set_first(&mut a);
+    return a[0];
+}
+
+// The same round trip read back through a second, shared lending. Both calls
+// name `a`, so both speak about one sequence — which is exactly the fact a
+// borrow local would have broken.
+/// post result
+pub fn lend_twice() -> bool {
+    mut [bool] a = alloc_array<bool>(2, false);
+    set_first(&mut a);
+    return first(&a);
+}
+
+// A reborrow is an argument too: `&mut m` inside a function whose parameter
+// is already `&mut [bool]` is admitted, because it is written at the call and
+// never bound to a name.
+/// pre  m.len ≥ 1
+/// post m.get 0 = true
+pub fn reborrow_at_the_call(&mut [bool] m) {
+    set_first(&mut m);
+}
+
+// The same two rewrites for an integer array: the rule is about the binding
+// mode, so what it refuses and what it leaves is payload-independent.
+/// pre  m.len ≥ 1
+/// post m.get 0 = 7
+fn set_first_u32(&mut [u32] m) {
+    m[0] = 7;
+}
+
+/// post result = 7
+pub fn lend_an_int_array() -> u32 {
+    mut [u32] a = alloc_array<u32>(3, 0);
+    set_first_u32(&mut a);
+    return a[0];
+}
+
+pub class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// post self.n = 0
+    init zero() {
+        self.n = 0;
+    }
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+
+    /// post result = self.n
+    fn get(&self) -> u64 {
+        return self.n;
+    }
+}
+
+/// pre  c.n < 99
+/// post c.n = old c.n + 2
+fn bump_twice(&mut Counter c) {
+    c.bump();
+    c.bump();
+}
+
+// Instead of `var r = &mut c; r.bump();` — call the method on `c`, and hand
+// `&mut c` to a function that needs unique access.
+/// post result = 3
+pub fn use_the_owner_of_a_class() -> u64 {
+    mut var c = Counter::zero();
+    c.bump();
+    bump_twice(&mut c);
+    return c.get();
+}

@@ -1,0 +1,11 @@
+// expect-error: type.borrow_local_unsupported
+// A shared borrow is refused for the same reason as a unique one: the second
+// name is the problem, not the direction of the writes. Here the owner is
+// what gets written and the stale second name is what gets read.
+
+fn borrow_local() -> bool {
+    mut [bool] a = alloc_array<bool>(3, false);
+    var view = &a;
+    a[0] = true;
+    return view[0];
+}

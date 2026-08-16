@@ -61,6 +61,11 @@ const CASES: &[Case] = &[
         entry: "u32_arrays_entry",
     },
     Case {
+        label: "bool-array-borrows",
+        source: "bool_array_borrows.sable",
+        entry: "bool_array_borrows_entry",
+    },
+    Case {
         label: "bignum-native",
         source: "../verifies/bignum_native.sable",
         entry: "bignum_native_entry",

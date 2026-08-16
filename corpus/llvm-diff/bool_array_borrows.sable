@@ -1,0 +1,136 @@
+// Native borrowed Boolean arrays.
+//
+// An owner already has a native descriptor and a lifetime; a borrowed `[u32]`
+// already has a calling convention. This subject is their intersection: a
+// borrow passes the same `{ ptr, i64 }` descriptor by value, so the callee's
+// element writes land in the caller's storage through the shared data
+// pointer, and no borrow ever reaches the free hook.
+//
+// The entry observes aliasing directly — the caller reads back what a callee
+// wrote through a `&mut` parameter — and the guarded helpers make the bounds
+// trap reachable through a borrow rather than through an owner.
+
+fn bool_shared_count(&[bool] flags) -> u64 {
+    mut u64 index = 0;
+    mut u64 count = 0;
+    /// invariant index ≤ flags.len
+    /// invariant count ≤ index
+    /// variant flags.len - index
+    while (index < flags.len) {
+        if (flags[index]) {
+            count = count + 1;
+        }
+        index = index + 1;
+    }
+    return count;
+}
+
+fn bool_set(&mut [bool] flags, u64 index) -> bool {
+    if (index >= flags.len) {
+        return false;
+    }
+    flags[index] = true;
+    return flags[index];
+}
+
+fn bool_clear(&mut [bool] flags, u64 index) -> bool {
+    if (index >= flags.len) {
+        return false;
+    }
+    flags[index] = false;
+    return !flags[index];
+}
+
+// A shared reborrow: the argument names the storage the parameter already
+// names, so the second callee reads the caller's elements.
+fn bool_count_if(&[bool] flags, bool enabled) -> u64 {
+    if (enabled) {
+        return bool_shared_count(&flags);
+    }
+    return 0;
+}
+
+// A unique reborrow handed on by name.
+fn bool_set_first_two(&mut [bool] flags) -> bool {
+    if (!bool_set(&mut flags, 0)) {
+        return false;
+    }
+    return bool_set(&mut flags, 1);
+}
+
+/// pre index < flags.len
+fn read_through_borrow(&[bool] flags, u64 index) -> bool {
+    return flags[index];
+}
+
+/// pre index < flags.len
+fn write_through_borrow(&mut [bool] flags, u64 index) -> bool {
+    flags[index] = true;
+    return flags[index];
+}
+
+/// pre index = 0
+fn bool_borrow_load_guard(u64 index) -> bool {
+    [bool] values = [true, false];
+    return read_through_borrow(&values, index);
+}
+
+/// pre index = 0
+fn bool_borrow_store_guard(u64 index) -> bool {
+    mut [bool] values = [false, true];
+    if (!write_through_borrow(&mut values, index)) {
+        return false;
+    }
+    return values[0];
+}
+
+fn bool_array_borrows_entry() -> i32 {
+    mut [bool] owned = alloc_array<bool>(4, false);
+    if (bool_shared_count(&owned) != 0) {
+        return 1;
+    }
+    if (!bool_set(&mut owned, 0)) {
+        return 2;
+    }
+    if (!bool_set(&mut owned, 3)) {
+        return 3;
+    }
+    // The callee wrote through the borrow; the owner reads it back.
+    if (bool_shared_count(&owned) != 2) {
+        return 4;
+    }
+    if (!owned[0] || owned[1] || !owned[3]) {
+        return 5;
+    }
+    if (!bool_set_first_two(&mut owned)) {
+        return 6;
+    }
+    if (bool_shared_count(&owned) != 3) {
+        return 7;
+    }
+    if (!bool_clear(&mut owned, 0)) {
+        return 8;
+    }
+    if (bool_count_if(&owned, true) != 2) {
+        return 9;
+    }
+    if (bool_count_if(&owned, false) != 0) {
+        return 10;
+    }
+
+    [bool] literal = [true, false, true];
+    if (bool_shared_count(&literal) != 2) {
+        return 11;
+    }
+
+    // A zero-length borrow carries the null/zero descriptor and still refuses
+    // every index.
+    mut [bool] empty = alloc_array<bool>(0, true);
+    if (bool_shared_count(&empty) != 0) {
+        return 12;
+    }
+    if (bool_set(&mut empty, 0)) {
+        return 13;
+    }
+    return 42;
+}

@@ -213,9 +213,12 @@ pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String
         return Err(affine_option_unsupported(ty.clone(), context));
     }
     validate_ty_payload(ty.clone(), context)?;
-    if bool_array_ty(ty) {
+    // The owner is what a call boundary may not carry: an array reaches a
+    // callee as `&[T]` or `&mut [T]`, which the machine transports as an
+    // argument value and, for a unique borrow, a loan returned at the pop.
+    if owned_bool_array_ty(ty) {
         return Err(format!(
-            "svm.bool_array_position_unsupported: {context} is Boolean-array-typed; Boolean arrays are owned locals only"
+            "svm.bool_array_position_unsupported: {context} owns a Boolean array; an array crosses a call boundary as a borrow"
         ));
     }
     if matches!(ty, Ty::Option(_)) {
@@ -634,12 +637,41 @@ fn semantic_expr_ty(
     let semantic = match &expr.kind {
         ExprKind::Var(name) => {
             let ty = ctx.initialized_local(name, context)?.ty;
-            if bool_array_ty(&ty.clone()) {
+            if owned_bool_array_ty(&ty.clone()) {
                 return Err(format!(
-                    "svm.bool_array_transport_unsupported: {context} moves Boolean array local `{name}`; Boolean arrays may only be accessed by index or length"
+                    "svm.bool_array_transport_unsupported: {context} moves Boolean array local `{name}`; an owner is accessed by index or length and lent by borrow"
                 ));
             }
             ty
+        }
+        // A borrow is a second name for storage its source keeps, so its type
+        // is the source's array under the requested mode. What the machine
+        // does with it is a call-boundary question, answered in `lower_call`.
+        ExprKind::Borrow {
+            array,
+            field: None,
+            mutable,
+        } if expr
+            .ty
+            .as_ref()
+            .is_some_and(|ty| ty.as_array_borrow().is_some()) =>
+        {
+            let (payload, mode, declared_mutable) = resolve_array(ctx, array, "array borrow")?;
+            if *mutable
+                && (mode == BindingMode::Shared
+                    || (mode == BindingMode::Owned && !declared_mutable))
+            {
+                return Err(format!(
+                    "svm.array_borrow_place: `&mut {array}` borrows non-writable `{}`",
+                    mode.bind(Ty::array(payload)).name()
+                ));
+            }
+            let requested = if *mutable {
+                Mutability::Mut
+            } else {
+                Mutability::Shared
+            };
+            Ty::borrow(requested, Ty::array(payload))
         }
         ExprKind::AllocArray { elem, .. } => Ty::Array(Box::new(elem.clone())),
         ExprKind::ArrayLit(_) => match &expr.ty {
@@ -860,9 +892,9 @@ fn validate_local_var(
     operation: &str,
 ) -> Result<LocalBinding, String> {
     let binding = ctx.initialized_local(name, operation)?;
-    if bool_array_ty(&binding.ty) {
+    if owned_bool_array_ty(&binding.ty) {
         return Err(format!(
-            "svm.bool_array_transport_unsupported: {operation} moves Boolean array local `{name}`; Boolean arrays may only be accessed by index or length"
+            "svm.bool_array_transport_unsupported: {operation} moves Boolean array local `{name}`; an owner is accessed by index or length and lent by borrow"
         ));
     }
     match &expr.ty {
@@ -1803,14 +1835,14 @@ fn validate_call_signature(
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
     if let Some(ty) = &expr.ty {
         validate_ty_payload(ty.clone(), "expression annotation")?;
-        if bool_array_ty(&ty.clone())
+        if owned_bool_array_ty(&ty.clone())
             && !matches!(
                 &expr.kind,
                 ExprKind::OptTake { .. } | ExprKind::OptValue { .. }
             )
         {
             return Err(
-                "svm.bool_array_position_unsupported: a Boolean-array-valued expression is only supported as the initializer of a fresh owned local"
+                "svm.bool_array_position_unsupported: an owned-Boolean-array expression is only supported as the initializer of a fresh owned local"
                     .into(),
             );
         }
@@ -2004,14 +2036,6 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         }
         ExprKind::Borrow { array, .. } => {
             reject_named_affine_option(ctx, array, "a borrow source")?;
-            if ctx
-                .local(array)
-                .is_some_and(|binding| bool_array_ty(&binding.ty))
-            {
-                return Err(format!(
-                    "svm.bool_array_borrow_unsupported: Boolean array local `{array}` cannot be borrowed or transported"
-                ));
-            }
         }
         ExprKind::SelfField { .. } | ExprKind::SelfFieldLen { .. } => {}
         ExprKind::ClassField { obj, .. } | ExprKind::ClassFieldLen { obj, .. } => {
@@ -2054,23 +2078,25 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
 }
 
 /// Lower any function to a `Prog.ofList` entry: `("name", ⟨[params],
-/// body⟩)`. Parameters must be machine values — borrows are outside the
-/// machine (arrays are owned values; `&mut` reflection back to the
-/// caller has no machine analog yet).
+/// body⟩)`. A parameter is either a machine value or a borrowed array —
+/// the machine binds the caller's sequence, and a unique borrow's exit
+/// value returns to the caller's local when the frame pops (`Arg.lend`).
+/// Resources, class receivers, and owned arrays stay outside.
 pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
     validate_program_option_positions(program)?;
     let mut validation_ctx = LowerCtx::for_function(program, f)?;
     validate_fn_payloads(&mut validation_ctx, f)?;
     let mut lowering_ctx = LowerCtx::for_function(program, f)?;
     for p in &f.params {
-        match p.ty {
+        match &p.ty {
             Ty::Int(_) | Ty::Bool => {}
             Ty::Record(ri) | Ty::RawRecord(ri) | Ty::OptionRaw(ri) => {
-                lowering_ctx.record(ri)?;
+                lowering_ctx.record(*ri)?;
             }
+            borrowed if borrowed.as_array_borrow().is_some() => {}
             _ => {
                 return Err(format!(
-                    "parameter `{}`: its type is outside the SVM core subset (borrows and resources are scoped out)",
+                    "parameter `{}`: its type is outside the SVM core subset (resources are scoped out)",
                     p.name
                 ));
             }
@@ -3387,8 +3413,7 @@ fn lower_call(ctx: &LowerCtx<'_>, dst: &Option<String>, call: &Expr) -> Result<S
         unreachable!("lower_call requires an ordinary call expression")
     };
     validate_call_signature(ctx, call, callee, args)?;
-    let lowered: Result<Vec<String>, String> =
-        args.iter().map(|arg| lower_expr(ctx, arg)).collect();
+    let lowered: Result<Vec<String>, String> = args.iter().map(|arg| lower_arg(ctx, arg)).collect();
     let d = match dst {
         Some(x) => format!("(some \"{x}\")"),
         None => "none".into(),
@@ -3397,6 +3422,41 @@ fn lower_call(ctx: &LowerCtx<'_>, dst: &Option<String>, call: &Expr) -> Result<S
         "(.call {d} \"{callee}\" [{}])",
         lowered?.join(", ")
     ))
+}
+
+/// Lower one call argument.
+///
+/// A unique array borrow becomes `Arg.lend`: the machine binds the caller's
+/// sequence on entry and returns the callee's exit value to that same local
+/// when the frame pops, which is what makes a `&mut` store visible to the
+/// caller. Every other argument is `Arg.byValue` — a shared borrow included,
+/// because its whole promise is that the callee does not write, and a value
+/// is exactly that promise. Lending needs a name to return to, so a unique
+/// borrow of anything but a local fails closed.
+fn lower_arg(ctx: &LowerCtx<'_>, arg: &Expr) -> Result<String, String> {
+    let Some((_, mutability)) = arg.ty.as_ref().and_then(Ty::as_array_borrow) else {
+        return Ok(format!("(.byValue {})", lower_expr(ctx, arg)?));
+    };
+    let source = match &arg.kind {
+        ExprKind::Borrow {
+            array,
+            field: None,
+            mutable: _,
+        } => array,
+        ExprKind::Var(name) => name,
+        _ => {
+            return Err(format!(
+                "svm.array_borrow_place: an array borrow argument must name a local; `{}` does not",
+                arg.ty.as_ref().map_or_else(|| "<untyped>".into(), Ty::name)
+            ));
+        }
+    };
+    validate_expr_payloads(ctx, arg)?;
+    ctx.initialized_local(source, "array borrow argument")?;
+    Ok(match mutability {
+        Mutability::Mut => format!("(.lend \"{source}\")"),
+        Mutability::Shared => format!("(.byValue (.var \"{source}\"))"),
+    })
 }
 
 fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
@@ -4475,7 +4535,7 @@ mod tests {
         validate_expr_payloads(&ctx, &valid).expect("checked option-returning call");
         assert_eq!(
             lower_call(&ctx, &Some("choice".into()), &valid).unwrap(),
-            "(.call (some \"choice\") \"choose\" [(.intLit .i32 0)])"
+            "(.call (some \"choice\") \"choose\" [(.byValue (.intLit .i32 0))])"
         );
 
         let wrong_result = call(vec![selector()], Some(Ty::Int(IntTy::I32)));
@@ -4693,7 +4753,7 @@ mod tests {
     }
 
     #[test]
-    fn boolean_arrays_reject_uninitialized_alias_rebind_borrow_and_exposure() {
+    fn boolean_arrays_reject_uninitialized_alias_rebind_and_exposure() {
         let program = empty_program();
         let array_ty = Ty::array(Ty::Bool);
         let literal = || {
@@ -4763,25 +4823,6 @@ mod tests {
             "{error}"
         );
 
-        let mut ctx = LowerCtx::bare(&program);
-        ctx.insert_local("bits", array_ty.clone(), true, true)
-            .unwrap();
-        let borrow = Expr {
-            kind: ExprKind::Borrow {
-                array: "bits".into(),
-                field: None,
-                mutable: false,
-            },
-            span: Span::new(0, 0),
-            ty: None,
-        };
-        let error = validate_expr_payloads(&ctx, &borrow)
-            .expect_err("Boolean array locals cannot be borrowed");
-        assert!(
-            error.starts_with("svm.bool_array_borrow_unsupported:"),
-            "{error}"
-        );
-
         let exposure = checked_fn(
             Ty::Unit,
             vec![
@@ -4802,6 +4843,82 @@ mod tests {
         let error = lower_fn(&program, &exposure)
             .expect_err("Boolean array locals cannot cross the exposure bridge");
         assert!(error.starts_with("svm.array_expose_type:"), "{error}");
+    }
+
+    #[test]
+    fn a_borrowed_boolean_array_is_a_call_argument_and_a_unique_one_is_a_loan() {
+        let program = empty_program();
+        let array_ty = Ty::array(Ty::Bool);
+        let shared_ty = Ty::array_ref(Ty::Bool, Mutability::Shared);
+        let unique_ty = Ty::array_ref(Ty::Bool, Mutability::Mut);
+
+        let mut ctx = LowerCtx::bare(&program);
+        ctx.insert_local("bits", array_ty.clone(), true, true)
+            .unwrap();
+        ctx.insert_local("frozen", array_ty, false, true).unwrap();
+        ctx.insert_local("lent", unique_ty.clone(), false, true)
+            .unwrap();
+
+        let borrow = |array: &str, mutable: bool, ty: Ty| Expr {
+            kind: ExprKind::Borrow {
+                array: array.into(),
+                field: None,
+                mutable,
+            },
+            span: Span::new(0, 0),
+            ty: Some(ty),
+        };
+
+        // A shared borrow may only be read, so the caller's sequence is what
+        // the callee is owed; a unique one is a loan the pop returns.
+        assert_eq!(
+            lower_arg(&ctx, &borrow("bits", false, shared_ty.clone())).unwrap(),
+            "(.byValue (.var \"bits\"))"
+        );
+        assert_eq!(
+            lower_arg(&ctx, &borrow("bits", true, unique_ty.clone())).unwrap(),
+            "(.lend \"bits\")"
+        );
+        // A reborrow by name lends the same storage one frame further, so the
+        // loans compose back to the owner.
+        assert_eq!(
+            lower_arg(&ctx, &expr(ExprKind::Var("lent".into()), unique_ty.clone())).unwrap(),
+            "(.lend \"lent\")"
+        );
+
+        // A loan needs a local to return to.
+        let field_borrow = Expr {
+            kind: ExprKind::Borrow {
+                array: "bits".into(),
+                field: Some("flags".into()),
+                mutable: true,
+            },
+            span: Span::new(0, 0),
+            ty: Some(unique_ty.clone()),
+        };
+        let error = lower_arg(&ctx, &field_borrow).expect_err("a loan must name a local");
+        assert!(error.starts_with("svm.array_borrow_place:"), "{error}");
+
+        // A borrow's type is its source's array under the requested mode, and
+        // an immutable owner has no unique borrow to give.
+        assert_eq!(
+            semantic_expr_ty(
+                &ctx,
+                &borrow("bits", false, shared_ty.clone()),
+                shared_ty.clone(),
+                "argument 1",
+            )
+            .unwrap(),
+            shared_ty
+        );
+        let error = semantic_expr_ty(
+            &ctx,
+            &borrow("frozen", true, unique_ty.clone()),
+            unique_ty,
+            "argument 1",
+        )
+        .expect_err("an immutable owner cannot be lent uniquely");
+        assert!(error.starts_with("svm.array_borrow_place:"), "{error}");
     }
 
     #[test]

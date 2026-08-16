@@ -1,0 +1,22 @@
+// expect-error: type.borrow_local_unsupported
+// The initializer does not have to be written `&`. A bare name whose type is
+// already a borrow binds that borrow, so `var d = c;` is the same second name
+// by a different spelling — use `c` itself.
+
+pub class Counter {
+    u64 n;
+
+    /// invariant n ≤ 100
+
+    /// pre  self.n < 100
+    /// post self.n = old self.n + 1
+    fn bump(&mut self) {
+        self.n = self.n + 1;
+    }
+}
+
+/// pre  c.n < 100
+fn borrow_local(&mut Counter c) {
+    var d = c;
+    d.bump();
+}

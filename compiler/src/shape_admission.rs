@@ -19,10 +19,11 @@
 //!
 //! A gate that panics is a failure here, not a passing row: "no source
 //! program reaches this" is an argument about the parser, and this table
-//! deliberately does not go through the parser. The one stage whose refusal
-//! is a panic rather than a diagnostic is the LLVM backend's type lowering,
-//! which is why `llvm_lowering_is_total_on_admitted_shapes` checks the
-//! implication the panic rests on instead of recording it as an answer.
+//! deliberately does not go through the parser. The LLVM backend's type
+//! lowerings are not gates and so have no column; they are total, and
+//! `llvm_lowering_is_total_on_admitted_shapes` checks the stronger property
+//! the arrangement wants — that no shape a gate admits ever needs their
+//! refusal.
 //!
 //! Run with `SABLE_BLESS=1` to rewrite the table after an intended change.
 
@@ -350,6 +351,54 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
                 Ty::array(Ty::array(Ty::Int(IntTy::U64))),
             ),
         ),
+        (
+            "&mut [[u64]]",
+            Ty::borrow(Mutability::Mut, Ty::array(Ty::array(Ty::Int(IntTy::U64)))),
+        ),
+        (
+            "&[[bool]]",
+            Ty::borrow(Mutability::Shared, Ty::array(Ty::array(Ty::Bool))),
+        ),
+        (
+            "&mut [[bool]]",
+            Ty::borrow(Mutability::Mut, Ty::array(Ty::array(Ty::Bool))),
+        ),
+        ("&[record]", Ty::array_ref(Ty::Record(0), Mutability::Shared)),
+        ("&mut [record]", Ty::array_ref(Ty::Record(0), Mutability::Mut)),
+        ("&[class]", Ty::array_ref(Ty::Class(0), Mutability::Shared)),
+        ("&mut [class]", Ty::array_ref(Ty::Class(0), Mutability::Mut)),
+        (
+            "&[type parameter]",
+            Ty::array_ref(Ty::Param(param()), Mutability::Shared),
+        ),
+        (
+            "&mut [type parameter]",
+            Ty::array_ref(Ty::Param(param()), Mutability::Mut),
+        ),
+        (
+            "&[option<u64>]",
+            Ty::array_ref(Ty::option(Ty::Int(IntTy::U64)), Mutability::Shared),
+        ),
+        (
+            "&mut [option<u64>]",
+            Ty::array_ref(Ty::option(Ty::Int(IntTy::U64)), Mutability::Mut),
+        ),
+        (
+            "&[option<[bool]>]",
+            Ty::array_ref(Ty::affine_array_option(Ty::Bool), Mutability::Shared),
+        ),
+        (
+            "&mut [option<[bool]>]",
+            Ty::array_ref(Ty::affine_array_option(Ty::Bool), Mutability::Mut),
+        ),
+        (
+            "resource<record> &",
+            Ty::borrow(Mutability::Shared, Ty::Res(ResKind::PointsToRecord(0))),
+        ),
+        (
+            "resource<record> &mut",
+            Ty::borrow(Mutability::Mut, Ty::Res(ResKind::PointsToRecord(0))),
+        ),
         // A borrow of a borrow: the referent of a `Ty::Borrow` is a full
         // type, so this is representable and nothing but a rule keeps it out.
         (
@@ -456,6 +505,7 @@ const GATES: &[&str] = &[
     "check affine payload",
     "check aggregate",
     "check parameter",
+    "check local",
     "record field",
     "vc type",
     "vc array payload",
@@ -515,6 +565,7 @@ fn answers(ty: &Ty) -> Vec<Answer> {
         )),
         from_diagnostic(crate::check::validate_aggregate_ty(ty.clone(), SPAN)),
         from_diagnostic(crate::check::parameter_ty(ty, SPAN)),
+        from_diagnostic(crate::check::local_ty(ty, SPAN)),
         match crate::check::record_field_layout(ty, "probe", SPAN) {
             Ok(_) => Answer::Accepted,
             Err(diagnostic) => Answer::Rejected(diagnostic.name),
@@ -817,26 +868,22 @@ fn every_distinguished_binding_mode_is_probed() {
 
 /// The LLVM type lowering is total on every shape the backend admits.
 ///
-/// `llvm::llvm_ty` and `llvm::type_code` end in `unreachable!`: they are
-/// lowerings, not gates, and the backend's refusal is issued earlier by the
-/// `require_*` gates, which carry a span. This test checks the implication
-/// that arrangement rests on — admitted implies lowerable — so a widened gate
-/// that forgot to teach the lowering fails here instead of aborting the
-/// process later. A shape the gates refuse is never handed to the lowering,
-/// which is why the table records the gates' answers and never a panic.
+/// `llvm::llvm_ty` and `llvm::type_code` are total: a shape they cannot spell
+/// is `None`, which the emitter turns into a spanned
+/// `internal.backend.type_lowering` diagnostic. That is the floor, not the
+/// intent — the intent is that no admitted shape ever reaches it, because the
+/// `require_*` gates refuse first under their own names. This test checks
+/// that implication, so a widened gate that forgot to teach the lowering
+/// fails here rather than shipping a compiler-bug diagnostic to a user.
 #[test]
 fn llvm_lowering_is_total_on_admitted_shapes() {
-    /// Run a lowering on a shape the backend admits and report the shape by
-    /// name if it has none. The lowering's own refusal is a panic, so it is
-    /// caught here rather than allowed to end the run without saying which
-    /// shape the gate and the lowering disagree about.
-    fn lowers(name: &str, what: &str, lowering: impl FnOnce() -> String + std::panic::UnwindSafe) {
-        match std::panic::catch_unwind(lowering) {
-            Ok(text) => assert!(!text.is_empty(), "`{name}` has an empty {what}"),
-            Err(_) => panic!(
+    fn lowers(name: &str, what: &str, lowering: Option<String>) {
+        match lowering {
+            Some(text) => assert!(!text.is_empty(), "`{name}` has an empty {what}"),
+            None => panic!(
                 "`{name}` is admitted by the backend's gate but has no {what}: the gate was \
-                 widened without teaching the lowering, and the disagreement would reach a user \
-                 as an aborted compile with no span"
+                 widened without teaching the lowering, so a program using that shape would \
+                 fail with a compiler-bug diagnostic instead of being compiled"
             ),
         }
     }
@@ -848,19 +895,23 @@ fn llvm_lowering_is_total_on_admitted_shapes() {
         let local =
             crate::llvm::require_local_value(&program, ROOT_SPAN_END, ty.clone(), SPAN, name);
         if runtime.is_ok() || local.is_ok() {
-            let lowered = ty.clone();
-            lowers(name, "LLVM value type", move || {
-                crate::llvm::llvm_ty(lowered)
-            });
+            lowers(name, "LLVM value type", crate::llvm::llvm_ty(ty.clone()));
         }
         if crate::llvm::require_parameter_value(&program, ROOT_SPAN_END, ty.clone(), SPAN, name)
             .is_ok()
         {
-            let coded = ty.clone();
-            lowers(name, "symbol type code", move || {
-                crate::llvm::type_code(coded)
-            });
+            lowers(name, "symbol type code", crate::llvm::type_code(ty.clone()));
         }
+    }
+}
+
+/// Every sample reaches both lowerings without a panic, whether or not a gate
+/// admits it. Totality is the property; the implication above is the intent.
+#[test]
+fn llvm_lowering_answers_every_shape() {
+    for (_, ty) in samples() {
+        let _ = crate::llvm::llvm_ty(ty.clone());
+        let _ = crate::llvm::type_code(ty);
     }
 }
 

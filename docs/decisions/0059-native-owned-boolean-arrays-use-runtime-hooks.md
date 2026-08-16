@@ -155,6 +155,10 @@ checked mutability are admitted. Owned-array call transport, returns, entries,
 fields, classes, methods, externs, Boolean borrows, other payloads, exposure,
 and public or cross-module ABI positions stay closed.
 
+ADR 0070 supersedes the Boolean-borrow half of that sentence: `&[bool]` and
+`&mut [bool]` are admitted parameters under the same argument rule, lending the
+same kind of descriptor. Everything else in it stands.
+
 ## N1a–N5 amendment: nested class cleanup and arithmetic scratch storage
 
 N1a embeds one `%sable.array.u32` descriptor in the exact fixed native `Nat`

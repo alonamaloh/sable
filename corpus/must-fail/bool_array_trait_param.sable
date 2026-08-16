@@ -1,5 +1,7 @@
-// expect-error: type.bool_array_param
-// Retained trait methods do not transport borrowed Boolean arrays.
+// expect-error: type.trait_param_unsupported
+// An abstract trait call substitutes integer arguments into the trait's
+// contract, so a sequence-valued parameter has no meaning at that call —
+// for `&[bool]` exactly as for `&[u64]`.
 
 trait Select {
     fn select(Self value, &[bool] flags) -> Self;

@@ -60,8 +60,18 @@ class Box {
 ";
 
 const TYPES: &[Probe] = &[
-    Probe { name: "u64", spelling: "u64", values: &["7"], decls: "" },
-    Probe { name: "bool", spelling: "bool", values: &["true"], decls: "" },
+    Probe {
+        name: "u64",
+        spelling: "u64",
+        values: &["7"],
+        decls: "",
+    },
+    Probe {
+        name: "bool",
+        spelling: "bool",
+        values: &["true"],
+        decls: "",
+    },
     // Arrays are constructed either by a literal or by `alloc_array`; only
     // the latter yields the owned array that a sink taking ownership wants.
     Probe {
@@ -76,14 +86,24 @@ const TYPES: &[Probe] = &[
         values: &["alloc_array<bool>(2, true)", "[true, false]"],
         decls: "",
     },
-    Probe { name: "option<u64>", spelling: "option<u64>", values: &["none", "some(7)"], decls: "" },
+    Probe {
+        name: "option<u64>",
+        spelling: "option<u64>",
+        values: &["none", "some(7)"],
+        decls: "",
+    },
     Probe {
         name: "option<bool>",
         spelling: "option<bool>",
         values: &["none", "some(true)"],
         decls: "",
     },
-    Probe { name: "record", spelling: "Pair", values: &["Pair(1, 2)"], decls: RECORD_DECL },
+    Probe {
+        name: "record",
+        spelling: "Pair",
+        values: &["Pair(1, 2)"],
+        decls: RECORD_DECL,
+    },
     // An affine option admits exactly `none` and a freshly allocated array.
     Probe {
         name: "option<[bool]>",
@@ -91,7 +111,12 @@ const TYPES: &[Probe] = &[
         values: &["none", "some(alloc_array<bool>(2, true))"],
         decls: "",
     },
-    Probe { name: "class", spelling: "Box", values: &["Box::make()"], decls: CLASS_DECL },
+    Probe {
+        name: "class",
+        spelling: "Box",
+        values: &["Box::make()"],
+        decls: CLASS_DECL,
+    },
 ];
 
 /// One probed position, as a list of candidate programs. A type belongs in
@@ -139,13 +164,19 @@ fn ctx_local(p: &Probe) -> Vec<String> {
         "mut var".to_string(),
     ];
     spellings_by_values(p, &bindings, |binding, value| {
-        format!("{}\nfn probe() -> u64 {{\n    {binding} x = {value};\n    return 0;\n}}\n", p.decls)
+        format!(
+            "{}\nfn probe() -> u64 {{\n    {binding} x = {value};\n    return 0;\n}}\n",
+            p.decls
+        )
     })
 }
 
 fn ctx_return(p: &Probe) -> Vec<String> {
     spellings_by_values(p, &[p.spelling.to_string()], |spelling, value| {
-        format!("{}\nfn probe() -> {spelling} {{\n    return {value};\n}}\n", p.decls)
+        format!(
+            "{}\nfn probe() -> {spelling} {{\n    return {value};\n}}\n",
+            p.decls
+        )
     })
 }
 
@@ -155,12 +186,20 @@ fn ctx_return(p: &Probe) -> Vec<String> {
 fn ctx_param(p: &Probe) -> Vec<String> {
     [format!("&{}", p.spelling), p.spelling.to_string()]
         .iter()
-        .map(|param| format!("{}\nfn probe({param} x) -> u64 {{\n    return 0;\n}}\n", p.decls))
+        .map(|param| {
+            format!(
+                "{}\nfn probe({param} x) -> u64 {{\n    return 0;\n}}\n",
+                p.decls
+            )
+        })
         .collect()
 }
 
 fn ctx_param_mut(p: &Probe) -> Vec<String> {
-    vec![format!("{}\nfn probe(&mut {} x) -> u64 {{\n    return 0;\n}}\n", p.decls, p.spelling)]
+    vec![format!(
+        "{}\nfn probe(&mut {} x) -> u64 {{\n    return 0;\n}}\n",
+        p.decls, p.spelling
+    )]
 }
 
 fn ctx_record_field(p: &Probe) -> Vec<String> {
@@ -183,10 +222,16 @@ fn ctx_class_field(p: &Probe) -> Vec<String> {
 }
 
 fn ctx_array_element(p: &Probe) -> Vec<String> {
-    let bindings =
-        ["var".to_string(), format!("[{}]", p.spelling), format!("mut [{}]", p.spelling)];
+    let bindings = [
+        "var".to_string(),
+        format!("[{}]", p.spelling),
+        format!("mut [{}]", p.spelling),
+    ];
     spellings_by_values(p, &bindings, |binding, value| {
-        format!("{}\nfn probe() -> u64 {{\n    {binding} xs = [{value}];\n    return 0;\n}}\n", p.decls)
+        format!(
+            "{}\nfn probe() -> u64 {{\n    {binding} xs = [{value}];\n    return 0;\n}}\n",
+            p.decls
+        )
     })
 }
 
@@ -197,7 +242,10 @@ fn ctx_option_payload(p: &Probe) -> Vec<String> {
         format!("mut option<{}>", p.spelling),
     ];
     spellings_by_values(p, &bindings, |binding, value| {
-        format!("{}\nfn probe() -> u64 {{\n    {binding} o = some({value});\n    return 0;\n}}\n", p.decls)
+        format!(
+            "{}\nfn probe() -> u64 {{\n    {binding} o = some({value});\n    return 0;\n}}\n",
+            p.decls
+        )
     })
 }
 
@@ -225,7 +273,10 @@ fn probe_cell(candidates: Vec<String>) -> Result<(), String> {
 }
 
 fn matrix_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("docs/type-matrix.md")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("docs/type-matrix.md")
 }
 
 fn render(results: &[Vec<Result<(), String>>]) -> String {
@@ -275,7 +326,10 @@ fn type_matrix_is_pinned() {
     let results: Vec<Vec<Result<(), String>>> = TYPES
         .iter()
         .map(|probe| {
-            CONTEXTS.iter().map(|(_, build)| probe_cell(build(probe))).collect()
+            CONTEXTS
+                .iter()
+                .map(|(_, build)| probe_cell(build(probe)))
+                .collect()
         })
         .collect();
 
@@ -288,17 +342,76 @@ fn type_matrix_is_pinned() {
     }
 
     let recorded = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!("cannot read {}: {e}\nrun with SABLE_BLESS=1 to create it", path.display())
+        panic!(
+            "cannot read {}: {e}\nrun with SABLE_BLESS=1 to create it",
+            path.display()
+        )
     });
 
-    assert_eq!(
-        recorded,
-        rendered,
-        "\n{} is stale.\n\
-         A cell changed state, or a diagnostic was renamed. Widening the language should \
-         open cells, never close them: check the diff before blessing it with \
-         SABLE_BLESS=1.\n",
-        path.display()
-    );
+    if recorded != rendered {
+        panic!(
+            "\n{} is stale.\n{}\n\
+             Widening the language should open cells, never close them: check every line \
+             above before blessing it with SABLE_BLESS=1.\n",
+            path.display(),
+            describe_drift(&recorded, &rendered)
+        );
+    }
 }
 
+/// What moved, named. The whole value of this pin is telling a later author
+/// *which* cell changed, so a failure reports the moved cells rather than two
+/// documents to diff by eye.
+fn describe_drift(recorded: &str, rendered: &str) -> String {
+    // Only the grid: its rows carry one field per context, which the
+    // closing-diagnostic table below it does not.
+    let cells = |table: &str| -> Vec<(String, Vec<String>)> {
+        table
+            .lines()
+            .filter(|line| line.starts_with("| `"))
+            .filter_map(|line| {
+                let fields: Vec<String> = line
+                    .trim()
+                    .trim_matches('|')
+                    .split('|')
+                    .map(|f| f.trim().to_string())
+                    .collect();
+                (fields.len() == CONTEXTS.len() + 1)
+                    .then(|| (fields[0].clone(), fields[1..].to_vec()))
+            })
+            .collect()
+    };
+
+    let (before, after) = (cells(recorded), cells(rendered));
+    let contexts: Vec<&str> = CONTEXTS.iter().map(|(name, _)| *name).collect();
+    let mut lines = Vec::new();
+
+    for (ty, row_after) in &after {
+        let Some((_, row_before)) = before.iter().find(|(name, _)| name == ty) else {
+            lines.push(format!("  row {ty} is new"));
+            continue;
+        };
+        for (i, (was, now)) in row_before
+            .iter()
+            .zip(row_after.iter())
+            .enumerate()
+            .filter(|(_, (was, now))| was != now)
+        {
+            let context = contexts.get(i).copied().unwrap_or("?");
+            lines.push(format!("  {ty} x {context}: was {was}, now {now}"));
+        }
+    }
+    for (ty, _) in &before {
+        if !after.iter().any(|(name, _)| name == ty) {
+            lines.push(format!("  row {ty} disappeared"));
+        }
+    }
+
+    if lines.is_empty() {
+        // Only the prose or the closing-diagnostic table moved.
+        return "The grid is unchanged; a closing diagnostic was renamed or the \
+                surrounding text moved."
+            .to_string();
+    }
+    lines.join("\n")
+}

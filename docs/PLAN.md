@@ -20,7 +20,11 @@ and natively lowered internal integer-field POD record calls. G1.4b closes
 owned-local Boolean arrays through checking, verification, interpretation, and
 dynamic monitoring. G1.5 is closed across the formal SVM and its owned-local
 Rust differential bridge, and G1.6 closes the matching local LLVM storage and
-cleanup slice. G2.0–G2.2 close affine-option representation, local semantics,
+cleanup slice. G1.7 admits borrowed Boolean-array parameters in the checker and
+VC generation, G1.8 runs and monitors them (ADR 0068), G1.9 models one in
+the formal SVM as a lending argument (ADR 0069), and G1.10 lowers one natively
+as a lent descriptor (ADR 0070).
+G2.0–G2.2 close affine-option representation, local semantics,
 and atomic formal-machine take; G2.3 closes the exact local LLVM lowering. No
 array, affine-option, or record ABI, and no generic-class widening, is claimed.
 N0's exact local `[u32]` LLVM storage and internal borrowed-array call slice is
@@ -682,7 +686,12 @@ Unsafe Sable v1, the scalar LLVM v0 boundary, the first end-to-end Boolean
 option slice, G1.4a's internal POD record-value slice, and G1.4b's owned-local
 Boolean-array proof/runtime slice are complete. G1.5's closure of that exact
 local slice in the formal SVM and differential lowerer is also complete. G1.6's
-native storage and lexical cleanup for that same local slice are complete. The broader
+native storage and lexical cleanup for that same local slice are complete;
+G1.7 opens `&[bool]`/`&mut [bool]` parameters through the checker and VC
+generation, G1.8 runs and monitors them, G1.9 gives the formal SVM a
+lending call argument so the two executables can be compared on one, and G1.10
+lowers one natively by lending its descriptor.
+The broader
 aggregate-generics/backend track continues at M46+; G2.0's affine-option
 representation/fail-closed checkpoint and G2.1's local semantic slice are
 closed, as is G2.2's formal-SVM slice. G2.3's exact local native slice is
@@ -1024,6 +1033,142 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      differential passed 1/1 over six subjects at both levels; and SVM stayed
      green at 86/86. Randomized allocator, grind-budget, LSP, documentation,
      diff-check, and static-audit gates were green. G1.6 is closed.
+
+     **G1.7 — borrowed Boolean-array parameters (checker and VC complete,
+     ADR 0068):** `&[bool]` and `&mut [bool]` are ordinary parameters. Nothing
+     in the array-parameter proof path was integer-specific: `lean_array_ty`,
+     the parameter binder and its `_old_` twin, the loop and call-site havoc,
+     the element read and store bridges, and `Sable.Seq` itself were already
+     payload-generic. What refused the shape was a set of gates spelling
+     `[bool]` with an accessor that looks through the borrow, so each gate now
+     asks the question it was written for: an owner is restricted to a local
+     value, and a borrowed array carries a proof model wherever `&[T]` does.
+
+     The parameter's well-formedness is the length fact
+     `0 ≤ m.len ≤ u64.max` and nothing else. There is no element fact, because
+     `Bool` is already its complete value domain — the analogue of an integer
+     array's range hypothesis does not exist rather than being omitted. Loop
+     havoc leaves a shared borrow alone (it is never a store target) and gives a
+     unique borrow a fresh binder plus length preservation, which is what
+     `Seq.len_set` justifies.
+
+     `type.bool_array_param` and `type.bool_array_borrow` are deleted rather
+     than narrowed: the parser's `P::Param` row already refuses an owned array
+     of every element type, so a narrowed refusal would have been a diagnostic
+     no source program could reach. `type.trait_param_unsupported` gains arrays
+     in any binding mode, closing a panic that an `&[u64]` trait signature
+     could already reach.
+
+     `corpus/verifies/bool_array_params.sable` verifies 37/37 obligations
+     across six functions with one hand discharge, covering reads, an element
+     invariant, a reborrow passed to a second function, an owner lending a
+     literal, a `&mut [bool]` writer with `old m`, and a `&mut` round trip
+     whose post follows only from the callee's posts over the fresh sequence.
+     `docs/type-matrix.md` opens `[bool]` × `param` and `[bool]` × `param &mut`
+     (33/81 → 35/81) and no other cell.
+
+     **G1.8 — the same shape at run time (interpreter and monitor complete,
+     ADR 0068):** `sable test` runs a borrowed Boolean-array parameter with its
+     contract monitored. No execution code was written: the runtime array is
+     payload-tagged, `ExprKind::Borrow` hands the callee the caller's own
+     handle, and owned-parameter destruction matches the bare constructors, so
+     a `&mut [bool]` writes through and a lent array still dies with its owner.
+     The gates split the way the checker's and VC generation's did — an owner
+     is restricted to a local value, a borrowed array transports wherever
+     `&[T]` does.
+
+     The monitor needed nothing either. A frame snapshots a unique borrow's
+     array at entry for `old p`, and the snapshot carries the payload, so
+     `m.len`, `m.get k`, a bounded `∀`, an `↔`, and `(old m).get k` all
+     evaluate. `corpus/tests/test_bool_array_params.sable` runs the verified
+     subject's contracts across seven tests at **zero skipped clauses and no
+     `expect-skip` fence**. `docs/shape-admission.md` opens
+     `&[bool]`/`&mut [bool]` × `interp type` and no other cell;
+     `docs/type-matrix.md` does not move.
+
+     **G1.9 — the same shape in the formal machine (complete, ADR 0069):** a
+     formal SVM call argument is `Arg.byValue e` or `Arg.lend x`. Both supply
+     the same entry value, so evaluation order, the ⊥-read, and argument traps
+     are unchanged; what lending adds is where the value goes back. `Arg.loans`
+     pairs each lent argument with the parameter that receives it, `call_enter`
+     records that list in the frame, and both `ret_pop` and `nil_pop` apply
+     `Env.restore` before binding the destination — a procedure writes through
+     a `&mut` parameter as often as a function does.
+
+     Copy-in/copy-out is faithful because a unique borrow is exclusive: no
+     second name reaches that storage while the callee runs, and the machine
+     has no concurrency. A shared borrow therefore needs no constructor; `Val`
+     is unchanged, and a borrow is still not a machine value.
+
+     The rules, the evaluator, and both directions of the agreement theorem
+     moved together and no proof needed real work — the write-back is a total
+     function both sides name, so every arm kept its shape. `SVMArrayTests`
+     pins write-through, the by-value contrast, both ways of leaving a body,
+     loan composition through frames, a terminal callee trap, the payload tag
+     crossing the call, the ⊥-read, and an integer array lending identically.
+
+     `lower_fn_entry` admits a borrowed array parameter of any payload, and
+     `lower_arg` reads the argument form off the argument's type rather than
+     its syntax, so a `&mut` reborrow passed on by name still lends.
+     `corpus/svm-diff/bool_array_borrows.sable` compares ten zero-argument
+     subjects against `interp.rs`; removing the `lend` arm makes three of them
+     diverge. `docs/shape-admission.md` opens `&[bool]`/`&mut [bool]` ×
+     `svm parameter` and no other cell; `docs/type-matrix.md` does not move.
+
+     **G1.10 — the same shape natively (complete, ADR 0070):** `&[bool]` and
+     `&mut [bool]` are parameters of internal ordinary functions. The IR type
+     of a borrowed array is the IR type of the array — one
+     `%sable.array.bool` descriptor, passed by value — so the emitter gained no
+     type, no hook, no trap kind, and no element encoding. What split is the
+     question each site asks: `is_owned_bool_array` still decides ownership
+     (which declarations allocate, enter the cleanup registry, and free), and
+     the borrow-transparent `is_bool_array` decides representation (the IR
+     type, the descriptor loads, element addressing, index and length bases).
+     A borrow therefore never enters a cleanup scope.
+
+     Write-through is the shared data pointer, not a copy-out: the callee's
+     descriptor copy holds the caller's pointer, so a store lands in the
+     caller's bytes during the call. That is deliberately not the formal
+     machine's mechanism (ADR 0069 restores a loan at the pop); both are
+     faithful because a unique borrow is exclusive, and
+     `corpus/llvm-diff/bool_array_borrows.sable` compares the interpreter's
+     answer with Clang `-O0`/`-O2` rather than assuming they agree. The
+     mangled component generalizes to `a` + element code + `s`/`m` (`abs`,
+     `abm` beside `au32s`, `au32m`); it stays internal and versionable, and no
+     array ABI follows. Owned array parameters and returns, entries, fields,
+     externs, other widths, exposure, and container containment stay refused.
+
+     `docs/shape-admission.md` opens `&[bool]`/`&mut [bool]` × `llvm
+     parameter` and no other cell — those rows now match `&[u32]`/`&mut [u32]`
+     in all three LLVM columns; `docs/type-matrix.md` does not move, because
+     the backend is not on the verification path.
+
+     **The backend's type lowerings are total (ADR 0071).** `llvm_ty` and
+     `type_code` answer `Option<String>` for every `Ty` instead of ending in
+     `unreachable!`; `None` becomes a spanned
+     `internal.backend.type_lowering` diagnostic naming the shape and the
+     declaration. The `require_*` gates still refuse first under their own
+     names, and `llvm_lowering_is_total_on_admitted_shapes` still checks that
+     implication — what changed is that its failure mode is now a bad
+     diagnostic rather than a process abort. `IntTy::bits`/`min`/`max` and
+     `integer_type_code` keep their separate post-monomorphization contract.
+
+     **A borrow is not a local binding (ADR 0072).** `var view = &mut a;` bound
+     a *snapshot* of the owner's symbolic term under a second name, so a store
+     through either name moved only that entry while both stayed believed —
+     `sable check` proved false postconditions over arrays of every payload,
+     classes, class fields, resources, and `unsafe expose`, and an aliased pair
+     of arguments proved a false post for an ordinary borrow-free callee.
+     `check::local_ty` now refuses a local whose type is not owned, under
+     `type.borrow_local_unsupported`, keyed on `Ty::binding_mode()` so it holds
+     for every referent. This fences the hole: there is still no loan map and
+     no loan liveness, and what holds instead is that a borrow exists only
+     where the compiler already relates it to its owner — at a call, as an
+     argument, for the length of that call. Borrow locals would need an
+     aliasing model of their own; that is not scheduled, and this rule is what
+     such a model would replace. `docs/shape-admission.md` gains a `check
+     local` column; `docs/type-matrix.md` does not move, because a borrow has
+     no declared local spelling for a source-level probe to write.
    - **G2 — affine options (staged; G2.0–G2.3 complete):**
      carry ownership and destruction correctly through present/absent aggregate
      values without widening the existing copy-option family by accident.

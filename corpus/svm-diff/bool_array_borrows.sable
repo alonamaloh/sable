@@ -1,0 +1,108 @@
+// SVM differential subjects: a Boolean array lent across a call. A shared
+// borrow is the callee's to read, so the machine hands it the caller's
+// sequence; a unique borrow is a loan, and the callee's exit value returns
+// to the caller's local when the frame pops. Loans compose through frames,
+// a trap inside a callee is terminal, and none of it is Boolean-specific.
+
+fn count_true(&[bool] m) -> u64 {
+    mut u64 c = 0;
+    mut u64 i = 0;
+    /// variant m.len - i
+    while (i < m.len) {
+        if (m[i]) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+
+fn set_all(&mut [bool] m) {
+    mut u64 i = 0;
+    /// variant m.len - i
+    while (i < m.len) {
+        m[i] = true;
+        i = i + 1;
+    }
+}
+
+fn set_first(&mut [bool] m) {
+    m[0] = true;
+}
+
+fn lend_onward(&mut [bool] m) {
+    set_first(&mut m);
+}
+
+fn read_onward(&[bool] m) -> u64 {
+    u64 seen = count_true(&m);
+    return seen;
+}
+
+fn read_beyond(&[bool] m) -> bool {
+    return m[7];
+}
+
+fn set_first_int(&mut [i64] xs) {
+    xs[0] = 7;
+}
+
+fn lend_writes_through() -> bool {
+    mut [bool] bits = alloc_array<bool>(3, false);
+    set_all(&mut bits);
+    return bits[0] && bits[2];
+}
+
+fn shared_borrow_reads_the_callers_stores() -> u64 {
+    mut [bool] bits = alloc_array<bool>(4, false);
+    bits[1] = true;
+    bits[3] = true;
+    u64 seen = count_true(&bits);
+    return seen;
+}
+
+fn a_loan_preserves_length() -> u64 {
+    mut [bool] bits = alloc_array<bool>(5, false);
+    set_all(&mut bits);
+    return bits.len;
+}
+
+fn a_loan_reaches_through_two_frames() -> bool {
+    mut [bool] bits = alloc_array<bool>(2, false);
+    lend_onward(&mut bits);
+    return bits[0];
+}
+
+fn a_reborrow_names_the_same_storage() -> u64 {
+    [bool] bits = [true, false, true];
+    u64 seen = read_onward(&bits);
+    return seen;
+}
+
+fn an_empty_loan_keeps_its_payload() -> u64 {
+    mut [bool] bits = alloc_array<bool>(0, false);
+    set_all(&mut bits);
+    return bits.len;
+}
+
+fn a_callee_trap_is_terminal() -> bool {
+    [bool] bits = [true];
+    bool seen = read_beyond(&bits);
+    return seen;
+}
+
+fn a_lent_write_precedes_a_later_trap() -> bool {
+    mut [bool] bits = alloc_array<bool>(1, false);
+    set_first(&mut bits);
+    return bits[9];
+}
+
+fn a_store_beyond_a_lent_array_traps_in_the_callee() -> bool {
+    mut [bool] bits = alloc_array<bool>(0, false);
+    set_first(&mut bits);
+    return true;
+}
+
+fn integer_arrays_lend_the_same_way() -> i64 {
+    mut [i64] xs = alloc_array<i64>(2, 0);
+    set_first_int(&mut xs);
+    return xs[0];
+}

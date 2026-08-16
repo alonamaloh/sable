@@ -128,9 +128,9 @@ fn emit_program(
             .iter()
             .find(|function| function.name == *entry)
             .expect("entry selection validated above");
-        emit_main_bridge(function, &mut definitions);
+        emit_main_bridge(function, &mut definitions)?;
     }
-    support.emit(program, &mut out);
+    support.emit(program, &mut out)?;
     out.push_str(&definitions);
     Ok(out)
 }
@@ -1277,8 +1277,22 @@ fn validate_block(
     Ok(returned)
 }
 
+/// A Boolean array whose storage this scope owns and must free.
+///
+/// Strict about the binding mode, because it answers ownership questions:
+/// which declarations allocate, which enter the cleanup registry, and which
+/// call the free hook.
 fn is_owned_bool_array(ty: &Ty) -> bool {
     ty.is_owned_array_of(&Ty::Bool)
+}
+
+/// A Boolean array in any binding mode.
+///
+/// Borrow-transparent, because it answers representation questions: the
+/// descriptor an owner and a borrow both carry, and the element bytes both
+/// address. The `u32` pair below is the same distinction.
+fn is_bool_array(ty: &Ty) -> bool {
+    ty.is_array_of(&Ty::Bool)
 }
 
 fn is_owned_u32_array(ty: Ty) -> bool {
@@ -1291,6 +1305,11 @@ fn is_u32_array(ty: &Ty) -> bool {
 
 fn is_owned_native_array(ty: &Ty) -> bool {
     is_owned_bool_array(&ty.clone()) || is_owned_u32_array(ty.clone())
+}
+
+/// An array the backend has a descriptor for, in any binding mode.
+fn is_native_array(ty: &Ty) -> bool {
+    is_bool_array(ty) || is_u32_array(ty)
 }
 
 fn require_fixed_class<'a>(
@@ -1585,13 +1604,13 @@ fn validate_moving_arguments(
             class_borrow if class_borrow.as_class_borrow().is_some() => {
                 validate_class_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
             }
-            array_borrow
-                if matches!(
-                    array_borrow.as_array_borrow(),
-                    Some((&Ty::Int(IntTy::U32), _))
-                ) =>
-            {
-                validate_u32_array_borrow_argument(program, argument, parameter.ty.clone(), locals)?
+            array_borrow if array_borrow.as_array_borrow().is_some() => {
+                validate_native_array_borrow_argument(
+                    program,
+                    argument,
+                    parameter.ty.clone(),
+                    locals,
+                )?
             }
             _ => {
                 validate_expr(program, argument, root_span_end, locals)?;
@@ -1656,11 +1675,8 @@ fn validate_call_arguments(
     for (argument, parameter) in args.iter().zip(&function.params) {
         if parameter.ty.as_class_borrow().is_some() {
             validate_class_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
-        } else if matches!(
-            parameter.ty.as_array_borrow(),
-            Some((&Ty::Int(IntTy::U32), _))
-        ) {
-            validate_u32_array_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
+        } else if parameter.ty.as_array_borrow().is_some() {
+            validate_native_array_borrow_argument(program, argument, parameter.ty.clone(), locals)?;
         } else {
             validate_expr(program, argument, root_span_end, locals)?;
             require_expr_type(argument, parameter.ty.clone(), "call argument")?;
@@ -2125,9 +2141,7 @@ fn validate_native_array_store(
             format!("array store names unknown or out-of-scope local `{array}`"),
         )]);
     };
-    if !is_owned_native_array(&local.ty)
-        && local.ty != Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut)
-    {
+    if !is_native_array(&local.ty) {
         return Err(vec![unsupported(
             array_span,
             format!(
@@ -2136,15 +2150,27 @@ fn validate_native_array_store(
             ),
         )]);
     }
-    if is_owned_native_array(&local.ty) && !local.mutable {
-        return Err(vec![unsupported(
-            array_span,
-            format!("array store targets immutable owned array `{array}`"),
-        )]);
+    // Writing needs the exclusive right to the storage, whichever way the
+    // place is bound: a `mut` owner has it, a unique borrow has it, and a
+    // shared borrow's whole promise is that it does not.
+    match local.ty.binding_mode() {
+        BindingMode::Owned if !local.mutable => {
+            return Err(vec![unsupported(
+                array_span,
+                format!("array store targets immutable owned array `{array}`"),
+            )]);
+        }
+        BindingMode::Shared => {
+            return Err(vec![unsupported(
+                array_span,
+                format!("array store targets shared borrow `{array}`"),
+            )]);
+        }
+        BindingMode::Owned | BindingMode::Mut => {}
     }
     validate_expr(program, index, root_span_end, locals)?;
     require_expr_type(index, Ty::Int(IntTy::U64), "array store index")?;
-    if is_owned_bool_array(&local.ty) {
+    if is_bool_array(&local.ty) {
         validate_bool_expr(
             program,
             value,
@@ -2158,22 +2184,27 @@ fn validate_native_array_store(
     }
 }
 
-fn validate_u32_array_borrow_argument(
+fn validate_native_array_borrow_argument(
     program: &Program,
     argument: &Expr,
     expected: Ty,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let Some((&Ty::Int(IntTy::U32), _)) = expected.as_array() else {
-        unreachable!("called only for a checked `u32` array borrow parameter")
+    let Some((element, _)) = expected.as_array() else {
+        return Err(vec![unsupported(
+            argument.span,
+            "array borrow parameter has no checked element type",
+        )]);
     };
+    let element = element.clone();
     let Some((_, expected_mutability)) = expected.as_array_borrow() else {
         return Err(vec![unsupported(
             argument.span,
             "owned arrays cannot cross an LLVM call boundary",
         )]);
     };
-    require_expr_type(argument, expected, "`u32` array borrow argument")?;
+    let element_name = element.name();
+    require_expr_type(argument, expected, "array borrow argument")?;
     let ExprKind::Borrow {
         array,
         field,
@@ -2182,7 +2213,7 @@ fn validate_u32_array_borrow_argument(
     else {
         return Err(vec![unsupported(
             argument.span,
-            "borrowed `u32` array parameters require an explicit named borrow",
+            format!("borrowed `{element_name}` array parameters require an explicit named borrow"),
         )]);
     };
     let requested = if *mutable {
@@ -2213,7 +2244,7 @@ fn validate_u32_array_borrow_argument(
         }
         let (_, _, field_ty) =
             validate_fixed_class_field_base(program, locals, array, field, argument.span)?;
-        if field_ty != Ty::array(Ty::Int(IntTy::U32)) {
+        if element != Ty::Int(IntTy::U32) || field_ty != Ty::array(Ty::Int(IntTy::U32)) {
             return Err(vec![diag(
                 "backend.class_unsupported",
                 "array field borrow has the wrong native type",
@@ -2223,12 +2254,21 @@ fn validate_u32_array_borrow_argument(
         }
         return Ok(());
     }
-    let Some((&Ty::Int(IntTy::U32), source_mutability)) = source.ty.as_array() else {
+    let Some((source_element, source_mutability)) = source.ty.as_array() else {
         return Err(vec![unsupported(
             argument.span,
-            format!("array borrow source `{array}` is not a native `u32` array"),
+            format!("array borrow source `{array}` is not a native array"),
         )]);
     };
+    if source_element != &element {
+        return Err(vec![unsupported(
+            argument.span,
+            format!(
+                "array borrow source `{array}` holds `{}` elements, not `{element_name}`",
+                source_element.name()
+            ),
+        )]);
+    }
     if *mutable
         && (source_mutability == BindingMode::Shared
             || (source_mutability == BindingMode::Owned && !source.mutable))
@@ -2867,7 +2907,7 @@ fn validate_expr(
                     local.ty,
                 )]);
             }
-            if !is_owned_bool_array(&local.ty) && !is_u32_array(&local.ty) {
+            if !is_native_array(&local.ty) {
                 return Err(vec![unsupported(
                     *array_span,
                     format!(
@@ -2878,7 +2918,7 @@ fn validate_expr(
             }
             validate_expr(program, index, root_span_end, locals)?;
             require_expr_type(index, Ty::Int(IntTy::U64), "array index")?;
-            let element_ty = if is_owned_bool_array(&local.ty) {
+            let element_ty = if is_bool_array(&local.ty) {
                 Ty::Bool
             } else {
                 Ty::Int(IntTy::U32)
@@ -2899,7 +2939,7 @@ fn validate_expr(
                     local.ty,
                 )]);
             }
-            if !is_owned_bool_array(&local.ty) && !is_u32_array(&local.ty) {
+            if !is_native_array(&local.ty) {
                 return Err(vec![unsupported(
                     expression.span,
                     format!(
@@ -3239,7 +3279,16 @@ pub(crate) fn require_parameter_value(
     match ty {
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
-        ref borrowed if matches!(borrowed.as_array_borrow(), Some((&Ty::Int(IntTy::U32), _))) => {
+        // A borrowed array is its descriptor, passed by value. The callee
+        // cannot change the length or the allocation, so a `&mut` callee's
+        // element writes reach the caller's storage through the shared data
+        // pointer and need no write-back.
+        ref borrowed
+            if matches!(
+                borrowed.as_array_borrow(),
+                Some((&Ty::Int(IntTy::U32), _)) | Some((&Ty::Bool, _))
+            ) =>
+        {
             Ok(())
         }
         Ty::Class(class) => {
@@ -3279,7 +3328,7 @@ pub(crate) fn require_parameter_value(
         _ => Err(vec![unsupported(
             span,
             format!(
-                "{role} type `{}` has no LLVM value representation; the backend lowers concrete integers, `bool`, borrowed `u32` arrays, fixed-owner classes, and integer-field records as values",
+                "{role} type `{}` has no LLVM value representation; the backend lowers concrete integers, `bool`, borrowed `u32` and `bool` arrays, fixed-owner classes, and integer-field records as values",
                 ty.name()
             ),
         )]),
@@ -3470,13 +3519,20 @@ impl ModuleSupport {
         self.records.insert(record);
     }
 
-    fn emit_record_type(record: usize, declaration: &RecordDecl, out: &mut String) {
-        let fields = declaration
-            .fields
-            .iter()
-            .map(|field| llvm_ty(field.ty.clone()))
-            .collect::<Vec<_>>()
-            .join(", ");
+    fn emit_record_type(
+        record: usize,
+        declaration: &RecordDecl,
+        out: &mut String,
+    ) -> Result<(), Vec<BackendError>> {
+        let mut fields = Vec::with_capacity(declaration.fields.len());
+        for field in &declaration.fields {
+            fields.push(require_llvm_ty(
+                field.ty.clone(),
+                field.span,
+                &format!("field `{}.{}`", declaration.name, field.name),
+            )?);
+        }
+        let fields = fields.join(", ");
         // This is an ordinary-value carrier only. It does not encode the
         // source record's explicit raw-storage offsets, padding, or pointer
         // geometry and therefore grants no CRepr/BitwiseRepr promise.
@@ -3490,9 +3546,10 @@ impl ModuleSupport {
             format!("{{ {fields} }}")
         };
         out.push_str(&format!("{} = type {body}\n\n", llvm_record_ty(record)));
+        Ok(())
     }
 
-    fn emit(&self, program: &Program, out: &mut String) {
+    fn emit(&self, program: &Program, out: &mut String) -> Result<(), Vec<BackendError>> {
         if self.needs_option_bool {
             out.push_str(LLVM_OPTION_BOOL);
             out.push_str(" = type { i8, i8 }\n\n");
@@ -3521,19 +3578,23 @@ impl ModuleSupport {
                 "; internal fixed-owner semantic value for class `{}`; not a public ABI\n",
                 program.classes[*class].name
             ));
-            let fields = program.classes[*class]
-                .fields
-                .iter()
-                .map(|field| llvm_ty(field.ty.clone()))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let declaration = &program.classes[*class];
+            let mut fields = Vec::with_capacity(declaration.fields.len());
+            for field in &declaration.fields {
+                fields.push(require_llvm_ty(
+                    field.ty.clone(),
+                    field.span,
+                    &format!("field `{}.{}`", declaration.name, field.name),
+                )?);
+            }
+            let fields = fields.join(", ");
             out.push_str(&format!(
                 "{} = type {{ {fields} }}\n\n",
                 llvm_class_ty(*class)
             ));
         }
         for record in &self.records {
-            Self::emit_record_type(*record, &program.records[*record], out);
+            Self::emit_record_type(*record, &program.records[*record], out)?;
         }
         for intrinsic in &self.overflow_intrinsics {
             out.push_str(&intrinsic.declaration());
@@ -3569,6 +3630,7 @@ impl ModuleSupport {
         } else if !self.overflow_intrinsics.is_empty() {
             out.push('\n');
         }
+        Ok(())
     }
 }
 
@@ -3675,13 +3737,15 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         for ty in parameter_types {
             self.require_type_support(ty);
         }
-        let explicit_parameters = self
-            .function
-            .params
-            .iter()
-            .enumerate()
-            .map(|(index, parameter)| format!("{} %p{index}", llvm_ty(parameter.ty.clone())))
-            .collect::<Vec<_>>();
+        let mut explicit_parameters = Vec::with_capacity(self.function.params.len());
+        for (index, parameter) in self.function.params.iter().enumerate() {
+            let ty = require_llvm_ty(
+                parameter.ty.clone(),
+                parameter.span,
+                &format!("parameter `{}`", parameter.name),
+            )?;
+            explicit_parameters.push(format!("{ty} %p{index}"));
+        }
         let implicit_parameter = self
             .initializer_class
             .or(self.method.map(|(class, _)| class))
@@ -3697,18 +3761,19 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         } else {
             explicit_parameters.join(", ")
         };
-        let symbol = self
-            .initializer_class
-            .map(|class| mangle_initializer(class, self.function))
-            .or_else(|| {
-                self.method
-                    .map(|(class, _)| mangle_method(class, self.function))
-            })
-            .unwrap_or_else(|| mangle(self.function));
+        let symbol = match (self.initializer_class, self.method) {
+            (Some(class), _) => mangle_initializer(class, self.function)?,
+            (None, Some((class, _))) => mangle_method(class, self.function)?,
+            (None, None) => mangle(self.function)?,
+        };
         let return_ty = if matches!(self.function.ret, Ty::Class(_)) {
             "void".to_string()
         } else {
-            llvm_ty(self.function.ret.clone())
+            require_llvm_ty(
+                self.function.ret.clone(),
+                self.function.name_span,
+                &format!("the return type of `{}`", self.function.name),
+            )?
         };
         out.push_str(&format!(
             "define internal {} @{symbol}({parameters}) {{\nentry:\n",
@@ -3728,8 +3793,13 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         collect_local_declarations(&self.function.body, &mut declarations);
         for (name, ty) in parameters.iter().chain(declarations.iter()) {
             self.require_type_support(ty.clone());
+            let slot_ty = require_llvm_ty(
+                ty.clone(),
+                self.function.name_span,
+                &format!("local `{name}`"),
+            )?;
             let slot = self.new_slot();
-            self.instruction(format!("{slot} = alloca {}", llvm_ty(ty.clone())));
+            self.instruction(format!("{slot} = alloca {slot_ty}"));
             self.locals.insert(
                 name.clone(),
                 Local {
@@ -3760,10 +3830,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 .expect("parameter slot was preallocated")
                 .slot
                 .clone();
-            self.instruction(format!(
-                "store {} %p{index}, ptr {slot}",
-                llvm_ty(ty.clone())
-            ));
+            let stored = require_llvm_ty(
+                ty.clone(),
+                self.function.name_span,
+                &format!("parameter `{name}`"),
+            )?;
+            self.instruction(format!("store {stored} %p{index}, ptr {slot}"));
             if let Ty::Class(class) = ty {
                 self.cleanup_scopes[0].push(OwnedCleanup::FixedClass(name.clone(), *class));
             }
@@ -3803,7 +3875,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             Ty::Option(payload) if payload.as_ref() == &Ty::Bool => {
                 self.support.require_option_bool()
             }
-            ty if is_owned_bool_array(&ty.clone()) => self.support.require_array_bool(),
+            ty if is_bool_array(&ty.clone()) => self.support.require_array_bool(),
             ty if is_u32_array(&ty.clone()) => self.support.require_array_u32(),
             ty if is_affine_bool_option(&ty.clone()) => {
                 self.support.require_affine_option_bool_array()
@@ -3865,9 +3937,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         continue;
                     }
                     let emitted = self.emit_expr(value)?;
+                    let stored =
+                        require_llvm_ty(ty, value.span, &format!("assignment to `{name}`"))?;
                     self.instruction(format!(
-                        "store {} {}, ptr {}",
-                        llvm_ty(ty),
+                        "store {stored} {}, ptr {}",
                         emitted.operand.expect("assignment value is non-unit"),
                         slot
                     ));
@@ -3902,10 +3975,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                             self.emit_all_cleanups();
                             self.terminate("ret void");
                         } else {
+                            let returned = require_llvm_ty(
+                                emitted.ty,
+                                self.function.name_span,
+                                &format!("the return value of `{}`", self.function.name),
+                            )?;
                             self.emit_all_cleanups();
                             self.terminate(format!(
-                                "ret {} {}",
-                                llvm_ty(emitted.ty),
+                                "ret {returned} {}",
                                 emitted.operand.expect("non-unit return value")
                             ));
                         }
@@ -3937,7 +4014,12 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     value,
                     ..
                 } => self.emit_native_array_store(array, index, value)?,
-                Stmt::FieldAssign { field, value, .. } => {
+                Stmt::FieldAssign {
+                    field,
+                    field_span,
+                    value,
+                    ..
+                } => {
                     let class = self
                         .initializer_class
                         .or(self.method.map(|(class, _)| class))
@@ -3957,9 +4039,13 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         }
                         Ty::Int(_) => {
                             let value = self.emit_expr(value)?;
+                            let stored = require_llvm_ty(
+                                field_ty,
+                                *field_span,
+                                &format!("class field `{field}`"),
+                            )?;
                             self.instruction(format!(
-                                "store {} {}, ptr {field_slot}",
-                                llvm_ty(field_ty),
+                                "store {stored} {}, ptr {field_slot}",
                                 value.operand.expect("scalar class field assignment")
                             ));
                         }
@@ -4014,9 +4100,13 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             } else {
                 self.emit_expr(init)?
             };
+            let stored = require_llvm_ty(
+                ty.clone(),
+                init.span,
+                &format!("the initializer of local `{name}`"),
+            )?;
             self.instruction(format!(
-                "store {} {}, ptr {slot}",
-                llvm_ty(ty.clone()),
+                "store {stored} {}, ptr {slot}",
                 value.operand.expect("local initializer is non-unit")
             ));
             if is_owned_bool_array(&ty.clone()) {
@@ -4139,7 +4229,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         lowered.extend(self.emit_call_arguments(&initializer.params, args)?);
         self.instruction(format!(
             "call void @{}({})",
-            mangle_initializer(class, initializer),
+            mangle_initializer(class, initializer)?,
             lowered.join(", ")
         ));
         Ok(())
@@ -4165,7 +4255,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 lowered.extend(self.emit_call_arguments(&function.params, args)?);
                 self.instruction(format!(
                     "call void @{}({})",
-                    mangle(function),
+                    mangle(function)?,
                     lowered.join(", ")
                 ));
                 Ok(())
@@ -4212,9 +4302,13 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             } else {
                 self.emit_expr(argument)?
             };
+            let passed = require_llvm_ty(
+                parameter.ty.clone(),
+                argument.span,
+                &format!("argument for parameter `{}`", parameter.name),
+            )?;
             lowered.push(format!(
-                "{} {}",
-                llvm_ty(parameter.ty.clone()),
+                "{passed} {}",
                 value.operand.expect("call argument is non-unit")
             ));
         }
@@ -4727,7 +4821,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .expect("validated native array local")
             .ty
             .clone();
-        if is_owned_bool_array(&ty) {
+        if is_bool_array(&ty) {
             return self.emit_bool_array_store(array, index, value);
         }
         self.emit_u32_array_store(array, index, value)
@@ -5017,7 +5111,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 let ty = local.ty.clone();
                 let slot = local.slot.clone();
                 let temp = self.new_temp();
-                self.instruction(format!("{temp} = load {}, ptr {slot}", llvm_ty(ty.clone())));
+                let loaded =
+                    require_llvm_ty(ty.clone(), expression.span, &format!("local `{name}`"))?;
+                self.instruction(format!("{temp} = load {loaded}, ptr {slot}"));
                 Ok(Value {
                     ty,
                     operand: Some(temp),
@@ -5031,7 +5127,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .operand
                     .expect("validated Boolean array index");
                 let ty = self.locals[array].ty.clone();
-                if is_owned_bool_array(&ty) {
+                if is_bool_array(&ty) {
                     let (ptr, len) = self.load_bool_array_parts(array);
                     self.emit_bool_array_bounds_guard(&index, &len);
                     let address = self.new_temp();
@@ -5063,7 +5159,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             }
             ExprKind::Len { array } => {
                 let ty = self.locals[array].ty.clone();
-                let (_, len) = if is_owned_bool_array(&ty) {
+                let (_, len) = if is_bool_array(&ty) {
                     self.load_bool_array_parts(array)
                 } else {
                     self.load_u32_array_parts(array)
@@ -5102,11 +5198,13 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             }
             ExprKind::ClassField { obj, field, .. } => {
                 let (field_ty, field_slot) = self.class_field_slot(obj, field);
+                let loaded = require_llvm_ty(
+                    field_ty.clone(),
+                    expression.span,
+                    &format!("class field `{field}`"),
+                )?;
                 let value = self.new_temp();
-                self.instruction(format!(
-                    "{value} = load {}, ptr {field_slot}",
-                    llvm_ty(field_ty.clone())
-                ));
+                self.instruction(format!("{value} = load {loaded}, ptr {field_slot}"));
                 Ok(Value {
                     ty: field_ty,
                     operand: Some(value),
@@ -5114,11 +5212,13 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             }
             ExprKind::SelfField { field } => {
                 let (field_ty, field_slot) = self.class_field_slot("self", field);
+                let loaded = require_llvm_ty(
+                    field_ty.clone(),
+                    expression.span,
+                    &format!("class field `{field}`"),
+                )?;
                 let value = self.new_temp();
-                self.instruction(format!(
-                    "{value} = load {}, ptr {field_slot}",
-                    llvm_ty(field_ty.clone())
-                ));
+                self.instruction(format!("{value} = load {loaded}, ptr {field_slot}"));
                 Ok(Value {
                     ty: field_ty,
                     operand: Some(value),
@@ -5144,10 +5244,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 let mut aggregate = "zeroinitializer".to_string();
                 for (index, (argument, field)) in args.iter().zip(&declaration.fields).enumerate() {
                     let value = self.emit_expr(argument)?;
+                    let field_ty = require_llvm_ty(
+                        field.ty.clone(),
+                        argument.span,
+                        &format!("record field `{}`", field.name),
+                    )?;
                     let next = self.new_temp();
                     self.instruction(format!(
-                        "{next} = insertvalue {record_ty} {aggregate}, {} {}, {index}",
-                        llvm_ty(field.ty.clone()),
+                        "{next} = insertvalue {record_ty} {aggregate}, {field_ty} {}, {index}",
                         value.operand.expect("validated record field value")
                     ));
                     aggregate = next;
@@ -5332,10 +5436,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .find(|function| function.name == *callee)
                     .expect("validated callee");
                 let lowered = self.emit_call_arguments(&function.params, args)?;
+                let returned = require_llvm_ty(
+                    function.ret.clone(),
+                    expression.span,
+                    &format!("the return type of `{}`", function.name),
+                )?;
                 let call = format!(
-                    "call {} @{}({})",
-                    llvm_ty(function.ret.clone()),
-                    mangle(function),
+                    "call {returned} @{}({})",
+                    mangle(function)?,
                     lowered.join(", ")
                 );
                 if function.ret == Ty::Unit {
@@ -5366,7 +5474,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .expect("validated native method");
                 self.instruction(format!(
                     "call void @{}(ptr {receiver})",
-                    mangle_method(class, &method.f)
+                    mangle_method(class, &method.f)?
                 ));
                 Ok(Value {
                     ty: Ty::Unit,
@@ -5399,14 +5507,17 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 } else {
                     self.locals
                         .get(array)
-                        .expect("validated named `u32` array borrow")
+                        .expect("validated named array borrow")
                         .slot
                         .clone()
                 };
+                let borrowed = expression.ty.clone().expect("validated borrow type");
+                let descriptor_ty =
+                    require_llvm_ty(borrowed.clone(), expression.span, "array borrow")?;
                 let descriptor = self.new_temp();
-                self.instruction(format!("{descriptor} = load {LLVM_ARRAY_U32}, ptr {slot}"));
+                self.instruction(format!("{descriptor} = load {descriptor_ty}, ptr {slot}"));
                 Ok(Value {
-                    ty: expression.ty.clone().expect("validated borrow type"),
+                    ty: borrowed,
                     operand: Some(descriptor),
                 })
             }
@@ -5440,10 +5551,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     BinOp::Ge => "uge",
                     _ => unreachable!("comparison operator validated above"),
                 };
+                let compared = require_llvm_ty(lhs.ty, expression.span, "comparison operand")?;
                 let temp = self.new_temp();
                 self.instruction(format!(
-                    "{temp} = icmp {predicate} {} {}, {}",
-                    llvm_ty(lhs.ty),
+                    "{temp} = icmp {predicate} {compared} {}, {}",
                     lhs.operand.expect("integer comparison lhs"),
                     rhs.operand.expect("integer comparison rhs")
                 ));
@@ -5506,8 +5617,8 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     let extension = if source.signed() { "sext" } else { "zext" };
                     self.instruction(format!(
                         "{temp} = {extension} {} {operand} to {}",
-                        llvm_ty(Ty::Int(source)),
-                        llvm_ty(Ty::Int(*target))
+                        integer_llvm_ty(source),
+                        integer_llvm_ty(*target)
                     ));
                     Ok(Value {
                         ty: Ty::Int(*target),
@@ -5544,7 +5655,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     ) -> Result<Value, Vec<BackendError>> {
         let intrinsic = OverflowIntrinsic::for_binary(operator, integer);
         self.support.require_overflow(intrinsic);
-        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let llvm_integer = integer_llvm_ty(integer);
         let pair = self.new_temp();
         self.instruction(format!(
             "{pair} = call {{ {llvm_integer}, i1 }} @{}({llvm_integer} {lhs}, \
@@ -5586,7 +5697,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     ) -> Result<Value, Vec<BackendError>> {
         let intrinsic = OverflowIntrinsic::signed_sub(integer);
         self.support.require_overflow(intrinsic);
-        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let llvm_integer = integer_llvm_ty(integer);
         let pair = self.new_temp();
         self.instruction(format!(
             "{pair} = call {{ {llvm_integer}, i1 }} @{}({llvm_integer} 0, \
@@ -5623,7 +5734,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         rhs: String,
     ) -> Result<Value, Vec<BackendError>> {
         self.support.require_trap();
-        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let llvm_integer = integer_llvm_ty(integer);
 
         // LLVM division by zero is immediate undefined behavior.  This guard
         // dominates every `*div`/`*rem` instruction emitted below.
@@ -5730,7 +5841,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         remainder: String,
         divisor: &str,
     ) -> String {
-        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let llvm_integer = integer_llvm_ty(integer);
         let remainder_negative = self.new_temp();
         self.instruction(format!(
             "{remainder_negative} = icmp slt {llvm_integer} {remainder}, 0"
@@ -5767,7 +5878,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         remainder: String,
         divisor: &str,
     ) -> String {
-        let llvm_integer = llvm_ty(Ty::Int(integer));
+        let llvm_integer = integer_llvm_ty(integer);
         let remainder_negative = self.new_temp();
         self.instruction(format!(
             "{remainder_negative} = icmp slt {llvm_integer} {remainder}, 0"
@@ -5804,7 +5915,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         operand: String,
     ) -> Result<Value, Vec<BackendError>> {
         self.support.require_trap();
-        let source_ty = llvm_ty(Ty::Int(source));
+        let source_ty = integer_llvm_ty(source);
         let extension = if source.signed() { "sext" } else { "zext" };
         let wide = self.new_temp();
         self.instruction(format!(
@@ -5820,7 +5931,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         let result = self.new_temp();
         self.instruction(format!(
             "{result} = trunc i128 {wide} to {}",
-            llvm_ty(Ty::Int(target))
+            integer_llvm_ty(target)
         ));
         Ok(Value {
             ty: Ty::Int(target),
@@ -5888,7 +5999,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             let temp = self.new_temp();
             self.instruction(format!(
                 "{temp} = zext {} {operand} to i64",
-                llvm_ty(Ty::Int(integer))
+                integer_llvm_ty(integer)
             ));
             temp
         }
@@ -6054,29 +6165,57 @@ fn collect_assignment_targets(statements: &[Stmt], targets: &mut BTreeSet<String
     }
 }
 
-fn emit_main_bridge(function: &Fn, out: &mut String) {
+fn emit_main_bridge(function: &Fn, out: &mut String) -> Result<(), Vec<BackendError>> {
+    let symbol = mangle(function)?;
     out.push_str("define i32 @main() {\nentry:\n");
     if function.ret == Ty::Unit {
-        out.push_str(&format!(
-            "  call void @{}()\n  ret i32 0\n",
-            mangle(function)
-        ));
+        out.push_str(&format!("  call void @{symbol}()\n  ret i32 0\n"));
     } else {
         out.push_str(&format!(
-            "  %result = call i32 @{}()\n  ret i32 %result\n",
-            mangle(function)
+            "  %result = call i32 @{symbol}()\n  ret i32 %result\n"
         ));
     }
     out.push_str("}\n");
+    Ok(())
 }
 
-pub(crate) fn llvm_ty(ty: Ty) -> String {
-    match ty {
+/// The name of the disagreement between a backend gate and a backend
+/// lowering: the gate admitted a shape the lowering has no spelling for.
+///
+/// It is `internal.` because no source program reaches it — the `require_*`
+/// gates refuse first, under their own names and with their own spans. What
+/// it buys is that when the two do disagree, the compile ends in a
+/// diagnostic naming the shape and pointing at the declaration, rather than
+/// in a process abort that says neither.
+const LOWERING_GAP: &str = "internal.backend.type_lowering";
+
+fn lowering_gap(span: Span, role: &str, ty: &Ty, what: &str) -> BackendError {
+    diag(
+        LOWERING_GAP,
+        format!("no LLVM {what} for a shape the backend admitted"),
+        span,
+        format!(
+            "{role} has type `{}`, which a backend gate accepted and the {what} lowering cannot spell",
+            ty.name()
+        ),
+    )
+}
+
+/// The LLVM value type for a shape, or `None` for one the backend does not
+/// represent.
+///
+/// Total, so that the answer for an unrepresented shape is a value rather
+/// than a panic. `require_llvm_ty` turns that answer into a spanned
+/// diagnostic; the `require_*` gates are what a source program actually
+/// meets.
+pub(crate) fn llvm_ty(ty: Ty) -> Option<String> {
+    Some(match ty {
+        Ty::Int(IntTy::TParam(_)) => return None,
         Ty::Int(integer) => format!("i{}", integer.bits()),
         Ty::Bool => "i1".into(),
         Ty::Unit => "void".into(),
         Ty::Option(payload) if payload.as_ref() == &Ty::Bool => LLVM_OPTION_BOOL.into(),
-        ty if is_owned_bool_array(&ty.clone()) => LLVM_ARRAY_BOOL.into(),
+        ty if is_bool_array(&ty.clone()) => LLVM_ARRAY_BOOL.into(),
         ty if is_u32_array(&ty.clone()) => LLVM_ARRAY_U32.into(),
         ty if is_affine_bool_option(&ty.clone()) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
         Ty::Class(class) => llvm_class_ty(class),
@@ -6085,11 +6224,21 @@ pub(crate) fn llvm_ty(ty: Ty) -> String {
         // the two (see `type_code`).
         ref borrowed if borrowed.as_class_borrow().is_some() => "ptr".into(),
         Ty::Record(record) => llvm_record_ty(record),
-        ty if ty.is_affine_option() => {
-            unreachable!("affine option escaped LLVM validation into type lowering")
-        }
-        _ => unreachable!("type without an LLVM runtime representation validated out"),
-    }
+        _ => return None,
+    })
+}
+
+fn require_llvm_ty(ty: Ty, span: Span, role: &str) -> Result<String, Vec<BackendError>> {
+    llvm_ty(ty.clone()).ok_or_else(|| vec![lowering_gap(span, role, &ty, "value type")])
+}
+
+/// The LLVM type of a checked integer width.
+///
+/// Concrete widths only, the same post-monomorphization contract `IntTy::bits`
+/// and `integer_type_code` carry: `require_concrete_integer` is the gate that
+/// keeps an unsubstituted parameter from reaching any of the three.
+fn integer_llvm_ty(integer: IntTy) -> String {
+    format!("i{}", integer.bits())
 }
 
 fn integer_type_code(integer: IntTy) -> u32 {
@@ -6112,8 +6261,10 @@ fn packed_type_info(result: IntTy, lhs: IntTy, rhs: Option<IntTy>) -> u32 {
         | (rhs.map(integer_type_code).unwrap_or(0) << 16)
 }
 
-pub(crate) fn type_code(ty: Ty) -> String {
-    match ty {
+/// The mangled component for a shape, or `None` for one the backend does not
+/// name in a symbol. Total for the same reason `llvm_ty` is.
+pub(crate) fn type_code(ty: Ty) -> Option<String> {
+    Some(match ty {
         Ty::Int(IntTy::U8) => "u8".into(),
         Ty::Int(IntTy::U16) => "u16".into(),
         Ty::Int(IntTy::U32) => "u32".into(),
@@ -6129,14 +6280,19 @@ pub(crate) fn type_code(ty: Ty) -> String {
         // two functions differing only in a parameter's borrow mutability are
         // two different native entry points.
         ref borrowed
-            if borrowed.as_array_borrow() == Some((&Ty::Int(IntTy::U32), Mutability::Shared)) =>
+            if matches!(
+                borrowed.as_array_borrow(),
+                Some((&Ty::Int(IntTy::U32), _)) | Some((&Ty::Bool, _))
+            ) =>
         {
-            "au32s".into()
-        }
-        ref borrowed
-            if borrowed.as_array_borrow() == Some((&Ty::Int(IntTy::U32), Mutability::Mut)) =>
-        {
-            "au32m".into()
+            let (element, mutability) = borrowed
+                .as_array_borrow()
+                .expect("the arm's guard already matched this shape");
+            let mutability = match mutability {
+                Mutability::Shared => "s",
+                Mutability::Mut => "m",
+            };
+            format!("a{}{mutability}", type_code(element.clone())?)
         }
         ref borrowed if borrowed.as_class_borrow().is_some() => {
             let (class, mutability) = borrowed
@@ -6149,56 +6305,65 @@ pub(crate) fn type_code(ty: Ty) -> String {
         }
         Ty::Class(class) => format!("c{class}o"),
         Ty::Record(record) => format!("r{record}"),
-        ty if ty.is_affine_option() => {
-            unreachable!("affine option escaped LLVM validation into symbol mangling")
-        }
-        _ => unreachable!("type without an LLVM runtime representation validated out"),
-    }
+        _ => return None,
+    })
 }
 
-fn mangle(function: &Fn) -> String {
-    let params = function
-        .params
-        .iter()
-        .map(|parameter| type_code(parameter.ty.clone()))
-        .collect::<Vec<_>>()
-        .join("_");
-    format!(
+/// The mangled components of a signature, or the first shape that has none.
+fn signature_codes(function: &Fn, ret: Option<&Ty>) -> Result<(String, String), Vec<BackendError>> {
+    let mut params = Vec::with_capacity(function.params.len());
+    for parameter in &function.params {
+        let code = type_code(parameter.ty.clone()).ok_or_else(|| {
+            vec![lowering_gap(
+                parameter.span,
+                &format!("parameter `{}`", parameter.name),
+                &parameter.ty,
+                "symbol type code",
+            )]
+        })?;
+        params.push(code);
+    }
+    let ret = match ret {
+        Some(ret) => type_code(ret.clone()).ok_or_else(|| {
+            vec![lowering_gap(
+                function.name_span,
+                &format!("the return type of `{}`", function.name),
+                ret,
+                "symbol type code",
+            )]
+        })?,
+        None => String::new(),
+    };
+    Ok((params.join("_"), ret))
+}
+
+fn mangle(function: &Fn) -> Result<String, Vec<BackendError>> {
+    let (params, ret) = signature_codes(function, Some(&function.ret))?;
+    Ok(format!(
         "__sable_v0_f_{}_{}__p_{}__r_{}",
         function.name.len(),
         function.name,
         params,
-        type_code(function.ret.clone())
-    )
+        ret
+    ))
 }
 
-fn mangle_initializer(class: usize, initializer: &Fn) -> String {
-    let params = initializer
-        .params
-        .iter()
-        .map(|parameter| type_code(parameter.ty.clone()))
-        .collect::<Vec<_>>()
-        .join("_");
-    format!(
+fn mangle_initializer(class: usize, initializer: &Fn) -> Result<String, Vec<BackendError>> {
+    let (params, _) = signature_codes(initializer, None)?;
+    Ok(format!(
         "__sable_v0_c{class}_i_{}_{}__p_{params}",
         initializer.name.len(),
         initializer.name
-    )
+    ))
 }
 
-fn mangle_method(class: usize, method: &Fn) -> String {
-    let params = method
-        .params
-        .iter()
-        .map(|parameter| type_code(parameter.ty.clone()))
-        .collect::<Vec<_>>()
-        .join("_");
-    format!(
-        "__sable_v0_c{class}_m_{}_{}__p_{params}__r_{}",
+fn mangle_method(class: usize, method: &Fn) -> Result<String, Vec<BackendError>> {
+    let (params, ret) = signature_codes(method, Some(&method.ret))?;
+    Ok(format!(
+        "__sable_v0_c{class}_m_{}_{}__p_{params}__r_{ret}",
         method.name.len(),
-        method.name,
-        type_code(method.ret.clone())
-    )
+        method.name
+    ))
 }
 
 fn collect_calls_block(statements: &[Stmt], calls: &mut Vec<(String, Span)>) {
@@ -8011,6 +8176,35 @@ mod tests {
     }
 
     #[test]
+    fn the_type_lowerings_answer_every_shape_and_name_the_ones_they_cannot_spell() {
+        // A resource is representable, gated out of the backend by name, and
+        // has no native spelling — so it is what the lowerings must answer
+        // `None` for rather than abort on.
+        let outside = Ty::Res(crate::ast::ResKind::OpenFile);
+        assert_eq!(llvm_ty(outside.clone()), None);
+        assert_eq!(type_code(outside.clone()), None);
+
+        let span = Span::new(11, 17);
+        let error = require_llvm_ty(outside, span, "parameter `handle`").unwrap_err();
+        assert_eq!(error.len(), 1);
+        assert_eq!(error[0].name, "internal.backend.type_lowering");
+        assert_eq!(error[0].span, span);
+        assert!(error[0].label.contains("parameter `handle`"));
+
+        // Every shape the gates do admit still lowers, which is what keeps
+        // that diagnostic unreachable from a source program.
+        assert_eq!(llvm_ty(Ty::Bool).as_deref(), Some("i1"));
+        assert_eq!(
+            llvm_ty(Ty::array_ref(Ty::Bool, Mutability::Mut)).as_deref(),
+            Some(LLVM_ARRAY_BOOL)
+        );
+        assert_eq!(
+            type_code(Ty::array_ref(Ty::Bool, Mutability::Mut)).as_deref(),
+            Some("abm")
+        );
+    }
+
+    #[test]
     fn u32_array_backend_revalidates_borrow_positions_capabilities_and_aliases() {
         let owned = u32_array_ty(BindingMode::Owned);
         let shared = u32_array_ty(BindingMode::Shared);
@@ -8125,7 +8319,7 @@ mod tests {
         shared_store.params = vec![parameter("values", shared)];
         let error =
             emit_program(&program(vec![shared_store]), 1, &EmitOptions::default()).unwrap_err();
-        assert!(error[0].label.contains("unsupported LLVM type"));
+        assert!(error[0].label.contains("shared borrow"));
     }
 
     #[test]
@@ -8311,12 +8505,12 @@ mod tests {
             ],
         );
 
-        let subject_symbol = mangle(&subject);
+        let subject_symbol = mangle(&subject).expect("test subject has a mangled symbol");
         let call_marker = |function: &Fn| {
             format!(
                 "call {} @{}()",
-                llvm_ty(function.ret.clone()),
-                mangle(function)
+                llvm_ty(function.ret.clone()).expect("test helper has an LLVM return type"),
+                mangle(function).expect("test helper has a mangled symbol")
             )
         };
         let lit_first_call = call_marker(&lit_first);

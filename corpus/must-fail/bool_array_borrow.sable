@@ -1,7 +1,0 @@
-// expect-error: type.bool_array_borrow
-// Owned local Boolean arrays cannot yet produce borrowed array values.
-
-fn cannot_borrow_local() {
-    [bool] values = [true];
-    var view = &values;
-}

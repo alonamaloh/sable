@@ -1,0 +1,87 @@
+// Borrowed Boolean arrays across a call boundary.
+//
+// A borrow is a second name for storage its caller keeps, so `&[bool]` and
+// `&mut [bool]` lift to the same `Sable.Seq Bool` an owned `[bool]` local
+// does — the payload decides the Lean type, the binding mode decides only
+// which binder holds the entry state. The well-formedness a Boolean array
+// parameter carries is the length fact `0 ≤ m.len ≤ u64.max` and nothing
+// else: `Bool` is already its complete value domain, so there is no element
+// range to state, and stating one would not even be well-typed.
+//
+// Reads cross into the proof language as propositions (`m.get k = true`) and
+// stores reify a proposition back at the sequence boundary, exactly as they
+// do for an owned local.
+
+/// post result ≤ m.len
+pub fn count_true(&[bool] m) -> u64 {
+    mut u64 c = 0;
+    /// invariant c ≤ i
+    for (u64 i : range(0, m.len)) {
+        if (m[i]) { c = c + 1; }
+    }
+    return c;
+}
+
+// An invariant over elements, and a postcondition that reads them back.
+/// post result ↔ ∀ k, 0 ≤ k → k < m.len → m.get k = true
+pub fn all_true(&[bool] m) -> bool {
+    /// invariant ∀ k, 0 ≤ k → k < i → m.get k = true
+    for (u64 i : range(0, m.len)) {
+        if (!m[i]) { return false; }
+    }
+    return true;
+}
+
+// A shared borrow passed on to another function: the callee's `pre`/`post`
+// are stated over the same sequence, because a reborrow names the same
+// storage.
+/// post result ≤ m.len
+pub fn count_if(&[bool] m, bool enabled) -> u64 {
+    if (enabled) { return count_true(&m); }
+    return 0;
+}
+
+// A unique borrow. `old m` is the entry-state binder; the length relation is
+// what survives havoc, since a store is the only mutation and `Seq.set`
+// preserves length by construction.
+/// post ∀ k, 0 ≤ k → k < m.len → m.get k = true
+/// post m.len = (old m).len
+pub fn set_all(&mut [bool] m) {
+    u64 n = m.len;
+    mut u64 i = 0;
+    /// invariant i ≤ n
+    /// invariant m.len = n
+    /// invariant ∀ k, 0 ≤ k → k < i → m.get k = true
+    /// variant n - i
+    while (i < n) {
+        m[i] = true;
+        i = i + 1;
+    }
+}
+
+// An owner lending its array: the argument is the literal's sequence, so the
+// callee's post lands on a length the caller already knows.
+/// post result ≤ 4
+pub fn count_literal() -> u64 {
+    [bool] flags = [true, false, true, true];
+    return count_true(&flags);
+}
+
+// The `&mut` round trip. The array comes back from `set_all` in a fresh
+// state whose only facts are the callee's posts over that fresh sequence;
+// `all_true` then has to be discharged from them rather than from the
+// pre-call value.
+/// post result
+pub fn set_then_check() -> bool {
+    mut [bool] flags = alloc_array<bool>(3, false);
+    set_all(&mut flags);
+    return all_true(&flags);
+}
+
+/// discharge set_all.inv_preserved.k_0_k_k_i_m_get_k_true by
+///   intro k hk0 hk
+///   by_cases hki : k = i
+///   · simp [Sable.Seq.get_set, hki]
+///   · have h2 := h_inv_k_0_k_k_i_m_get_k_true k hk0 (by omega)
+///     simp [Sable.Seq.get_set, hki]
+///     exact h2

@@ -446,6 +446,90 @@ fn affine_options_use_atomic_take_and_conditional_native_cleanup() {
 }
 
 #[test]
+fn borrowed_boolean_arrays_pass_a_descriptor_and_never_own_it() {
+    let source = repo_root().join("corpus/llvm-diff/bool_array_borrows.sable");
+    let output = build_command()
+        .args(["build", "--emit-llvm", "-o", "-"])
+        .arg(&source)
+        .output()
+        .expect("run the Sable borrowed-Boolean-array LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM borrowed-Boolean-array build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
+    assert!(report.contains("status: fully verified"));
+    assert!(!ir.contains("define i32 @main("));
+    // An owner and a borrow share one descriptor; the borrow adds no type.
+    assert!(ir.contains("%sable.array.bool = type { ptr, i64 }"));
+    assert!(!ir.contains(" inbounds "));
+
+    let entry = internal_function_symbol(&ir, "bool_array_borrows_entry");
+    let shared = internal_function_symbol(&ir, "bool_shared_count");
+    let unique = internal_function_symbol(&ir, "bool_set");
+    let load_guard = internal_function_symbol(&ir, "bool_borrow_load_guard");
+    let store_guard = internal_function_symbol(&ir, "bool_borrow_store_guard");
+    // Mangling is mutability-sensitive even though the IR type is not, so the
+    // two borrow forms are two entry points. The component spelling is
+    // internal and versionable, like the named type.
+    assert!(shared.contains("__p_abs__"), "shared borrow code: {shared}");
+    assert!(
+        unique.contains("__p_abm_u64__"),
+        "unique borrow code: {unique}"
+    );
+    assert!(ir.contains(&format!("call i64 @{shared}(%sable.array.bool ")));
+    assert!(ir.contains(&format!("call i1 @{unique}(%sable.array.bool ")));
+
+    // No function that only borrows may reach the free hook: an owner frees,
+    // and every borrowed descriptor is a copy of one the caller still owns.
+    for borrowing in [
+        "bool_shared_count",
+        "bool_set",
+        "bool_clear",
+        "bool_count_if",
+        "bool_set_first_two",
+        "read_through_borrow",
+        "write_through_borrow",
+    ] {
+        let symbol = internal_function_symbol(&ir, borrowing);
+        let body = internal_function_body(&ir, &symbol);
+        assert!(
+            !body.contains("__sable_rt_array_free_v1"),
+            "`{borrowing}` borrows its array but reaches the free hook"
+        );
+    }
+
+    // The injected main calls only scalar-signature helpers, so it neither
+    // publishes nor reconstructs the internal borrowed-array convention.
+    let ir = format!(
+        "{ir}\n\
+         define i32 @main(i32 %argc, ptr %argv) {{\n\
+         entry:\n\
+           switch i32 %argc, label %unexpected [\n\
+             i32 1, label %normal\n\
+             i32 2, label %load_oob\n\
+             i32 3, label %store_oob\n\
+           ]\n\
+         normal:\n\
+           %normal_result = call i32 @{entry}()\n\
+           ret i32 %normal_result\n\
+         load_oob:\n\
+           %load_result = call i1 @{load_guard}(i64 7)\n\
+           ret i32 0\n\
+         store_oob:\n\
+           %store_result = call i1 @{store_guard}(i64 9)\n\
+           ret i32 0\n\
+         unexpected:\n\
+           ret i32 99\n\
+         }}\n"
+    );
+
+    assert_clang_bool_array_borrow_runtime("bool-array-borrows", &ir);
+}
+
+#[test]
 fn u32_arrays_use_byte_hooks_unaligned_access_and_nonowning_internal_borrows() {
     let source = repo_root().join("corpus/llvm-diff/u32_arrays.sable");
     let output = build_command()
@@ -1164,6 +1248,155 @@ void __sable_rt_trap_v1(
     fs::remove_dir_all(&temp).expect("remove isolated LLVM affine-option test directory");
 }
 
+/// Run the borrowed-Boolean-array fixture against strong hooks that track
+/// every live allocation, so a free the emitter should not have emitted —
+/// a callee freeing storage it only borrowed — aborts instead of passing.
+fn assert_clang_bool_array_borrow_runtime(label: &str, ir: &str) {
+    let Some(clang) = find_clang() else {
+        assert_ne!(
+            std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
+            Ok("1"),
+            "SABLE_REQUIRE_CLANG=1 but no clang executable was found"
+        );
+        return;
+    };
+    let temp = temp_dir(label);
+    let ir_path = temp.join(format!("{label}.ll"));
+    let hook_path = temp.join("bool-array-borrow-hooks.c");
+    fs::write(&ir_path, ir).expect("write emitted borrowed-Boolean-array IR fixture");
+    fs::write(
+        &hook_path,
+        br#"#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+static void *live_allocations[64];
+static size_t live_count = 0;
+
+void *__sable_rt_array_alloc_v1(uint64_t bytes) {
+    fprintf(stderr, "SABLE_ARRAY_ALLOC_V1 bytes=%" PRIu64 "\n", bytes);
+    fflush(stderr);
+    if (bytes > SIZE_MAX) {
+        return NULL;
+    }
+    void *storage = malloc((size_t)bytes);
+    if (storage == NULL || live_count == 64) {
+        abort();
+    }
+    live_allocations[live_count] = storage;
+    live_count += 1;
+    return storage;
+}
+
+void __sable_rt_array_free_v1(void *storage) {
+    fprintf(stderr, "SABLE_ARRAY_FREE_V1\n");
+    fflush(stderr);
+    for (size_t i = 0; i < live_count; i += 1) {
+        if (live_allocations[i] == storage) {
+            live_count -= 1;
+            live_allocations[i] = live_allocations[live_count];
+            free(storage);
+            return;
+        }
+    }
+    // Either a double free or storage this scope only borrowed.
+    abort();
+}
+
+void __sable_rt_trap_v1(
+    int32_t kind,
+    int32_t type_info,
+    uint64_t lhs_bits,
+    uint64_t rhs_bits
+) {
+    fprintf(
+        stderr,
+        "SABLE_TRAP_V1 kind=%" PRId32 " type_info=%" PRIu32
+        " lhs=%" PRIu64 " rhs=%" PRIu64 "\n",
+        kind,
+        (uint32_t)type_info,
+        lhs_bits,
+        rhs_bits
+    );
+    fflush(stderr);
+}
+"#,
+    )
+    .expect("write strong borrowed-Boolean-array runtime hooks");
+
+    for optimization in ["-O0", "-O2"] {
+        let executable = temp.join(format!("{label}-{}", &optimization[1..]));
+        let compile = Command::new(&clang)
+            .args([optimization, "-x", "ir"])
+            .arg(&ir_path)
+            .args(["-x", "c"])
+            .arg(&hook_path)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("run clang over emitted borrowed-Boolean-array IR");
+        assert!(
+            compile.status.success(),
+            "clang {optimization} rejected the borrowed-Boolean-array fixture:\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let normal = Command::new(&executable)
+            .output()
+            .expect("run the compiled normal borrowed-Boolean-array case");
+        assert_eq!(
+            normal.status.code(),
+            Some(42),
+            "borrowed-Boolean-array case diverged at {optimization}:\n{}",
+            String::from_utf8_lossy(&normal.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&normal.stderr);
+        // The entry owns two nonempty arrays and lends them repeatedly; the
+        // empty one keeps the allocation-free representation.
+        assert_eq!(stderr.matches("SABLE_ARRAY_ALLOC_V1").count(), 2);
+        assert_eq!(stderr.matches("SABLE_ARRAY_FREE_V1").count(), 2);
+        assert!(stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=4"));
+        assert!(stderr.contains("SABLE_ARRAY_ALLOC_V1 bytes=3"));
+        assert!(
+            !stderr.contains("bytes=0"),
+            "a zero-length array uses the allocation-free representation"
+        );
+
+        for (arguments, expected_trap) in [
+            (
+                &["load-oob"][..],
+                "SABLE_TRAP_V1 kind=10 type_info=0 lhs=7 rhs=2",
+            ),
+            (
+                &["store-oob", "case"][..],
+                "SABLE_TRAP_V1 kind=10 type_info=0 lhs=9 rhs=2",
+            ),
+        ] {
+            let trapped = Command::new(&executable)
+                .args(arguments)
+                .output()
+                .expect("run a compiled borrowed-Boolean-array trap case");
+            assert!(
+                !trapped.status.success(),
+                "the trap hook returned at {optimization}; llvm.trap must terminate"
+            );
+            let stderr = String::from_utf8_lossy(&trapped.stderr);
+            assert!(
+                stderr.contains(expected_trap),
+                "wrong bounds trap through a borrow at {optimization} (status {}):\n{stderr}",
+                trapped.status
+            );
+            assert_eq!(
+                stderr.matches("SABLE_ARRAY_FREE_V1").count(),
+                0,
+                "trap edges do not unwind owned arrays"
+            );
+        }
+    }
+    fs::remove_dir_all(&temp).expect("remove isolated borrowed-Boolean-array test directory");
+}
+
 fn assert_clang_u32_array_runtime(label: &str, ir: &str) {
     let Some(clang) = find_clang() else {
         assert_ne!(
@@ -1562,6 +1795,23 @@ fn internal_function_symbol(ir: &str, source_name: &str) -> String {
         .split_once('(')
         .map(|(symbol, _)| symbol.to_owned())
         .expect("internal definition has a parameter list")
+}
+
+/// The emitted lines of one internal definition, from `define` to its `}`.
+fn internal_function_body(ir: &str, symbol: &str) -> String {
+    let opening = format!("@{symbol}(");
+    let mut lines = ir
+        .lines()
+        .skip_while(|line| !(line.starts_with("define internal ") && line.contains(&opening)));
+    let mut body = String::new();
+    for line in lines.by_ref() {
+        body.push_str(line);
+        body.push('\n');
+        if line == "}" {
+            return body;
+        }
+    }
+    panic!("missing emitted body for `{symbol}`")
 }
 
 fn assert_clang_exit(label: &str, ir: &str, expected: i32) {

@@ -1,0 +1,16 @@
+// expect-test-failure: post of `claims_it_left_the_array_alone` violated
+// A `&mut` argument is the caller's storage, not a copy of it. This contract
+// says the callee changed nothing, the callee writes, and the monitor
+// evaluates the clause against the caller's array — the aliasing fact whose
+// proof-side analogue a borrow local used to break (ADR 0072).
+
+/// pre  m.len ≥ 1
+/// post m.get 0 = (old m).get 0
+fn claims_it_left_the_array_alone(&mut [bool] m) {
+    m[0] = true;
+}
+
+fn test_a_mut_argument_is_not_a_copy() {
+    mut [bool] flags = alloc_array<bool>(2, false);
+    claims_it_left_the_array_alone(&mut flags);
+}

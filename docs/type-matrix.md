@@ -10,14 +10,14 @@ language admits, not what verifies.
 | `u64` | yes | yes | yes | no | yes | yes | yes | yes | yes |
 | `bool` | yes | yes | yes | no | no | yes | yes | yes | no |
 | `[u64]` | yes | no | yes | yes | no | yes | no | no | no |
-| `[bool]` | yes | no | no | no | no | no | no | yes | no |
+| `[bool]` | yes | no | yes | yes | no | no | no | yes | no |
 | `option<u64>` | yes | yes | no | no | no | no | no | no | no |
 | `option<bool>` | yes | yes | no | no | no | no | no | no | no |
 | `record` | yes | yes | yes | no | no | no | no | no | no |
 | `option<[bool]>` | yes | no | no | no | no | no | no | no | no |
 | `class` | yes | yes | yes | yes | no | yes | no | no | no |
 
-Open cells: 33/81.
+Open cells: 35/81.
 
 ## What closes each cell
 
@@ -33,8 +33,6 @@ Open cells: 33/81.
 | `[u64]` | option payload | `type.affine_option_payload` |
 | `[u64]` | generic arg | `mono.type_arg_unsupported` |
 | `[bool]` | return | `type.array_return` |
-| `[bool]` | param | `type.param_unsupported` |
-| `[bool]` | param &mut | `type.bool_array_param` |
 | `[bool]` | record field | `record.field_type` |
 | `[bool]` | class field | `type.bool_array_field` |
 | `[bool]` | array element | `type.array_payload_unsupported` |

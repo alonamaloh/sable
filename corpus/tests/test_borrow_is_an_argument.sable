@@ -1,0 +1,47 @@
+// The rewrites in `corpus/verifies/borrow_is_an_argument.sable`, run.
+//
+// This pairing is the point of the file. A borrow local used to verify a
+// false contract because the proof believed two names for one storage; the
+// programs that replace it must be ones where the proof answer and the run
+// answer are the same answer. Each function below is proved in the verified
+// subject and executed here, and every clause is monitored.
+
+use borrow_is_an_argument;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+// Writing through the owner's own name.
+fn test_the_owner_sees_its_own_store() {
+    bool r = store_through_the_owner();
+    /// assert #[label(owner_store_is_visible)] r = true
+}
+
+// A `&mut` argument writes through to the caller's array: one storage, one
+// name, and the post the callee proved is the fact the caller reads back.
+fn test_lending_at_the_call_writes_through() {
+    bool r = lend_at_the_call();
+    /// assert #[label(callee_write_reaches_the_owner)] r = true
+    bool s = lend_twice();
+    /// assert #[label(a_second_lending_reads_the_first)] s = true
+}
+
+// A reborrow written at the call, exercised on the caller's own array.
+fn test_a_reborrow_reaches_the_original_owner() {
+    mut [bool] flags = alloc_array<bool>(2, false);
+    /// assert #[label(before)] flags.get 0 = false
+    reborrow_at_the_call(&mut flags);
+    /// assert #[label(after)] flags.get 0 = true ∧ flags.len = 2
+}
+
+// The integer array takes the same route, because the rule that refuses the
+// borrow local is about the binding mode rather than the payload.
+fn test_an_int_array_lends_the_same_way() {
+    expect_eq(widen<u64>(lend_an_int_array()), 7);
+}
+
+// A class mutated through its own name and through a `&mut` argument.
+fn test_a_class_owner_and_a_class_argument_agree() {
+    expect_eq(use_the_owner_of_a_class(), 3);
+}

@@ -546,6 +546,20 @@ pub(crate) fn validate_vc_type_position(
     // position that the checked language currently forbids.
     validate_vc_ty(ty.clone(), allow_param, context)?;
 
+    // A borrow is an argument form and a parameter binding mode, not a local
+    // binding (ADR 0072). The symbolic environment is keyed by source name and
+    // every entry is assumed to be the only name for its storage; a borrow
+    // local would be a second one, and the two entries would diverge at the
+    // first store. `check::local_ty` refuses this at the source span — this is
+    // the same rule at the VC boundary, which has no honest answer for the
+    // shape either.
+    if matches!(ty, Ty::Borrow(..)) && position == VcTypePosition::Local {
+        return Err(format!(
+            "internal.vcgen.type_error: a borrow is a parameter binding mode, not a local \
+             binding, in {context}"
+        ));
+    }
+
     if ty.is_affine_option() {
         let position = match position {
             VcTypePosition::Expression | VcTypePosition::Local => return Ok(()),
@@ -562,15 +576,21 @@ pub(crate) fn validate_vc_type_position(
         ));
     }
 
-    if let Some((&Ty::Bool, mutability)) = ty.as_array() {
-        if matches!(position, VcTypePosition::Expression | VcTypePosition::Local)
-            && mutability == BindingMode::Owned
-        {
+    // Only the *owned* Boolean array is position-restricted. A borrowed one
+    // is a second name for a sequence its caller owns, and its proof model is
+    // read off the element type exactly as `&[T]`'s is — one `Sable.Seq Bool`
+    // binder, a length fact, and no element fact, because `Bool` is already
+    // its complete value domain. So it goes wherever a borrowed array goes,
+    // and the positions a borrow may be *written* in stay the parser's row
+    // and `check::borrow_referent_ty`'s to state.
+    if ty.is_owned_array_of(&Ty::Bool) {
+        if matches!(position, VcTypePosition::Expression | VcTypePosition::Local) {
             return Ok(());
         }
         let position = match position {
-            VcTypePosition::Expression => "a borrowed array expression",
-            VcTypePosition::Local => "a non-owned local",
+            VcTypePosition::Expression | VcTypePosition::Local => {
+                unreachable!("an owned Boolean array is admitted as a local value")
+            }
             VcTypePosition::Parameter => "a function parameter",
             VcTypePosition::TraitParameter => "a trait parameter",
             VcTypePosition::Return => "a function return",
@@ -580,7 +600,7 @@ pub(crate) fn validate_vc_type_position(
             VcTypePosition::Borrow => "a borrow",
         };
         return Err(format!(
-            "internal.vcgen.type_error: Boolean arrays are owned-local only; {position} is not supported in {context}"
+            "internal.vcgen.type_error: an owned Boolean array is a local value; {position} is not supported in {context}"
         ));
     }
 
@@ -607,16 +627,25 @@ fn is_bool_array(ty: Ty) -> bool {
     ty.is_array_of(&Ty::Bool)
 }
 
+/// An *owned* Boolean array — the local value that carries its own
+/// allocation, literal, and rebinding rules. `&[bool]` and `&mut [bool]` are
+/// deliberately not owned Boolean arrays: they name a sequence their caller
+/// owns and transport exactly as `&[T]` does, so the rules that keep an owner
+/// in one place have nothing to say about them.
+fn is_owned_bool_array(ty: Ty) -> bool {
+    ty.is_owned_array_of(&Ty::Bool)
+}
+
 fn is_affine_bool_option(ty: Ty) -> bool {
     ty == Ty::affine_array_option(Ty::Bool)
 }
 
-fn expr_is_bool_array(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
-    expr.ty.clone().is_some_and(is_bool_array)
+fn expr_is_owned_bool_array(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
+    expr.ty.clone().is_some_and(is_owned_bool_array)
         || matches!(
             &expr.kind,
             ExprKind::Var(name)
-                if locals.get(name).as_ref().is_some_and(|ty| ty.is_array_of(&Ty::Bool))
+                if locals.get(name).as_ref().is_some_and(|ty| ty.is_owned_array_of(&Ty::Bool))
         )
 }
 
@@ -640,15 +669,15 @@ fn is_affine_option_take(expr: &Expr) -> bool {
     expr.ty == Some(Ty::array(Ty::Bool)) && matches!(expr.kind, ExprKind::OptTake { .. })
 }
 
-fn reject_bool_array_value(
+fn reject_owned_bool_array_value(
     expr: &Expr,
     locals: &HashMap<String, Ty>,
     boundary: &str,
     context: &str,
 ) -> Result<(), String> {
-    if expr_is_bool_array(expr, locals) {
+    if expr_is_owned_bool_array(expr, locals) {
         return Err(format!(
-            "internal.vcgen.type_error: Boolean arrays cannot cross {boundary} in {context}"
+            "internal.vcgen.type_error: an owned Boolean array cannot cross {boundary} in {context}"
         ));
     }
     Ok(())
@@ -906,7 +935,11 @@ fn validate_vc_expr(
             VcTypePosition::Expression
         };
         validate_vc_type_position(ty.clone(), allow_param, position, context)?;
-        if is_bool_array(ty.clone()) {
+        // The producers of an *owned* Boolean array are enumerated because an
+        // owner has to come from somewhere the ownership rules know about. A
+        // borrowed one is not produced at all — it names storage that already
+        // exists — so it is no more restricted here than `&[T]` is.
+        if is_owned_bool_array(ty.clone()) {
             match &expr.kind {
                 ExprKind::Var(name) if locals.get(name) == Some(ty) => {}
                 ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } => {}
@@ -973,7 +1006,7 @@ fn validate_vc_expr(
         | ExprKind::RecordLit { args, .. }
         | ExprKind::TraitCall { args, .. } => {
             for arg in args {
-                reject_bool_array_value(arg, locals, "a call boundary", context)?;
+                reject_owned_bool_array_value(arg, locals, "a call boundary", context)?;
                 reject_affine_option_value(arg, locals, "a call boundary", context)?;
                 validate_vc_expr(arg, allow_param, context, locals)?;
             }
@@ -991,7 +1024,7 @@ fn validate_vc_expr(
                 ));
             }
             for arg in args {
-                reject_bool_array_value(arg, locals, "a call boundary", context)?;
+                reject_owned_bool_array_value(arg, locals, "a call boundary", context)?;
                 reject_affine_option_value(arg, locals, "a call boundary", context)?;
                 validate_vc_expr(arg, allow_param, context, locals)?;
             }
@@ -1001,7 +1034,7 @@ fn validate_vc_expr(
         | ExprKind::DeviceOp { args, .. }
         | ExprKind::ResOp { args, .. } => {
             for arg in args {
-                reject_bool_array_value(arg, locals, "an intrinsic boundary", context)?;
+                reject_owned_bool_array_value(arg, locals, "an intrinsic boundary", context)?;
                 reject_affine_option_value(arg, locals, "an intrinsic boundary", context)?;
                 validate_vc_expr(arg, allow_param, context, locals)?;
             }
@@ -1102,15 +1135,6 @@ fn validate_vc_expr(
         }
         ExprKind::Borrow { array, .. } => {
             reject_affine_option_named_source(array, locals, "a borrow source", context)?;
-            if locals
-                .get(array)
-                .as_ref()
-                .is_some_and(|ty| ty.is_array_of(&Ty::Bool))
-            {
-                return Err(format!(
-                    "internal.vcgen.type_error: Boolean array borrows are not supported in {context}"
-                ));
-            }
             Ok(())
         }
         ExprKind::Var(name) => {
@@ -1122,7 +1146,7 @@ fn validate_vc_expr(
             if locals
                 .get(name)
                 .as_ref()
-                .is_some_and(|ty| ty.is_array_of(&Ty::Bool))
+                .is_some_and(|ty| ty.is_owned_array_of(&Ty::Bool))
                 && expr.ty != locals.get(name).cloned()
             {
                 return Err(format!(
@@ -1369,12 +1393,12 @@ fn validate_vc_block_with_mutability(
                 }
             }
             Stmt::FieldAssign { value, .. } => {
-                reject_bool_array_value(value, locals, "a field boundary", context)?;
+                reject_owned_bool_array_value(value, locals, "a field boundary", context)?;
                 reject_affine_option_value(value, locals, "a field boundary", context)?;
                 validate_vc_expr(value, allow_param, context, locals)?;
             }
             Stmt::ExprStmt(value) => {
-                reject_bool_array_value(value, locals, "an expression statement", context)?;
+                reject_owned_bool_array_value(value, locals, "an expression statement", context)?;
                 reject_affine_option_value(value, locals, "an expression statement", context)?;
                 validate_vc_expr(value, allow_param, context, locals)?;
             }
@@ -1408,7 +1432,7 @@ fn validate_vc_block_with_mutability(
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
-                    reject_bool_array_value(value, locals, "a function return", context)?;
+                    reject_owned_bool_array_value(value, locals, "a function return", context)?;
                     reject_affine_option_value(value, locals, "a function return", context)?;
                     if let Some(ty) = &value.ty {
                         validate_vc_type_position(
@@ -1431,7 +1455,7 @@ fn validate_vc_block_with_mutability(
                     context,
                 )?;
                 validate_vc_expr(value, allow_param, context, locals)?;
-                reject_bool_array_value(value, locals, "a field-store value", context)?;
+                reject_owned_bool_array_value(value, locals, "a field-store value", context)?;
                 reject_affine_option_value(value, locals, "a field-store value", context)?;
             }
             Stmt::Store {
@@ -3902,11 +3926,22 @@ impl<'a> Generator<'a> {
                     // has an entry-state binder, and an owned local has the
                     // pre-havoc `.set` chain instead.
                     if bound.is_some_and(Ty::is_unique_borrow) {
-                        let entry = self.entry_states[name.as_str()].clone();
-                        self.hyps.push((
-                            format!("h_{name}_len"),
-                            format!("({name}.len) = ({entry}.len)"),
-                        ));
+                        // Only a parameter has an entry state, and only a
+                        // parameter can be a unique borrow here: a borrow is
+                        // not a local binding (ADR 0072). If some other name
+                        // reaches this arm the length relation has nothing to
+                        // be relative to, so refuse rather than index.
+                        match self.entry_states.get(name.as_str()).cloned() {
+                            Some(entry) => self.hyps.push((
+                                format!("h_{name}_len"),
+                                format!("({name}.len) = ({entry}.len)"),
+                            )),
+                            None => refuse_vc_type(format!(
+                                "internal.vcgen.borrow_without_entry_state: unique borrow \
+                                 `{name}` is live at a loop head with no entry state; a \
+                                 borrow is a parameter binding mode, not a local"
+                            )),
+                        }
                     } else {
                         // The prior chain may reference renamed binders
                         // (alloc binders carry the source name): rewrite to
@@ -6639,8 +6674,7 @@ impl<'a> Generator<'a> {
                 // construction (stores are the only mutation); the callee's
                 // posts, substituted over the fresh symbol, say the rest.
                 // Omitting this havoc asserts posts over the pre-call state
-                // and yields inconsistent hypotheses — the soundness bug
-                // caught by the quicksort agent on 2026-08-09.
+                // and yields inconsistent hypotheses.
                 for (p, arg) in sig.params.iter().zip(args.iter()) {
                     let Some(elem) = p.ty.as_unique_borrow().and_then(Ty::as_owned_array) else {
                         continue;
@@ -8229,38 +8263,63 @@ fn affine_loop(u64 n) {
         }
     }
 
+    /// An owned Boolean array is a local value; a borrowed one names a
+    /// sequence its caller owns and goes wherever a borrowed array goes.
+    /// Which positions a borrow may be *written* in is the parser's row and
+    /// `check::borrow_referent_ty`'s to state, not this gate's.
     #[test]
-    fn bool_arrays_are_owned_local_only_in_vc_preflight() {
-        assert!(
-            validate_vc_type_position(
-                Ty::array(Ty::Bool),
+    fn an_owned_bool_array_is_a_local_value_in_vc_preflight() {
+        for position in [VcTypePosition::Expression, VcTypePosition::Local] {
+            validate_vc_type_position(Ty::array(Ty::Bool), false, position, "synthetic local")
+                .expect("an owned Boolean array is a local value");
+        }
+
+        for mutability in [Mutability::Shared, Mutability::Mut] {
+            for position in [
+                VcTypePosition::Expression,
+                VcTypePosition::Parameter,
+                VcTypePosition::TraitParameter,
+                VcTypePosition::Borrow,
+            ] {
+                validate_vc_type_position(
+                    Ty::array_ref(Ty::Bool, mutability),
+                    false,
+                    position,
+                    "synthetic declaration",
+                )
+                .unwrap_or_else(|error| {
+                    panic!("a borrowed Boolean array carries a proof model here: {error}")
+                });
+            }
+            // ...but not as a *local*. The symbolic environment is keyed by
+            // source name and each key is assumed to be the only name for its
+            // storage; a borrow local would be a second one (ADR 0072).
+            let error = validate_vc_type_position(
+                Ty::array_ref(Ty::Bool, mutability),
                 false,
                 VcTypePosition::Local,
-                "synthetic local",
+                "synthetic declaration",
             )
-            .is_ok()
-        );
+            .expect_err("a borrow is not a local binding");
+            assert!(error.contains("not a local binding"));
+        }
 
-        for (ty, position) in [
-            (
-                Ty::array_ref(Ty::Bool, Mutability::Shared),
-                VcTypePosition::Parameter,
-            ),
-            (
-                Ty::array_ref(Ty::Bool, Mutability::Mut),
-                VcTypePosition::TraitParameter,
-            ),
-            (Ty::array(Ty::Bool), VcTypePosition::Return),
-            (Ty::array(Ty::Bool), VcTypePosition::ClassField),
-            (Ty::array(Ty::Bool), VcTypePosition::RecordField),
-            (
-                Ty::array_ref(Ty::Bool, Mutability::Shared),
-                VcTypePosition::Borrow,
-            ),
+        for position in [
+            VcTypePosition::Parameter,
+            VcTypePosition::TraitParameter,
+            VcTypePosition::Return,
+            VcTypePosition::ClassField,
+            VcTypePosition::RecordField,
+            VcTypePosition::Borrow,
         ] {
-            let error = validate_vc_type_position(ty, false, position, "synthetic declaration")
-                .expect_err("Boolean array boundary must fail before symbolic evaluation");
-            assert!(error.contains("owned-local only"));
+            let error = validate_vc_type_position(
+                Ty::array(Ty::Bool),
+                false,
+                position,
+                "synthetic declaration",
+            )
+            .expect_err("an owned Boolean array boundary must fail before symbolic evaluation");
+            assert!(error.contains("an owned Boolean array is a local value"));
         }
 
         for payload in [Ty::Record(0), Ty::Param(TypeParamId::from_legacy(0))] {
@@ -8280,10 +8339,11 @@ fn affine_loop(u64 n) {
     }
 
     #[test]
-    fn bool_array_preflight_rejects_forged_borrow_and_exposure() {
+    fn bool_array_preflight_rejects_a_forged_owner_crossing_a_boundary() {
         let span = Span::new(0, 1);
         let array_ty = Ty::array(Ty::Bool);
         let mut locals = HashMap::from([("bits".to_string(), array_ty.clone())]);
+        // Lending the owner is ordinary: the borrow produces no new owner.
         let borrowed = Expr {
             kind: ExprKind::Borrow {
                 array: "bits".into(),
@@ -8293,9 +8353,8 @@ fn affine_loop(u64 n) {
             span,
             ty: Some(Ty::array_ref(Ty::Bool, Mutability::Shared)),
         };
-        let error = validate_vc_expr(&borrowed, false, "forged borrow", &locals)
-            .expect_err("forged Boolean array borrow must fail closed");
-        assert!(error.contains("owned-local only") || error.contains("borrows"));
+        validate_vc_expr(&borrowed, false, "array borrow", &locals)
+            .expect("a Boolean array borrow is an ordinary value");
 
         let call = Expr {
             kind: ExprKind::Call {
