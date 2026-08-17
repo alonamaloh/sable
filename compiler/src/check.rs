@@ -2913,12 +2913,29 @@ pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
 
 /// The declared type of a class `init` or method parameter.
 ///
-/// Class parameters: by value (moved in) or borrowed (ADR 0020, ADR 0023),
-/// and resources — a class that owns authority takes it in through an init
-/// (ADR 0029). Inits additionally take `&[T]` (the bignum from_prefix
-/// shape: build a class value from computed limbs); methods do not.
+/// Copyable values — integers, `bool`, and options with a concrete value
+/// payload — cross the member boundary by value exactly as they cross a
+/// function call. Class parameters: by value (moved in) or borrowed
+/// (ADR 0020, ADR 0023), and resources — a class that owns authority takes
+/// it in through an init (ADR 0029). Inits additionally take `&[T]` (the
+/// bignum from_prefix shape: build a class value from computed limbs);
+/// methods do not.
+///
+/// The option arm matches the owned `Ty::Option` directly — never through a
+/// borrow-transparent accessor — so `&option<u64>` stays refused here, and
+/// its payload test is `option_payload_ty`'s minus the type parameter: an
+/// abstract payload has no member-call transport.
 pub(crate) fn member_param_ty(ty: &Ty, span: Span, allow_shared_arrays: bool) -> CResult<()> {
-    let ok = matches!(ty, Ty::Int(_))
+    let value_option = match ty {
+        Ty::Option(payload) => match payload.as_ref() {
+            Ty::Int(IntTy::TParam(_)) => false,
+            Ty::Int(_) | Ty::Bool => true,
+            _ => false,
+        },
+        _ => false,
+    };
+    let ok = matches!(ty, Ty::Int(_) | Ty::Bool)
+        || value_option
         || ty.class_index().is_some()
         || ty.is_resource()
         || (allow_shared_arrays
@@ -2926,10 +2943,15 @@ pub(crate) fn member_param_ty(ty: &Ty, span: Span, allow_shared_arrays: bool) ->
     if !ok {
         return Err(Diagnostic {
             name: "type.member_param".into(),
-            title: "init/method parameters must be integers for now".into(),
+            title: "this type cannot be an init or method parameter yet".into(),
             span,
             label: format!("this has type `{}`", ty.clone().name()),
-            notes: vec![],
+            notes: vec![(
+                "note".into(),
+                "init/method parameters take integers, `bool`, options of those, \
+                 class values, and resources; an init additionally takes `&[T]`"
+                    .into(),
+            )],
         });
     }
     Ok(())

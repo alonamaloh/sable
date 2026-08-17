@@ -13,17 +13,17 @@ The `init param` / `method param` pairs read the same way.
 | type | local | return | param | param & | param &mut | record field | class field | array element | option payload | generic arg | for index | const | cast target | trait-impl target | raw element | resource extent | resource map key | init param | init param & | method param | method param & |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `u64` | yes | yes | yes | no | no | yes | yes | yes | yes | yes | yes | yes | yes | yes | no | yes | yes | yes | no | yes | no |
-| `bool` | yes | yes | yes | no | no | no | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no |
+| `bool` | yes | yes | yes | no | no | no | yes | yes | yes | no | no | no | no | no | no | no | no | yes | no | yes | no |
 | `[u64]` | yes | no | no | yes | yes | no | yes | no | no | no | no | no | no | no | no | no | no | no | yes | no | no |
 | `[bool]` | yes | no | no | yes | yes | no | no | no | yes | no | no | no | no | no | no | no | no | no | yes | no | no |
-| `option<u64>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
-| `option<bool>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
+| `option<u64>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | yes | no | yes | no |
+| `option<bool>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | yes | no | yes | no |
 | `record` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | yes | yes | no | no | no | no | no |
 | `option<[bool]>` | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
 | `class` | yes | yes | yes | yes | yes | no | yes | no | no | no | no | no | no | no | no | no | no | yes | yes | yes | yes |
 | `raw<u8>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
 
-Open cells: 57/210.
+Open cells: 63/210.
 
 ## What closes each cell
 
@@ -45,9 +45,7 @@ Open cells: 57/210.
 | `bool` | raw element | `type.raw_element_unsupported` |
 | `bool` | resource extent | `type.resource_extent_unsupported` |
 | `bool` | resource map key | `type.resource_map_key_unsupported` |
-| `bool` | init param | `type.member_param` |
 | `bool` | init param & | `type.borrow_param_unsupported` |
-| `bool` | method param | `type.member_param` |
 | `bool` | method param & | `type.borrow_param_unsupported` |
 | `[u64]` | return | `type.array_return` |
 | `[u64]` | param | `type.param_unsupported` |
@@ -95,9 +93,7 @@ Open cells: 57/210.
 | `option<u64>` | raw element | `type.raw_element_unsupported` |
 | `option<u64>` | resource extent | `type.resource_extent_unsupported` |
 | `option<u64>` | resource map key | `type.resource_map_key_unsupported` |
-| `option<u64>` | init param | `type.member_param` |
 | `option<u64>` | init param & | `type.borrow_param_unsupported` |
-| `option<u64>` | method param | `type.member_param` |
 | `option<u64>` | method param & | `type.borrow_param_unsupported` |
 | `option<bool>` | param & | `type.borrow_param_unsupported` |
 | `option<bool>` | param &mut | `type.borrow_param_unsupported` |
@@ -113,9 +109,7 @@ Open cells: 57/210.
 | `option<bool>` | raw element | `type.raw_element_unsupported` |
 | `option<bool>` | resource extent | `type.resource_extent_unsupported` |
 | `option<bool>` | resource map key | `type.resource_map_key_unsupported` |
-| `option<bool>` | init param | `type.member_param` |
 | `option<bool>` | init param & | `type.borrow_param_unsupported` |
-| `option<bool>` | method param | `type.member_param` |
 | `option<bool>` | method param & | `type.borrow_param_unsupported` |
 | `record` | param & | `type.borrow_param_unsupported` |
 | `record` | param &mut | `type.borrow_param_unsupported` |

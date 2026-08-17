@@ -6379,7 +6379,13 @@ impl<'a> Generator<'a> {
                         // Parenthesized as at a function call: dot-notation
                         // in the callee's clauses must bind the whole chain.
                         Val::Opt(v) => format!("({v})"),
-                        _ => unreachable!("checked: int/option/array/class/resource/pointer args"),
+                        // Program booleans are propositions in symbolic
+                        // execution, while source parameters bind Lean Bool;
+                        // reify at the call boundary as at a function call.
+                        Val::Prop(p) => lean_bool_value(&p),
+                        _ => unreachable!(
+                            "checked: int/bool/option/array/class/resource/pointer args"
+                        ),
                     })
                     .collect();
                 let Some(ci) = self.var_tys.get(recv.as_str()).and_then(Ty::class_index) else {

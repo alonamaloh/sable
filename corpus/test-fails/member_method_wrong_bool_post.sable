@@ -1,0 +1,26 @@
+// expect-test-failure: post of `Tank::step` violated
+// The dynamic half of `corpus/must-fail/member_method_wrong_bool_post.sable`:
+// the taken branch claims two steps and takes one, and the monitor
+// refutes the implication when the argument is `true`.
+
+pub class Tank {
+    u64 v;
+
+    /// post self.v = 0
+    init empty() {
+        self.v = 0;
+    }
+
+    /// pre  self.v ≤ 50
+    /// post on = true → self.v = old self.v + 2
+    fn step(&mut self, bool on) {
+        if (on) {
+            self.v = self.v + 1;
+        }
+    }
+}
+
+fn test_up_arm_is_false() {
+    var mut t = Tank::empty();
+    t.step(true);
+}

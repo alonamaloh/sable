@@ -1,0 +1,40 @@
+// pair: same-run
+// A copyable argument crosses a member boundary exactly as it crosses a
+// plain call: the same option and `bool` arguments produce the same
+// values whether the callee is a method or a free function.
+
+pub class Keeper {
+    u64 base;
+
+    init at(u64 b) {
+        self.base = b;
+    }
+
+    fn pick(&self, option<u64> o, bool fallback) -> u64 {
+        if (o.is_some) {
+            return o.value;
+        }
+        if (fallback) {
+            return self.base;
+        }
+        return 0;
+    }
+}
+
+fn subject_some() -> u64 {
+    var k = Keeper::at(11);
+    u64 r = k.pick(some(7), false);
+    return r;
+}
+
+fn subject_none_fallback() -> u64 {
+    var k = Keeper::at(11);
+    u64 r = k.pick(none, true);
+    return r;
+}
+
+fn subject_none_zero() -> u64 {
+    var k = Keeper::at(11);
+    u64 r = k.pick(none, false);
+    return r;
+}

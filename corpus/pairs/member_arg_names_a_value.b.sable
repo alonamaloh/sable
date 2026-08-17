@@ -1,0 +1,30 @@
+// pair: same-lean
+// See member_arg_names_a_value.a.sable: naming the arguments must
+// change nothing.
+
+pub class Keeper {
+    u64 base;
+
+    /// pre  s.is_some
+    /// pre  s.value ≤ 100
+    /// post self.base = s.value
+    init at(option<u64> s) {
+        self.base = s.value;
+    }
+
+    /// pre  o.is_some
+    /// pre  o.value ≤ 100
+    /// pre  self.base ≤ 100
+    /// post result = self.base + o.value
+    fn plus(&self, option<u64> o) -> u64 {
+        return self.base + o.value;
+    }
+}
+
+pub fn subject() -> u64 {
+    option<u64> s = some(5);
+    var k = Keeper::at(s);
+    option<u64> o = some(7);
+    u64 r = k.plus(o);
+    return r;
+}

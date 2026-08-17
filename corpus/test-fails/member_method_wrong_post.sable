@@ -1,0 +1,26 @@
+// expect-test-failure: post of `Tank::bump_by` violated
+// The dynamic half of `corpus/must-fail/member_method_wrong_post.sable`:
+// the method returns one more than its post claims, and the monitor
+// refutes it at the method call.
+
+pub class Tank {
+    u64 v;
+
+    /// pre  s ≤ 100
+    /// post self.v = s
+    init fill(u64 s) {
+        self.v = s;
+    }
+
+    /// pre  d.is_some
+    /// pre  d.value ≤ 100
+    /// post result = self.v + d.value
+    fn bump_by(&self, option<u64> d) -> u64 {
+        return self.v + d.value + 1;
+    }
+}
+
+fn test_sum_is_false() {
+    var t = Tank::fill(40);
+    u64 r = t.bump_by(some(5));
+}

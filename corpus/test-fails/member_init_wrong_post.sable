@@ -1,0 +1,23 @@
+// expect-test-failure: post of `Tank::fill` violated
+// The dynamic half of `corpus/must-fail/member_init_wrong_post.sable`:
+// the absent arm of the init's match post claims a value the body does
+// not store, and the monitor refutes it at the constructor call.
+
+pub class Tank {
+    u64 v;
+
+    /// post match s with
+    ///      | some x => self.v = x
+    ///      | none   => self.v = 1
+    init fill(option<u64> s) {
+        if (s.is_some) {
+            self.v = s.value;
+        } else {
+            self.v = 0;
+        }
+    }
+}
+
+fn test_none_arm_is_false() {
+    var t = Tank::fill(none);
+}

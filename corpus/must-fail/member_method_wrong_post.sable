@@ -1,0 +1,23 @@
+// expect-error: Tank::bump_by.post.sum
+// A false method post over an option parameter: the body adds one more
+// than the contract claims. The dynamic twin is
+// `corpus/test-fails/member_method_wrong_post.sable`.
+
+pub class Tank {
+    u64 v;
+
+    /// invariant v ≤ 100
+
+    /// pre  s ≤ 100
+    /// post self.v = s
+    init fill(u64 s) {
+        self.v = s;
+    }
+
+    /// pre  d.is_some
+    /// pre  d.value ≤ 100
+    /// post #[label(sum)] result = self.v + d.value
+    fn bump_by(&self, option<u64> d) -> u64 {
+        return self.v + d.value + 1;
+    }
+}

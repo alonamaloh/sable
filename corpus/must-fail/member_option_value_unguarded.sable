@@ -1,0 +1,17 @@
+// expect-error: Tank::peek_at.option.d_value
+// `.value` of an option parameter without establishing someness is a
+// verification error at the member boundary exactly as at a plain call.
+// The dynamic twin is `corpus/test-fails/member_option_value_trap.sable`.
+
+pub class Tank {
+    u64 v;
+
+    /// post self.v = 0
+    init empty() {
+        self.v = 0;
+    }
+
+    fn peek_at(&self, option<u64> d) -> u64 {
+        return d.value;
+    }
+}

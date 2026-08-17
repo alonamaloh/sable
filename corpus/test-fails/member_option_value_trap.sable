@@ -1,0 +1,22 @@
+// expect-test-failure: `.value` of an empty option
+// The dynamic half of `corpus/must-fail/member_option_value_unguarded.sable`:
+// a member body reads `.value` of an option parameter with no someness
+// pre, and an absent argument traps at the read.
+
+pub class Tank {
+    u64 v;
+
+    /// post self.v = 0
+    init empty() {
+        self.v = 0;
+    }
+
+    fn peek_at(&self, option<u64> d) -> u64 {
+        return d.value;
+    }
+}
+
+fn test_absent_argument_traps() {
+    var t = Tank::empty();
+    u64 r = t.peek_at(none);
+}

@@ -1,0 +1,30 @@
+// pair: same-lean
+// A copyable argument to an init or a method is a value: binding it to
+// a local name before the call must change nothing about the emitted
+// obligations — the callee's instantiated clauses see the same chain
+// either way.
+
+pub class Keeper {
+    u64 base;
+
+    /// pre  s.is_some
+    /// pre  s.value ≤ 100
+    /// post self.base = s.value
+    init at(option<u64> s) {
+        self.base = s.value;
+    }
+
+    /// pre  o.is_some
+    /// pre  o.value ≤ 100
+    /// pre  self.base ≤ 100
+    /// post result = self.base + o.value
+    fn plus(&self, option<u64> o) -> u64 {
+        return self.base + o.value;
+    }
+}
+
+pub fn subject() -> u64 {
+    var k = Keeper::at(some(5));
+    u64 r = k.plus(some(7));
+    return r;
+}

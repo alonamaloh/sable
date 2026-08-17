@@ -1,0 +1,23 @@
+// expect-error: Tank::step.post.up
+// A false method post over a `bool` parameter: the taken branch claims
+// two steps and takes one. The dynamic twin is
+// `corpus/test-fails/member_method_wrong_bool_post.sable`.
+
+pub class Tank {
+    u64 v;
+
+    /// invariant v ≤ 100
+
+    /// post self.v = 0
+    init empty() {
+        self.v = 0;
+    }
+
+    /// pre  self.v ≤ 50
+    /// post #[label(up)] on = true → self.v = old self.v + 2
+    fn step(&mut self, bool on) {
+        if (on) {
+            self.v = self.v + 1;
+        }
+    }
+}

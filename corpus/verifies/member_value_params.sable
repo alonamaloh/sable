@@ -1,0 +1,210 @@
+// Copyable init and method parameters: integers, `bool`, and value
+// options cross the member boundary by value, with the same accessor,
+// match, and junk-model surface (`getD default = 0`, ADR 0008) a
+// plain-call parameter has. An integer payload carries its range fact
+// over `.value`; a someness VC keeps program code away from the junk.
+
+pub class Gauge {
+    u64 level;
+    u64 cap;
+
+    /// invariant level ≤ cap
+
+    /// pre  c ≥ 10
+    /// post match seed with
+    ///      | some v => self.level = v % 10
+    ///      | none   => self.level = 0
+    /// post self.cap = c
+    init make(option<u64> seed, u64 c) {
+        self.cap = c;
+        if (seed.is_some) {
+            self.level = seed.value % 10;
+        } else {
+            self.level = 0;
+        }
+    }
+
+    // A `bool` parameter in a `&mut` method: the branch not taken holds
+    // the state still, and the invariant is re-established on both. The
+    // receiver comes back fresh, so the untouched field needs its frame
+    // post for a second call's pre to close.
+    /// pre  self.level < self.cap
+    /// post #[label(up)]   on = true → self.level = old self.level + 1
+    /// post #[label(hold)] on = false → self.level = old self.level
+    /// post #[label(cap)]  self.cap = old self.cap
+    fn tick(&mut self, bool on) {
+        if (on) {
+            self.level = self.level + 1;
+        }
+    }
+
+    /// post result = self.level
+    fn read(&self) -> u64 {
+        return self.level;
+    }
+
+    // The parameter's payload range fact is load-bearing: the overflow
+    // VC on `a.value / 2 + 1` closes from `0 ≤ a.value ≤ u64.max`, and
+    // no clause here supplies either bound.
+    /// pre  a.is_some
+    /// post result = a.value / 2 + 1
+    fn half_plus_one(&self, option<u64> a) -> u64 {
+        return a.value / 2 + 1;
+    }
+
+    // An `option<bool>` parameter: the payload is compared as a value,
+    // and the absent case answers from state instead.
+    /// post match d with
+    ///      | some v => (result ↔ v = true)
+    ///      | none   => (result ↔ self.level = 0)
+    fn engaged_or(&self, option<bool> d) -> bool {
+        if (d.is_some) {
+            return d.value;
+        }
+        if (self.level == 0) {
+            return true;
+        }
+        return false;
+    }
+
+    // A signed payload carries signed bounds; the pre narrows them so
+    // the sum stays in range.
+    /// pre  off.is_some
+    /// pre  -100 ≤ off.value ∧ off.value ≤ 100
+    /// post result = 200 + off.value
+    fn biased(&self, option<i64> off) -> i64 {
+        i64 b = 200;
+        return b + off.value;
+    }
+
+    // A method forwards its own option parameter to a plain function:
+    // the callee's match-shaped post instantiates at the whole chain.
+    /// post match o with
+    ///      | some v => result = v
+    ///      | none   => result = self.cap
+    fn value_or_cap(&self, option<u64> o) -> u64 {
+        return value_or(o, self.cap);
+    }
+}
+
+/// post match o with
+///      | some v => result = v
+///      | none   => result = d
+pub fn value_or(option<u64> o, u64 d) -> u64 {
+    if (o.is_some) {
+        return o.value;
+    }
+    return d;
+}
+
+// A plain function forwards its option parameter into an init: the
+// init's pre instantiates at the literal, its match-shaped post at the
+// forwarded chain.
+/// post match s with
+///      | some v => result.level = v % 10
+///      | none   => result.level = 0
+pub fn build(option<u64> s) -> Gauge {
+    var g = Gauge::make(s, 10);
+    return g;
+}
+
+/// post result = 4
+pub fn demo() -> u64 {
+    var mut g = Gauge::make(some(23), 10);
+    g.tick(true);
+    g.tick(false);
+    u64 r = g.read();
+    return r;
+}
+
+/// post result = 118
+pub fn demo_more() -> u64 {
+    var g = Gauge::make(none, 10);
+    bool e = g.engaged_or(none);
+    bool s = g.engaged_or(some(false));
+    i64 z = g.biased(some(100));
+    option<u64> bound = some(8);
+    u64 w = g.value_or_cap(bound);
+    u64 v = g.value_or_cap(none);
+    u64 acc = w + v;
+    if (e) {
+        if (!s) {
+            if (z == 300) {
+                return acc + 100;
+            }
+        }
+    }
+    return 0;
+}
+
+/// post result = 3
+pub fn demo_build() -> u64 {
+    var g = build(some(23));
+    u64 r = g.read();
+    return r;
+}
+
+// A class template whose members take concrete copyable parameters: the
+// gate answers at the instance, and the instantiated contracts carry the
+// same option and `bool` surface the concrete class above does.
+pub class Slot<T> {
+    [T] buf;
+    u64 tag;
+
+    /// invariant buf.len > 0
+
+    /// pre  n > 0
+    /// pre  n ≤ 1024
+    /// post match t with
+    ///      | some v => self.tag = v
+    ///      | none   => self.tag = 0
+    init sized(u64 n, option<u64> t) {
+        self.buf = alloc_array<T>(n, 0);
+        if (t.is_some) {
+            self.tag = t.value;
+        } else {
+            self.tag = 0;
+        }
+    }
+
+    /// post #[label(taken)]  b = true → result = self.tag
+    /// post #[label(passed)] b = false → result = 0
+    fn tag_if(&self, bool b) -> u64 {
+        if (b) {
+            return self.tag;
+        }
+        return 0;
+    }
+}
+
+/// post result = 7
+pub fn use_template() -> u64 {
+    var p = Slot<u64>::sized(3, some(7));
+    u64 r = p.tag_if(true);
+    return r;
+}
+
+// A match-shaped post about an *abstract* option needs the case split
+// spelled out on the present path; automation handles the constructor
+// forms at every call site above. Obligation names come from the
+// failure output.
+
+/// discharge Gauge::make.post.match_seed_with_some_v_self_level_v_10_n by
+///   cases seed with
+///   | none => exact absurd rfl h_path_seed_none
+///   | some v => simp_all
+
+/// discharge Gauge::engaged_or.post.match_d_with_some_v_result_v_true_none_r by
+///   cases d with
+///   | none => exact absurd rfl h_path_d_none
+///   | some v => simp_all
+
+/// discharge value_or.post.match_o_with_some_v_result_v_none_result by
+///   cases o with
+///   | none => exact absurd rfl h_path_o_none
+///   | some v => simp_all
+
+/// discharge Slot::sized.post.match_t_with_some_v_self_tag_v_none_self by
+///   cases t with
+///   | none => exact absurd rfl h_path_t_none
+///   | some v => simp_all

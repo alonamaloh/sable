@@ -1297,6 +1297,44 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      differential gates together — rather than an unreviewed switch from
      copies to pointers.
 
+     **Checker and VC generation admit copyable member parameters.** A
+     `bool`, `option<u64>`-family, or `option<bool>` parameter of a class
+     init or method crosses the member boundary by value exactly as it
+     crosses a plain call: the body binds the same `Bool` or `Option`
+     entry state (member bodies already share `fresh_state_for`), and the
+     caller substitutes the reified Boolean or the parenthesized option
+     chain into the member's clauses — the method-call arm gained the one
+     missing reification; the constructor arm already had both. The same
+     discharges the plain-call subjects use close the match-shaped member
+     posts (`corpus/verifies/member_value_params.sable`).
+     `check::member_param_ty` keeps one name, `type.member_param`, for
+     every family it still refuses (records, raw pointers, options of
+     anything but a concrete value payload, owned arrays, `&mut [T]`,
+     method `&[T]`), and its option arm matches the owned option
+     directly, so borrow spellings stay behind
+     `type.borrow_param_unsupported`. The interpreter and monitor needed
+     nothing: member contracts over the new parameters run at zero
+     skips — match-shaped init and method posts, `.is_some` pres, `old
+     self` frames beside a `bool` argument, the absent-`.value` trap, and
+     copy semantics at both member boundaries
+     (`corpus/tests/test_member_value_params.sable`); each false-contract
+     direction carries a must-fail + test-fails twin, and `corpus/pairs/`
+     pins member-vs-free agreement (same-run) and argument-naming
+     invariance (same-lean). The formal SVM has no member-call leg to
+     extend — `CtorCall`/`MethodCall` are outside the core subset, so no
+     svm-diff subject can exist — and the LLVM backend keeps every member
+     call behind the fixed-owner fences; the initializer-parameter
+     validator drops its unreachable `bool` admission so the newly
+     spellable shape is a named refusal, not an uncovered lowering.
+     Cross-module transport rides the existing artifact path
+     (`corpus/verifies/member_param_import.sable`), and a class
+     template's concrete `bool`/option member parameters admit at the
+     instance (`Slot<T>` in the same subject).
+     `docs/type-matrix.md` opens exactly `bool`, `option<u64>`, and
+     `option<bool>` × `init param` and `method param` (57/210 → 63/210);
+     `docs/shape-admission.md` moves exactly the `check init param` and
+     `check method param` columns for those three shapes.
+
    - **G2 — affine options (staged; G2.0–G2.3 complete):**
      carry ownership and destruction correctly through present/absent aggregate
      values without widening the existing copy-option family by accident.

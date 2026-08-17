@@ -1,12 +1,18 @@
 // expect-error: type.member_param
-// An option member parameter is refused even though ordinary functions
-// admit value-payload option parameters: the member call boundary has not
-// been given the transport.
+// Options with a concrete value payload cross the member boundary; an
+// option of a raw pointer does not — members have no nullable-pointer
+// transport. The gate answers on the outer type, so the refusal names
+// the option, not its payload.
+
+record Rec #[layout(size := 8, align := 4)] {
+    #[offset(0)] u32 a;
+    #[offset(4)] u32 b;
+}
 
 pub class C {
     u64 v;
 
-    init make(option<u64> o) {
+    init make(option<raw<Rec>> p) {
         self.v = 0;
     }
 }

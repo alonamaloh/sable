@@ -1,0 +1,78 @@
+// Dynamic checks for copyable member parameters: init and method
+// contracts over `bool`, `option<u64>`, `option<bool>`, and `option<i64>`
+// parameters are monitored at the member boundary — match-shaped posts
+// over a parameter, `.is_some` pres, `old self` frames beside a `bool`
+// argument, and copy semantics at the argument: the caller's binding is
+// untouched by an init or a method call.
+
+use member_value_params;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre x = y
+fn expect_eq_i(i64 x, i64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+/// pre ¬b
+fn expect_false(bool b) {
+}
+
+fn test_init_option_params() {
+    var g = Gauge::make(some(23), 10);
+    expect_eq(g.read(), 3);
+    var h = Gauge::make(none, 12);
+    expect_eq(h.read(), 0);
+}
+
+fn test_method_bool_params() {
+    var mut g = Gauge::make(some(23), 10);
+    g.tick(true);
+    expect_eq(g.read(), 4);
+    g.tick(false);
+    expect_eq(g.read(), 4);
+}
+
+fn test_method_option_params() {
+    var g = Gauge::make(none, 10);
+    expect_eq(g.half_plus_one(some(8)), 5);
+    expect_true(g.engaged_or(some(true)));
+    expect_false(g.engaged_or(some(false)));
+    expect_true(g.engaged_or(none));
+    expect_eq_i(g.biased(some(-100)), 100);
+    expect_eq(g.value_or_cap(some(8)), 8);
+    expect_eq(g.value_or_cap(none), 10);
+}
+
+fn test_member_args_are_copies() {
+    option<u64> bound = some(9);
+    var g = Gauge::make(bound, 10);
+    expect_eq(g.read(), 9);
+    u64 w = g.value_or_cap(bound);
+    expect_eq(w, 9);
+    expect_true(bound.is_some);
+    expect_eq(bound.value, 9);
+}
+
+fn test_template_member_params() {
+    var p = Slot<u64>::sized(3, some(7));
+    expect_eq(p.tag_if(true), 7);
+    expect_eq(p.tag_if(false), 0);
+    var q = Slot<u64>::sized(2, none);
+    expect_eq(q.tag_if(true), 0);
+}
+
+fn test_free_and_member_agree() {
+    var g = Gauge::make(none, 10);
+    expect_eq(value_or(some(7), 1), 7);
+    expect_eq(g.value_or_cap(some(7)), 7);
+    expect_eq(demo(), 4);
+    expect_eq(demo_more(), 118);
+    expect_eq(demo_build(), 3);
+    expect_eq(use_template(), 7);
+}

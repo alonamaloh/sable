@@ -1,0 +1,28 @@
+// pair: same-run
+// See member_arg_vs_free_arg.a.sable: the free spelling of the same
+// selection must run identically.
+
+fn pick(u64 base, option<u64> o, bool fallback) -> u64 {
+    if (o.is_some) {
+        return o.value;
+    }
+    if (fallback) {
+        return base;
+    }
+    return 0;
+}
+
+fn subject_some() -> u64 {
+    u64 r = pick(11, some(7), false);
+    return r;
+}
+
+fn subject_none_fallback() -> u64 {
+    u64 r = pick(11, none, true);
+    return r;
+}
+
+fn subject_none_zero() -> u64 {
+    u64 r = pick(11, none, false);
+    return r;
+}

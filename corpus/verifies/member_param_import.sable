@@ -1,0 +1,31 @@
+// An imported class's init and methods take copyable value parameters:
+// the member contracts crossed a module boundary as verified artifacts,
+// and the option and `bool` arguments instantiate them here exactly as
+// they do in the declaring module.
+
+use member_value_params;
+
+/// post result = 11
+pub fn imported_member_args() -> u64 {
+    var mut g = Gauge::make(some(15), 12);
+    g.tick(true);
+    u64 h = g.half_plus_one(some(8));
+    u64 r = g.read();
+    return h + r;
+}
+
+// A parameter of this module forwards into the imported class's method:
+// the imported match-shaped post instantiates at the abstract chain, and
+// the case split is spelled on the present path.
+/// pre  o.is_some
+/// post result = o.value
+pub fn imported_forward(option<u64> o) -> u64 {
+    var g = build(some(3));
+    u64 w = g.value_or_cap(o);
+    return w;
+}
+
+/// discharge imported_forward.post.result_o_value by
+///   cases o with
+///   | none => exact absurd rfl h_pre_o_is_some
+///   | some v => simp_all

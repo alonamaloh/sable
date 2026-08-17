@@ -423,11 +423,13 @@ foreign, or cross-module array ABI.
   Clang at `-O0`/`-O2` by `corpus/llvm-diff/option_param.sable`), keeps
   refusing the integer-payload parameter under `backend.unsupported` — the
   type has no LLVM representation in any position — and a stored option field
-  keeps `interp.option_position_unsupported`. Not admitted
+  keeps `interp.option_position_unsupported`. Init and method
+  parameters admit the same copyable option and `bool` shapes plain calls do
+  (`check::member_param_ty`). Not admitted
   anywhere: option parameters with a type-parameter payload
   (`type.option_param`), trait-method option parameters
-  (`type.trait_param_unsupported`), init/method option parameters
-  (`type.member_param`), option-valued class or record fields, trait or impl
+  (`type.trait_param_unsupported`), option-valued class or record fields,
+  trait or impl
   method option returns, Boolean arrays or `alloc_array<bool>`, record or
   nested option payloads, or Boolean generic arguments. These position fences
   are checked before execution as well as at the individual checker/VC

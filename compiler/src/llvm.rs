@@ -1389,7 +1389,6 @@ fn require_initializer_parameter(
             Ok(())
         }
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        Ty::Bool => Ok(()),
         Ty::Class(class) => {
             let declaration = require_fixed_class(program, class, span, "initializer parameter")?;
             if declaration.name == "Nat" {
