@@ -3645,8 +3645,21 @@ impl<'a> Generator<'a> {
                 let Val::Int(i) = self.eval(index) else {
                     unreachable!()
                 };
-                let Val::Int(v) = self.eval(value) else {
-                    unreachable!()
+                let v = match self.eval(value) {
+                    Val::Int(v) | Val::Record(v) => v,
+                    Val::Prop(p) => lean_bool_value(&p),
+                    Val::Arr(_)
+                    | Val::Obj(_)
+                    | Val::View(_)
+                    | Val::Ptr(_)
+                    | Val::Opt(_)
+                    | Val::Unit => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.field_state_unsupported: `self.{field}[..]` has \
+                             no element-store value for this type"
+                        ));
+                        "0".to_string()
+                    }
                 };
                 let arr = self.self_field_str(field);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
@@ -6306,7 +6319,35 @@ impl<'a> Generator<'a> {
                 );
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
-                Val::Int(format!("({arr}.get {i})"))
+                let value = format!("({arr}.get {i})");
+                match &e.ty {
+                    Some(Ty::Bool) => Val::Prop(format!("({value} = true)")),
+                    Some(Ty::Int(_) | Ty::Param(_)) => Val::Int(value),
+                    Some(Ty::Record(ri)) => {
+                        let wf =
+                            format!("{}.wf {value}", lean_record_name(&self.records[*ri].name));
+                        self.assume_fact(&wf);
+                        Val::Record(value)
+                    }
+                    Some(
+                        Ty::Class(_)
+                        | Ty::Array(_)
+                        | Ty::Option(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Res(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit,
+                    )
+                    | None => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.field_state_unsupported: `{obj}.{field}[..]` has \
+                             no symbolic element value for its type"
+                        ));
+                        Val::Unit
+                    }
+                }
             }
             ExprKind::SelfField { field } => match self.cctx {
                 Cctx::Init(_) => self
@@ -6353,7 +6394,6 @@ impl<'a> Generator<'a> {
                 let Val::Int(i) = self.eval(index) else {
                     unreachable!()
                 };
-                let model = adr0009_ty_int_model(e.ty.clone().expect("checked: field index type"));
                 let arr = self.self_field_str(field);
                 let goal = format!("0 ≤ {i} ∧ {i} < ({arr}.len)");
                 let ob = self.obligation(
@@ -6365,9 +6405,36 @@ impl<'a> Generator<'a> {
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
                 let value = format!("({arr}.get {i})");
-                let range = self.r_prop(&value, model);
-                self.assume_fact(&range);
-                Val::Int(value)
+                match e.ty.clone().expect("checked: field index type") {
+                    Ty::Bool => Val::Prop(format!("({value} = true)")),
+                    ty @ (Ty::Int(_) | Ty::Param(_)) => {
+                        let range = self.r_prop(&value, adr0009_ty_int_model(ty));
+                        self.assume_fact(&range);
+                        Val::Int(value)
+                    }
+                    // Element well-formedness follows from the field's
+                    // elementwise fact plus the just-proven bounds.
+                    Ty::Record(ri) => {
+                        let wf = format!("{}.wf {value}", lean_record_name(&self.records[ri].name));
+                        self.assume_fact(&wf);
+                        Val::Record(value)
+                    }
+                    Ty::Class(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.field_state_unsupported: `self.{field}[..]` has \
+                             no symbolic element value for its type"
+                        ));
+                        Val::Unit
+                    }
+                }
             }
             ExprKind::CtorCall {
                 class, init, args, ..

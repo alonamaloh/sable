@@ -21,7 +21,7 @@ The `init param` / `method param` pairs read the same way.
 | `bool` | yes | yes | yes | never | not yet | not yet | yes | yes | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `[u64]` | yes | not yet | not yet | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
 | `[bool]` | yes | not yet | not yet | yes | yes | never | not yet | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
-| `[record]` | yes | not yet | not yet | yes | yes | never | not yet | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
+| `[record]` | yes | not yet | not yet | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
 | `option<u64>` | yes | yes | yes | never | not yet | not yet | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `option<bool>` | yes | yes | yes | never | not yet | not yet | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `record` | yes | yes | yes | never | not yet | not yet | not yet | yes | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
@@ -29,7 +29,7 @@ The `init param` / `method param` pairs read the same way.
 | `class` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
 | `raw<u8>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | not yet | not yet | never | not yet | never |
 
-Open cells: 72 of 180 intended; 51 never open by design.
+Open cells: 73 of 180 intended; 51 never open by design.
 
 ## Cells that never open
 
@@ -108,7 +108,6 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `[record]` | return | `type.array_return` |
 | `[record]` | param | `type.param_unsupported` |
 | `[record]` | record field | `record.field_type` |
-| `[record]` | class field | `type.record_array_field` |
 | `[record]` | array element | `type.array_payload_unsupported` |
 | `[record]` | option payload | `type.affine_option_payload` |
 | `[record]` | generic arg | `mono.type_arg_unsupported` |

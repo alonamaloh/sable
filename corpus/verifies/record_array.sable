@@ -105,3 +105,63 @@ pub fn demo_extent() -> u64 {
     u64 w = e.width();
     return w;
 }
+
+// A record array as class-field state: element stores through the
+// receiver chain, elementwise reads in methods and destructors, and
+// external element reads on an owned object.
+pub class Track {
+    [Pt] marks;
+    u64 count;
+
+    /// invariant count ≤ marks.len
+    /// invariant marks.len ≥ 1
+
+    /// pre  n ≥ 1
+    /// pre  n ≤ 100
+    /// post #[label(len)] self.marks.len = n
+    /// post #[label(cnt)] self.count = 0
+    init blank(u64 n) {
+        self.marks = alloc_array<Pt>(n, Pt(0, 0));
+        self.count = 0;
+    }
+
+    /// pre  self.count < self.marks.len
+    /// post #[label(x)] (self.marks.get (old self.count)).x = px
+    /// post #[label(y)] (self.marks.get (old self.count)).y = py
+    /// post #[label(cnt)] self.count = old self.count + 1
+    /// post #[label(len)] self.marks.len = old self.marks.len
+    fn push(&mut self, u64 px, u64 py) {
+        self.marks[self.count] = Pt(px, py);
+        self.count = self.count + 1;
+    }
+
+    /// pre  i < self.count
+    /// post result = (self.marks.get i).x
+    fn x_at(&self, u64 i) -> u64 {
+        Pt m = self.marks[i];
+        return m.x;
+    }
+
+    deinit {
+        if (self.count > 0) {
+            Pt last = self.marks[0];
+            self.count = 0;
+        }
+    }
+}
+
+/// post result = 7
+pub fn demo_track() -> u64 {
+    var mut t = Track::blank(4);
+    t.push(7, 9);
+    u64 r = t.x_at(0);
+    return r;
+}
+
+/// post result = 9
+pub fn demo_external_read() -> u64 {
+    var mut t = Track::blank(2);
+    t.push(7, 9);
+    Pt m = t.marks[0];
+    return m.y;
+}

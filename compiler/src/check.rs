@@ -2995,20 +2995,6 @@ pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "field"));
     }
-    if matches!(ty.as_array(), Some((Ty::Record(_), _))) {
-        return Err(Diagnostic {
-            name: "type.record_array_field".into(),
-            title: "record arrays cannot be stored in class fields yet".into(),
-            span,
-            label: "keep `[record]` as an owned local".into(),
-            notes: vec![(
-                "note".into(),
-                "field element reads, stores, and havoc must be enabled together before a \
-                 class can retain a record array"
-                    .into(),
-            )],
-        });
-    }
     if ty.is_array_of(&Ty::Bool) {
         return Err(Diagnostic {
             name: "type.bool_array_field".into(),
