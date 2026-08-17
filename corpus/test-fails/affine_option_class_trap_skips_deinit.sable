@@ -1,0 +1,29 @@
+// expect-test-failure: index out of bounds
+// A trap runs no drops: a present class payload's destructor does not
+// run on the trapping path, so the reported failure is the trap itself,
+// never the destructor's own violation.
+
+/// pre x = 0
+fn require_zero(u64 x) -> u64 {
+    return x;
+}
+
+pub class Loud {
+    u64 armed;
+
+    /// post self.armed = 1
+    init arm() {
+        self.armed = 1;
+    }
+
+    deinit {
+        u64 w = require_zero(self.armed);
+    }
+}
+
+fn test_trap_beats_deinit() {
+    mut option<Loud> held = some(Loud::arm());
+    [u64] empty = alloc_array<u64>(0, 0);
+    mut u64 i = 0;
+    u64 boom = empty[i];
+}

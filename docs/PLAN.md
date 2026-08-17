@@ -1354,6 +1354,18 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **A nullable owning handle (ADR 0080).** `option<class>` joins the
+     affine family: take is skolemization through the one havoc dispatch
+     (fresh binder pinned by `old = some taken`; the closed producer set
+     is what makes invariant-at-take sound), the wrap consumes its
+     source, and the single semantic edit is the interpreter's drop
+     routing — a present payload dies through `drop_value`, a trap runs
+     no destructors. The exact-once discipline lands as both corpus
+     halves plus trap-beats-deinit; the monitor's affine snapshot is
+     payload-generic; every boundary closes in the family's names with
+     zero SVM/LLVM edits (no differential oracle exists for the cell —
+     behavior is pinned by interp + corpus). 74 of 180 intended open.
+
      **Record elements are values (ADR 0079).** `[record]` opens across
      locals, element reads/stores, borrows, and init `&[record]` — the
      payload family split by container (array gates admit, option gates

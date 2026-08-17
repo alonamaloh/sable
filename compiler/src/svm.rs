@@ -3773,6 +3773,11 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
             "opt some {}",
             render_inner(program, &RtVal::Arr(array.clone()))
         ),
+        // A class value cannot exist in the machine, so an affine class
+        // option never reaches a rendered differential outcome; render
+        // honestly if a future caller asks.
+        RtVal::AffineOptClass { value: None, .. } => "opt none".into(),
+        RtVal::AffineOptClass { value: Some(_), .. } => "opt some <class>".into(),
         // A nullable raw pointer is an ordinary option carrying a pointer,
         // so it takes the ordinary option spelling.
         RtVal::PtrOpt(None) => "opt none".into(),

@@ -1,0 +1,94 @@
+// Dynamic checks for the owning class option: drop-while-some runs the
+// destructor exactly once (a deinit that would fail a second run
+// passes), a none drop runs nothing (a deinit that would fail ANY run
+// passes untouched), take moves the payload out without copying, and
+// the wrap kills its source so the wrapped value dies through the
+// option alone.
+
+use affine_option_class;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+/// pre x = 1
+fn require_armed(u64 x) {
+}
+
+// At-most-once: the deinit consumes its own arming — a second run would
+// see 0 and fail. Exactly one drop passes.
+pub class Fuse {
+    u64 armed;
+
+    /// post self.armed = 1
+    init set() {
+        self.armed = 1;
+    }
+
+    deinit {
+        require_armed(self.armed);
+        self.armed = 0;
+    }
+}
+
+// A deinit that fails on ANY run: its silence is the proof a drop did
+// not happen.
+pub class Tripwire {
+    u64 live;
+
+    /// post self.live = 1
+    init lay() {
+        self.live = 1;
+    }
+
+    deinit {
+        u64 w = never_run(self.live);
+    }
+}
+
+/// pre x = 0
+fn never_run(u64 x) -> u64 {
+    return x;
+}
+
+fn test_drop_while_some_destroys_once() {
+    mut option<Fuse> held = some(Fuse::set());
+}
+
+fn test_take_then_drop_destroys_once() {
+    mut option<Fuse> held = some(Fuse::set());
+    if (held.is_some) {
+        var f = held.take;
+    }
+}
+
+fn test_source_dies_through_the_option_alone() {
+    var f = Fuse::set();
+    mut option<Fuse> boxed = some(f);
+}
+
+fn test_none_drop_runs_nothing() {
+    mut option<Tripwire> empty = none;
+}
+
+fn test_branch_divergent_drop() {
+    mut option<Fuse> slot = some(Fuse::set());
+    mut u64 mode = 1;
+    if (mode == 1) {
+        if (slot.is_some) {
+            var f = slot.take;
+        }
+    }
+}
+
+fn test_lifecycles_agree() {
+    expect_eq(take_and_use(), 7);
+    expect_eq(drop_while_some(), 3);
+    expect_eq(none_lifecycle(), 2);
+    expect_eq(wrap_named(), 5);
+    expect_eq(churn(6), 6);
+}

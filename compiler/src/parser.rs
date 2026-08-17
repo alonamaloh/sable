@@ -1663,7 +1663,7 @@ impl<'a> Parser<'a> {
             // decide the rest.
             P::OptionPayload => matches!(
                 shape,
-                S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw | S::Option
+                S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw | S::Option | S::Class
             ),
             P::ForIndex | P::Const | P::CastTarget | P::TraitImplTarget | P::ResourceMapKey => {
                 matches!(shape, S::Int | S::Param)

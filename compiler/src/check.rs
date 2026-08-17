@@ -1377,7 +1377,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             name: "mut.option_take_immutable".into(),
                             title: format!("affine-option local `{name}` is immutable"),
                             span: *name_span,
-                            label: "write `mut option<[bool]>` so `.take` may leave `none` behind"
+                            label: "write `mut option<...>` so `.take` may leave `none` behind"
                                 .into(),
                             notes: vec![(
                                 "note".into(),
@@ -1918,22 +1918,42 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             name: "option.affine_inferred".into(),
                             title: "an affine-option binding cannot be inferred".into(),
                             span: *name_span,
-                            label: "write an explicit `mut option<[bool]>` declaration".into(),
+                            label: "write an explicit `mut option<...>` declaration".into(),
                             notes: vec![],
                         });
                     }
                     validate_aggregate_ty(cached.clone(), *name_span)?;
                 }
-                if matches!(
+                let some_of_class_local = matches!(
                     &init.kind,
                     ExprKind::SomeE(inner)
-                        if matches!(&inner.kind, ExprKind::AllocArray { .. } | ExprKind::ArrayLit(_))
-                ) {
+                        if matches!(
+                            &inner.kind,
+                            ExprKind::Var(v)
+                                if matches!(
+                                    ctx.vars.get(v.as_str()).map(|i| &i.ty),
+                                    Some(Ty::Class(_))
+                                )
+                        )
+                );
+                if some_of_class_local
+                    || matches!(
+                        &init.kind,
+                        ExprKind::SomeE(inner)
+                            if matches!(
+                                &inner.kind,
+                                ExprKind::AllocArray { .. }
+                                    | ExprKind::ArrayLit(_)
+                                    | ExprKind::CtorCall { .. }
+                            )
+                    )
+                {
                     return Err(Diagnostic {
                         name: "option.affine_inferred".into(),
                         title: "an affine-option binding cannot be inferred".into(),
                         span: *name_span,
-                        label: "write `mut option<[bool]> name = some(alloc_array<bool>(...));`"
+                        label: "write an explicit `mut option<...>` declaration for an \
+                                ownership-bearing option"
                             .into(),
                         notes: vec![(
                             "note".into(),
@@ -1972,12 +1992,31 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     }
                     _ => None,
                 };
-                let t = match moved_from {
-                    Some(ci) => {
-                        check_expr(ctx, init, Some(Ty::Class(ci)))?;
-                        Ty::Class(ci)
+                // `var t = o.take;` — atomic extraction of an owned class
+                // payload into a fresh owner. The array family keeps its
+                // typed-declaration route; a class local is var-introduced,
+                // so its take is too.
+                let take_class = match &init.kind {
+                    ExprKind::OptTake { option, .. } => ctx
+                        .vars
+                        .get(option.as_str())
+                        .and_then(|v| v.ty.as_affine_option_payload())
+                        .and_then(|p| match p {
+                            Ty::Class(ci) => Some(*ci),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                let t = if take_class.is_some() {
+                    check_affine_option_take(ctx, init)?
+                } else {
+                    match moved_from {
+                        Some(ci) => {
+                            check_expr(ctx, init, Some(Ty::Class(ci)))?;
+                            Ty::Class(ci)
+                        }
+                        None => check_expr(ctx, init, None)?,
                     }
-                    None => check_expr(ctx, init, None)?,
                 };
                 local_ty(&t, init.span)?;
                 // A declaration takes the value like any other sink, and
@@ -2682,7 +2721,7 @@ fn affine_option_unsupported(ty: Ty, span: Span) -> Diagnostic {
 /// named refusal, because each owned payload kind needs matching proof,
 /// interpreter, formal-machine, and native destruction semantics.
 pub(crate) fn affine_option_payload(payload: &Ty, span: Span) -> CResult<()> {
-    if payload.is_owned_array_of(&Ty::Bool) {
+    if payload.is_owned_array_of(&Ty::Bool) || matches!(payload, Ty::Class(_)) {
         return Ok(());
     }
     Err(Diagnostic {
@@ -2692,7 +2731,7 @@ pub(crate) fn affine_option_payload(payload: &Ty, span: Span) -> CResult<()> {
             payload.name()
         ),
         span,
-        label: "the affine-option family currently owns only `option<[bool]>`".into(),
+        label: "the affine-option family owns `option<[bool]>` and `option<class>`".into(),
         notes: vec![(
             "note".into(),
             "each owned payload kind needs matching proof, interpreter, SVM, and native destruction semantics".into(),
@@ -2705,7 +2744,7 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
         "parameter" => (
             "type.affine_option_param",
             format!("affine option `{}` cannot be a parameter", ty.name()),
-            "keep `option<[bool]>` as an explicit local; call transport is deferred",
+            "keep the owning option as an explicit local; call transport is deferred",
         ),
         "return" => (
             "type.affine_option_return",
@@ -2715,7 +2754,7 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
         "field" => (
             "type.affine_option_field",
             format!("affine option `{}` cannot be stored in a field", ty.name()),
-            "keep `option<[bool]>` as a local; aggregate field storage is deferred",
+            "keep the owning option as a local; aggregate field storage is deferred",
         ),
         "trait" => (
             "type.affine_option_trait",
@@ -2728,7 +2767,7 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
                 "affine option `{}` cannot appear in a generic template",
                 ty.name()
             ),
-            "use the concrete local `option<[bool]>` surface in a non-generic function",
+            "use the concrete owning-option local surface in a non-generic function",
         ),
         _ => unreachable!("known affine-option boundary"),
     };
@@ -3302,6 +3341,7 @@ fn check_affine_option_initializer(
         .as_affine_option_payload()
         .expect("affine-option initializer is dispatched on an owning option");
     affine_option_payload(payload, expression.span)?;
+    let payload = payload.clone();
     match &mut expression.kind {
         ExprKind::NoneE => {}
         ExprKind::SomeE(inner)
@@ -3309,15 +3349,30 @@ fn check_affine_option_initializer(
         {
             check_expr(ctx, inner, Some(Ty::array(Ty::Bool)))?;
         }
+        // A class payload wraps an owned value: a fresh construction, or a
+        // named local the wrap consumes (ADR 0030 — the move kills its
+        // source). Both producers carry the class invariant, which is what
+        // lets `.take` hand it back out.
+        ExprKind::SomeE(inner)
+            if matches!(payload, Ty::Class(_))
+                && matches!(&inner.kind, ExprKind::CtorCall { .. } | ExprKind::Var(_)) =>
+        {
+            check_expr(ctx, inner, Some(payload.clone()))?;
+            transfer(ctx, inner, None)?;
+        }
         _ => {
             return Err(Diagnostic {
                 name: "option.affine_initializer".into(),
                 title: "unsupported affine-option initializer".into(),
                 span: expression.span,
-                label: "use `none` or `some(alloc_array<bool>(len, init))`".into(),
+                label: "use `none`, `some(alloc_array<bool>(len, init))`, or `some(<class \
+                        value>)`"
+                    .into(),
                 notes: vec![(
                     "note".into(),
-                    "wrapping an existing array, an array literal, or a temporary is deferred until every ownership path has an atomic model".into(),
+                    "wrapping an array temporary or a compound expression is deferred until \
+                     every ownership path has an atomic model"
+                        .into(),
                 )],
             });
         }
@@ -3346,7 +3401,7 @@ fn check_affine_option_local(
             name: "type.mismatch".into(),
             title: format!("`.{operation}` on `{}`", info.ty.clone().name()),
             span,
-            label: "expected an affine `option<[bool]>` local".into(),
+            label: "expected an owning-option local".into(),
             notes: vec![],
         });
     };
@@ -3375,7 +3430,7 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
     else {
         unreachable!("take checker called for non-take expression");
     };
-    let (_, mutable) = check_affine_option_local(ctx, option, *option_span, "take")?;
+    let (option_ty, mutable) = check_affine_option_local(ctx, option, *option_span, "take")?;
     if !mutable {
         return Err(Diagnostic {
             name: "mut.option_take_immutable".into(),
@@ -3388,7 +3443,12 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
             )],
         });
     }
-    let ty = Ty::array(Ty::Bool);
+    // The result is the option's own payload: what was wrapped is what
+    // comes out, and the destination check compares against exactly this.
+    let ty = option_ty
+        .as_affine_option_payload()
+        .expect("checked: affine-option local")
+        .clone();
     expression.ty = Some(ty.clone());
     Ok(ty)
 }
@@ -6545,7 +6605,7 @@ mod concrete_aggregate_tests {
                 Ty::option(Ty::option(Ty::Class(0))),
                 "type.option_payload_unsupported",
             ),
-            (Ty::option(Ty::Class(0)), "type.option_payload_unsupported"),
+            (Ty::option(Ty::Class(0)), "type.affine_option_unsupported"),
         ];
         validate_aggregate_ty(Ty::option(Ty::option(Ty::Int(IntTy::U64))), span)
             .expect("the recursive copyable family nests at any depth");

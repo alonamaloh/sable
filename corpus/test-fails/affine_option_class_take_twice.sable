@@ -1,0 +1,17 @@
+// expect-test-failure: `.take` of an empty affine option
+// `.take` leaves `none` behind: the second extraction traps.
+
+pub class Token {
+    u64 id;
+
+    /// post self.id = 1
+    init make() {
+        self.id = 1;
+    }
+}
+
+fn test_take_twice_traps() {
+    mut option<Token> held = some(Token::make());
+    var a = held.take;
+    var b = held.take;
+}

@@ -1,0 +1,19 @@
+// expect-error: option.affine_initializer
+// `some` wraps a fresh construction or a named owner, never a compound
+// extraction: `some(o.take)` would need an atomic two-option transition
+// no rule models.
+
+pub class Token {
+    u64 id;
+
+    /// post self.id = 1
+    init make() {
+        self.id = 1;
+    }
+}
+
+fn rewrap() -> u64 {
+    mut option<Token> a = some(Token::make());
+    mut option<Token> b = some(a.take);
+    return 0;
+}

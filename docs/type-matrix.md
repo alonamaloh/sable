@@ -26,10 +26,10 @@ The `init param` / `method param` pairs read the same way.
 | `option<bool>` | yes | yes | yes | never | not yet | not yet | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `record` | yes | yes | yes | never | not yet | not yet | not yet | yes | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
 | `option<[bool]>` | yes | not yet | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet |
-| `class` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
+| `class` | yes | yes | yes | yes | yes | never | yes | not yet | yes | not yet | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
 | `raw<u8>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | not yet | not yet | never | not yet | never |
 
-Open cells: 73 of 180 intended; 51 never open by design.
+Open cells: 74 of 180 intended; 51 never open by design.
 
 ## Cells that never open
 
@@ -186,7 +186,6 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `option<[bool]>` | method param & | `type.borrow_param_unsupported` |
 | `class` | record field | `record.field_type` |
 | `class` | array element | `type.array_payload_unsupported` |
-| `class` | option payload | `type.option_payload_unsupported` |
 | `class` | generic arg | `mono.type_arg_unsupported` |
 | `class` | for index | `type.for_index_unsupported` |
 | `class` | const | `type.const_unsupported` |

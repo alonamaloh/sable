@@ -1,0 +1,24 @@
+// expect-error: grab.option_take.t_take
+// `.take` carries a presence obligation; an option initialized `none`
+// cannot prove it.
+
+pub class Token {
+    u64 id;
+
+    /// post self.id = 1
+    init make() {
+        self.id = 1;
+    }
+
+    /// post result = self.id
+    fn read(&self) -> u64 {
+        return self.id;
+    }
+}
+
+/// post result >= 0
+pub fn grab() -> u64 {
+    mut option<Token> t = none;
+    var got = t.take;
+    return got.read();
+}

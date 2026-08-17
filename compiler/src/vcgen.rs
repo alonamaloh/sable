@@ -433,7 +433,7 @@ fn lean_array_ty(element: &Ty, records: &[RecordDecl]) -> String {
 ///
 /// The owned array payload is spelled with its parentheses because the result
 /// is one argument: `Option (Sable.Seq Bool)`, never `Option Sable.Seq Bool`.
-fn lean_option_ty(element: &Ty) -> String {
+fn lean_option_ty(element: &Ty, classes: &[ClassDecl]) -> String {
     match element {
         Ty::Bool => "Option Bool".into(),
         Ty::Int(_) | Ty::Param(_) => {
@@ -442,7 +442,10 @@ fn lean_option_ty(element: &Ty) -> String {
         }
         // A nested payload's Lean type is the payload's own option type,
         // parenthesized because the result is one argument.
-        Ty::Option(inner) => format!("Option ({})", lean_option_ty(inner)),
+        Ty::Option(inner) => format!("Option ({})", lean_option_ty(inner, classes)),
+        // The owning class payload: the present case is the class's own
+        // structure value.
+        Ty::Class(ci) => format!("Option {}", lean_class_name(&classes[*ci].name)),
         owned if owned.is_owned_array_of(&Ty::Bool) => "Option (Sable.Seq Bool)".into(),
         _ => {
             refuse_vc_type(format!(
@@ -531,11 +534,11 @@ pub(crate) fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result
     // which would report the copyable family's refusal for a shape that
     // family never handles.
     if let Some(payload) = ty.as_affine_option_payload() {
-        if payload.is_owned_array_of(&Ty::Bool) {
+        if payload.is_owned_array_of(&Ty::Bool) || matches!(payload, Ty::Class(_)) {
             return Ok(());
         }
         return Err(format!(
-            "vc.affine_option_payload: `{}` has no affine-option proof semantics in {context}; only `option<[bool]>` is admitted",
+            "vc.affine_option_payload: `{}` has no affine-option proof semantics in {context}; `option<[bool]>` and `option<class>` are admitted",
             ty.name()
         ));
     }
@@ -706,7 +709,7 @@ fn is_owned_bool_array(ty: Ty) -> bool {
 }
 
 fn is_affine_bool_option(ty: Ty) -> bool {
-    ty == Ty::affine_array_option(Ty::Bool)
+    ty.is_affine_option()
 }
 
 fn expr_is_owned_bool_array(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
@@ -735,7 +738,11 @@ fn is_fresh_bool_array_value(expr: &Expr) -> bool {
 }
 
 fn is_affine_option_take(expr: &Expr) -> bool {
-    expr.ty == Some(Ty::array(Ty::Bool)) && matches!(expr.kind, ExprKind::OptTake { .. })
+    matches!(expr.kind, ExprKind::OptTake { .. })
+        && expr
+            .ty
+            .as_ref()
+            .is_some_and(|ty| ty.is_owned_array_of(&Ty::Bool) || matches!(ty, Ty::Class(_)))
 }
 
 fn reject_owned_bool_array_value(
@@ -971,12 +978,22 @@ fn validate_vc_option_operator(
                     "internal.vcgen.type_error: inconsistent `some` payload type in {context}"
                 ));
             }
-            if result.is_affine_option()
-                && !matches!(inner.kind, ExprKind::AllocArray { elem: Ty::Bool, .. })
-            {
-                return Err(format!(
-                    "vc.affine_option_initializer: `some` for `option<[bool]>` must directly wrap a fresh Boolean-array allocation in {context}"
-                ));
+            if result.is_affine_option() {
+                let class_payload = matches!(expected.as_ref(), Ty::Class(_));
+                let admitted = if class_payload {
+                    // A class payload wraps a fresh construction or a
+                    // named owner the wrap consumes.
+                    matches!(inner.kind, ExprKind::CtorCall { .. } | ExprKind::Var(_))
+                } else {
+                    matches!(inner.kind, ExprKind::AllocArray { elem: Ty::Bool, .. })
+                };
+                if !admitted {
+                    return Err(format!(
+                        "vc.affine_option_initializer: `some` for an owning option must \
+                         directly wrap a fresh allocation, a fresh construction, or a named \
+                         owner in {context}"
+                    ));
+                }
             }
         }
         ExprKind::NoneE => {
@@ -1225,7 +1242,7 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::OptTake { .. } => Err(format!(
-            "vc.option_take_position: `.take` is only admitted as the direct initializer of an explicit owned Boolean-array local in {context}"
+            "vc.option_take_position: `.take` is only admitted as the direct initializer of a fresh owned local in {context}"
         )),
         ExprKind::NoneE => validate_vc_option_operator(expr, context, locals),
         ExprKind::IntLit(_)
@@ -1279,14 +1296,17 @@ fn validate_vc_take_initializer(
             "internal.vcgen.type_error: expected an affine-option take initializer in {context}"
         ));
     };
-    if expr.ty != Some(Ty::array(Ty::Bool)) {
+    let source_payload = locals
+        .get(option)
+        .and_then(|ty| ty.as_affine_option_payload());
+    let Some(source_payload) = source_payload else {
         return Err(format!(
-            "internal.vcgen.type_error: `.take` has an inconsistent owned Boolean-array result in {context}"
+            "vc.option_take_not_local: `.take` source `{option}` is not an active owning-option local in {context}"
         ));
-    }
-    if locals.get(option) != Some(&Ty::affine_array_option(Ty::Bool)) {
+    };
+    if expr.ty.as_ref() != Some(source_payload) {
         return Err(format!(
-            "vc.option_take_not_local: `.take` source `{option}` is not an active `option<[bool]>` local in {context}"
+            "internal.vcgen.type_error: `.take` result disagrees with its source's payload in {context}"
         ));
     }
     if !mutable_locals.contains(option) {
@@ -1396,7 +1416,16 @@ fn validate_vc_block_with_mutability(
                         "vc.duplicate_local: declaration `{name}` would replace an active local in {context}"
                     ));
                 }
-                validate_vc_expr(init, allow_param, context, locals)?;
+                // `var t = o.take;` — the class-payload extraction route:
+                // the take validator owns it, since the expression walk
+                // refuses `.take` everywhere else.
+                let class_take = matches!(init.kind, ExprKind::OptTake { .. })
+                    && matches!(ty, Some(Ty::Class(_)));
+                if class_take {
+                    validate_vc_take_initializer(init, locals, mutable_locals, context)?;
+                } else {
+                    validate_vc_expr(init, allow_param, context, locals)?;
+                }
                 if let Some(ty) = ty {
                     validate_vc_type_position(
                         ty.clone(),
@@ -1884,7 +1913,7 @@ fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> Strin
         // gains a value and no obligation (ADR 0024/0029).
         Ty::Res(k) => lean_res_view_ty(*k, records),
         Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
-        Ty::Option(element) => lean_option_ty(element),
+        Ty::Option(element) => lean_option_ty(element, classes),
         Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
         _ => unreachable!("checked: field types"),
     }
@@ -2605,7 +2634,7 @@ impl<'a> Generator<'a> {
             Some(Ty::Res(k)) => lean_res_view_ty(*k, self.records),
             Some(Ty::Raw(_)) | Some(Ty::RawRecord(_)) => "Sable.RawPtr".to_string(),
             Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".to_string(),
-            Some(Ty::Option(element)) => lean_option_ty(element),
+            Some(Ty::Option(element)) => lean_option_ty(element, self.classes),
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             Some(Ty::Array(element)) => lean_array_ty(element, self.records),
@@ -2643,7 +2672,7 @@ impl<'a> Generator<'a> {
                 Ty::Res(k) => Some((name.clone(), lean_res_view_ty(*k, self.records))),
                 Ty::Raw(_) | Ty::RawRecord(_) => Some((name.clone(), "Sable.RawPtr".to_string())),
                 Ty::OptionRaw(_) => Some((name.clone(), "Option Sable.RawPtr".to_string())),
-                Ty::Option(element) => Some((name.clone(), lean_option_ty(element))),
+                Ty::Option(element) => Some((name.clone(), lean_option_ty(element, self.classes))),
                 Ty::Borrow(..) | Ty::Unit => None,
             })
             .collect();
@@ -2876,7 +2905,7 @@ impl<'a> Generator<'a> {
             Ty::Option(element) => {
                 let element = element.as_ref().clone();
                 self.binders
-                    .push((binder.to_string(), lean_option_ty(&element)));
+                    .push((binder.to_string(), lean_option_ty(&element, self.classes)));
                 self.push_option_value_facts(&element, base, binder);
                 Val::Opt(binder.to_string())
             }
@@ -3178,7 +3207,7 @@ impl<'a> Generator<'a> {
     fn result_lean_ty(&self) -> String {
         match &self.f.ret {
             Ty::Int(_) | Ty::Param(_) => "Int".into(),
-            Ty::Option(element) => lean_option_ty(&element.clone()),
+            Ty::Option(element) => lean_option_ty(&element.clone(), self.classes),
             Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
             // Bool results are Prop-valued in the logic: posts like
             // `result → P` splice with no coercion noise.
@@ -4299,17 +4328,51 @@ impl<'a> Generator<'a> {
                 let goal = format!("({old_option}) ≠ none");
                 let ob = self.obligation(
                     &format!("{}.option_take.{}", self.fname, slug(self.src(e.span))),
-                    format!("`{}.take` must hold an owned array here", option),
+                    format!("`{}.take` must hold an owned value here", option),
                     option_span.join(e.span),
                     goal.clone(),
                 );
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
-                self.env.insert(
-                    option.clone(),
-                    Val::Opt("(none : Option (Sable.Seq Bool))".into()),
-                );
-                Val::Arr(format!("(({old_option}).getD ⟨0, fun _ => false⟩)"))
+                let payload = self
+                    .var_tys
+                    .get(option)
+                    .and_then(|ty| ty.as_affine_option_payload())
+                    .cloned()
+                    .expect("checked: affine-option take source type");
+                let reset = format!("(none : {})", lean_option_ty(&payload, self.classes));
+                self.env.insert(option.clone(), Val::Opt(reset));
+                match payload {
+                    // The array payload has a spellable junk default, and
+                    // the proven presence keeps every reader away from it.
+                    Ty::Array(..) => Val::Arr(format!("(({old_option}).getD ⟨0, fun _ => false⟩)")),
+                    // A class has no junk default to spell, so the taken
+                    // value is a fresh binder pinned by the presence
+                    // equation: it *is* the payload, and it carries the
+                    // facts every checked class value carries — sound
+                    // because every `some` was wrapped from a checked
+                    // constructor or an invariant-carrying named local.
+                    Ty::Class(ci) => {
+                        self.fresh += 1;
+                        let binder = format!("_taken{}", self.fresh);
+                        let base = format!("taken{}", self.fresh);
+                        let taken =
+                            self.fresh_state_for(&Ty::Class(ci), &binder, &base, LenFact::Skip);
+                        self.push_hyp_unique(
+                            format!("h_{base}_eq"),
+                            format!("({old_option}) = some ({binder})"),
+                        );
+                        taken
+                    }
+                    _ => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.type_error: `.take` has no extraction model \
+                             for this payload in {}",
+                            self.fname
+                        ));
+                        Val::Unit
+                    }
+                }
             }
             ExprKind::Widen { arg, .. } => self.eval(arg),
             ExprKind::Narrow { target, arg } => {
@@ -4336,9 +4399,10 @@ impl<'a> Generator<'a> {
                     Val::Int(v) | Val::Ptr(v) | Val::Arr(v) => v,
                     Val::Prop(p) => lean_bool_value(&p),
                     // A nested inner option is one chain; `some (...)`
-                    // parenthesizes it below.
-                    Val::Opt(v) => v,
-                    Val::Obj(_) | Val::View(_) | Val::Record(_) | Val::Unit => {
+                    // parenthesizes it below. A class payload's structure
+                    // chain rides the same way.
+                    Val::Opt(v) | Val::Obj(v) => v,
+                    Val::View(_) | Val::Record(_) | Val::Unit => {
                         refuse_vc_type(format!(
                             "internal.vcgen.type_error: `some` payload has no symbolic \
                              value in {}",
@@ -4351,7 +4415,7 @@ impl<'a> Generator<'a> {
             }
             ExprKind::NoneE => {
                 let ty = match &e.ty {
-                    Some(Ty::Option(element)) => lean_option_ty(element),
+                    Some(Ty::Option(element)) => lean_option_ty(element, self.classes),
                     Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".into(),
                     _ => unreachable!("checked: contextual none has an option type"),
                 };
@@ -6719,7 +6783,7 @@ impl<'a> Generator<'a> {
                     }
                     Ty::Option(element) => {
                         self.binders
-                            .push((ret_sym.clone(), lean_option_ty(element)));
+                            .push((ret_sym.clone(), lean_option_ty(element, self.classes)));
                     }
                     Ty::Bool => {
                         self.binders.push((ret_sym.clone(), "Prop".into()));
@@ -7050,7 +7114,7 @@ impl<'a> Generator<'a> {
                     }
                     Ty::Option(element) => {
                         self.binders
-                            .push((ret_sym.clone(), lean_option_ty(element)));
+                            .push((ret_sym.clone(), lean_option_ty(element, self.classes)));
                     }
                     Ty::Bool => {
                         self.binders.push((ret_sym.clone(), "Prop".into()));
@@ -7381,7 +7445,7 @@ impl<'a> Generator<'a> {
                     }
                 }
                 Ty::Option(element) => {
-                    out.push((p.name.clone(), lean_option_ty(element)));
+                    out.push((p.name.clone(), lean_option_ty(element, self.classes)));
                 }
                 Ty::Borrow(..) | Ty::Unit => {}
             }
@@ -8173,7 +8237,7 @@ mod type_domain_tests {
         // The one admitted owning payload has a Lean type, parenthesized so
         // it stays one argument.
         assert_eq!(
-            lean_option_ty(&Ty::array(Ty::Bool)),
+            lean_option_ty(&Ty::array(Ty::Bool), &[]),
             "Option (Sable.Seq Bool)"
         );
         assert!(
@@ -8182,7 +8246,7 @@ mod type_domain_tests {
         );
 
         assert_eq!(
-            lean_option_ty(&Ty::array(Ty::Int(IntTy::U64))),
+            lean_option_ty(&Ty::array(Ty::Int(IntTy::U64)), &[]),
             UNSUPPORTED_LEAN_TY
         );
         assert!(
@@ -8625,7 +8689,7 @@ fn affine_loop(u64 n) {
 
     #[test]
     fn bool_options_have_a_distinct_proof_model() {
-        assert_eq!(lean_option_ty(&Ty::Bool), "Option Bool");
+        assert_eq!(lean_option_ty(&Ty::Bool, &[]), "Option Bool");
         assert!(validate_vc_ty(Ty::option(Ty::Bool), false, "unused ordinary function").is_ok());
         assert_eq!(lean_array_ty(&Ty::Bool, &[]), "Sable.Seq Bool");
     }

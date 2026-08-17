@@ -1,0 +1,18 @@
+// expect-error: option.affine_inferred
+// An owning-option binding cannot be inferred: wrapping a class value
+// under `var` would route the ownership-bearing option through the
+// copyable inference path.
+
+pub class Token {
+    u64 id;
+
+    /// post self.id = 1
+    init make() {
+        self.id = 1;
+    }
+}
+
+fn hidden() -> u64 {
+    var pending = some(Token::make());
+    return 0;
+}

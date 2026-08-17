@@ -1,0 +1,16 @@
+// expect-test-failure: `.take` of an empty affine option
+// The class payload traps exactly as the array payload does.
+
+pub class Token {
+    u64 id;
+
+    /// post self.id = 1
+    init make() {
+        self.id = 1;
+    }
+}
+
+fn test_take_of_none_traps() {
+    mut option<Token> empty = none;
+    var t = empty.take;
+}

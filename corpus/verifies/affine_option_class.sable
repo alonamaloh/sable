@@ -1,0 +1,85 @@
+// A nullable owning handle: `option<class>` joins the affine family.
+// The present case carries the class's destructor — dropping a `some`
+// runs the deinit exactly once, `.take` extracts the owned value with
+// its invariant (every `some` was wrapped from a checked constructor or
+// an invariant-carrying named local), and the wrap consumes its source.
+
+pub class Token {
+    u64 id;
+
+    /// invariant id ≥ 1
+
+    /// pre  n ≥ 1
+    /// post self.id = n
+    init make(u64 n) {
+        self.id = n;
+    }
+
+    /// post result = self.id
+    fn read(&self) -> u64 {
+        return self.id;
+    }
+}
+
+/// post result = 7
+pub fn take_and_use() -> u64 {
+    mut option<Token> pending = some(Token::make(7));
+    if (pending.is_some) {
+        var t = pending.take;
+        u64 r = t.read();
+        return r;
+    }
+    return 0;
+}
+
+/// post result = 3
+pub fn drop_while_some() -> u64 {
+    mut option<Token> held = some(Token::make(9));
+    return 3;
+}
+
+/// post result = 2
+pub fn none_lifecycle() -> u64 {
+    mut option<Token> empty = none;
+    if (empty.is_some) {
+        return 1;
+    }
+    return 2;
+}
+
+/// post result = 5
+pub fn wrap_named() -> u64 {
+    var t = Token::make(5);
+    mut option<Token> boxed = some(t);
+    if (boxed.is_some) {
+        var back = boxed.take;
+        u64 r = back.read();
+        return r;
+    }
+    return 0;
+}
+
+// Take in a loop: the source refills each round, and the loop havoc
+// hands both locals fresh states under the invariants.
+/// pre  n ≥ 1
+/// pre  n ≤ 50
+/// post result = n
+pub fn churn(u64 n) -> u64 {
+    mut u64 i = 0;
+    mut u64 seen = 0;
+    /// invariant i ≤ n
+    /// invariant seen = i
+    /// variant n - i
+    while (i < n) {
+        mut option<Token> slot = some(Token::make(i + 1));
+        if (slot.is_some) {
+            var t = slot.take;
+            u64 r = t.read();
+            if (r >= 1) {
+                seen = seen + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return seen;
+}

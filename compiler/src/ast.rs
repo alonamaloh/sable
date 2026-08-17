@@ -1144,22 +1144,27 @@ impl Ty {
         }
     }
 
-    /// The payload of an option whose present case owns storage — the whole
+    /// The payload of an option whose present case owns — the whole
     /// payload type, not its element.
     ///
     /// This is the single question every rule asks when it has to route the
-    /// owning case away from a rule that would copy it. It is deliberately
-    /// narrower than `self.as_option().is_some_and(Ty::is_affine)`:
-    /// `option<class>` has an owning payload too, and it belongs to the
-    /// copyable family's gates, which refuse it by their own name
-    /// (`type.option_payload_unsupported`). The owning family is the shapes
-    /// the ownership rules — move, take, join, destruction — are written for,
-    /// and that is an option over an owned array.
+    /// owning case away from a rule that would copy it. The owning family is
+    /// the shapes the ownership rules — move, take, destruction — are
+    /// written for: an option over an owned array, and an option over a
+    /// class, whose present case additionally carries a destructor. The
+    /// class arm matches the owned constructor directly — never through a
+    /// referent — so an option over a class *borrow* stays out of the
+    /// family (a borrow owns nothing).
     ///
     /// A gate, not a traversal: one level, no recursion.
     pub fn as_affine_option_payload(&self) -> Option<&Ty> {
         match self {
-            Ty::Option(payload) if payload.as_owned_array().is_some() => Some(payload),
+            Ty::Option(payload)
+                if payload.as_owned_array().is_some()
+                    || matches!(payload.as_ref(), Ty::Class(_)) =>
+            {
+                Some(payload)
+            }
             _ => None,
         }
     }
@@ -2289,7 +2294,7 @@ mod generic_ty_tests {
         assert!(!Ty::option(Ty::array_ref(Ty::Bool, Mutability::Shared)).is_affine_option());
         // Neither does an option over another owner the ownership rules are
         // not written for; the copyable-option gate refuses it by name.
-        assert!(!Ty::option(Ty::Class(0)).is_affine_option());
+        assert!(Ty::option(Ty::Class(0)).is_affine_option());
         assert!(Ty::option(Ty::Class(0)).is_affine());
 
         // Nesting is representable, and prints exactly as it is spelled. What

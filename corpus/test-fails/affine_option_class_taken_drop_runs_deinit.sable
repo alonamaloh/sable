@@ -1,0 +1,28 @@
+// expect-test-failure: pre of `require_zero` violated
+// The taken value's own scope exit runs the destructor: extraction
+// moves the obligation, never loses it.
+
+/// pre x = 0
+fn require_zero(u64 x) -> u64 {
+    return x;
+}
+
+pub class Loud {
+    u64 armed;
+
+    /// post self.armed = 1
+    init arm() {
+        self.armed = 1;
+    }
+
+    deinit {
+        u64 w = require_zero(self.armed);
+    }
+}
+
+fn test_taken_value_dies_loudly() {
+    mut option<Loud> held = some(Loud::arm());
+    if (held.is_some) {
+        var out = held.take;
+    }
+}

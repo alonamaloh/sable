@@ -33,6 +33,13 @@ pub enum RtVal {
     /// lives directly in the named runtime place so `.take` can clear that
     /// place atomically.  The contained array is never cloned or deep-copied.
     AffineOptBoolArray(Option<Rc<RefCell<RtArray>>>),
+    /// The ownership-bearing option over a class: the payload slot lives
+    /// directly in the named runtime place, and a present payload carries
+    /// the class's destructor with it.
+    AffineOptClass {
+        class: usize,
+        value: Option<Rc<RefCell<HashMap<String, RtVal>>>>,
+    },
     PtrOpt(Option<(i128, i128)>),
     /// A POD record is a plain copyable value, distinct from an affine
     /// class object and its destructor-bearing field storage (ADR 0054).
@@ -63,7 +70,7 @@ impl Clone for RtVal {
                 payload: payload.clone(),
                 value: value.clone(),
             },
-            RtVal::AffineOptBoolArray(_) => {
+            RtVal::AffineOptBoolArray(_) | RtVal::AffineOptClass { .. } => {
                 panic!("affine option runtime values cannot be cloned")
             }
             RtVal::PtrOpt(value) => RtVal::PtrOpt(*value),
@@ -423,11 +430,11 @@ pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
     // dispatch below: its payload gate is a different allow-list, and the
     // copyable one would name the wrong rule.
     if let Some(payload) = ty.as_affine_option_payload() {
-        if payload.is_owned_array_of(&Ty::Bool) {
+        if payload.is_owned_array_of(&Ty::Bool) || matches!(payload, Ty::Class(_)) {
             return Ok(());
         }
         return Err(format!(
-            "interp.affine_option_payload_unsupported: {context} has type `{}`; the supported affine option is exactly `option<[bool]>`",
+            "interp.affine_option_payload_unsupported: {context} has type `{}`; the supported affine options are `option<[bool]>` and `option<class>`",
             ty.name()
         ));
     }
@@ -533,7 +540,7 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                             "interp.affine_option_initializer: affine option local `{name}` must be initialized with `none` or `some(alloc_array<bool>(...))`"
                         ));
                     };
-                    validate_affine_option_initializer(init, locals, name)?;
+                    validate_affine_option_initializer(init, ty, locals, name)?;
                 } else if let Some(init) = init {
                     validate_interp_expr(init, locals)?;
                     validate_interp_sink(
@@ -615,9 +622,14 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                         "interp.duplicate_local: declaration `{name}` would replace an active local"
                     ));
                 }
-                if matches!(init.kind, ExprKind::OptTake { .. }) {
+                // `var t = o.take;` extracts a class payload into a fresh
+                // owner; the array family keeps its typed-declaration
+                // route.
+                if matches!(init.kind, ExprKind::OptTake { .. })
+                    && !matches!(ty, Some(Ty::Class(_)))
+                {
                     return Err(
-                        "interp.affine_option_take_position: `.take` must directly initialize an explicit owned `[bool]` declaration"
+                        "interp.affine_option_take_position: `.take` must directly initialize a fresh owned local"
                             .into(),
                     );
                 }
@@ -802,11 +814,15 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
 
 fn validate_affine_option_initializer(
     init: &Expr,
+    declared: &Ty,
     locals: &InterpLocals,
     name: &str,
 ) -> Result<(), String> {
-    let expected = Ty::affine_array_option(Ty::Bool);
-    require_cached_type(init, expected, "affine option initializer")?;
+    require_cached_type(init, declared.clone(), "affine option initializer")?;
+    let payload = declared
+        .as_affine_option_payload()
+        .cloned()
+        .expect("checked: affine option declaration");
     match &init.kind {
         ExprKind::NoneE => Ok(()),
         ExprKind::SomeE(inner)
@@ -815,8 +831,15 @@ fn validate_affine_option_initializer(
             validate_interp_expr(inner, locals)?;
             require_cached_type(inner, Ty::array(Ty::Bool), "affine option payload")
         }
+        ExprKind::SomeE(inner)
+            if matches!(payload, Ty::Class(_))
+                && matches!(inner.kind, ExprKind::CtorCall { .. } | ExprKind::Var(_)) =>
+        {
+            validate_interp_expr(inner, locals)?;
+            require_cached_type(inner, payload, "affine option payload")
+        }
         _ => Err(format!(
-            "interp.affine_option_initializer: affine option local `{name}` must be initialized with `none` or `some(alloc_array<bool>(...))`"
+            "interp.affine_option_initializer: affine option local `{name}` must be initialized with `none`, `some(alloc_array<bool>(...))`, or `some(<class value>)`"
         )),
     }
 }
@@ -932,9 +955,9 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                             .into(),
                     );
                 };
-                if interp_local_ty(locals, name) != Some(Ty::affine_array_option(Ty::Bool)) {
+                if !interp_local_ty(locals, name).is_some_and(|ty| ty.is_affine_option()) {
                     return Err(format!(
-                        "interp.affine_option_payload_unsupported: `{name}` is not an executable `option<[bool]>` local"
+                        "interp.affine_option_payload_unsupported: `{name}` is not an executable owning-option local"
                     ));
                 }
             } else {
@@ -952,7 +975,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             let operand_ty = semantic_interp_ty(operand, locals)?;
             if operand_ty.is_affine_option() {
                 return Err(
-                    "interp.affine_option_value_unsupported: `option<[bool]>` has no copying `.value`; use `.take`"
+                    "interp.affine_option_value_unsupported: an owning option has no copying `.value`; use `.take`"
                         .into(),
                 );
             }
@@ -982,9 +1005,9 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
             let local = locals.get(option).ok_or_else(|| {
                 format!("interp.unknown_local: `.take` names unknown local `{option}`")
             })?;
-            if local.ty != Ty::affine_array_option(Ty::Bool) {
+            if !local.ty.is_affine_option() {
                 return Err(format!(
-                    "interp.option_operand: `.take` needs `option<[bool]>`, found `{}`",
+                    "interp.option_operand: `.take` needs an owning option, found `{}`",
                     local.ty.clone().name()
                 ));
             }
@@ -993,7 +1016,12 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                     "interp.affine_option_immutable: `.take` needs mutable local `{option}`"
                 ));
             }
-            require_cached_type(expr, Ty::array(Ty::Bool), "affine option take result")?;
+            let payload = local
+                .ty
+                .as_affine_option_payload()
+                .cloned()
+                .expect("checked: owning-option local");
+            require_cached_type(expr, payload, "affine option take result")?;
         }
         ExprKind::Binary { op, lhs, rhs, .. } => match op {
             BinOp::And | BinOp::Or => {
@@ -2118,7 +2146,18 @@ impl<'a> Interp<'a> {
         let owned = match place {
             RtPlace::Local(name) => match frame.vars.get(name.as_str()) {
                 Some(RtVal::Obj { class, fields }) => OwnedDrop::Object(*class, fields.clone()),
-                Some(RtVal::Arr(_) | RtVal::AffineOptBoolArray(_)) => OwnedDrop::Plain,
+                // A present class payload dies with its option, through the
+                // class's own destructor path — exactly once, because the
+                // whole option leaves the place before the deinit runs.
+                Some(RtVal::AffineOptClass {
+                    class,
+                    value: Some(fields),
+                }) => OwnedDrop::Object(*class, fields.clone()),
+                Some(
+                    RtVal::Arr(_)
+                    | RtVal::AffineOptBoolArray(_)
+                    | RtVal::AffineOptClass { value: None, .. },
+                ) => OwnedDrop::Plain,
                 _ => OwnedDrop::None,
             },
             RtPlace::SelfField(field) => match frame.self_ctx.as_ref().and_then(|(_, fields)| {
@@ -2127,7 +2166,15 @@ impl<'a> Interp<'a> {
                     Some(RtVal::Obj { class, fields }) => {
                         Some(OwnedDrop::Object(*class, fields.clone()))
                     }
-                    Some(RtVal::Arr(_) | RtVal::AffineOptBoolArray(_)) => Some(OwnedDrop::Plain),
+                    Some(RtVal::AffineOptClass {
+                        class,
+                        value: Some(fields),
+                    }) => Some(OwnedDrop::Object(*class, fields.clone())),
+                    Some(
+                        RtVal::Arr(_)
+                        | RtVal::AffineOptBoolArray(_)
+                        | RtVal::AffineOptClass { value: None, .. },
+                    ) => Some(OwnedDrop::Plain),
                     _ => None,
                 }
             }) {
@@ -2144,12 +2191,13 @@ impl<'a> Interp<'a> {
                 self.drop_value(class, &fields, &place.name())
             }
             OwnedDrop::Plain => {
-                // Arrays and affine options have no user destructor, but an
-                // owned local still dies at its lexical boundary. Removing
-                // the binding releases either the direct array owner or the
-                // option's still-present payload exactly once. This is a
-                // drop, not a move; an array transferred through `eval_moved`
-                // or `.take` has already left its source place.
+                // Arrays, array-payload affine options, and absent options
+                // have no destructor to run, but an owned local still dies
+                // at its lexical boundary. A class-payload option that is
+                // present routes Object-style above instead: its payload
+                // carries a destructor. This is a drop, not a move; a value
+                // transferred through `eval_moved` or `.take` has already
+                // left its source place.
                 self.take_place(place, frame);
                 Ok(())
             }
@@ -3452,6 +3500,10 @@ impl<'a> Interp<'a> {
                     if let Some(RtVal::AffineOptBoolArray(value)) = frame.vars.get(name.as_str()) {
                         return Ok(RtVal::Bool(value.is_some()));
                     }
+                    if let Some(RtVal::AffineOptClass { value, .. }) = frame.vars.get(name.as_str())
+                    {
+                        return Ok(RtVal::Bool(value.is_some()));
+                    }
                 }
                 match self.eval(operand, frame)? {
                     RtVal::Opt { value, .. } => Ok(RtVal::Bool(value.is_some())),
@@ -3474,20 +3526,28 @@ impl<'a> Interp<'a> {
             ExprKind::OptTake {
                 option,
                 option_span,
-            } => {
-                let array = match frame.vars.get_mut(option.as_str()) {
-                    Some(RtVal::AffineOptBoolArray(value)) => value.take(),
-                    _ => unreachable!("checked: affine option local"),
-                };
-                match array {
+            } => match frame.vars.get_mut(option.as_str()) {
+                Some(RtVal::AffineOptBoolArray(value)) => match value.take() {
                     Some(array) => Ok(RtVal::Arr(array)),
                     None => Err(Trap {
                         undef: false,
                         message: "`.take` of an empty affine option".into(),
                         span: *option_span,
                     }),
+                },
+                Some(RtVal::AffineOptClass { class, value }) => {
+                    let class = *class;
+                    match value.take() {
+                        Some(fields) => Ok(RtVal::Obj { class, fields }),
+                        None => Err(Trap {
+                            undef: false,
+                            message: "`.take` of an empty affine option".into(),
+                            span: *option_span,
+                        }),
+                    }
                 }
-            }
+                _ => unreachable!("checked: affine option local"),
+            },
             ExprKind::TraitCall { .. } => {
                 unreachable!("trait calls exist only in templates, never executed")
             }
@@ -3557,11 +3617,20 @@ impl<'a> Interp<'a> {
             // — would see neither of them.
             ExprKind::SomeE(inner) => match &e.ty {
                 Some(option) if option.is_affine_option() => {
-                    let RtVal::Arr(array) = self.eval_moved(inner, frame)? else {
-                        unreachable!("checked: affine Boolean-array option payload")
-                    };
-                    debug_assert_eq!(array.borrow().payload(), Ty::Bool);
-                    Ok(RtVal::AffineOptBoolArray(Some(array)))
+                    match self.eval_moved(inner, frame)? {
+                        RtVal::Arr(array) => {
+                            debug_assert_eq!(array.borrow().payload(), Ty::Bool);
+                            Ok(RtVal::AffineOptBoolArray(Some(array)))
+                        }
+                        // The wrap consumes the class value: `eval_moved`
+                        // cleared its source, so the option is the sole
+                        // owner from here.
+                        RtVal::Obj { class, fields } => Ok(RtVal::AffineOptClass {
+                            class,
+                            value: Some(fields),
+                        }),
+                        _ => unreachable!("checked: affine option payload"),
+                    }
                 }
                 Some(Ty::Option(payload)) => {
                     let value = self.eval(inner, frame)?;
@@ -3579,7 +3648,15 @@ impl<'a> Interp<'a> {
                 _ => unreachable!("checked: option construction"),
             },
             ExprKind::NoneE => match &e.ty {
-                Some(option) if option.is_affine_option() => Ok(RtVal::AffineOptBoolArray(None)),
+                Some(option) if option.is_affine_option() => {
+                    match option.as_affine_option_payload() {
+                        Some(Ty::Class(class)) => Ok(RtVal::AffineOptClass {
+                            class: *class,
+                            value: None,
+                        }),
+                        _ => Ok(RtVal::AffineOptBoolArray(None)),
+                    }
+                }
                 Some(Ty::Option(payload)) => Ok(RtVal::Opt {
                     payload: *payload.clone(),
                     value: None,
@@ -3898,9 +3975,21 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
                 None => None,
             },
         },
-        RtVal::AffineOptBoolArray(value) => SpecVal::AffineOptBoolArray {
+        RtVal::AffineOptBoolArray(value) => SpecVal::AffineOpt {
             value: match value {
-                Some(array) => Some(array.borrow().to_spec()?),
+                Some(array) => Some(Box::new(SpecVal::Arr(array.borrow().to_spec()?))),
+                None => None,
+            },
+        },
+        RtVal::AffineOptClass { value, .. } => SpecVal::AffineOpt {
+            value: match value {
+                Some(fields) => Some(Box::new(SpecVal::Obj(
+                    fields
+                        .borrow()
+                        .iter()
+                        .filter_map(|(k, v)| spec_of(v).map(|sv| (k.clone(), sv)))
+                        .collect(),
+                ))),
                 None => None,
             },
         },
@@ -4445,8 +4534,10 @@ mod payload_guard_tests {
         assert_eq!(Rc::strong_count(&array), 1);
         assert_eq!(
             snapshot,
-            SpecVal::AffineOptBoolArray {
-                value: Some(crate::speceval::spec_bools(&[true, false])),
+            SpecVal::AffineOpt {
+                value: Some(Box::new(SpecVal::Arr(crate::speceval::spec_bools(&[
+                    true, false
+                ])))),
             }
         );
     }
