@@ -1,0 +1,21 @@
+// expect-error: type.option_field
+// An option field takes a concrete value payload: a template's
+// `option<T>` field has no stored-field state for an abstract payload,
+// and mono instantiates template fields before this gate re-answers, so
+// the refusal is the checker's alone.
+
+pub class Holder<T> {
+    [T] buf;
+    option<T> extra;
+
+    init empty() {
+        self.buf = alloc_array<T>(1, 0);
+        self.extra = none;
+    }
+}
+
+/// post result = 0
+pub fn use_holder() -> u64 {
+    var h = Holder<u64>::empty();
+    return 0;
+}

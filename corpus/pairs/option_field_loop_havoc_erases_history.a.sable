@@ -1,0 +1,27 @@
+// pair: same-lean
+// An init whose loop reassigns an option field: at the loop head the
+// field is a fresh `Option` state (ADR 0074). The halves differ only in
+// the dead pre-loop value of `self.slot` — a present payload here, an
+// absent one in the twin — so the obligations after the loop must be
+// identical; a field havoc that skipped the option arm would keep the
+// pre-loop chain and leak the difference.
+
+pub class Probe {
+    option<u64> slot;
+    u64 n;
+
+    /// post self.n = 3
+    init run() {
+        self.slot = some(1);
+        self.n = 0;
+        mut u64 i = 0;
+        /// invariant i ≤ 3
+        /// invariant self.n = i
+        /// variant 3 - i
+        while (i < 3) {
+            self.slot = some(i);
+            self.n = i + 1;
+            i = i + 1;
+        }
+    }
+}

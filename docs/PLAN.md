@@ -1208,8 +1208,8 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      the monitor checks their contracts at the call boundary — match-shaped
      posts over a parameter, `.is_some` pres, the absent case's typed junk
      `.value`, and copy semantics at the argument, pinned at zero skips by
-     `corpus/tests/test_option_param.sable`; a stored option field keeps
-     `interp.option_position_unsupported`.
+     `corpus/tests/test_option_param.sable`; a stored option field then
+     kept `interp.option_position_unsupported`.
      `corpus/verifies/option_param.sable` carries the
      match-shaped contracts, the payload-fact proof, and the some/none
      callers; `docs/type-matrix.md` opens `option<u64>` × `param` and
@@ -1334,6 +1334,25 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      `option<bool>` × `init param` and `method param` (57/210 → 63/210);
      `docs/shape-admission.md` moves exactly the `check init param` and
      `check method param` columns for those three shapes.
+
+     **Stored option state (ADR 0076).** `option<u64>`-family and
+     `option<bool>` class fields open end-to-end: the payload-driven gate
+     (the abstract payload keeps `type.option_field`, the checker's own
+     fence since mono instantiates first), the field accessor surface
+     (`self.f.is_some`/`.value` through the ordinary postfix accessors),
+     the stored state's `.value` range fact beside the field facts every
+     whole-object state carries, `old self.f` in posts and as a match
+     scrutinee (the monitor's `match_opt` now takes `old` paths), the
+     interpreter's field gate split by container (record fields keep
+     `interp.option_position_unsupported`), and both loop-havoc branches.
+     The groundwork commit made all four field-state dispatches explicit
+     and fail-closed first (ADR 0074 discipline; type-snapshot
+     byte-identical, no cell moved) and added `vc class field` and
+     `interp class/record field` admission columns. 122 obligations in
+     `corpus/verifies/option_field.sable` plus an importing module, a
+     zero-skip tests twin, four must-fail + three test-fails negation
+     twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
+     the two class-field cells (63 → 65 of 163 intended).
 
      **A closed cell is work or a decision (ADR 0075).** The matrix's
      closed cells now say which kind of closed they are: `not yet` (work

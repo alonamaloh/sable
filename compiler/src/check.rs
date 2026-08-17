@@ -2999,17 +2999,31 @@ pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
         });
     }
     validate_aggregate_ty(ty.clone(), span)?;
-    if matches!(ty, Ty::Option(_)) {
-        return Err(Diagnostic {
-            name: "type.option_field".into(),
-            title: "option-valued class fields are not supported yet".into(),
-            span,
-            label: "`option<T>` lives in returns and locals".into(),
-            notes: vec![(
-                "note".into(),
-                "field storage must land together with aggregate ownership and lowering".into(),
-            )],
-        });
+    // A copyable option with a concrete value payload is stored-field
+    // state exactly as it is a parameter or a return. The type-parameter
+    // payload stays out: mono instantiates template fields before this
+    // gate runs, so this arm is the only fence between an abstract
+    // option field and stages with no abstract-option field state.
+    if let Ty::Option(payload) = ty {
+        let concrete_value = match payload.as_ref() {
+            Ty::Int(IntTy::TParam(_)) => false,
+            Ty::Int(_) | Ty::Bool => true,
+            _ => false,
+        };
+        if !concrete_value {
+            return Err(Diagnostic {
+                name: "type.option_field".into(),
+                title: "an option field takes a concrete integer or `bool` payload".into(),
+                span,
+                label: format!("this has type `{}`", ty.clone().name()),
+                notes: vec![(
+                    "note".into(),
+                    "`option<u64>`-family and `option<bool>` fields are supported; an \
+                     abstract payload has no stored-field state"
+                        .into(),
+                )],
+            });
+        }
     }
     Ok(())
 }
@@ -7089,11 +7103,16 @@ class Holder {
 }
 "#,
         );
-        let error = match check(&mut field) {
-            Err(error) => error,
-            Ok(_) => panic!("option class fields remain unsupported"),
-        };
-        assert_eq!(error.name, "type.option_field");
+        check(&mut field).expect("a concrete-payload option class field is admitted");
+        assert_eq!(
+            class_field_ty(
+                &Ty::option(Ty::Param(TypeParamId::from_legacy(0))),
+                Span::new(0, 0)
+            )
+            .expect_err("a template option payload has no stored-field state")
+            .name,
+            "type.option_field"
+        );
 
         let mut trait_program = parse_program(
             r#"

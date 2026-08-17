@@ -1,0 +1,15 @@
+// An imported class's option field: the stored-state contracts crossed
+// the module boundary as verified artifacts, and the field's accessor
+// surface and match posts instantiate here exactly as they do in the
+// declaring module.
+
+use option_field;
+
+/// post result = 6
+pub fn imported_field_state() -> u64 {
+    var mut c = Cache::make(some(13), 10);
+    u64 a = c.hit_or(0);
+    u64 t = c.take_hit();
+    u64 z = c.hit_or(0);
+    return a + t + z;
+}

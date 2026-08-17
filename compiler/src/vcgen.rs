@@ -653,7 +653,11 @@ pub(crate) fn validate_vc_type_position(
             VcTypePosition::Parameter => "non-value-payload option parameters",
             VcTypePosition::TraitParameter => "trait option parameters",
             VcTypePosition::TraitReturn => "trait option returns",
-            VcTypePosition::ClassField => "option-valued class fields",
+            // A class field stores `Option Int` / `Option Bool` exactly as
+            // a parameter binds it; the abstract payload stays out here
+            // too, independently of check's `type.option_field`.
+            VcTypePosition::ClassField if concrete_value_payload => return Ok(()),
+            VcTypePosition::ClassField => "non-value-payload option class fields",
             VcTypePosition::RecordField => "option-valued record fields",
             VcTypePosition::Borrow => "option borrows",
         };
@@ -2515,11 +2519,15 @@ impl<'a> Generator<'a> {
                         Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s))
                         | Some(Val::View(s)) | Some(Val::Ptr(s)) => format!("{s}"),
                         Some(Val::Prop(p)) => lean_bool_value(p),
+                        // Parenthesized so an option chain stays one
+                        // constructor argument: `some (7)` spliced bare
+                        // would parse as two.
+                        Some(Val::Opt(s)) => format!("({s})"),
                         // A field state this constructor literal cannot
                         // splice is a named refusal, never a silent `0`:
                         // a wrong literal here is a false-proof machine
                         // (ADR 0074), not a crash.
-                        Some(Val::Opt(_)) | Some(Val::Record(_)) | Some(Val::Unit) | None => {
+                        Some(Val::Record(_)) | Some(Val::Unit) | None => {
                             refuse_vc_type(format!(
                                 "internal.vcgen.field_state_unsupported: field `{}` of \
                                  `{}` has no constructor-literal state",
@@ -2543,10 +2551,15 @@ impl<'a> Generator<'a> {
                 Some(Val::Prop(p)) => {
                     map.insert(fld.name.clone(), lean_bool_value(p));
                 }
+                // Parenthesized as at a call: dot-notation in the init's
+                // posts must bind the whole chain.
+                Some(Val::Opt(s)) => {
+                    map.insert(fld.name.clone(), format!("({s})"));
+                }
                 // A field silently missing from the substitution map makes
                 // an init post about that field vacuously unbindable; refuse
                 // by name instead.
-                Some(Val::Opt(_)) | Some(Val::Record(_)) | Some(Val::Unit) | None => {
+                Some(Val::Record(_)) | Some(Val::Unit) | None => {
                     refuse_vc_type(format!(
                         "internal.vcgen.field_state_unsupported: field `{}` of `{}` has \
                          no substitution state",
@@ -2681,14 +2694,25 @@ impl<'a> Generator<'a> {
                         self.push_hyp_unique(h, prop);
                     }
                 }
+                // A copyable option field carries its integer payload's
+                // range fact over `.value`, exactly as a fresh option
+                // parameter does: the absent case reads the typed junk
+                // model (`getD default = 0`, ADR 0008), in range for every
+                // integer type. A `bool` payload needs no fact.
+                Ty::Option(payload) => {
+                    if let Ty::Int(it) = payload.as_ref() {
+                        self.push_hyp_unique(
+                            format!("h_field_{}_range", fld.name),
+                            self.r_prop(&format!("(({binder}.{}).value)", fld.name), *it),
+                        );
+                    }
+                }
                 // No representability fact exists for the rest: `Bool` is
-                // its own complete domain, a raw pointer is unconstrained
-                // data, and an option's payload fact lives with its
-                // accessors.
+                // its own complete domain and a raw pointer is
+                // unconstrained data.
                 Ty::Bool
                 | Ty::Raw(_)
                 | Ty::RawRecord(_)
-                | Ty::Option(_)
                 | Ty::OptionRaw(_)
                 | Ty::Record(_)
                 | Ty::Unit
@@ -3535,7 +3559,10 @@ impl<'a> Generator<'a> {
                             | Val::View(s)
                             | Val::Ptr(s) => s,
                             Val::Prop(p) => lean_bool_value(&p),
-                            Val::Opt(_) | Val::Record(_) | Val::Unit => {
+                            // Parenthesized so the option chain stays one
+                            // structure-update argument.
+                            Val::Opt(s) => format!("({s})"),
+                            Val::Record(_) | Val::Unit => {
                                 refuse_vc_type(format!(
                                     "internal.vcgen.field_state_unsupported: `self.{field}` \
                                      has no field-store rule for this value"
@@ -6197,15 +6224,13 @@ impl<'a> Generator<'a> {
                         Some(Ty::Array(..)) => Val::Arr(projected),
                         Some(Ty::Bool) => Val::Prop(format!("({projected} = true)")),
                         Some(Ty::Int(_) | Ty::Param(_)) => Val::Int(projected),
+                        // A copyable option field projects as its chain,
+                        // with the accessor and match surface any option
+                        // value has.
+                        Some(Ty::Option(_)) => Val::Opt(projected),
                         // A field type with no symbolic projection is a
                         // named refusal, never a bare Int (ADR 0074).
-                        Some(
-                            Ty::Record(_)
-                            | Ty::Option(_)
-                            | Ty::OptionRaw(_)
-                            | Ty::Borrow(..)
-                            | Ty::Unit,
-                        )
+                        Some(Ty::Record(_) | Ty::OptionRaw(_) | Ty::Borrow(..) | Ty::Unit)
                         | None => {
                             refuse_vc_type(format!(
                                 "internal.vcgen.field_state_unsupported: `self.{field}` \
@@ -8452,7 +8477,6 @@ fn affine_loop(u64 n) {
         for (position, expected) in [
             (VcTypePosition::TraitParameter, "trait option parameters"),
             (VcTypePosition::TraitReturn, "trait option returns"),
-            (VcTypePosition::ClassField, "option-valued class fields"),
         ] {
             let error = validate_vc_type_position(
                 Ty::option(Ty::Bool),
@@ -8463,6 +8487,24 @@ fn affine_loop(u64 n) {
             .expect_err("unsupported option position must fail before VC generation");
             assert!(error.contains(expected));
         }
+        validate_vc_type_position(
+            Ty::option(Ty::Bool),
+            false,
+            VcTypePosition::ClassField,
+            "synthetic declaration",
+        )
+        .expect("a concrete value-payload option class field has VC field state");
+        let error = validate_vc_type_position(
+            Ty::option(Ty::Param(TypeParamId::from_legacy(0))),
+            true,
+            VcTypePosition::ClassField,
+            "synthetic declaration",
+        )
+        .expect_err("a type-parameter option payload has no stored-field state");
+        assert!(
+            error.contains("non-value-payload option class fields"),
+            "{error}"
+        );
     }
 
     /// An owned Boolean array is a local value; a borrowed one names a

@@ -1,0 +1,22 @@
+// expect-test-failure: `.value` of an empty option
+// The dynamic half of `corpus/must-fail/option_field_value_unguarded.sable`:
+// a method reads `.value` of an option field with no someness guard,
+// and the absent field traps at the read.
+
+pub class Meter {
+    option<u64> level;
+
+    /// post self.level = none
+    init empty() {
+        self.level = none;
+    }
+
+    fn peek(&self) -> u64 {
+        return self.level.value;
+    }
+}
+
+fn test_absent_field_traps() {
+    var m = Meter::empty();
+    u64 r = m.peek();
+}

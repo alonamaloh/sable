@@ -1,6 +1,6 @@
 // expect-error: type.affine_option_field
 // Conditional ownership in aggregate storage needs a field layout and
-// destructor rule; G2.1 keeps affine options as locals.
+// destructor rule; an affine option stays an explicit local.
 
 class Holder {
     option<[bool]> pending;

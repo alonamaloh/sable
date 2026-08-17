@@ -1480,7 +1480,7 @@ pub enum ExprKind {
         len: Box<Expr>,
         init: Box<Expr>,
     },
-    /// `self.f` — int/bool field read (methods only).
+    /// `self.f` — field read (methods only).
     SelfField {
         field: String,
     },

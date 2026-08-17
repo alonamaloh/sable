@@ -1,0 +1,92 @@
+// Dynamic checks for stored option state: init and method contracts
+// over option fields are monitored — match-shaped posts over a field
+// and over `old self.f` (the extended match scrutinee), `.is_some`
+// pres, invariants at init and `&mut` exits, the absent field's typed
+// junk `.value`, and copy semantics: storing an option copies it, and
+// reading a field copies it back.
+
+use option_field;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre x = y
+fn expect_eq_i(i64 x, i64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+/// pre ¬b
+fn expect_false(bool b) {
+}
+
+fn test_cache_lifecycle() {
+    var mut c = Cache::make(some(23), 10);
+    expect_eq(c.hit_or(7), 3);
+    expect_eq(c.half_hit(), 2);
+    c.clear();
+    expect_eq(c.hit_or(7), 7);
+    c.set(12);
+    expect_eq(c.hit_or(0), 2);
+    u64 t = c.take_hit();
+    expect_eq(t, 2);
+    expect_eq(c.hit_or(9), 9);
+}
+
+fn test_none_seed_and_junk() {
+    var c = Cache::make(none, 5);
+    expect_eq(c.hit_or(4), 4);
+}
+
+fn test_scanner_loops() {
+    var mut s = Scanner::sweep(12);
+    expect_eq(s.limit_of(), 12);
+    s.rescan(4);
+    expect_eq(s.limit_of(), 12);
+}
+
+fn test_toggle_payloads() {
+    var mut t = Toggle::neutral(-50);
+    expect_false(t.engaged());
+    t.set_state(true);
+    expect_true(t.engaged());
+    expect_eq_i(t.biased(), 150);
+    t.set_state(false);
+    expect_false(t.engaged());
+}
+
+fn test_template_field() {
+    var s = Slotted<u64>::sized(2, some(7));
+    expect_eq(s.tag_or_zero(), 7);
+    var e = Slotted<u64>::sized(3, none);
+    expect_eq(e.tag_or_zero(), 0);
+}
+
+fn test_wrap_and_ledger() {
+    var c = Cache::make(some(23), 10);
+    var w = Wrap::of(c);
+    expect_eq(w.probe(), 3);
+    var l = Ledger::owe(9);
+    expect_eq(l.flushed_total(), 0);
+}
+
+fn test_stored_option_is_a_copy() {
+    option<u64> seed = some(23);
+    var mut c = Cache::make(seed, 10);
+    c.clear();
+    expect_true(seed.is_some);
+    expect_eq(seed.value, 23);
+}
+
+fn test_demos_agree() {
+    expect_eq(demo(), 3);
+    expect_eq(demo_lifecycle(), 9);
+    expect_eq(demo_scan(), 12);
+    expect_eq_i(demo_toggle(), 150);
+    expect_eq(demo_slotted(), 7);
+    expect_eq(demo_wrap(), 3);
+    expect_eq(demo_ledger(), 0);
+}

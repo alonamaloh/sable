@@ -1,0 +1,365 @@
+// Stored option state: a copyable option is a class field exactly as it
+// is a parameter or a return — the same accessor, match, and junk-model
+// surface (`getD default = 0`, ADR 0008) — and the stored state carries
+// its integer payload's range fact the way a fresh option parameter
+// does.
+
+pub class Cache {
+    option<u64> hit;
+    u64 cap;
+
+    /// invariant hit.is_some → hit.value < cap
+    /// invariant 1 ≤ cap
+
+    /// pre  c ≥ 1
+    /// post #[label(cap)]  self.cap = c
+    /// post #[label(seed)] match s with
+    ///      | some v => self.hit = some (v % c)
+    ///      | none   => self.hit = none
+    init make(option<u64> s, u64 c) {
+        self.cap = c;
+        if (s.is_some) {
+            self.hit = some(s.value % c);
+        } else {
+            self.hit = none;
+        }
+    }
+
+    /// post #[label(set)]  self.hit = some (v % self.cap)
+    /// post #[label(kept)] self.cap = old self.cap
+    fn set(&mut self, u64 v) {
+        self.hit = some(v % self.cap);
+    }
+
+    /// post #[label(cleared)] self.hit = none
+    /// post #[label(kept)]    self.cap = old self.cap
+    fn clear(&mut self) {
+        self.hit = none;
+    }
+
+    // The new program surface: `self.hit.is_some` and `self.hit.value`
+    // are field reads under the ordinary option accessors, and the
+    // `.value` read is guarded by its someness VC exactly as a local's.
+    /// post match self.hit with
+    ///      | some v => result = v
+    ///      | none   => result = d
+    fn hit_or(&self, u64 d) -> u64 {
+        if (self.hit.is_some) {
+            return self.hit.value;
+        }
+        return d;
+    }
+
+    // The stored payload's range fact is load-bearing: at entry `self`
+    // is an arbitrary checked state, and the overflow VC on
+    // `self.hit.value / 2 + 1` closes only from that state's field fact.
+    /// pre  self.hit.is_some
+    /// post result = self.hit.value / 2 + 1
+    fn half_hit(&self) -> u64 {
+        return self.hit.value / 2 + 1;
+    }
+
+    // `old self.hit` in a post and in its match scrutinee: the entry
+    // state of the field survives the write that empties it.
+    /// post #[label(was)] match old self.hit with
+    ///      | some v => result = v
+    ///      | none   => result = 0
+    /// post #[label(now)] self.hit = none
+    /// post #[label(kept)] self.cap = old self.cap
+    fn take_hit(&mut self) -> u64 {
+        mut u64 r = 0;
+        if (self.hit.is_some) {
+            r = self.hit.value;
+        }
+        self.hit = none;
+        return r;
+    }
+}
+
+/// post result = 3
+pub fn demo() -> u64 {
+    var c = Cache::make(some(23), 10);
+    u64 h = c.hit_or(7);
+    return h;
+}
+
+// A match-shaped post about an *abstract* option — a parameter or the
+// entry state of a field — needs its case split spelled on the present
+// path; automation handles the constructor forms at every call site.
+
+/// discharge Cache::make.post.seed by
+///   cases s with
+///   | none => exact absurd rfl h_path_s_none
+///   | some v => simp_all
+
+/// discharge Cache::hit_or.post.match_self_hit_with_some_v_result_v_none by
+///   cases h : _old_self.hit with
+///   | none => simp_all
+///   | some v => simp_all
+
+/// discharge Cache::take_hit.post.was by
+///   cases h : _old_self.hit with
+///   | none => simp_all
+///   | some v => simp_all
+
+/// post result = 9
+pub fn demo_lifecycle() -> u64 {
+    var mut c = Cache::make(none, 5);
+    u64 a = c.hit_or(4);
+    c.set(7);
+    u64 b = c.hit_or(0);
+    u64 t = c.take_hit();
+    u64 z = c.hit_or(1);
+    return a + b + t + z;
+}
+
+// An option field mutated in an init loop and in a method loop: the
+// loop havoc hands the field a fresh `Option` state under the loop
+// invariant, and the class invariant is what carries it out.
+pub class Scanner {
+    option<u64> found;
+    u64 limit;
+
+    /// invariant found.is_some → found.value < limit
+    /// invariant 1 ≤ limit
+
+    /// pre  1 ≤ m
+    /// pre  m ≤ 1000
+    /// post #[label(lim)] self.limit = m
+    init sweep(u64 m) {
+        self.limit = m;
+        self.found = none;
+        mut u64 i = 0;
+        /// invariant i ≤ m
+        /// invariant self.limit = m
+        /// invariant self.found.is_some → self.found.value < m
+        /// variant m - i
+        while (i < m) {
+            if (i % 7 == 0) {
+                self.found = some(i);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// post result = self.limit
+    fn limit_of(&self) -> u64 {
+        return self.limit;
+    }
+
+    /// pre  k ≤ self.limit
+    /// post #[label(kept)] self.limit = old self.limit
+    fn rescan(&mut self, u64 k) {
+        self.found = none;
+        u64 lim = self.limit;
+        mut u64 i = 0;
+        /// invariant i ≤ k
+        /// invariant self.limit = lim
+        /// invariant self.found.is_some → self.found.value < self.limit
+        /// variant k - i
+        while (i < k) {
+            if (i % 3 == 0) {
+                self.found = some(i);
+            }
+            i = i + 1;
+        }
+    }
+}
+
+/// post result = 12
+pub fn demo_scan() -> u64 {
+    var mut s = Scanner::sweep(12);
+    s.rescan(4);
+    u64 r = s.limit_of();
+    return r;
+}
+
+// An `option<bool>` field and a signed payload: the class invariant over
+// the stored signed payload is what closes the overflow VC in `biased`.
+pub class Toggle {
+    option<bool> state;
+    option<i64> bias;
+
+    /// invariant bias.is_some → -100 ≤ bias.value ∧ bias.value ≤ 100
+
+    /// pre  -100 ≤ b
+    /// pre  b ≤ 100
+    /// post #[label(st)] self.state = none
+    /// post #[label(bi)] self.bias = some (b)
+    init neutral(i64 b) {
+        self.state = none;
+        self.bias = some(b);
+    }
+
+    /// post #[label(st)] self.state = some (on)
+    /// post #[label(bi)] self.bias = old self.bias
+    fn set_state(&mut self, bool on) {
+        self.state = some(on);
+    }
+
+    /// post match self.state with
+    ///      | some v => (result ↔ v = true)
+    ///      | none   => ¬result
+    fn engaged(&self) -> bool {
+        if (self.state.is_some) {
+            return self.state.value;
+        }
+        return false;
+    }
+
+    /// pre  self.bias.is_some
+    /// post result = 200 + self.bias.value
+    fn biased(&self) -> i64 {
+        i64 base = 200;
+        return base + self.bias.value;
+    }
+}
+
+/// discharge Toggle::engaged.post.match_self_state_with_some_v_result_v_tr by
+///   cases h : _old_self.state with
+///   | none => simp_all
+///   | some v => simp_all
+
+/// discharge Toggle::engaged.post.match_self_state_with_some_v_result_v_tr.2 by
+///   cases h : _old_self.state with
+///   | none => simp_all
+///   | some v => simp_all
+
+/// post result = 150
+pub fn demo_toggle() -> i64 {
+    var mut t = Toggle::neutral(-50);
+    bool off = t.engaged();
+    t.set_state(true);
+    bool on = t.engaged();
+    i64 b = t.biased();
+    if (on) {
+        if (!off) {
+            return b;
+        }
+    }
+    return 0;
+}
+
+// A class template's concrete option field admits at the instance and
+// verifies at the template.
+pub class Slotted<T> {
+    [T] buf;
+    option<u64> tag;
+
+    /// invariant buf.len ≥ 1
+
+    /// pre  n ≥ 1
+    /// pre  n ≤ 1024
+    /// post match t with
+    ///      | some v => self.tag = some (v)
+    ///      | none   => self.tag = none
+    init sized(u64 n, option<u64> t) {
+        self.buf = alloc_array<T>(n, 0);
+        self.tag = t;
+    }
+
+    /// post match self.tag with
+    ///      | some v => result = v
+    ///      | none   => result = 0
+    fn tag_or_zero(&self) -> u64 {
+        if (self.tag.is_some) {
+            return self.tag.value;
+        }
+        return 0;
+    }
+}
+
+/// discharge Slotted::sized.post.match_t_with_some_v_self_tag_some_v_none by
+///   cases h : t with
+///   | none => simp_all
+///   | some v => simp_all
+
+/// discharge Slotted::tag_or_zero.post.match_self_tag_with_some_v_result_v_none by
+///   cases h : _old_self.tag with
+///   | none => simp_all
+///   | some v => simp_all
+
+/// discharge Slotted::tag_or_zero.post.match_self_tag_with_some_v_result_v_none.2 by
+///   cases h : _old_self.tag with
+///   | none => simp_all
+///   | some v => simp_all
+
+/// post result = 7
+pub fn demo_slotted() -> u64 {
+    var s = Slotted<u64>::sized(2, some(7));
+    u64 r = s.tag_or_zero();
+    return r;
+}
+
+// A class-valued field whose class holds an option field: the nested
+// state carries the inner field's facts and invariant one level down,
+// and a shared borrow of the field hands the inner option on.
+pub class Wrap {
+    Cache inner;
+
+    /// post #[label(held)] self.inner.hit = c.hit
+    init of(Cache c) {
+        self.inner = c;
+    }
+
+    /// post match self.inner.hit with
+    ///      | some v => result = v
+    ///      | none   => result = 77
+    fn probe(&self) -> u64 {
+        u64 r = cache_hit_or(&self.inner, 77);
+        return r;
+    }
+}
+
+/// post match c.hit with
+///      | some v => result = v
+///      | none   => result = d
+pub fn cache_hit_or(&Cache c, u64 d) -> u64 {
+    u64 r = c.hit_or(d);
+    return r;
+}
+
+/// post result = 3
+pub fn demo_wrap() -> u64 {
+    var c = Cache::make(some(23), 10);
+    var w = Wrap::of(c);
+    u64 r = w.probe();
+    return r;
+}
+
+/// discharge demo_wrap.post.result_3 by
+///   simp_all
+
+// A destructor that branches on an option field: the deinit reads the
+// stored option through the same accessors a method does, guarded by
+// the same someness VC.
+pub class Ledger {
+    option<u64> pending;
+    u64 flushed;
+
+    /// post #[label(p)] self.pending = some (v)
+    /// post #[label(f)] self.flushed = 0
+    init owe(u64 v) {
+        self.pending = some(v);
+        self.flushed = 0;
+    }
+
+    /// post result = self.flushed
+    fn flushed_total(&self) -> u64 {
+        return self.flushed;
+    }
+
+    deinit {
+        if (self.pending.is_some) {
+            self.flushed = self.pending.value;
+            self.pending = none;
+        }
+    }
+}
+
+/// post result = 0
+pub fn demo_ledger() -> u64 {
+    var l = Ledger::owe(9);
+    u64 r = l.flushed_total();
+    return r;
+}

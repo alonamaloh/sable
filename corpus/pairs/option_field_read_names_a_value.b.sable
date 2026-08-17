@@ -1,0 +1,19 @@
+// pair: same-lean
+// See option_field_read_names_a_value.a.sable: naming the field's value
+// must change nothing.
+
+pub class Keep {
+    option<u64> hit;
+
+    /// post self.hit = some (v)
+    init at(u64 v) {
+        self.hit = some(v);
+    }
+
+    /// pre  self.hit.is_some
+    /// post result = self.hit.value
+    fn get(&self) -> u64 {
+        option<u64> t = self.hit;
+        return t.value;
+    }
+}

@@ -529,7 +529,8 @@ const GATES: &[&str] = &[
     "interp array payload",
     "interp option payload",
     "interp option value",
-    "interp field",
+    "interp class field",
+    "interp record field",
     "svm type",
     "svm array payload",
     "svm option payload",
@@ -638,6 +639,10 @@ fn answers(ty: &Ty) -> Vec<Answer> {
             Some(value) => format!("`{}`", value.name()),
             None => "none".into(),
         }),
+        from_string(crate::interp::validate_interp_class_field_ty(
+            ty.clone(),
+            "shape probe",
+        )),
         from_string(crate::interp::validate_interp_field_ty(
             ty.clone(),
             "shape probe",

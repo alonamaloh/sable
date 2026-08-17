@@ -1,0 +1,17 @@
+// expect-error: Meter::peek.option.self_level_value
+// `.value` of an option field without establishing someness is a
+// verification error exactly as for a local or a parameter. The dynamic
+// twin is `corpus/test-fails/option_field_value_trap.sable`.
+
+pub class Meter {
+    option<u64> level;
+
+    /// post self.level = none
+    init empty() {
+        self.level = none;
+    }
+
+    fn peek(&self) -> u64 {
+        return self.level.value;
+    }
+}

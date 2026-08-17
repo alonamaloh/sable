@@ -1,0 +1,19 @@
+// expect-error: Meter::fill.inv_exit.level_is_some_level_value_cap
+// A false class invariant over an option field: the init stores the
+// boundary value the invariant excludes. The dynamic twin is
+// `corpus/test-fails/option_field_wrong_invariant.sable`.
+
+pub class Meter {
+    option<u64> level;
+    u64 cap;
+
+    /// invariant level.is_some → level.value < cap
+    /// invariant 1 ≤ cap
+
+    /// pre  c ≥ 1
+    /// post self.cap = c
+    init fill(u64 c) {
+        self.cap = c;
+        self.level = some(c);
+    }
+}

@@ -1,0 +1,25 @@
+// expect-error: Meter::drain.post.was
+// A false post over `old self.f`: the entry state's payload is not what
+// the post claims after the write. The dynamic twin is
+// `corpus/test-fails/option_field_wrong_old_post.sable`.
+
+pub class Meter {
+    option<u64> level;
+
+    /// post self.level = some (v)
+    init at(u64 v) {
+        self.level = some(v);
+    }
+
+    /// post #[label(was)] match old self.level with
+    ///      | some v => result = v + 1
+    ///      | none   => result = 0
+    fn drain(&mut self) -> u64 {
+        mut u64 r = 0;
+        if (self.level.is_some) {
+            r = self.level.value;
+        }
+        self.level = none;
+        return r;
+    }
+}

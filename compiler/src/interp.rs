@@ -305,7 +305,7 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 
     for class in &program.classes {
         for field in &class.fields {
-            validate_interp_field_ty(
+            validate_interp_class_field_ty(
                 field.ty.clone(),
                 &format!("field `{}.{}`", class.name, field.name),
             )?;
@@ -389,15 +389,25 @@ fn validate_interp_param_ty(ty: Ty, context: &str) -> Result<(), String> {
     validate_interp_ty(ty, context)
 }
 
-/// A stored class/record field is a position boundary: an ordinary option is
-/// a value — a parameter, a return, a local — and must not acquire a
-/// stored-field ABI merely because the interpreter knows how to execute it.
+/// A class field stores what a parameter binds: the value families the
+/// interpreter executes, copyable options included — a stored option is an
+/// `RtVal::Opt` in the object's field map like any other field value.
+pub(crate) fn validate_interp_class_field_ty(ty: Ty, context: &str) -> Result<(), String> {
+    validate_interp_param_ty(ty, context)
+}
+
+/// A stored record field is a position boundary: a record is explicit
+/// layout, and an ordinary option is a value — a parameter, a return, a
+/// local — that must not acquire a byte-layout ABI merely because the
+/// interpreter knows how to execute it. This gate is independent of the
+/// checker's record-field rules on purpose: it serves raw `Program` callers
+/// as defense in depth.
 pub(crate) fn validate_interp_field_ty(ty: Ty, context: &str) -> Result<(), String> {
     if matches!(ty, Ty::Option(_)) && !ty.is_affine_option() {
         return Err(format!(
             "interp.option_position_unsupported: {context} is option-valued; \
-             ordinary options are supported as parameters, returns, and locals, \
-             not stored fields"
+             ordinary options are supported as parameters, returns, locals, \
+             and class fields, not record fields"
         ));
     }
     validate_interp_param_ty(ty, context)
@@ -4708,12 +4718,14 @@ mod payload_guard_tests {
     }
 
     #[test]
-    fn option_parameters_execute_and_stored_option_fields_stay_refused() {
+    fn option_parameters_execute_and_stored_option_fields_split_by_container() {
         for payload in [Ty::Bool, Ty::Int(IntTy::U64)] {
             validate_interp_param_ty(Ty::option(payload.clone()), "parameter `value`")
                 .expect("a copyable option parameter is an executable value");
-            let error = validate_interp_field_ty(Ty::option(payload), "field `Box.value`")
-                .expect_err("options must not acquire a stored-field ABI");
+            validate_interp_class_field_ty(Ty::option(payload.clone()), "field `Box.value`")
+                .expect("a copyable option class field is an executable value");
+            let error = validate_interp_field_ty(Ty::option(payload), "field `Pair.value`")
+                .expect_err("options must not acquire a record byte-layout ABI");
             assert!(error.starts_with("interp.option_position_unsupported:"));
         }
         let affine = validate_interp_param_ty(Ty::option(Ty::array(Ty::Bool)), "parameter `value`")

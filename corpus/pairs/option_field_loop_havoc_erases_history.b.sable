@@ -1,0 +1,24 @@
+// pair: same-lean
+// See option_field_loop_havoc_erases_history.a.sable: only the dead
+// pre-loop value of `self.slot` differs, and the init-branch field
+// havoc must erase it.
+
+pub class Probe {
+    option<u64> slot;
+    u64 n;
+
+    /// post self.n = 3
+    init run() {
+        self.slot = none;
+        self.n = 0;
+        mut u64 i = 0;
+        /// invariant i ≤ 3
+        /// invariant self.n = i
+        /// variant 3 - i
+        while (i < 3) {
+            self.slot = some(i);
+            self.n = i + 1;
+            i = i + 1;
+        }
+    }
+}

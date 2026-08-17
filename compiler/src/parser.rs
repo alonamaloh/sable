@@ -4469,22 +4469,35 @@ impl<'a> Parser<'a> {
                     });
                 }
                 if self.at(&Tok::Dot) {
-                    self.bump();
-                    let (sub, sspan) = self.ident()?;
-                    if sub != "len" {
-                        return Err(Diagnostic {
-                            name: "parse.unknown_field".into(),
-                            title: format!("unknown field `.{sub}`"),
-                            span: sspan,
-                            label: "`.len` is the only array-field accessor".into(),
-                            notes: vec![],
+                    // Option accessors postfix any expression (ADR 0008), a
+                    // field read included: leave the dot for the postfix
+                    // loop, which builds `is_some`/`value`/`take` over the
+                    // field. `.len` stays the field-level array accessor.
+                    let option_accessor = match self.peek2() {
+                        Tok::Ident(sub) if sub == "is_some" || sub == "value" => true,
+                        Tok::Ident(sub) if sub == "take" => self.peek3() != &Tok::LParen,
+                        _ => false,
+                    };
+                    if !option_accessor {
+                        self.bump();
+                        let (sub, sspan) = self.ident()?;
+                        if sub != "len" {
+                            return Err(Diagnostic {
+                                name: "parse.unknown_field".into(),
+                                title: format!("unknown field `.{sub}`"),
+                                span: sspan,
+                                label: "`.len`, `.is_some`, `.value`, and `.take` are the \
+                                        field accessors"
+                                    .into(),
+                                notes: vec![],
+                            });
+                        }
+                        return Ok(Expr {
+                            kind: ExprKind::SelfFieldLen { field },
+                            span: span.join(sspan),
+                            ty: None,
                         });
                     }
-                    return Ok(Expr {
-                        kind: ExprKind::SelfFieldLen { field },
-                        span: span.join(sspan),
-                        ty: None,
-                    });
                 }
                 Ok(Expr {
                     kind: ExprKind::SelfField { field },

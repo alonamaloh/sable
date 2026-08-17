@@ -1,0 +1,30 @@
+// expect-test-failure: post of `Meter::drain` violated
+// The dynamic half of `corpus/must-fail/option_field_wrong_old_post.sable`:
+// the post claims one more than the entry payload, and the monitor
+// refutes the `old self.level` match at the method's exit.
+
+pub class Meter {
+    option<u64> level;
+
+    /// post self.level = some (v)
+    init at(u64 v) {
+        self.level = some(v);
+    }
+
+    /// post match old self.level with
+    ///      | some v => result = v + 1
+    ///      | none   => result = 0
+    fn drain(&mut self) -> u64 {
+        mut u64 r = 0;
+        if (self.level.is_some) {
+            r = self.level.value;
+        }
+        self.level = none;
+        return r;
+    }
+}
+
+fn test_old_field_post_is_false() {
+    var mut m = Meter::at(6);
+    u64 r = m.drain();
+}

@@ -1,0 +1,23 @@
+// expect-test-failure: invariant of `Meter` violated
+// The dynamic half of `corpus/must-fail/option_field_wrong_invariant.sable`:
+// the init stores the boundary value the class invariant excludes, and
+// the monitor refutes the invariant at the constructor's exit.
+
+pub class Meter {
+    option<u64> level;
+    u64 cap;
+
+    /// invariant level.is_some → level.value < cap
+    /// invariant 1 ≤ cap
+
+    /// pre  c ≥ 1
+    /// post self.cap = c
+    init fill(u64 c) {
+        self.cap = c;
+        self.level = some(c);
+    }
+}
+
+fn test_boundary_breaks_invariant() {
+    var m = Meter::fill(5);
+}

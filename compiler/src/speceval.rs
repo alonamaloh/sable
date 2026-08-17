@@ -628,11 +628,20 @@ impl P {
     }
 
     /// `match result with | some i => E | none => E` (either arm order).
+    /// The scrutinee is a variable or a dotted path, optionally under
+    /// `old`: `match old self.f with` reads the entry state of the field.
     fn match_opt(&mut self) -> EResult<S> {
         let Some(T::Ident(scrut)) = self.bump() else {
             return Err(Unmonitorable("match scrutinee must be a variable".into()));
         };
-        let scrutinee = Box::new(ident_to_expr(&scrut)?);
+        let scrutinee = if scrut == "old" {
+            let Some(T::Ident(path)) = self.bump() else {
+                return Err(Unmonitorable("expected a path after `old`".into()));
+            };
+            Box::new(oldify(ident_to_expr(&path)?)?)
+        } else {
+            Box::new(ident_to_expr(&scrut)?)
+        };
         if !matches!(self.bump(), Some(T::Ident(w)) if w == "with") {
             return Err(Unmonitorable("expected `with`".into()));
         }
