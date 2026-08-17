@@ -1335,6 +1335,17 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      `docs/shape-admission.md` moves exactly the `check init param` and
      `check method param` columns for those three shapes.
 
+     **A closed cell is work or a decision (ADR 0075).** The matrix's
+     closed cells now say which kind of closed they are: `not yet` (work
+     remaining, the fail-safe default) or `never` (a recorded decision
+     with its reason, pinned in the `NEVER` table and red-tested in both
+     directions — a by-design cell the front end starts admitting cannot
+     be blessed over). Progress reads against an honest denominator:
+     **63 of 163 intended cells open; 47 never open by design.** The
+     first draft of the decision table overclaimed seven cells that
+     ADRs 0026/0029/0031/0054 hold open — struck on review, which is the
+     argument for the fail-safe default recorded in the ADR.
+
    - **G2 — affine options (staged; G2.0–G2.3 complete):**
      carry ownership and destruction correctly through present/absent aggregate
      values without widening the existing copy-option family by accident.

@@ -38,6 +38,13 @@
 //! columns for borrows) and every type position must be probed as a
 //! context. A new shape or position turns them red until the matrix sees it.
 //!
+//! A closed cell is one of two things, and the grid says which: `not yet`
+//! (work remaining) or `never` (a decision, recorded in `NEVER` with its
+//! reason). The default for a closed cell is `not yet`, because claiming
+//! work remains is safe where silently claiming a decision is not; `never`
+//! must be written down here, cell by cell, and a `never` cell the front
+//! end starts admitting is a red test in both directions.
+//!
 //! Run with `SABLE_BLESS=1` to rewrite the table after an intended change.
 
 use std::path::{Path, PathBuf};
@@ -408,6 +415,130 @@ fn ctx_method_param_shared(p: &Probe) -> Vec<String> {
     )]
 }
 
+/// The cells that never open, each with its reason. Everything closed and
+/// not listed here reads `not yet` — the conservative default, because a
+/// missing entry claims only that work remains, while a wrong entry would
+/// silently close off design space. Reversing one of these decisions is
+/// deleting its entry (with the reasoning that outgrew it) and blessing;
+/// a listed cell the front end admits is a red test until then.
+const NEVER: &[(&str, &[&str], &str)] = &[
+    (
+        "for index",
+        &[
+            "bool",
+            "[u64]",
+            "[bool]",
+            "option<u64>",
+            "option<bool>",
+            "record",
+            "option<[bool]>",
+            "class",
+            "raw<u8>",
+        ],
+        "a range index is an integer",
+    ),
+    (
+        "cast target",
+        &[
+            "bool",
+            "[u64]",
+            "[bool]",
+            "option<u64>",
+            "option<bool>",
+            "record",
+            "option<[bool]>",
+            "class",
+            "raw<u8>",
+        ],
+        "`widen`/`narrow` convert between integer types; every other conversion is \
+         spelled as the operation it is",
+    ),
+    (
+        "param &",
+        &[
+            "u64",
+            "bool",
+            "option<u64>",
+            "option<bool>",
+            "record",
+            "raw<u8>",
+        ],
+        "a shared borrow of a copyable value is indistinguishable from the value; pass \
+         it by value",
+    ),
+    (
+        "init param &",
+        &[
+            "u64",
+            "bool",
+            "option<u64>",
+            "option<bool>",
+            "record",
+            "raw<u8>",
+        ],
+        "a shared borrow of a copyable value is indistinguishable from the value; pass \
+         it by value",
+    ),
+    (
+        "method param &",
+        &[
+            "u64",
+            "bool",
+            "option<u64>",
+            "option<bool>",
+            "record",
+            "raw<u8>",
+        ],
+        "a shared borrow of a copyable value is indistinguishable from the value; pass \
+         it by value",
+    ),
+    (
+        "record field",
+        &["[u64]", "[bool]"],
+        "a `#[layout]` record is a plain copyable value with fixed storage geometry; \
+         an array owns heap storage",
+    ),
+    (
+        "record field",
+        &["option<[bool]>"],
+        "record values copy freely; an affine value has exactly one owner",
+    ),
+    (
+        "record field",
+        &["class"],
+        "record values copy freely; class ownership cannot be copied",
+    ),
+    (
+        "const",
+        &["option<[bool]>"],
+        "a constant copies freely; an affine value has exactly one owner",
+    ),
+    (
+        "const",
+        &["class"],
+        "a class value owns storage and a destructor; a constant owns nothing",
+    ),
+    (
+        "const",
+        &["raw<u8>"],
+        "a raw pointer is provenance plus an offset (ADR 0025), and a constant has \
+         neither",
+    ),
+    (
+        "resource map key",
+        &["[u64]", "[bool]", "option<[bool]>", "class"],
+        "a map key is a pure value compared by equality; an owning value cannot be one",
+    ),
+];
+
+/// The recorded reason a cell never opens, if one is recorded.
+fn never_reason(ty: &str, context: &str) -> Option<&'static str> {
+    NEVER
+        .iter()
+        .find(|(ctx, rows, _)| *ctx == context && rows.contains(&ty))
+        .map(|(_, _, reason)| *reason)
+}
+
 /// `Ok` when the position admits the type; `Err` carries the diagnostic
 /// name that closed it.
 fn probe_cell(candidates: Vec<String>) -> Result<(), String> {
@@ -436,7 +567,12 @@ fn render(results: &[Vec<Result<(), String>>]) -> String {
          `compiler/tests/type_matrix.rs`;\nrewrite it with `SABLE_BLESS=1 cargo test \
          --test type_matrix`. A cell is `yes` when the\nLean-free front end accepts \
          some spelling of that type in that position, so it answers what the\nlanguage \
-         admits, not what verifies.\n\nEach binding-mode column probes one spelling: \
+         admits, not what verifies.\n\nA closed cell says which kind of closed it is: \
+         `not yet` is work remaining, and\n`never` is a decision — every `never` \
+         carries a recorded reason (the table below),\nand a `never` cell the front \
+         end starts admitting is a red test. The default for\na closed cell is \
+         `not yet`, so nothing becomes a decision by omission.\n\nEach binding-mode \
+         column probes one spelling: \
          `param` is the owned spelling, and\n`param &` / `param &mut` are the borrow \
          spellings, so an open borrow cell says the\nlanguage admits lending the type, \
          never that an owned value of it crosses the call.\nThe `init param` / `method \
@@ -453,15 +589,48 @@ fn render(results: &[Vec<Result<(), String>>]) -> String {
 
     for (row, probe) in results.iter().zip(TYPES) {
         out.push_str(&format!("| `{}` |", probe.name));
-        for cell in row {
-            out.push_str(if cell.is_ok() { " yes |" } else { " no |" });
+        for (cell, (context, _)) in row.iter().zip(CONTEXTS) {
+            out.push_str(match cell {
+                Ok(()) => " yes |",
+                Err(_) if never_reason(probe.name, context).is_some() => " never |",
+                Err(_) => " not yet |",
+            });
         }
         out.push('\n');
     }
 
-    let total = TYPES.len() * CONTEXTS.len();
     let open = results.iter().flatten().filter(|c| c.is_ok()).count();
-    out.push_str(&format!("\nOpen cells: {open}/{total}.\n"));
+    let never: usize = results
+        .iter()
+        .zip(TYPES)
+        .map(|(row, probe)| {
+            row.iter()
+                .zip(CONTEXTS)
+                .filter(|(cell, (context, _))| {
+                    cell.is_err() && never_reason(probe.name, context).is_some()
+                })
+                .count()
+        })
+        .sum();
+    let intended = TYPES.len() * CONTEXTS.len() - never;
+    out.push_str(&format!(
+        "\nOpen cells: {open} of {intended} intended; {never} never open by design.\n"
+    ));
+
+    out.push_str(
+        "\n## Cells that never open\n\n\
+         Reversing one of these is deleting its `NEVER` entry in \
+         `compiler/tests/type_matrix.rs`\n(with the reasoning that outgrew it) and \
+         blessing.\n\n| context | types | reason |\n|---|---|---|\n",
+    );
+    for (context, rows, reason) in NEVER {
+        let types = rows
+            .iter()
+            .map(|r| format!("`{r}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("| {context} | {types} | {reason} |\n"));
+    }
 
     out.push_str("\n## What closes each cell\n\n| type | context | diagnostic |\n|---|---|---|\n");
     for (row, probe) in results.iter().zip(TYPES) {
@@ -476,6 +645,25 @@ fn render(results: &[Vec<Result<(), String>>]) -> String {
 
 #[test]
 fn type_matrix_is_pinned() {
+    // The decision table names real cells, once each.
+    let mut seen = std::collections::BTreeSet::new();
+    for (context, rows, _) in NEVER {
+        assert!(
+            CONTEXTS.iter().any(|(name, _)| name == context),
+            "NEVER names the context `{context}`, which does not exist"
+        );
+        for row in *rows {
+            assert!(
+                TYPES.iter().any(|probe| probe.name == *row),
+                "NEVER names the row `{row}`, which does not exist"
+            );
+            assert!(
+                seen.insert((*context, *row)),
+                "NEVER lists `{row}` × `{context}` twice"
+            );
+        }
+    }
+
     let results: Vec<Vec<Result<(), String>>> = TYPES
         .iter()
         .map(|probe| {
@@ -485,6 +673,22 @@ fn type_matrix_is_pinned() {
                 .collect()
         })
         .collect();
+
+    // A cell recorded as never-by-design that the front end admits is a
+    // contradiction the bless flag must not be able to paper over: either
+    // the admission is a bug, or the decision is being reversed — and a
+    // reversal starts by deleting the entry, not by blessing around it.
+    for (row, probe) in results.iter().zip(TYPES) {
+        for (cell, (context, _)) in row.iter().zip(CONTEXTS) {
+            assert!(
+                !(cell.is_ok() && never_reason(probe.name, context).is_some()),
+                "`{}` × `{context}` is recorded as never opening, but the front end \
+                 admits it; delete its NEVER entry (with the reasoning that outgrew \
+                 it) if this is a deliberate reversal",
+                probe.name
+            );
+        }
+    }
 
     let rendered = render(&results);
     let path = matrix_path();

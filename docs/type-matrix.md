@@ -5,6 +5,11 @@ rewrite it with `SABLE_BLESS=1 cargo test --test type_matrix`. A cell is `yes` w
 Lean-free front end accepts some spelling of that type in that position, so it answers what the
 language admits, not what verifies.
 
+A closed cell says which kind of closed it is: `not yet` is work remaining, and
+`never` is a decision — every `never` carries a recorded reason (the table below),
+and a `never` cell the front end starts admitting is a red test. The default for
+a closed cell is `not yet`, so nothing becomes a decision by omission.
+
 Each binding-mode column probes one spelling: `param` is the owned spelling, and
 `param &` / `param &mut` are the borrow spellings, so an open borrow cell says the
 language admits lending the type, never that an owned value of it crosses the call.
@@ -12,18 +17,38 @@ The `init param` / `method param` pairs read the same way.
 
 | type | local | return | param | param & | param &mut | record field | class field | array element | option payload | generic arg | for index | const | cast target | trait-impl target | raw element | resource extent | resource map key | init param | init param & | method param | method param & |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `u64` | yes | yes | yes | no | no | yes | yes | yes | yes | yes | yes | yes | yes | yes | no | yes | yes | yes | no | yes | no |
-| `bool` | yes | yes | yes | no | no | no | yes | yes | yes | no | no | no | no | no | no | no | no | yes | no | yes | no |
-| `[u64]` | yes | no | no | yes | yes | no | yes | no | no | no | no | no | no | no | no | no | no | no | yes | no | no |
-| `[bool]` | yes | no | no | yes | yes | no | no | no | yes | no | no | no | no | no | no | no | no | no | yes | no | no |
-| `option<u64>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | yes | no | yes | no |
-| `option<bool>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | yes | no | yes | no |
-| `record` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | yes | yes | no | no | no | no | no |
-| `option<[bool]>` | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
-| `class` | yes | yes | yes | yes | yes | no | yes | no | no | no | no | no | no | no | no | no | no | yes | yes | yes | yes |
-| `raw<u8>` | yes | yes | yes | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no | no |
+| `u64` | yes | yes | yes | never | not yet | yes | yes | yes | yes | yes | yes | yes | yes | yes | not yet | yes | yes | yes | never | yes | never |
+| `bool` | yes | yes | yes | never | not yet | not yet | yes | yes | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
+| `[u64]` | yes | not yet | not yet | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
+| `[bool]` | yes | not yet | not yet | yes | yes | never | not yet | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
+| `option<u64>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
+| `option<bool>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
+| `record` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
+| `option<[bool]>` | yes | not yet | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet |
+| `class` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
+| `raw<u8>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | not yet | not yet | never | not yet | never |
 
-Open cells: 63/210.
+Open cells: 63 of 163 intended; 47 never open by design.
+
+## Cells that never open
+
+Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_matrix.rs`
+(with the reasoning that outgrew it) and blessing.
+
+| context | types | reason |
+|---|---|---|
+| for index | `bool`, `[u64]`, `[bool]`, `option<u64>`, `option<bool>`, `record`, `option<[bool]>`, `class`, `raw<u8>` | a range index is an integer |
+| cast target | `bool`, `[u64]`, `[bool]`, `option<u64>`, `option<bool>`, `record`, `option<[bool]>`, `class`, `raw<u8>` | `widen`/`narrow` convert between integer types; every other conversion is spelled as the operation it is |
+| param & | `u64`, `bool`, `option<u64>`, `option<bool>`, `record`, `raw<u8>` | a shared borrow of a copyable value is indistinguishable from the value; pass it by value |
+| init param & | `u64`, `bool`, `option<u64>`, `option<bool>`, `record`, `raw<u8>` | a shared borrow of a copyable value is indistinguishable from the value; pass it by value |
+| method param & | `u64`, `bool`, `option<u64>`, `option<bool>`, `record`, `raw<u8>` | a shared borrow of a copyable value is indistinguishable from the value; pass it by value |
+| record field | `[u64]`, `[bool]` | a `#[layout]` record is a plain copyable value with fixed storage geometry; an array owns heap storage |
+| record field | `option<[bool]>` | record values copy freely; an affine value has exactly one owner |
+| record field | `class` | record values copy freely; class ownership cannot be copied |
+| const | `option<[bool]>` | a constant copies freely; an affine value has exactly one owner |
+| const | `class` | a class value owns storage and a destructor; a constant owns nothing |
+| const | `raw<u8>` | a raw pointer is provenance plus an offset (ADR 0025), and a constant has neither |
+| resource map key | `[u64]`, `[bool]`, `option<[bool]>`, `class` | a map key is a pure value compared by equality; an owning value cannot be one |
 
 ## What closes each cell
 
