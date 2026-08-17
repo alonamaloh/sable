@@ -304,7 +304,7 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
             });
             continue;
         }
-        let two = if i + 1 < bytes.len() {
+        let two = if i + 1 < bytes.len() && text.is_char_boundary(i + 2) {
             &text[i..i + 2]
         } else {
             ""
@@ -341,13 +341,11 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Diagnostic> {
                 b'!' => (Tok::Bang, 1),
                 b'=' => (Tok::Assign, 1),
                 _ => {
+                    let unexpected = text[i..].chars().next().unwrap();
                     return Err(Diagnostic {
                         name: "lex.unexpected_char".into(),
-                        title: format!(
-                            "unexpected character `{}`",
-                            text[i..].chars().next().unwrap()
-                        ),
-                        span: Span::new(i, i + 1),
+                        title: format!("unexpected character `{unexpected}`"),
+                        span: Span::new(i, i + unexpected.len_utf8()),
                         label: "not part of the Sable program language".into(),
                         notes: vec![],
                     });

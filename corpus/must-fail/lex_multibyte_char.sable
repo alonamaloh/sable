@@ -1,0 +1,8 @@
+// expect-error: lex.unexpected_char
+// The proof language's symbols are not program-language tokens: a
+// multi-byte character in program text is a spanned diagnostic naming
+// the character, never a crash.
+
+pub fn confused(bool a, bool b) -> bool {
+    return a ∧ b;
+}
