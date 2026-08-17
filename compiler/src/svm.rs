@@ -264,13 +264,15 @@ fn reject_named_affine_option(ctx: &LowerCtx<'_>, name: &str, context: &str) -> 
 /// payload its holder already has.
 pub(crate) fn validate_array_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload.payload_family() {
-        PayloadFamily::Value => Ok(()),
+        // A record element is a machine value with a declaration tag:
+        // `ValTag.record` is its admission, and a cross-record store is
+        // tag confusion before it is anything else.
+        PayloadFamily::Value | PayloadFamily::Record => Ok(()),
         // The SVM lowers only the monomorphized program, so a type
         // parameter answers alongside the unsupported families; option
         // elements answer with them, because arrays of options stay
         // closed.
-        PayloadFamily::Record
-        | PayloadFamily::OptionOfValue
+        PayloadFamily::OptionOfValue
         | PayloadFamily::Param
         | PayloadFamily::Noncanonical
         | PayloadFamily::Unsupported => Err(format!(
@@ -4987,7 +4989,7 @@ mod tests {
         let program = empty_program();
         let allocation = expr(
             ExprKind::AllocArray {
-                elem: Ty::Record(0),
+                elem: Ty::option(Ty::Int(IntTy::U64)),
                 len: Box::new(expr(ExprKind::IntLit(1), Ty::Int(IntTy::U64))),
                 init: Box::new(expr(ExprKind::IntLit(0), Ty::Int(IntTy::U8))),
             },
@@ -5008,8 +5010,9 @@ mod tests {
             .expect_err("AllocArray's own payload must be checked independently");
         assert_eq!(
             error,
-            "svm.aggregate_payload_unsupported: alloc_array has array payload `record`; \
-             the SVM currently lowers only concrete integer and Boolean payloads"
+            "svm.aggregate_payload_unsupported: alloc_array has array payload \
+             `option<u64>`; the SVM currently lowers only concrete integer and Boolean \
+             payloads"
         );
     }
 

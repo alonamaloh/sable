@@ -200,5 +200,53 @@ runs at all. -/
     .ret (.var "a") ]
   = "done arr [1, 0]"
 
+
+/- Record elements: the element tag is the record's declaration tag.
+Alloc, store, read, and field projection are the ordinary payload-generic
+operations; a cross-record store is tag confusion (`undef`) and wins over
+OOB; the empty record array retains its tag. -/
+#guard outcome 100
+  [ .recordMake "p" 7 ["x"] [u64 3],
+    .assign "a" (.allocArray (u64 2) (.var "p")),
+    .ret (.recordField (.index "a" (u64 0)) "x") ]
+  = "done int 3"
+
+#guard outcome 100
+  [ .recordMake "p" 7 ["x"] [u64 1],
+    .recordMake "q" 7 ["x"] [u64 9],
+    .assign "a" (.allocArray (u64 2) (.var "p")),
+    .store "a" (u64 1) (.var "q"),
+    .ret (.recordField (.index "a" (u64 1)) "x") ]
+  = "done int 9"
+
+/- A store of a different record's value is tag confusion, before bounds. -/
+#guard outcome 100
+  [ .recordMake "p" 7 ["x"] [u64 1],
+    .recordMake "q" 8 ["x"] [u64 2],
+    .assign "a" (.allocArray (u64 1) (.var "p")),
+    .store "a" (u64 0) (.var "q") ]
+  = "undef"
+
+#guard outcome 100
+  [ .recordMake "p" 7 ["x"] [u64 1],
+    .recordMake "q" 8 ["x"] [u64 2],
+    .assign "a" (.allocArray (u64 0) (.var "p")),
+    .store "a" (u64 5) (.var "q") ]
+  = "undef"
+
+/- The matching store on the empty record array reaches the bounds trap. -/
+#guard outcome 100
+  [ .recordMake "p" 7 ["x"] [u64 1],
+    .assign "a" (.allocArray (u64 0) (.var "p")),
+    .store "a" (u64 0) (.var "p") ]
+  = "trap indexOOB 0 0"
+
+/- A scalar store into a record array is tag confusion too. -/
+#guard outcome 100
+  [ .recordMake "p" 7 ["x"] [u64 1],
+    .assign "a" (.allocArray (u64 1) (.var "p")),
+    .store "a" (u64 0) (u64 5) ]
+  = "undef"
+
 end SVM
 end Sable

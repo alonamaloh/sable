@@ -1,0 +1,59 @@
+// Record arrays in the formal machine: the element tag is the record's
+// declaration tag, construction and element access are the ordinary
+// payload-generic array operations, and both trap depths agree with the
+// interpreter.
+
+record Pt #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 x;
+    #[offset(8)] u64 y;
+}
+
+fn subject_alloc_read() -> u64 {
+    Pt fill = Pt(1, 2);
+    mut [Pt] pts = alloc_array<Pt>(3, fill);
+    Pt first = pts[0];
+    return first.x + first.y;
+}
+
+fn subject_store_read() -> u64 {
+    Pt fill = Pt(0, 0);
+    mut [Pt] pts = alloc_array<Pt>(2, fill);
+    Pt fresh = Pt(7, 9);
+    pts[1] = fresh;
+    Pt back = pts[1];
+    return back.y;
+}
+
+fn subject_fill_then_read() -> u64 {
+    Pt a = Pt(3, 4);
+    Pt b = Pt(5, 6);
+    Pt fill = Pt(0, 0);
+    mut [Pt] pts = alloc_array<Pt>(2, fill);
+    pts[0] = a;
+    pts[1] = b;
+    Pt second = pts[1];
+    return second.x;
+}
+
+fn subject_len() -> u64 {
+    Pt fill = Pt(0, 0);
+    mut [Pt] pts = alloc_array<Pt>(5, fill);
+    return pts.len;
+}
+
+fn subject_oob_read() -> u64 {
+    Pt fill = Pt(0, 0);
+    mut [Pt] pts = alloc_array<Pt>(1, fill);
+    mut u64 i = 2;
+    Pt beyond = pts[i];
+    return beyond.x;
+}
+
+fn subject_oob_store() -> u64 {
+    Pt fill = Pt(0, 0);
+    mut [Pt] pts = alloc_array<Pt>(1, fill);
+    Pt w = Pt(1, 1);
+    mut u64 i = 3;
+    pts[i] = w;
+    return 0;
+}

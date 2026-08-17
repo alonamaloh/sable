@@ -113,6 +113,10 @@ its element type at length zero, where no element is left to imply one. -/
 inductive ValTag where
   | int
   | bool
+  /-- Record elements carry the declaration tag, so two record types'
+  empty arrays stay distinguishable and a cross-record store is tag
+  confusion, not a silent structural coincidence. -/
+  | record (tag : Int)
   deriving DecidableEq, Repr
 
 /-- Machine values. Integers are exact (`Int`); their widths live in the
@@ -153,6 +157,7 @@ to another payload is one arm here, not an arm in every array operation. -/
 def Val.tag? : Val → Option ValTag
   | .int _ => some .int
   | .bool _ => some .bool
+  | .record tag _ => some (.record tag)
   | _ => none
 
 /-- Type-preserving update of a `Val.arr`'s fields, one implementation for

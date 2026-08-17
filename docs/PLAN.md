@@ -1362,9 +1362,15 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      `a[i].x` pinned as a non-place in both directions, class fields
      behind `type.record_array_field` until the field-element paths
      generalize, off-range junk deliberately unanswered by the monitor
-     (Seq junk is unconstrained; no Lean default exists to mirror), and
-     the machine leg deferred to its own ValTag commit. The matrix gains
-     the `[record]` row: 72 of 180 intended open.
+     (Seq junk is unconstrained; no Lean default exists to mirror). The
+     class-field parity commit then removes the interim gate and makes
+     the three field-element paths payload-driven, and the machine
+     commit adds `ValTag.record` carrying the declaration tag — the
+     agreement proofs survived unchanged, the `#guard` battery pins
+     cross-record stores as tag confusion beating OOB, and
+     `corpus/svm-diff/record_arrays.sable` compares six A-normal
+     subjects against the interpreter, both trap depths included. The
+     matrix gains the `[record]` row: 73 of 180 intended open.
 
      **Option nesting is the recursive family (ADR 0078).**
      `option<option<T>>` — a founding example of the representation
