@@ -930,6 +930,24 @@ pub enum Mutability {
 
 /// How a type binds the storage it names: outright, or through a borrow.
 ///
+/// The copyable container-payload families, as [`Ty::payload_family`]
+/// classifies them. Which families a *stage* serves is that stage's own
+/// named gate to say: `Value` is admitted everywhere, `Param` only where
+/// templates are proof artifacts rather than executables (check, VC
+/// generation), and `Noncanonical`/`Unsupported` nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadFamily {
+    /// A concrete integer or `bool`: stored, copied, and compared in place.
+    Value,
+    /// A declaration type parameter under the abstract-integer model
+    /// (ADR 0009).
+    Param,
+    /// A legacy `IntTy::TParam`, canonical nowhere as a payload.
+    Noncanonical,
+    /// No copyable container-payload story exists for the shape.
+    Unsupported,
+}
+
 /// Derived from the shape — `Ty::Borrow` carries the two borrowed cases and
 /// every other constructor owns — so it is a *question* about a type, never a
 /// field of one. A rule that must give owned, shared, and unique three
@@ -1137,6 +1155,31 @@ impl Ty {
     /// Whether this option's present case owns storage.
     pub fn is_affine_option(&self) -> bool {
         self.as_affine_option_payload().is_some()
+    }
+
+    /// Which copyable container-payload family this type is — the one
+    /// classification behind every stage's array-element and copy-option
+    /// payload gate. Widening a family is a change *here*, and every stage
+    /// answers for itself in its own name from this shared answer, which is
+    /// what makes widening some stages but not others impossible to do
+    /// silently. The owning payloads (`option<[T]>`, `option<raw<R>>`) are
+    /// separate families with their own gates, not classified here.
+    pub fn payload_family(&self) -> PayloadFamily {
+        match self {
+            Ty::Int(IntTy::TParam(_)) => PayloadFamily::Noncanonical,
+            Ty::Int(_) | Ty::Bool => PayloadFamily::Value,
+            Ty::Param(_) => PayloadFamily::Param,
+            Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => PayloadFamily::Unsupported,
+        }
     }
 
     /// Whether this is an array of exactly `element`, in any binding mode.

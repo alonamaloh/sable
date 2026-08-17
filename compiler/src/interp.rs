@@ -468,28 +468,34 @@ fn validate_interp_container_payloads(ty: Ty, context: &str) -> Result<(), Strin
 /// May the interpreter execute an array with this payload. A gate: an
 /// allow-list ending in a named refusal, which never recurses.
 pub(crate) fn validate_interp_array_payload(payload: &Ty, context: &str) -> Result<(), String> {
-    match payload {
-        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        Ty::Bool => Ok(()),
-        _ => Err(format!(
-            "interp.aggregate_payload_unsupported: {context} has array payload `{}`; \
-             the interpreter currently executes only concrete integer and Boolean payloads",
-            payload.name()
-        )),
+    match payload.payload_family() {
+        PayloadFamily::Value => Ok(()),
+        // A type parameter is a proof artifact; the interpreter executes
+        // only the monomorphized program, so it answers alongside the
+        // unsupported families rather than the admitted one.
+        PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
+            Err(format!(
+                "interp.aggregate_payload_unsupported: {context} has array payload `{}`; \
+                 the interpreter currently executes only concrete integer and Boolean payloads",
+                payload.name()
+            ))
+        }
     }
 }
 
 /// May the interpreter execute a copyable option with this payload. A gate,
 /// on the same terms as `validate_interp_array_payload`.
 pub(crate) fn validate_interp_option_payload(payload: &Ty, context: &str) -> Result<(), String> {
-    match payload {
-        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        Ty::Bool => Ok(()),
-        _ => Err(format!(
-            "interp.aggregate_payload_unsupported: {context} has option payload `{}`; \
-             the interpreter currently executes only concrete integer and Boolean option payloads",
-            payload.name()
-        )),
+    match payload.payload_family() {
+        PayloadFamily::Value => Ok(()),
+        PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
+            Err(format!(
+                "interp.aggregate_payload_unsupported: {context} has option payload `{}`; \
+                 the interpreter currently executes only concrete integer and Boolean option \
+                 payloads",
+                payload.name()
+            ))
+        }
     }
 }
 

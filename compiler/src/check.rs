@@ -2595,10 +2595,10 @@ fn noncanonical_aggregate_payload(span: Span) -> Diagnostic {
 /// below keeps Boolean arrays owned and local, while element checking can
 /// preserve their exact `bool` identity.
 pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
-    match payload {
-        Ty::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
-        Ty::Int(_) | Ty::Param(_) | Ty::Bool => Ok(()),
-        _ => Err(Diagnostic {
+    match payload.payload_family() {
+        PayloadFamily::Noncanonical => Err(noncanonical_aggregate_payload(span)),
+        PayloadFamily::Value | PayloadFamily::Param => Ok(()),
+        PayloadFamily::Unsupported => Err(Diagnostic {
             name: "type.array_payload_unsupported".into(),
             title: format!(
                 "array payload type `{}` is not supported yet",
@@ -2628,12 +2628,10 @@ pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
 /// families. Retained declaration parameters keep the ADR 0009
 /// abstract-integer semantics.
 pub(crate) fn option_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
-    match payload {
-        Ty::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
-        Ty::Int(integer) => Ok(Ty::Int(integer)),
-        Ty::Param(parameter) => Ok(Ty::Param(parameter)),
-        Ty::Bool => Ok(Ty::Bool),
-        _ => Err(Diagnostic {
+    match payload.payload_family() {
+        PayloadFamily::Noncanonical => Err(noncanonical_aggregate_payload(span)),
+        PayloadFamily::Value | PayloadFamily::Param => Ok(payload),
+        PayloadFamily::Unsupported => Err(Diagnostic {
             name: "type.option_payload_unsupported".into(),
             title: format!(
                 "option payload type `{}` is not supported yet",

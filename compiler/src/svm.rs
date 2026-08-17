@@ -263,14 +263,17 @@ fn reject_named_affine_option(ctx: &LowerCtx<'_>, name: &str, context: &str) -> 
 /// entry point: an array holds a full `Ty`, and the type of one element is the
 /// payload its holder already has.
 pub(crate) fn validate_array_payload(payload: &Ty, context: &str) -> Result<(), String> {
-    match payload {
-        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        Ty::Bool => Ok(()),
-        _ => Err(format!(
-            "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
-             the SVM currently lowers only concrete integer and Boolean payloads",
-            payload.name()
-        )),
+    match payload.payload_family() {
+        PayloadFamily::Value => Ok(()),
+        // The SVM lowers only the monomorphized program, so a type
+        // parameter answers alongside the unsupported families.
+        PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
+            Err(format!(
+                "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
+                 the SVM currently lowers only concrete integer and Boolean payloads",
+                payload.name()
+            ))
+        }
     }
 }
 
@@ -1081,14 +1084,15 @@ fn validate_allocation_size(ctx: &LowerCtx<'_>, size: &Expr, context: &str) -> R
 /// May the formal machine lower a copyable option with this payload. A gate
 /// on the same terms as `validate_array_payload`.
 pub(crate) fn validate_option_payload(payload: &Ty, context: &str) -> Result<(), String> {
-    match payload {
-        Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
-        Ty::Bool => Ok(()),
-        _ => Err(format!(
-            "svm.aggregate_payload_unsupported: {context} has option payload `{}`; \
-             the SVM currently lowers only concrete integer and Boolean option payloads",
-            payload.name()
-        )),
+    match payload.payload_family() {
+        PayloadFamily::Value => Ok(()),
+        PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
+            Err(format!(
+                "svm.aggregate_payload_unsupported: {context} has option payload `{}`; \
+                 the SVM currently lowers only concrete integer and Boolean option payloads",
+                payload.name()
+            ))
+        }
     }
 }
 

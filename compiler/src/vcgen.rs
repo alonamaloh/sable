@@ -489,19 +489,19 @@ pub(crate) fn validate_vc_payload_ty(
     context: &str,
 ) -> Result<(), String> {
     let container = aggregate.container();
-    match ty {
-        Ty::Int(IntTy::TParam(_)) => Err(format!(
+    match ty.payload_family() {
+        PayloadFamily::Noncanonical => Err(format!(
             "internal.vcgen.type_error: non-canonical legacy parameter in {container} payload in {context}"
         )),
-        Ty::Int(_) | Ty::Bool => Ok(()),
-        Ty::Param(_) if allow_param => Ok(()),
-        Ty::Param(_) => Err(format!(
+        PayloadFamily::Value => Ok(()),
+        PayloadFamily::Param if allow_param => Ok(()),
+        PayloadFamily::Param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {container} payload in {context}"
         )),
-        Ty::Record(_) => Err(format!(
+        PayloadFamily::Unsupported if matches!(ty, Ty::Record(_)) => Err(format!(
             "internal.vcgen.type_error: POD-record {container} payload reached {context} before record proof semantics"
         )),
-        _ => Err(format!(
+        PayloadFamily::Unsupported => Err(format!(
             "internal.vcgen.type_error: {container} payload `{}` has no proof semantics in {context}",
             ty.name()
         )),
