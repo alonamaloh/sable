@@ -33,9 +33,6 @@ pub fn bool_array_loop() -> bool {
     return bits[1];
 }
 
-/// discharge bool_array_loop.inv_preserved.n_2 by
-///   omega
-
 /// discharge bool_array_loop.inv_preserved.k_0_k_k_i_bits_get_k_true by
 ///   intro k hk0 hk
 ///   by_cases hki : k = i
@@ -43,7 +40,3 @@ pub fn bool_array_loop() -> bool {
 ///   · have h2 := h_inv_k_0_k_k_i_bits_get_k_tru k hk0 (by omega)
 ///     simp [Sable.Seq.get_set, hki]
 ///     exact h2
-
-/// discharge bool_array_loop.post.result by
-///   rw [h_result]
-///   exact h_inv_k_0_k_k_i_bits_get_k_tru 1 (by omega) (by omega)

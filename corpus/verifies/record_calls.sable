@@ -19,10 +19,6 @@ pub fn sum_call_pair(CallPair pair) -> u64 {
     return pair.left + pair.right;
 }
 
-/// discharge sum_call_pair.overflow.pair_left_pair_right by
-///   simp [SableR_CallPair.wf] at h_pair_wf
-///   constructor <;> omega
-
 /// post result = 16
 pub fn record_call_transport() -> u64 {
     CallPair pair = make_call_pair(7, 9);

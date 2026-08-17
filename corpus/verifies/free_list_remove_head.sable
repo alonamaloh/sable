@@ -141,9 +141,6 @@ pub fn free_list_remove_head(raw<u8> base,
 ///     h_FreeListState_advance_post_self_head_next_self_limi.2]
 ///   exact hmatch.2.2.2.2.2
 
-/// discharge free_list_remove_head.post.transition by
-///   rw [h_state_step_header]
-
 /// discharge free_list_remove_head.post.removed by
 ///   obtain ⟨header, hstored, hfields⟩ := h_pre_node
 ///   have hmatch := Sable.AllocatorView.StoredChain.takeMatchingHead

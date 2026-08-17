@@ -343,30 +343,6 @@ fn demo() {
 ///     omega
 ///   · exact h_inv_j2_0_j2_j2_j_self_occ_ge j2 hj20 (by omega)
 
-/// discharge HashMap::insert.inv_exit.occ_len_keys_len by
-///   simp only [Sable.Seq.len_set]
-///   omega
-
-/// discharge HashMap::insert.inv_exit.occ_len_vals_len by
-///   simp only [Sable.Seq.len_set]
-///   omega
-
-/// discharge HashMap::insert.inv_exit.occ_len_vals_len.2 by
-///   simp only [Sable.Seq.len_set]
-///   omega
-
-/// discharge HashMap::insert.inv_exit.occ_len_0 by
-///   simp only [Sable.Seq.len_set]
-///   omega
-
-/// discharge HashMap::insert.inv_exit.occ_len_4611686018427387904 by
-///   simp only [Sable.Seq.len_set]
-///   omega
-
-/// discharge HashMap::insert.inv_exit.len_occ_len by
-///   simp only [Sable.Seq.len_set]
-///   omega
-
 /// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1 by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
 ///   intro i hi0 hic
@@ -432,10 +408,6 @@ fn demo() {
 /// discharge HashMap::insert.inv_exit.i1_0_i1_i1_occ_len_i2_0_i2_i2_occ_len_oc.3 by
 ///   rw [h_inv_self_occ_len_cap_self_ke.1]
 ///   exact h_inv_i1_0_i1_i1_cap_i2_0_i2_i
-
-/// discharge HashMap::insert.post.self_occ_len_old_self_occ_len by
-///   simp only [Sable.Seq.len_set]
-///   omega
 
 /// discharge HashMap::insert.post.result_i_0_i_i_self_occ_len_self_occ_get by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]

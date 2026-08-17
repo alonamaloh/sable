@@ -250,10 +250,6 @@ pub fn free_list_walk_two() -> u64 {
 ///   · rw [h_base_system]
 ///     exact h_fact_mem_off_0_0_mem_len.1
 
-/// discharge free_list_walk_unchanged.allocator_step_header.current by
-///   exact ⟨h_path_current_limit,
-///     h_inv_sable_allocatorview_stor⟩
-
 /// discharge free_list_walk_unchanged.free_header.next by
 ///   obtain ⟨node, storedSize, storedNext, hstored, hfields,
 ///       hextent, hclear, hfit, horder, hbound, tail⟩ :=
@@ -340,16 +336,6 @@ pub fn free_list_walk_two() -> u64 {
 ///   injection h_value7_header_next
 ///   simp [Sable.freeHeaderBytes, Sable.u64.layout] at hfit
 ///   rw [h_variant_limit_current]
-///   omega
-
-/// discharge free_list_walk_unchanged.post.frame by
-///   exact h_inv_state_old_state
-
-/// discharge free_list_walk_unchanged.post.chain by
-///   rw [h_inv_state_old_state]
-///   exact h_pre_chain
-
-/// discharge free_list_walk_unchanged.post.end by
 ///   omega
 
 /// discharge free_list_walk_two.allocator_take_header.0 by
@@ -601,6 +587,3 @@ pub fn free_list_walk_two() -> u64 {
 ///   simp [h_base_system, h_release_system, h_mem_system, hroot,
 ///     h_view29_extent.1, h_view29_extent.2.1,
 ///     h_view29_extent.2.2]
-
-/// discharge free_list_walk_two.post.result_64 by
-///   omega

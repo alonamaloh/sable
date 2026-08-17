@@ -1331,13 +1331,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   have h := trim_top_zero xs rl (by omega) (by omega)
 ///   omega
 
-/// discharge trim_len.post.top by
-///   rw [h_result]
-///   by_cases h0 : rl = 0
-///   · omega
-///   · have h := h_xs_elems (rl - 1) (by omega) (by omega)
-///     omega
-
 /// discharge cmp.post.lt by
 ///   sable_norm
 ///   have hv : natVal a.limbs < natVal b.limbs :=
@@ -1497,13 +1490,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   rw [hlen]
 ///   omega
 
-/// discharge cmp.inv_preserved.k_i_k_k_a_limbs_len_a_limbs_get_k_b_limb by
-///   intro k hk1 hk2
-///   by_cases hki : k = i - 1
-///   · rw [hki]
-///     omega
-///   · exact h_inv_k_i_k_k_a_limbs_len_a_li k (by omega) hk2
-
 // The add/sub discharges: zero-prefix base cases, the carry/borrow
 // step lemmas, and the exit compositions (carry/borrow vanish, the
 // trimmed prefix carries the exact value into from_prefix).
@@ -1608,10 +1594,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   exact valIn_zeros out 0 (a.limbs.len + b.limbs.len)
 ///     (fun k hk1 hk2 => h_alloc3 k (by omega) (by omega))
 
-/// discharge mul.inv_init.k_i_lb_k_k_n_out_get_k_0 by
-///   intro k hk1 hk2
-///   exact h_alloc3 k (by omega) (by omega)
-
 /// discharge mul.inv_init.valin_out_0_n_carry_pw_i_j_valin_a_limbs by
 ///   rw [valIn_nil b.limbs 0 0 (by omega), Int.mul_zero, Int.zero_mul]
 ///   omega
@@ -1641,11 +1623,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   exact mul_inner_step out a.limbs b.limbs i j (a.limbs.len + b.limbs.len)
 ///     b.limbs.len carry _ (by omega) (by omega) (by omega) (by omega) rfl
 ///     h_inv_valin_out_0_n_carry_pw_i
-
-/// discharge mul.inv_preserved.k_i_lb_k_k_n_out_get_k_0 by
-///   intro k hk1 hk2
-///   rw [Sable.Seq.get_set, if_neg (by omega)]
-///   exact h_inv_k_i_lb_k_k_n_out_get_k_0 k hk1 hk2
 
 /// discharge mul.inv_preserved.k_i_lb_k_k_n_out_get_k_0.2 by
 ///   intro k hk1 hk2
@@ -2054,18 +2031,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   rw [h_assert_vn_len] at hres
 ///   omega
 
-/// discharge div.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387 by
-///   omega
-
-/// discharge div.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387.2 by
-///   omega
-
-/// discharge div.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387.3 by
-///   omega
-
-/// discharge div.call_pre.mul.a_limbs_len_b_limbs_len_4611686018427387.4 by
-///   omega
-
 /// discharge div.call_pre.shift_in.r_limbs_len_4611686018427387904 by
 ///   have h1 := len_le_of_val_le (vn.limbs) (r.limbs) (by omega)
 ///     (by omega) h_field_limbs_elems_4
@@ -2225,10 +2190,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///     rw [Sable.Seq.get_set, if_pos rfl]
 ///   omega
 
-/// discharge norm_factor.inv_preserved.t_t0_m by
-///   have e1 : t0 * (m + m) = t0 * m + t0 * m := Int.mul_add _ _ _
-///   omega
-
 /// discharge norm_factor.post.cap by
 ///   rw [h_result]
 ///   have h1 : 1 * m ≤ t0 * m := Int.mul_le_mul_of_nonneg_right (by omega) (by omega)
@@ -2260,10 +2221,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   · have h1 := h_inv_k_0_k_k_i_xs_get_k_1_r_l k (by omega) (by omega)
 ///     rw [Sable.Seq.get_set, if_neg (by omega)]
 ///     exact h1
-
-/// discharge shift_in.post.len by
-///   subst h_result
-///   omega
 
 /// discharge shift_in.post.value by
 ///   subst h_result

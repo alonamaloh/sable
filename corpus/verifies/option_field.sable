@@ -287,9 +287,6 @@ pub fn demo_wrap() -> u64 {
     return r;
 }
 
-/// discharge demo_wrap.post.result_3 by
-///   simp_all
-
 // A destructor that branches on an option field: the deinit reads the
 // stored option through the same accessors a method does, guarded by
 // the same someness VC.

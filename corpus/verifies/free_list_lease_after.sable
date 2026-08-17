@@ -37,10 +37,6 @@ pub fn free_list_lease_after(raw<u8> base,
 ///   rw [h_result, h_lease3_lease]
 ///   exact h_free_list_remove_after_post_root
 
-/// discharge free_list_lease_after.post.returnable by
-///   rw [h_result, h_lease3_lease]
-///   exact h_free_list_remove_after_post_returnable
-
 /// discharge free_list_lease_after.post.returnable_in by
 ///   rw [h_result, h_lease3_lease]
 ///   refine ⟨h_free_list_remove_after_post_returnable,

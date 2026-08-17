@@ -834,16 +834,3 @@ pub fn json_valid(&[u8] b) -> bool {
 ///   apply jgram_val_arr b pos p (ta + 1) hw (by omega)
 ///   apply h_inv_e2_jgram_b_6_cura_e2_jgr (ta + 1)
 ///   exact jgram_arrtail_close b cura ta hw3 (by omega)
-
-/// discharge json_valid.post.result_e_jgram_b_0_0_e_wsto_b_e_b_len by
-///   intro h
-///   exact (h_result.mp h).elim
-
-/// discharge json_valid.post.result_e_jgram_b_0_0_e_wsto_b_e_b_len.2 by
-///   intro _
-///   have hv := h_json_value_end_post_result_0_pos_result_resu (by omega)
-///   have hw := h_ws_run_post_wsto_b_i_result
-///   have hpl : p = b.len := by have := h_ws_run_post_i_result_result_b_len; omega
-///   refine ⟨e, hv.2.2, ?_⟩
-///   rw [← hpl]
-///   exact hw
