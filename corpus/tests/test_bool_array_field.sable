@@ -1,0 +1,20 @@
+// Dynamic checks for Boolean-array class fields: fill, set, and read
+// through the receiver, with contracts monitored at member boundaries.
+
+use bool_array_field;
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+/// pre ¬b
+fn expect_false(bool b) {
+}
+
+fn test_flag_state() {
+    var mut f = Flags::blank(4);
+    f.set(2);
+    expect_true(f.get(2));
+    expect_false(f.get(1));
+    expect_true(demo_flags());
+}

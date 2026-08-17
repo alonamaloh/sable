@@ -1,0 +1,40 @@
+// A Boolean array as class-field state: parity with integer arrays —
+// the payload-generic field paths carry the tag, and a Boolean element
+// projects as a proposition through the receiver chain.
+
+pub class Flags {
+    [bool] bits;
+    u64 n;
+
+    /// invariant bits.len = n
+    /// invariant n >= 1
+
+    /// pre  k >= 1
+    /// pre  k <= 100
+    /// post self.n = k
+    init blank(u64 k) {
+        self.bits = alloc_array<bool>(k, false);
+        self.n = k;
+    }
+
+    /// pre  i < self.n
+    /// post (self.bits.get i = true)
+    /// post self.n = old self.n
+    fn set(&mut self, u64 i) {
+        self.bits[i] = true;
+    }
+
+    /// pre  i < self.n
+    /// post result ↔ self.bits.get i = true
+    fn get(&self, u64 i) -> bool {
+        return self.bits[i];
+    }
+}
+
+/// post result
+pub fn demo_flags() -> bool {
+    var mut f = Flags::blank(4);
+    f.set(2);
+    bool b = f.get(2);
+    return b;
+}

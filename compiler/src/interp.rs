@@ -400,6 +400,12 @@ fn validate_interp_param_ty(ty: Ty, context: &str) -> Result<(), String> {
 /// interpreter executes, copyable options included — a stored option is an
 /// `RtVal::Opt` in the object's field map like any other field value.
 pub(crate) fn validate_interp_class_field_ty(ty: Ty, context: &str) -> Result<(), String> {
+    // A class field stores owners a parameter cannot bind: an owned
+    // Boolean array is field state exactly as an integer array is, tagged
+    // in the payload-generic runtime array.
+    if ty.is_owned_array_of(&Ty::Bool) {
+        return Ok(());
+    }
     validate_interp_param_ty(ty, context)
 }
 
@@ -584,7 +590,6 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
             }
             Stmt::FieldAssign { value, .. } => {
                 validate_interp_expr(value, locals)?;
-                reject_owned_bool_array_transport(value, locals, "field assignment")?;
             }
             Stmt::If {
                 cond,

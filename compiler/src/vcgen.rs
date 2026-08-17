@@ -642,19 +642,19 @@ pub(crate) fn validate_vc_type_position(
     // and `check::borrow_referent_ty`'s to state.
     if ty.is_owned_array_of(&Ty::Bool) {
         let position = match position {
-            VcTypePosition::Expression | VcTypePosition::Local => {
+            VcTypePosition::Expression | VcTypePosition::Local | VcTypePosition::ClassField => {
                 return Ok(());
             }
             VcTypePosition::Parameter => "a function parameter",
             VcTypePosition::TraitParameter => "a trait parameter",
             VcTypePosition::Return => "a function return",
             VcTypePosition::TraitReturn => "a trait return",
-            VcTypePosition::ClassField => "a class field",
             VcTypePosition::RecordField => "a record field",
             VcTypePosition::Borrow => "a borrow",
         };
         return Err(format!(
-            "internal.vcgen.type_error: an owned Boolean array is a local value; {position} is not supported in {context}"
+            "internal.vcgen.type_error: an owned Boolean array is a local value or a class \
+             field; {position} is not supported in {context}"
         ));
     }
 
@@ -1491,7 +1491,6 @@ fn validate_vc_block_with_mutability(
                 }
             }
             Stmt::FieldAssign { value, .. } => {
-                reject_owned_bool_array_value(value, locals, "a field boundary", context)?;
                 reject_affine_option_value(value, locals, "a field boundary", context)?;
                 validate_vc_expr(value, allow_param, context, locals)?;
             }
@@ -8801,11 +8800,17 @@ fn affine_loop(u64 n) {
             assert!(error.contains("not a local binding"));
         }
 
+        validate_vc_type_position(
+            Ty::array(Ty::Bool),
+            false,
+            VcTypePosition::ClassField,
+            "synthetic declaration",
+        )
+        .expect("a Boolean array is class-field state");
         for position in [
             VcTypePosition::Parameter,
             VcTypePosition::TraitParameter,
             VcTypePosition::Return,
-            VcTypePosition::ClassField,
             VcTypePosition::RecordField,
             VcTypePosition::Borrow,
         ] {

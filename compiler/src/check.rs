@@ -3034,20 +3034,6 @@ pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "field"));
     }
-    if ty.is_array_of(&Ty::Bool) {
-        return Err(Diagnostic {
-            name: "type.bool_array_field".into(),
-            title: "Boolean arrays cannot be stored in class fields yet".into(),
-            span,
-            label: "keep `[bool]` as an owned local".into(),
-            notes: vec![(
-                "note".into(),
-                "field ownership, invariant transport, and backend layout must be enabled \
-                 together before a class can retain a Boolean array"
-                    .into(),
-            )],
-        });
-    }
     validate_aggregate_ty(ty.clone(), span)?;
     // A copyable option with a concrete value payload is stored-field
     // state exactly as it is a parameter or a return. The type-parameter
@@ -7091,7 +7077,7 @@ class Holder {
 }
 "#,
         );
-        assert_eq!(check_error(&mut field).name, "type.bool_array_field");
+        check(&mut field).expect("a Boolean array is a class field like any admitted payload");
 
         let mut exposed = monomorphized_program(
             r#"

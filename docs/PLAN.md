@@ -1354,6 +1354,12 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **Boolean arrays are class-field state.** The parity cell rides the
+     payload-generic field paths: the checker, VC-position, and interp
+     class-field gates open `[bool]`, a Boolean element projects as a
+     proposition through the receiver chain, and the transport fences
+     narrow to the boundaries that stay closed. 75 of 180 intended open.
+
      **A nullable owning handle (ADR 0080).** `option<class>` joins the
      affine family: take is skolemization through the one havoc dispatch
      (fresh binder pinned by `old = some taken`; the closed producer set
