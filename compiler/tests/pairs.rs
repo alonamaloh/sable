@@ -84,7 +84,8 @@ fn rename_idents(text: &str, map: &HashMap<&str, String>) -> String {
 fn normalize_obligation(ob: &sable::vcgen::Obligation) -> String {
     let mut map: HashMap<&str, String> = HashMap::new();
     for (i, (name, _)) in ob.binders.iter().enumerate() {
-        map.entry(name.as_str()).or_insert_with(|| format!("\u{3b1}{i}"));
+        map.entry(name.as_str())
+            .or_insert_with(|| format!("\u{3b1}{i}"));
     }
     let binders: Vec<String> = ob
         .binders
@@ -136,7 +137,11 @@ struct Loaded {
     /// Empty when the front end (through VC generation) accepted the file.
     diag_names: BTreeSet<String>,
     rendered: Vec<String>,
-    ok: Option<(sable::ast::Program, sable::modules::ModuleSet, sable::vcgen::VcResult)>,
+    ok: Option<(
+        sable::ast::Program,
+        sable::modules::ModuleSet,
+        sable::vcgen::VcResult,
+    )>,
 }
 
 fn load(path: &Path) -> Loaded {
@@ -263,7 +268,8 @@ fn differential_pairs() {
         .join("corpus")
         .join("pairs");
     let mut halves: BTreeMap<String, (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
-    for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+    for entry in
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
     {
         let path = entry.unwrap().path();
         if path.extension().is_none_or(|ext| ext != "sable") {
@@ -275,7 +281,10 @@ fn differential_pairs() {
         } else if let Some(stem) = file.strip_suffix(".b.sable") {
             (stem.to_string(), 1)
         } else {
-            panic!("{}: pair files are named <stem>.a.sable / <stem>.b.sable", path.display());
+            panic!(
+                "{}: pair files are named <stem>.a.sable / <stem>.b.sable",
+                path.display()
+            );
         };
         let entry = halves.entry(stem).or_default();
         if slot == 0 {

@@ -541,12 +541,9 @@ fn every_spellable_type_shape_is_probed() {
             "Raw" => ShapeWitness::Rows(&["raw<u8>"]),
             // A borrow is a binding-mode wrapper (ADR 0067), so it is
             // probed as a mode of every row rather than as a row.
-            "Borrow" => ShapeWitness::Contexts(&[
-                "param &",
-                "param &mut",
-                "init param &",
-                "method param &",
-            ]),
+            "Borrow" => {
+                ShapeWitness::Contexts(&["param &", "param &mut", "init param &", "method param &"])
+            }
             // A type parameter is in scope only inside a template; the
             // `generic arg` context probes instantiation, and the
             // shape-admission table's `type parameter` rows watch every

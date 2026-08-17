@@ -332,7 +332,9 @@ fn take_vc_type_refusal() -> Option<String> {
 /// fails on the latch.
 fn sealed_borrow_root(arg: &Expr, op: &str) -> String {
     match &arg.kind {
-        ExprKind::Borrow { array, field: None, .. } => array.clone(),
+        ExprKind::Borrow {
+            array, field: None, ..
+        } => array.clone(),
         ExprKind::Borrow {
             array,
             field: Some(f),
@@ -2821,7 +2823,8 @@ impl<'a> Generator<'a> {
             // authority. A fresh one is unconstrained: whatever is known
             // about it must come from the site's own facts or invariants.
             Ty::Raw(_) | Ty::RawRecord(_) => {
-                self.binders.push((binder.to_string(), "Sable.RawPtr".into()));
+                self.binders
+                    .push((binder.to_string(), "Sable.RawPtr".into()));
                 Val::Ptr(binder.to_string())
             }
             Ty::Array(element) => {
@@ -3942,9 +3945,10 @@ impl<'a> Generator<'a> {
                             let len = match &prior_value {
                                 Val::Arr(chain) => {
                                     let prior = substitute(chain, &stale_map, None);
-                                    if havoc_set.iter().any(|h| {
-                                        !stale_map.contains_key(h) && mentions(&prior, h)
-                                    }) {
+                                    if havoc_set
+                                        .iter()
+                                        .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
+                                    {
                                         LenFact::Skip
                                     } else {
                                         LenFact::Eq(prior)
@@ -6493,10 +6497,7 @@ impl<'a> Generator<'a> {
                         self.binders.push((ret_sym.clone(), "Sable.RawPtr".into()));
                     }
                     Ty::Unit => {}
-                    returned @ (Ty::Record(_)
-                    | Ty::Array(..)
-                    | Ty::Borrow(..)
-                    | Ty::Res(_)) => {
+                    returned @ (Ty::Record(_) | Ty::Array(..) | Ty::Borrow(..) | Ty::Res(_)) => {
                         // Spelled out so a new constructor is a compile error
                         // here, and a return type with no fresh-state story
                         // refuses rather than binding nothing (ADR 0074).
@@ -8381,7 +8382,10 @@ fn affine_loop(u64 n) {
             "synthetic declaration",
         )
         .expect_err("a type-parameter option payload has no parameter transport");
-        assert!(error.contains("non-value-payload option parameters"), "{error}");
+        assert!(
+            error.contains("non-value-payload option parameters"),
+            "{error}"
+        );
         for (position, expected) in [
             (VcTypePosition::TraitParameter, "trait option parameters"),
             (VcTypePosition::TraitReturn, "trait option returns"),
@@ -9038,14 +9042,18 @@ fn bool_array_loop(u64 n, bool seed) {
                 generator.env.get("xs"),
                 Some(Val::Arr(state)) if state == "_arr1"
             ));
-            assert!(generator
-                .binders
-                .iter()
-                .any(|(b, ty)| b == "_arr1" && ty == "Sable.Seq Int"));
-            assert!(generator
-                .hyps
-                .iter()
-                .any(|(h, prop)| h == "h_xs_len" && prop == "(_arr1.len) = (xs.len)"));
+            assert!(
+                generator
+                    .binders
+                    .iter()
+                    .any(|(b, ty)| b == "_arr1" && ty == "Sable.Seq Int")
+            );
+            assert!(
+                generator
+                    .hyps
+                    .iter()
+                    .any(|(h, prop)| h == "h_xs_len" && prop == "(_arr1.len) = (xs.len)")
+            );
             assert!(generator.hyps.iter().any(|(h, _)| h == "h_xs_elems"));
         });
         assert!(take_vc_type_refusal().is_none());

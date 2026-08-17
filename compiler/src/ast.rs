@@ -2211,7 +2211,9 @@ mod generic_ty_tests {
             Some(&Ty::array(Ty::Bool))
         );
         assert_eq!(
-            owning.as_affine_option_payload().and_then(Ty::as_owned_array),
+            owning
+                .as_affine_option_payload()
+                .and_then(Ty::as_owned_array),
             Some(&Ty::Bool)
         );
         // A borrowed array payload is representable and does not join the

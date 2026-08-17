@@ -363,8 +363,14 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
             "&mut [[bool]]",
             Ty::borrow(Mutability::Mut, Ty::array(Ty::array(Ty::Bool))),
         ),
-        ("&[record]", Ty::array_ref(Ty::Record(0), Mutability::Shared)),
-        ("&mut [record]", Ty::array_ref(Ty::Record(0), Mutability::Mut)),
+        (
+            "&[record]",
+            Ty::array_ref(Ty::Record(0), Mutability::Shared),
+        ),
+        (
+            "&mut [record]",
+            Ty::array_ref(Ty::Record(0), Mutability::Mut),
+        ),
         ("&[class]", Ty::array_ref(Ty::Class(0), Mutability::Shared)),
         ("&mut [class]", Ty::array_ref(Ty::Class(0), Mutability::Mut)),
         (

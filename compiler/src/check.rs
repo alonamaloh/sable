@@ -2938,8 +2938,7 @@ pub(crate) fn member_param_ty(ty: &Ty, span: Span, allow_shared_arrays: bool) ->
         || value_option
         || ty.class_index().is_some()
         || ty.is_resource()
-        || (allow_shared_arrays
-            && matches!(ty.as_array_borrow(), Some((_, Mutability::Shared))));
+        || (allow_shared_arrays && matches!(ty.as_array_borrow(), Some((_, Mutability::Shared))));
     if !ok {
         return Err(Diagnostic {
             name: "type.member_param".into(),
@@ -5564,7 +5563,7 @@ fn refuse_sealed_field_borrows(op: &str, args: &[Expr]) -> CResult<()> {
                      may move fields out); a sealed operation's fresh state is written \
                      back under the borrow's root name, and a field has no root of its \
                      own"
-                        .into(),
+                    .into(),
                 )],
             });
         }

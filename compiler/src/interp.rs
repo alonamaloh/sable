@@ -336,10 +336,7 @@ fn validate_interp_program(program: &Program) -> Result<(), String> {
 fn validate_interp_fn(function: &Fn) -> Result<(), String> {
     let mut locals = HashMap::new();
     for param in &function.params {
-        validate_interp_param_ty(
-            param.ty.clone(),
-            &format!("parameter `{}`", param.name),
-        )?;
+        validate_interp_param_ty(param.ty.clone(), &format!("parameter `{}`", param.name))?;
         locals.insert(
             param.name.clone(),
             InterpLocal {
@@ -405,7 +402,6 @@ fn validate_interp_field_ty(ty: Ty, context: &str) -> Result<(), String> {
     }
     validate_interp_param_ty(ty, context)
 }
-
 
 /// Check every container payload inside a type the interpreter will execute.
 ///
@@ -4716,18 +4712,12 @@ mod payload_guard_tests {
         for payload in [Ty::Bool, Ty::Int(IntTy::U64)] {
             validate_interp_param_ty(Ty::option(payload.clone()), "parameter `value`")
                 .expect("a copyable option parameter is an executable value");
-            let error = validate_interp_field_ty(
-                Ty::option(payload),
-                "field `Box.value`",
-            )
-            .expect_err("options must not acquire a stored-field ABI");
+            let error = validate_interp_field_ty(Ty::option(payload), "field `Box.value`")
+                .expect_err("options must not acquire a stored-field ABI");
             assert!(error.starts_with("interp.option_position_unsupported:"));
         }
-        let affine = validate_interp_param_ty(
-            Ty::option(Ty::array(Ty::Bool)),
-            "parameter `value`",
-        )
-        .expect_err("an affine option has no parameter ABI");
+        let affine = validate_interp_param_ty(Ty::option(Ty::array(Ty::Bool)), "parameter `value`")
+            .expect_err("an affine option has no parameter ABI");
         assert!(affine.starts_with("interp.affine_option_position_unsupported:"));
         let generic = validate_interp_param_ty(
             Ty::option(Ty::Param(TypeParamId::from_legacy(0))),

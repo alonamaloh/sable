@@ -4408,7 +4408,10 @@ mod tests {
                 consumes: false,
             });
             let entry = lower_fn_entry(&program, &function).unwrap_or_else(|error| {
-                panic!("`option<{}>` is a machine parameter value: {error}", payload.name())
+                panic!(
+                    "`option<{}>` is a machine parameter value: {error}",
+                    payload.name()
+                )
             });
             assert!(entry.contains("\"choice\""), "{entry}");
         }

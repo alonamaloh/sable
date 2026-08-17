@@ -7950,8 +7950,7 @@ mod tests {
                 span: Span::new(0, 1),
             }],
         );
-        integer_parameterized.params =
-            vec![parameter("value", Ty::option(Ty::Int(IntTy::U64)))];
+        integer_parameterized.params = vec![parameter("value", Ty::option(Ty::Int(IntTy::U64)))];
         let parameter_error = emit_program(
             &program(vec![integer_parameterized]),
             1,
