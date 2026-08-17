@@ -2598,7 +2598,10 @@ pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
     match payload.payload_family() {
         PayloadFamily::Noncanonical => Err(noncanonical_aggregate_payload(span)),
         PayloadFamily::Value | PayloadFamily::Param => Ok(()),
-        PayloadFamily::Unsupported => Err(Diagnostic {
+        // An element is a place a store can name one of; an option element
+        // would need per-element option storage no stage has. Arrays of
+        // options stay closed while option nesting opens.
+        PayloadFamily::OptionOfValue | PayloadFamily::Unsupported => Err(Diagnostic {
             name: "type.array_payload_unsupported".into(),
             title: format!(
                 "array payload type `{}` is not supported yet",
@@ -2620,8 +2623,9 @@ pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
 /// May a value of this type be a copyable option payload, and if so, what is
 /// the type of the present case.
 ///
-/// A gate on the same terms as `validate_array_payload`: an allow-list that
-/// never recurses. It answers with the present case's type rather than a bare
+/// A gate on the same terms as `validate_array_payload`, over the recursive
+/// family: an option payload is a value or such an option itself, at any
+/// depth. It answers with the present case's type rather than a bare
 /// yes, because a caller needs that type. Copyable is the whole
 /// rule — an option duplicates its payload whenever it is duplicated, so the
 /// owning payloads are the separate `option<[T]>` and `option<raw<Record>>`
@@ -2630,7 +2634,10 @@ pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
 pub(crate) fn option_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
     match payload.payload_family() {
         PayloadFamily::Noncanonical => Err(noncanonical_aggregate_payload(span)),
-        PayloadFamily::Value | PayloadFamily::Param => Ok(payload),
+        // The recursive family: an option nests wherever an option goes,
+        // at any depth, because everything an option needs of its payload
+        // (a Lean type, a junk default, a runtime value) an option has.
+        PayloadFamily::Value | PayloadFamily::OptionOfValue | PayloadFamily::Param => Ok(payload),
         PayloadFamily::Unsupported => Err(Diagnostic {
             name: "type.option_payload_unsupported".into(),
             title: format!(
@@ -2638,7 +2645,7 @@ pub(crate) fn option_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
                 payload.name()
             ),
             span,
-            label: "value options currently hold integers or `bool`".into(),
+            label: "value options hold integers, `bool`, or such options".into(),
             notes: vec![(
                 "note".into(),
                 "POD record options need their representation, proof, and runtime semantics \
@@ -2739,7 +2746,9 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
 /// here is fail-open, because a shape nested under a constructor nobody
 /// thought about would be admitted without any gate seeing it. A new
 /// constructor must be a compile error, not a silent `Ok`. One level is
-/// enough because the payload gate it hands off to is an atom allow-list.
+/// enough because the payload gate it hands off to answers from the
+/// payload family, whose one recursive case (option nesting) classifies
+/// the whole chain itself.
 fn validate_container_payloads(ty: Ty, span: Span) -> CResult<()> {
     match ty {
         Ty::Array(payload) => validate_array_payload(&payload, span),
@@ -6529,11 +6538,13 @@ mod concrete_aggregate_tests {
                 "type.array_payload_unsupported",
             ),
             (
-                Ty::option(Ty::option(Ty::Int(IntTy::U64))),
+                Ty::option(Ty::option(Ty::Class(0))),
                 "type.option_payload_unsupported",
             ),
             (Ty::option(Ty::Class(0)), "type.option_payload_unsupported"),
         ];
+        validate_aggregate_ty(Ty::option(Ty::option(Ty::Int(IntTy::U64))), span)
+            .expect("the recursive copyable family nests at any depth");
         for (ty, expected) in cases {
             let refusal = validate_aggregate_ty(ty.clone(), span)
                 .expect_err(&format!("`{}` must be refused by a named gate", ty.name()));

@@ -1,8 +1,9 @@
 // expect-error: type.option_payload_unsupported
 // The owning option family `option<[T]>` is not itself an option payload:
-// nesting would need a take rule that clears both containers at once.
-// Refused by the parser's admissibility table (ADR 0063), which does not admit
-// the option shape at `TyPos::OptionPayload`, not by `check::option_payload_ty`.
+// nesting would need a take rule that clears both containers at once. The
+// copyable nesting `option<option<u64>>` is admitted; the owning payload
+// keeps this refusal at `check::option_payload_ty` (the payload family is
+// the payload's own, and an affine option is not a value).
 
 fn nested() -> u64 {
     option<option<[bool]>> maybe = none;

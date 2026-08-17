@@ -1,0 +1,11 @@
+// expect-error: type.member_param
+// An init/method parameter takes a flat value payload: the nested
+// family crosses plain calls, not the member boundary.
+
+pub class Holder {
+    u64 v;
+
+    init make(option<option<u64>> o) {
+        self.v = 0;
+    }
+}

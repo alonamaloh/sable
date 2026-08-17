@@ -1,0 +1,128 @@
+// The recursive copyable family: an option nests in an option, at any
+// depth. `.value` of an absent level reads `none`, whose own `.value`
+// reads the junk of the level below (`getD default`, ADR 0008), so the
+// composed range fact holds on every path, and a junk-reading clause is
+// provable for an absent argument.
+
+// The composed range fact is load-bearing: the overflow VC closes from
+// `0 ≤ o.value.value ≤ u64.max`, which no clause here supplies.
+/// pre  o.is_some
+/// pre  o.value.is_some
+/// post result = o.value.value / 2 + 1
+pub fn half_inner(option<option<u64>> o) -> u64 {
+    return o.value.value / 2 + 1;
+}
+
+/// post match o with
+///      | some v => result = v
+///      | none   => result = none
+pub fn flatten_or_none(option<option<u64>> o) -> option<u64> {
+    if (o.is_some) {
+        return o.value;
+    }
+    return none;
+}
+
+// The junk model composes across the call boundary: `o.value.value` in
+// a pre reads 0 for an absent outer or inner level, so `none` and
+// `some(none)` arguments prove it without holding anything.
+/// pre  o.value.value ≤ 100
+/// post result = o.value.value
+pub fn inner_or_junk(option<option<u64>> o) -> u64 {
+    if (o.is_some) {
+        if (o.value.is_some) {
+            return o.value.value;
+        }
+    }
+    return 0;
+}
+
+/// post match o with
+///      | some v => (result ↔ v.is_some)
+///      | none   => ¬result
+pub fn has_inner(option<option<u64>> o) -> bool {
+    if (o.is_some) {
+        return o.value.is_some;
+    }
+    return false;
+}
+
+/// pre  b.is_some
+/// pre  b.value.is_some
+/// post result ↔ b.value.value = true
+pub fn inner_flag(option<option<bool>> b) -> bool {
+    return b.value.value;
+}
+
+// Depth is not a property any stage limits: the machinery composes per
+// level, and this subject is the pin.
+/// pre  d.is_some
+/// pre  d.value.is_some
+/// pre  d.value.value.is_some
+/// post result = d.value.value.value
+pub fn depth_three(option<option<option<u64>>> d) -> u64 {
+    return d.value.value.value;
+}
+
+/// post result = 5
+pub fn demo() -> u64 {
+    option<option<u64>> nested = some(some(8));
+    u64 h = half_inner(nested);
+    return h;
+}
+
+// A match-shaped post about an abstract option needs its case split
+// spelled on the present path, and a junk-reading goal needs the
+// `getD` reduction spelled — both the standing discharge tax.
+
+/// discharge flatten_or_none.post.match_o_with_some_v_result_v_none_result by
+///   cases o with
+///   | none => exact absurd rfl h_path_o_none
+///   | some v => simp_all
+
+/// discharge has_inner.post.match_o_with_some_v_result_v_is_some_non by
+///   cases o with
+///   | none => exact absurd rfl h_path_o_none
+///   | some v => simp_all
+
+/// post result = 9
+pub fn demo_junk() -> u64 {
+    u64 a = inner_or_junk(some(some(9)));
+    u64 b = inner_or_junk(some(none));
+    u64 c = inner_or_junk(none);
+    return a + b + c;
+}
+
+/// post result = 3
+pub fn demo_depth() -> u64 {
+    option<option<option<u64>>> deep = some(some(some(3)));
+    u64 d = depth_three(deep);
+    return d;
+}
+
+/// post result = 9
+pub fn demo_flatten() -> u64 {
+    option<u64> f = flatten_or_none(some(some(9)));
+    if (f.is_some) {
+        return f.value;
+    }
+    return 0;
+}
+
+/// post result = 2
+pub fn demo_flags() -> u64 {
+    bool h1 = has_inner(some(some(4)));
+    bool h2 = has_inner(some(none));
+    bool g = inner_flag(some(some(true)));
+    mut u64 t = 0;
+    if (h1) {
+        t = t + 1;
+    }
+    if (!h2) {
+        t = t + 1;
+    }
+    if (g) {
+        return t;
+    }
+    return 0;
+}

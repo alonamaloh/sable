@@ -481,10 +481,11 @@ impl VcAggregateKind {
 
 /// May a container payload cross into VC generation.
 ///
-/// This is a gate, not a traversal: it is an allow-list of the payloads the
-/// proof language has a Lean type for, and it deliberately does not call
-/// `validate_vc_ty`. Delegating would accept `option<option<u64>>` here,
-/// because an option of an integer is fine one level further down.
+/// This is a gate, not a traversal: it answers from the payload family the
+/// classification recognizes, and it deliberately does not call
+/// `validate_vc_ty`. Option nesting is the family's own recursion
+/// (`Option (Option Int)` has proof rules per level); an array element
+/// stays a flat value.
 pub(crate) fn validate_vc_payload_ty(
     ty: &Ty,
     allow_param: bool,
@@ -497,6 +498,14 @@ pub(crate) fn validate_vc_payload_ty(
             "internal.vcgen.type_error: non-canonical legacy parameter in {container} payload in {context}"
         )),
         PayloadFamily::Value => Ok(()),
+        // The recursive family nests in options (`Option (Option Int)` is
+        // a Lean type whose proof rules compose per level) and stays out
+        // of arrays (no per-element option storage).
+        PayloadFamily::OptionOfValue if aggregate == VcAggregateKind::Option => Ok(()),
+        PayloadFamily::OptionOfValue => Err(format!(
+            "internal.vcgen.type_error: {container} payload `{}` has no proof semantics in {context}",
+            ty.name()
+        )),
         PayloadFamily::Param if allow_param => Ok(()),
         PayloadFamily::Param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {container} payload in {context}"
@@ -646,20 +655,27 @@ pub(crate) fn validate_vc_type_position(
         // or a returned value does, so the concrete value payloads pass. The
         // type-parameter payload does not: check refuses it first
         // (`type.option_param`), and this gate stays closed independently.
-        let concrete_value_payload = matches!(element.as_ref(), Ty::Bool)
-            || matches!(element.as_ref(), Ty::Int(it) if !matches!(it, IntTy::TParam(_)));
+        // A parameter transports the recursive family (any nesting depth);
+        // a class field stores flat value payloads only — the two
+        // conditions are stated apart so the positions cannot drift
+        // together by accident.
+        let value_payload = element.payload_family() == PayloadFamily::Value;
+        let transportable_payload = matches!(
+            element.payload_family(),
+            PayloadFamily::Value | PayloadFamily::OptionOfValue
+        );
         let position = match position {
             VcTypePosition::Expression | VcTypePosition::Local | VcTypePosition::Return => {
                 return Ok(());
             }
-            VcTypePosition::Parameter if concrete_value_payload => return Ok(()),
+            VcTypePosition::Parameter if transportable_payload => return Ok(()),
             VcTypePosition::Parameter => "non-value-payload option parameters",
             VcTypePosition::TraitParameter => "trait option parameters",
             VcTypePosition::TraitReturn => "trait option returns",
             // A class field stores `Option Int` / `Option Bool` exactly as
-            // a parameter binds it; the abstract payload stays out here
-            // too, independently of check's `type.option_field`.
-            VcTypePosition::ClassField if concrete_value_payload => return Ok(()),
+            // a parameter binds it; the abstract and nested payloads stay
+            // out here, independently of check's `type.option_field`.
+            VcTypePosition::ClassField if value_payload => return Ok(()),
             VcTypePosition::ClassField => "non-value-payload option class fields",
             VcTypePosition::RecordField => "option-valued record fields",
             VcTypePosition::Borrow => "option borrows",
@@ -8095,13 +8111,28 @@ mod type_domain_tests {
     /// itself so a refusal says which position asked (ADR 0064).
     #[test]
     fn a_payload_with_no_proof_semantics_is_refused_by_name() {
+        // The recursive family splits by container: an option payload may
+        // itself be an option, an array element may not.
+        validate_vc_payload_ty(
+            &Ty::option(Ty::Int(IntTy::U64)),
+            false,
+            VcAggregateKind::Option,
+            "a probe",
+        )
+        .expect("option nesting has proof semantics per level");
+        validate_vc_payload_ty(
+            &Ty::option(Ty::Int(IntTy::U64)),
+            false,
+            VcAggregateKind::Array,
+            "a probe",
+        )
+        .expect_err("an array element stays a flat value");
         for aggregate in [VcAggregateKind::Array, VcAggregateKind::Option] {
             let container = aggregate.container();
             for shape in [
                 Ty::Record(0),
                 Ty::Class(0),
                 Ty::array(Ty::Int(IntTy::U64)),
-                Ty::option(Ty::Int(IntTy::U64)),
                 Ty::Int(IntTy::TParam(0)),
                 Ty::Param(TypeParamId::from_legacy(0)),
             ] {

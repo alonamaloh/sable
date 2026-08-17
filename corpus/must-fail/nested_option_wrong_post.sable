@@ -1,0 +1,11 @@
+// expect-error: hollow_is_full.post.claim
+// A false post over the nested shapes: `some(none)` is not `none`, and
+// the match on the outer level cannot conflate them. The dynamic twin
+// is `corpus/test-fails/nested_option_wrong_post.sable`.
+
+/// post #[label(claim)] match o with
+///      | some v => result ↔ v.is_some
+///      | none   => ¬result
+pub fn hollow_is_full(option<option<u64>> o) -> bool {
+    return o.is_some;
+}

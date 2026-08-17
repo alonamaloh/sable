@@ -266,14 +266,17 @@ pub(crate) fn validate_array_payload(payload: &Ty, context: &str) -> Result<(), 
     match payload.payload_family() {
         PayloadFamily::Value => Ok(()),
         // The SVM lowers only the monomorphized program, so a type
-        // parameter answers alongside the unsupported families.
-        PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
-            Err(format!(
-                "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
+        // parameter answers alongside the unsupported families; option
+        // elements answer with them, because arrays of options stay
+        // closed.
+        PayloadFamily::OptionOfValue
+        | PayloadFamily::Param
+        | PayloadFamily::Noncanonical
+        | PayloadFamily::Unsupported => Err(format!(
+            "svm.aggregate_payload_unsupported: {context} has array payload `{}`; \
                  the SVM currently lowers only concrete integer and Boolean payloads",
-                payload.name()
-            ))
-        }
+            payload.name()
+        )),
     }
 }
 
@@ -1085,7 +1088,9 @@ fn validate_allocation_size(ctx: &LowerCtx<'_>, size: &Expr, context: &str) -> R
 /// on the same terms as `validate_array_payload`.
 pub(crate) fn validate_option_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload.payload_family() {
-        PayloadFamily::Value => Ok(()),
+        // `Val.opt : Option Val` is recursive in the formal machine, so a
+        // nested option lowers exactly as a flat one.
+        PayloadFamily::Value | PayloadFamily::OptionOfValue => Ok(()),
         PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
             Err(format!(
                 "svm.aggregate_payload_unsupported: {context} has option payload `{}`; \

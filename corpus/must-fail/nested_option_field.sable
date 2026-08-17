@@ -1,0 +1,11 @@
+// expect-error: type.option_field
+// A class field stores a flat value payload: nesting transports across
+// calls but does not acquire stored-field state with it.
+
+pub class Holder {
+    option<option<u64>> slot;
+
+    init empty() {
+        self.slot = none;
+    }
+}

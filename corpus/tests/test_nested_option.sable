@@ -1,0 +1,61 @@
+// Dynamic checks for nested options: construction at every shape
+// (`some(some(v))`, `some(none)`, `none`), accessor chains, the junk
+// model composing per level (an absent outer's `.value` is the absent
+// inner, whose `.value` is the leaf junk), depth three, and contracts
+// over nested parameters monitored at the boundary.
+
+use nested_option;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+/// pre ¬b
+fn expect_false(bool b) {
+}
+
+fn test_shapes_and_junk() {
+    expect_eq(inner_or_junk(some(some(9))), 9);
+    expect_eq(inner_or_junk(some(none)), 0);
+    expect_eq(inner_or_junk(none), 0);
+    expect_eq(half_inner(some(some(8))), 5);
+}
+
+fn test_flatten_and_flags() {
+    option<u64> f = flatten_or_none(some(some(9)));
+    expect_true(f.is_some);
+    expect_eq(f.value, 9);
+    option<u64> e = flatten_or_none(none);
+    expect_false(e.is_some);
+    expect_true(has_inner(some(some(4))));
+    expect_false(has_inner(some(none)));
+    expect_false(has_inner(none));
+    expect_true(inner_flag(some(some(true))));
+    expect_false(inner_flag(some(some(false))));
+}
+
+fn test_depth_three() {
+    option<option<option<u64>>> deep = some(some(some(3)));
+    expect_eq(depth_three(deep), 3);
+}
+
+fn test_nested_is_a_copy() {
+    option<option<u64>> bound = some(some(7));
+    u64 a = inner_or_junk(bound);
+    expect_eq(a, 7);
+    expect_true(bound.is_some);
+    expect_true(bound.value.is_some);
+    expect_eq(bound.value.value, 7);
+}
+
+fn test_demos_agree() {
+    expect_eq(demo(), 5);
+    expect_eq(demo_junk(), 9);
+    expect_eq(demo_depth(), 3);
+    expect_eq(demo_flatten(), 9);
+    expect_eq(demo_flags(), 2);
+}

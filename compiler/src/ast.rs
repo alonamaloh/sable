@@ -939,6 +939,12 @@ pub enum Mutability {
 pub enum PayloadFamily {
     /// A concrete integer or `bool`: stored, copied, and compared in place.
     Value,
+    /// A copyable option over a `Value` or `OptionOfValue` payload — the
+    /// recursive family, at any depth: the machinery below this
+    /// classification (Lean `Option` types, value-chain facts, runtime and
+    /// machine values, the junk model) composes uniformly per level, so
+    /// depth is not a property any stage limits.
+    OptionOfValue,
     /// A declaration type parameter under the abstract-integer model
     /// (ADR 0009).
     Param,
@@ -1169,6 +1175,19 @@ impl Ty {
             Ty::Int(IntTy::TParam(_)) => PayloadFamily::Noncanonical,
             Ty::Int(_) | Ty::Bool => PayloadFamily::Value,
             Ty::Param(_) => PayloadFamily::Param,
+            // The recursive family: an option payload is admitted exactly
+            // when its own payload is, so `option<option<u64>>` and every
+            // deeper nesting classify here, while an option of a `Param`,
+            // an owned array (the affine family), or anything else stays
+            // out with the family its payload would have.
+            Ty::Option(inner)
+                if matches!(
+                    inner.payload_family(),
+                    PayloadFamily::Value | PayloadFamily::OptionOfValue
+                ) =>
+            {
+                PayloadFamily::OptionOfValue
+            }
             Ty::Class(_)
             | Ty::Record(_)
             | Ty::Array(_)

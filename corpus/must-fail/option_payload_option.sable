@@ -1,11 +1,16 @@
 // expect-error: type.option_payload_unsupported
-// An option of an option has no payload representation: the copyable payloads
-// are the scalars and the laid-out records, and the two owning families are
-// spelled `option<[T]>` and `option<raw<Record>>`. This is the parser's half
-// of the option-payload rule (`option_payload_record.sable` pins the
-// checker's half).
+// Option nesting is the recursive copyable family: the payload of an
+// admitted option is a concrete value or such an option itself. An
+// abstract payload is neither — `option<option<T>>` has no transport
+// for the inner case — so the nesting stays refused inside a template
+// even when every instantiation would be concrete.
 
-fn nested() -> u64 {
-    option<option<u64>> maybe = none;
+fn nested<T>(T x) -> u64 {
+    option<option<T>> maybe = none;
     return 0;
+}
+
+/// post result = 0
+pub fn use_nested() -> u64 {
+    return nested<u64>(3);
 }

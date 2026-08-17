@@ -472,14 +472,16 @@ pub(crate) fn validate_interp_array_payload(payload: &Ty, context: &str) -> Resu
         PayloadFamily::Value => Ok(()),
         // A type parameter is a proof artifact; the interpreter executes
         // only the monomorphized program, so it answers alongside the
-        // unsupported families rather than the admitted one.
-        PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
-            Err(format!(
-                "interp.aggregate_payload_unsupported: {context} has array payload `{}`; \
+        // unsupported families rather than the admitted one. Option
+        // elements answer with them: arrays of options stay closed.
+        PayloadFamily::OptionOfValue
+        | PayloadFamily::Param
+        | PayloadFamily::Noncanonical
+        | PayloadFamily::Unsupported => Err(format!(
+            "interp.aggregate_payload_unsupported: {context} has array payload `{}`; \
                  the interpreter currently executes only concrete integer and Boolean payloads",
-                payload.name()
-            ))
-        }
+            payload.name()
+        )),
     }
 }
 
@@ -487,7 +489,9 @@ pub(crate) fn validate_interp_array_payload(payload: &Ty, context: &str) -> Resu
 /// on the same terms as `validate_interp_array_payload`.
 pub(crate) fn validate_interp_option_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload.payload_family() {
-        PayloadFamily::Value => Ok(()),
+        // `RtVal::Opt` is recursive and stores its payload type, so a
+        // nested option executes exactly as a flat one.
+        PayloadFamily::Value | PayloadFamily::OptionOfValue => Ok(()),
         PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
             Err(format!(
                 "interp.aggregate_payload_unsupported: {context} has option payload `{}`; \

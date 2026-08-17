@@ -1354,6 +1354,27 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **Option nesting is the recursive family (ADR 0078).**
+     `option<option<T>>` — a founding example of the representation
+     problem — is a type at any depth for concrete value leaves, in
+     locals, returns, and plain parameters. The widening went through
+     ADR 0077's classification as designed: one new family variant
+     (`OptionOfValue`, admitted when the inner payload is `Value` or
+     itself), and every wrapper a compile error until each stage
+     answered — option wrappers admit, array wrappers refuse (no
+     per-element option storage), the VC position gate splits parameter
+     transport from flat-only field storage. One recursive helper emits
+     the single range fact at the chain's integer leaf; the junk model
+     composes per level, and marking core's `Option.default_eq_none` as
+     simp made the whole junk-obligation class automatic — the first
+     down payment on the tactics direction. Members and fields keep
+     their refusals in their own names; the interp class-field gate
+     stays deliberately wider (executability, not policy). The corpus
+     battery includes the first container-slice svm-diff subject (the
+     machine was already recursive) and depth-three pins;
+     `docs/type-matrix.md` opens exactly the two option-payload cells
+     (65 → 67 of 163 intended).
+
      **A closed cell is work or a decision (ADR 0075).** The matrix's
      closed cells now say which kind of closed they are: `not yet` (work
      remaining, the fail-safe default) or `never` (a recorded decision

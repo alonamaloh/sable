@@ -16,6 +16,12 @@ namespace Option
 
 @[simp] theorem value_some {α : Type} [Inhabited α] (x : α) : (some x).value = x := rfl
 
+/- The junk chain reduces level by level: an absent option's `.value` is
+`default`, which for a nested option is `none`, whose own `.value` is the
+junk one level down. Core states the lemma without the attribute; marking
+it is what lets `simp` walk the chain. -/
+attribute [simp] Option.default_eq_none
+
 @[simp] theorem is_some_some {α : Type} (x : α) : (some x).is_some := by
   simp [is_some]
 

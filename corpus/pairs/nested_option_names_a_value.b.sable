@@ -1,0 +1,11 @@
+// pair: same-lean
+// See nested_option_names_a_value.a.sable: naming the inner option must
+// change nothing.
+
+/// pre  o.is_some
+/// pre  o.value.is_some
+/// post result = o.value.value
+pub fn get_inner(option<option<u64>> o) -> u64 {
+    option<u64> inner = o.value;
+    return inner.value;
+}

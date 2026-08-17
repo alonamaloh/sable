@@ -291,7 +291,7 @@ impl TyPos {
     /// own for the shapes this table deliberately lets through
     /// (`array_element_record.sable`, `option_payload_record.sable`, against
     /// the parser's `array_element_class.sable` and
-    /// `option_payload_option.sable`).
+    /// `option_payload_class.sable`).
     fn gate_name(self) -> &'static str {
         match self {
             TyPos::Param => "type.param_unsupported",
@@ -1664,7 +1664,7 @@ impl<'a> Parser<'a> {
             // decide the rest.
             P::OptionPayload => matches!(
                 shape,
-                S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw
+                S::Int | S::Bool | S::Param | S::Record | S::Array | S::Raw | S::Option
             ),
             P::ForIndex | P::Const | P::CastTarget | P::TraitImplTarget | P::ResourceMapKey => {
                 matches!(shape, S::Int | S::Param)

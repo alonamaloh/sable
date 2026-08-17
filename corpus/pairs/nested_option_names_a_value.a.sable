@@ -1,0 +1,12 @@
+// pair: same-lean
+// A nested option is a value: binding the inner level to a local name
+// before the guarded access must change nothing about the emitted
+// obligations — both someness VCs and the composed payload fact travel
+// with the value, not with the spelling.
+
+/// pre  o.is_some
+/// pre  o.value.is_some
+/// post result = o.value.value
+pub fn get_inner(option<option<u64>> o) -> u64 {
+    return o.value.value;
+}

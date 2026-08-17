@@ -1,0 +1,11 @@
+// expect-test-failure: `.value` of an empty option
+// The outer level traps first: `.value` of an absent nested option
+// never reaches the inner read.
+
+fn careless_outer(option<option<u64>> o) -> u64 {
+    return o.value.value;
+}
+
+fn test_empty_traps_outer() {
+    u64 r = careless_outer(none);
+}

@@ -339,6 +339,33 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
             "option<option<u64>>",
             Ty::option(Ty::option(Ty::Int(IntTy::U64))),
         ),
+        ("option<option<bool>>", Ty::option(Ty::option(Ty::Bool))),
+        (
+            "&option<option<bool>>",
+            Ty::borrow(Mutability::Shared, Ty::option(Ty::option(Ty::Bool))),
+        ),
+        (
+            "&mut option<option<bool>>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::option(Ty::Bool))),
+        ),
+        (
+            "option<option<option<u64>>>",
+            Ty::option(Ty::option(Ty::option(Ty::Int(IntTy::U64)))),
+        ),
+        (
+            "&option<option<option<u64>>>",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::option(Ty::option(Ty::option(Ty::Int(IntTy::U64)))),
+            ),
+        ),
+        (
+            "&mut option<option<option<u64>>>",
+            Ty::borrow(
+                Mutability::Mut,
+                Ty::option(Ty::option(Ty::option(Ty::Int(IntTy::U64)))),
+            ),
+        ),
         ("option<class>", Ty::option(Ty::Class(0))),
         (
             "option<[[bool]]>",

@@ -1,0 +1,15 @@
+// expect-test-failure: post of `hollow_is_full` violated
+// The dynamic half of `corpus/must-fail/nested_option_wrong_post.sable`:
+// `some(none)` refutes the claim that outer presence implies inner
+// presence.
+
+/// post match o with
+///      | some v => result ↔ v.is_some
+///      | none   => ¬result
+pub fn hollow_is_full(option<option<u64>> o) -> bool {
+    return o.is_some;
+}
+
+fn test_hollow_refutes() {
+    bool r = hollow_is_full(some(none));
+}

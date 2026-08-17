@@ -1,0 +1,15 @@
+// expect-test-failure: `.value` of an empty option
+// The dynamic half of `corpus/must-fail/nested_option_value_unguarded.sable`:
+// the outer guard passes for `some(none)`, and the unguarded inner read
+// traps at the absent inner level.
+
+fn careless_inner(option<option<u64>> o) -> u64 {
+    if (o.is_some) {
+        return o.value.value;
+    }
+    return 0;
+}
+
+fn test_hollow_traps_inner() {
+    u64 r = careless_inner(some(none));
+}

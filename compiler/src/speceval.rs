@@ -41,14 +41,19 @@ pub enum SpecVal {
 }
 
 impl SpecVal {
-    /// The junk value Lean's `getD default` produces for this payload.
+    /// The junk value Lean's `getD default` produces for this payload, for
+    /// the positions that can reach it today (array elements).
     ///
     /// This is an allow-list, and it is the one gate in the compiler whose
-    /// failure mode is a wrong answer rather than a loud one: a payload with
-    /// no `Inhabited` instance in Lean has no junk value, and inventing one
-    /// here would make the monitor agree with a `getD default` the proof
-    /// never wrote. A payload not listed has no default, and the clause
-    /// reading it is reported unmonitorable instead.
+    /// failure mode is a wrong answer rather than a loud one: inventing a
+    /// junk value here that disagrees with the `getD default` the proof
+    /// wrote would silently diverge the monitor from Lean. A payload not
+    /// listed has no answer, and the clause reading it is reported
+    /// unmonitorable instead — deliberately including payloads Lean *can*
+    /// default (an option's is `none`): a family no admitted position can
+    /// reach keeps no answer here, so the widening that makes it reachable
+    /// must re-ask the question. Option junk at option positions is
+    /// `option_default`'s.
     pub(crate) fn default_of(payload: Ty) -> Option<SpecVal> {
         match payload {
             Ty::Int(_) => Some(SpecVal::Int(0)),
@@ -1201,6 +1206,13 @@ fn option_default(payload: Option<Ty>) -> EResult<SpecVal> {
     match payload {
         Some(Ty::Int(_)) => Ok(SpecVal::Int(0)),
         Some(Ty::Bool) => Ok(SpecVal::Bool(false)),
+        // Junk composes: an absent nested option's `.value` is the absent
+        // option one level down, whose own junk this function answers on
+        // the next read.
+        Some(Ty::Option(inner)) => Ok(SpecVal::Opt {
+            payload: Some(*inner),
+            value: None,
+        }),
         Some(Ty::Record(_)) => Err(Unmonitorable(
             "the monitor has no default value for a POD-record option".into(),
         )),

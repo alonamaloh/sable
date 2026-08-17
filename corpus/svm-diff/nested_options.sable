@@ -1,0 +1,60 @@
+// Nested options in the formal machine: `Val.opt` is recursive, so
+// construction, projection, and the trap at each absent level lower and
+// agree with the interpreter.
+
+fn subject_full() -> u64 {
+    option<option<u64>> nested = some(some(8));
+    if (nested.is_some) {
+        option<u64> inner = nested.value;
+        if (inner.is_some) {
+            return inner.value;
+        }
+    }
+    return 0;
+}
+
+fn subject_hollow() -> u64 {
+    option<option<u64>> nested = some(none);
+    if (nested.is_some) {
+        option<u64> inner = nested.value;
+        if (inner.is_some) {
+            return 1;
+        }
+        return 2;
+    }
+    return 0;
+}
+
+fn subject_empty() -> u64 {
+    option<option<u64>> nested = none;
+    if (nested.is_some) {
+        return 1;
+    }
+    return 3;
+}
+
+fn subject_outer_trap() -> u64 {
+    option<option<u64>> nested = none;
+    option<u64> inner = nested.value;
+    return 0;
+}
+
+fn subject_inner_trap() -> u64 {
+    option<option<u64>> nested = some(none);
+    option<u64> inner = nested.value;
+    return inner.value;
+}
+
+fn subject_depth_three() -> u64 {
+    option<option<option<u64>>> deep = some(some(some(3)));
+    if (deep.is_some) {
+        option<option<u64>> mid = deep.value;
+        if (mid.is_some) {
+            option<u64> leaf = mid.value;
+            if (leaf.is_some) {
+                return leaf.value;
+            }
+        }
+    }
+    return 0;
+}

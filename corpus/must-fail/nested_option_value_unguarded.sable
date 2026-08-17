@@ -1,0 +1,11 @@
+// expect-error: careless_inner.option.o_value_value
+// The inner `.value` carries its own someness VC: guarding the outer
+// level does not discharge the inner read. The dynamic twin is
+// `corpus/test-fails/nested_option_inner_trap.sable`.
+
+fn careless_inner(option<option<u64>> o) -> u64 {
+    if (o.is_some) {
+        return o.value.value;
+    }
+    return 0;
+}
