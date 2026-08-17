@@ -2515,7 +2515,18 @@ impl<'a> Generator<'a> {
                         Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s))
                         | Some(Val::View(s)) | Some(Val::Ptr(s)) => format!("{s}"),
                         Some(Val::Prop(p)) => lean_bool_value(p),
-                        _ => "0".to_string(), // unreachable: checked init
+                        // A field state this constructor literal cannot
+                        // splice is a named refusal, never a silent `0`:
+                        // a wrong literal here is a false-proof machine
+                        // (ADR 0074), not a crash.
+                        Some(Val::Opt(_)) | Some(Val::Record(_)) | Some(Val::Unit) | None => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.field_state_unsupported: field `{}` of \
+                                 `{}` has no constructor-literal state",
+                                fld.name, class.name
+                            ));
+                            "0".to_string()
+                        }
                     }
                 })
                 .collect::<Vec<_>>()
@@ -2532,7 +2543,16 @@ impl<'a> Generator<'a> {
                 Some(Val::Prop(p)) => {
                     map.insert(fld.name.clone(), lean_bool_value(p));
                 }
-                _ => {}
+                // A field silently missing from the substitution map makes
+                // an init post about that field vacuously unbindable; refuse
+                // by name instead.
+                Some(Val::Opt(_)) | Some(Val::Record(_)) | Some(Val::Unit) | None => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.field_state_unsupported: field `{}` of `{}` has \
+                         no substitution state",
+                        fld.name, class.name
+                    ));
+                }
             }
         }
         (literal, map)
@@ -3515,7 +3535,13 @@ impl<'a> Generator<'a> {
                             | Val::View(s)
                             | Val::Ptr(s) => s,
                             Val::Prop(p) => lean_bool_value(&p),
-                            _ => unreachable!("checked: field value"),
+                            Val::Opt(_) | Val::Record(_) | Val::Unit => {
+                                refuse_vc_type(format!(
+                                    "internal.vcgen.field_state_unsupported: `self.{field}` \
+                                     has no field-store rule for this value"
+                                ));
+                                "0".to_string()
+                            }
                         };
                         let chain = self.self_chain();
                         self.env.insert(
@@ -6084,9 +6110,30 @@ impl<'a> Generator<'a> {
                     unreachable!("checked: class-typed receiver")
                 };
                 let projected = project_field(&chain, field);
-                match e.ty {
+                match &e.ty {
                     Some(Ty::Bool) => Val::Prop(format!("({projected} = true)")),
-                    _ => Val::Int(projected),
+                    Some(Ty::Int(_) | Ty::Param(_)) => Val::Int(projected),
+                    // A field type with no symbolic projection is a named
+                    // refusal, never a bare Int (ADR 0074).
+                    Some(
+                        Ty::Res(_)
+                        | Ty::Class(_)
+                        | Ty::Record(_)
+                        | Ty::Array(..)
+                        | Ty::Option(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit,
+                    )
+                    | None => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.field_state_unsupported: `{obj}.{field}` has \
+                             no symbolic field state for its type"
+                        ));
+                        Val::Unit
+                    }
                 }
             }
             ExprKind::RecordField { obj, field, .. } => {
@@ -6146,10 +6193,26 @@ impl<'a> Generator<'a> {
                     match e.ty.as_ref().map(Ty::referent) {
                         Some(Ty::Res(_)) => Val::View(projected),
                         Some(Ty::Class(_)) => Val::Obj(projected),
-                        Some(Ty::Raw(_)) => Val::Ptr(projected),
+                        Some(Ty::Raw(_) | Ty::RawRecord(_)) => Val::Ptr(projected),
                         Some(Ty::Array(..)) => Val::Arr(projected),
                         Some(Ty::Bool) => Val::Prop(format!("({projected} = true)")),
-                        _ => Val::Int(projected),
+                        Some(Ty::Int(_) | Ty::Param(_)) => Val::Int(projected),
+                        // A field type with no symbolic projection is a
+                        // named refusal, never a bare Int (ADR 0074).
+                        Some(
+                            Ty::Record(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit,
+                        )
+                        | None => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.field_state_unsupported: `self.{field}` \
+                                 has no symbolic field state for its type"
+                            ));
+                            Val::Unit
+                        }
                     }
                 }
                 Cctx::None => unreachable!("checked: fields only in members"),

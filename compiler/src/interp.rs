@@ -392,7 +392,7 @@ fn validate_interp_param_ty(ty: Ty, context: &str) -> Result<(), String> {
 /// A stored class/record field is a position boundary: an ordinary option is
 /// a value — a parameter, a return, a local — and must not acquire a
 /// stored-field ABI merely because the interpreter knows how to execute it.
-fn validate_interp_field_ty(ty: Ty, context: &str) -> Result<(), String> {
+pub(crate) fn validate_interp_field_ty(ty: Ty, context: &str) -> Result<(), String> {
     if matches!(ty, Ty::Option(_)) && !ty.is_affine_option() {
         return Err(format!(
             "interp.option_position_unsupported: {context} is option-valued; \

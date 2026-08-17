@@ -6124,7 +6124,12 @@ fn class_holds_storage(metas: &[ClassMeta], ci: usize, depth: usize) -> bool {
         // Records cannot currently be class fields, but treating one as a
         // storage container is the conservative answer if that surface grows.
         Ty::Record(_) => true,
-        _ => false,
+        // Pure values: nothing here can carry storage out. Option payloads
+        // that could (`option<raw<R>>`) are the `OptionRaw` constructor
+        // above; a borrow is not a field type, but storage-conservative if
+        // one ever appears.
+        Ty::Int(_) | Ty::Bool | Ty::Param(_) | Ty::Array(_) | Ty::Option(_) | Ty::Unit => false,
+        Ty::Res(_) | Ty::Borrow(..) => true,
     })
 }
 
