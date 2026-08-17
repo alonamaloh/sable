@@ -2601,22 +2601,24 @@ pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
         // An element is a place a store can name one of; an option element
         // would need per-element option storage no stage has. Arrays of
         // options stay closed while option nesting opens.
-        PayloadFamily::OptionOfValue | PayloadFamily::Unsupported => Err(Diagnostic {
-            name: "type.array_payload_unsupported".into(),
-            title: format!(
-                "array payload type `{}` is not supported yet",
-                payload.name()
-            ),
-            span,
-            label: "array operations currently support integers and `bool`".into(),
-            notes: vec![(
-                "note".into(),
-                "an element is stored, copied, and compared in place, so a payload needs a \
-                 layout, a copy rule, and — if it owns anything — a place path that can name \
-                 one element"
-                    .into(),
-            )],
-        }),
+        PayloadFamily::Record | PayloadFamily::OptionOfValue | PayloadFamily::Unsupported => {
+            Err(Diagnostic {
+                name: "type.array_payload_unsupported".into(),
+                title: format!(
+                    "array payload type `{}` is not supported yet",
+                    payload.name()
+                ),
+                span,
+                label: "array operations currently support integers and `bool`".into(),
+                notes: vec![(
+                    "note".into(),
+                    "an element is stored, copied, and compared in place, so a payload needs \
+                     a layout, a copy rule, and — if it owns anything — a place path that can \
+                     name one element"
+                        .into(),
+                )],
+            })
+        }
     }
 }
 
@@ -2638,7 +2640,9 @@ pub(crate) fn option_payload_ty(payload: Ty, span: Span) -> CResult<Ty> {
         // at any depth, because everything an option needs of its payload
         // (a Lean type, a junk default, a runtime value) an option has.
         PayloadFamily::Value | PayloadFamily::OptionOfValue | PayloadFamily::Param => Ok(payload),
-        PayloadFamily::Unsupported => Err(Diagnostic {
+        // A POD-record option needs its representation, proof, and runtime
+        // semantics enabled together; the record family stays out here.
+        PayloadFamily::Record | PayloadFamily::Unsupported => Err(Diagnostic {
             name: "type.option_payload_unsupported".into(),
             title: format!(
                 "option payload type `{}` is not supported yet",

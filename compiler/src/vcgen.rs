@@ -510,7 +510,7 @@ pub(crate) fn validate_vc_payload_ty(
         PayloadFamily::Param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {container} payload in {context}"
         )),
-        PayloadFamily::Unsupported if matches!(ty, Ty::Record(_)) => Err(format!(
+        PayloadFamily::Record => Err(format!(
             "internal.vcgen.type_error: POD-record {container} payload reached {context} before record proof semantics"
         )),
         PayloadFamily::Unsupported => Err(format!(

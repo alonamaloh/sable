@@ -269,7 +269,8 @@ pub(crate) fn validate_array_payload(payload: &Ty, context: &str) -> Result<(), 
         // parameter answers alongside the unsupported families; option
         // elements answer with them, because arrays of options stay
         // closed.
-        PayloadFamily::OptionOfValue
+        PayloadFamily::Record
+        | PayloadFamily::OptionOfValue
         | PayloadFamily::Param
         | PayloadFamily::Noncanonical
         | PayloadFamily::Unsupported => Err(format!(
@@ -1091,13 +1092,14 @@ pub(crate) fn validate_option_payload(payload: &Ty, context: &str) -> Result<(),
         // `Val.opt : Option Val` is recursive in the formal machine, so a
         // nested option lowers exactly as a flat one.
         PayloadFamily::Value | PayloadFamily::OptionOfValue => Ok(()),
-        PayloadFamily::Param | PayloadFamily::Noncanonical | PayloadFamily::Unsupported => {
-            Err(format!(
-                "svm.aggregate_payload_unsupported: {context} has option payload `{}`; \
+        PayloadFamily::Record
+        | PayloadFamily::Param
+        | PayloadFamily::Noncanonical
+        | PayloadFamily::Unsupported => Err(format!(
+            "svm.aggregate_payload_unsupported: {context} has option payload `{}`; \
                  the SVM currently lowers only concrete integer and Boolean option payloads",
-                payload.name()
-            ))
-        }
+            payload.name()
+        )),
     }
 }
 

@@ -945,6 +945,12 @@ pub enum PayloadFamily {
     /// machine values, the junk model) composes uniformly per level, so
     /// depth is not a property any stage limits.
     OptionOfValue,
+    /// A plain copyable POD record (ADR 0054): value semantics like an
+    /// integer, but a composite whose per-stage story (element facts, a
+    /// junk answer, a machine tag) each container position must supply
+    /// deliberately — which is why it is its own family rather than
+    /// `Value`.
+    Record,
     /// A declaration type parameter under the abstract-integer model
     /// (ADR 0009).
     Param,
@@ -1188,8 +1194,8 @@ impl Ty {
             {
                 PayloadFamily::OptionOfValue
             }
+            Ty::Record(_) => PayloadFamily::Record,
             Ty::Class(_)
-            | Ty::Record(_)
             | Ty::Array(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
