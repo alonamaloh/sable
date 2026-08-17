@@ -184,27 +184,6 @@ pub fn use_template() -> u64 {
     return r;
 }
 
-// A match-shaped post about an *abstract* option needs the case split
-// spelled out on the present path; automation handles the constructor
-// forms at every call site above. Obligation names come from the
-// failure output.
-
-/// discharge Gauge::make.post.match_seed_with_some_v_self_level_v_10_n by
-///   cases seed with
-///   | none => exact absurd rfl h_path_seed_none
-///   | some v => simp_all
-
-/// discharge Gauge::engaged_or.post.match_d_with_some_v_result_v_true_none_r by
-///   cases d with
-///   | none => exact absurd rfl h_path_d_none
-///   | some v => simp_all
-
-/// discharge value_or.post.match_o_with_some_v_result_v_none_result by
-///   cases o with
-///   | none => exact absurd rfl h_path_o_none
-///   | some v => simp_all
-
-/// discharge Slot::sized.post.match_t_with_some_v_self_tag_v_none_self by
-///   cases t with
-///   | none => exact absurd rfl h_path_t_none
-///   | some v => simp_all
+// Match-shaped posts close on abstract options and constructor forms
+// alike: `sable_auto` case-splits the abstract scrutinee and refutes
+// the absent arm from the path fact.

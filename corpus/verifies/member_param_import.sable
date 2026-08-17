@@ -15,8 +15,8 @@ pub fn imported_member_args() -> u64 {
 }
 
 // A parameter of this module forwards into the imported class's method:
-// the imported match-shaped post instantiates at the abstract chain, and
-// the case split is spelled on the present path.
+// the imported match-shaped post instantiates at the abstract chain and
+// closes through the case-split tier of `sable_auto`.
 /// pre  o.is_some
 /// post result = o.value
 pub fn imported_forward(option<u64> o) -> u64 {
@@ -24,8 +24,3 @@ pub fn imported_forward(option<u64> o) -> u64 {
     u64 w = g.value_or_cap(o);
     return w;
 }
-
-/// discharge imported_forward.post.result_o_value by
-///   cases o with
-///   | none => exact absurd rfl h_pre_o_is_some
-///   | some v => simp_all

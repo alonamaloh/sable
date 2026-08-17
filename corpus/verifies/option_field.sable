@@ -83,24 +83,9 @@ pub fn demo() -> u64 {
     return h;
 }
 
-// A match-shaped post about an *abstract* option — a parameter or the
-// entry state of a field — needs its case split spelled on the present
-// path; automation handles the constructor forms at every call site.
-
-/// discharge Cache::make.post.seed by
-///   cases s with
-///   | none => exact absurd rfl h_path_s_none
-///   | some v => simp_all
-
-/// discharge Cache::hit_or.post.match_self_hit_with_some_v_result_v_none by
-///   cases h : _old_self.hit with
-///   | none => simp_all
-///   | some v => simp_all
-
-/// discharge Cache::take_hit.post.was by
-///   cases h : _old_self.hit with
-///   | none => simp_all
-///   | some v => simp_all
+// Match-shaped posts about an abstract option — a parameter or the
+// entry state of a field — close automatically: `sable_auto` splits
+// the scrutinee, equation form for field projections.
 
 /// post result = 9
 pub fn demo_lifecycle() -> u64 {
@@ -215,16 +200,6 @@ pub class Toggle {
     }
 }
 
-/// discharge Toggle::engaged.post.match_self_state_with_some_v_result_v_tr by
-///   cases h : _old_self.state with
-///   | none => simp_all
-///   | some v => simp_all
-
-/// discharge Toggle::engaged.post.match_self_state_with_some_v_result_v_tr.2 by
-///   cases h : _old_self.state with
-///   | none => simp_all
-///   | some v => simp_all
-
 /// post result = 150
 pub fn demo_toggle() -> i64 {
     var mut t = Toggle::neutral(-50);
@@ -268,21 +243,6 @@ pub class Slotted<T> {
         return 0;
     }
 }
-
-/// discharge Slotted::sized.post.match_t_with_some_v_self_tag_some_v_none by
-///   cases h : t with
-///   | none => simp_all
-///   | some v => simp_all
-
-/// discharge Slotted::tag_or_zero.post.match_self_tag_with_some_v_result_v_none by
-///   cases h : _old_self.tag with
-///   | none => simp_all
-///   | some v => simp_all
-
-/// discharge Slotted::tag_or_zero.post.match_self_tag_with_some_v_result_v_none.2 by
-///   cases h : _old_self.tag with
-///   | none => simp_all
-///   | some v => simp_all
 
 /// post result = 7
 pub fn demo_slotted() -> u64 {

@@ -1354,6 +1354,23 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **A case-split tier in sable_auto (ADR 0081).** The portfolio
+     learns the one move every option slice was paying for by hand:
+     `sable_cases` splits every `match` whose scrutinee is an abstract
+     variable or projection — goal- or hypothesis-side, nested included
+     — then `contradiction` refutes the absent arm from the path fact
+     and simp/omega close the live one. Emission is untouched (the
+     match is user clause text, spliced verbatim; reshaping it in Rust
+     is forbidden by design), so the change is prelude-only and the
+     type-snapshot oracle sees identical bytes. All eighteen match-post
+     discharges across the option corpus are deleted; the files
+     verifying without them is what pins the tier. Lean's own `split`
+     was measured and rejected (it duplicates the dependent hypothesis
+     telescope and sends `simp_all` into unbounded recursion); the
+     collector's discipline — closed scrutinees, non-Prop inductives
+     with two-plus constructors, an equation-pinned loop guard — is
+     what keeps the split from firing on proofs or repeating forever.
+
      **Boolean arrays are class-field state.** The parity cell rides the
      payload-generic field paths: the checker, VC-position, and interp
      class-field gates open `[bool]`, a Boolean element projects as a

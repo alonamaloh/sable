@@ -71,19 +71,9 @@ pub fn demo() -> u64 {
     return h;
 }
 
-// A match-shaped post about an abstract option needs its case split
-// spelled on the present path, and a junk-reading goal needs the
-// `getD` reduction spelled — both the standing discharge tax.
-
-/// discharge flatten_or_none.post.match_o_with_some_v_result_v_none_result by
-///   cases o with
-///   | none => exact absurd rfl h_path_o_none
-///   | some v => simp_all
-
-/// discharge has_inner.post.match_o_with_some_v_result_v_is_some_non by
-///   cases o with
-///   | none => exact absurd rfl h_path_o_none
-///   | some v => simp_all
+// Match-shaped posts about an abstract option close automatically: the
+// case-split tier of `sable_auto` splits the scrutinee and refutes the
+// absent arm from the path fact.
 
 /// post result = 9
 pub fn demo_junk() -> u64 {
