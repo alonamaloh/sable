@@ -438,6 +438,9 @@ fn lean_option_ty(element: &Ty) -> String {
             let _ = adr0009_int_model(element);
             "Option Int".into()
         }
+        // A nested payload's Lean type is the payload's own option type,
+        // parenthesized because the result is one argument.
+        Ty::Option(inner) => format!("Option ({})", lean_option_ty(inner)),
         owned if owned.is_owned_array_of(&Ty::Bool) => "Option (Sable.Seq Bool)".into(),
         _ => {
             refuse_vc_type(format!(
@@ -2645,6 +2648,41 @@ impl<'a> Generator<'a> {
 
     /// Per-field representability facts about a class-state binder —
     /// justified the same way havoc facts are: every store is checked.
+    /// The payload fact a checked option state carries, over its value
+    /// chain: an integer leaf's `.value` is in range whether present or
+    /// junk-on-none (`getD default = 0`, ADR 0008), and a nested payload's
+    /// fact sits one `.value` deeper — an absent level reads `none`, whose
+    /// own `.value` reads the junk of the level below, so the composed
+    /// fact holds on every path. One fact per chain, at the integer leaf.
+    fn push_option_value_facts(&mut self, payload: &Ty, base: &str, term: &str) {
+        match payload {
+            Ty::Int(it) => {
+                self.push_hyp_unique(
+                    format!("h_{base}_range"),
+                    self.r_prop(&format!("(({term}).value)"), *it),
+                );
+            }
+            Ty::Option(inner) => {
+                let deeper = format!("(({term}).value)");
+                self.push_option_value_facts(inner, base, &deeper);
+            }
+            // `Bool` is its own complete domain, and an abstract payload
+            // deliberately carries no fact (the flat rule); the rest have
+            // no copy-option value chain to state a fact over.
+            Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => {}
+        }
+    }
+
     fn push_class_state_facts(&mut self, class: &ClassDecl, binder: &str) {
         // Deduped (`_2` suffixes) like class invariants: two borrowed
         // arguments of the same class must not shadow each other's facts
@@ -2816,12 +2854,7 @@ impl<'a> Generator<'a> {
                 let element = element.as_ref().clone();
                 self.binders
                     .push((binder.to_string(), lean_option_ty(&element)));
-                if let Ty::Int(it) = element {
-                    self.push_hyp_unique(
-                        format!("h_{base}_range"),
-                        self.r_prop(&format!("(({binder}).value)"), it),
-                    );
-                }
+                self.push_option_value_facts(&element, base, binder);
                 Val::Opt(binder.to_string())
             }
             Ty::OptionRaw(_) => {
@@ -4177,10 +4210,32 @@ impl<'a> Generator<'a> {
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
                 let value = format!("(({o}).value)");
-                match e.ty {
+                match &e.ty {
                     Some(Ty::RawRecord(_)) => Val::Ptr(value),
                     Some(Ty::Bool) => Val::Prop(format!("({value} = true)")),
-                    _ => Val::Int(value),
+                    Some(Ty::Int(_) | Ty::Param(_)) => Val::Int(value),
+                    // A nested payload's `.value` is itself an option chain.
+                    Some(Ty::Option(_) | Ty::OptionRaw(_)) => Val::Opt(value),
+                    // The affine `.value` is checked-refused (`.take` is the
+                    // extraction), so a payload with no projection here is a
+                    // named refusal, never a misbranded Int (ADR 0074).
+                    Some(
+                        Ty::Array(..)
+                        | Ty::Class(_)
+                        | Ty::Record(_)
+                        | Ty::Res(_)
+                        | Ty::Raw(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit,
+                    )
+                    | None => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.type_error: `.value` result has no symbolic \
+                             projection for its type in {}",
+                            self.fname
+                        ));
+                        Val::Unit
+                    }
                 }
             }
             ExprKind::OptTake {
@@ -4239,7 +4294,17 @@ impl<'a> Generator<'a> {
                 let value = match self.eval(inner) {
                     Val::Int(v) | Val::Ptr(v) | Val::Arr(v) => v,
                     Val::Prop(p) => lean_bool_value(&p),
-                    _ => unreachable!("checked: option payload"),
+                    // A nested inner option is one chain; `some (...)`
+                    // parenthesizes it below.
+                    Val::Opt(v) => v,
+                    Val::Obj(_) | Val::View(_) | Val::Record(_) | Val::Unit => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.type_error: `some` payload has no symbolic \
+                             value in {}",
+                            self.fname
+                        ));
+                        "0".to_string()
+                    }
                 };
                 Val::Opt(format!("some ({value})"))
             }
@@ -6648,13 +6713,9 @@ impl<'a> Generator<'a> {
                 }
                 // Same payload fact as `fresh_state_for`, emitted after the
                 // posts for the same motive-capture reason as the free call.
-                if let Ty::Option(element) = &m.f.ret {
-                    if let Ty::Int(it) = element.as_ref() {
-                        self.push_hyp_unique(
-                            format!("h_{}_range", ret_sym.trim_start_matches('_')),
-                            self.r_prop(&format!("(({ret_sym}).value)"), *it),
-                        );
-                    }
+                if let Ty::Option(element) = &m.f.ret.clone() {
+                    let base = ret_sym.trim_start_matches('_').to_string();
+                    self.push_option_value_facts(element, &base, &ret_sym);
                 }
                 match m.f.ret {
                     Ty::Option(_) | Ty::OptionRaw(_) => Val::Opt(ret_sym),
@@ -6966,17 +7027,13 @@ impl<'a> Generator<'a> {
                     ));
                 }
                 // The payload fact every fresh option state carries
-                // (`fresh_state_for`): an integer payload's `.value` is in
+                // (`fresh_state_for`): an integer leaf's `.value` is in
                 // range whether present or junk-on-none. Emitted after the
                 // callee's posts, so a `match`-shaped post's motive does not
                 // capture it and user scripts can case on the result.
-                if let Ty::Option(element) = &sig.ret {
-                    if let Ty::Int(it) = element.as_ref() {
-                        self.push_hyp_unique(
-                            format!("h_{}_range", ret_sym.trim_start_matches('_')),
-                            self.r_prop(&format!("(({ret_sym}).value)"), *it),
-                        );
-                    }
+                if let Ty::Option(element) = &sig.ret.clone() {
+                    let base = ret_sym.trim_start_matches('_').to_string();
+                    self.push_option_value_facts(element, &base, &ret_sym);
                 }
                 match sig.ret {
                     Ty::Option(_) | Ty::OptionRaw(_) => Val::Opt(ret_sym),
