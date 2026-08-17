@@ -1,0 +1,11 @@
+// expect-error: parse.expected
+// An element is not a place: a field read on an indexed element has no
+// spelling — copy the element out (`Pt p = a[i];`) and read the copy.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+fn head_x(&[Pt] a) -> u64 {
+    return a[0].x;
+}

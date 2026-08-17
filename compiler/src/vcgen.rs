@@ -407,13 +407,15 @@ fn adr0009_ty_int_model(ty: Ty) -> IntTy {
 
 /// The Lean type of an array with this payload. An allow-list: a payload the
 /// proof language has no sequence element type for gets no name at all.
-fn lean_array_ty(element: &Ty) -> String {
+fn lean_array_ty(element: &Ty, records: &[RecordDecl]) -> String {
     match element {
         Ty::Bool => "Sable.Seq Bool".into(),
         Ty::Int(_) | Ty::Param(_) => {
             let _ = adr0009_int_model(element);
             "Sable.Seq Int".into()
         }
+        // A record element's sequence is the record's own structure type.
+        Ty::Record(ri) => format!("Sable.Seq {}", lean_record_name(&records[*ri].name)),
         _ => {
             refuse_vc_type(format!(
                 "internal.vcgen.lean_type_unsupported: array payload `{}` has no Lean sequence \
@@ -510,6 +512,9 @@ pub(crate) fn validate_vc_payload_ty(
         PayloadFamily::Param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {container} payload in {context}"
         )),
+        // A record element has proof semantics (`Sable.Seq SableR_X` with
+        // elementwise well-formedness); a record option payload does not.
+        PayloadFamily::Record if aggregate == VcAggregateKind::Array => Ok(()),
         PayloadFamily::Record => Err(format!(
             "internal.vcgen.type_error: POD-record {container} payload reached {context} before record proof semantics"
         )),
@@ -1870,7 +1875,7 @@ fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> Strin
     match ty.referent() {
         Ty::Int(_) | Ty::Param(_) => "Int".into(),
         Ty::Bool => "Bool".into(),
-        Ty::Array(element) => lean_array_ty(element),
+        Ty::Array(element) => lean_array_ty(element, records),
         // A class-valued field is a nested structure (ADR 0020).
         Ty::Class(ci) => lean_class_name(&classes[*ci].name),
         Ty::Record(ri) => lean_record_name(&records[*ri].name),
@@ -1943,7 +1948,9 @@ fn emit_extern_clause_wfs(
                     ));
                 }
             }
-            Ty::Array(element) => binders.push((p.name.clone(), lean_array_ty(element))),
+            Ty::Array(element) => {
+                binders.push((p.name.clone(), lean_array_ty(element, &program.records)))
+            }
             Ty::Class(ci) => {
                 binders.push((p.name.clone(), lean_class_name(&program.classes[*ci].name)))
             }
@@ -2601,7 +2608,7 @@ impl<'a> Generator<'a> {
             Some(Ty::Option(element)) => lean_option_ty(element),
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
-            Some(Ty::Array(element)) => lean_array_ty(element),
+            Some(Ty::Array(element)) => lean_array_ty(element, self.records),
             Some(Ty::Unit) | Some(Ty::Borrow(..)) | None => {
                 unreachable!("checked: value has a Lean binder type")
             }
@@ -2628,7 +2635,7 @@ impl<'a> Generator<'a> {
             .filter_map(|(name, ty)| match ty.referent() {
                 Ty::Int(_) | Ty::Param(_) => Some((name.clone(), "Int".to_string())),
                 Ty::Bool => Some((name.clone(), "Bool".to_string())),
-                Ty::Array(element) => Some((name.clone(), lean_array_ty(element))),
+                Ty::Array(element) => Some((name.clone(), lean_array_ty(element, self.records))),
                 Ty::Class(ci) => Some((name.clone(), lean_class_name(&self.classes[*ci].name))),
                 Ty::Record(ri) => Some((name.clone(), lean_record_name(&self.records[*ri].name))),
                 // A resource binds its *view*; the authority it names is
@@ -2923,7 +2930,7 @@ impl<'a> Generator<'a> {
             Ty::Array(element) => {
                 let element = element.as_ref().clone();
                 self.binders
-                    .push((binder.to_string(), lean_array_ty(&element)));
+                    .push((binder.to_string(), lean_array_ty(&element, self.records)));
                 match len {
                     LenFact::Bounded => self.push_hyp_unique(
                         format!("h_{base}_len"),
@@ -3685,6 +3692,11 @@ impl<'a> Generator<'a> {
                     }
                     (Some(ref found), Val::Int(value))
                         if matches!(found.as_array(), Some((Ty::Int(_) | Ty::Param(_), _))) =>
+                    {
+                        value
+                    }
+                    (Some(ref found), Val::Record(value))
+                        if matches!(found.as_array(), Some((Ty::Record(_), _))) =>
                     {
                         value
                     }
@@ -6129,13 +6141,14 @@ impl<'a> Generator<'a> {
                     unreachable!("checked: array literal has an array type")
                 };
                 self.binders
-                    .push((b.clone(), lean_array_ty(&(*element).clone())));
+                    .push((b.clone(), lean_array_ty(&(*element).clone(), self.records)));
                 let h1 = self.fresh_hyp("h_lit");
                 self.hyps.push((h1, format!("({b}.len) = {}", elems.len())));
                 for (i, el) in elems.iter().enumerate() {
                     let v = match (element.as_ref(), self.eval(el)) {
                         (Ty::Bool, Val::Prop(prop)) => lean_bool_value(&prop),
                         (Ty::Int(_) | Ty::Param(_), Val::Int(value)) => value,
+                        (Ty::Record(_), Val::Record(value)) => value,
                         (payload, _) => {
                             refuse_vc_type(format!(
                                 "internal.vcgen.lean_type_unsupported: array literal element \
@@ -6175,6 +6188,13 @@ impl<'a> Generator<'a> {
                         self.assume_fact(&range);
                         Val::Int(value)
                     }
+                    Ty::Record(ri) => {
+                        // Element well-formedness follows the same way from
+                        // the array's elementwise fact.
+                        let wf = format!("{}.wf {value}", lean_record_name(&self.records[ri].name));
+                        self.assume_fact(&wf);
+                        Val::Record(value)
+                    }
                     other => {
                         refuse_vc_type(format!(
                             "internal.vcgen.lean_type_unsupported: array element `{}` has no \
@@ -6193,6 +6213,7 @@ impl<'a> Generator<'a> {
                 let v0 = match (elem.clone(), self.eval(init)) {
                     (Ty::Bool, Val::Prop(prop)) => lean_bool_value(&prop),
                     (Ty::Int(_) | Ty::Param(_), Val::Int(value)) => value,
+                    (Ty::Record(_), Val::Record(value)) => value,
                     (payload, _) => {
                         refuse_vc_type(format!(
                             "internal.vcgen.lean_type_unsupported: array allocation initializer \
@@ -6205,7 +6226,8 @@ impl<'a> Generator<'a> {
                 // Allocation succeeds symbolically: failure is the named
                 // OOM trap (design §10), not a proof obligation.
                 let b = self.hinted_sym("_alloc", hint);
-                self.binders.push((b.clone(), lean_array_ty(elem)));
+                self.binders
+                    .push((b.clone(), lean_array_ty(elem, self.records)));
                 let h1 = self.fresh_hyp("h_alloc");
                 self.hyps.push((h1, format!("({b}.len) = {n}")));
                 let h2 = self.fresh_hyp("h_alloc");
@@ -7277,7 +7299,7 @@ impl<'a> Generator<'a> {
                     out.push((p.name.clone(), lean_record_name(&self.records[*ri].name)))
                 }
                 Ty::Array(element) => {
-                    let lean_ty = lean_array_ty(element);
+                    let lean_ty = lean_array_ty(element, self.records);
                     out.push((p.name.clone(), lean_ty.clone()));
                     if let Some(entry) = self.entry_states.get(&p.name) {
                         out.push((entry.clone(), lean_ty));
@@ -7423,6 +7445,12 @@ impl<'a> Generator<'a> {
                 "∀ k, 0 ≤ k → k < {array}.len → {} ≤ {array}.get k ∧ {array}.get k ≤ {}",
                 self.t_min(&ty.clone()),
                 self.t_max(ty)
+            )),
+            // Nominal well-formedness elementwise: every record value a
+            // program can store was built through the checked constructor.
+            Ty::Record(ri) => Some(format!(
+                "∀ k, 0 ≤ k → k < {array}.len → {}.wf ({array}.get k)",
+                lean_record_name(&self.records[*ri].name)
             )),
             other => {
                 refuse_vc_type(format!(
@@ -8067,7 +8095,7 @@ mod type_domain_tests {
     fn an_unprovable_payload_latches_a_named_internal_error() {
         let _ = take_vc_type_refusal();
 
-        assert_eq!(lean_array_ty(&Ty::Record(0)), UNSUPPORTED_LEAN_TY);
+        assert_eq!(lean_array_ty(&Ty::Class(0), &[]), UNSUPPORTED_LEAN_TY);
         let latched = take_vc_type_refusal().expect("the refusal is latched");
         assert!(
             latched.starts_with("internal.vcgen.lean_type_unsupported:"),
@@ -8127,10 +8155,18 @@ mod type_domain_tests {
             "a probe",
         )
         .expect_err("an array element stays a flat value");
+        validate_vc_payload_ty(&Ty::Record(0), false, VcAggregateKind::Array, "a probe")
+            .expect("record elements have proof semantics");
+        let record_option =
+            validate_vc_payload_ty(&Ty::Record(0), false, VcAggregateKind::Option, "a probe")
+                .expect_err("record option payloads keep the refusal");
+        assert!(
+            record_option.starts_with("internal.vcgen.type_error:"),
+            "{record_option}"
+        );
         for aggregate in [VcAggregateKind::Array, VcAggregateKind::Option] {
             let container = aggregate.container();
             for shape in [
-                Ty::Record(0),
                 Ty::Class(0),
                 Ty::array(Ty::Int(IntTy::U64)),
                 Ty::Int(IntTy::TParam(0)),
@@ -8524,19 +8560,17 @@ fn affine_loop(u64 n) {
     fn bool_options_have_a_distinct_proof_model() {
         assert_eq!(lean_option_ty(&Ty::Bool), "Option Bool");
         assert!(validate_vc_ty(Ty::option(Ty::Bool), false, "unused ordinary function").is_ok());
-        assert_eq!(lean_array_ty(&Ty::Bool), "Sable.Seq Bool");
+        assert_eq!(lean_array_ty(&Ty::Bool, &[]), "Sable.Seq Bool");
     }
 
     #[test]
-    fn pod_record_payloads_still_fail_closed_independently() {
+    fn pod_record_payloads_split_by_container() {
         let record_error =
             validate_vc_ty(Ty::option(Ty::Record(0)), false, "unused ordinary function")
                 .expect_err("POD-record options are represented but have no proof semantics");
         assert!(record_error.contains("POD-record option payload"));
-        let array_error =
-            validate_vc_ty(Ty::array(Ty::Record(0)), false, "unused ordinary function")
-                .expect_err("POD-record arrays are represented but have no proof semantics");
-        assert!(array_error.contains("POD-record array payload"));
+        validate_vc_ty(Ty::array(Ty::Record(0)), false, "unused ordinary function")
+            .expect("record elements have proof semantics (Sable.Seq over the structure)");
     }
 
     #[test]
@@ -8654,7 +8688,14 @@ fn affine_loop(u64 n) {
             assert!(error.contains("an owned Boolean array is a local value"));
         }
 
-        for payload in [Ty::Record(0), Ty::Param(TypeParamId::from_legacy(0))] {
+        validate_vc_type_position(
+            Ty::array(Ty::Record(0)),
+            false,
+            VcTypePosition::Local,
+            "synthetic local",
+        )
+        .expect("a record-array local has VC state");
+        for payload in [Ty::Param(TypeParamId::from_legacy(0))] {
             let error = validate_vc_type_position(
                 Ty::array(payload.clone()),
                 false,
@@ -8662,11 +8703,7 @@ fn affine_loop(u64 n) {
                 "synthetic local",
             )
             .expect_err("non-Boolean future payloads stay independently closed");
-            assert!(error.contains(if matches!(payload, Ty::Record(_)) {
-                "POD-record array payload"
-            } else {
-                "escaped monomorphization"
-            }));
+            assert!(error.contains("escaped monomorphization"));
         }
     }
 

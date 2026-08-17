@@ -469,13 +469,14 @@ fn validate_interp_container_payloads(ty: Ty, context: &str) -> Result<(), Strin
 /// allow-list ending in a named refusal, which never recurses.
 pub(crate) fn validate_interp_array_payload(payload: &Ty, context: &str) -> Result<(), String> {
     match payload.payload_family() {
-        PayloadFamily::Value => Ok(()),
+        // Record elements are RtVal::Record entries in the payload-generic
+        // runtime array, honest copies in and out.
+        PayloadFamily::Value | PayloadFamily::Record => Ok(()),
         // A type parameter is a proof artifact; the interpreter executes
         // only the monomorphized program, so it answers alongside the
         // unsupported families rather than the admitted one. Option
         // elements answer with them: arrays of options stay closed.
-        PayloadFamily::Record
-        | PayloadFamily::OptionOfValue
+        PayloadFamily::OptionOfValue
         | PayloadFamily::Param
         | PayloadFamily::Noncanonical
         | PayloadFamily::Unsupported => Err(format!(

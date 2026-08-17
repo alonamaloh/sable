@@ -1,0 +1,18 @@
+// expect-test-failure: post of `stamp` violated
+// The dynamic half of `corpus/must-fail/record_array_wrong_post.sable`:
+// the monitor reads the stored element's field and refutes the claim.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+/// pre  a.len ≥ 1
+/// post (a.get 0).x = 5
+fn stamp(&mut [Pt] a) {
+    a[0] = Pt(6);
+}
+
+fn test_stamp_is_false() {
+    mut [Pt] pts = alloc_array<Pt>(1, Pt(1));
+    stamp(&mut pts);
+}

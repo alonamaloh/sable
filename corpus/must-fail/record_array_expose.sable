@@ -1,0 +1,15 @@
+// expect-error: expose.element_type
+// Exposure stays a byte-array affair: a record array has no exposure
+// rule, and with record elements admitted the refusal is exposure's
+// own rather than the payload gate's.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+fn peek(u64 n) -> u64 {
+    mut [Pt] pts = alloc_array<Pt>(1, Pt(3));
+    unsafe expose &mut pts as (p, resource m) {
+    }
+    return 0;
+}

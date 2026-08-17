@@ -114,6 +114,16 @@ const TYPES: &[Probe] = &[
         feed: "",
     },
     Probe {
+        name: "[record]",
+        spelling: "[Pair]",
+        values: &[
+            "alloc_array<Pair>(2, Pair(1, 2))",
+            "[Pair(1, 2), Pair(3, 4)]",
+        ],
+        decls: RECORD_DECL,
+        feed: "",
+    },
+    Probe {
         name: "option<u64>",
         spelling: "option<u64>",
         values: &["none", "some(7)"],
@@ -428,6 +438,7 @@ const NEVER: &[(&str, &[&str], &str)] = &[
             "bool",
             "[u64]",
             "[bool]",
+            "[record]",
             "option<u64>",
             "option<bool>",
             "record",
@@ -443,6 +454,7 @@ const NEVER: &[(&str, &[&str], &str)] = &[
             "bool",
             "[u64]",
             "[bool]",
+            "[record]",
             "option<u64>",
             "option<bool>",
             "record",
@@ -494,7 +506,7 @@ const NEVER: &[(&str, &[&str], &str)] = &[
     ),
     (
         "record field",
-        &["[u64]", "[bool]"],
+        &["[u64]", "[bool]", "[record]"],
         "a `#[layout]` record is a plain copyable value with fixed storage geometry; \
          an array owns heap storage",
     ),
@@ -526,7 +538,7 @@ const NEVER: &[(&str, &[&str], &str)] = &[
     ),
     (
         "resource map key",
-        &["[u64]", "[bool]", "option<[bool]>", "class"],
+        &["[u64]", "[bool]", "[record]", "option<[bool]>", "class"],
         "a map key is a pure value compared by equality; an owning value cannot be one",
     ),
 ];
@@ -740,7 +752,7 @@ fn every_spellable_type_shape_is_probed() {
             "Bool" => ShapeWitness::Rows(&["bool"]),
             "Record" => ShapeWitness::Rows(&["record"]),
             "Class" => ShapeWitness::Rows(&["class"]),
-            "Array" => ShapeWitness::Rows(&["[u64]", "[bool]"]),
+            "Array" => ShapeWitness::Rows(&["[u64]", "[bool]", "[record]"]),
             "Option" => ShapeWitness::Rows(&["option<u64>", "option<bool>", "option<[bool]>"]),
             "Raw" => ShapeWitness::Rows(&["raw<u8>"]),
             // A borrow is a binding-mode wrapper (ADR 0067), so it is

@@ -1,0 +1,14 @@
+// expect-error: stamp.post.claim
+// A false post over a stored element: the body writes a different field
+// value than the contract claims. The dynamic twin is
+// `corpus/test-fails/record_array_wrong_post.sable`.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+/// pre  a.len ≥ 1
+/// post #[label(claim)] (a.get 0).x = 5
+pub fn stamp(&mut [Pt] a) {
+    a[0] = Pt(6);
+}

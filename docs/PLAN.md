@@ -1354,6 +1354,18 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **Record elements are values (ADR 0079).** `[record]` opens across
+     locals, element reads/stores, borrows, and init `&[record]` — the
+     payload family split by container (array gates admit, option gates
+     refuse, each in its own name), elementwise `R.wf` as the element
+     fact with the emitted `wf_iff` unfolding lemma automation needs,
+     `a[i].x` pinned as a non-place in both directions, class fields
+     behind `type.record_array_field` until the field-element paths
+     generalize, off-range junk deliberately unanswered by the monitor
+     (Seq junk is unconstrained; no Lean default exists to mirror), and
+     the machine leg deferred to its own ValTag commit. The matrix gains
+     the `[record]` row: 72 of 180 intended open.
+
      **Option nesting is the recursive family (ADR 0078).**
      `option<option<T>>` — a founding example of the representation
      problem — is a type at any depth for concrete value leaves, in

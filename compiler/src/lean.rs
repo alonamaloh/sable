@@ -210,14 +210,18 @@ pub fn emit(
             }
         }
         let value_wf: Vec<&str> = r.fields.iter().filter_map(|f| f.wf.as_deref()).collect();
+        let wf_body = if value_wf.is_empty() {
+            "True".to_string()
+        } else {
+            value_wf.join(" ∧ ")
+        };
         e.push(&format!("def wf (value : {lean_name}) : Prop :="));
+        e.push(&format!("  {wf_body}"));
+        // A plain `def` is invisible to `simp`; the explicit unfolding
+        // lemma is what lets automation read the field facts out of a
+        // `wf` hypothesis (an elementwise array fact included).
         e.push(&format!(
-            "  {}",
-            if value_wf.is_empty() {
-                "True".to_string()
-            } else {
-                value_wf.join(" ∧ ")
-            }
+            "@[simp] theorem wf_iff (value : {lean_name}) : wf value ↔ ({wf_body}) := Iff.rfl"
         ));
         e.push(&format!(
             "def cellWf (cell : Sable.PointsToView {lean_name}) : Prop :="

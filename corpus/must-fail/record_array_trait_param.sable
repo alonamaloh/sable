@@ -1,0 +1,12 @@
+// expect-error: type.trait_param_unsupported
+// Trait calls do not transport arrays; with record elements admitted
+// the refusal is the trait boundary's own rather than the payload
+// gate's.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+trait Scans {
+    fn scan(Self value, &[Pt] pts) -> u64;
+}

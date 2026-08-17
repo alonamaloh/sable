@@ -2597,28 +2597,28 @@ fn noncanonical_aggregate_payload(span: Span) -> Diagnostic {
 pub(crate) fn validate_array_payload(payload: &Ty, span: Span) -> CResult<()> {
     match payload.payload_family() {
         PayloadFamily::Noncanonical => Err(noncanonical_aggregate_payload(span)),
-        PayloadFamily::Value | PayloadFamily::Param => Ok(()),
+        // A record element is stored, copied, and compared in place like an
+        // integer: value semantics with a checked constructor behind it.
+        PayloadFamily::Value | PayloadFamily::Record | PayloadFamily::Param => Ok(()),
         // An element is a place a store can name one of; an option element
         // would need per-element option storage no stage has. Arrays of
         // options stay closed while option nesting opens.
-        PayloadFamily::Record | PayloadFamily::OptionOfValue | PayloadFamily::Unsupported => {
-            Err(Diagnostic {
-                name: "type.array_payload_unsupported".into(),
-                title: format!(
-                    "array payload type `{}` is not supported yet",
-                    payload.name()
-                ),
-                span,
-                label: "array operations currently support integers and `bool`".into(),
-                notes: vec![(
-                    "note".into(),
-                    "an element is stored, copied, and compared in place, so a payload needs \
+        PayloadFamily::OptionOfValue | PayloadFamily::Unsupported => Err(Diagnostic {
+            name: "type.array_payload_unsupported".into(),
+            title: format!(
+                "array payload type `{}` is not supported yet",
+                payload.name()
+            ),
+            span,
+            label: "array operations currently support integers and `bool`".into(),
+            notes: vec![(
+                "note".into(),
+                "an element is stored, copied, and compared in place, so a payload needs \
                      a layout, a copy rule, and — if it owns anything — a place path that can \
                      name one element"
-                        .into(),
-                )],
-            })
-        }
+                    .into(),
+            )],
+        }),
     }
 }
 
@@ -2994,6 +2994,20 @@ pub(crate) fn return_ty(ty: &Ty, fn_name: &str, span: Span) -> CResult<()> {
 pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "field"));
+    }
+    if matches!(ty.as_array(), Some((Ty::Record(_), _))) {
+        return Err(Diagnostic {
+            name: "type.record_array_field".into(),
+            title: "record arrays cannot be stored in class fields yet".into(),
+            span,
+            label: "keep `[record]` as an owned local".into(),
+            notes: vec![(
+                "note".into(),
+                "field element reads, stores, and havoc must be enabled together before a \
+                 class can retain a record array"
+                    .into(),
+            )],
+        });
     }
     if ty.is_array_of(&Ty::Bool) {
         return Err(Diagnostic {
@@ -6837,8 +6851,7 @@ fn consume(i32 value) -> bool {
 
         let option_record = option_payload_ty(Ty::Record(0), Span::new(0, 1)).unwrap_err();
         assert_eq!(option_record.name, "type.option_payload_unsupported");
-        let array_record = validate_array_payload(&Ty::Record(0), Span::new(0, 1)).unwrap_err();
-        assert_eq!(array_record.name, "type.array_payload_unsupported");
+        assert!(validate_array_payload(&Ty::Record(0), Span::new(0, 1)).is_ok());
     }
 
     #[test]

@@ -1,0 +1,54 @@
+// Dynamic checks for record arrays: construction by literal and by
+// alloc fill, element reads and stores as honest copies, borrows
+// lending elements to callees, the loop over elements, and contracts
+// over element fields monitored at the boundary.
+
+use record_array;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+fn test_construction_and_elements() {
+    mut [Pt] pts = alloc_array<Pt>(3, Pt(1, 2));
+    expect_eq(pts.len, 3);
+    Pt first = pts[0];
+    expect_eq(first.x, 1);
+    expect_eq(first.y, 2);
+    pts[1] = Pt(7, 9);
+    Pt mid = pts[1];
+    expect_eq(mid.x, 7);
+    expect_eq(mid.y, 9);
+}
+
+fn test_element_is_a_copy() {
+    mut [Pt] pts = [Pt(3, 4)];
+    Pt held = pts[0];
+    pts[0] = Pt(8, 8);
+    expect_eq(held.x, 3);
+    Pt now = pts[0];
+    expect_eq(now.x, 8);
+}
+
+fn test_borrows_and_swap() {
+    mut [Pt] pts = [Pt(3, 4), Pt(5, 6)];
+    expect_eq(half_sum_head(&pts), 3);
+    swap_heads(&mut pts);
+    expect_eq(half_sum_head(&pts), 5);
+}
+
+fn test_fill_and_extent() {
+    expect_eq(fill_ramp(9), 9);
+    [Pt] pts = [Pt(2, 6)];
+    var e = Extent::of_head(&pts);
+    expect_eq(e.width(), 4);
+}
+
+fn test_demos_agree() {
+    expect_eq(demo(), 3);
+    expect_eq(demo_extent(), 4);
+}

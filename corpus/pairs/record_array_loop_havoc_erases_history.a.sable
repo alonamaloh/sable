@@ -1,0 +1,28 @@
+// pair: same-lean
+// A loop that builds record elements from a loop-mutated scalar: the
+// scalar is a fresh binder at the loop head and the array a fresh state,
+// so the two halves — which differ only in the dead pre-loop value of
+// `seed` — must emit identical obligations. A record-store path that
+// kept the pre-loop chain would leak the dead value into the goals.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+/// pre  n ≥ 1
+/// pre  n ≤ 100
+/// post result = n
+pub fn refill(u64 n) -> u64 {
+    mut u64 seed = 1;
+    mut [Pt] pts = alloc_array<Pt>(n, Pt(0));
+    mut u64 i = 0;
+    /// invariant i ≤ n
+    /// invariant pts.len = n
+    /// variant n - i
+    while (i < n) {
+        seed = i;
+        pts[i] = Pt(seed);
+        i = i + 1;
+    }
+    return pts.len;
+}

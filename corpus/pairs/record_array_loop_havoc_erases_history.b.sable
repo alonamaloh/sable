@@ -1,0 +1,26 @@
+// pair: same-lean
+// See record_array_loop_havoc_erases_history.a.sable: only the dead
+// pre-loop value of `seed` differs, and the loop-head havoc must erase
+// it before any record store reads it.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+/// pre  n ≥ 1
+/// pre  n ≤ 100
+/// post result = n
+pub fn refill(u64 n) -> u64 {
+    mut u64 seed = 2;
+    mut [Pt] pts = alloc_array<Pt>(n, Pt(0));
+    mut u64 i = 0;
+    /// invariant i ≤ n
+    /// invariant pts.len = n
+    /// variant n - i
+    while (i < n) {
+        seed = i;
+        pts[i] = Pt(seed);
+        i = i + 1;
+    }
+    return pts.len;
+}

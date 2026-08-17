@@ -289,9 +289,8 @@ impl TyPos {
     /// shape, so a gate that started admitting a shape its lowering cannot
     /// hold fails there, and the checker's half has corpus subjects of its
     /// own for the shapes this table deliberately lets through
-    /// (`array_element_record.sable`, `option_payload_record.sable`, against
-    /// the parser's `array_element_class.sable` and
-    /// `option_payload_class.sable`).
+    /// (`option_payload_record.sable`, against the parser's
+    /// `array_element_class.sable` and `option_payload_class.sable`).
     fn gate_name(self) -> &'static str {
         match self {
             TyPos::Param => "type.param_unsupported",

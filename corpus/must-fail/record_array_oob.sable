@@ -1,0 +1,13 @@
+// expect-error: head_x.bounds.a_0
+// An element read carries its bounds VC; nothing here proves the array
+// is nonempty. The dynamic twin is
+// `corpus/test-fails/record_array_oob.sable`.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+pub fn head_x(&[Pt] a) -> u64 {
+    Pt h = a[0];
+    return h.x;
+}

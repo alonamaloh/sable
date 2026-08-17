@@ -21,14 +21,15 @@ The `init param` / `method param` pairs read the same way.
 | `bool` | yes | yes | yes | never | not yet | not yet | yes | yes | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `[u64]` | yes | not yet | not yet | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
 | `[bool]` | yes | not yet | not yet | yes | yes | never | not yet | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
+| `[record]` | yes | not yet | not yet | yes | yes | never | not yet | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
 | `option<u64>` | yes | yes | yes | never | not yet | not yet | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `option<bool>` | yes | yes | yes | never | not yet | not yet | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
-| `record` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
+| `record` | yes | yes | yes | never | not yet | not yet | not yet | yes | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
 | `option<[bool]>` | yes | not yet | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet |
 | `class` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
 | `raw<u8>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | not yet | not yet | never | not yet | never |
 
-Open cells: 67 of 163 intended; 47 never open by design.
+Open cells: 72 of 180 intended; 51 never open by design.
 
 ## Cells that never open
 
@@ -37,18 +38,18 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 
 | context | types | reason |
 |---|---|---|
-| for index | `bool`, `[u64]`, `[bool]`, `option<u64>`, `option<bool>`, `record`, `option<[bool]>`, `class`, `raw<u8>` | a range index is an integer |
-| cast target | `bool`, `[u64]`, `[bool]`, `option<u64>`, `option<bool>`, `record`, `option<[bool]>`, `class`, `raw<u8>` | `widen`/`narrow` convert between integer types; every other conversion is spelled as the operation it is |
+| for index | `bool`, `[u64]`, `[bool]`, `[record]`, `option<u64>`, `option<bool>`, `record`, `option<[bool]>`, `class`, `raw<u8>` | a range index is an integer |
+| cast target | `bool`, `[u64]`, `[bool]`, `[record]`, `option<u64>`, `option<bool>`, `record`, `option<[bool]>`, `class`, `raw<u8>` | `widen`/`narrow` convert between integer types; every other conversion is spelled as the operation it is |
 | param & | `u64`, `bool`, `option<u64>`, `option<bool>`, `record`, `raw<u8>` | a shared borrow of a copyable value is indistinguishable from the value; pass it by value |
 | init param & | `u64`, `bool`, `option<u64>`, `option<bool>`, `record`, `raw<u8>` | a shared borrow of a copyable value is indistinguishable from the value; pass it by value |
 | method param & | `u64`, `bool`, `option<u64>`, `option<bool>`, `record`, `raw<u8>` | a shared borrow of a copyable value is indistinguishable from the value; pass it by value |
-| record field | `[u64]`, `[bool]` | a `#[layout]` record is a plain copyable value with fixed storage geometry; an array owns heap storage |
+| record field | `[u64]`, `[bool]`, `[record]` | a `#[layout]` record is a plain copyable value with fixed storage geometry; an array owns heap storage |
 | record field | `option<[bool]>` | record values copy freely; an affine value has exactly one owner |
 | record field | `class` | record values copy freely; class ownership cannot be copied |
 | const | `option<[bool]>` | a constant copies freely; an affine value has exactly one owner |
 | const | `class` | a class value owns storage and a destructor; a constant owns nothing |
 | const | `raw<u8>` | a raw pointer is provenance plus an offset (ADR 0025), and a constant has neither |
-| resource map key | `[u64]`, `[bool]`, `option<[bool]>`, `class` | a map key is a pure value compared by equality; an owning value cannot be one |
+| resource map key | `[u64]`, `[bool]`, `[record]`, `option<[bool]>`, `class` | a map key is a pure value compared by equality; an owning value cannot be one |
 
 ## What closes each cell
 
@@ -104,6 +105,23 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `[bool]` | init param | `type.param_unsupported` |
 | `[bool]` | method param | `type.param_unsupported` |
 | `[bool]` | method param & | `type.member_param` |
+| `[record]` | return | `type.array_return` |
+| `[record]` | param | `type.param_unsupported` |
+| `[record]` | record field | `record.field_type` |
+| `[record]` | class field | `type.record_array_field` |
+| `[record]` | array element | `type.array_payload_unsupported` |
+| `[record]` | option payload | `type.affine_option_payload` |
+| `[record]` | generic arg | `mono.type_arg_unsupported` |
+| `[record]` | for index | `type.for_index_unsupported` |
+| `[record]` | const | `type.const_unsupported` |
+| `[record]` | cast target | `type.cast_target_unsupported` |
+| `[record]` | trait-impl target | `type.impl_target_unsupported` |
+| `[record]` | raw element | `type.raw_element_unsupported` |
+| `[record]` | resource extent | `type.resource_extent_unsupported` |
+| `[record]` | resource map key | `type.resource_map_key_unsupported` |
+| `[record]` | init param | `type.param_unsupported` |
+| `[record]` | method param | `type.param_unsupported` |
+| `[record]` | method param & | `type.member_param` |
 | `option<u64>` | param & | `type.borrow_param_unsupported` |
 | `option<u64>` | param &mut | `type.borrow_param_unsupported` |
 | `option<u64>` | record field | `record.field_type` |
@@ -136,7 +154,6 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `record` | param &mut | `type.borrow_param_unsupported` |
 | `record` | record field | `record.field_type` |
 | `record` | class field | `type.class_field_unsupported` |
-| `record` | array element | `type.array_payload_unsupported` |
 | `record` | option payload | `type.option_payload_unsupported` |
 | `record` | generic arg | `mono.type_arg_unsupported` |
 | `record` | for index | `type.for_index_unsupported` |

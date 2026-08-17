@@ -1,0 +1,11 @@
+// expect-error: parse.expected
+// An element is not a place: a field store into an indexed element has
+// no spelling — read-modify-write the whole element instead.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+fn poke(&mut [Pt] a) {
+    a[0].x = 5;
+}

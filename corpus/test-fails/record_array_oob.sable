@@ -1,0 +1,17 @@
+// expect-test-failure: index out of bounds
+// The dynamic half of `corpus/must-fail/record_array_oob.sable`: the
+// unproved bounds trap at run time.
+
+record Pt #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 x;
+}
+
+fn head_x(&[Pt] a) -> u64 {
+    Pt h = a[0];
+    return h.x;
+}
+
+fn test_empty_traps() {
+    [Pt] none_at_all = alloc_array<Pt>(0, Pt(0));
+    u64 r = head_x(&none_at_all);
+}

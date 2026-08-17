@@ -1,0 +1,107 @@
+// Arrays of POD records: elements are stored, copied, and compared in
+// place like integers, with nominal well-formedness carried elementwise
+// — every record a program can store was built through the checked
+// constructor, so a havocked array's elements still satisfy `wf`, which
+// is what bounds their fields.
+
+pub record Pt #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 x;
+    #[offset(8)] u64 y;
+}
+
+// The elementwise wf fact is load-bearing: at entry `a` is an arbitrary
+// checked state, and the overflow VC on the field sum closes only from
+// the fields' ranges inside `Pt.wf`.
+/// pre  a.len ≥ 1
+/// post result = (a.get 0).x / 2 + (a.get 0).y / 2
+pub fn half_sum_head(&[Pt] a) -> u64 {
+    Pt h = a[0];
+    return h.x / 2 + h.y / 2;
+}
+
+// Whole-element equality in a post: a record element is one value.
+/// pre  a.len ≥ 2
+/// post #[label(zero)] a.get 0 = (old a).get 1
+/// post #[label(one)]  a.get 1 = (old a).get 0
+/// post #[label(len)]  a.len = (old a).len
+pub fn swap_heads(&mut [Pt] a) {
+    Pt t = a[0];
+    a[0] = a[1];
+    a[1] = t;
+}
+
+// An element store is a `Seq.set` chain; the quantified loop invariant
+// tracks a field of every filled element across the havoc.
+/// pre  n ≥ 1
+/// pre  n ≤ 1000
+/// post #[label(len)] result = n
+pub fn fill_ramp(u64 n) -> u64 {
+    mut [Pt] pts = alloc_array<Pt>(n, Pt(0, 0));
+    mut u64 i = 0;
+    /// invariant i ≤ n
+    /// invariant pts.len = n
+    /// invariant ∀ k, 0 ≤ k → k < i → (pts.get k).x = k
+    /// variant n - i
+    while (i < n) {
+        pts[i] = Pt(i, i + 1);
+        i = i + 1;
+    }
+    return pts.len;
+}
+
+// The wf hypothesis unfolds by `simp` (the emitted `wf_iff` lemma) and
+// the arithmetic closes by `omega`; the element store's get/set case
+// split is the standing quantified-invariant discharge.
+
+/// discharge half_sum_head.overflow.h_x_2_h_y_2 by
+///   simp only [SableR_Pt.wf_iff] at *
+///   omega
+
+/// discharge fill_ramp.inv_preserved.k_0_k_k_i_pts_get_k_x_k by
+///   intro k hk0 hki
+///   by_cases h : k = i
+///   · simp_all
+///   · have hklt : k < i := by omega
+///     simp_all [Sable.Seq.get_set]
+
+/// post result = 3
+pub fn demo() -> u64 {
+    mut [Pt] pts = [Pt(3, 4), Pt(5, 6)];
+    swap_heads(&mut pts);
+    u64 r = half_sum_head(&pts);
+    if (r == 5) {
+        return 3;
+    }
+    return 0;
+}
+
+// A class init lends a record array in, the `from_prefix` shape.
+pub class Extent {
+    u64 lo;
+    u64 hi;
+
+    /// invariant lo ≤ hi
+
+    /// pre  src.len ≥ 1
+    /// pre  (src.get 0).x ≤ (src.get 0).y
+    /// post #[label(lo)] self.lo = (src.get 0).x
+    /// post #[label(hi)] self.hi = (src.get 0).y
+    init of_head(&[Pt] src) {
+        Pt h = src[0];
+        self.lo = h.x;
+        self.hi = h.y;
+    }
+
+    /// post result = self.hi - self.lo
+    fn width(&self) -> u64 {
+        return self.hi - self.lo;
+    }
+}
+
+/// post result = 4
+pub fn demo_extent() -> u64 {
+    [Pt] pts = [Pt(2, 6)];
+    var e = Extent::of_head(&pts);
+    u64 w = e.width();
+    return w;
+}
