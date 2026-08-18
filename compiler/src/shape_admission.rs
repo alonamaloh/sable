@@ -551,8 +551,10 @@ const GATES: &[&str] = &[
     "vc option payload",
     "vc local position",
     "vc parameter position",
+    "vc return position",
     "vc class field",
     "interp type",
+    "interp return",
     "interp array payload",
     "interp option payload",
     "interp option value",
@@ -562,6 +564,7 @@ const GATES: &[&str] = &[
     "svm array payload",
     "svm option payload",
     "svm parameter",
+    "svm return",
     "llvm runtime type",
     "llvm local",
     "llvm parameter",
@@ -650,10 +653,20 @@ fn answers(ty: &Ty) -> Vec<Answer> {
         from_string(crate::vcgen::validate_vc_type_position(
             ty.clone(),
             true,
+            crate::vcgen::VcTypePosition::Return,
+            "shape probe",
+        )),
+        from_string(crate::vcgen::validate_vc_type_position(
+            ty.clone(),
+            true,
             crate::vcgen::VcTypePosition::ClassField,
             "shape probe",
         )),
         from_string(crate::interp::validate_interp_ty(ty.clone(), "shape probe")),
+        from_string(crate::interp::validate_interp_return_ty(
+            ty.clone(),
+            "shape probe",
+        )),
         from_string(crate::interp::validate_interp_array_payload(
             ty,
             "shape probe",
@@ -678,6 +691,7 @@ fn answers(ty: &Ty) -> Vec<Answer> {
         from_string(crate::svm::validate_array_payload(ty, "shape probe")),
         from_string(crate::svm::validate_option_payload(ty, "shape probe")),
         from_string(crate::svm::validate_parameter_ty(ty, "shape probe")),
+        from_string(crate::svm::validate_return_ty(ty, "shape probe")),
         from_backend(crate::llvm::require_runtime_type(
             &program,
             ROOT_SPAN_END,

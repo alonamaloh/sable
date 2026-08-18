@@ -126,19 +126,8 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
     for param in &f.params {
         validate_parameter_ty(&param.ty, &format!("parameter `{}`", param.name))?;
     }
-    if f.ret.is_affine_option() {
-        return Err(affine_option_unsupported(
-            f.ret.clone(),
-            &format!("return type of `{}`", f.name),
-        ));
-    }
+    validate_return_ty(&f.ret, &format!("return type of `{}`", f.name))?;
     validate_ty_payload(f.ret.clone(), &format!("return type of `{}`", f.name))?;
-    if f.ret.is_bool_array() {
-        return Err(format!(
-            "svm.bool_array_position_unsupported: `{}` returns a Boolean array; Boolean arrays are owned locals only",
-            f.name
-        ));
-    }
     if f.ret.clone().is_resource() {
         return Err(format!(
             "svm.resource_return_unsupported: `{}` returns erased authority, which has no SVM value representation",
@@ -216,6 +205,24 @@ pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String
     if ty.is_owned_bool_array() {
         return Err(format!(
             "svm.bool_array_position_unsupported: {context} owns a Boolean array; an array crosses a call boundary as a borrow"
+        ));
+    }
+    Ok(())
+}
+
+/// What a result may be — the other half of the boundary
+/// `validate_parameter_ty` states, and a named function for the same reason:
+/// `docs/shape-admission.md` asks each stage gate directly, so a rule written
+/// inline in a signature walk is a rule no ratchet watches. The payload
+/// traversal stays at the call sites, which differ in how much of a signature
+/// they are validating.
+pub(crate) fn validate_return_ty(ty: &Ty, context: &str) -> Result<(), String> {
+    if ty.is_affine_option() {
+        return Err(affine_option_unsupported(ty.clone(), context));
+    }
+    if ty.is_bool_array() {
+        return Err(format!(
+            "svm.bool_array_position_unsupported: {context} is a Boolean array; Boolean arrays are owned locals only"
         ));
     }
     Ok(())
@@ -1290,17 +1297,7 @@ fn validate_program_option_positions(program: &Program) -> Result<(), String> {
                 &format!("{context} parameter `{}`", parameter.name),
             )?;
         }
-        if function.ret.is_affine_option() {
-            return Err(affine_option_unsupported(
-                function.ret.clone(),
-                &format!("{context} return type"),
-            ));
-        }
-        if function.ret.is_bool_array() {
-            return Err(format!(
-                "svm.bool_array_position_unsupported: {context} returns a Boolean array; Boolean arrays are owned locals only"
-            ));
-        }
+        validate_return_ty(&function.ret, &format!("{context} return type"))?;
         if trait_member {
             if let Some(parameter) = function
                 .params

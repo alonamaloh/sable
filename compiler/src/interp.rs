@@ -352,23 +352,29 @@ fn validate_interp_fn(function: &Fn) -> Result<(), String> {
             },
         );
     }
-    if function.ret.is_array_of(&Ty::Bool) {
-        return Err(format!(
-            "interp.array_position_unsupported: return type of `{}` is a Boolean array; Boolean arrays are supported only as owned locals",
-            function.name
-        ));
-    }
-    if function.ret.is_affine_option() {
-        return Err(format!(
-            "interp.affine_option_position_unsupported: return type of `{}` is ownership-bearing; affine options are supported only as explicit locals",
-            function.name
-        ));
-    }
-    validate_interp_ty(
+    validate_interp_return_ty(
         function.ret.clone(),
         &format!("return type of `{}`", function.name),
     )?;
     validate_interp_stmts(&function.body, &mut locals)
+}
+
+/// What a result may be. A return is the other half of the call boundary
+/// `validate_interp_param_ty` states, and it is a named function for the same
+/// reason that one is: `docs/shape-admission.md` asks each stage gate directly,
+/// and a rule spelled inline in a signature walk is a rule the table cannot see.
+pub(crate) fn validate_interp_return_ty(ty: Ty, context: &str) -> Result<(), String> {
+    if ty.is_array_of(&Ty::Bool) {
+        return Err(format!(
+            "interp.array_position_unsupported: {context} is a Boolean array; Boolean arrays are supported only as owned locals"
+        ));
+    }
+    if ty.is_affine_option() {
+        return Err(format!(
+            "interp.affine_option_position_unsupported: {context} is ownership-bearing; affine options are supported only as explicit locals"
+        ));
+    }
+    validate_interp_ty(ty, context)
 }
 
 /// A parameter is a value binding, so a copyable option crosses a call the
