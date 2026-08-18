@@ -114,18 +114,3 @@ pub fn free_header_round_trip() -> u64 {
 ///   simp [h_base_system, h_release_system, h_mem_system, hroot,
 ///     h_view16_extent.1, h_view16_extent.2.1,
 ///     h_view16_extent.2.2]
-
-/// discharge free_header_round_trip.overflow.size_next by
-///   rw [h_header_init] at h_value11_header_size
-///   rw [h_header_init] at h_value12_header_next
-///   simp [Sable.FreeHeaderView.putFields] at h_value11_header_size
-///   simp [Sable.FreeHeaderView.putFields] at h_value12_header_next
-///   simp [Sable.u64.max]
-///   omega
-
-/// discharge free_header_round_trip.post.result_64 by
-///   rw [h_header_init] at h_value11_header_size
-///   rw [h_header_init] at h_value12_header_next
-///   simp [Sable.FreeHeaderView.putFields] at h_value11_header_size
-///   simp [Sable.FreeHeaderView.putFields] at h_value12_header_next
-///   omega

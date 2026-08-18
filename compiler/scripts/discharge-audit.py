@@ -115,6 +115,9 @@ class Audit:
     def check(self, fn, budget):
         env = dict(os.environ)
         env.pop("SABLE_GRIND_HEARTBEATS", None)
+        # each Lean process runs its own elaborator thread pool sized to
+        # the machine; uncapped, N parallel checks oversubscribe it N-fold
+        env.setdefault("LEAN_NUM_THREADS", "2")
         if budget is not None:
             env["SABLE_GRIND_HEARTBEATS"] = str(budget)
         p = subprocess.run(
@@ -205,7 +208,7 @@ class Audit:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary", help="path to the sable binary")
-    ap.add_argument("-j", "--jobs", type=int, default=6)
+    ap.add_argument("-j", "--jobs", type=int, default=4)
     ap.add_argument("--json", help="also write full results to this file")
     args = ap.parse_args()
 

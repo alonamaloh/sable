@@ -1302,13 +1302,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 // step, and the cmp closers (first-difference, shorter-is-smaller,
 // pointwise-equal-means-equal), all through the in-file lemmas.
 
-/// discharge Nat::from_prefix.inv_preserved.k_0_k_k_i_self_limbs_get_k_xs_get_k by
-///   intro k hk1 hk2
-///   by_cases hki : k = i
-///   · rw [hki, Sable.Seq.get_set, if_pos rfl]
-///   · rw [Sable.Seq.get_set, if_neg hki]
-///     exact h_inv_k_0_k_k_i_self_limbs_get k hk1 (by omega)
-
 /// discharge Nat::from_prefix.inv_exit.limbs_len_0_limbs_get_limbs_len_1_1 by
 ///   by_cases h0 : n = 0
 ///   · left
@@ -1540,26 +1533,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   exact sub_step out a.limbs b.limbs i b.limbs.len borrow _r10 (by omega)
 ///     h_limb_or0_post_sel h_inv_valin_out_0_i_borrow_pw
 
-/// discharge sub.overflow.widen_u64_a_limbs_i_4294967296 by
-///   sable_norm
-///   have h := h_field_limbs_elems i (by omega) (by omega)
-///   omega
-
-/// discharge sub.overflow.widen_u64_a_limbs_i_4294967296_y by
-///   sable_norm
-///   have h := h_field_limbs_elems i (by omega) (by omega)
-///   omega
-
-/// discharge sub.overflow.widen_u64_a_limbs_i_4294967296_y_borrow by
-///   sable_norm
-///   have h := h_field_limbs_elems i (by omega) (by omega)
-///   omega
-
-/// discharge sub.overflow.1_s_4294967296 by
-///   sable_norm
-///   have h := h_field_limbs_elems i (by omega) (by omega)
-///   omega
-
 /// discharge sub.post.diff by
 ///   sable_norm
 ///   have hll : b.limbs.len ≤ a.limbs.len :=
@@ -1623,11 +1596,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   exact mul_inner_step out a.limbs b.limbs i j (a.limbs.len + b.limbs.len)
 ///     b.limbs.len carry _ (by omega) (by omega) (by omega) (by omega) rfl
 ///     h_inv_valin_out_0_n_carry_pw_i
-
-/// discharge mul.inv_preserved.k_i_lb_k_k_n_out_get_k_0.2 by
-///   intro k hk1 hk2
-///   rw [Sable.Seq.get_set, if_neg (by omega)]
-///   exact h_inv_k_i_lb_k_k_n_out_get_k_0 k (by omega) hk2
 
 /// discharge mul.inv_preserved.valin_out_0_n_valin_a_limbs_0_i_valin_b by
 ///   have hj : j = b.limbs.len := by omega
@@ -1896,13 +1864,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///     have hz := valIn_nil (b.limbs) 0 ((b.limbs).len) (by omega)
 ///     simp only [natVal] at h_pre_natval_b_limbs_1
 ///     omega
-
-/// discharge div.assert.r2_bound by
-///   have hu := h_field_limbs_elems_5 (j - 1) (by omega) (by omega)
-///   have hmax : (u32.max : Int) = 4294967295 := rfl
-///   have hb := shift_stays_bounded (natVal r.limbs) (natVal vn.limbs) ((u.limbs).get (j - 1))
-///     h_inv_natval_r_limbs_natval_vn hu.1 (by omega)
-///   omega
 
 /// discharge div.assert.r2_len by
 ///   have hvnlt := valIn_lt_pw (vn.limbs) 0 ((vn.limbs).len) h_field_limbs_elems_4

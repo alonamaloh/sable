@@ -94,33 +94,3 @@ fn demo_u8() -> u8 {
 // invariant instantiated across the get_set case split — ONCE, at the
 // template (ADR 0009): these four discharges cover every
 // instantiation of Vec<T>.
-
-/// discharge Vec::push.inv_preserved.k_0_k_k_i_nb_get_k_self_buf_get_k by
-///   intro k hk0 hk
-///   by_cases hki : k = i
-///   · simp [Sable.Seq.get_set, hki]
-///   · have h2 := h_inv_k_0_k_k_i_nb_get_k_self k hk0 (by omega)
-///     simp [Sable.Seq.get_set, hki]
-///     exact h2
-
-/// discharge Vec::push.post.k_0_k_k_old_self_len_self_buf_get_k_old by
-///   intro k hk0 hk
-///   have h2 := h_inv_k_0_k_k_i_nb_get_k_self k hk0 (by omega)
-///   have hne : k ≠ _old_self.len := by omega
-///   simp [Sable.Seq.get_set, hne]
-///   exact h2
-
-/// discharge Vec::push.inv_preserved.k_0_k_k_i_nb_get_k_self_buf_get_k.2 by
-///   intro k hk0 hk
-///   by_cases hki : k = i
-///   · simp [Sable.Seq.get_set, hki]
-///   · have h2 := h_inv_k_0_k_k_i_nb_get_k_self k hk0 (by omega)
-///     simp [Sable.Seq.get_set, hki]
-///     exact h2
-
-/// discharge Vec::push.post.k_0_k_k_old_self_len_self_buf_get_k_old.2 by
-///   intro k hk0 hk
-///   have h2 := h_inv_k_0_k_k_i_nb_get_k_self k hk0 (by omega)
-///   have hne : k ≠ _old_self.len := by omega
-///   simp [Sable.Seq.get_set, hne]
-///   exact h2

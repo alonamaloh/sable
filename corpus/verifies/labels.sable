@@ -18,11 +18,3 @@ fn zero_all(&mut [i32] a) {
         a[i] = 0;
     }
 }
-
-/// discharge zero_all.inv_preserved.prefix_zeroed by
-///   intro k hk0 hk
-///   by_cases hki : k = i
-///   · simp [Sable.Seq.get_set, hki]
-///   · have h2 := h_inv_prefix_zeroed k hk0 (by omega)
-///     simp [Sable.Seq.get_set, hki]
-///     exact h2

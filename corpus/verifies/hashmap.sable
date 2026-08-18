@@ -343,21 +343,7 @@ fn demo() {
 ///     omega
 ///   · exact h_inv_j2_0_j2_j2_j_self_occ_ge j2 hj20 (by omega)
 
-/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1 by
-///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
-///   intro i hi0 hic
-///   by_cases hip : i = p
-///   · rw [if_pos hip]
-///     right
-///     rfl
-///   · rw [if_neg hip]
-///     exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
-
 /// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.2 by
-///   intro i hi0 hic
-///   exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
-
-/// discharge HashMap::insert.inv_exit.i_0_i_i_occ_len_occ_get_i_0_occ_get_i_1.3 by
 ///   intro i hi0 hic
 ///   exact h_inv_i_0_i_i_cap_self_occ_get_2 i hi0 (by omega)
 
@@ -430,22 +416,6 @@ fn demo() {
 ///   intro h
 ///   exact (h_result.mp h).elim
 
-/// discharge HashMap::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i by
-///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
-///   intro i hi0 hic hold
-///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
-///   by_cases hip : i = p
-///   · exfalso
-///     rw [hip] at hfr hold
-///     omega
-///   · refine ⟨?_, ?_, ?_⟩
-///     · rw [if_neg hip, hfr.1]
-///       exact hold
-///     · rw [if_neg hip, hfr.2.1]
-///     · intro hne
-///       rw [if_neg hip]
-///       exact hfr.2.2
-
 /// discharge HashMap::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.2 by
 ///   simp only [Sable.Seq.len_set, Sable.Seq.get_set]
 ///   intro i hi0 hic hold
@@ -462,13 +432,3 @@ fn demo() {
 ///       exact h_path_self_loop_keys_get_p_k
 ///     · rw [if_neg hip]
 ///       exact hfr.2.2
-
-/// discharge HashMap::insert.post.i_0_i_i_self_occ_len_old_self_occ_get_i.3 by
-///   intro i hi0 hic hold
-///   have hfr := h_inv_i_0_i_i_cap_self_occ_get i hi0 (by omega)
-///   refine ⟨?_, ?_, ?_⟩
-///   · rw [hfr.1]
-///     exact hold
-///   · rw [hfr.2.1]
-///   · intro hne
-///     exact hfr.2.2

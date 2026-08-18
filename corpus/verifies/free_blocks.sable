@@ -147,8 +147,3 @@ pub fn free_block_round_trip() -> u64 {
 ///   simp [h_base_system, h_release_system, h_mem_system, hroot,
 ///     h_view23_extent.1, h_view23_extent.2.1,
 ///     h_view23_extent.2.2]
-
-/// discharge free_block_round_trip.post.result_37 by
-///   rw [h_cell_init] at h_value15_cell_value
-///   simp [Sable.LeasedPointsToU64View.put] at h_value15_cell_value
-///   omega

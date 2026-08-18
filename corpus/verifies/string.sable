@@ -68,12 +68,6 @@ operator cmp = cmp;
 
 // The copy-loop frame: the just-written cell is the source byte, the
 // prefix is the invariant.
-/// discharge String::from_bytes.inv_preserved.k_0_k_k_i_self_bytes_get_k_xs_get_k by
-///   intro k hk0 hklt
-///   rw [Sable.Seq.get_set]
-///   split
-///   · next heq => rw [heq]
-///   · next hne => exact h_inv_k_0_k_k_i_self_bytes_get k hk0 (by omega)
 
 // Validity survives the copy: the loop exits with a byte-for-byte
 // image of xs, and validScan_congr transfers the pre.

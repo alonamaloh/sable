@@ -91,19 +91,6 @@ pub fn hex_decode(&[u8] src, &mut [u8] dst) -> bool {
 ///     simp [Sable.Seq.get_set, hne1, hne2, hne3, hne4]
 ///     omega
 
-/// discharge hex_decode.inv_preserved.k_0_k_k_i_dst_get_k_16_unhex_src_get_2_k by
-///   have h7 := h_unhex_char_post_result_unhex_c
-///   have h8 := h_unhex_char_post_result_unhex_c_2
-///   simp only [unhex] at h7 h8
-///   intro k hk0 hk
-///   by_cases hki : k = i
-///   · simp [Sable.Seq.get_set, hki]
-///     omega
-///   · have hkalt := h_inv_k_0_k_k_i_dst_get_k_16_u k hk0 (by omega)
-///     simp only [unhex] at hkalt
-///     simp [Sable.Seq.get_set, hki]
-///     omega
-
 // The round trip, stated over the ghost maps alone (pure Lean): decoding
 // what hex_encode's post says about a byte gives the byte back.
 
