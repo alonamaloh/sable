@@ -59,13 +59,6 @@ pub fn free_header_round_trip() -> u64 {
 ///       h_fact_base_2_alloc_free8_span]
 ///   · simp [Sable.FreeHeaderView.putFields]
 
-/// discharge free_header_round_trip.free_header.clear by
-///   exact ⟨h_fact_sable_pointstoview_names.1,
-///     h_fact_sable_pointstoview_names.2,
-///     h_fact_header_nextcell_alloc_ba.1.1,
-///     h_fact_header_nextcell_alloc_ba.1.2,
-///     h_fact_header_nextcell_alloc_ba.2⟩
-
 /// discharge free_header_round_trip.free_header.to_block by
 ///   rw [h_header_clear]
 ///   constructor

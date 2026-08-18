@@ -117,13 +117,6 @@ pub fn free_list_coalesce_head(raw<u8> base,
 ///   · rw [hfields.2]
 ///     simp
 
-/// discharge free_list_coalesce_head.free_header.clear by
-///   exact ⟨h_fact_sable_pointstoview_names.1,
-///     h_fact_sable_pointstoview_names.2,
-///     h_fact_header3_nextcell_alloc_s.1.1,
-///     h_fact_header3_nextcell_alloc_s.1.2,
-///     h_fact_header3_nextcell_alloc_s.2⟩
-
 /// discharge free_list_coalesce_head.free_header.to_block by
 ///   rw [h_successor_clear]
 ///   constructor
