@@ -5638,19 +5638,6 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
     }
 }
 
-/// The place an argument hands over by moving, if it does.
-///
-/// An owned array reaches a parameter by name (ADR 0085), and the `Var` arm
-/// of `check_expr` admits that spelling only where a sink asks for exactly
-/// that array type — so a `Var` argument still carrying an owned array type
-/// is a move, and `Place::local` is the storage it gives away.
-fn moved_place(a: &Expr) -> Option<Place> {
-    match (&a.kind, a.ty.as_ref()) {
-        (ExprKind::Var(name), Some(Ty::Array(_))) => Some(Place::local(name)),
-        _ => None,
-    }
-}
-
 /// Within one call, a mutable borrow must not overlap any other borrow, and
 /// a moved owner must not overlap any borrow at all.
 ///
@@ -5698,30 +5685,25 @@ fn check_borrow_conflicts(
             }
         }
     }
-    for a in args {
-        let Some(moved) = moved_place(a) else {
-            continue;
-        };
-        if let Some((borrowed, _, _)) = borrows.iter().find(|(p, _, _)| p.overlaps(&moved)) {
+    for (borrowed, _, span) in &borrows {
+        if ctx.is_moved(borrowed) {
             return Err(Diagnostic {
-                name: "array.moved_while_borrowed".into(),
+                name: "borrow.moved_in_call".into(),
                 title: format!(
                     "`{}` is both lent and handed over in one call",
-                    moved.render()
+                    borrowed.render()
                 ),
-                span: a.span,
+                span: *span,
                 label: format!(
-                    "this moves `{}`, which is borrowed by another argument",
-                    moved.render()
+                    "this borrow promises the caller keeps `{}`, which the same call moves",
+                    borrowed.render()
                 ),
                 notes: vec![(
                     "note".into(),
-                    format!(
-                        "a borrow promises the caller keeps `{}` for the length of the \
-                         call, and a move hands it to the callee: the contract would \
-                         frame one storage as two separate values",
-                        borrowed.render()
-                    ),
+                    "a borrow and a move of one storage reach the callee as two values its \
+                     contract frames separately, so a write through one is invisible to the \
+                     other"
+                        .into(),
                 )],
             });
         }

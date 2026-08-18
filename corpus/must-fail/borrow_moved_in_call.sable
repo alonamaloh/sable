@@ -1,4 +1,4 @@
-// expect-error: array.moved_while_borrowed
+// expect-error: borrow.moved_in_call
 // Lending an array and handing it over in the same call would give the callee
 // two names for one sequence: `m` is havocked into a fresh state at the call
 // while `xs` keeps the entry value, so the contract frames one storage as two

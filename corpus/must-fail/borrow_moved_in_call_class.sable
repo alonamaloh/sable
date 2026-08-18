@@ -1,0 +1,33 @@
+// expect-error: borrow.moved_in_call
+// The rule is not about arrays. A class value is a move sink too, and a
+// by-value class parameter's posts are substituted over the *caller's* chain,
+// so the caller proves `c.v = 0` from what it knew before the call while the
+// write through `m` changes the same object — the post below is provable and
+// false (`both` returns 99).
+
+class Box {
+    u64 v;
+
+    /// post self.v = n
+    init new(u64 n) {
+        self.v = n;
+    }
+
+    /// post self.v = 99
+    fn bump(&mut self) {
+        self.v = 99;
+    }
+}
+
+/// post result = c.v
+fn both(&mut Box m, Box c) -> u64 {
+    m.bump();
+    return c.v;
+}
+
+/// post result = 0
+fn caller() -> u64 {
+    mut var b = Box::new(0);
+    u64 r = both(&mut b, b);
+    return r;
+}

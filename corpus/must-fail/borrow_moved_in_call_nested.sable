@@ -1,0 +1,31 @@
+// expect-error: borrow.moved_in_call
+// The move need not be the argument itself. `dup` hands its parameter straight
+// back out, so `dup(a)` consumes `a` and returns the same storage the `&mut`
+// argument is lending — the callee receives one array under two names whose
+// contract frames them separately, and the post below is provable and false
+// (`both` returns 99, not 0).
+//
+// This is why the rule asks the checker whether the borrowed place was moved
+// rather than testing the shape of an argument: the ways a call can consume a
+// place are not enumerable by spelling.
+
+/// post result.len = xs.len
+/// post ∀ k, 0 ≤ k → k < xs.len → result.get k = xs.get k
+fn dup([u64] xs) -> [u64] {
+    return xs;
+}
+
+/// pre  m.len ≥ 1
+/// pre  ys.len ≥ 1
+/// post result = ys.get 0
+fn both(&mut [u64] m, [u64] ys) -> u64 {
+    m[0] = 99;
+    return ys[0];
+}
+
+/// post result = 0
+fn caller() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 0);
+    u64 r = both(&mut a, dup(a));
+    return r;
+}

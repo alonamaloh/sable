@@ -1,4 +1,4 @@
-// expect-error: array.moved_while_borrowed
+// expect-error: borrow.moved_in_call
 // The shared half of the same rule. A `&[T]` argument promises the caller
 // keeps the storage for the length of the call; handing the same array over
 // as an owned parameter in that call breaks the promise, whatever the callee
