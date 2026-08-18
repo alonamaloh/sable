@@ -1,0 +1,18 @@
+// pair: same-run
+// See array_return_carries_the_callees_writes.a.sable: the same subjects
+// build the array in place, with no call and no ownership transfer.
+
+/// post result = 15
+pub fn subject() -> u64 {
+    mut [u64] xs = alloc_array<u64>(3, 0);
+    xs[0] = 1;
+    xs[1] = 2;
+    return xs[0] * 10 + xs[1] + xs.len;
+}
+
+/// post result
+pub fn subject_bool() -> bool {
+    mut [bool] fs = alloc_array<bool>(2, false);
+    fs[1] = true;
+    return fs[1];
+}

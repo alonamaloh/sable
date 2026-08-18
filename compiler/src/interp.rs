@@ -364,9 +364,13 @@ fn validate_interp_fn(function: &Fn) -> Result<(), String> {
 /// reason that one is: `docs/shape-admission.md` asks each stage gate directly,
 /// and a rule spelled inline in a signature walk is a rule the table cannot see.
 pub(crate) fn validate_interp_return_ty(ty: Ty, context: &str) -> Result<(), String> {
-    if ty.is_array_of(&Ty::Bool) {
+    // A *borrowed* array is what a return may not be: the callee's frame
+    // stops keeping the storage it names. An owned one is precisely what a
+    // return hands over (ADR 0085), payload included — `RtVal::Arr` is one
+    // `Rc` whichever domain its tag names.
+    if ty.as_borrow().is_some() {
         return Err(format!(
-            "interp.array_position_unsupported: {context} is a Boolean array; Boolean arrays are supported only as owned locals"
+            "interp.borrow_return_unsupported: {context} is a borrow; a returned borrow would name storage the callee's frame stops keeping"
         ));
     }
     if ty.is_affine_option() {
@@ -612,18 +616,11 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
-                    if value
-                        .ty
-                        .as_ref()
-                        .is_some_and(|ty| ty.is_array_of(&Ty::Bool))
-                    {
-                        return Err(
-                            "interp.array_position_unsupported: returning a Boolean array; Boolean arrays are supported only as owned locals"
-                                .into(),
-                        );
-                    }
+                    // A return is the one boundary an owner may cross by
+                    // moving (ADR 0085): `eval_moved` clears the source
+                    // place, so the value leaves with the caller and the
+                    // scopes unwinding behind it find nothing to destroy.
                     validate_interp_expr(value, locals)?;
-                    reject_owned_bool_array_transport(value, locals, "return")?;
                 }
             }
             Stmt::Assert(_) => {}
@@ -873,6 +870,10 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                 | ExprKind::AllocArray { .. }
                 | ExprKind::OptTake { .. }
                 | ExprKind::Var(_)
+                // A verified callee hands its owner over (ADR 0085), so a
+                // call result is storage the destruction rules already know
+                // about: the callee's frame stopped owning it at the return.
+                | ExprKind::Call { .. }
         )
     {
         return Err(
@@ -938,7 +939,6 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                 validate_interp_expr(arg, locals)?;
                 reject_owned_bool_array_transport(arg, locals, "call argument")?;
             }
-            reject_bool_array_result(expr, "call result")?;
         }
         ExprKind::Unary { op, operand } => match op {
             UnOp::Not => {
@@ -1289,11 +1289,17 @@ fn validate_interp_sink(
     if expected.is_owned_array_of(&Ty::Bool)
         && !matches!(
             expr.kind,
-            ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } | ExprKind::OptTake { .. }
+            ExprKind::ArrayLit(_)
+                | ExprKind::AllocArray { .. }
+                | ExprKind::OptTake { .. }
+                // A call hands its owner over at the return (ADR 0085), so
+                // the value this declaration receives is storage nothing
+                // else still names.
+                | ExprKind::Call { .. }
         )
     {
         return Err(format!(
-            "interp.array_position_unsupported: {context} receives an owned Boolean array through an unsupported transport; only owned literals and allocations are executable"
+            "interp.array_position_unsupported: {context} receives an owned Boolean array through an unsupported transport; only owned literals, allocations, and handed-over call results are executable"
         ));
     }
     Ok(())
@@ -5081,17 +5087,33 @@ mod payload_guard_tests {
         ));
         assert!(validate_interp_program(&program).is_err());
 
-        let forged_call = expr(
+        // An ordinary call hands an owner over (ADR 0085), so it is a
+        // producer. A *method* result is not: that boundary stays closed,
+        // and forging one still meets the producer allow-list.
+        let handed_over = expr(
             ExprKind::Call {
                 callee: "make".into(),
                 callee_span: Span::new(0, 0),
                 type_args: vec![],
                 args: vec![],
             },
+            Some(bool_array.clone()),
+        );
+        validate_interp_expr(&handed_over, &HashMap::new())
+            .expect("a call result is an owner the callee handed over");
+
+        let forged_member = expr(
+            ExprKind::MethodCall {
+                recv: "holder".into(),
+                recv_span: Span::new(0, 0),
+                method: "make".into(),
+                method_span: Span::new(0, 0),
+                args: vec![],
+            },
             Some(bool_array),
         );
         assert!(
-            validate_interp_expr(&forged_call, &HashMap::new())
+            validate_interp_expr(&forged_member, &HashMap::new())
                 .unwrap_err()
                 .starts_with("interp.array_position_unsupported:")
         );

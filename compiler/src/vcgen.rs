@@ -642,12 +642,18 @@ pub(crate) fn validate_vc_type_position(
     // and `check::borrow_referent_ty`'s to state.
     if ty.is_owned_array_of(&Ty::Bool) {
         let position = match position {
-            VcTypePosition::Expression | VcTypePosition::Local | VcTypePosition::ClassField => {
+            // A return joins the positions an owned Boolean array occupies:
+            // the transfer is payload-blind (ADR 0085), and the proof state a
+            // returned sequence carries is `lean_array_ty`'s, which reads the
+            // element type exactly as every other array site does.
+            VcTypePosition::Expression
+            | VcTypePosition::Local
+            | VcTypePosition::ClassField
+            | VcTypePosition::Return => {
                 return Ok(());
             }
             VcTypePosition::Parameter => "a function parameter",
             VcTypePosition::TraitParameter => "a trait parameter",
-            VcTypePosition::Return => "a function return",
             VcTypePosition::TraitReturn => "a trait return",
             VcTypePosition::RecordField => "a record field",
             VcTypePosition::Borrow => "a borrow",
@@ -729,11 +735,15 @@ fn expr_is_affine_option(expr: &Expr, locals: &HashMap<String, Ty>) -> bool {
         )
 }
 
+/// Where an owned Boolean array comes from. A literal and an allocation build
+/// one; a call hands one over, its owner having left the callee's frame at the
+/// return (ADR 0085). What is *not* here is a second name for storage someone
+/// else still holds, which is the whole point of enumerating producers.
 fn is_fresh_bool_array_value(expr: &Expr) -> bool {
     expr.ty == Some(Ty::array(Ty::Bool))
         && matches!(
             expr.kind,
-            ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. }
+            ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } | ExprKind::Call { .. }
         )
 }
 
@@ -1028,7 +1038,10 @@ fn validate_vc_expr(
         if is_owned_bool_array(ty.clone()) {
             match &expr.kind {
                 ExprKind::Var(name) if locals.get(name) == Some(ty) => {}
-                ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } => {}
+                // A call joins the list for the reason the list exists: a
+                // verified callee hands its owner over (ADR 0085), so the
+                // result is storage the ownership rules already accounted for.
+                ExprKind::ArrayLit(_) | ExprKind::AllocArray { .. } | ExprKind::Call { .. } => {}
                 ExprKind::Var(_) => {
                     return Err(format!(
                         "internal.vcgen.type_error: Boolean array variable has an inconsistent source type in {context}"
@@ -1529,7 +1542,12 @@ fn validate_vc_block_with_mutability(
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
-                    reject_owned_bool_array_value(value, locals, "a function return", context)?;
+                    // No owned-Boolean-array refusal here: a return is where
+                    // an owner is handed over (ADR 0085), and
+                    // `VcTypePosition::Return` below is what states which
+                    // shapes may cross. The remaining boundaries — a call
+                    // argument, an expression statement, a field store —
+                    // keep theirs.
                     reject_affine_option_value(value, locals, "a function return", context)?;
                     if let Some(ty) = &value.ty {
                         validate_vc_type_position(
@@ -3219,8 +3237,12 @@ impl<'a> Generator<'a> {
             Ty::Res(k) => lean_res_view_ty(*k, self.records),
             Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
             Ty::Unit => "Unit".into(),
-            Ty::Array(..) | Ty::Borrow(..) => {
-                unreachable!("checked: borrowed values and arrays are not return types")
+            // A returned array is its sequence, the same lift `&[T]` and
+            // `[T]` already share — binding mode never reached this type
+            // (ADR 0067), and returning the owner is what ADR 0085 opened.
+            Ty::Array(element) => lean_array_ty(element, self.records),
+            Ty::Borrow(..) => {
+                unreachable!("checked: borrowed values are not return types")
             }
         }
     }
@@ -3402,6 +3424,12 @@ impl<'a> Generator<'a> {
                             format!("(result = {chain})")
                         }
                         Val::Record(record) => format!("(result = {record})"),
+                        // A returned array is the sequence its name holds.
+                        // There is no `ret_inv` analogue: an array's checked
+                        // facts are its length and its element domain, both
+                        // true of every state the callee could have left it
+                        // in, and neither is a user invariant to re-establish.
+                        Val::Arr(chain) => format!("(result = {chain})"),
                         // Returning a resource returns its authority; in
                         // the logic that is just its view. There is no
                         // `ret_inv` analogue — a view carries its own
@@ -7162,8 +7190,21 @@ impl<'a> Generator<'a> {
                         self.binders
                             .push((ret_sym.clone(), "Option Sable.RawPtr".into()));
                     }
+                    // A returned array is storage the caller never named, so
+                    // its state is the fresh one every checked inhabitant
+                    // satisfies — the length bound and the payload's element
+                    // fact, through the one dispatch (ADR 0074). It is
+                    // deliberately `Bounded` and never `Eq`: a `&mut`
+                    // argument comes back with its length related to the
+                    // pre-call chain because it is the same storage, and a
+                    // return has no prior chain to relate to (ADR 0085).
+                    Ty::Array(..) => {
+                        let base = ret_sym.trim_start_matches('_').to_string();
+                        let ret_ty = sig.ret.clone();
+                        self.fresh_state_for(&ret_ty, &ret_sym, &base, LenFact::Bounded);
+                    }
                     Ty::Unit => {}
-                    returned @ (Ty::Array(..) | Ty::Borrow(..) | Ty::Res(_)) => {
+                    returned @ (Ty::Borrow(..) | Ty::Res(_)) => {
                         // Spelled out so a new constructor is a compile error
                         // here, and a return type with no fresh-state story
                         // refuses rather than binding nothing (ADR 0074).
@@ -7209,6 +7250,7 @@ impl<'a> Generator<'a> {
                     Ty::Bool => Val::Prop(ret_sym),
                     Ty::Class(_) => Val::Obj(ret_sym),
                     Ty::Record(_) => Val::Record(ret_sym),
+                    Ty::Array(_) => Val::Arr(ret_sym),
                     ref returned if returned.is_resource() => Val::View(ret_sym),
                     Ty::Raw(_) | Ty::RawRecord(_) => Val::Ptr(ret_sym),
                     Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
@@ -8807,10 +8849,18 @@ fn affine_loop(u64 n) {
             "synthetic declaration",
         )
         .expect("a Boolean array is class-field state");
+        // A return hands the owner over (ADR 0085), so it joins the
+        // positions an owned Boolean array occupies.
+        validate_vc_type_position(
+            Ty::array(Ty::Bool),
+            false,
+            VcTypePosition::Return,
+            "synthetic return",
+        )
+        .expect("a returned Boolean array is a value the callee hands over");
         for position in [
             VcTypePosition::Parameter,
             VcTypePosition::TraitParameter,
-            VcTypePosition::Return,
             VcTypePosition::RecordField,
             VcTypePosition::Borrow,
         ] {
@@ -9523,15 +9573,16 @@ fn bool_array_loop(u64 n, bool seed) {
 
     /// A call whose return type has no fresh-state story latches a named
     /// refusal instead of aborting. No `.sable` source reaches this — the
-    /// checker refuses such return types first — so the `internal.` name's
-    /// corpus exemption is earned here (ADR 0064, ADR 0074).
+    /// parser and the checker both refuse a returned borrow first (ADR 0085)
+    /// — so the `internal.` name's corpus exemption is earned here
+    /// (ADR 0064, ADR 0074).
     #[test]
     fn a_call_return_with_no_state_story_latches_a_named_refusal() {
         let _ = take_vc_type_refusal();
         let f = minimal_fn();
         let mut callee = minimal_fn();
         callee.name = "g".to_string();
-        callee.ret = Ty::array(Ty::Int(IntTy::U64));
+        callee.ret = Ty::borrow(Mutability::Shared, Ty::array(Ty::Int(IntTy::U64)));
         let classes: Vec<ClassDecl> = Vec::new();
         let records: Vec<RecordDecl> = Vec::new();
         let mut sigs: HashMap<String, FnSig> = HashMap::new();
@@ -9539,7 +9590,7 @@ fn bool_array_loop(u64 n, bool seed) {
             "g".to_string(),
             FnSig {
                 params: Vec::new(),
-                ret: Ty::array(Ty::Int(IntTy::U64)),
+                ret: Ty::borrow(Mutability::Shared, Ty::array(Ty::Int(IntTy::U64))),
             },
         );
         let mut fn_map: HashMap<&str, &Fn> = HashMap::new();
@@ -9577,7 +9628,7 @@ fn bool_array_loop(u64 n, bool seed) {
                 args: Vec::new(),
             },
             span: Span::new(0, 0),
-            ty: Some(Ty::array(Ty::Int(IntTy::U64))),
+            ty: Some(Ty::borrow(Mutability::Shared, Ty::array(Ty::Int(IntTy::U64)))),
         };
         generator.eval(&call);
         let latched = take_vc_type_refusal().expect("the return shape is latched");

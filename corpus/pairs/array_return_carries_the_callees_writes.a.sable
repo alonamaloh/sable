@@ -1,0 +1,39 @@
+// pair: same-run
+// Handing an owned array over at a return is transparent: the caller
+// receives the callee's storage, writes included. This half builds the
+// array inside a callee and returns it; the other half builds the same
+// array in place. A return that handed back the allocation without the
+// callee's stores, or that copied a stale pre-store state, would diverge
+// here.
+
+/// pre  n ≥ 2
+/// post result.len = n
+/// post result.get 0 = 1
+/// post result.get 1 = 2
+fn build(u64 n) -> [u64] {
+    mut [u64] xs = alloc_array<u64>(n, 0);
+    xs[0] = 1;
+    xs[1] = 2;
+    return xs;
+}
+
+/// post result = 15
+pub fn subject() -> u64 {
+    [u64] xs = build(3);
+    return xs[0] * 10 + xs[1] + xs.len;
+}
+
+/// pre  n ≥ 2
+/// post result.len = n
+/// post result.get 1 = true
+fn build_flags(u64 n) -> [bool] {
+    mut [bool] fs = alloc_array<bool>(n, false);
+    fs[1] = true;
+    return fs;
+}
+
+/// post result
+pub fn subject_bool() -> bool {
+    [bool] fs = build_flags(2);
+    return fs[1];
+}

@@ -1,0 +1,13 @@
+// expect-error: type.array_temporary
+// An owned array always has a place. A discarded result would be an owner
+// with no name and no lexical death, so a returned array has to be bound
+// exactly as a literal or an allocation does.
+
+fn make() -> [u64] {
+    mut [u64] xs = alloc_array<u64>(2, 0);
+    return xs;
+}
+
+fn test_discard() {
+    make();
+}

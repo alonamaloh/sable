@@ -1,0 +1,124 @@
+// Returning an owned array: the callee hands its storage over.
+//
+// `return xs;` moves the owner out — the source place dies, the value
+// leaves with the caller, and the scopes unwinding behind it find nothing
+// to destroy. At the call site the result is a *fresh* sequence: one
+// binder, the length bound `0 ≤ result.len ≤ u64.max`, and the payload's
+// element fact. That is deliberately weaker than what a `&mut [T]`
+// argument comes back with. A unique borrow's post-call length is equated
+// to the pre-call one, because it is the same storage; a returned array is
+// storage the caller never named, so the only thing relating it to
+// anything is what the callee's posts say.
+//
+// Which is why every subject here that needs a length states it.
+
+pub record Pt #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 x;
+    #[offset(8)] u64 y;
+}
+
+/// post result.len = n
+/// post ∀ k, 0 ≤ k → k < result.len → result.get k = fill
+pub fn filled(u64 n, u64 fill) -> [u64] {
+    mut [u64] xs = alloc_array<u64>(n, fill);
+    return xs;
+}
+
+// The caller reads the length back out of the post, not out of the
+// allocation it never saw.
+/// post result = 7
+pub fn head_of_filled() -> u64 {
+    [u64] xs = filled(4, 7);
+    return xs[0];
+}
+
+// A returned array flows into a second call as a borrow: the caller owns
+// it, so lending it is the ordinary borrow rule.
+/// post result ≤ 4
+pub fn count_of_filled() -> u64 {
+    [u64] xs = filled(4, 1);
+    return count_nonzero(&xs);
+}
+
+/// post result ≤ a.len
+pub fn count_nonzero(&[u64] a) -> u64 {
+    mut u64 c = 0;
+    /// invariant c ≤ i
+    for (u64 i : range(0, a.len)) {
+        if (a[i] != 0) { c = c + 1; }
+    }
+    return c;
+}
+
+// A loop over a returned array: the element fact the fresh state carries
+// is what bounds the sum, exactly as it does for a borrowed parameter.
+/// post result.len = 3
+pub fn three_ones() -> [u64] {
+    mut [u64] xs = alloc_array<u64>(3, 1);
+    return xs;
+}
+
+/// post result ≤ 3
+pub fn sum_of_three_ones() -> u64 {
+    [u64] xs = three_ones();
+    mut u64 total = 0;
+    /// invariant total ≤ i
+    /// invariant xs.len = 3
+    for (u64 i : range(0, xs.len)) {
+        if (xs[i] != 0) { total = total + 1; }
+    }
+    return total;
+}
+
+// A Boolean payload carries the length fact and no element fact: `Bool`
+// is already its complete value domain.
+/// post result.len = n
+/// post ∀ k, 0 ≤ k → k < result.len → result.get k = true
+pub fn all_set(u64 n) -> [bool] {
+    mut [bool] fs = alloc_array<bool>(n, true);
+    return fs;
+}
+
+/// post result
+pub fn second_is_set() -> bool {
+    [bool] fs = all_set(5);
+    return fs[1];
+}
+
+// A record payload carries elementwise `wf`, which is what bounds the
+// fields of an element the caller reads back.
+/// post result.len = n
+/// post ∀ k, 0 ≤ k → k < result.len → (result.get k).x = 1
+/// post ∀ k, 0 ≤ k → k < result.len → (result.get k).y = 2
+pub fn points(u64 n) -> [Pt] {
+    mut [Pt] ps = alloc_array<Pt>(n, Pt(1, 2));
+    return ps;
+}
+
+/// post result = 3
+pub fn head_point_sum() -> u64 {
+    [Pt] ps = points(2);
+    Pt h = ps[0];
+    return h.x + h.y;
+}
+
+// The array a callee returns is not the array the caller lent it. `grow`
+// takes a borrow and returns fresh storage; the post is what relates the
+// two, and it relates them elementwise rather than by identity.
+/// pre  a.len < 100
+/// post result.len = a.len + 1
+pub fn grow(&[u64] a) -> [u64] {
+    mut [u64] out = alloc_array<u64>(a.len + 1, 0);
+    /// invariant out.len = a.len + 1
+    for (u64 i : range(0, a.len)) {
+        out[i] = a[i];
+    }
+    return out;
+}
+
+/// post result.len = 3
+pub fn grown_from_two() -> [u64] {
+    mut [u64] a = alloc_array<u64>(2, 5);
+    [u64] b = grow(&a);
+    return b;
+}

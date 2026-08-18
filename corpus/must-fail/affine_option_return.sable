@@ -1,5 +1,6 @@
 // expect-error: type.affine_option_return
-// G2.1 is local-only and defines no affine-option return transport.
+// An affine option owns its payload, and no return transports one: it is
+// constructed, inspected, and emptied where it is declared.
 
 fn return_option() -> option<[bool]> {
     return none;

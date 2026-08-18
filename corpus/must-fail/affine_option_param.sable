@@ -1,5 +1,6 @@
 // expect-error: type.affine_option_param
-// G2.1 is local-only and defines no affine-option call ABI.
+// An affine option owns its payload, and no call boundary transports one:
+// it is constructed, inspected, and emptied where it is declared.
 
 fn inspect_parameter(option<[bool]> pending) -> bool {
     return pending.is_some;

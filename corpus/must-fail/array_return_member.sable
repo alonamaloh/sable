@@ -1,0 +1,17 @@
+// expect-error: type.member_array_return
+// An ordinary function hands an owned array over at a return. A method
+// call has its own receiver-state and result transport, and no array has
+// crossed it — so the member boundary refuses in its own name rather than
+// inheriting the ordinary function's rule.
+
+class Holder {
+    u64 n;
+
+    init new() {
+        self.n = 1;
+    }
+
+    fn flags(&self) -> [bool] {
+        return [true];
+    }
+}

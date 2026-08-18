@@ -220,9 +220,13 @@ pub(crate) fn validate_return_ty(ty: &Ty, context: &str) -> Result<(), String> {
     if ty.is_affine_option() {
         return Err(affine_option_unsupported(ty.clone(), context));
     }
-    if ty.is_bool_array() {
+    // A borrow is the shape a return may not have: `Arg.lend` is an argument
+    // form, and the machine restores a loan at the pop rather than carrying
+    // one out. An owner is carried out by value, whatever its payload — the
+    // return value `ret_pop` binds is data (ADR 0085).
+    if ty.as_borrow().is_some() {
         return Err(format!(
-            "svm.bool_array_position_unsupported: {context} is a Boolean array; Boolean arrays are owned locals only"
+            "svm.borrow_return_unsupported: {context} is a borrow; a loan returns to its owner at the pop rather than leaving as a value"
         ));
     }
     Ok(())
@@ -544,6 +548,16 @@ fn validate_affine_option_take(
 /// Keep that positional rule separate from payload classification: the latter
 /// describes the machine representation, while this function describes the
 /// intentionally smaller source-to-machine bridge.
+/// Whether a Boolean-array declaration takes the *construction* route.
+///
+/// The fresh-local route exists for building an array in place — a literal,
+/// an allocation, or an atomic take. A call result is not built here but
+/// *received*: the callee hands its owner over at the return (ADR 0085), and
+/// the general bind path already knows how to name a call result.
+fn builds_a_fresh_bool_array(ty: &Ty, init: Option<&Expr>) -> bool {
+    ty.is_bool_array() && !matches!(init.map(|e| &e.kind), Some(ExprKind::Call { .. }))
+}
+
 fn validate_fresh_bool_array_initializer(
     ctx: &LowerCtx<'_>,
     declared_ty: Ty,
@@ -1021,7 +1035,35 @@ fn validate_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
                 .into(),
         );
     }
+    if returned_owner(ctx, value)? {
+        return Ok(());
+    }
     validate_sink_type(ctx, expected.clone(), value, "return value")
+}
+
+/// Whether this return hands an owned array over by naming it.
+///
+/// Naming an owned array is a *move*, which every other expression position
+/// refuses — an owner is read by index or length and lent by borrow, because
+/// binding its value elsewhere would leave two names for one sequence in the
+/// machine's environment. A return is the sink that move is for (ADR 0085):
+/// `ret` discards the callee's frame, so the value leaving is the only name
+/// that survives.
+fn returned_owner(ctx: &LowerCtx<'_>, value: &Expr) -> Result<bool, String> {
+    let Some(expected) = ctx.return_ty.as_ref().and_then(Ty::as_owned_array) else {
+        return Ok(false);
+    };
+    let ExprKind::Var(name) = &value.kind else {
+        return Ok(false);
+    };
+    let local = ctx.initialized_local(name, "return value")?;
+    // A disagreeing annotation falls through rather than being accepted here:
+    // `validate_local_var` owns that coherence rule and names it, and a
+    // forged result type must not ride out on the ownership rule.
+    if value.ty.as_ref().is_some_and(|annotation| *annotation != local.ty) {
+        return Ok(false);
+    }
+    Ok(local.ty.as_owned_array() == Some(expected))
 }
 
 fn validate_array_exposure(ctx: &LowerCtx<'_>, array: &str, mutable: bool) -> Result<(), String> {
@@ -1563,7 +1605,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                         *mutable,
                         init.as_ref(),
                     )?;
-                } else if ty.is_bool_array() {
+                } else if builds_a_fresh_bool_array(ty, init.as_ref()) {
                     let Some(init) = init else {
                         return Err(format!(
                             "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
@@ -1642,7 +1684,11 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
             }
             Stmt::Return { value, .. } => {
                 if let Some(value) = value {
-                    validate_expr_payloads(ctx, value)?;
+                    // The payload walk refuses a named owner as a transport;
+                    // `validate_return` is where the return's own rule lives.
+                    if !returned_owner(ctx, value)? {
+                        validate_expr_payloads(ctx, value)?;
+                    }
                     validate_return(ctx, value)?;
                 }
             }
@@ -1666,7 +1712,7 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                     ));
                 }
                 validate_ty_payload(ty.clone(), &format!("inferred declaration `{name}`"))?;
-                if ty.is_bool_array() {
+                if builds_a_fresh_bool_array(&ty, Some(init)) {
                     validate_fresh_bool_array_initializer(ctx, ty.clone(), init, name)?;
                 } else {
                     validate_expr_payloads(ctx, init)?;
@@ -1842,7 +1888,13 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
         if ty.is_owned_bool_array()
             && !matches!(
                 &expr.kind,
-                ExprKind::OptTake { .. } | ExprKind::OptValue { .. }
+                // A name and a call result join the take: both are how an
+                // owner is handed over (ADR 0085) — the name at a `return`,
+                // the call result at the declaration that receives it.
+                ExprKind::OptTake { .. }
+                    | ExprKind::OptValue { .. }
+                    | ExprKind::Var(_)
+                    | ExprKind::Call { .. }
             )
         {
             return Err(
@@ -2168,7 +2220,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             mutable,
             init,
             ..
-        } if ty.is_bool_array() => {
+        } if builds_a_fresh_bool_array(ty, init.as_ref()) => {
             let Some(initializer) = init else {
                 return Err(format!(
                     "svm.bool_array_fresh_local: Boolean array local `{name}` must be initialized by a fresh literal or allocation"
@@ -2241,7 +2293,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             ty: Some(ty),
             mutable,
             ..
-        } if ty.is_bool_array() => {
+        } if builds_a_fresh_bool_array(ty, Some(init)) => {
             let lowered = lower_fresh_bool_array_bind(ctx, name, ty.clone(), init)?;
             ctx.insert_local(name, ty.clone(), *mutable, true)?;
             Some(lowered)
@@ -2473,7 +2525,13 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
         }
         Stmt::Return { value: Some(e), .. } => {
             validate_return(ctx, e)?;
-            Some(format!("(.ret {})", lower_expr(ctx, e)?))
+            if let (true, ExprKind::Var(name)) = (returned_owner(ctx, e)?, &e.kind) {
+                // Reading the owner's name is the move itself, and the frame
+                // it names is discarded at the pop (ADR 0085).
+                Some(format!("(.ret (.var \"{name}\"))"))
+            } else {
+                Some(format!("(.ret {})", lower_expr(ctx, e)?))
+            }
         }
         Stmt::Return { value: None, .. } => {
             return Err("bare `return;` has no SVM form (fall off the end instead)".into());
@@ -4479,13 +4537,18 @@ mod tests {
             "{error}"
         );
 
-        let returned = checked_fn(array_ty.clone(), Vec::new());
-        let error =
-            lower_fn_entry(&program, &returned).expect_err("Boolean arrays have no SVM result ABI");
-        assert!(
-            error.starts_with("svm.bool_array_position_unsupported:"),
-            "{error}"
-        );
+        // A return is not a position an owner is refused at: the machine
+        // carries the value out at the pop, whatever its payload (ADR 0085).
+        // What a result may not be is a loan, which returns to its owner
+        // instead of leaving as a value.
+        validate_return_ty(&array_ty, "probe return")
+            .expect("the machine carries an owned array out by value");
+        let error = validate_return_ty(
+            &Ty::borrow(Mutability::Shared, array_ty.clone()),
+            "probe return",
+        )
+        .expect_err("a loan does not leave as a value");
+        assert!(error.starts_with("svm.borrow_return_unsupported:"), "{error}");
 
         let mut field_program = empty_program();
         field_program.classes.push(ClassDecl {

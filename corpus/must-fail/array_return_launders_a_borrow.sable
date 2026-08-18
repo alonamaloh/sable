@@ -1,0 +1,10 @@
+// expect-error: type.array_value
+// A `&mut [T]` parameter names storage its caller keeps. Returning it as
+// an owned `[T]` would hand the caller's own array back as a second owner,
+// and both names would reach the same elements while the logic treats them
+// as separate values. A bare array name is a value exactly where it is
+// handed over, and a borrow owns nothing to hand over.
+
+fn steal(&mut [u64] m) -> [u64] {
+    return m;
+}

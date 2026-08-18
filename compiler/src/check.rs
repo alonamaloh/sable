@@ -1444,13 +1444,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     check_expr(ctx, e, Some(ty.clone()))?;
                     unreachable!("affine-option `.value` must be rejected")
                 }
-                let alloc_init = matches!(
+                // Where an owned array may come from. A call joins the
+                // allocation and the literal because a verified callee hands
+                // its owner over (ADR 0085) — which is what makes the result
+                // storage this declaration may name, rather than a second
+                // name for something the caller already holds.
+                let owner_init = matches!(
                     init.as_ref().map(|e| &e.kind),
                     Some(ExprKind::AllocArray { .. })
                         | Some(ExprKind::ArrayLit(_))
                         | Some(ExprKind::OptTake { .. })
+                        | Some(ExprKind::Call { .. })
                 );
-                if matches!(ty, Ty::Array(_)) && !ctx.in_test && !alloc_init {
+                if matches!(ty, Ty::Array(_)) && !ctx.in_test && !owner_init {
                     return Err(Diagnostic {
                         name: "type.owned_array_outside_test".into(),
                         title: "owned arrays exist only in test functions for now".into(),
@@ -1875,15 +1881,22 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             }
             Stmt::ExprStmt(e) => {
                 let ty = check_expr(ctx, e, None)?;
-                if ty == Ty::array(Ty::Bool) {
+                // An owned array always has a place. Discarding one would
+                // leave an owner with no name and no lexical death, which is
+                // the one thing every array's storage story depends on
+                // (ADR 0085) — so a returned owner has to be bound, exactly
+                // as a literal or an allocation does.
+                if matches!(ty, Ty::Array(_)) {
                     return Err(Diagnostic {
-                        name: "type.bool_array_temporary".into(),
-                        title: "discarding a Boolean array temporary".into(),
+                        name: "type.array_temporary".into(),
+                        title: format!("discarding an owned `{}` temporary", ty.clone().name()),
                         span: e.span,
-                        label: "bind the literal or allocation to an owned local".into(),
+                        label: "bind it to an owned local".into(),
                         notes: vec![(
                             "note".into(),
-                            "an owned Boolean array has no temporary or transport form".into(),
+                            "an owned array has no temporary form: it is named, or it is \
+                             handed to something that names it"
+                                .into(),
                         )],
                     });
                 }
@@ -3012,16 +3025,22 @@ pub(crate) fn return_ty(ty: &Ty, fn_name: &str, span: Span) -> CResult<()> {
         return Err(affine_option_boundary(ty.clone(), span, "return"));
     }
     validate_aggregate_ty(ty.clone(), span)?;
-    if matches!(ty, Ty::Array(..)) {
+    // A returned borrow would name storage the callee's frame stops keeping,
+    // which is the parser's `TyPos::Return` row and its name. Saying it here
+    // too is not redundancy: an owned array is returnable (ADR 0085), so the
+    // arm that used to refuse every array is gone, and a rule that reads
+    // `Ty::Array` is not borrow-transparent — leaving the referent to decide
+    // would make `&[T]` returnable the moment this function stopped looking.
+    if ty.as_borrow().is_some() {
         return Err(Diagnostic {
-            name: "type.array_return".into(),
-            title: format!("function `{fn_name}` returns an array"),
+            name: "type.return_unsupported".into(),
+            title: format!("function `{fn_name}` returns a borrow"),
             span,
-            label: "arrays cannot be returned yet".into(),
+            label: format!("`{}` names storage it does not own", ty.clone().name()),
             notes: vec![(
                 "note".into(),
-                "an owned array local has no ownership-transfer rule across a return \
-                 boundary"
+                "a returned borrow would name storage that the callee's frame stops \
+                 keeping at the return; return the owner instead"
                     .into(),
             )],
         });
@@ -3120,10 +3139,13 @@ pub(crate) fn trait_return_ty(ty: &Ty, method_name: &str, span: Span) -> CResult
             )],
         });
     }
-    if matches!(ty, Ty::Bool | Ty::Record(_)) {
+    // An array joins the list for the reason `type.trait_param_unsupported`
+    // already gives about array parameters: an abstract trait call substitutes
+    // integer arguments into the trait's contract, and a sequence is not one.
+    if matches!(ty, Ty::Bool | Ty::Record(_)) || ty.as_array().is_some() {
         return Err(Diagnostic {
             name: "type.trait_return_unsupported".into(),
-            title: "trait calls do not return Boolean or POD-record values".into(),
+            title: "trait calls do not return Boolean, POD-record, or array values".into(),
             span,
             label: format!(
                 "`{}` is not supported as a trait method result",
@@ -3131,8 +3153,8 @@ pub(crate) fn trait_return_ty(ty: &Ty, method_name: &str, span: Span) -> CResult
             ),
             notes: vec![(
                 "note".into(),
-                "ordinary functions may return Boolean and POD-record values, but retained \
-                 trait calls do not yet model those result kinds"
+                "ordinary functions may return Boolean, POD-record, and array values, but \
+                 retained trait calls do not yet model those result kinds"
                     .into(),
             )],
         });
@@ -3157,6 +3179,24 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
 
     fn class_method(method: &Fn) -> CResult<()> {
         function(method)?;
+        // The same boundary the record refusal below names, for the same
+        // reason: an ordinary function transports an owned array out
+        // (ADR 0085), while a method call carries its own argument
+        // reification and receiver-state machinery that no array has crossed.
+        if method.ret.as_array().is_some() {
+            return Err(Diagnostic {
+                name: "type.member_array_return".into(),
+                title: "class methods may not return arrays yet".into(),
+                span: method.name_span,
+                label: "return the array from an ordinary function".into(),
+                notes: vec![(
+                    "note".into(),
+                    "method-call verification has separate receiver-state and result \
+                     transport; its array-valued result boundary is not implemented yet"
+                        .into(),
+                )],
+            });
+        }
         if matches!(method.ret, Ty::Record(_)) {
             return Err(Diagnostic {
                 name: "type.member_record_return".into(),
@@ -3606,12 +3646,31 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     });
                 }
                 if v.ty.as_array().is_some() {
+                    // An owned array moves where a sink asks for exactly its
+                    // type — out through `return`, into an owned parameter —
+                    // the same escape a class value has, and for the same
+                    // reason (ADR 0085): naming the array *is* handing it
+                    // over, and `transfer` kills the source place. Every
+                    // other read of a whole array stays refused, including
+                    // through a borrow, which owns nothing to hand over.
+                    let moves_here = matches!(&expected, Some(want) if *want == v.ty)
+                        && matches!(v.ty, Ty::Array(_))
+                        && v.initialized;
+                    if moves_here {
+                        e.ty = Some(v.ty.clone());
+                        return Ok(v.ty.clone());
+                    }
                     return Err(Diagnostic {
                         name: "type.array_value".into(),
                         title: format!("array `{name}` used as a value"),
                         span,
                         label: "arrays support only `a[i]` and `a.len` here".into(),
-                        notes: vec![],
+                        notes: vec![(
+                            "note".into(),
+                            "an owned array is a value where it is handed over — returned, \
+                             or passed to an owned `[T]` parameter"
+                                .into(),
+                        )],
                     });
                 }
                 if !v.initialized {
@@ -7065,7 +7124,7 @@ trait Bad {
     }
 
     #[test]
-    fn bool_array_fields_exposure_and_returns_stay_closed() {
+    fn bool_array_fields_and_exposure_stay_closed_while_returns_open() {
         let mut field = monomorphized_program(
             r#"
 class Holder {
@@ -7089,9 +7148,34 @@ fn bad() {
         );
         assert_eq!(check_error(&mut exposed).name, "expose.element_type");
 
-        let mut returned = monomorphized_program("fn bad() {}\n");
-        returned.fns[0].ret = Ty::array(Ty::Bool);
-        assert_eq!(check_error(&mut returned).name, "type.array_return");
+        // A return is where an owner is handed over (ADR 0085); a class
+        // method's result boundary is what stays closed.
+        let mut returned = monomorphized_program(
+            r#"
+fn good() -> [bool] {
+    [bool] flags = [true];
+    return flags;
+}
+"#,
+        );
+        check(&mut returned).expect("an ordinary function hands its owned array over");
+
+        let mut member = monomorphized_program(
+            r#"
+class Holder {
+    u64 n;
+
+    init new() {
+        self.n = 1;
+    }
+
+    fn flags(&self) -> [bool] {
+        return [true];
+    }
+}
+"#,
+        );
+        assert_eq!(check_error(&mut member).name, "type.member_array_return");
     }
 
     #[test]
@@ -7126,10 +7210,7 @@ record Flag #[layout(size := 1, align := 1)] {
             panic!("expected the array allocation declaration");
         };
         discarded.fns[0].body.push(Stmt::ExprStmt(allocation));
-        assert_eq!(
-            check_error(&mut discarded).name,
-            "type.bool_array_temporary"
-        );
+        assert_eq!(check_error(&mut discarded).name, "type.array_temporary");
     }
 
     #[test]

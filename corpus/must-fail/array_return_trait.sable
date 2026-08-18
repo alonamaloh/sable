@@ -1,0 +1,8 @@
+// expect-error: type.trait_return_unsupported
+// An abstract trait call substitutes integer arguments into the trait's
+// contract, and a sequence is not one — the same reason
+// `type.trait_param_unsupported` gives about an array parameter.
+
+trait Maker {
+    fn make(Self seed) -> [u64];
+}

@@ -1,0 +1,75 @@
+// Dynamic checks for returned arrays: what a caller actually receives.
+//
+// The static half says the result is a fresh sequence whose only facts are
+// the callee's posts. The half to observe at run time is ownership — the
+// value leaves the callee with the caller, so the array a caller holds is
+// live storage it may read, write, and lend after the callee's frame is
+// gone. Two returned arrays are two allocations: writing one leaves the
+// other alone.
+
+use array_return;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+fn test_the_caller_receives_the_length_the_post_states() {
+    [u64] xs = filled(4, 7);
+    /// assert #[label(length)] xs.len = 4
+    expect_eq(xs.len, 4);
+    expect_eq(xs[0], 7);
+    expect_eq(xs[3], 7);
+}
+
+fn test_the_returned_array_outlives_the_callee_frame() {
+    mut [u64] xs = filled(3, 1);
+    xs[0] = 42;
+    /// assert #[label(written_after_the_callee_returned)] xs.get 0 = 42
+    expect_eq(xs[0], 42);
+    expect_eq(xs[1], 1);
+}
+
+fn test_two_returns_are_two_allocations() {
+    mut [u64] a = filled(2, 0);
+    mut [u64] b = filled(2, 0);
+    a[0] = 9;
+    /// assert #[label(the_other_array_is_untouched)] b.get 0 = 0
+    expect_eq(a[0], 9);
+    expect_eq(b[0], 0);
+}
+
+fn test_a_returned_array_can_be_lent() {
+    [u64] xs = filled(5, 1);
+    expect_eq(count_nonzero(&xs), 5);
+}
+
+fn test_a_returned_array_carries_its_payload() {
+    [bool] fs = all_set(3);
+    expect_true(fs[0]);
+    expect_true(fs[2]);
+    expect_eq(fs.len, 3);
+}
+
+fn test_a_returned_record_array_carries_its_elements() {
+    [Pt] ps = points(2);
+    Pt head = ps[0];
+    expect_eq(head.x, 1);
+    expect_eq(head.y, 2);
+}
+
+fn test_a_callee_may_return_storage_grown_from_a_borrow() {
+    mut [u64] a = alloc_array<u64>(2, 5);
+    mut [u64] b = grow(&a);
+    /// assert #[label(the_lent_array_is_unchanged)] a.len = 2
+    expect_eq(a.len, 2);
+    expect_eq(b.len, 3);
+    expect_eq(b[0], 5);
+    expect_eq(b[2], 0);
+    b[0] = 8;
+    /// assert #[label(the_grown_array_is_separate_storage)] a.get 0 = 5
+    expect_eq(a[0], 5);
+}

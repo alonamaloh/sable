@@ -1,0 +1,18 @@
+// expect-error: type.array_field_value
+// A class field's array belongs to the class. Returning it would move an
+// owner out of `self` and leave the invariant naming storage the method
+// gave away — a whole-array field read is refused wherever it appears.
+
+class Holder {
+    [u64] buf;
+
+    /// invariant buf.len = 2
+
+    init new() {
+        self.buf = alloc_array<u64>(2, 0);
+    }
+}
+
+fn leak(&Holder h) -> [u64] {
+    return h.buf;
+}

@@ -1,0 +1,95 @@
+// SVM differential subjects: an owned array crosses a return.
+//
+// The machine's `ret` carries any value, so a returned sequence needs no
+// rule, evaluator arm, or agreement case of its own — what these subjects
+// compare is that the two executables agree on what the caller receives.
+// They disagree by construction about *how*: the interpreter hands over
+// the same `Rc` the callee held, while the machine copies a value into the
+// caller's environment at the pop. Both are faithful only because the
+// callee's frame stops naming the storage at the return, which is what a
+// move means, and that is exactly the claim these subjects test.
+//
+// Calls live at statement level, so a returned array is bound to a local
+// before it is read.
+
+fn build(u64 n) -> [u64] {
+    mut [u64] xs = alloc_array<u64>(n, 0);
+    xs[0] = 4;
+    return xs;
+}
+
+fn build_flags(u64 n) -> [bool] {
+    mut [bool] fs = alloc_array<bool>(n, true);
+    fs[0] = false;
+    return fs;
+}
+
+// The callee's store is visible to the caller.
+fn returned_array_carries_the_store() -> u64 {
+    [u64] xs = build(3);
+    return xs[0];
+}
+
+// The length is the callee's allocation, not the caller's guess.
+fn returned_array_carries_its_length() -> u64 {
+    [u64] xs = build(5);
+    return xs.len;
+}
+
+// A returned array is ordinary caller storage afterwards: writing it is a
+// write to the caller's own array.
+fn the_caller_may_write_what_it_received() -> u64 {
+    mut [u64] xs = build(2);
+    xs[1] = 9;
+    return xs[0] + xs[1];
+}
+
+// Two calls are two allocations; writing one leaves the other alone.
+fn two_returns_do_not_alias() -> u64 {
+    mut [u64] a = build(2);
+    [u64] b = build(2);
+    a[0] = 7;
+    return a[0] * 10 + b[0];
+}
+
+// The payload tag survives the return.
+fn returned_boolean_array_carries_its_payload() -> bool {
+    [bool] fs = build_flags(2);
+    return fs[1];
+}
+
+fn returned_boolean_array_carries_the_store() -> bool {
+    [bool] fs = build_flags(2);
+    return fs[0];
+}
+
+// An empty array still returns, and still knows its length.
+fn an_empty_array_returns() -> u64 {
+    [u64] xs = build_empty();
+    return xs.len;
+}
+
+fn build_empty() -> [u64] {
+    [u64] xs = alloc_array<u64>(0, 0);
+    return xs;
+}
+
+// A trap inside the callee is the caller's outcome: the return never
+// happens, and no array reaches the caller at all.
+fn a_callee_trap_precedes_the_return() -> u64 {
+    [u64] xs = build_out_of_bounds(1);
+    return xs[0];
+}
+
+fn build_out_of_bounds(u64 n) -> [u64] {
+    mut [u64] xs = alloc_array<u64>(n, 0);
+    xs[5] = 1;
+    return xs;
+}
+
+// Reading past the end of a returned array traps in the caller, against
+// the length the callee actually allocated.
+fn reading_past_a_returned_array_traps() -> u64 {
+    [u64] xs = build(2);
+    return xs[7];
+}
