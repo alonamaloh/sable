@@ -1906,9 +1906,7 @@ impl<'a> Interp<'a> {
                 // established convention: clauses read current contents, and
                 // `old p` is the snapshot taken above.
                 (array @ RtVal::Arr(_), ty) if matches!(ty, Ty::Array(_)) => {
-                    frame
-                        .entry_scalars
-                        .insert(p.name.clone(), deep_copy(array));
+                    frame.entry_scalars.insert(p.name.clone(), deep_copy(array));
                 }
                 (RtVal::Arr(_), _) => {}
                 _ => {

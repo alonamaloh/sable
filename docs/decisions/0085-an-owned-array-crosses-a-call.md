@@ -89,6 +89,28 @@ passing **moves** ownership unless the type is `copy`", and an array is not
    disappearing: "array arguments are passed by explicit borrow" stops being
    true of every array parameter and stays true of every borrowed one.
 
+   **A moved owner may not overlap a borrow in the same call**
+   (`array.moved_while_borrowed`). This is ADR 0022/0023's overlap rule seen
+   from the other side, and the new sink genuinely needed it: `f(&mut a, a)`
+   hands the callee a borrow promising the caller keeps the storage *and* the
+   storage itself, so VC generation havocs `m` into a fresh sequence while `xs`
+   keeps the entry value, and one write reaches both. That combination verified
+   a false postcondition before this rule existed. Argument order is why it
+   needs stating separately: a borrow *after* a move meets
+   `array.use_after_move`, because the move already killed the place, while a
+   move after a borrow leaves the borrow recorded and nothing relating them.
+   The shared case is refused too — a promise the caller keeps the storage is
+   broken by giving it away, whatever either name goes on to do.
+
+   The rule is stated for owned arrays rather than for every affine argument,
+   and the class case was checked rather than assumed: `f(&mut c, c)` is
+   admitted and is *not* exploitable, because a by-value class parameter binds
+   a fresh state carrying field facts and the invariant rather than an equation
+   to the caller's value, so the logic never relates the two names closely
+   enough to contradict itself. That is a property of how class arguments are
+   modelled, not of the overlap rule — if a later slice ties a class parameter
+   to its caller's state, this is the rule to widen.
+
 4. **An owned array parameter is not writable, because no parameter is.**
    Element stores need the exclusive right to storage, which a `mut` owner and
    a unique borrow have; a parameter has no `mut` spelling in the language, so
@@ -103,9 +125,12 @@ passing **moves** ownership unless the type is `copy`", and an array is not
    interpreter shares the caller's `Rc` with the callee (ADR 0068) while the
    formal machine copies the argument value at `call_enter` (ADR 0069). A
    callee that could write through an owned parameter would write the caller's
-   storage in one implementation and its own copy in the other; today the
-   caller's place is dead, so nothing could observe the difference, but an
-   unwritable parameter makes the difference unwritable instead of invisible.
+   storage in one implementation and its own copy in the other. What keeps that
+   unobservable is that the caller's place is dead for the rest of its scope —
+   and the one arrangement where it was *not* dead, `f(&mut a, a)`, is exactly
+   what decision 3's overlap rule had to close. An unwritable parameter makes
+   the divergence unwritable rather than leaving it resting on the reachability
+   argument alone.
 
 5. **An owned array always has a place.** A discarded array-valued call result
    would be an owner with no name and no lexical death, so it is refused:
@@ -199,8 +224,10 @@ unfolding, which a borrowed record array needs too. The negations keep a
 borrow from being laundered into an owner (`fn f(&mut [u64] m) -> [u64]`
 names a value it does not own), an owner from being read out of a field, a
 member or trait result from inheriting the ordinary function's rule, a
-discarded result from existing at all, and a store from reaching through a
-parameter. Two `same-run` pairs compare a return against building in place
+discarded result from existing at all, a store from reaching through a
+parameter, and an array from being lent and handed over in one call — that
+last one carries the false postcondition it used to prove, in both borrow
+modes, because a fence is worth more when it shows what it caught. Two `same-run` pairs compare a return against building in place
 and a move against a lend. `corpus/svm-diff/array_return.sable` and
 `array_param.sable` put the interpreter's shared `Rc` and the machine's copied
 value on the same outcomes in both directions.

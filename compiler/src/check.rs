@@ -5638,11 +5638,32 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
     }
 }
 
-/// Within one call, a mutable borrow must not overlap any other borrow.
+/// The place an argument hands over by moving, if it does.
+///
+/// An owned array reaches a parameter by name (ADR 0085), and the `Var` arm
+/// of `check_expr` admits that spelling only where a sink asks for exactly
+/// that array type — so a `Var` argument still carrying an owned array type
+/// is a move, and `Place::local` is the storage it gives away.
+fn moved_place(a: &Expr) -> Option<Place> {
+    match (&a.kind, a.ty.as_ref()) {
+        (ExprKind::Var(name), Some(Ty::Array(_))) => Some(Place::local(name)),
+        _ => None,
+    }
+}
+
+/// Within one call, a mutable borrow must not overlap any other borrow, and
+/// a moved owner must not overlap any borrow at all.
+///
 /// VCgen havocs the mutable argument into a fresh symbol and keeps the
 /// other arguments' pre-call symbols, so overlapping borrows would let
 /// the caller assume a contract framed over storage the callee actually
-/// changed — unsound, not merely imprecise.
+/// changed — unsound, not merely imprecise. A move is the same hazard from
+/// the other side: `f(&mut a, a)` hands the callee a borrow that promises
+/// the caller keeps the storage *and* the storage itself, and the callee's
+/// contract frames the two as separate sequences while one write reaches
+/// both. Argument order is why this needs saying: a move after a borrow
+/// leaves the borrow already recorded and nothing relating them, where a
+/// borrow after a move meets `array.use_after_move`.
 fn check_borrow_conflicts(
     ctx: &Ctx,
     args: &[Expr],
@@ -5675,6 +5696,34 @@ fn check_borrow_conflicts(
                     )],
                 });
             }
+        }
+    }
+    for a in args {
+        let Some(moved) = moved_place(a) else {
+            continue;
+        };
+        if let Some((borrowed, _, _)) = borrows.iter().find(|(p, _, _)| p.overlaps(&moved)) {
+            return Err(Diagnostic {
+                name: "array.moved_while_borrowed".into(),
+                title: format!(
+                    "`{}` is both lent and handed over in one call",
+                    moved.render()
+                ),
+                span: a.span,
+                label: format!(
+                    "this moves `{}`, which is borrowed by another argument",
+                    moved.render()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    format!(
+                        "a borrow promises the caller keeps `{}` for the length of the \
+                         call, and a move hands it to the callee: the contract would \
+                         frame one storage as two separate values",
+                        borrowed.render()
+                    ),
+                )],
+            });
         }
     }
     Ok(())

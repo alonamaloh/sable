@@ -1,0 +1,14 @@
+// expect-error: array.moved_while_borrowed
+// The shared half of the same rule. A `&[T]` argument promises the caller
+// keeps the storage for the length of the call; handing the same array over
+// as an owned parameter in that call breaks the promise, whatever the callee
+// does with either name.
+
+fn both(&[u64] m, [u64] xs) -> u64 {
+    return m.len + xs.len;
+}
+
+fn caller() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 1);
+    return both(&a, a);
+}

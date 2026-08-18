@@ -1,0 +1,25 @@
+// expect-error: array.moved_while_borrowed
+// Lending an array and handing it over in the same call would give the callee
+// two names for one sequence: `m` is havocked into a fresh state at the call
+// while `xs` keeps the entry value, so the contract frames one storage as two
+// separate values and a write through `m` is invisible to `xs`. The post
+// below is provable and false — `both(&mut a, a)` returns 7, not 0.
+//
+// Argument order is why the rule needs its own name: a borrow *after* a move
+// meets `array.use_after_move`, because the move already killed the place. A
+// move after a borrow leaves the borrow recorded with nothing relating them.
+
+/// pre  m.len ≥ 1
+/// pre  xs.len ≥ 1
+/// post result = xs.get 0
+fn both(&mut [u64] m, [u64] xs) -> u64 {
+    m[0] = 7;
+    return xs[0];
+}
+
+/// post result = 0
+fn caller() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 0);
+    u64 r = both(&mut a, a);
+    return r;
+}
