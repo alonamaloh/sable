@@ -90,6 +90,11 @@ elab "sable_grind" : tactic => do
         evalTactic tac
   tryCatchRuntimeEx (run budgetK (← `(tactic| grind))) fun e => do
     if e.isInterrupt then throw e
+    -- a runtime death below the budget (a simp rewrite cycle hitting the
+    -- recursion limit, an internal error) is a failure, not exhaustion;
+    -- report it as itself, demoted to an ordinary catchable error
+    if ((← IO.getNumHeartbeats) - start) / 1000 < budgetK then
+      throwError "`grind` failed: {e.toMessageData}"
     throwError "`grind` exceeded its heartbeat budget \
       ({budgetK}k; `sable.grindHeartbeats`)"
   let spent := ((← IO.getNumHeartbeats) - start) / 1000
@@ -336,22 +341,32 @@ macro_rules
     -- `solve`, not `first`: an alternative that merely makes progress
     -- (e.g. a partial simp_all) must not commit — every alternative
     -- either closes the goal or the next one runs.
+    -- Every data-dependent tier runs under `sable_slice`: a tier that
+    -- dies on a runtime error — heartbeat exhaustion or a simp rewrite
+    -- cycle blowing the recursion limit — must fail the alternative,
+    -- not abort the portfolio. The view-equation contexts of resource
+    -- code do produce such cycles in the bare `simp_all` tier, and the
+    -- `subst_eqs`-first tier behind it is immune; without the slice the
+    -- error escapes `solve` and the immune tiers never run.
     `(tactic| solve
         | assumption
         | rfl
-        | ((try sable_norm) <;> omega)
-        | ((try sable_norm) <;> (try simp only [Sable.Seq.len_set] at *) <;> omega)
+        | (sable_slice 100000 ((try sable_norm) <;> omega))
+        | (sable_slice 100000
+            ((try sable_norm) <;> (try simp only [Sable.Seq.len_set] at *) <;> omega))
         | (sable_slice 20000
             ((try sable_norm) <;> (intros) <;>
              (try simp only [Sable.Seq.len_set] at *) <;>
              (try simp only [Sable.Seq.get_set]) <;>
              (repeat split) <;> (try subst_eqs) <;> sable_instantiate))
-        | ((try sable_norm) <;> simp_all)
-        | ((try sable_norm) <;> (try subst_eqs) <;> simp_all <;> omega)
-        | ((try sable_norm) <;> sable_cases <;>
-           (first
-             | contradiction
-             | ((try simp) <;> (try simp_all) <;> (try omega))))
+        | (sable_slice 100000 ((try sable_norm) <;> simp_all))
+        | (sable_slice 100000
+            ((try sable_norm) <;> (try subst_eqs) <;> simp_all <;> omega))
+        | (sable_slice 100000
+            ((try sable_norm) <;> sable_cases <;>
+             (first
+               | contradiction
+               | ((try simp) <;> (try simp_all) <;> (try omega)))))
         | sable_grind)
 
 end Sable

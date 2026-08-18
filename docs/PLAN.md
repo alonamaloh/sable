@@ -1354,6 +1354,17 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **No tier may abort the portfolio (ADR 0083).** The free-list
+     `simp` recursion was run to ground: view equations plus the
+     prelude's projection-composition simp lemmas (composite back to
+     bare variable) form a rewrite cycle simp's loop detection cannot
+     see through, and the resulting recursion error is a *runtime*
+     exception `solve` does not catch — so the immune `subst_eqs`-first
+     tier behind the crash never ran. Every data-dependent tier now
+     runs under `sable_slice`, which demotes runtime deaths to ordinary
+     tier failures, and `sable_grind` reports a below-budget runtime
+     death as itself instead of as budget exhaustion.
+
      **Instantiate, then omega (ADR 0082).** The second dedicated tier
      closes the pointwise array-update class: apply every hypothesis
      with leading Int binders at the index atoms in scope (get/set
