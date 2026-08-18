@@ -637,7 +637,9 @@ fn validate_function(
             root_span_end,
             function.ret.clone(),
             function.name_span,
-            "function return type",
+            // `require_runtime_type` spells "<role> type"; the class refusal
+            // above names the role on its own.
+            "function return",
         )?;
     }
     let mut locals = ValidationLocals::new();
