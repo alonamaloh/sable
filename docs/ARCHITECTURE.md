@@ -738,9 +738,44 @@ foreign, or cross-module array ABI.
   asks for the exclusive right to the storage, which a `mut` owner and a
   unique borrow have and a shared borrow does not. The mangled component is
   `a` + the element's code + `s`/`m` — `abs`, `abm` beside `au32s`, `au32m` —
-  internal and versionable like the named type. Owned array parameters and
-  returns, entries, fields, classes, externs, other element widths, whole-array
-  transport, exposure, and container containment remain refused.
+  internal and versionable like the named type. The *backend* still refuses
+  owned array parameters and returns, entries, fields, classes, externs, other
+  element widths, whole-array transport, exposure, and container containment —
+  the language admits the first two (ADR 0085) and `backend.unsupported` is
+  what a native build of one reports.
+
+- **An owned array crosses a call** (ADR 0085). A bare array name at a
+  `return` or at an owned `[T]` parameter is a move, performed by the one
+  `transfer` every other owned value already goes through (ADR 0030): the
+  source place dies, and the callee's frame destroys what it received unless
+  the body hands it on. The two sinks that cross a call were the last two
+  missing from the array's set.
+
+  What a caller may assume about a returned array is a *fresh* sequence —
+  `fresh_state_for`'s binder, the length bound, and the payload's element fact
+  (integer ranges, nothing for `Bool`, elementwise `R.wf` for a record) — and
+  then whatever the callee's posts say. The length fact is `LenFact::Bounded`
+  and never `Eq`: a `&mut [T]` argument comes back with its length equated to
+  the pre-call chain because it is the same storage, while a returned array is
+  storage the caller never named. Equating it would fabricate a relation
+  between unrelated sequences, which is the stale-chain shape ADR 0074 exists
+  to prevent.
+
+  A parameter has no `mut` spelling, so an owned array parameter is readable,
+  keepable, and passable but not writable; `&mut [T]` is how a callee writes
+  one. That is the parameter rule every type obeys, not an array rule, and it
+  also makes unwritable a divergence that would otherwise merely be
+  unobservable: the interpreter shares the caller's `Rc` while the machine
+  copies the argument value. An owned array always has a place —
+  `type.array_temporary` refuses a discarded result — and a contract still
+  reads a parameter the body handed on, through a deep entry snapshot.
+
+  Members and traits keep their own answers: `type.member_array_return`,
+  `type.trait_return_unsupported`, `type.member_param`. A returned borrow is
+  now refused by the checker as well as the parser, because the never-cell was
+  resting on the layer this change rewrote. The formal machine needed no Lean
+  edit — `call_enter` and `ret_pop` carry any `Val` — and LLVM keeps refusing
+  both positions under `backend.unsupported`.
 
 - **A backend lowering answers rather than aborts** (ADR 0071). `llvm_ty` and
   `type_code` are total: every `Ty` gets an `Option<String>`, and `None`
@@ -980,10 +1015,11 @@ foreign, or cross-module array ABI.
   cleanup across normal branch exits, each loop iteration, and early return;
   traps still do not unwind.
 
-  N0 does not admit owned-array parameters or returns, array-valued entries,
-  fields, classes, methods, externs, public or cross-module ABI, other integer
-  widths, whole-array transport/rebinding, exposure, generic containment, or
-  option containment. A *Boolean* array borrow is admitted, by the separate
+  N0 does not lower owned-array parameters or returns — the language admits
+  both (ADR 0085), and the native leg of that transfer is a separate slice —
+  nor array-valued entries, fields, classes, methods, externs, public or
+  cross-module ABI, other integer widths, whole-array transport/rebinding,
+  exposure, generic containment, or option containment. A *Boolean* array borrow is admitted, by the separate
   rule below (ADR 0070); the `u32` and `bool` borrow rows of
   `docs/shape-admission.md` are identical. Its source verification, interpreter,
   and formal integer-array value already existed, so N0 changes no VC or Lean

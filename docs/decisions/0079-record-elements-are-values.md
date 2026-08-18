@@ -67,6 +67,13 @@ every wrapper with its prior diagnostic first (snapshot byte-identical).
    now refuses in its own name where the payload gate refused first
    before, and each flip is corpus-pinned.
 
+   > **ADR 0085 supersedes two of those names.** A return no longer
+   > refuses an array at all; a class-method result answers
+   > `type.member_array_return`, and `type.param_unsupported` has left the
+   > member-parameter pair, which `type.member_param` now closes alone.
+   > The decision this item states — each boundary refusing in its own
+   > name, each flip corpus-pinned — is what that change followed.
+
 ## Consequences
 
 `corpus/verifies/record_array.sable` (36 obligations: the elementwise wf

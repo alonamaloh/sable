@@ -1354,6 +1354,25 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **An owned array crosses a call (ADR 0085).** The two move sinks
+     that cross a call — an argument and a return — open for `[u64]`,
+     `[bool]`, and `[record]`, completing the set ADR 0030 defined. The
+     transfer is the existing `transfer`; the caller of an array-returning
+     function receives a fresh sequence built by `fresh_state_for`, with
+     the length bound and never a relation to anything the caller held,
+     which is what distinguishes a return from the `&mut` havoc it
+     otherwise mirrors. A parameter is not `mut`, so an owned array
+     parameter is readable and passable but not writable, and that also
+     makes unwritable the one place the interpreter's shared `Rc` and the
+     machine's copied value could have diverged. Members and traits keep
+     their own refusals, a returned borrow gains a checker fence beside
+     the parser's, and a discarded owner is refused outright. The formal
+     machine needed no Lean edit and gained differential subjects in both
+     directions; LLVM stays closed under `backend.unsupported`. The
+     shape-admission table gained return-position columns first, so the
+     frontier the change moved was watched before it moved. 81 of 180
+     intended open.
+
      **Facts are declared, not discovered (ADR 0084).** Ghost theorems
      gain `#[fact]`: the marked lemma is emitted `@[sable_fact]` and a
      second instantiation stage applies it at the argument tuples its
