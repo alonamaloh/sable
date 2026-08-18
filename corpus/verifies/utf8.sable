@@ -56,7 +56,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   unfold utf8_decode utf8_b0 utf8_b1 utf8_b2 utf8_b3
 ///   repeat (first | omega | split)
 
-/// theorem utf8_decode_encode2 (cp g1 g2 g3 : int) (h : scalar cp)
+/// theorem #[fact] utf8_decode_encode2 (cp g1 g2 g3 : int) (h : scalar cp)
 ///     (h1 : 2 ≤ utf8_len cp → g1 = utf8_b1 cp)
 ///     (h2 : 3 ≤ utf8_len cp → g2 = utf8_b2 cp)
 ///     (h3 : utf8_len cp = 4 → g3 = utf8_b3 cp) :
@@ -189,7 +189,7 @@ pub fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
 ///   unfold utf8_len
 ///   repeat (first | omega | split)
 
-/// theorem validFrom_step (b : Sable.Seq Int) (pos cp : int)
+/// theorem #[fact] validFrom_step (b : Sable.Seq Int) (pos cp : int)
 ///     (hpos : pos < b.len)
 ///     (hs : scalar cp) (hlen : pos + utf8_len cp ≤ b.len)
 ///     (h0 : b.get pos = utf8_b0 cp)
@@ -202,7 +202,7 @@ pub fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
 ///   rw [if_neg (by omega)]
 ///   exact ⟨cp, hs, hlen, h0, h1, h2, h3, hrest⟩
 
-/// theorem validFrom_end (b : Sable.Seq Int) (pos : int) (h : b.len ≤ pos) :
+/// theorem #[fact] validFrom_end (b : Sable.Seq Int) (pos : int) (h : b.len ≤ pos) :
 ///     validFrom b pos := by
 ///   rw [validFrom]
 ///   rw [if_pos h]
@@ -331,7 +331,7 @@ pub fn decode_utf8(&[u8] b, u64 pos) -> option<u32> {
 // Congruence: a byte-for-byte copy (on the in-range prefix) preserves
 // the scan. Positions stay ≥ 0, so every read is in range.
 
-/// theorem validScan_congr (a b : Sable.Seq Int) (pos : int)
+/// theorem #[fact] validScan_congr (a b : Sable.Seq Int) (pos : int)
 ///     (hlen : b.len = a.len)
 ///     (hget : ∀ k, 0 ≤ k → k < a.len → b.get k = a.get k)
 ///     (hpos : 0 ≤ pos)

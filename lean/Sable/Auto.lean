@@ -49,6 +49,12 @@ script.
 
 namespace Sable
 
+/-- Ghost theorems the program marks `#[fact]` arrive as `@[sable_fact]`:
+instantiation facts for `sable_instantiate` — guarded lemmas automation
+applies at the argument tuples that actually occur in the goal, the way
+a discharge script would instantiate them by hand. -/
+register_label_attr sable_fact
+
 register_option sable.grindHeartbeats : Nat := {
   defValue := 50000
   descr := "heartbeat budget for the `grind` tier of `sable_auto`, in \
@@ -153,7 +159,116 @@ private def isIntTy (t : Expr) : MetaM Bool := do
 private def containsAny (e : Expr) (needles : Array Expr) : Bool :=
   Option.isSome <| e.find? fun sub => needles.contains sub
 
-elab "sable_instantiate" : tactic => do
+/-- Closed constant-headed applications — the atom pool that global-fact
+patterns match against. Logical and arithmetic heads are noise, not
+atoms. -/
+private def boringHead (n : Name) : Bool :=
+  n == ``Eq || n == ``Ne || n == ``And || n == ``Or || n == ``Not ||
+  n == ``Iff || n == ``LE.le || n == ``LT.lt || n == ``GE.ge || n == ``GT.gt ||
+  n == ``HAdd.hAdd || n == ``HSub.hSub || n == ``HMul.hMul ||
+  n == ``HDiv.hDiv || n == ``HMod.hMod || n == ``HPow.hPow ||
+  n == ``OfNat.ofNat || n == ``Neg.neg || n == ``Int.ofNat
+
+partial def collectApps (seen : IO.Ref (Std.HashSet Expr))
+    (acc : IO.Ref (Array Expr)) (e : Expr) : MetaM Unit := do
+  if e.isApp && !e.hasLooseBVars && !e.hasExprMVar then
+    if let .const n _ := e.getAppFn then
+      unless boringHead n do
+        unless (← seen.get).contains e do
+          seen.modify (·.insert e)
+          if (← acc.get).size < 96 then acc.modify (·.push e)
+  match e with
+  | .app f a => collectApps seen acc f; collectApps seen acc a
+  | .lam _ t b _ => collectApps seen acc t; collectApps seen acc b
+  | .forallE _ t b _ => collectApps seen acc t; collectApps seen acc b
+  | .letE _ t v b _ =>
+    collectApps seen acc t; collectApps seen acc v; collectApps seen acc b
+  | .mdata _ b => collectApps seen acc b
+  | .proj _ _ b => collectApps seen acc b
+  | _ => pure ()
+
+private partial def mvarCount : Expr → Nat
+  | .mvar _ => 1
+  | .app f a => mvarCount f + mvarCount a
+  | .forallE _ t b _ => mvarCount t + mvarCount b
+  | .lam _ t b _ => mvarCount t + mvarCount b
+  | .letE _ t v b _ => mvarCount t + mvarCount v + mvarCount b
+  | .mdata _ b => mvarCount b
+  | .proj _ _ b => mvarCount b
+  | _ => 0
+
+/-- The conclusion's constant-headed applications that mention the opened
+metavariables — the patterns whose occurrences pick the instantiation. -/
+partial def collectPatterns (acc : IO.Ref (Array Expr)) (e : Expr) : MetaM Unit := do
+  if e.isApp && e.hasExprMVar && !e.hasLooseBVars then
+    if let .const n _ := e.getAppFn then
+      unless boringHead n do
+        let seen ← acc.get
+        unless seen.contains e do acc.modify (·.push e)
+  match e with
+  | .app f a => collectPatterns acc f; collectPatterns acc a
+  | .forallE _ t b _ => collectPatterns acc t; collectPatterns acc b
+  | .mdata _ b => collectPatterns acc b
+  | _ => pure ()
+
+/-- Per-theorem static data for `@[sable_fact]` matching: the count of
+leading value binders (0 = unusable shape) and the conclusion's pattern
+head constants, keyed by a hash of the theorem's type so a same-named
+theorem from another module misses rather than lies. A theorem whose
+pattern heads do not occur in an obligation costs one map lookup. -/
+initialize sableFactCache :
+    IO.Ref (Std.HashMap (Name × UInt64) (Nat × Array Name)) ← IO.mkRef {}
+
+private partial def patternHeads (acc : IO.Ref (Array Name)) (e : Expr) :
+    MetaM Unit := do
+  if e.isApp && (e.hasLooseBVars || e.hasExprMVar) then
+    if let .const n _ := e.getAppFn then
+      unless boringHead n do
+        unless (← acc.get).contains n do acc.modify (·.push n)
+  match e with
+  | .app f a => patternHeads acc f; patternHeads acc a
+  | .forallE _ t b _ => patternHeads acc t; patternHeads acc b
+  | .mdata _ b => patternHeads acc b
+  | _ => pure ()
+
+private def factShape (ci : ConstantInfo) : MetaM (Nat × Array Name) := do
+  let key := (ci.name, hash ci.type)
+  if let some v := (← sableFactCache.get)[key]? then
+    return v
+  let v ← do
+    if !ci.levelParams.isEmpty then pure (0, #[]) else
+    let mut ty := ci.type
+    let mut k := 0
+    let mut ok := true
+    while ty.isForall do
+      let dom := ty.bindingDomain!
+      if (← inferType dom).isProp then break
+      ty := ty.bindingBody!.instantiate1 (mkConst ``True)
+      k := k + 1
+    let mut rest := ty
+    while rest.isForall do
+      let dom := rest.bindingDomain!
+      if !(← inferType dom).isProp then ok := false
+      rest := if rest.bindingBody!.hasLooseBVars
+              then rest.bindingBody!.instantiate1 (mkConst ``True)
+              else rest.bindingBody!
+    if k == 0 || !ok then pure (0, #[]) else
+    -- collect heads from the raw body: the dummy walk above closed the
+    -- binder variables, and the collector keys on their looseness
+    let mut raw := ci.type
+    for _ in [0:k] do
+      raw := raw.bindingBody!
+    let heads ← IO.mkRef (#[] : Array Name)
+    patternHeads heads raw
+    pure (k, ← heads.get)
+  sableFactCache.modify (·.insert key v)
+  return v
+
+/-- Instantiate every `@[sable_fact]` theorem at the argument tuples its
+conclusion patterns pick out of the goal and hypotheses, and assert the
+guarded facts; then omega. -/
+
+def instantiateCore (withGlobals : Bool) : TacticM Unit := do
   let g ← getMainGoal
   let news ← g.withContext do
     let idxs ← IO.mkRef (#[] : Array Expr)
@@ -213,12 +328,103 @@ elab "sable_instantiate" : tactic => do
                         if news.size < budget then
                           news := news.push (tm, nty)
               frontier := next
+    -- `@[sable_fact]` ghost theorems: instantiate each at the argument
+    -- tuples its conclusion patterns pick out of the goal and hypotheses
+    -- (a discharge script's `have h := thm args (by omega)` by machine).
+    -- Only the `!` form pays for this; the bare form is the hypothesis
+    -- tier, and its slice is never spent on global matching.
+    let facts ← if withGlobals then labelled `sable_fact else pure #[]
+    if withGlobals && facts.isEmpty then
+      throwError "sable_instantiate_all: no `@[sable_fact]` theorems in scope"
+    let pool ← do
+      if facts.isEmpty then pure #[] else
+        let seenRef ← IO.mkRef ({} : Std.HashSet Expr)
+        let atomsRef ← IO.mkRef (#[] : Array Expr)
+        -- goal first, then hypotheses newest-first: the atoms that decide
+        -- an obligation live in its own tail (callee posts, path facts,
+        -- the result equation), not in the ambient invariants up front
+        collectApps seenRef atomsRef (← g.getType)
+        let decls := (← getLCtx).decls.toArray.filterMap id
+        for i in [0:decls.size] do
+          let d := decls[decls.size - 1 - i]!
+          unless d.isImplementationDetail do
+            collectApps seenRef atomsRef d.type
+        atomsRef.get
+    let env ← getEnv
+    -- head-indexed pool, each bucket capped: matching consults only the
+    -- handful of same-head atoms, never the whole pool
+    let headOf : Expr → Name := fun e =>
+      match e.getAppFn with | .const n _ => n | _ => .anonymous
+    let byHead : Std.HashMap Name (Array Expr) :=
+      pool.foldl (init := {}) fun m o =>
+        let h := headOf o
+        let a := m.getD h #[]
+        if a.size < 12 then m.insert h (a.push o) else m
+    -- a hard per-theorem budget of unification trials: every marked
+    -- theorem gets its bounded shot, and a generously marked module
+    -- costs each obligation theorems × a small constant, no more
+    let trials ← IO.mkRef (0 : Nat)
+    let globalCap := 16
+    let mut nGlobal := 0
+    for thm in facts do
+      if nGlobal ≥ globalCap then continue
+      trials.set 0
+      if let some ci := env.find? thm then
+        let (k, heads) ← factShape ci
+        -- a theorem none of whose pattern heads occur here cannot match
+        if k > 0 && heads.any byHead.contains then
+            let seeds ← withoutModifyingState do
+              let (ms, _, opened) ← forallMetaBoundedTelescope ci.type k
+              let pats ← IO.mkRef (#[] : Array Expr)
+              collectPatterns pats opened
+              let sorted := (← pats.get).qsort fun a b =>
+                mvarCount a > mvarCount b
+              let mut found : Array (Array Expr) := #[]
+              if h : 0 < sorted.size then
+                for o in byHead.getD (headOf sorted[0]) #[] do
+                  if found.size < 4 && (← trials.get) < 12 then
+                    trials.modify (· + 1)
+                    let saved ← saveState
+                    let matched ← try isDefEq sorted[0] o catch _ => pure false
+                    if matched then
+                      for pat in sorted[1:] do
+                        let pat' ← instantiateMVars pat
+                        if pat'.hasExprMVar then
+                          for o2 in byHead.getD (headOf pat') #[] do
+                            if (← trials.get) < 12 then
+                              trials.modify (· + 1)
+                              let s2 ← saveState
+                              let done ← try isDefEq pat' o2 catch _ => pure false
+                              unless done do s2.restore
+                      let args ← ms.mapM instantiateMVars
+                      if args.all (fun a => !a.hasExprMVar) then
+                        found := found.push args
+                    saved.restore
+              pure found
+            for args in seeds do
+              let fact := mkAppN (mkConst thm) args
+              if let some fty ← try some <$> inferType fact catch _ => pure none then
+                if (← inferType fty).isProp then
+                  unless seenTys.contains fty do
+                    seenTys := seenTys.push fty
+                    if nGlobal < globalCap && news.size < budget then
+                      nGlobal := nGlobal + 1
+                      news := news.push (fact, fty)
     pure news
+  if (← IO.getEnv "SABLE_DEBUG_INST").isSome then
+    logInfo m!"instantiate: {news.size} facts"
+    for (_, ty) in news do logInfo m!"  {ty}"
   let hyps : Array Hypothesis := news.map fun (pf, ty) =>
     { userName := `h_inst, type := ty, value := pf }
   let g2 ← (·.2) <$> g.assertHypotheses hyps
   replaceMainGoal [g2]
   evalTactic (← `(tactic| omega))
+
+/-- Hypothesis instantiation only (the array-update tier). -/
+elab "sable_instantiate" : tactic => instantiateCore false
+
+/-- Hypothesis instantiation plus `@[sable_fact]` ghost theorems. -/
+elab "sable_instantiate_all" : tactic => instantiateCore true
 
 end SableInstantiate
 
@@ -359,6 +565,11 @@ macro_rules
              (try simp only [Sable.Seq.len_set] at *) <;>
              (try simp only [Sable.Seq.get_set]) <;>
              (repeat split) <;> (try subst_eqs) <;> sable_instantiate))
+        | (sable_slice 60000
+            ((try sable_norm) <;> (intros) <;>
+             (try simp only [Sable.Seq.len_set] at *) <;>
+             (try simp only [Sable.Seq.get_set]) <;>
+             (repeat split) <;> (try subst_eqs) <;> sable_instantiate_all))
         | (sable_slice 100000 ((try sable_norm) <;> simp_all))
         | (sable_slice 100000
             ((try sable_norm) <;> (try subst_eqs) <;> simp_all <;> omega))

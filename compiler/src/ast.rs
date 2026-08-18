@@ -1904,6 +1904,9 @@ pub struct GhostItem {
     pub keyword: &'static str,
     /// `#[unfold]`: emit `@[simp]` even though the def recurses.
     pub unfold: bool,
+    /// `#[fact]`: emit `@[sable_fact]` so `sable_instantiate` applies
+    /// the theorem at occurring argument tuples, guards left for omega.
+    pub fact: bool,
     pub text: String,
     pub span: Span,
 }

@@ -64,12 +64,12 @@ const u64 MAX_BYTES = 4611686018427387904;
 /// decreasing_by
 ///   all_goals first | omega | (split <;> omega)
 
-/// theorem strTail_close (b : Sable.Seq Int) (i : int) (h : b.get i = 34) :
+/// theorem #[fact] strTail_close (b : Sable.Seq Int) (i : int) (h : b.get i = 34) :
 ///     strTail b i (i + 1) := by
 ///   rw [strTail]
 ///   rw [if_neg (by omega), if_pos h]
 
-/// theorem strTail_char (b : Sable.Seq Int) (i j : int)
+/// theorem #[fact] strTail_char (b : Sable.Seq Int) (i j : int)
 ///     (hq : b.get i ≠ 34) (he : b.get i ≠ 92) (hlo : 32 ≤ b.get i)
 ///     (hj : i < j)
 ///     (hrest : strTail b (i + 1) j) : strTail b i j := by
@@ -77,7 +77,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_neg (by omega), if_neg hq, if_neg he]
 ///   exact ⟨hlo, hrest⟩
 
-/// theorem strTail_esc (b : Sable.Seq Int) (i j : int)
+/// theorem #[fact] strTail_esc (b : Sable.Seq Int) (i j : int)
 ///     (hq : b.get i ≠ 34) (he : b.get i = 92) (hesc : escc (b.get (i + 1)))
 ///     (hj : i < j)
 ///     (hrest : strTail b (i + 2) j) : strTail b i j := by
@@ -85,7 +85,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_neg (by omega), if_neg hq, if_pos he]
 ///   exact Or.inl ⟨hesc, hrest⟩
 
-/// theorem strTail_hex (b : Sable.Seq Int) (i j : int)
+/// theorem #[fact] strTail_hex (b : Sable.Seq Int) (i j : int)
 ///     (hq : b.get i ≠ 34) (he : b.get i = 92) (hu : b.get (i + 1) = 117)
 ///     (h2 : hexd (b.get (i + 2))) (h3 : hexd (b.get (i + 3)))
 ///     (h4 : hexd (b.get (i + 4))) (h5 : hexd (b.get (i + 5)))
@@ -95,26 +95,26 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_neg (by omega), if_neg hq, if_pos he]
 ///   exact Or.inr ⟨hu, h2, h3, h4, h5, hrest⟩
 
-/// theorem strTail_lt (b : Sable.Seq Int) (i j : int) (h : strTail b i j) : i < j := by
+/// theorem #[fact] strTail_lt (b : Sable.Seq Int) (i j : int) (h : strTail b i j) : i < j := by
 ///   rw [strTail] at h
 ///   split at h
 ///   · exact h.elim
 ///   · omega
 
-/// theorem lexable_end (b : Sable.Seq Int) (pos : int) (h : b.len ≤ pos) :
+/// theorem #[fact] lexable_end (b : Sable.Seq Int) (pos : int) (h : b.len ≤ pos) :
 ///     lexable b pos := by
 ///   rw [lexable]
 ///   rw [if_pos h]
 ///   trivial
 
-/// theorem lexable_ws (b : Sable.Seq Int) (pos : int)
+/// theorem #[fact] lexable_ws (b : Sable.Seq Int) (pos : int)
 ///     (hpos : pos < b.len) (hws : isWs (b.get pos))
 ///     (hrest : lexable b (pos + 1)) : lexable b pos := by
 ///   rw [lexable]
 ///   rw [if_neg (by omega)]
 ///   exact Or.inl ⟨hws, hrest⟩
 
-/// theorem lexable_tok (b : Sable.Seq Int) (pos e : int)
+/// theorem #[fact] lexable_tok (b : Sable.Seq Int) (pos e : int)
 ///     (hpos : pos < b.len) (ht : jtoken b pos e)
 ///     (hlt : pos < e) (hle : e ≤ b.len)
 ///     (hrest : lexable b e) : lexable b pos := by

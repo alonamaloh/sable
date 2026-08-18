@@ -90,12 +90,12 @@ const u64 MAX_BYTES = 4611686018427387904;
 /// decreasing_by
 ///   all_goals first | omega | (split <;> first | omega | (split <;> omega))
 
-/// theorem strTail_close (b : Sable.Seq Int) (i : int) (h : b.get i = 34) :
+/// theorem #[fact] strTail_close (b : Sable.Seq Int) (i : int) (h : b.get i = 34) :
 ///     strTail b i (i + 1) := by
 ///   rw [strTail]
 ///   rw [if_neg (by omega), if_pos h]
 
-/// theorem strTail_char (b : Sable.Seq Int) (i j : int)
+/// theorem #[fact] strTail_char (b : Sable.Seq Int) (i j : int)
 ///     (hq : b.get i ≠ 34) (he : b.get i ≠ 92) (hlo : 32 ≤ b.get i)
 ///     (hj : i < j)
 ///     (hrest : strTail b (i + 1) j) : strTail b i j := by
@@ -103,7 +103,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_neg (by omega), if_neg hq, if_neg he]
 ///   exact ⟨hlo, hrest⟩
 
-/// theorem strTail_esc (b : Sable.Seq Int) (i j : int)
+/// theorem #[fact] strTail_esc (b : Sable.Seq Int) (i j : int)
 ///     (hq : b.get i ≠ 34) (he : b.get i = 92) (hesc : escc (b.get (i + 1)))
 ///     (hj : i < j)
 ///     (hrest : strTail b (i + 2) j) : strTail b i j := by
@@ -111,7 +111,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_neg (by omega), if_neg hq, if_pos he]
 ///   exact Or.inl ⟨hesc, hrest⟩
 
-/// theorem strTail_hex (b : Sable.Seq Int) (i j : int)
+/// theorem #[fact] strTail_hex (b : Sable.Seq Int) (i j : int)
 ///     (hq : b.get i ≠ 34) (he : b.get i = 92) (hu : b.get (i + 1) = 117)
 ///     (h2 : hexd (b.get (i + 2))) (h3 : hexd (b.get (i + 3)))
 ///     (h4 : hexd (b.get (i + 4))) (h5 : hexd (b.get (i + 5)))
@@ -121,7 +121,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_neg (by omega), if_neg hq, if_pos he]
 ///   exact Or.inr ⟨hu, h2, h3, h4, h5, hrest⟩
 
-/// theorem strTail_lt (b : Sable.Seq Int) (i j : int) (h : strTail b i j) : i < j := by
+/// theorem #[fact] strTail_lt (b : Sable.Seq Int) (i j : int) (h : strTail b i j) : i < j := by
 ///   rw [strTail] at h
 ///   split at h
 ///   · exact h.elim
@@ -134,7 +134,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   · exact h.elim
 ///   · omega
 
-/// theorem jgram_val_tok (b : Sable.Seq Int) (i p j : int)
+/// theorem #[fact] jgram_val_tok (b : Sable.Seq Int) (i p j : int)
 ///     (hw : wsTo b i p)
 ///     (ht : jstring b p j ∨ jnumber b p j ∨ jtrue b p j ∨ jfalse b p j ∨
 ///       jnull b p j)
@@ -148,7 +148,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///         (fun h => Or.inr (Or.inr (Or.inr (Or.inl h))))
 ///         (fun h => Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h))))))))
 
-/// theorem jgram_val_obj (b : Sable.Seq Int) (i p j : int)
+/// theorem #[fact] jgram_val_obj (b : Sable.Seq Int) (i p j : int)
 ///     (hw : wsTo b i p) (hb : b.get p = 123)
 ///     (hrest : jgram b 1 (p + 1) j) : jgram b 0 i j := by
 ///   have hij : i < j := by
@@ -161,7 +161,7 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_pos (by have := hw.1; omega)]
 ///   exact hrest
 
-/// theorem jgram_val_arr (b : Sable.Seq Int) (i p j : int)
+/// theorem #[fact] jgram_val_arr (b : Sable.Seq Int) (i p j : int)
 ///     (hw : wsTo b i p) (hb : b.get p = 91)
 ///     (hrest : jgram b 2 (p + 1) j) : jgram b 0 i j := by
 ///   have hij : i < j := by
@@ -174,13 +174,13 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   rw [if_pos (by have := hw.1; omega)]
 ///   exact hrest
 
-/// theorem jgram_obj_empty (b : Sable.Seq Int) (i q : int)
+/// theorem #[fact] jgram_obj_empty (b : Sable.Seq Int) (i q : int)
 ///     (hw : wsTo b i q) (hb : b.get q = 125) : jgram b 1 i (q + 1) := by
 ///   rw [jgram]
 ///   rw [if_neg (by have := hw.1; omega), if_pos rfl]
 ///   exact Or.inl ⟨q, hw, hb, rfl⟩
 
-/// theorem jgram_obj_member (b : Sable.Seq Int) (i q r s e j : int)
+/// theorem #[fact] jgram_obj_member (b : Sable.Seq Int) (i q r s e j : int)
 ///     (hw : wsTo b i q) (hs : jstring b q r) (hw2 : wsTo b r s)
 ///     (hc : b.get s = 58)
 ///     (hv : jgram b 0 (s + 1) e) (htail : jgram b 4 e j)
@@ -195,14 +195,14 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   · rw [if_pos (by omega)]
 ///     exact htail
 
-/// theorem jgram_objtail_close (b : Sable.Seq Int) (i q : int)
+/// theorem #[fact] jgram_objtail_close (b : Sable.Seq Int) (i q : int)
 ///     (hw : wsTo b i q) (hb : b.get q = 125) : jgram b 4 i (q + 1) := by
 ///   rw [jgram]
 ///   rw [if_neg (by have := hw.1; omega), if_neg (by omega), if_neg (by omega),
 ///     if_pos rfl]
 ///   exact Or.inl ⟨q, hw, hb, rfl⟩
 
-/// theorem jgram_objtail_member (b : Sable.Seq Int) (i q q2 r s e j : int)
+/// theorem #[fact] jgram_objtail_member (b : Sable.Seq Int) (i q q2 r s e j : int)
 ///     (hw : wsTo b i q) (hb : b.get q = 44) (hw1 : wsTo b (q + 1) q2)
 ///     (hs : jstring b q2 r)
 ///     (hw2 : wsTo b r s) (hc : b.get s = 58)
@@ -218,14 +218,14 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   · rw [if_pos (by omega)]
 ///     exact htail
 
-/// theorem jgram_arr_empty (b : Sable.Seq Int) (i q : int)
+/// theorem #[fact] jgram_arr_empty (b : Sable.Seq Int) (i q : int)
 ///     (hw : wsTo b i q) (hb : b.get q = 93) : jgram b 2 i (q + 1) := by
 ///   rw [jgram]
 ///   rw [if_neg (by have := hw.1; omega), if_neg (by omega), if_neg (by omega),
 ///     if_neg (by omega), if_pos rfl]
 ///   exact Or.inl ⟨q, hw, hb, rfl⟩
 
-/// theorem jgram_arr_elem (b : Sable.Seq Int) (i e j : int)
+/// theorem #[fact] jgram_arr_elem (b : Sable.Seq Int) (i e j : int)
 ///     (hv : jgram b 0 i e) (htail : jgram b 6 e j) : jgram b 2 i j := by
 ///   have hie : i < e := jgram_lt b 0 i e hv
 ///   have hej : e < j := jgram_lt b 6 e j htail
@@ -238,14 +238,14 @@ const u64 MAX_BYTES = 4611686018427387904;
 ///   · rw [if_pos (by omega)]
 ///     exact htail
 
-/// theorem jgram_arrtail_close (b : Sable.Seq Int) (i q : int)
+/// theorem #[fact] jgram_arrtail_close (b : Sable.Seq Int) (i q : int)
 ///     (hw : wsTo b i q) (hb : b.get q = 93) : jgram b 6 i (q + 1) := by
 ///   rw [jgram]
 ///   rw [if_neg (by have := hw.1; omega), if_neg (by omega), if_neg (by omega),
 ///     if_neg (by omega), if_neg (by omega), if_pos rfl]
 ///   exact Or.inl ⟨q, hw, hb, rfl⟩
 
-/// theorem jgram_arrtail_elem (b : Sable.Seq Int) (i q e j : int)
+/// theorem #[fact] jgram_arrtail_elem (b : Sable.Seq Int) (i q e j : int)
 ///     (hw : wsTo b i q) (hb : b.get q = 44)
 ///     (hv : jgram b 0 (q + 1) e) (htail : jgram b 6 e j)
 ///     (hiq : i ≤ q) : jgram b 6 i j := by

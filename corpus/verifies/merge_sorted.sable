@@ -64,7 +64,7 @@ pub fn merge(&[i32] xs, &[i32] ys, &mut [i32] out) {
 // adds one occurrence test. (The prelude's countUpto recurses on Nat; the
 // invariants above measure the prefix with Int cursors, so this bridge
 // lemma is stated in Int and proved by unfolding one step.)
-/// theorem cnt_snoc (s : Sable.Seq Int) (v kk : Int) (hkk : 0 ≤ kk) :
+/// theorem #[fact] cnt_snoc (s : Sable.Seq Int) (v kk : Int) (hkk : 0 ≤ kk) :
 ///     s.countUpto v (Int.toNat (kk + 1)) =
 ///       s.countUpto v (Int.toNat kk) + (if s.get kk = v then 1 else 0) := by
 ///   have h1 : Int.toNat (kk + 1) = Int.toNat kk + 1 := by omega

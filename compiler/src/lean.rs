@@ -300,11 +300,15 @@ pub fn emit(
         // unfolded manually in discharges. `#[unfold]` opts an item in
         // explicitly — typically a conditional step lemma whose side
         // conditions gate the rewrite to concrete data.
-        let attr = if g.unfold || (g.keyword == "def" && !ghost_recursive(&g.text)) {
-            "@[simp] "
-        } else {
-            ""
-        };
+        let mut attr = String::new();
+        if g.unfold || (g.keyword == "def" && !ghost_recursive(&g.text)) {
+            attr.push_str("@[simp] ");
+        }
+        // `#[fact]`: the instantiation tier applies the theorem at the
+        // argument tuples occurring in each obligation.
+        if g.fact {
+            attr.push_str("@[sable_fact] ");
+        }
         e.push(&format!("{attr}{} {}", g.keyword, g.text));
         e.push("");
         map.push(MapEntry {

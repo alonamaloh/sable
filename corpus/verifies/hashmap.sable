@@ -38,7 +38,7 @@ impl Hashable for i32 {
 ///     0 ≤ probe h j cap ∧ probe h j cap < cap := by
 ///   unfold probe; split <;> omega
 
-/// theorem dist_bounds (h i cap : int) (h0 : 0 ≤ h) (hc : h < cap)
+/// theorem #[fact] dist_bounds (h i cap : int) (h0 : 0 ≤ h) (hc : h < cap)
 ///     (i0 : 0 ≤ i) (ic : i < cap) :
 ///     0 ≤ dist h i cap ∧ dist h i cap < cap := by
 ///   unfold dist; split <;> omega
@@ -47,11 +47,11 @@ impl Hashable for i32 {
 ///     (j0 : 0 ≤ j) (jc : j < cap) : dist h (probe h j cap) cap = j := by
 ///   unfold probe dist; split <;> split <;> omega
 
-/// theorem probe_dist_eq (h i cap : int) (h0 : 0 ≤ h) (hc : h < cap)
+/// theorem #[fact] probe_dist_eq (h i cap : int) (h0 : 0 ≤ h) (hc : h < cap)
 ///     (i0 : 0 ≤ i) (ic : i < cap) : probe h (dist h i cap) cap = i := by
 ///   unfold probe dist; split <;> split <;> omega
 
-/// theorem hash_absent (cap : int) (occ keys : Sable.Seq Int)
+/// theorem #[fact] hash_absent (cap : int) (occ keys : Sable.Seq Int)
 ///     (hm : int → int) (k j : int)
 ///     (hbnd : ∀ x, 0 ≤ hm x ∧ hm x < cap)
 ///     (hinv : ∀ i, 0 ≤ i → i < cap → occ.get i = 1 →
@@ -79,7 +79,7 @@ impl Hashable for i32 {
 ///       rw [hkey] at h3
 ///       exact hempty (h3 j hj (by omega))
 
-/// theorem hash_inv_preserved (cap : int) (occ keys : Sable.Seq Int)
+/// theorem #[fact] hash_inv_preserved (cap : int) (occ keys : Sable.Seq Int)
 ///     (hm : int → int) (s k j : int)
 ///     (hbnd : ∀ x, 0 ≤ hm x ∧ hm x < cap)
 ///     (hinv : ∀ i, 0 ≤ i → i < cap → occ.get i = 1 →
@@ -120,7 +120,7 @@ impl Hashable for i32 {
 ///     · rw [Sable.Seq.get_set, if_neg hps]
 ///       exact hold
 
-/// theorem hash_nodup_preserved (cap : int) (occ keys : Sable.Seq Int)
+/// theorem #[fact] hash_nodup_preserved (cap : int) (occ keys : Sable.Seq Int)
 ///     (hm : int → int) (s k j : int)
 ///     (hbnd : ∀ x, 0 ≤ hm x ∧ hm x < cap)
 ///     (hinv : ∀ i, 0 ≤ i → i < cap → occ.get i = 1 →

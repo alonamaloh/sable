@@ -705,12 +705,14 @@ pub fn parse_module(
                 ClauseKind::GhostDef => ghosts.push(GhostItem {
                     keyword: "def",
                     unfold: clause.unfold,
+                    fact: false,
                     text: clause.text.clone(),
                     span: clause.span,
                 }),
                 ClauseKind::Theorem => ghosts.push(GhostItem {
                     keyword: "theorem",
                     unfold: clause.unfold,
+                    fact: clause.fact,
                     text: clause.text.clone(),
                     span: clause.span,
                 }),
@@ -3105,6 +3107,7 @@ impl<'a> Parser<'a> {
                         ClauseKind::GhostDef => ghosts.push(GhostItem {
                             keyword: "def",
                             unfold: clause.unfold,
+                            fact: false,
                             text: clause.text.clone(),
                             span: clause.span,
                         }),
@@ -3157,6 +3160,7 @@ impl<'a> Parser<'a> {
                     ghosts.push(GhostItem {
                         keyword: "def",
                         unfold: clause.unfold,
+                        fact: false,
                         text: clause.text.clone(),
                         span: clause.span,
                     });
@@ -3342,6 +3346,7 @@ impl<'a> Parser<'a> {
             kind,
             label: None,
             unfold: false,
+            fact: false,
             text,
             span: hi_span,
             line_span: kw_span.join(hi_span),

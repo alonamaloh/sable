@@ -1,0 +1,11 @@
+// expect-error: proof.clause_syntax
+// `#[fact]` marks a ghost theorem as an instantiation fact for
+// automation; a def is not a fact. The misplaced attribute reaches
+// Lean as part of the item, and the item's span carries the rejection.
+
+/// def #[fact] shadow (n : Int) : Int := n + 1
+
+/// post result = 3
+fn f() -> u32 {
+    return 3;
+}

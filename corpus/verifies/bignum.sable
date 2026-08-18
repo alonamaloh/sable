@@ -22,12 +22,12 @@
 /// theorem pw_nonpos (n : int) (h : n ≤ 0) : pw n = 1 := by
 ///   rw [pw, if_neg (by omega)]
 
-/// theorem pw_pos (n : int) : 0 < pw n := by
+/// theorem #[fact] pw_pos (n : int) : 0 < pw n := by
 ///   fun_induction pw n with
 ///   | case1 n h ih => omega
 ///   | case2 n h => omega
 
-/// theorem pw_succ (n : int) (h : 0 ≤ n) : pw (n + 1) = 4294967296 * pw n := by
+/// theorem #[fact] pw_succ (n : int) (h : 0 ≤ n) : pw (n + 1) = 4294967296 * pw n := by
 ///   rw [pw, if_pos (by omega)]
 ///   have e : n + 1 - 1 = n := by omega
 ///   rw [e]
@@ -66,11 +66,11 @@
 ///       rw [pw_nonpos m (by omega)]
 ///       omega
 
-/// theorem valIn_nil (a : Sable.Seq Int) (i n : int) (h : n ≤ i) :
+/// theorem #[fact] valIn_nil (a : Sable.Seq Int) (i n : int) (h : n ≤ i) :
 ///     valIn a i n = 0 := by
 ///   rw [valIn, if_neg (by omega)]
 
-/// theorem valIn_nonneg (a : Sable.Seq Int) (i n : int)
+/// theorem #[fact] valIn_nonneg (a : Sable.Seq Int) (i n : int)
 ///     (hb : ∀ k, i ≤ k → k < n → 0 ≤ a.get k) : 0 ≤ valIn a i n := by
 ///   revert hb
 ///   fun_induction valIn a i n with
@@ -83,7 +83,7 @@
 ///       intro _
 ///       omega
 
-/// theorem valIn_lt_pw (a : Sable.Seq Int) (i n : int)
+/// theorem #[fact] valIn_lt_pw (a : Sable.Seq Int) (i n : int)
 ///     (hb : ∀ k, i ≤ k → k < n → 0 ≤ a.get k ∧ a.get k ≤ 4294967295) :
 ///     valIn a i n < pw (n - i) := by
 ///   revert hb
@@ -127,7 +127,7 @@
 ///       intro _ hin
 ///       omega
 
-/// theorem valIn_congr (a b : Sable.Seq Int) (i n : int)
+/// theorem #[fact] valIn_congr (a b : Sable.Seq Int) (i n : int)
 ///     (h : ∀ k, i ≤ k → k < n → a.get k = b.get k) :
 ///     valIn a i n = valIn b i n := by
 ///   revert h
@@ -145,7 +145,7 @@
 ///       have hbu : valIn b i n = 0 := by rw [valIn, if_neg hc]
 ///       rw [hbu]
 
-/// theorem valIn_snoc (a : Sable.Seq Int) (i n : int) (h : i ≤ n) :
+/// theorem #[fact] valIn_snoc (a : Sable.Seq Int) (i n : int) (h : i ≤ n) :
 ///     valIn a i (n + 1) = valIn a i n + a.get n * pw (n - i) := by
 ///   revert h
 ///   fun_induction valIn a i n with
@@ -239,7 +239,7 @@
 ///       intro _ _ hij
 ///       omega
 
-/// theorem cmp_first_diff (a b : Sable.Seq Int) (j n : int)
+/// theorem #[fact] cmp_first_diff (a b : Sable.Seq Int) (j n : int)
 ///     (hj : 0 ≤ j) (hjn : j < n)
 ///     (heq : ∀ k, j < k → k < n → a.get k = b.get k)
 ///     (hlt : a.get j < b.get j)
@@ -258,7 +258,7 @@
 ///     (fun k hk1 hk2 => hb1 k hk1 (by omega))
 ///     (fun k hk1 hk2 => hb2 k hk1 (by omega)) hj
 
-/// theorem natVal_lt_of_len_lt (a b : Sable.Seq Int)
+/// theorem #[fact] natVal_lt_of_len_lt (a b : Sable.Seq Int)
 ///     (hlen : a.len < b.len) (halen : 0 ≤ a.len)
 ///     (hb1 : ∀ k, 0 ≤ k → k < a.len → 0 ≤ a.get k ∧ a.get k ≤ 4294967295)
 ///     (hb2 : ∀ k, 0 ≤ k → k < b.len → 0 ≤ b.get k)
@@ -270,7 +270,7 @@
 ///   simp only [natVal]
 ///   omega
 
-/// theorem len_le_of_val_le (a b : Sable.Seq Int)
+/// theorem #[fact] len_le_of_val_le (a b : Sable.Seq Int)
 ///     (hle : natVal b ≤ natVal a) (halen : 0 ≤ a.len)
 ///     (hb1 : ∀ k, 0 ≤ k → k < a.len → 0 ≤ a.get k ∧ a.get k ≤ 4294967295)
 ///     (hb2 : ∀ k, 0 ≤ k → k < b.len → 0 ≤ b.get k)
@@ -281,7 +281,7 @@
 ///   · have := natVal_lt_of_len_lt a b (by omega) halen hb1 hb2 (htop (by omega))
 ///     omega
 
-/// theorem trim_top_zero (xs : Sable.Seq Int) (rl : int) (h0 : 0 < rl)
+/// theorem #[fact] trim_top_zero (xs : Sable.Seq Int) (rl : int) (h0 : 0 < rl)
 ///     (hz : xs.get (rl - 1) = 0) :
 ///     valIn xs 0 rl = valIn xs 0 (rl - 1) := by
 ///   have h := valIn_snoc xs 0 (rl - 1) (by omega)
@@ -289,7 +289,7 @@
 ///   rw [h, hz]
 ///   omega
 
-/// theorem prefix_val (s xs : Sable.Seq Int) (rl : int)
+/// theorem #[fact] prefix_val (s xs : Sable.Seq Int) (rl : int)
 ///     (hlen : s.len = rl)
 ///     (hcopy : ∀ k, 0 ≤ k → k < rl → s.get k = xs.get k) :
 ///     natVal s = valIn xs 0 rl := by
@@ -307,7 +307,7 @@
 ///         rw [Int.add_mul, Int.mul_comm (s / 4294967296) 4294967296]
 ///     _ = s * P := by rw [h]
 
-/// theorem add_step (out a b : Sable.Seq Int) (i la lb carry x y : int)
+/// theorem #[fact] add_step (out a b : Sable.Seq Int) (i la lb carry x y : int)
 ///     (hi : 0 ≤ i)
 ///     (hx : x = if i < la then a.get i else 0)
 ///     (hy : y = if i < lb then b.get i else 0)
@@ -380,7 +380,7 @@
 ///       rw [hsa2, hsb2] at hinv
 ///       omega
 
-/// theorem add_carry_zero (out a b : Sable.Seq Int) (n la lb carry : int)
+/// theorem #[fact] add_carry_zero (out a b : Sable.Seq Int) (n la lb carry : int)
 ///     (hla : 0 ≤ la) (hlb : 0 ≤ lb)
 ///     (hn : la < n ∧ lb < n)
 ///     (hcb : 0 ≤ carry ∧ carry ≤ 1)
@@ -403,7 +403,7 @@
 ///     have := pw_pos (n - 1)
 ///     omega
 
-/// theorem sub_step (out a b : Sable.Seq Int) (i lb borrow y : int)
+/// theorem #[fact] sub_step (out a b : Sable.Seq Int) (i lb borrow y : int)
 ///     (hi : 0 ≤ i)
 ///     (hy : y = if i < lb then b.get i else 0)
 ///     (hinv : valIn out 0 i - borrow * pw i
@@ -451,7 +451,7 @@
 ///     rw [hsb2] at hinv
 ///     omega
 
-/// theorem sub_borrow_zero (out a b : Sable.Seq Int) (la lb borrow : int)
+/// theorem #[fact] sub_borrow_zero (out a b : Sable.Seq Int) (la lb borrow : int)
 ///     (hbw : 0 ≤ borrow ∧ borrow ≤ 1)
 ///     (hbo : ∀ k, 0 ≤ k → k < la → 0 ≤ out.get k ∧ out.get k ≤ 4294967295)
 ///     (hle : valIn b 0 lb ≤ valIn a 0 la)
@@ -473,7 +473,7 @@
 ///     ⟨by rw [Int.mul_comm b q]; omega, hr0, hrb⟩
 ///   omega
 
-/// theorem ediv_decomp (a b : int) (hb : 1 ≤ b) :
+/// theorem #[fact] ediv_decomp (a b : int) (hb : 1 ≤ b) :
 ///     (a / b) * b + a % b = a ∧ 0 ≤ a % b ∧ a % b < b := by
 ///   obtain ⟨h1, h2, h3⟩ :=
 ///     (Int.ediv_emod_unique (by omega : (0:Int) < b)).mp ⟨rfl, rfl⟩
@@ -498,7 +498,7 @@
 ///     (by rw [show c - 1 + 1 = c from by omega]; exact h)
 ///   omega
 
-/// theorem qhat_ge (w rtop2 Rlow R V Vlow k qh : int)
+/// theorem #[fact] qhat_ge (w rtop2 Rlow R V Vlow k qh : int)
 ///     (hw : 1 ≤ w) (_hk : 0 ≤ k)
 ///     (hV : V = w * pw k + Vlow) (hVl : 0 ≤ Vlow) (_hVh : Vlow < pw k)
 ///     (hR : R = rtop2 * pw k + Rlow) (hRl : 0 ≤ Rlow) (hRh : Rlow < pw k)
@@ -548,7 +548,7 @@
 ///     have := ediv_lt_of_lt_mul R V 4294967296 hV1 hR0 hRB
 ///     omega
 
-/// theorem qhat_le4 (w rtop2 Rlow R V Vlow k qh : int)
+/// theorem #[fact] qhat_le4 (w rtop2 Rlow R V Vlow k qh : int)
 ///     (hw : 1073741824 < w) (_hk : 0 ≤ k)
 ///     (hV : V = w * pw k + Vlow) (_hVl : 0 ≤ Vlow) (hVh : Vlow < pw k)
 ///     (hR : R = rtop2 * pw k + Rlow) (hRl : 0 ≤ Rlow) (_hRh : Rlow < pw k)
@@ -607,7 +607,7 @@
 ///     have e3 : R / V * (w + 1) = R / V * w + R / V * 1 := Int.mul_add _ _ _
 ///     omega
 
-/// theorem valIn_shift (out r : Sable.Seq Int) (i n : int)
+/// theorem #[fact] valIn_shift (out r : Sable.Seq Int) (i n : int)
 ///     (h : ∀ k, i ≤ k → k < n → out.get (k + 1) = r.get k) :
 ///     valIn out (i + 1) (n + 1) = valIn r i n := by
 ///   revert h
@@ -624,7 +624,7 @@
 ///       intro _
 ///       rw [valIn, if_neg (by omega)]
 
-/// theorem top2_decomp (r : Sable.Seq Int) (n : int)
+/// theorem #[fact] top2_decomp (r : Sable.Seq Int) (n : int)
 ///     (hn : 1 ≤ n) (_hlen0 : 0 ≤ r.len) (hlen : r.len ≤ n + 1)
 ///     (hb : ∀ k, 0 ≤ k → k < r.len → 0 ≤ r.get k ∧ r.get k ≤ 4294967295) :
 ///     ∃ low, natVal r
@@ -675,7 +675,7 @@
 ///         rw [show n - 1 - 0 = n - 1 from by omega] at h1
 ///         exact h1
 
-/// theorem top_limb_lb (v : Sable.Seq Int) (c : int)
+/// theorem #[fact] top_limb_lb (v : Sable.Seq Int) (c : int)
 ///     (hlen : 1 ≤ v.len)
 ///     (hb : ∀ k, 0 ≤ k → k < v.len → 0 ≤ v.get k ∧ v.get k ≤ 4294967295)
 ///     (hval : c * pw (v.len - 1) ≤ natVal v) :
@@ -699,7 +699,7 @@
 ///       Int.mul_le_mul_of_nonneg_right h1 (by omega)
 ///     omega
 
-/// theorem val_range_len (v : Sable.Seq Int) (k : int)
+/// theorem #[fact] val_range_len (v : Sable.Seq Int) (k : int)
 ///     (_hk : 1 ≤ k) (_hlen0 : 0 ≤ v.len)
 ///     (hb : ∀ j, 0 ≤ j → j < v.len → 0 ≤ v.get j ∧ v.get j ≤ 4294967295)
 ///     (htop : 0 < v.len → 1 ≤ v.get (v.len - 1))
@@ -732,7 +732,7 @@
 ///       omega
 ///   omega
 
-/// theorem len_le_of_val_lt_pw (v : Sable.Seq Int) (k : int)
+/// theorem #[fact] len_le_of_val_lt_pw (v : Sable.Seq Int) (k : int)
 ///     (hk : 0 ≤ k) (hlen0 : 0 ≤ v.len)
 ///     (hb : ∀ j, 0 ≤ j → j < v.len → 0 ≤ v.get j)
 ///     (htop : 0 < v.len → 1 ≤ v.get (v.len - 1))
@@ -748,7 +748,7 @@
 ///     have := pw_mono k (v.len - 1) (by omega)
 ///     omega
 
-/// theorem digit_step (S S2 Q Q2 R R2 R3 V uj qd : int)
+/// theorem #[fact] digit_step (S S2 Q Q2 R R2 R3 V uj qd : int)
 ///     (hopen : S = uj + 4294967296 * S2)
 ///     (hinv : S2 = Q * V + R)
 ///     (hshift : R2 = 4294967296 * R + uj)
@@ -769,7 +769,7 @@
 ///   rw [Int.add_mul] at hhi
 ///   omega
 
-/// theorem denorm_quot (A V Q R m : int) (hm : 1 ≤ m) (hV : 1 ≤ V)
+/// theorem #[fact] denorm_quot (A V Q R m : int) (hm : 1 ≤ m) (hV : 1 ≤ V)
 ///     (heq : A * m = Q * (V * m) + R) (hR0 : 0 ≤ R) (hRm : R < V * m) :
 ///     Q = A / V := by
 ///   have hRm2 : R = (A - Q * V) * m := by
@@ -802,7 +802,7 @@
 ///   rw [Int.mul_add] at h1
 ///   omega
 
-/// theorem window_open (a : Sable.Seq Int) (j n : int) (h : j < n) :
+/// theorem #[fact] window_open (a : Sable.Seq Int) (j n : int) (h : j < n) :
 ///     valIn a j n = a.get j + 4294967296 * valIn a (j + 1) n := by
 ///   rw [valIn, if_pos h]
 
@@ -995,7 +995,7 @@ pub fn sub(&Nat a, &Nat b) -> Nat {
     return r;
 }
 
-/// theorem valIn_zeros (a : Sable.Seq Int) (i n : int)
+/// theorem #[fact] valIn_zeros (a : Sable.Seq Int) (i n : int)
 ///     (hz : ∀ k, i ≤ k → k < n → a.get k = 0) : valIn a i n = 0 := by
 ///   revert hz
 ///   fun_induction valIn a i n with
@@ -1008,7 +1008,7 @@ pub fn sub(&Nat a, &Nat b) -> Nat {
 ///       intro _
 ///       omega
 
-/// theorem mul_bound (x y : int)
+/// theorem #[fact] mul_bound (x y : int)
 ///     (hx : 0 ≤ x ∧ x ≤ 4294967295) (hy : 0 ≤ y ∧ y ≤ 4294967295) :
 ///     0 ≤ x * y ∧ x * y ≤ 18446744065119617025 := by
 ///   constructor
@@ -1017,7 +1017,7 @@ pub fn sub(&Nat a, &Nat b) -> Nat {
 ///       _ ≤ 4294967295 * 4294967295 := Int.mul_le_mul_of_nonneg_right hx.2 (by omega)
 ///       _ = 18446744065119617025 := by decide
 
-/// theorem mul_inner_step (out a b : Sable.Seq Int) (i j n lb carry t : int)
+/// theorem #[fact] mul_inner_step (out a b : Sable.Seq Int) (i j n lb carry t : int)
 ///     (hi : 0 ≤ i) (hj : 0 ≤ j) (hjlb : j < lb) (hin : i + lb ≤ n)
 ///     (ht : t = out.get (i + j) + a.get i * b.get j + carry)
 ///     (hinv : valIn out 0 n + carry * pw (i + j)
@@ -1057,7 +1057,7 @@ pub fn sub(&Nat a, &Nat b) -> Nat {
 ///   rw [hkey, hab, hd]
 ///   omega
 
-/// theorem mul_outer_close (out a b : Sable.Seq Int) (i n lb carry : int)
+/// theorem #[fact] mul_outer_close (out a b : Sable.Seq Int) (i n lb carry : int)
 ///     (hi : 0 ≤ i) (hlb : 0 ≤ lb) (hin : i + lb < n)
 ///     (hzero : out.get (i + lb) = 0)
 ///     (hinv : valIn out 0 n + carry * pw (i + lb)
@@ -1106,16 +1106,16 @@ pub fn mul(&Nat a, &Nat b) -> Nat {
 }
 
 
-/// theorem rem_eq (a b q p : int) (hq : q = a / b) (hp : p = q * b) :
+/// theorem #[fact] rem_eq (a b q p : int) (hq : q = a / b) (hp : p = q * b) :
 ///     a - p = a % b := by
 ///   rw [hp, hq, Int.mul_comm]
 ///   have := Int.emod_def a b
 ///   omega
 
-/// theorem ediv_le_self_nat (a b : int) (ha : 0 ≤ a) (_hb : 1 ≤ b) :
+/// theorem #[fact] ediv_le_self_nat (a b : int) (ha : 0 ≤ a) (_hb : 1 ≤ b) :
 ///     a / b ≤ a := Int.ediv_le_self b ha
 
-/// theorem ediv_mul_le_self (a b : int) (_ha : 0 ≤ a) (hb : 1 ≤ b) :
+/// theorem #[fact] ediv_mul_le_self (a b : int) (_ha : 0 ≤ a) (hb : 1 ≤ b) :
 ///     a / b * b ≤ a := by
 ///   have := Int.emod_def a b
 ///   have := Int.emod_nonneg a (by omega : b ≠ 0)
@@ -1219,14 +1219,14 @@ pub fn rem(&Nat a, &Nat b) -> Nat {
 ///   have h2 := Int.emod_lt_of_pos a (by omega : 0 < b)
 ///   omega
 
-/// theorem igcd_zero (a : int) : igcd a 0 = a := by
+/// theorem #[fact] igcd_zero (a : int) : igcd a 0 = a := by
 ///   rw [igcd, if_pos (by omega)]
 
-/// theorem igcd_step (x y : int) (hy : 1 ≤ y) : igcd y (x % y) = igcd x y := by
+/// theorem #[fact] igcd_step (x y : int) (hy : 1 ≤ y) : igcd y (x % y) = igcd x y := by
 ///   conv => rhs; rw [igcd]
 ///   rw [if_neg (by omega)]
 
-/// theorem emod_lt (x y : int) (hy : 1 ≤ y) : x % y < y :=
+/// theorem #[fact] emod_lt (x y : int) (hy : 1 ≤ y) : x % y < y :=
 ///   Int.emod_lt_of_pos x (by omega)
 
 /// theorem emod_nonneg' (x y : int) (hy : 1 ≤ y) : 0 ≤ x % y :=
@@ -1641,10 +1641,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 // asserts above carry the shared facts (zero/one values, order and
 // domination bounds), so what remains is the step identities, the
 // length lemma applications, and the Euclidean closers.
-
-/// discharge gcd.assert.zero_val by
-///   have h := valIn_nil zarr 0 0 (by omega)
-///   omega
 
 /// discharge gcd.inv_init.x_limbs_len_a_limbs_len_b_limbs_len by
 ///   sable_norm

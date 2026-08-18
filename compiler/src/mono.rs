@@ -114,6 +114,7 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
             program.ghosts.push(GhostItem {
                 keyword: "def",
                 unfold: false,
+                fact: false,
                 text: renamed,
                 span: g.span,
             });

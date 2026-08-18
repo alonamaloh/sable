@@ -1354,6 +1354,19 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **Facts are declared, not discovered (ADR 0084).** Ghost theorems
+     gain `#[fact]`: the marked lemma is emitted `@[sable_fact]` and a
+     second instantiation stage applies it at the argument tuples its
+     conclusion patterns pick out of each obligation — the machine form
+     of `have h := valIn_nil zarr 0 0 (by omega)`, guards left for
+     omega. Matching is pattern-directed (an instantiation exists only
+     where its pattern occurs, goal first then hypotheses newest-first)
+     and cost-disciplined (shape cache, head-indexed pool, per-theorem
+     trial budget, its own slice behind the hypothesis tier — the first
+     integration starved that tier's slice and took working obligations
+     down with it). Seventy-nine corpus theorems are marked; the
+     instantiate-a-lemma discharge family is the target.
+
      **No tier may abort the portfolio (ADR 0083).** The free-list
      `simp` recursion was run to ground: view equations plus the
      prelude's projection-composition simp lemmas (composite back to
