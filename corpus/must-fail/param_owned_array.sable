@@ -1,8 +1,0 @@
-// expect-error: type.param_unsupported
-// An array is passed by naming the caller's storage, `&[T]` or `&mut [T]`,
-// never by moving the array itself into the callee. The parameter position
-// admits every other value shape, so this is the one shape gate it keeps.
-
-fn total([u64] xs) -> u64 {
-    return xs[0];
-}

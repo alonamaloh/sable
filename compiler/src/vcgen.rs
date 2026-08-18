@@ -642,17 +642,18 @@ pub(crate) fn validate_vc_type_position(
     // and `check::borrow_referent_ty`'s to state.
     if ty.is_owned_array_of(&Ty::Bool) {
         let position = match position {
-            // A return joins the positions an owned Boolean array occupies:
-            // the transfer is payload-blind (ADR 0085), and the proof state a
-            // returned sequence carries is `lean_array_ty`'s, which reads the
-            // element type exactly as every other array site does.
+            // Both halves of a call join the positions an owned Boolean array
+            // occupies: the transfer is payload-blind (ADR 0085), and the
+            // proof state a transferred sequence carries is
+            // `lean_array_ty`'s, which reads the element type exactly as
+            // every other array site does.
             VcTypePosition::Expression
             | VcTypePosition::Local
             | VcTypePosition::ClassField
+            | VcTypePosition::Parameter
             | VcTypePosition::Return => {
                 return Ok(());
             }
-            VcTypePosition::Parameter => "a function parameter",
             VcTypePosition::TraitParameter => "a trait parameter",
             VcTypePosition::TraitReturn => "a trait return",
             VcTypePosition::RecordField => "a record field",
@@ -1100,8 +1101,17 @@ fn validate_vc_expr(
                 validate_vc_option_operator(expr, context, locals)
             }
         }
-        ExprKind::Call { args, .. }
-        | ExprKind::CtorCall { args, .. }
+        // An ordinary call is where an owner may be handed over (ADR 0085);
+        // the member, record-literal, and trait boundaries keep their
+        // refusal, each closed in the checker by its own name.
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                reject_affine_option_value(arg, locals, "a call boundary", context)?;
+                validate_vc_expr(arg, allow_param, context, locals)?;
+            }
+            Ok(())
+        }
+        ExprKind::CtorCall { args, .. }
         | ExprKind::RecordLit { args, .. }
         | ExprKind::TraitCall { args, .. } => {
             for arg in args {
@@ -8858,8 +8868,16 @@ fn affine_loop(u64 n) {
             "synthetic return",
         )
         .expect("a returned Boolean array is a value the callee hands over");
-        for position in [
+        // A parameter joins the return: both halves of a call transfer an
+        // owner (ADR 0085).
+        validate_vc_type_position(
+            Ty::array(Ty::Bool),
+            false,
             VcTypePosition::Parameter,
+            "synthetic parameter",
+        )
+        .expect("an owned Boolean array is handed over at a call");
+        for position in [
             VcTypePosition::TraitParameter,
             VcTypePosition::RecordField,
             VcTypePosition::Borrow,
@@ -8911,23 +8929,40 @@ fn affine_loop(u64 n) {
         validate_vc_expr(&borrowed, false, "array borrow", &locals)
             .expect("a Boolean array borrow is an ordinary value");
 
+        // An ordinary call is where an owner is handed over (ADR 0085). The
+        // member boundary is not, and forging one still fails closed.
+        let owned_argument = || Expr {
+            kind: ExprKind::Var("bits".into()),
+            span,
+            ty: Some(array_ty.clone()),
+        };
         let call = Expr {
             kind: ExprKind::Call {
                 callee: "sink".into(),
                 callee_span: span,
                 type_args: Vec::new(),
-                args: vec![Expr {
-                    kind: ExprKind::Var("bits".into()),
-                    span,
-                    ty: Some(array_ty),
-                }],
+                args: vec![owned_argument()],
             },
             span,
             ty: Some(Ty::Unit),
         };
-        let error = validate_vc_expr(&call, false, "forged call", &locals)
-            .expect_err("forged Boolean array call argument must fail closed");
-        assert!(error.contains("call boundary"));
+        validate_vc_expr(&call, false, "handing an owner over", &locals)
+            .expect("an owned Boolean array is handed over at an ordinary call");
+
+        let ctor = Expr {
+            kind: ExprKind::CtorCall {
+                class: "Holder".into(),
+                class_span: span,
+                init: "with".into(),
+                type_args: Vec::new(),
+                args: vec![owned_argument()],
+            },
+            span,
+            ty: Some(Ty::Unit),
+        };
+        let error = validate_vc_expr(&ctor, false, "forged constructor", &locals)
+            .expect_err("forged Boolean array constructor argument must fail closed");
+        assert!(error.contains("call boundary"), "{error}");
 
         let expose = Stmt::Expose {
             kw_span: span,
@@ -9628,7 +9663,10 @@ fn bool_array_loop(u64 n, bool seed) {
                 args: Vec::new(),
             },
             span: Span::new(0, 0),
-            ty: Some(Ty::borrow(Mutability::Shared, Ty::array(Ty::Int(IntTy::U64)))),
+            ty: Some(Ty::borrow(
+                Mutability::Shared,
+                Ty::array(Ty::Int(IntTy::U64)),
+            )),
         };
         generator.eval(&call);
         let latched = take_vc_type_refusal().expect("the return shape is latched");

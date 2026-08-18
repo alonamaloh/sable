@@ -1,0 +1,10 @@
+// expect-error: mut.store_immutable
+// An owned array parameter is a parameter, and no parameter is `mut`. The
+// callee owns the array and may keep it, pass it on, or let it die with the
+// frame — writing it needs the exclusive right a `mut` owner or a `&mut`
+// borrow has.
+
+fn fill([u64] xs) -> u64 {
+    xs[0] = 1;
+    return xs[0];
+}

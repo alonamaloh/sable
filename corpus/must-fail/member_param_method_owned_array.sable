@@ -1,0 +1,15 @@
+// expect-error: type.member_param
+// The method half of the member-parameter boundary: an owned array moves
+// into an ordinary function and not into a method.
+
+pub class Holder {
+    u64 n;
+
+    init new() {
+        self.n = 0;
+    }
+
+    fn take(&self, [u64] xs) -> u64 {
+        return 0;
+    }
+}

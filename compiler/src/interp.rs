@@ -392,17 +392,10 @@ fn validate_interp_param_ty(ty: Ty, context: &str) -> Result<(), String> {
             "interp.affine_option_position_unsupported: {context} is ownership-bearing; `option<[bool]>` is supported only as an explicit local"
         ));
     }
-    // Only an *owner* is position-restricted. A borrowed Boolean array is a
-    // second name for storage its caller keeps, so it is a parameter exactly
-    // as `&[T]` is: `ExprKind::Borrow` hands the callee the same `Rc`, and
-    // `drop_owned_params` matches the bare constructors, so nothing here
-    // acquires an owner.
-    if ty.is_owned_array_of(&Ty::Bool) {
-        return Err(format!(
-            "interp.array_position_unsupported: {context} is an owned Boolean array; \
-             an owned Boolean array is a local value"
-        ));
-    }
+    // An owner crossing here is what a move is (ADR 0085): the caller's place
+    // dies at the argument, `drop_owned_params` matches the bare constructors
+    // so the callee's frame destroys what it received, and a borrow stays a
+    // second name for storage its caller keeps.
     validate_interp_ty(ty, context)
 }
 
@@ -935,9 +928,15 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                         .into(),
                 );
             }
+            // An ordinary call is where an owner is handed over (ADR 0085);
+            // a constructor argument keeps the refusal, and the checker
+            // closes that boundary in its own name (`type.member_param`).
+            let hands_over = matches!(expr.kind, ExprKind::Call { .. });
             for arg in args {
                 validate_interp_expr(arg, locals)?;
-                reject_owned_bool_array_transport(arg, locals, "call argument")?;
+                if !hands_over {
+                    reject_owned_bool_array_transport(arg, locals, "call argument")?;
+                }
             }
         }
         ExprKind::Unary { op, operand } => match op {
@@ -1897,6 +1896,19 @@ impl<'a> Interp<'a> {
                     if let Some(sv) = spec_of(obj) {
                         frame.olds.insert(p.name.clone(), sv);
                     }
+                }
+                // An *owned* array parameter was handed over, so the callee
+                // may hand it on again and leave its place empty — and a
+                // contract still speaks about a moved-from parameter (ADR
+                // 0030). The entry copy is deep rather than the `Rc`,
+                // because an entry value is what it was at entry whatever
+                // becomes of the storage. A borrowed array keeps the
+                // established convention: clauses read current contents, and
+                // `old p` is the snapshot taken above.
+                (array @ RtVal::Arr(_), ty) if matches!(ty, Ty::Array(_)) => {
+                    frame
+                        .entry_scalars
+                        .insert(p.name.clone(), deep_copy(array));
                 }
                 (RtVal::Arr(_), _) => {}
                 _ => {
@@ -4748,10 +4760,16 @@ mod payload_guard_tests {
             validate_interp_param_ty(ty, "parameter `m`")
                 .expect("a borrowed Boolean array is an ordinary parameter");
         }
+        // An owner crosses too, by moving: the caller's place dies at the
+        // argument and `drop_owned_params` destroys what the callee received
+        // (ADR 0085). What stays refused is an affine option, which has no
+        // call boundary at all.
+        validate_interp_param_ty(Ty::array(Ty::Bool), "parameter `flags`")
+            .expect("an owned Boolean array is handed over at a call");
         assert!(
-            validate_interp_param_ty(Ty::array(Ty::Bool), "parameter `flags`")
+            validate_interp_param_ty(Ty::option(Ty::array(Ty::Bool)), "parameter `held`")
                 .unwrap_err()
-                .starts_with("interp.array_position_unsupported:")
+                .starts_with("interp.affine_option_position_unsupported:")
         );
     }
 

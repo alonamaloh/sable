@@ -1,0 +1,15 @@
+// expect-error: array.use_after_move
+// Passing an owned array to an owned parameter is a move: the callee's
+// parameter becomes the only name for the elements, so the caller's name is
+// dead afterwards. Reading it would let two names reach one sequence while
+// the logic treats them as separate values.
+
+fn head([u64] xs) -> u64 {
+    return xs[0];
+}
+
+fn bad() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 1);
+    u64 first = head(a);
+    return a[0];
+}

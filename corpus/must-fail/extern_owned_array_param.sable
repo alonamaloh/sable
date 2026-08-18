@@ -1,0 +1,7 @@
+// expect-error: extern.param_abi
+// An owned array crosses a verified call by moving; an audited extern has no
+// such rule to rely on. The ABI carries integers, raw pointers, and
+// whitelisted resources, and a safe array is none of them.
+
+extern "C" #[audit(id := "test.owned.arr.v1", reason := "no layout")]
+fn c_consume([u8] a);

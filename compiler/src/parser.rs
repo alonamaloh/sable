@@ -343,10 +343,6 @@ impl TyPos {
         use TyPos as P;
         use TypeShape as S;
         match (self, shape) {
-            (P::Param, S::Array) => {
-                "an owned array is borrowed at a call: write `&[T]` or `&mut [T]`, which \
-                 names the caller's storage instead of moving the array into the callee"
-            }
             (P::Return, S::Borrow) => {
                 "a returned borrow would name storage that the callee's frame stops \
                  keeping at the return"
@@ -1602,8 +1598,8 @@ impl<'a> Parser<'a> {
         use TyPos as P;
         use TypeShape as S;
         match pos {
-            // `type.option_param` and the affine-option boundary decide the
-            // rest.
+            // `type.option_param`, `type.member_param`, and the
+            // affine-option boundary decide the rest.
             P::Param => matches!(
                 shape,
                 S::Int
@@ -1611,14 +1607,15 @@ impl<'a> Parser<'a> {
                     | S::Param
                     | S::Record
                     | S::Class
+                    | S::Array
                     | S::Option
                     | S::Raw
                     | S::Resource
                     | S::Borrow
             ),
             P::BorrowParam => matches!(shape, S::Class | S::Array),
-            // `type.array_return` and the affine-option boundary own the
-            // aggregate cases.
+            // `type.member_array_return` and the affine-option boundary own
+            // the aggregate cases.
             P::Return => matches!(
                 shape,
                 S::Int
@@ -5740,17 +5737,17 @@ mod type_position_tests {
     #[test]
     fn a_rejection_note_explains_the_shape_that_was_written() {
         // The note is per (shape, position): a returned borrow is not told
-        // about calling conventions, and an owned array parameter is told the
-        // one thing that fixes it.
+        // about calling conventions, and a class local is told the one thing
+        // that fixes it.
         assert!(
             TyPos::Return
                 .rejection_note(TypeShape::Borrow)
                 .contains("callee's frame")
         );
         assert!(
-            TyPos::Param
+            TyPos::RecordField
                 .rejection_note(TypeShape::Array)
-                .contains("&mut [T]")
+                .contains("copy rule")
         );
         assert!(
             TyPos::Local

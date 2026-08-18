@@ -199,14 +199,9 @@ fn validate_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
 /// machine answers them separately for the same type.
 pub(crate) fn validate_parameter_ty(ty: &Ty, context: &str) -> Result<(), String> {
     validate_ty_payload(ty.clone(), context)?;
-    // The owner is what a call boundary may not carry: an array reaches a
-    // callee as `&[T]` or `&mut [T]`, which the machine transports as an
-    // argument value and, for a unique borrow, a loan returned at the pop.
-    if ty.is_owned_bool_array() {
-        return Err(format!(
-            "svm.bool_array_position_unsupported: {context} owns a Boolean array; an array crosses a call boundary as a borrow"
-        ));
-    }
+    // An owner crosses as a value and a borrow as a loan; both are ordinary
+    // argument forms (ADR 0069, ADR 0085), and neither depends on the
+    // payload.
     Ok(())
 }
 
@@ -1050,17 +1045,31 @@ fn validate_return(ctx: &LowerCtx<'_>, value: &Expr) -> Result<(), String> {
 /// `ret` discards the callee's frame, so the value leaving is the only name
 /// that survives.
 fn returned_owner(ctx: &LowerCtx<'_>, value: &Expr) -> Result<bool, String> {
-    let Some(expected) = ctx.return_ty.as_ref().and_then(Ty::as_owned_array) else {
+    let Some(expected) = ctx.return_ty.clone() else {
+        return Ok(false);
+    };
+    moved_owner(ctx, &expected, value)
+}
+
+/// Whether this expression hands an owned array over by naming it, at a sink
+/// whose destination is that same owned array type.
+///
+/// A disagreeing annotation answers `false` rather than being accepted here:
+/// `validate_local_var` owns that coherence rule and names it, and a forged
+/// type must not ride out on the ownership rule.
+fn moved_owner(ctx: &LowerCtx<'_>, destination: &Ty, value: &Expr) -> Result<bool, String> {
+    let Some(expected) = destination.as_owned_array() else {
         return Ok(false);
     };
     let ExprKind::Var(name) = &value.kind else {
         return Ok(false);
     };
-    let local = ctx.initialized_local(name, "return value")?;
-    // A disagreeing annotation falls through rather than being accepted here:
-    // `validate_local_var` owns that coherence rule and names it, and a
-    // forged result type must not ride out on the ownership rule.
-    if value.ty.as_ref().is_some_and(|annotation| *annotation != local.ty) {
+    let local = ctx.initialized_local(name, "owner transfer")?;
+    if value
+        .ty
+        .as_ref()
+        .is_some_and(|annotation| *annotation != local.ty)
+    {
         return Ok(false);
     }
     Ok(local.ty.as_owned_array() == Some(expected))
@@ -1865,6 +1874,12 @@ fn validate_call_signature(
         ));
     }
     for (index, (arg, parameter)) in args.iter().zip(&function.params).enumerate() {
+        // Naming an owned array is a move, and an owned parameter is a sink
+        // that move is for (ADR 0085): `Arg.byValue` records no loan, so the
+        // callee's parameter is the only name for the sequence while it runs.
+        if moved_owner(ctx, &parameter.ty, arg)? {
+            continue;
+        }
         validate_sink_type(
             ctx,
             parameter.ty.clone(),
@@ -1946,6 +1961,14 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
             }
             validate_call_signature(ctx, expr, callee, args)?;
             for arg in args {
+                // A named owner is checked against its parameter by
+                // `validate_call_signature`; the payload walk refuses the
+                // read itself, which at an argument *is* the move (ADR 0085).
+                if arg.ty.as_ref().and_then(Ty::as_owned_array).is_some()
+                    && matches!(arg.kind, ExprKind::Var(_))
+                {
+                    continue;
+                }
                 validate_expr_payloads(ctx, arg)?;
             }
         }
@@ -2153,6 +2176,11 @@ pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
                 lowering_ctx.record(*ri)?;
             }
             borrowed if borrowed.as_array_borrow().is_some() => {}
+            // An owner crosses by value: `call_enter` binds whatever the
+            // argument evaluated to, and no loan is recorded, so the callee's
+            // parameter is the only name for the sequence while it runs
+            // (ADR 0085).
+            Ty::Array(_) => {}
             _ => {
                 return Err(format!(
                     "parameter `{}`: its type is outside the SVM core subset (resources are scoped out)",
@@ -3499,6 +3527,16 @@ fn lower_call(ctx: &LowerCtx<'_>, dst: &Option<String>, call: &Expr) -> Result<S
 /// is exactly that promise. Lending needs a name to return to, so a unique
 /// borrow of anything but a local fails closed.
 fn lower_arg(ctx: &LowerCtx<'_>, arg: &Expr) -> Result<String, String> {
+    // A named owner is a move: reading the name is the transfer, and no loan
+    // is recorded, so the callee's parameter is the only name for the
+    // sequence while it runs (ADR 0085). `lower_expr` refuses the read
+    // because every *other* position that performs it would leave two names.
+    if let (Some(_), ExprKind::Var(name)) =
+        (arg.ty.as_ref().and_then(Ty::as_owned_array), &arg.kind)
+    {
+        ctx.initialized_local(name, "owned array argument")?;
+        return Ok(format!("(.byValue (.var \"{name}\"))"));
+    }
     let Some((_, mutability)) = arg.ty.as_ref().and_then(Ty::as_array_borrow) else {
         return Ok(format!("(.byValue {})", lower_expr(ctx, arg)?));
     };
@@ -4523,19 +4561,20 @@ mod tests {
         let program = empty_program();
         let array_ty = Ty::array(Ty::Bool);
 
-        let mut parameter = checked_fn(Ty::Bool, Vec::new());
+        // Both halves of a call transfer an owner, whatever its payload
+        // (ADR 0085): `call_enter` binds the argument's value and records no
+        // loan, so the parameter is the only name for the sequence.
+        let mut parameter = checked_fn(Ty::Unit, Vec::new());
         parameter.params.push(Param {
             name: "bits".into(),
             ty: array_ty.clone(),
             span: Span::new(0, 0),
             consumes: false,
         });
-        let error = lower_fn_entry(&program, &parameter)
-            .expect_err("Boolean arrays have no SVM parameter ABI");
-        assert!(
-            error.starts_with("svm.bool_array_position_unsupported:"),
-            "{error}"
-        );
+        lower_fn_entry(&program, &parameter)
+            .expect("an owned Boolean array is handed over at a call");
+        validate_parameter_ty(&array_ty, "parameter `bits`")
+            .expect("an owned Boolean array is handed over at a call");
 
         // A return is not a position an owner is refused at: the machine
         // carries the value out at the pop, whatever its payload (ADR 0085).
@@ -4548,7 +4587,10 @@ mod tests {
             "probe return",
         )
         .expect_err("a loan does not leave as a value");
-        assert!(error.starts_with("svm.borrow_return_unsupported:"), "{error}");
+        assert!(
+            error.starts_with("svm.borrow_return_unsupported:"),
+            "{error}"
+        );
 
         let mut field_program = empty_program();
         field_program.classes.push(ClassDecl {

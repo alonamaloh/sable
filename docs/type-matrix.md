@@ -19,9 +19,9 @@ The `init param` / `method param` pairs read the same way.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `u64` | yes | yes | yes | never | not yet | yes | yes | yes | yes | yes | yes | yes | yes | yes | not yet | yes | yes | yes | never | yes | never |
 | `bool` | yes | yes | yes | never | not yet | not yet | yes | yes | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
-| `[u64]` | yes | yes | not yet | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
-| `[bool]` | yes | yes | not yet | yes | yes | never | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
-| `[record]` | yes | yes | not yet | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
+| `[u64]` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
+| `[bool]` | yes | yes | yes | yes | yes | never | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
+| `[record]` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
 | `option<u64>` | yes | yes | yes | never | not yet | not yet | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `option<bool>` | yes | yes | yes | never | not yet | not yet | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `record` | yes | yes | yes | never | not yet | not yet | not yet | yes | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
@@ -29,7 +29,7 @@ The `init param` / `method param` pairs read the same way.
 | `class` | yes | yes | yes | yes | yes | never | yes | not yet | yes | not yet | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
 | `raw<u8>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | not yet | not yet | never | not yet | never |
 
-Open cells: 78 of 180 intended; 51 never open by design.
+Open cells: 81 of 180 intended; 51 never open by design.
 
 ## Cells that never open
 
@@ -73,7 +73,6 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `bool` | resource map key | `type.resource_map_key_unsupported` |
 | `bool` | init param & | `type.borrow_param_unsupported` |
 | `bool` | method param & | `type.borrow_param_unsupported` |
-| `[u64]` | param | `type.param_unsupported` |
 | `[u64]` | record field | `record.field_type` |
 | `[u64]` | array element | `type.array_payload_unsupported` |
 | `[u64]` | option payload | `type.affine_option_payload` |
@@ -85,10 +84,9 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `[u64]` | raw element | `type.raw_element_unsupported` |
 | `[u64]` | resource extent | `type.resource_extent_unsupported` |
 | `[u64]` | resource map key | `type.resource_map_key_unsupported` |
-| `[u64]` | init param | `type.param_unsupported` |
-| `[u64]` | method param | `type.param_unsupported` |
+| `[u64]` | init param | `type.member_param` |
+| `[u64]` | method param | `type.member_param` |
 | `[u64]` | method param & | `type.member_param` |
-| `[bool]` | param | `type.param_unsupported` |
 | `[bool]` | record field | `record.field_type` |
 | `[bool]` | array element | `type.array_payload_unsupported` |
 | `[bool]` | generic arg | `mono.type_arg_unsupported` |
@@ -99,10 +97,9 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `[bool]` | raw element | `type.raw_element_unsupported` |
 | `[bool]` | resource extent | `type.resource_extent_unsupported` |
 | `[bool]` | resource map key | `type.resource_map_key_unsupported` |
-| `[bool]` | init param | `type.param_unsupported` |
-| `[bool]` | method param | `type.param_unsupported` |
+| `[bool]` | init param | `type.member_param` |
+| `[bool]` | method param | `type.member_param` |
 | `[bool]` | method param & | `type.member_param` |
-| `[record]` | param | `type.param_unsupported` |
 | `[record]` | record field | `record.field_type` |
 | `[record]` | array element | `type.array_payload_unsupported` |
 | `[record]` | option payload | `type.affine_option_payload` |
@@ -114,8 +111,8 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `[record]` | raw element | `type.raw_element_unsupported` |
 | `[record]` | resource extent | `type.resource_extent_unsupported` |
 | `[record]` | resource map key | `type.resource_map_key_unsupported` |
-| `[record]` | init param | `type.param_unsupported` |
-| `[record]` | method param | `type.param_unsupported` |
+| `[record]` | init param | `type.member_param` |
+| `[record]` | method param | `type.member_param` |
 | `[record]` | method param & | `type.member_param` |
 | `option<u64>` | param & | `type.borrow_param_unsupported` |
 | `option<u64>` | param &mut | `type.borrow_param_unsupported` |

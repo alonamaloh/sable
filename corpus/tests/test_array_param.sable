@@ -1,0 +1,76 @@
+// Dynamic checks for owned array parameters: what a move actually does.
+//
+// The static half says the caller's place dies and the callee owns what it
+// received. The halves to observe at run time are that the callee reads the
+// caller's values (a move hands over storage, not a blank), that a contract
+// still speaks about a parameter the callee handed on (ADR 0030 — the entry
+// value outlives the transfer of authority over it), and that lending and
+// moving compose in one function without either disturbing the other.
+
+use array_param;
+
+/// pre x = y
+fn expect_eq(u64 x, u64 y) {
+}
+
+/// pre b
+fn expect_true(bool b) {
+}
+
+fn test_the_callee_reads_what_the_caller_had() {
+    mut [u64] a = alloc_array<u64>(3, 0);
+    a[0] = 11;
+    expect_eq(head(a), 11);
+}
+
+fn test_a_moved_in_array_keeps_its_length() {
+    mut [u64] a = alloc_array<u64>(4, 1);
+    expect_eq(count_nonzero(a), 4);
+}
+
+// `passthrough` hands its parameter straight back out, so its posts name a
+// parameter whose place the body emptied. The contract still reads it.
+fn test_a_contract_reads_a_parameter_the_body_handed_on() {
+    mut [u64] a = alloc_array<u64>(2, 6);
+    mut [u64] b = passthrough(a);
+    /// assert #[label(the_same_values_came_back)] b.get 0 = 6
+    expect_eq(b.len, 2);
+    expect_eq(b[0], 6);
+}
+
+// What comes back is the caller's to write: the callee's frame is gone.
+fn test_the_returned_owner_is_writable_storage() {
+    mut [u64] a = alloc_array<u64>(2, 3);
+    mut [u64] b = passthrough(a);
+    b[1] = 8;
+    expect_eq(b[0], 3);
+    expect_eq(b[1], 8);
+}
+
+fn test_lending_then_moving_is_two_transfers() {
+    expect_eq(lend_then_move(), 1);
+}
+
+fn test_a_move_may_be_handed_on_again() {
+    expect_eq(hand_over(), 4);
+}
+
+fn test_a_boolean_array_moves_with_its_payload() {
+    mut [bool] fs = alloc_array<bool>(3, false);
+    fs[0] = true;
+    expect_true(first_set(fs));
+}
+
+fn test_a_record_array_moves_with_its_elements() {
+    mut [Pt] ps = alloc_array<Pt>(2, Pt(6, 8));
+    expect_eq(half_head(ps), 7);
+}
+
+fn test_a_returned_array_moves_straight_into_a_parameter() {
+    expect_eq(make_then_move(), 4);
+}
+
+fn test_an_empty_array_moves() {
+    mut [u64] a = alloc_array<u64>(0, 0);
+    expect_eq(count_nonzero(a), 0);
+}

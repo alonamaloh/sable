@@ -1,0 +1,13 @@
+// expect-error: type.member_param
+// An ordinary function takes an owned array by moving it in. An init or
+// method parameter is a different boundary: the member call site has its own
+// argument reification and receiver-state machinery, and no owner has
+// crossed it.
+
+pub class Holder {
+    u64 n;
+
+    init with([u64] xs) {
+        self.n = 0;
+    }
+}

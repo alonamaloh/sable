@@ -1,0 +1,31 @@
+// pair: same-run
+// See array_move_vs_lend.a.sable: the same subjects lend the array instead
+// of handing it over, and the callee reads the caller's storage through the
+// borrow.
+
+/// pre  xs.len ≥ 2
+/// post result = xs.get 1
+fn second(&[u64] xs) -> u64 {
+    return xs[1];
+}
+
+/// post result = 4
+pub fn subject() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 0);
+    a[0] = 3;
+    a[1] = 4;
+    return second(&a);
+}
+
+/// pre  fs.len ≥ 1
+/// post result ↔ fs.get 0 = true
+fn read_flag(&[bool] fs) -> bool {
+    return fs[0];
+}
+
+/// post result
+pub fn subject_bool() -> bool {
+    mut [bool] fs = alloc_array<bool>(1, false);
+    fs[0] = true;
+    return read_flag(&fs);
+}

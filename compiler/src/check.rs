@@ -4738,13 +4738,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
                             return Err(Diagnostic {
                                 name: "type.array_arg_borrow".into(),
-                                title: "array arguments are passed by explicit borrow".into(),
+                                title: "a borrowed array parameter takes an explicit borrow".into(),
                                 span: arg.span,
                                 label: format!(
                                     "write `{}name`",
                                     if m == Mutability::Mut { "&mut " } else { "&" }
                                 ),
-                                notes: vec![],
+                                notes: vec![(
+                                    "note".into(),
+                                    "an argument's form follows the parameter's binding mode: \
+                                     a borrow names the caller's storage, while an owned \
+                                     `[T]` parameter takes the array itself"
+                                        .into(),
+                                )],
                             });
                         }
                         let got = check_expr(ctx, arg, None)?;
@@ -5467,13 +5473,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         if !matches!(arg.kind, ExprKind::Borrow { .. }) {
                             return Err(Diagnostic {
                                 name: "type.array_arg_borrow".into(),
-                                title: "array arguments are passed by explicit borrow".into(),
+                                title: "a borrowed array parameter takes an explicit borrow".into(),
                                 span: arg.span,
                                 label: format!(
                                     "write `{}name`",
                                     if m == Mutability::Mut { "&mut " } else { "&" }
                                 ),
-                                notes: vec![],
+                                notes: vec![(
+                                    "note".into(),
+                                    "an argument's form follows the parameter's binding mode: \
+                                     a borrow names the caller's storage, while an owned \
+                                     `[T]` parameter takes the array itself"
+                                        .into(),
+                                )],
                             });
                         }
                         let got = check_expr(ctx, arg, None)?;

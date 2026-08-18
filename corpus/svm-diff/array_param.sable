@@ -1,0 +1,105 @@
+// SVM differential subjects: an owned array crosses a call by moving.
+//
+// `Arg.byValue` supplies the value and records no loan, so the callee's
+// parameter is the only name for the sequence while it runs and nothing is
+// written back at the pop. That is the machine's whole account of a move,
+// and it needs no rule of its own.
+//
+// The two executables disagree by construction about the mechanism: the
+// interpreter hands the callee the same `Rc` the caller held, while the
+// machine copies the value into a fresh environment. They agree on every
+// outcome here only because the caller's place is dead for the rest of its
+// scope — which is the checker's rule, and the reason these subjects are
+// worth comparing rather than assuming.
+
+fn head([u64] xs) -> u64 {
+    return xs[0];
+}
+
+fn length([u64] xs) -> u64 {
+    return xs.len;
+}
+
+fn first_flag([bool] fs) -> bool {
+    return fs[0];
+}
+
+// The callee reads the caller's values, not a blank.
+fn a_move_hands_over_the_contents() -> u64 {
+    mut [u64] a = alloc_array<u64>(3, 0);
+    a[1] = 6;
+    u64 seen = head_at_one(a);
+    return seen;
+}
+
+fn head_at_one([u64] xs) -> u64 {
+    return xs[1];
+}
+
+// The length crosses with the value.
+fn a_move_hands_over_the_length() -> u64 {
+    [u64] a = alloc_array<u64>(4, 0);
+    u64 n = length(a);
+    return n;
+}
+
+// A parameter may be handed on again: the second callee owns what the first
+// received.
+fn a_moved_parameter_may_be_handed_on() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 5);
+    u64 seen = via(a);
+    return seen;
+}
+
+fn via([u64] xs) -> u64 {
+    u64 seen = head(xs);
+    return seen;
+}
+
+// Moving out and back in: the value survives both directions.
+fn a_move_out_and_back_in() -> u64 {
+    [u64] a = build(2);
+    u64 seen = head(a);
+    return seen;
+}
+
+fn build(u64 n) -> [u64] {
+    mut [u64] xs = alloc_array<u64>(n, 3);
+    return xs;
+}
+
+// The payload tag crosses the boundary.
+fn a_boolean_array_moves_with_its_payload() -> bool {
+    mut [bool] fs = alloc_array<bool>(2, false);
+    fs[0] = true;
+    bool seen = first_flag(fs);
+    return seen;
+}
+
+// An empty array is still an owner, and still knows its length.
+fn an_empty_array_moves() -> u64 {
+    [u64] a = alloc_array<u64>(0, 0);
+    u64 n = length(a);
+    return n;
+}
+
+// A trap inside the callee is the caller's outcome; the frame it traps in is
+// the one that owns the array.
+fn a_trap_in_the_callee_is_the_outcome() -> u64 {
+    [u64] a = alloc_array<u64>(1, 0);
+    u64 seen = head_at_one(a);
+    return seen;
+}
+
+// Lending and moving the same array in one body, in that order: the borrow
+// ends at its call, so the move that follows names storage nothing else does.
+fn a_lend_then_a_move() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 7);
+    u64 lent = peek(&a);
+    u64 moved = head(a);
+    return lent * 10 + moved;
+}
+
+fn peek(&[u64] m) -> u64 {
+    return m[0];
+}

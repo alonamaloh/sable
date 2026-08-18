@@ -1,0 +1,159 @@
+// Passing an owned array: the caller hands its storage over.
+//
+// A bare array name at an owned `[T]` parameter is a move. The callee's
+// parameter becomes the only name for those elements, the caller's place
+// dies, and the array is destroyed with the callee's frame unless the body
+// hands it on. That is the same rule a class value obeys, and the same
+// `transfer` performs it.
+//
+// The parameter binds like any other array: one `Sable.Seq` binder, the
+// length bound, and the payload's element fact. It has no `_old_` twin,
+// because nothing will replace it — a call-site havoc replaces what a `&mut`
+// argument names, and an owned parameter names nothing the caller still has.
+//
+// A parameter is not `mut`, so the callee may read, keep, or pass on the
+// array but not write it. Writing is what `&mut [T]` is for.
+
+pub record Pt #[layout(size := 16, align := 8)] {
+    #[offset(0)] u64 x;
+    #[offset(8)] u64 y;
+}
+
+/// pre  xs.len ≥ 1
+/// post result = xs.get 0
+pub fn head([u64] xs) -> u64 {
+    return xs[0];
+}
+
+// The element fact the parameter carries is what bounds the sum, exactly as
+// it does for a borrowed parameter.
+/// post result ≤ xs.len
+pub fn count_nonzero([u64] xs) -> u64 {
+    mut u64 c = 0;
+    /// invariant c ≤ i
+    for (u64 i : range(0, xs.len)) {
+        if (xs[i] != 0) { c = c + 1; }
+    }
+    return c;
+}
+
+// An owned parameter is immutable, so it survives a loop head unchanged:
+// stores are the only array mutation, and a parameter is not a store target.
+/// post result ↔ ∀ k, 0 ≤ k → k < xs.len → xs.get k = 0
+pub fn all_zero([u64] xs) -> bool {
+    /// invariant ∀ k, 0 ≤ k → k < i → xs.get k = 0
+    for (u64 i : range(0, xs.len)) {
+        if (xs[i] != 0) { return false; }
+    }
+    return true;
+}
+
+// The move is complete in both directions: the callee receives the owner and
+// hands it straight back out. The caller learns nothing about the result
+// except what these posts say — the returned sequence is fresh, so an
+// elementwise post is what carries the contents across.
+/// post result.len = xs.len
+/// post ∀ k, 0 ≤ k → k < xs.len → result.get k = xs.get k
+pub fn passthrough([u64] xs) -> [u64] {
+    return xs;
+}
+
+// A moved-in array can be handed on to a second callee. The caller's place
+// died at the first call; the callee's dies at the second.
+/// pre  xs.len ≥ 1
+/// post result = xs.get 0
+pub fn head_via([u64] xs) -> u64 {
+    return head(xs);
+}
+
+/// post result = 4
+pub fn hand_over() -> u64 {
+    mut [u64] a = alloc_array<u64>(3, 4);
+    return head_via(a);
+}
+
+// A round trip: allocate, move in, get the same sequence back, read it.
+/// post result = 6
+pub fn round_trip() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 6);
+    [u64] b = passthrough(a);
+    return b[0];
+}
+
+// Lending and moving are different transfers of the same array, in that
+// order: a borrow ends at the call, and the move that follows is legal
+// because nothing still names the storage.
+/// post result = 1
+pub fn lend_then_move() -> u64 {
+    mut [u64] a = alloc_array<u64>(2, 1);
+    u64 seen = count_borrowed(&a);
+    return head(a);
+}
+
+/// post result ≤ m.len
+pub fn count_borrowed(&[u64] m) -> u64 {
+    mut u64 c = 0;
+    /// invariant c ≤ i
+    for (u64 i : range(0, m.len)) {
+        if (m[i] != 0) { c = c + 1; }
+    }
+    return c;
+}
+
+// A Boolean payload: the length fact and no element fact, because `Bool` is
+// already its complete value domain.
+/// pre  fs.len ≥ 1
+/// post result ↔ fs.get 0 = true
+pub fn first_set([bool] fs) -> bool {
+    return fs[0];
+}
+
+/// post result
+pub fn boolean_move() -> bool {
+    mut [bool] fs = alloc_array<bool>(2, true);
+    return first_set(fs);
+}
+
+// A record payload: elementwise `wf` is what bounds the fields the callee
+// reads out of an element — unfolding it is what the field arithmetic needs,
+// exactly as it does for a borrowed record array.
+/// discharge half_head.overflow.h_x_2_h_y_2 by
+///   simp only [SableR_Pt.wf_iff] at *
+///   omega
+
+/// pre  ps.len ≥ 1
+/// post result = (ps.get 0).x / 2 + (ps.get 0).y / 2
+pub fn half_head([Pt] ps) -> u64 {
+    Pt h = ps[0];
+    return h.x / 2 + h.y / 2;
+}
+
+/// post result = 3
+pub fn record_move() -> u64 {
+    mut [Pt] ps = alloc_array<Pt>(2, Pt(2, 4));
+    return half_head(ps);
+}
+
+// A returned array moving straight into an owned parameter: the value never
+// belongs to a name in between.
+/// post result.len = n
+pub fn zeros(u64 n) -> [u64] {
+    mut [u64] xs = alloc_array<u64>(n, 0);
+    return xs;
+}
+
+/// post result = 4
+pub fn make_then_move() -> u64 {
+    [u64] xs = zeros(4);
+    return count_zeros(xs);
+}
+
+/// post result = xs.len
+pub fn count_zeros([u64] xs) -> u64 {
+    mut u64 c = 0;
+    /// invariant c = i
+    for (u64 i : range(0, xs.len)) {
+        c = c + 1;
+    }
+    return c;
+}
