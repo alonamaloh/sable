@@ -44,11 +44,6 @@ pub fn zero_nat() -> Nat {
     return z;
 }
 
-/// discharge zero_nat.post.val by
-///   rw [h_result]
-///   have h := valIn_nil zs 0 0 (by omega)
-///   omega
-
 // `Nat` is affine, so a borrowed magnitude has to be duplicated before
 // it can be moved into an `Integer`. Re-running the prefix constructor
 // over the existing limbs is the copy: the class invariant supplies its

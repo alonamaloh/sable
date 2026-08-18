@@ -1320,10 +1320,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///     show _self7_limbs.get k = xs.get k
 ///     exact h_inv_k_0_k_k_i_self_limbs_get k hk1 (by omega)
 
-/// discharge trim_len.inv_preserved.valin_xs_0_rl_valin_xs_0_xs_len by
-///   have h := trim_top_zero xs rl (by omega) (by omega)
-///   omega
-
 /// discharge cmp.post.lt by
 ///   sable_norm
 ///   have hv : natVal a.limbs < natVal b.limbs :=
@@ -1487,15 +1483,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 // step lemmas, and the exit compositions (carry/borrow vanish, the
 // trimmed prefix carries the exact value into from_prefix).
 
-/// discharge add.inv_init.valin_out_0_i_carry_pw_i_valin_a_limbs_0 by
-///   have e1 : (if (0:Int) ≤ a.limbs.len then (0:Int) else a.limbs.len) = 0 := by
-///     split <;> omega
-///   have e2 : (if (0:Int) ≤ b.limbs.len then (0:Int) else b.limbs.len) = 0 := by
-///     split <;> omega
-///   rw [e1, e2, valIn_nil out 0 0 (by omega), valIn_nil a.limbs 0 0 (by omega),
-///       valIn_nil b.limbs 0 0 (by omega)]
-///   omega
-
 /// discharge add.inv_preserved.valin_out_0_i_carry_pw_i_valin_a_limbs_0 by
 ///   exact add_step out a.limbs b.limbs i a.limbs.len b.limbs.len carry _r11 _r12
 ///     (by omega) h_limb_or0_post_sel h_limb_or0_post_sel_2
@@ -1520,13 +1507,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///   rw [h_result]
 ///   simp only [natVal] at *
 ///   rw [h_out_len, h_stale_alloc3] at h_trim_len_post_value
-///   omega
-
-/// discharge sub.inv_init.valin_out_0_i_borrow_pw_i_valin_a_limbs by
-///   have e2 : (if (0:Int) ≤ b.limbs.len then (0:Int) else b.limbs.len) = 0 := by
-///     split <;> omega
-///   rw [e2, valIn_nil out 0 0 (by omega), valIn_nil a.limbs 0 0 (by omega),
-///       valIn_nil b.limbs 0 0 (by omega)]
 ///   omega
 
 /// discharge sub.inv_preserved.valin_out_0_i_borrow_pw_i_valin_a_limbs by
@@ -2132,11 +2112,6 @@ pub fn gcd(&Nat a, &Nat b) -> Nat {
 ///     (by simp only [natVal]
 ///         exact valIn_nonneg _ _ _ (fun k hh1 hh2 => (h_field_limbs_elems_7 k hh1 hh2).1))
 ///     (by rw [← h_assert_vn_val]; omega)
-///   omega
-
-/// discharge nat1.post.value by
-///   subst h_result
-///   have h := valIn_nil (xs.set 0 d) 0 0 (by omega)
 ///   omega
 
 /// discharge nat1.post.value.2 by

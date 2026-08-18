@@ -156,18 +156,6 @@ fn bignum_div_native_entry() -> i32 {
     return 42;
 }
 
-/// discharge divide_by_one_case.call_pre.div.natval_b_limbs_1 by
-///   have hz := valIn_nil zero_source 0 0 (by omega)
-///   have hzero : natVal zero.limbs = 0 := by omega
-///   have hlt : natVal zero.limbs < natVal one.limbs := h_cmp_post_lt.mp (by omega)
-///   omega
-
-/// discharge exact_division_case.call_pre.div.natval_b_limbs_1 by
-///   have hz := valIn_nil zero_source 0 0 (by omega)
-///   have hzero : natVal zero.limbs = 0 := by omega
-///   have hlt : natVal zero.limbs < natVal divisor.limbs := h_cmp_post_lt.mp (by omega)
-///   omega
-
 /// discharge inexact_division_case.call_pre.div.natval_b_limbs_1 by
 ///   have hz := valIn_nil zero_source 0 0 (by omega)
 ///   have hzero : natVal zero.limbs = 0 := by omega
