@@ -1354,6 +1354,26 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      twins, and two same-lean pairs; `docs/type-matrix.md` opens exactly
      the two class-field cells (63 → 65 of 163 intended).
 
+     **Instantiate, then omega (ADR 0082).** The second dedicated tier
+     closes the pointwise array-update class: apply every hypothesis
+     with leading Int binders at the index atoms in scope (get/set
+     indices, Int variables), keep the instances that mention an active
+     get atom, and let omega — which reads implications and
+     disjunctions over opaque atoms — finish, after Seq normalization,
+     `repeat split` over the per-array ites, and `subst_eqs` for the
+     positive branch. Measured before building: grind closes these at
+     ~33M heartbeats (past the warning bar) and `grind only` costs the
+     same — the expense is E-matching the quantified local hypotheses,
+     so a budgeted grind-only tier was built, measured, and discarded.
+     What stays hand-proved: congruence chains and existential
+     witnesses, both correctly discharge territory. Landing it forced
+     the budget question: tiers shared one elaborator cap, so a new
+     tier made near-limit obligations die uncatchably. The portfolio
+     now owns proof cost — the tier runs under `sable_slice` (baseline
+     reset, hard cap, timeout demoted to a catchable failure) and
+     emitted files set `maxHeartbeats` to twice the default as a
+     backstop, not a meter.
+
      **A case-split tier in sable_auto (ADR 0081).** The portfolio
      learns the one move every option slice was paying for by hand:
      `sable_cases` splits every `match` whose scrutinee is an abstract

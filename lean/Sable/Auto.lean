@@ -8,8 +8,9 @@ Sable prelude: the automation portfolio.
 Every VC the compiler emits is a theorem proved `by sable_auto` (unless a
 `discharge` block overrides it). The portfolio is deliberately ordered:
 cheap closers first, then normalization + omega (the workhorse for range
-and overflow VCs), then simp_all, then `sable_cases` for match-shaped
-goals and hypotheses, then a heartbeat-budgeted `grind`.
+and overflow VCs), then `sable_instantiate` for pointwise array goals,
+then simp_all, then `sable_cases` for match-shaped goals and
+hypotheses, then a heartbeat-budgeted `grind`.
 
 `sable_norm` unfolds the Sable bound constants (`u32.max` etc.) to literals
 everywhere, since `omega` treats unknown constants as opaque.
@@ -23,6 +24,19 @@ variables (`cases o`) and equates projections (`cases h : self.f`), so the
 branch closers — `contradiction` for the refuted arm, simp/omega for the
 live one — see constructor-form scrutinees. It is also available in
 `discharge` scripts directly.
+
+`sable_instantiate` is quantifier instantiation with omega as the
+engine: every hypothesis with leading `Int` binders is applied at the
+index atoms in scope (`Seq.get`/`Seq.set` indices and `Int` variables),
+guards are left as implications — omega consumes those — and a
+relevance filter keeps only facts that mention a `get` atom of the goal
+or of a ground hypothesis. This closes the pointwise array shape (`∀ i,
+… → P ((a.set p v).get i)`, after `Seq` normalization and ite splits)
+that `grind` can only close well past the warning bar: the hand proofs
+it replaces were all `have h := hyp i (by omega) … <;> omega`. What it
+deliberately cannot do is congruence — a goal needing `f i = f j` from
+`i = j` (beyond what `subst_eqs` gives after an ite split) stays with
+`grind` or a discharge.
 
 `sable_grind` is `grind` under a heartbeat budget
 (`sable.grindHeartbeats`, in thousands like `maxHeartbeats`; 0 disables
@@ -42,6 +56,25 @@ register_option sable.grindHeartbeats : Nat := {
     A goal that grind closes using ≥ 1/5 of the budget produces a \
     warning with a minimized-proof suggestion."
 }
+
+open Lean Elab Tactic in
+/-- Run a tactic under its own heartbeat slice (in thousands, like
+`maxHeartbeats`), with the baseline reset so preceding tiers' spending
+does not count against it, and a runtime timeout demoted to an ordinary
+failure the portfolio's `solve` can catch. Tiers whose worst case is
+data-dependent (branch fan-out over chained stores, omega over a wide
+context) run inside this so one obligation's pathology costs a bounded
+slice, not the whole elaboration allowance. -/
+elab "sable_slice " budget:num tac:tacticSeq : tactic => do
+  let start ← IO.getNumHeartbeats
+  let run : TacticM Unit :=
+    withTheReader Core.Context
+      (fun ctx => { ctx with maxHeartbeats := budget.getNat * 1000,
+                             initHeartbeats := start }) do
+        evalTactic tac
+  tryCatchRuntimeEx run fun e => do
+    if e.isInterrupt then throw e
+    throwError "tier exceeded its heartbeat slice ({budget.getNat}k)"
 
 open Lean Elab Tactic in
 elab "sable_grind" : tactic => do
@@ -79,6 +112,110 @@ elab "sable_grind" : tactic => do
       saved.restore
       run (budgetK * 3) (← `(tactic| grind))
       warn false
+
+section SableInstantiate
+
+open Lean Meta Elab Tactic
+
+
+/-- Closed `Seq.get`/`Seq.set` index arguments and the full get-applications
+in `e`. -/
+private partial def collectSeq (idxs : IO.Ref (Array Expr))
+    (gets : IO.Ref (Array Expr)) (e : Expr) : MetaM Unit := do
+  if !e.hasLooseBVars && e.isApp then
+    if let .const n _ := e.getAppFn then
+      if n == ``Sable.Seq.get || n == ``Sable.Seq.set then
+        let args := e.getAppArgs
+        if h : 2 < args.size then
+          let idx := args[2]
+          if !idx.hasLooseBVars && !idx.hasExprMVar then
+            unless (← idxs.get).contains idx do idxs.modify (·.push idx)
+          if n == ``Sable.Seq.get then
+            unless (← gets.get).contains e do gets.modify (·.push e)
+  match e with
+  | .app f a => collectSeq idxs gets f; collectSeq idxs gets a
+  | .lam _ t b _ => collectSeq idxs gets t; collectSeq idxs gets b
+  | .forallE _ t b _ => collectSeq idxs gets t; collectSeq idxs gets b
+  | .letE _ t v b _ => collectSeq idxs gets t; collectSeq idxs gets v; collectSeq idxs gets b
+  | .mdata _ b => collectSeq idxs gets b
+  | .proj _ _ b => collectSeq idxs gets b
+  | _ => pure ()
+
+private def isIntTy (t : Expr) : MetaM Bool := do
+  let t ← whnf t
+  return t.isConstOf ``Int
+
+private def containsAny (e : Expr) (needles : Array Expr) : Bool :=
+  Option.isSome <| e.find? fun sub => needles.contains sub
+
+elab "sable_instantiate" : tactic => do
+  let g ← getMainGoal
+  let news ← g.withContext do
+    let idxs ← IO.mkRef (#[] : Array Expr)
+    let gets ← IO.mkRef (#[] : Array Expr)
+    let goalGets ← IO.mkRef (#[] : Array Expr)
+    collectSeq idxs goalGets (← g.getType)
+    for d in ← getLCtx do
+      unless d.isImplementationDetail do
+        collectSeq idxs gets d.type
+        -- ground hypotheses (no quantifier) contribute active atoms: the
+        -- link to an instantiation may run through a premise like
+        -- `old.occ.get i = 1` rather than through the goal
+        unless d.type.isForall do
+          collectSeq idxs goalGets d.type
+    -- goal gets participate in the atom pool too
+    for e in ← goalGets.get do
+      unless (← gets.get).contains e do gets.modify (·.push e)
+    -- candidate index atoms: get/set indices plus Int fvars
+    let mut atoms := (← idxs.get)
+    for d in ← getLCtx do
+      unless d.isImplementationDetail do
+        if ← isIntTy d.type then
+          unless atoms.contains d.toExpr do
+            atoms := atoms.push d.toExpr
+    let atomsCut := atoms[0:16].toArray
+    let goalAtoms ← goalGets.get
+    let mut news : Array (Expr × Expr) := #[]
+    let mut seenTys : Array Expr := #[]
+    let budget := 96
+    for d in ← getLCtx do
+      if news.size ≥ budget then break
+      unless d.isImplementationDetail do
+        let ty ← instantiateMVars d.type
+        if ty.isForall then
+          if ← isIntTy ty.bindingDomain! then
+            let mut frontier : Array Expr := #[d.toExpr]
+            for _ in [0:2] do
+              let mut next : Array Expr := #[]
+              for tm in frontier do
+                let tty ← whnf (← inferType tm)
+                let mut extended := false
+                if tty.isForall then
+                  if ← isIntTy tty.bindingDomain! then
+                    extended := true
+                    for a in atomsCut do
+                      if next.size < 64 then
+                        next := next.push (mkApp tm a)
+                if !extended && tm != d.toExpr then
+                  -- an instantiated fact (possibly still guarded by Prop
+                  -- implications, which omega consumes); keep it if it is a
+                  -- Prop mentioning one of the goal's get-atoms
+                  let nty ← inferType tm
+                  if (← inferType nty).isProp then
+                    if goalAtoms.isEmpty || containsAny nty goalAtoms then
+                      unless seenTys.contains nty do
+                        seenTys := seenTys.push nty
+                        if news.size < budget then
+                          news := news.push (tm, nty)
+              frontier := next
+    pure news
+  let hyps : Array Hypothesis := news.map fun (pf, ty) =>
+    { userName := `h_inst, type := ty, value := pf }
+  let g2 ← (·.2) <$> g.assertHypotheses hyps
+  replaceMainGoal [g2]
+  evalTactic (← `(tactic| omega))
+
+end SableInstantiate
 
 section SableCases
 
@@ -204,6 +341,11 @@ macro_rules
         | rfl
         | ((try sable_norm) <;> omega)
         | ((try sable_norm) <;> (try simp only [Sable.Seq.len_set] at *) <;> omega)
+        | (sable_slice 20000
+            ((try sable_norm) <;> (intros) <;>
+             (try simp only [Sable.Seq.len_set] at *) <;>
+             (try simp only [Sable.Seq.get_set]) <;>
+             (repeat split) <;> (try subst_eqs) <;> sable_instantiate))
         | ((try sable_norm) <;> simp_all)
         | ((try sable_norm) <;> (try subst_eqs) <;> simp_all <;> omega)
         | ((try sable_norm) <;> sable_cases <;>

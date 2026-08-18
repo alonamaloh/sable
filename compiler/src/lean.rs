@@ -111,6 +111,13 @@ pub fn emit(
     }
     e.push("open Sable");
     e.push("set_option linter.unusedVariables false");
+    // The portfolio owns the proof-cost policy: each expensive tier of
+    // `sable_auto` runs under its own heartbeat budget, and their sum
+    // exceeds the elaborator's default allowance — an obligation that
+    // exhausts every tier near its cap would otherwise die on the outer
+    // limit with an uncatchable timeout instead of a clean tier failure
+    // (ADR 0082). Twice the default keeps the outer cap as a backstop.
+    e.push("set_option maxHeartbeats 400000");
     // Test/CI hook: shrink or disable the grind heartbeat budget
     // without touching source (the option itself lives in the prelude).
     if let Ok(v) = std::env::var("SABLE_GRIND_HEARTBEATS") {
