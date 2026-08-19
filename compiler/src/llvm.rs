@@ -19,9 +19,12 @@ use crate::control::{
     SlotActionKind, StatementPlanKind, TrapSite, ValueDropRecipe,
 };
 use crate::diag::Diagnostic;
+use crate::ownership::{CheckedOwnershipPlan, ValueTransferKind};
 use crate::place::Place;
 use crate::span::Span;
-use crate::transition::CallOwner;
+use crate::transition::{
+    CallArgumentEffect, CallEffect, CallOwner, CallSiteKey, CallTarget, CheckedCallTransition,
+};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 const ARRAY_CAPACITY: u64 = 50_000_000;
@@ -58,9 +61,10 @@ pub fn emit_verified(
             format!("`{name}` is an audited axiom: {reason}"),
         )]);
     }
-    let mut ir = emit_program_with_control(
+    let mut ir = emit_program_with_plans(
         verified.program(),
         verified.control(),
+        verified.ownership(),
         verified.root_span_end(),
         options,
     )?;
@@ -82,33 +86,58 @@ fn emit_program(
     root_span_end: usize,
     options: &EmitOptions,
 ) -> Result<String, Vec<BackendError>> {
-    emit_program_inner(program, None, root_span_end, options)
+    emit_program_inner(program, None, None, root_span_end, options)
 }
 
+#[cfg(test)]
 fn emit_program_with_control(
     program: &Program,
     control: &ControlProgram,
     root_span_end: usize,
     options: &EmitOptions,
 ) -> Result<String, Vec<BackendError>> {
-    emit_program_inner(program, Some(control), root_span_end, options)
+    emit_program_inner(program, Some(control), None, root_span_end, options)
+}
+
+fn emit_program_with_plans(
+    program: &Program,
+    control: &ControlProgram,
+    ownership: &CheckedOwnershipPlan,
+    root_span_end: usize,
+    options: &EmitOptions,
+) -> Result<String, Vec<BackendError>> {
+    emit_program_inner(
+        program,
+        Some(control),
+        Some(ownership),
+        root_span_end,
+        options,
+    )
 }
 
 fn emit_program_inner(
     program: &Program,
     control: Option<&ControlProgram>,
+    ownership: Option<&CheckedOwnershipPlan>,
     root_span_end: usize,
     options: &EmitOptions,
 ) -> Result<String, Vec<BackendError>> {
     let selected = select_callables(program, root_span_end, options)?;
     validate_acyclic(program, &selected)?;
     for &index in &selected.functions {
-        validate_function(program, control, &program.fns[index], root_span_end)?;
+        validate_function(
+            program,
+            control,
+            ownership,
+            &program.fns[index],
+            root_span_end,
+        )?;
     }
     for &(class, initializer) in &selected.initializers {
         validate_initializer(
             program,
             control,
+            ownership,
             class,
             &program.classes[class].inits[initializer],
             root_span_end,
@@ -118,6 +147,7 @@ fn emit_program_inner(
         validate_method(
             program,
             control,
+            ownership,
             class,
             method,
             &program.classes[class].methods[method],
@@ -650,6 +680,7 @@ fn llvm_validation_plan<'a>(
 fn validate_function(
     program: &Program,
     control: Option<&ControlProgram>,
+    ownership: Option<&CheckedOwnershipPlan>,
     function: &Fn,
     root_span_end: usize,
 ) -> Result<(), Vec<BackendError>> {
@@ -717,7 +748,10 @@ fn validate_function(
             "function return",
         )?;
     }
-    let mut locals = ValidationLocals::new();
+    let mut locals = ValidationLocals::with_method_authority(
+        ownership,
+        CallOwner::Function(function.name.clone()),
+    );
     for parameter in &function.params {
         locals.insert(
             parameter.name.clone(),
@@ -738,8 +772,8 @@ fn validate_function(
         None,
         plan,
         plan.map(|plan| plan.body_block().id()),
-    )
-    .map(|_| ())
+    )?;
+    locals.finish_method_authority(function.name_span)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -751,13 +785,15 @@ struct InitializerValidation {
 fn validate_initializer(
     program: &Program,
     control: Option<&ControlProgram>,
+    ownership: Option<&CheckedOwnershipPlan>,
     class: usize,
     initializer: &Fn,
     root_span_end: usize,
 ) -> Result<(), Vec<BackendError>> {
-    let declaration = require_fixed_class(
+    let declaration = require_native_owner_class(
         program,
         class,
+        root_span_end,
         initializer.name_span,
         "selected initializer",
     )?;
@@ -783,14 +819,41 @@ fn validate_initializer(
         },
         initializer,
     )?;
-    let mut locals = ValidationLocals::new();
+    let mut locals = ValidationLocals::with_method_authority(
+        ownership,
+        CallOwner::Constructor {
+            class: declaration.name.clone(),
+            init: initializer.name.clone(),
+        },
+    );
     for parameter in &initializer.params {
-        require_initializer_parameter(
+        if require_fixed_class(
             program,
-            root_span_end,
-            parameter.ty.clone(),
-            parameter.span,
-        )?;
+            class,
+            initializer.name_span,
+            "selected initializer",
+        )
+        .is_ok()
+        {
+            require_initializer_parameter(
+                program,
+                root_span_end,
+                parameter.ty.clone(),
+                parameter.span,
+            )?;
+        } else if !matches!(parameter.ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+        {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "scalar-owner constructor parameter is outside the exact internal ABI",
+                parameter.span,
+                format!(
+                    "parameter `{}` has type `{}`; scalar-owner constructors accept concrete integers only",
+                    parameter.name,
+                    parameter.ty.name()
+                ),
+            )]);
+        }
         locals.insert(
             parameter.name.clone(),
             ValidationLocal {
@@ -828,34 +891,75 @@ fn validate_initializer(
             ),
         )]);
     }
-    Ok(())
+    locals.finish_method_authority(initializer.name_span)
 }
 
 fn validate_method(
     program: &Program,
     control: Option<&ControlProgram>,
+    ownership: Option<&CheckedOwnershipPlan>,
     class: usize,
     method_index: usize,
     method: &crate::ast::Method,
     root_span_end: usize,
 ) -> Result<(), Vec<BackendError>> {
-    let declaration = require_fixed_class(program, class, method.f.name_span, "selected method")?;
-    if declaration.name != "Integer"
-        || method_index != 0
-        || method.f.name != "flip_sign"
-        || method.self_kind != SelfKind::Mut
-        || !method.f.params.is_empty()
-        || method.f.ret != Ty::Unit
-        || method.f.extern_info.is_some()
-        || !method.f.type_params.is_empty()
-        || !method.f.type_bounds.is_empty()
-    {
-        return Err(vec![diag(
-            "backend.class_unsupported",
-            "method is outside the concrete `Integer` surface the LLVM backend lowers",
+    let declaration = require_native_owner_class(
+        program,
+        class,
+        root_span_end,
+        method.f.name_span,
+        "selected method",
+    )?;
+    let fixed = require_fixed_class(program, class, method.f.name_span, "selected method").is_ok();
+    if fixed {
+        if declaration.name != "Integer"
+            || method_index != 0
+            || method.f.name != "flip_sign"
+            || method.self_kind != SelfKind::Mut
+            || !method.f.params.is_empty()
+            || method.f.ret != Ty::Unit
+            || method.f.extern_info.is_some()
+            || !method.f.type_params.is_empty()
+            || !method.f.type_bounds.is_empty()
+        {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "method is outside the concrete `Integer` surface the LLVM backend lowers",
+                method.f.name_span,
+                "the backend lowers only `Integer::flip_sign(&mut self) -> ()`, with no explicit arguments",
+            )]);
+        }
+    } else {
+        if declaration
+            .methods
+            .get(method_index)
+            .is_none_or(|candidate| candidate.f.name != method.f.name)
+        {
+            return Err(vec![diag(
+                "backend.method_missing",
+                "selected scalar-owner method lost its checked identity",
+                method.f.name_span,
+                format!(
+                    "class `{}` has no matching method at index {method_index}",
+                    declaration.name
+                ),
+            )]);
+        }
+        for parameter in &method.f.params {
+            require_scalar_owner_method_parameter(
+                program,
+                root_span_end,
+                parameter.ty.clone(),
+                parameter.span,
+                &format!("method parameter `{}`", parameter.name),
+            )?;
+        }
+        require_scalar_owner_method_result(
+            program,
+            root_span_end,
+            method.f.ret.clone(),
             method.f.name_span,
-            "the backend lowers only `Integer::flip_sign(&mut self) -> ()`, with no explicit arguments",
-        )]);
+        )?;
     }
     let plan = llvm_validation_plan(
         control,
@@ -866,27 +970,49 @@ fn validate_method(
         },
         &method.f,
     )?;
-    let mut locals = ValidationLocals::new();
+    let mut locals = ValidationLocals::with_method_authority(
+        ownership,
+        CallOwner::Method {
+            class: declaration.name.clone(),
+            method: method.f.name.clone(),
+        },
+    );
     locals.insert(
         "self".into(),
         ValidationLocal {
-            ty: Ty::borrow(Mutability::Mut, Ty::Class(class)),
-            mutable: true,
+            ty: Ty::borrow(
+                match method.self_kind {
+                    SelfKind::Shared => Mutability::Shared,
+                    SelfKind::Mut => Mutability::Mut,
+                },
+                Ty::Class(class),
+            ),
+            mutable: method.self_kind == SelfKind::Mut,
         },
         method.f.name_span,
     )?;
+    for parameter in &method.f.params {
+        locals.insert(
+            parameter.name.clone(),
+            ValidationLocal {
+                ty: parameter.ty.clone(),
+                mutable: false,
+            },
+            parameter.span,
+        )?;
+    }
     validate_block(
         program,
         &method.f.body,
         root_span_end,
         &mut locals,
-        Ty::Unit,
+        method.f.ret.clone(),
         None,
         Some((class, method.self_kind)),
         plan,
         plan.map(|plan| plan.body_block().id()),
-    )
-    .map(|_| ())
+    )?;
+    locals.finish_method_authority(method.f.name_span)
 }
 
 #[derive(Clone)]
@@ -903,6 +1029,9 @@ struct ValidationLocals {
     declared: HashSet<String>,
     moved_classes: HashSet<String>,
     moved_slots: HashSet<String>,
+    call_owner: Option<CallOwner>,
+    checked_methods: HashMap<CallSiteKey, CheckedCallTransition>,
+    visited_methods: HashSet<CallSiteKey>,
 }
 
 impl ValidationLocals {
@@ -912,7 +1041,96 @@ impl ValidationLocals {
             declared: HashSet::new(),
             moved_classes: HashSet::new(),
             moved_slots: HashSet::new(),
+            call_owner: None,
+            checked_methods: HashMap::new(),
+            visited_methods: HashSet::new(),
         }
+    }
+
+    fn with_method_authority(ownership: Option<&CheckedOwnershipPlan>, owner: CallOwner) -> Self {
+        let mut locals = Self::new();
+        let Some(ownership) = ownership else {
+            return locals;
+        };
+        locals.call_owner = Some(owner.clone());
+        locals.checked_methods = ownership
+            .calls
+            .for_owner(&owner)
+            .filter(|(key, _)| matches!(key.target, CallTarget::Method { .. }))
+            .map(|(key, call)| (key.clone(), call.clone()))
+            .collect();
+        locals
+    }
+
+    fn checked_method_call(
+        &mut self,
+        key: &CallSiteKey,
+        span: Span,
+    ) -> Result<Option<CheckedCallTransition>, Vec<BackendError>> {
+        let Some(owner) = self.call_owner.as_ref() else {
+            return Ok(None);
+        };
+        if &key.owner != owner {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "method call is detached from its checked callable owner",
+                span,
+                format!(
+                    "expected {}, observed {}",
+                    owner.render(),
+                    key.owner.render()
+                ),
+            )]);
+        }
+        let Some(call) = self.checked_methods.get(key).cloned() else {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "LLVM method call has no exact checker-authored call plan",
+                span,
+                format!(
+                    "{} at this source identity was not retained for {}",
+                    key.target.render(),
+                    owner.render()
+                ),
+            )]);
+        };
+        if call.key != *key {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "LLVM method call plan has a detached value identity",
+                span,
+                "the retained transition key must exactly match its checker-authored map key",
+            )]);
+        }
+        if !self.visited_methods.insert(key.clone()) {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "LLVM method call reused one checked call identity",
+                span,
+                "each retained method transition must be consumed exactly once",
+            )]);
+        }
+        Ok(Some(call))
+    }
+
+    fn finish_method_authority(&self, span: Span) -> Result<(), Vec<BackendError>> {
+        if let Some((key, _)) = self
+            .checked_methods
+            .iter()
+            .find(|(key, _)| !self.visited_methods.contains(*key))
+        {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "checked method call was not consumed by LLVM validation",
+                span,
+                format!(
+                    "unused transition for {} at byte {}",
+                    key.target.render(),
+                    key.span.start
+                ),
+            )]);
+        }
+        Ok(())
     }
 
     fn insert(
@@ -1303,7 +1521,13 @@ fn validate_block(
                         )?;
                     }
                 } else if let Ty::Class(class) = ty {
-                    require_fixed_class(program, *class, *name_span, "local variable")?;
+                    require_native_owner_class(
+                        program,
+                        *class,
+                        root_span_end,
+                        *name_span,
+                        "local variable",
+                    )?;
                     if let Some(value) = init {
                         validate_fixed_class_initializer(
                             program,
@@ -1811,6 +2035,84 @@ fn is_owned_bool_slots(ty: &Ty) -> bool {
     matches!(ty, Ty::Slots(payload) if payload.as_ref() == &Ty::Bool)
 }
 
+fn is_concrete_scalar(ty: &Ty) -> bool {
+    matches!(ty, Ty::Bool) || matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+}
+
+/// A deliberately module-internal owner shape for exercising the exact
+/// method ABI without widening the older `Nat`/`Integer` gate.  The class is
+/// represented by one LLVM aggregate containing only concrete integer
+/// fields; it carries no nested ownership, erased authority, generic proof
+/// reuse, executable destruction, or public/cross-module surface.
+fn require_exact_scalar_owner_class<'a>(
+    program: &'a Program,
+    class: usize,
+    root_span_end: usize,
+    span: Span,
+    role: &str,
+) -> Result<&'a ClassDecl, Vec<BackendError>> {
+    let Some(declaration) = program.classes.get(class) else {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "scalar-owner class carries an invalid checked class index",
+            span,
+            format!("{role} carries class index {class}, outside the checked program"),
+        )]);
+    };
+    let member_is_internal = |function: &Fn| {
+        !function.is_pub
+            && function.extern_info.is_none()
+            && function.name_span.start < root_span_end
+            && function.type_params.is_empty()
+            && function.type_bounds.is_empty()
+            && function.proof_reuse.is_none()
+            && function.params.iter().all(|parameter| !parameter.consumes)
+    };
+    let supported = declaration.name != "Nat"
+        && declaration.name != "Integer"
+        && !declaration.is_pub
+        && declaration.name_span.start < root_span_end
+        && declaration.type_params.is_empty()
+        && declaration.type_bounds.is_empty()
+        && declaration.proof_reuse.is_none()
+        && !declaration.fields.is_empty()
+        && declaration.fields.iter().all(|field| {
+            !field.must_consume
+                && matches!(field.ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
+        })
+        && declaration.inits.iter().all(member_is_internal)
+        && declaration
+            .methods
+            .iter()
+            .all(|method| member_is_internal(&method.f))
+        && matches!(declaration.deinit.as_deref(), None | Some([]));
+    if !supported {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "class is outside the exact scalar-owner LLVM subset",
+            span,
+            format!(
+                "{role} uses `{}`; scalar owners must be private root-module classes with only concrete integer fields, ProofReuse::None, no generic metadata, no must-consume fields, and absent or empty destruction",
+                declaration.name
+            ),
+        )]);
+    }
+    Ok(declaration)
+}
+
+fn require_native_owner_class<'a>(
+    program: &'a Program,
+    class: usize,
+    root_span_end: usize,
+    span: Span,
+    role: &str,
+) -> Result<&'a ClassDecl, Vec<BackendError>> {
+    if let Ok(declaration) = require_fixed_class(program, class, span, role) {
+        return Ok(declaration);
+    }
+    require_exact_scalar_owner_class(program, class, root_span_end, span, role)
+}
+
 fn require_fixed_class<'a>(
     program: &'a Program,
     class: usize,
@@ -1929,6 +2231,55 @@ fn require_initializer_parameter(
     }
 }
 
+fn require_scalar_owner_method_parameter(
+    program: &Program,
+    root_span_end: usize,
+    ty: Ty,
+    span: Span,
+    role: &str,
+) -> Result<(), Vec<BackendError>> {
+    if is_concrete_scalar(&ty) {
+        return Ok(());
+    }
+    if let Ty::Class(class) = ty {
+        require_exact_scalar_owner_class(program, class, root_span_end, span, role)?;
+        return Ok(());
+    }
+    Err(vec![diag(
+        "backend.class_unsupported",
+        "method parameter is outside the exact scalar-owner ABI",
+        span,
+        format!(
+            "{role} has type `{}`; only concrete scalars and owned exact scalar-owner classes cross this internal method boundary",
+            ty.name()
+        ),
+    )])
+}
+
+fn require_scalar_owner_method_result(
+    program: &Program,
+    root_span_end: usize,
+    ty: Ty,
+    span: Span,
+) -> Result<(), Vec<BackendError>> {
+    if ty == Ty::Unit || is_concrete_scalar(&ty) {
+        return Ok(());
+    }
+    if let Ty::Class(class) = ty {
+        require_exact_scalar_owner_class(program, class, root_span_end, span, "method result")?;
+        return Ok(());
+    }
+    Err(vec![diag(
+        "backend.class_unsupported",
+        "method result is outside the exact scalar-owner ABI",
+        span,
+        format!(
+            "method result `{}` must be a concrete scalar, unit, or an exact scalar-owner class",
+            ty.name()
+        ),
+    )])
+}
+
 fn validate_fixed_class_initializer(
     program: &Program,
     class: usize,
@@ -1936,8 +2287,21 @@ fn validate_fixed_class_initializer(
     root_span_end: usize,
     locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    let declaration =
-        require_fixed_class(program, class, expression.span, "class local initializer")?;
+    let declaration = require_native_owner_class(
+        program,
+        class,
+        root_span_end,
+        expression.span,
+        "class local initializer",
+    )?;
+    let scalar_owner = require_exact_scalar_owner_class(
+        program,
+        class,
+        root_span_end,
+        expression.span,
+        "class local initializer",
+    )
+    .is_ok();
     require_expr_type(expression, Ty::Class(class), "class constructor result")?;
     match &expression.kind {
         ExprKind::CtorCall {
@@ -1996,6 +2360,17 @@ fn validate_fixed_class_initializer(
             args,
             ..
         } => {
+            if scalar_owner {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "scalar-owner class cannot cross the free-function return ABI",
+                    expression.span,
+                    format!(
+                        "bind `{}` only from its constructor, an exact scalar-owner method result, or a named owner move",
+                        declaration.name
+                    ),
+                )]);
+            }
             if !type_args.is_empty() {
                 return Err(vec![unsupported(
                     expression.span,
@@ -2029,6 +2404,9 @@ fn validate_fixed_class_initializer(
                 "class-returning call",
             )
         }
+        ExprKind::MethodCall { .. } if scalar_owner => {
+            validate_native_method_call(program, expression, root_span_end, locals)
+        }
         ExprKind::Var(source) => {
             let Some(local) = locals.get(source) else {
                 return Err(vec![unsupported(
@@ -2052,7 +2430,7 @@ fn validate_fixed_class_initializer(
             "backend.class_unsupported",
             "class value source is outside the fixed-owner class shapes the LLVM backend lowers",
             expression.span,
-            "expected a direct constructor, internal class-returning call, or named owner move",
+            "expected a direct constructor, admitted destination-passing call, or named owner move",
         )]),
     }
 }
@@ -2157,7 +2535,7 @@ fn validate_call_arguments(
     function: &Fn,
     args: &[Expr],
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     if args.len() != function.params.len() {
         return Err(vec![unsupported(
@@ -2203,7 +2581,13 @@ fn validate_initializer_field_assign(
             "class field assignment is outside a supported member",
         )]);
     };
-    let declaration = require_fixed_class(program, class, field_span, "member field assignment")?;
+    let declaration = require_native_owner_class(
+        program,
+        class,
+        root_span_end,
+        field_span,
+        "member field assignment",
+    )?;
     let Some((field_index, declaration_field)) = declaration
         .fields
         .iter()
@@ -2267,9 +2651,9 @@ fn validate_initializer_field_assign(
     let Ty::Int(integer) = declaration_field.ty else {
         return Err(vec![diag(
             "backend.class_unsupported",
-            "method field replacement is outside the concrete `Integer` surface the LLVM backend lowers",
+            "method field replacement is outside the exact native scalar surface",
             field_span,
-            "a lowered method may assign only the scalar `Integer.neg` field",
+            "a lowered method may assign only a concrete integer field",
         )]);
     };
     require_concrete_integer(integer, field_span, "method scalar field")?;
@@ -2288,7 +2672,7 @@ fn validate_initializer_field_store(
     index: &Expr,
     value: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
     initializer: Option<&InitializerValidation>,
 ) -> Result<(), Vec<BackendError>> {
     let Some(initializer) = initializer else {
@@ -2379,6 +2763,49 @@ fn validate_fixed_class_field_base(
     Ok((class, field_index, declaration_field.ty.clone()))
 }
 
+fn validate_native_owner_class_field_base(
+    program: &Program,
+    root_span_end: usize,
+    locals: &ValidationLocals,
+    object: &str,
+    field: &str,
+    span: Span,
+) -> Result<(usize, usize, Ty), Vec<BackendError>> {
+    let Some(local) = locals.get(object) else {
+        return Err(vec![unsupported(
+            span,
+            format!("class field access names unknown or out-of-scope local `{object}`"),
+        )]);
+    };
+    if matches!(local.ty, Ty::Class(_)) {
+        locals.require_live_class(object, span, "class field access")?;
+    }
+    let Some(class) = local.ty.class_index() else {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "class field access has a non-class base",
+            span,
+            format!("`{object}` has type `{}`", local.ty.name()),
+        )]);
+    };
+    let declaration =
+        require_native_owner_class(program, class, root_span_end, span, "class field access")?;
+    let Some((field_index, declaration_field)) = declaration
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, declaration_field)| declaration_field.name == field)
+    else {
+        return Err(vec![diag(
+            "backend.class_unsupported",
+            "class field access names an unsupported field",
+            span,
+            format!("class `{}` has no native field `{field}`", declaration.name),
+        )]);
+    };
+    Ok((class, field_index, declaration_field.ty.clone()))
+}
+
 fn affine_bool_option_ty() -> Ty {
     Ty::affine_array_option(Ty::Bool)
 }
@@ -2408,7 +2835,7 @@ fn validate_affine_bool_option_decl(
     mutable: bool,
     init: Option<&Expr>,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
     span: Span,
 ) -> Result<(), Vec<BackendError>> {
     if !is_affine_bool_option(&ty.clone()) {
@@ -2525,7 +2952,7 @@ fn validate_fresh_bool_array_initializer(
     program: &Program,
     expression: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
     local: &str,
     allow_take: bool,
 ) -> Result<(), Vec<BackendError>> {
@@ -2586,7 +3013,7 @@ fn validate_fresh_u32_array_initializer(
     program: &Program,
     expression: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     let expected = Ty::array(Ty::Int(IntTy::U32));
     require_expr_type(expression, expected, "owned `u32`-array initializer")?;
@@ -2631,7 +3058,7 @@ fn validate_native_array_store(
     index: &Expr,
     value: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     let Some(local) = locals.get(array) else {
         return Err(vec![unsupported(
@@ -3028,34 +3455,52 @@ fn collect_argument_borrow_places(
 fn validate_native_method_call(
     program: &Program,
     expression: &Expr,
-    receiver: &str,
-    receiver_span: Span,
-    method_name: &str,
-    args: &[Expr],
-    locals: &ValidationLocals,
+    root_span_end: usize,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
+    let ExprKind::MethodCall {
+        recv: receiver,
+        recv_span: receiver_span,
+        method: method_name,
+        args,
+        ..
+    } = &expression.kind
+    else {
+        return Err(vec![diag(
+            "internal.control_plan_invalid",
+            "native method validator received a non-method expression",
+            expression.span,
+            "the retained expression kind no longer matches its call site",
+        )]);
+    };
     let Some(local) = locals.get(receiver) else {
         return Err(vec![unsupported(
-            receiver_span,
+            *receiver_span,
             format!("method receiver names unknown local `{receiver}`"),
         )]);
     };
     if matches!(local.ty, Ty::Class(_)) {
-        locals.require_live_class(receiver, receiver_span, "method receiver")?;
+        locals.require_live_class(receiver, *receiver_span, "method receiver")?;
     }
     let Some(class) = local.ty.class_index() else {
         return Err(vec![diag(
             "backend.class_unsupported",
             "native method receiver is not a class",
-            receiver_span,
+            *receiver_span,
             format!("`{receiver}` has type `{}`", local.ty.name()),
         )]);
     };
-    let declaration = require_fixed_class(program, class, receiver_span, "method receiver")?;
+    let declaration = require_native_owner_class(
+        program,
+        class,
+        root_span_end,
+        *receiver_span,
+        "method receiver",
+    )?;
     let Some(method) = declaration
         .methods
         .iter()
-        .find(|candidate| candidate.f.name == method_name)
+        .find(|candidate| candidate.f.name == *method_name)
     else {
         return Err(vec![diag(
             "backend.method_missing",
@@ -3064,33 +3509,212 @@ fn validate_native_method_call(
             format!("class `{}` has no method `{method_name}`", declaration.name),
         )]);
     };
-    if method.f.name != "flip_sign"
-        || method.self_kind != SelfKind::Mut
-        || !method.f.params.is_empty()
-        || method.f.ret != Ty::Unit
-        || !args.is_empty()
-    {
-        return Err(vec![diag(
-            "backend.class_unsupported",
-            "method call is outside the concrete `Integer` surface the LLVM backend lowers",
-            expression.span,
-            "the backend lowers only the zero-argument unit method `Integer::flip_sign`",
-        )]);
+    let key = locals.call_owner.as_ref().map(|owner| CallSiteKey {
+        owner: owner.clone(),
+        span: expression.span,
+        target: CallTarget::Method {
+            class: declaration.name.clone(),
+            method: method.f.name.clone(),
+        },
+    });
+    let checked_call = match key.as_ref() {
+        Some(key) => locals.checked_method_call(key, expression.span)?,
+        None => None,
+    };
+    if let Some(checked_call) = checked_call.as_ref() {
+        validate_exact_method_call_authority(
+            checked_call,
+            class,
+            receiver,
+            *receiver_span,
+            method,
+            args,
+        )?;
+    }
+    let fixed = require_fixed_class(program, class, *receiver_span, "method receiver").is_ok();
+    if fixed {
+        if method.f.name != "flip_sign"
+            || method.self_kind != SelfKind::Mut
+            || !method.f.params.is_empty()
+            || method.f.ret != Ty::Unit
+            || !args.is_empty()
+        {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "method call is outside the concrete `Integer` surface the LLVM backend lowers",
+                expression.span,
+                "the backend lowers only the zero-argument unit method `Integer::flip_sign`",
+            )]);
+        }
+    } else {
+        require_scalar_owner_method_result(
+            program,
+            root_span_end,
+            method.f.ret.clone(),
+            method.f.name_span,
+        )?;
+        if args.len() != method.f.params.len() {
+            return Err(vec![diag(
+                "backend.class_unsupported",
+                "scalar-owner method call has the wrong arity",
+                expression.span,
+                format!(
+                    "`{}::{}` receives {} argument(s), expected {}",
+                    declaration.name,
+                    method.f.name,
+                    args.len(),
+                    method.f.params.len()
+                ),
+            )]);
+        }
     }
     let receiver_is_mutable = match local.ty.binding_mode() {
         BindingMode::Owned => matches!(local.ty, Ty::Class(_)) && local.mutable,
         BindingMode::Mut => matches!(local.ty.referent(), Ty::Class(_)),
         BindingMode::Shared => false,
     };
-    if !receiver_is_mutable {
+    if method.self_kind == SelfKind::Mut && !receiver_is_mutable {
         return Err(vec![diag(
             "backend.class_unsupported",
             "mutable method receiver is not mutable",
-            receiver_span,
+            *receiver_span,
             format!("`{receiver}` cannot receive `&mut self`"),
         )]);
     }
-    require_expr_type(expression, Ty::Unit, "native method result")
+    require_expr_type(expression, method.f.ret.clone(), "native method result")?;
+    if fixed {
+        return Ok(());
+    }
+
+    validate_owned_argument_aliases(args, &method.f.params, locals)?;
+    for (argument, parameter) in args.iter().zip(&method.f.params) {
+        require_scalar_owner_method_parameter(
+            program,
+            root_span_end,
+            parameter.ty.clone(),
+            parameter.span,
+            &format!("method parameter `{}`", parameter.name),
+        )?;
+        if let Ty::Class(argument_class) = parameter.ty {
+            if matches!(&argument.kind, ExprKind::Var(owner) if owner == receiver) {
+                return Err(vec![diag(
+                    "backend.class_unsupported",
+                    "owned method argument aliases its receiver",
+                    argument.span,
+                    format!(
+                        "`{receiver}` cannot be both the live method receiver and an owned argument"
+                    ),
+                )]);
+            }
+            validate_fixed_class_initializer(
+                program,
+                argument_class,
+                argument,
+                root_span_end,
+                locals,
+            )?;
+        } else {
+            validate_expr(program, argument, root_span_end, locals)?;
+            require_expr_type(argument, parameter.ty.clone(), "method call argument")?;
+        }
+    }
+    validate_borrow_aliases(args, &method.f.params, locals)
+}
+
+fn validate_exact_method_call_authority(
+    call: &CheckedCallTransition,
+    class: usize,
+    receiver: &str,
+    receiver_span: Span,
+    method: &crate::ast::Method,
+    args: &[Expr],
+) -> Result<(), Vec<BackendError>> {
+    let expected_effect = match method.self_kind {
+        SelfKind::Shared => CallEffect::SharedLoan,
+        SelfKind::Mut => CallEffect::HavocUniqueBorrow,
+    };
+    let receiver_matches = call.receiver.as_ref().is_some_and(|checked| {
+        checked.class.as_str()
+            == match &call.key.target {
+                CallTarget::Method { class, .. } => class.as_str(),
+                CallTarget::Function(_) | CallTarget::Constructor { .. } => return false,
+            }
+            && checked.transition.place == Place::local(receiver)
+            && checked.transition.referent == Ty::Class(class)
+            && checked.transition.effect == expected_effect
+            && checked.transition.span == receiver_span
+    });
+    if !receiver_matches {
+        return Err(vec![diag(
+            "internal.control_plan_invalid",
+            "LLVM method receiver disagrees with its checker-authored call plan",
+            receiver_span,
+            format!(
+                "receiver `{receiver}` must retain the exact class, place, mutability, and source span"
+            ),
+        )]);
+    }
+    if call.arguments.len() != method.f.params.len() || args.len() != method.f.params.len() {
+        return Err(vec![diag(
+            "internal.control_plan_invalid",
+            "LLVM method arguments disagree with their checker-authored call plan",
+            call.key.span,
+            format!(
+                "retained {}, declared {}, observed {} argument(s)",
+                call.arguments.len(),
+                method.f.params.len(),
+                args.len()
+            ),
+        )]);
+    }
+    for (index, ((checked, parameter), argument)) in call
+        .arguments
+        .iter()
+        .zip(&method.f.params)
+        .zip(args)
+        .enumerate()
+    {
+        let CallArgumentEffect::Value(transfer) = &checked.effect else {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "scalar-owner method argument retained an unsupported loan",
+                checked.argument_span,
+                format!("parameter `{}` must cross by value", parameter.name),
+            )]);
+        };
+        let source = Place::from_value_expr(argument);
+        let expected_kind = if matches!(parameter.ty, Ty::Class(_)) {
+            if source.is_some() {
+                ValueTransferKind::Move
+            } else {
+                ValueTransferKind::Fresh
+            }
+        } else {
+            ValueTransferKind::Copy
+        };
+        let matches = checked.parameter_index == index
+            && checked.parameter == parameter.name
+            && checked.parameter_ty == parameter.ty
+            && checked.argument_span == argument.span
+            && transfer.source == source
+            && transfer.value_ty == parameter.ty
+            && transfer.kind == expected_kind
+            && transfer.span == argument.span
+            && !transfer.carried_obligation
+            && !transfer.branded;
+        if !matches {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "LLVM method argument disagrees with its checker-authored transfer",
+                argument.span,
+                format!(
+                    "argument {index} for `{}` must retain its exact parameter identity, type, source, and move/copy outcome",
+                    parameter.name
+                ),
+            )]);
+        }
+    }
+    Ok(())
 }
 
 fn validate_local_bool_slot_container(
@@ -3151,7 +3775,7 @@ fn validate_bool_slot_operation(
     program: &Program,
     expression: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     let ExprKind::SlotOp { op, args, .. } = &expression.kind else {
         unreachable!("slot-operation validation is called only for a slot operation")
@@ -3276,7 +3900,7 @@ fn validate_expr(
     program: &Program,
     expression: &Expr,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     if matches!(expression.kind, ExprKind::SlotOp { .. }) {
         return validate_bool_slot_operation(program, expression, root_span_end, locals);
@@ -3709,14 +4333,8 @@ fn validate_expr(
                 "expression is outside the scalar/Boolean-option/POD-record/owned-Boolean-array LLVM subset",
             )])
         }
-        ExprKind::MethodCall {
-            recv,
-            recv_span,
-            method,
-            args,
-            ..
-        } => {
-            validate_native_method_call(program, expression, recv, *recv_span, method, args, locals)
+        ExprKind::MethodCall { .. } => {
+            validate_native_method_call(program, expression, root_span_end, locals)
         }
         ExprKind::ClassFieldIndex {
             obj,
@@ -3770,12 +4388,18 @@ fn validate_expr(
             require_expr_type(expression, field_ty, "class scalar field")
         }
         ExprKind::SelfField { field } => {
-            let (_, _, field_ty) =
-                validate_fixed_class_field_base(program, locals, "self", field, expression.span)?;
+            let (_, _, field_ty) = validate_native_owner_class_field_base(
+                program,
+                root_span_end,
+                locals,
+                "self",
+                field,
+                expression.span,
+            )?;
             let Ty::Int(integer) = field_ty else {
                 return Err(vec![diag(
                     "backend.class_unsupported",
-                    "method field read is outside the concrete `Integer` surface the LLVM backend lowers",
+                    "method field read is outside the exact native scalar-owner surface",
                     expression.span,
                     format!("`self.{field}` has type `{}`", field_ty.name()),
                 )]);
@@ -3850,7 +4474,7 @@ fn validate_bool_expr(
     expression: &Expr,
     role: &str,
     root_span_end: usize,
-    locals: &ValidationLocals,
+    locals: &mut ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
     validate_expr(program, expression, root_span_end, locals)?;
     require_expr_type(expression, Ty::Bool, role)
@@ -4577,21 +5201,19 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             )?;
             explicit_parameters.push(format!("{ty} %p{index}"));
         }
-        let implicit_parameter = self
-            .initializer_class
-            .or(self.method.map(|(class, _)| class))
-            .map(|_| "ptr %self".to_string())
-            .or_else(|| {
-                matches!(self.function.ret, Ty::Class(_)).then(|| "ptr %result".to_string())
-            });
-        let parameters = if let Some(implicit_parameter) = implicit_parameter {
-            std::iter::once(implicit_parameter)
-                .chain(explicit_parameters)
-                .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            explicit_parameters.join(", ")
-        };
+        let mut parameters = Vec::new();
+        if self.initializer_class.is_some() || self.method.is_some() {
+            parameters.push("ptr %self".to_string());
+        }
+        if self.initializer_class.is_none() && matches!(self.function.ret, Ty::Class(_)) {
+            // A class-returning method needs both authorities: `%self` is
+            // the receiver loan and `%result` is fresh caller-owned
+            // destination storage. Free class-returning functions retain the
+            // older one-pointer destination ABI.
+            parameters.push("ptr %result".to_string());
+        }
+        parameters.extend(explicit_parameters);
+        let parameters = parameters.join(", ");
         let symbol = match (self.initializer_class, self.method) {
             (Some(class), _) => mangle_initializer(class, self.function)?,
             (None, Some((class, _))) => mangle_method(class, self.function)?,
@@ -5664,6 +6286,29 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 ));
                 Ok(())
             }
+            ExprKind::MethodCall {
+                recv, method, args, ..
+            } => {
+                let (receiver_class, receiver) = self.class_base_pointer(recv);
+                let declaration = &self.program.classes[receiver_class];
+                let method = declaration
+                    .methods
+                    .iter()
+                    .find(|candidate| candidate.f.name == *method)
+                    .expect("validated class-returning native method")
+                    .f
+                    .clone();
+                let mut lowered = Vec::with_capacity(args.len() + 2);
+                lowered.push(format!("ptr {receiver}"));
+                lowered.push(format!("ptr {destination}"));
+                lowered.extend(self.emit_call_arguments(&method.params, args)?);
+                self.instruction(format!(
+                    "call void @{}({})",
+                    mangle_method(receiver_class, &method)?,
+                    lowered.join(", ")
+                ));
+                Ok(())
+            }
             ExprKind::Var(source) => {
                 let source_slot = self
                     .locals
@@ -5731,7 +6376,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 .expect("validated owned class argument")
                 .slot
                 .clone(),
-            ExprKind::CtorCall { .. } | ExprKind::Call { .. } => {
+            ExprKind::CtorCall { .. } | ExprKind::Call { .. } | ExprKind::MethodCall { .. } => {
                 let slot = self.new_slot();
                 self.late_entry_allocas
                     .push(format!("  {slot} = alloca {}", llvm_class_ty(class)));
@@ -7601,22 +8246,43 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ExprKind::MethodCall {
                 recv, method, args, ..
             } => {
-                debug_assert!(args.is_empty());
                 let (class, receiver) = self.class_base_pointer(recv);
                 let declaration = &self.program.classes[class];
                 let method = declaration
                     .methods
                     .iter()
                     .find(|candidate| candidate.f.name == *method)
-                    .expect("validated native method");
-                self.instruction(format!(
-                    "call void @{}(ptr {receiver})",
-                    mangle_method(class, &method.f)?
-                ));
-                Ok(Value {
-                    ty: Ty::Unit,
-                    operand: None,
-                })
+                    .expect("validated native method")
+                    .f
+                    .clone();
+                debug_assert!(!matches!(method.ret, Ty::Class(_)));
+                let mut lowered = Vec::with_capacity(args.len() + 1);
+                lowered.push(format!("ptr {receiver}"));
+                lowered.extend(self.emit_call_arguments(&method.params, args)?);
+                let returned = require_llvm_ty(
+                    method.ret.clone(),
+                    expression.span,
+                    &format!("the result of method `{}`", method.name),
+                )?;
+                let call = format!(
+                    "call {returned} @{}({})",
+                    mangle_method(class, &method)?,
+                    lowered.join(", ")
+                );
+                if method.ret == Ty::Unit {
+                    self.instruction(call);
+                    Ok(Value {
+                        ty: Ty::Unit,
+                        operand: None,
+                    })
+                } else {
+                    let result = self.new_temp();
+                    self.instruction(format!("{result} = {call}"));
+                    Ok(Value {
+                        ty: method.ret,
+                        operand: Some(result),
+                    })
+                }
             }
             ExprKind::Borrow { array, field, .. }
                 if expression
@@ -8927,13 +9593,10 @@ mod tests {
             },
             Ty::slots(Ty::Int(IntTy::U64)),
         );
-        let errors = validate_expr(
-            &program(Vec::new()),
-            &operation,
-            1,
-            &ValidationLocals::new(),
-        )
-        .expect_err("non-Boolean owner slots have no native representation or operation semantics");
+        let mut locals = ValidationLocals::new();
+        let errors = validate_expr(&program(Vec::new()), &operation, 1, &mut locals).expect_err(
+            "non-Boolean owner slots have no native representation or operation semantics",
+        );
         assert_eq!(errors[0].name, "backend.slots_unsupported");
     }
 
@@ -9392,6 +10055,156 @@ mod tests {
         )
     }
 
+    fn scalar_owner_constructor(value: i128, start: usize) -> Expr {
+        expression_at(
+            ExprKind::CtorCall {
+                class: "ScalarOwner".into(),
+                class_span: Span::new(start, start + 1),
+                type_args: Vec::new(),
+                init: "new".into(),
+                args: vec![expression_at(
+                    ExprKind::IntLit(value),
+                    Ty::Int(IntTy::U64),
+                    start + 1,
+                )],
+            },
+            Ty::Class(0),
+            start,
+        )
+    }
+
+    fn scalar_owner_method_call(
+        receiver: &str,
+        method: &str,
+        args: Vec<Expr>,
+        ret: Ty,
+        start: usize,
+    ) -> Expr {
+        expression_at(
+            ExprKind::MethodCall {
+                recv: receiver.into(),
+                recv_span: Span::new(start, start + 1),
+                method: method.into(),
+                method_span: Span::new(start + 1, start + 2),
+                args,
+            },
+            ret,
+            start,
+        )
+    }
+
+    fn scalar_owner_program() -> Program {
+        let mut initializer = function(
+            "new",
+            Ty::Unit,
+            vec![Stmt::FieldAssign {
+                field: "value".into(),
+                field_span: Span::new(3, 4),
+                value: expression_at(ExprKind::Var("initial".into()), Ty::Int(IntTy::U64), 4),
+            }],
+        );
+        initializer.params = vec![parameter("initial", Ty::Int(IntTy::U64))];
+        let getter = Method {
+            self_kind: SelfKind::Shared,
+            f: function(
+                "get",
+                Ty::Int(IntTy::U64),
+                vec![Stmt::Return {
+                    value: Some(expression_at(
+                        ExprKind::SelfField {
+                            field: "value".into(),
+                        },
+                        Ty::Int(IntTy::U64),
+                        6,
+                    )),
+                    span: Span::new(7, 8),
+                }],
+            ),
+        };
+        let mut forward = function(
+            "forward",
+            Ty::Class(0),
+            vec![Stmt::Return {
+                value: Some(expression_at(
+                    ExprKind::Var("incoming".into()),
+                    Ty::Class(0),
+                    10,
+                )),
+                span: Span::new(11, 12),
+            }],
+        );
+        forward.params = vec![parameter("incoming", Ty::Class(0))];
+        let class = ClassDecl {
+            is_pub: false,
+            name: "ScalarOwner".into(),
+            name_span: Span::new(1, 2),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            fields: vec![Field {
+                name: "value".into(),
+                ty: Ty::Int(IntTy::U64),
+                span: Span::new(2, 3),
+                must_consume: false,
+            }],
+            invariants: Vec::new(),
+            inits: vec![initializer],
+            methods: vec![
+                getter,
+                Method {
+                    self_kind: SelfKind::Mut,
+                    f: forward,
+                },
+            ],
+            deinit: None,
+            span: Span::new(1, 20),
+        };
+        let entry = function(
+            "scalar_owner_entry",
+            Ty::Int(IntTy::I32),
+            vec![
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "receiver".into(),
+                    name_span: Span::new(20, 21),
+                    init: scalar_owner_constructor(10, 21),
+                    mutable: true,
+                },
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "incoming".into(),
+                    name_span: Span::new(30, 31),
+                    init: scalar_owner_constructor(32, 31),
+                    mutable: false,
+                },
+                Stmt::VarDecl {
+                    ty: Some(Ty::Class(0)),
+                    name: "returned".into(),
+                    name_span: Span::new(40, 41),
+                    init: scalar_owner_method_call(
+                        "receiver",
+                        "forward",
+                        vec![expression_at(
+                            ExprKind::Var("incoming".into()),
+                            Ty::Class(0),
+                            43,
+                        )],
+                        Ty::Class(0),
+                        41,
+                    ),
+                    mutable: false,
+                },
+                Stmt::Return {
+                    value: Some(expression_at(ExprKind::IntLit(42), Ty::Int(IntTy::I32), 50)),
+                    span: Span::new(51, 52),
+                },
+            ],
+        );
+        let mut result = program(vec![entry]);
+        result.classes.push(class);
+        result
+    }
+
     fn fixed_class_program() -> Program {
         let initializer = function(
             "new",
@@ -9599,6 +10412,258 @@ mod tests {
             },
             Ty::Int(IntTy::I32),
         )
+    }
+
+    #[test]
+    fn exact_scalar_owner_gate_rejects_authority_metadata_and_non_scalar_layouts() {
+        let baseline = scalar_owner_program();
+        require_exact_scalar_owner_class(&baseline, 0, 100, Span::new(1, 2), "baseline")
+            .expect("private concrete integer-only owner is admitted");
+
+        let mut cases = Vec::new();
+        let mut public = baseline.clone();
+        public.classes[0].is_pub = true;
+        cases.push(public);
+        let mut imported = baseline.clone();
+        imported.classes[0].name_span = Span::new(100, 101);
+        cases.push(imported);
+        let mut generic = baseline.clone();
+        generic.classes[0].type_params.push("T".into());
+        generic.classes[0].type_bounds.push(None);
+        cases.push(generic);
+        let mut generic_method = baseline.clone();
+        generic_method.classes[0].methods[0]
+            .f
+            .type_params
+            .push("T".into());
+        generic_method.classes[0].methods[0]
+            .f
+            .type_bounds
+            .push(None);
+        cases.push(generic_method);
+        let mut reused = baseline.clone();
+        reused.classes[0].proof_reuse = ProofReuse::adr0009_int_model("Template".into());
+        cases.push(reused);
+        let mut reused_method = baseline.clone();
+        reused_method.classes[0].methods[0].f.proof_reuse =
+            ProofReuse::adr0009_int_model("TemplateMethod".into());
+        cases.push(reused_method);
+        let mut extern_method = baseline.clone();
+        extern_method.classes[0].methods[0].f.extern_info = Some(ExternInfo {
+            abi: "C".into(),
+            audit_id: "forged-scalar-owner".into(),
+            reason: "negative LLVM gate test".into(),
+            span: Span::new(62, 63),
+        });
+        cases.push(extern_method);
+        let mut executable_deinit = baseline.clone();
+        executable_deinit.classes[0].deinit = Some(vec![Stmt::ExprStmt(expression(
+            ExprKind::BoolLit(true),
+            Ty::Bool,
+        ))]);
+        cases.push(executable_deinit);
+        let mut mandatory = baseline.clone();
+        mandatory.classes[0].fields[0].must_consume = true;
+        cases.push(mandatory);
+        for ty in [
+            Ty::array(Ty::Int(IntTy::U32)),
+            Ty::slots(Ty::Bool),
+            Ty::Record(0),
+            Ty::Class(0),
+        ] {
+            let mut non_scalar = baseline.clone();
+            non_scalar.classes[0].fields[0].ty = ty;
+            cases.push(non_scalar);
+        }
+
+        for case in cases {
+            let error =
+                require_exact_scalar_owner_class(&case, 0, 100, Span::new(1, 2), "negative shape")
+                    .expect_err("every authority-bearing or non-scalar shape stays closed");
+            assert_eq!(error[0].name, "backend.class_unsupported");
+        }
+
+        let error = require_parameter_value(
+            &baseline,
+            100,
+            Ty::Class(0),
+            Span::new(60, 61),
+            "free-function owner parameter",
+        )
+        .expect_err("the new owner is not a free-function by-value ABI");
+        assert_eq!(error[0].name, "backend.class_unsupported");
+
+        let mut wrong_result = baseline.clone();
+        wrong_result.classes[0].methods[1].f.ret = Ty::slots(Ty::Bool);
+        let error = require_scalar_owner_method_result(
+            &wrong_result,
+            100,
+            wrong_result.classes[0].methods[1].f.ret.clone(),
+            Span::new(61, 62),
+        )
+        .expect_err("slots cannot become a scalar-owner method result");
+        assert_eq!(error[0].name, "backend.class_unsupported");
+    }
+
+    #[test]
+    fn scalar_owner_method_moves_are_live_checked_and_zeroed() {
+        let valid = scalar_owner_program();
+        let ir = emit_program(
+            &valid,
+            100,
+            &EmitOptions {
+                entry: Some("scalar_owner_entry".into()),
+            },
+        )
+        .expect("exact scalar-owner constructors and methods lower");
+        assert!(
+            ir.contains(
+                "define internal void @__sable_v0_c0_m_7_forward__p_c0o__r_c0o(ptr %self, ptr %result, %sable.class.0 %p0)"
+            ),
+            "{ir}"
+        );
+        let moved = ir
+            .find("load %sable.class.0")
+            .expect("owned method argument is loaded");
+        let cleared = ir[moved..]
+            .find("store %sable.class.0 zeroinitializer")
+            .map(|offset| moved + offset)
+            .expect("owned method argument source is neutralized");
+        let called = ir[cleared..]
+            .find("call void @__sable_v0_c0_m_7_forward")
+            .map(|offset| cleared + offset)
+            .expect("class-returning method is invoked after the move");
+        assert!(moved < cleared && cleared < called, "{ir}");
+
+        let mut reused = scalar_owner_program();
+        reused.fns[0].body.insert(
+            3,
+            Stmt::ExprStmt(scalar_owner_method_call(
+                "incoming",
+                "get",
+                Vec::new(),
+                Ty::Int(IntTy::U64),
+                48,
+            )),
+        );
+        let error = emit_program(
+            &reused,
+            100,
+            &EmitOptions {
+                entry: Some("scalar_owner_entry".into()),
+            },
+        )
+        .expect_err("a moved argument cannot be reused as a method receiver");
+        assert_eq!(error[0].name, "backend.class_moved");
+
+        let mut wrong_call_result = scalar_owner_program();
+        let Stmt::VarDecl { init, .. } = &mut wrong_call_result.fns[0].body[2] else {
+            unreachable!()
+        };
+        init.ty = Some(Ty::Unit);
+        let error = emit_program(
+            &wrong_call_result,
+            100,
+            &EmitOptions {
+                entry: Some("scalar_owner_entry".into()),
+            },
+        )
+        .expect_err("a method result annotation cannot disagree with its declaration");
+        assert_eq!(error[0].name, "backend.unsupported");
+    }
+
+    #[test]
+    fn scalar_owner_method_calls_exact_consume_the_checker_plan() {
+        let mut source = scalar_owner_program();
+        let checked = crate::check::check(&mut source).expect("synthetic scalar owner typechecks");
+        emit_program_with_plans(
+            &source,
+            &checked.control,
+            &checked.ownership,
+            100,
+            &EmitOptions {
+                entry: Some("scalar_owner_entry".into()),
+            },
+        )
+        .expect("the exact checked method plan lowers");
+
+        let mut respanned = source.clone();
+        let Stmt::VarDecl { init, .. } = &mut respanned.fns[0].body[2] else {
+            unreachable!()
+        };
+        let ExprKind::MethodCall { args, .. } = &mut init.kind else {
+            unreachable!()
+        };
+        args[0].span = Span::new(70, 71);
+        let error = emit_program_with_plans(
+            &respanned,
+            &checked.control,
+            &checked.ownership,
+            100,
+            &EmitOptions {
+                entry: Some("scalar_owner_entry".into()),
+            },
+        )
+        .expect_err("a respanned owned argument cannot reuse the checked method plan");
+        assert_eq!(error[0].name, "internal.control_plan_invalid");
+
+        let mut tampered = crate::check::check(&mut source).expect("fresh exact call plan");
+        let key = tampered
+            .ownership
+            .calls
+            .for_owner(&CallOwner::Function("scalar_owner_entry".into()))
+            .find(|(key, _)| {
+                matches!(key.target, CallTarget::Method { ref method, .. } if method == "forward")
+            })
+            .map(|(key, _)| key.clone())
+            .expect("forward call transition");
+        tampered
+            .ownership
+            .calls
+            .get_mut(&key)
+            .expect("mutable checked transition")
+            .arguments[0]
+            .parameter_ty = Ty::Bool;
+        let error = emit_program_with_plans(
+            &source,
+            &tampered.control,
+            &tampered.ownership,
+            100,
+            &EmitOptions {
+                entry: Some("scalar_owner_entry".into()),
+            },
+        )
+        .expect_err("a mutated transfer cannot authorize LLVM argument lowering");
+        assert_eq!(error[0].name, "internal.control_plan_invalid");
+
+        let mut detached = crate::check::check(&mut source).expect("fresh exact call plan");
+        let key = detached
+            .ownership
+            .calls
+            .for_owner(&CallOwner::Function("scalar_owner_entry".into()))
+            .find(|(key, _)| {
+                matches!(key.target, CallTarget::Method { ref method, .. } if method == "forward")
+            })
+            .map(|(key, _)| key.clone())
+            .expect("forward call transition");
+        detached
+            .ownership
+            .calls
+            .get_mut(&key)
+            .expect("mutable checked transition")
+            .key
+            .span = Span::new(80, 81);
+        let error = emit_program_with_plans(
+            &source,
+            &detached.control,
+            &detached.ownership,
+            100,
+            &EmitOptions {
+                entry: Some("scalar_owner_entry".into()),
+            },
+        )
+        .expect_err("a detached transition value key cannot authorize LLVM lowering");
+        assert_eq!(error[0].name, "internal.control_plan_invalid");
     }
 
     #[test]
@@ -10079,13 +11144,20 @@ mod tests {
             ("values", affine_take("missing")),
         ] {
             assert_affine_error(
-                validate_fresh_bool_array_initializer(&empty, &take, 1, &locals, destination, true)
-                    .expect_err("forged take source/destination must be rejected"),
+                validate_fresh_bool_array_initializer(
+                    &empty,
+                    &take,
+                    1,
+                    &mut locals,
+                    destination,
+                    true,
+                )
+                .expect_err("forged take source/destination must be rejected"),
             );
         }
 
         assert_affine_error(
-            validate_expr(&empty, &affine_take("pending"), 1, &locals)
+            validate_expr(&empty, &affine_take("pending"), 1, &mut locals)
                 .expect_err("take is not a general expression"),
         );
         assert_affine_error(
@@ -10098,7 +11170,7 @@ mod tests {
                     bool_array_ty(),
                 ),
                 1,
-                &locals,
+                &mut locals,
             )
             .expect_err("`.value` must not copy an affine payload"),
         );

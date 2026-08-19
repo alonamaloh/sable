@@ -1,0 +1,38 @@
+// Exact private scalar-owner method ABI differential. This intentionally
+// contains no arrays, slots, records, nested owners, or public declarations.
+
+class ScalarOwner {
+    u64 value;
+
+    /// invariant value ≤ 100
+
+    /// pre initial ≤ 100
+    /// post self.value = initial
+    init new(u64 initial) {
+        self.value = initial;
+    }
+
+    /// post result = self.value
+    fn get(&self) -> u64 {
+        return self.value;
+    }
+
+    /// post self.value = 10
+    fn set_ten(&mut self) {
+        self.value = 10;
+    }
+
+    /// post result.value = incoming.value
+    fn forward(&mut self, ScalarOwner incoming) -> ScalarOwner {
+        return incoming;
+    }
+}
+
+fn owner_class_calls_entry() -> i32 {
+    var mut receiver = ScalarOwner::new(9);
+    receiver.set_ten();
+    var mut relay = ScalarOwner::new(0);
+    var incoming = ScalarOwner::new(32);
+    var returned = receiver.forward(relay.forward(incoming));
+    return narrow<i32>(receiver.get() + returned.get());
+}

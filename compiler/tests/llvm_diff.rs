@@ -84,6 +84,11 @@ const CASES: &[Case] = &[
         entry: "slots_bool_entry",
     },
     Case {
+        label: "scalar-owner-methods",
+        source: "owner_class_calls.sable",
+        entry: "owner_class_calls_entry",
+    },
+    Case {
         label: "bignum-native",
         source: "../verifies/bignum_native.sable",
         entry: "bignum_native_entry",

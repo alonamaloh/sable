@@ -766,6 +766,75 @@ fn integer_native_balances_nested_array_ownership_at_o0_and_o2() {
 }
 
 #[test]
+fn scalar_owner_methods_use_exact_internal_move_and_destination_abi() {
+    let source = repo_root().join("corpus/llvm-diff/owner_class_calls.sable");
+    let output = build_command()
+        .args([
+            "build",
+            "--emit-llvm",
+            "--entry",
+            "owner_class_calls_entry",
+            "-o",
+            "-",
+        ])
+        .arg(&source)
+        .output()
+        .expect("run the Sable scalar-owner LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM scalar-owner build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
+    assert!(report.contains("status: fully verified"));
+
+    let forward = internal_function_symbol(&ir, "forward");
+    let forward_body = internal_function_body(&ir, &forward);
+    let definition = forward_body.lines().next().expect("method definition");
+    assert!(
+        definition.contains("(ptr %self, ptr %result, %sable.class.0 %p0)"),
+        "class-returning methods need receiver and destination pointers:\n{definition}"
+    );
+    assert!(
+        forward_body.contains("store %sable.class.0 %p0"),
+        "owned method argument must enter callee-owned storage"
+    );
+
+    let entry = internal_function_symbol(&ir, "owner_class_calls_entry");
+    let entry_body = internal_function_body(&ir, &entry);
+    let moved = entry_body
+        .find("load %sable.class.0")
+        .expect("caller loads the owned argument");
+    let cleared = entry_body[moved..]
+        .find("store %sable.class.0 zeroinitializer")
+        .map(|offset| moved + offset)
+        .expect("caller neutralizes the moved source");
+    let called = entry_body[cleared..]
+        .find(&format!("call void @{forward}(ptr "))
+        .map(|offset| cleared + offset)
+        .expect("caller invokes the destination-passing method");
+    let call_line = entry_body[called..]
+        .lines()
+        .next()
+        .expect("method call line");
+    assert!(moved < cleared && cleared < called, "{entry_body}");
+    assert!(
+        call_line.matches("ptr ").count() == 2 && call_line.contains("%sable.class.0 "),
+        "method call must carry receiver, result, and moved owner: {call_line}"
+    );
+    assert_eq!(
+        entry_body
+            .matches(&format!("call void @{forward}(ptr "))
+            .count(),
+        2,
+        "a fresh class-returning method result must lower directly as an owned method argument:\n{entry_body}"
+    );
+
+    assert_clang_exit("scalar-owner-methods", &ir, 42);
+}
+
+#[test]
 fn failed_verification_preserves_an_existing_output() {
     let temp = temp_dir("atomic");
     let destination = temp.join("program.ll");
