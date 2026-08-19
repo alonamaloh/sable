@@ -1,0 +1,16 @@
+// expect-error: type.duplicate_init
+
+class DuplicateInitializer {
+    u64 value;
+
+    init make() {
+        self.value = 0;
+    }
+
+    init make() {
+        self.value = 1;
+    }
+}
+
+fn subject() {
+}

@@ -1,0 +1,12 @@
+// expect-error: expose.return_from_body
+// A return is forbidden anywhere inside an exposure, even when another path
+// falls through and performs reconstruction.
+
+fn conditional_exit(bool leave, &[u8] bytes) -> u8 {
+    unsafe expose &bytes as (p, resource mem) {
+        if (leave) {
+            return 1;
+        }
+    }
+    return 0;
+}

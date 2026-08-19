@@ -26,8 +26,9 @@ unprovable. All kernel-checked, core-only, no mathlib.
 undef` at the expression layer). Every state the static semantics must
 exclude — ⊥-reads, type confusion, out-of-range literals, negative
 `alloc_array` lengths — has a defined `undef` outcome, so pillar 1 holds
-literally and soundness sharpens to "verified programs never reach
-`undef`". Operand shape is decided where the operand is *produced*
+literally and the target soundness statement sharpens to "verified programs
+never reach `undef`". This machine theorem does not by itself validate the
+trusted Rust VCs selected from source. Operand shape is decided where the operand is *produced*
 (left-to-right): once a left operand is known ill-shaped, the right
 operand is never evaluated, keeping abnormal-outcome identity
 deterministic without new ordering decisions.

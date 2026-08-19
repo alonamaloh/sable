@@ -2,6 +2,14 @@
 
 *Working draft 0.4 — subject to revision as real code generates friction.*
 
+> **Document status.** This document is normative where it records a settled
+> semantic rule, but it is not an inventory of the forms implemented by every
+> compiler stage. Prospective syntax and types describe design intent. The
+> executable [language tutorial](../TUTORIAL.md), generated
+> [type-position matrix](../type-matrix.md), and generated
+> [shape-by-stage table](../shape-admission.md) describe the currently accepted
+> surface and its checker, interpreter, formal-machine, and native coverage.
+
 Sable is an imperative, C-flavored language in which every function carries a machine-checked proof of its contract. One source file interleaves two languages:
 
 - The **program language**: C-like, no undefined behavior, fixed-width integers, classes with constructors/destructors (RAII), ownership-based memory model.
@@ -9,8 +17,8 @@ Sable is an imperative, C-flavored language in which every function carries a ma
 
 ## Design pillars
 
-1. **No undefined behavior.** Every syntactically valid program has a meaning defined by a formal machine model. Anything that would be UB in C is either statically excluded by a proof obligation, has defined trap semantics, or — for the one case a runtime check would be unaffordable, reading uninitialized memory in *unchecked* code — lands in an explicit `undef` terminal outcome that verified programs provably never reach (ADR 0005).
-2. **A formal machine model is the axiom base.** The default model is the Sable Virtual Machine (SVM, §10), formalized once in Lean. Proof obligations are theorems about machine traces. The SVM is a *semantic definition*, not a runtime: native compilation is (eventually verified) machine-behavior-preserving translation, and other machine models can sit below the same language (§11). The trusted base shrinks in **stages** (§10.1): initially the VC generator is trusted engineering, cross-checked by differential testing against the SVM formalization; a mechanized soundness proof of the VC generator — reducing trust to the machine formalization and the Lean kernel alone — is a scheduled long-running pillar, not a day-one claim.
+1. **No undefined behavior.** Every syntactically valid program has a meaning defined by a formal machine model. Anything that would be UB in C is either statically excluded by a proof obligation, has defined trap semantics, or — for the one case a runtime check would be unaffordable, reading uninitialized memory in *unchecked* code — lands in an explicit `undef` terminal outcome that the Stage 2 soundness theorem is intended to prove unreachable for verified programs (ADR 0005).
+2. **A formal machine model is the axiom base.** The default model is the Sable Virtual Machine (SVM, §10), formalized once in Lean. Today's generated obligations are source-level Lean propositions selected by the trusted Rust checker and VC generator; the scheduled Stage 2 soundness theorem must relate their validity to machine traces. The SVM is a *semantic definition*, not a runtime: native compilation is (eventually verified) machine-behavior-preserving translation, and other machine models can sit below the same language (§11). The trusted base shrinks in **stages** (§10.1): initially the checker and VC generator remain trusted engineering. Differential testing separately compares the reference interpreter with the Lean SVM evaluator on the admitted formal subset; it does not validate VC generation. A mechanized soundness proof of the VC generator — reducing trust to the machine formalization and the Lean kernel alone — is a scheduled long-running pillar, not a day-one claim.
 3. **Ownership before logic.** The type system enforces unique ownership with borrowing (§5). Because mutable aliasing is impossible in safe code, the verifier reasons about values rather than heaps, and framing is a type-system fact, not a per-call proof obligation.
 4. **Total verification, visible exceptions.** There are no build modes. An undischarged obligation is a compile error. The only ways past an obligation are written in the source, audited, and greppable: `defer` (sound runtime trap) and `assume` (unsound axiom) — §9.
 
@@ -93,7 +101,7 @@ fn mul_wide(u64 a, u64 b) -> (u64, u64);   // (lo, hi)
 
 ### 2.3 Definite initialization
 
-Reading a location requires a proof that it was initialized on every path — discharged by flow-sensitive typing in the common case, by the general verifier when control flow depends on proved facts. There is no default zero. The machine model represents uninitialized memory as `⊥`; a ⊥-read sends the machine to the explicit `undef` terminal outcome (so even unchecked programs have a defined meaning), and the soundness theorem (§10) states that verified programs never reach it.
+Reading a location requires a proof that it was initialized on every path — discharged by flow-sensitive typing in the common case, by the general verifier when control flow depends on proved facts. There is no default zero. The machine model represents uninitialized memory as `⊥`; a ⊥-read sends the machine to the explicit `undef` terminal outcome (so even unchecked programs have a defined meaning), and the target Stage 2 soundness theorem (§10.1) states that verified programs never reach it.
 
 ```sable
 fn pick(bool b) -> i32 {
@@ -334,13 +342,36 @@ The default machine model is deliberately boring: a **structured (AST-level) sma
 - **Soundness theorem** (the metatheory's target statement): *if every VC of program P is a theorem, then no execution of ⟦P⟧ reaches `undef`, executes a partial operation outside its domain, violates a contract, or — absent `partial` — diverges; and every `defer`red predicate either holds or the execution ends in a named trap.* When mechanized (§10.1, stage 2), the compiler is untrusted; the theorem, the machine formalization, and the Lean kernel are the trusted base.
 - Allocation failure is defined behavior: `alloc_array` halts in a named OOM trap. Top-level correctness claims therefore read "every execution either satisfies the contract or halts in the OOM trap." (A `try_alloc` returning `option` exists for callers that must handle exhaustion.)
 
-*(Formalization status: these semantics exist at `lean/Sable/SVM.lean` — core subset: expressions, statements, loops, and calls with frames (A-normalized per ADR 0005: `x = f(args)` at statement level, callee entered on an empty frame, returns pop the caller; recursion diverges by unbounded stack growth; a parameter is a machine value or a borrowed array, a unique borrow being an argument form whose exit value returns to the caller's local at the pop rather than a value of its own, ADR 0069); classes and ghost state remain scoped out. Writing the first draft surfaced eleven ambiguities in this section's prose; all eleven are resolved in ADR 0005 and folded into this document (the `undef` outcome, modifier scope, the AST-level machine, A-normalized calls, normative evaluation order and short-circuiting, the capacity parameter, procedures, and the minor batch), with ghost transitions and trap-payload observability explicitly deferred. The machine is total — `undef` is the defined outcome of every state the static semantics must exclude, so pillar 1 holds literally and soundness sharpens to "verified programs never reach `undef`". Determinism and rule/evaluator agreement are theorems (`lean/Sable/SVMEval.lean`), and the evaluator differentially tests `interp.rs` on `corpus/svm-diff` in `cargo test` (ADR 0017); audit trail in `docs/notes/svm-draft.md`.)*
+*(Formalization status: these semantics exist at `lean/Sable/SVM.lean` — core subset: expressions, statements, loops, and calls with frames (A-normalized per ADR 0005: `x = f(args)` at statement level, callee entered on an empty frame, returns pop the caller; recursion diverges by unbounded stack growth; a parameter is a machine value or a borrowed array, a unique borrow being an argument form whose exit value returns to the caller's local at the pop rather than a value of its own, ADR 0069); classes and ghost state remain scoped out. Writing the first draft surfaced eleven ambiguities in this section's prose; all eleven are resolved in ADR 0005 and folded into this document (the `undef` outcome, modifier scope, the AST-level machine, A-normalized calls, normative evaluation order and short-circuiting, the capacity parameter, procedures, and the minor batch), with ghost transitions and trap-payload observability explicitly deferred. The machine is total — `undef` is the defined outcome of every state the static semantics must exclude, so the target soundness statement sharpens to "verified programs never reach `undef`"; the Stage 2 source-to-machine theorem establishing that statement is not yet mechanized. Determinism and rule/evaluator agreement are theorems (`lean/Sable/SVMEval.lean`), and the evaluator is differentially tested against `interp.rs` on `corpus/svm-diff` in `cargo test` (ADR 0017); that differential checks the two executable semantics, not VC generation. Audit trail: `docs/notes/svm-draft.md`.)*
 
 ### 10.1 The trusted base, in stages
 
 The soundness story is deliberately staged, because a mechanized VCgen soundness proof is RustBelt-scale work that sits on the critical path of nothing in the near-term goals:
 
-- **Stage 1 (from day one)**: the SVM step relation is formalized in Lean and is the language's normative meaning. The VC generator is *trusted engineering* — the same trust posture as Verus and Creusot today — but it is cross-checked continuously: the SVM formalization is executable (its evaluator agrees with the rules by theorem) and is differentially tested against the reference interpreter on every `cargo test` run (ADR 0017); the planned self-hosted SVM interpreter will extend the same oracle to every compiler question.
+- **Stage 1 (from day one)**: the SVM step relation is formalized in Lean and
+  is the language's normative meaning. The checker and VC generator are
+  *trusted engineering* — the same trust posture as Verus and Creusot today.
+  Separately, the SVM formalization is executable, its evaluator agrees with
+  the rules by theorem, and that evaluator is differentially tested against the
+  reference interpreter on every `cargo test` run (ADR 0017). This cross-checks
+  the two executable semantics on the admitted formal subset; it does not
+  validate the VCs selected from source. Consolidation narrows duplicated trust
+  without retiring it. The checker authors one exact ownership/mutation plan
+  for the admitted checker-to-VC boundary, including moves, loans, receivers,
+  sealed operations, exposures, and loop effects; VC generation consumes it
+  fail-closed. Explicit unique-borrow write-back additionally has a Lean-checked
+  fresh-state/array-length certificate (ADRs 0087–0090). The checker consumes a
+  total pre-check control outline, which successful checking seals into the
+  structured typed control/action plan used by VC, formal-SVM lowering,
+  interpreter, and LLVM paths for block flow, lexical routes, exposure close,
+  local and field replacement, discarded class temporaries, direct traps, and
+  their admitted destruction subsets (ADRs 0089, 0091–0092). Each downstream
+  stage consumes the exact retained action before either executing/lowering it
+  or refusing a shape outside its admitted subset. Dynamic liveness and
+  representation remain consumer state, not independently selected semantic
+  policy. This closes all six C0 consolidation criteria, but the plan is not a
+  full expression CFG and none of these tranches is a mechanized Stage 2
+  source-translation result.
 - **Stage 2 (its own long-running pillar)**: mechanize the soundness theorem — VCgen correctness against the step relation, ghost-erasure soundness, and the ownership-implies-frame-rule metatheorem of §5. This retires the VCgen from the trusted base. It is scheduled as an explicit tier in the goals document, not implied by the design.
 
 Claims made about verified Sable programs must name the stage they rest on.

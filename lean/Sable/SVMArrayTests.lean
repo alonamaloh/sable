@@ -37,6 +37,41 @@ private def u64 (n : Int) : Expr := .intLit .u64 n
   [ .assign "a" (.allocArray (u64 2) (.boolLit true)), .ret (.var "a") ]
   = "done arr [true, true]"
 
+/- A normalized lexical exit removes the safe owner from the formal frame.
+The array has value semantics in the SVM, so there is no allocator event to
+run; the observable ownership fact is that the dead place cannot be read. -/
+#guard outcome 100
+  [ .assign "a" (.allocArray (u64 2) (.boolLit true)),
+    .scopeExit ["a"],
+    .ret (.var "a") ]
+  = "undef"
+
+/- Returning an affine owner uses an atomic compiler move before the source
+scope closes. The result slot is deliberately outside the source route. -/
+#guard outcome 100
+  [ .assign "a" (.allocArray (u64 2) (.boolLit true)),
+    .moveLocal "$result" "a",
+    .scopeExit ["a"],
+    .ret (.var "$result") ]
+  = "done arr [true, true]"
+
+#guard outcome 100
+  [ .assign "a" (.allocArray (u64 2) (.boolLit true)),
+    .scopeExit ["a"],
+    .retUnit ]
+  = "done unit"
+
+#guard outcome 100
+  [ .assign "a" (.allocArray (u64 1) (.boolLit false)),
+    .moveLocal "a" "a" ]
+  = "undef"
+
+#guard outcome 100
+  [ .assign "a" (.allocArray (u64 1) (.boolLit false)),
+    .assign "$result" (.boolLit true),
+    .moveLocal "$result" "a" ]
+  = "undef"
+
 /- OOB and OOM remain defined traps for Boolean payloads. -/
 #guard outcome 100
   [ .assign "a" (.allocArray (u64 1) (.boolLit false)),

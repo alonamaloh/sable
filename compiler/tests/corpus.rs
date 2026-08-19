@@ -8,6 +8,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
 
+// Verification is intentionally recursive over proof/control structure.  The
+// platform default for spawned Rust threads can be smaller than the main-thread
+// stack used by the CLI, which made large but valid subjects (notably bignum)
+// abort in this parallel harness even though the same check succeeds directly.
+// Keep the corpus workers at an explicit, CLI-comparable budget.
+const CORPUS_WORKER_STACK: usize = 16 * 1024 * 1024;
+
 /// Run `work` over `items` on a small thread pool; collect the failure
 /// strings. The Lean checks dominate wall clock and the files are
 /// independent, so this is a near-linear speedup.
@@ -25,16 +32,20 @@ fn parallel<T: Send>(items: Vec<T>, work: impl Fn(&T) -> Vec<String> + Sync) -> 
     let items = Mutex::new(items.into_iter());
     let failures = Mutex::new(Vec::new());
     thread::scope(|s| {
-        for _ in 0..n {
-            s.spawn(|| {
-                loop {
-                    let Some(item) = items.lock().unwrap().next() else {
-                        break;
-                    };
-                    let fs = work(&item);
-                    failures.lock().unwrap().extend(fs);
-                }
-            });
+        for worker in 0..n {
+            thread::Builder::new()
+                .name(format!("sable-corpus-{worker}"))
+                .stack_size(CORPUS_WORKER_STACK)
+                .spawn_scoped(s, || {
+                    loop {
+                        let Some(item) = items.lock().unwrap().next() else {
+                            break;
+                        };
+                        let fs = work(&item);
+                        failures.lock().unwrap().extend(fs);
+                    }
+                })
+                .expect("failed to spawn corpus worker");
         }
     });
     failures.into_inner().unwrap()

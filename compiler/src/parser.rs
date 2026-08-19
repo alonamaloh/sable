@@ -8,6 +8,7 @@
 use crate::ast::*;
 use crate::diag::Diagnostic;
 use crate::lexer::{Tok, Token};
+use crate::place::BorrowedPlace;
 use crate::scan::{Clause, ClauseKind, ProofBlock};
 use crate::span::{LineMap, Span};
 
@@ -557,6 +558,93 @@ pub fn parse(
     text: &str,
 ) -> PResult<Program> {
     parse_module(tokens, blocks, lines, text, &[], &[], &[])
+}
+
+/// One answer from the parser's type-position authority for `explain-type`.
+///
+/// The command deliberately receives the parser's real diagnostic rather
+/// than reconstructing a user-facing matrix from [`TyPos::gate_name`] and
+/// [`Parser::admits`]. That keeps the explanation on the same recursive
+/// lowering path as a type written in a program, including nested payload and
+/// resource-kind rules.
+pub(crate) struct TypePositionExplanation {
+    pub(crate) name: &'static str,
+    pub(crate) diagnostic: Option<Diagnostic>,
+}
+
+/// A standalone spelling lowered by at least one parser type position.
+pub(crate) struct ParsedTypeExplanation {
+    pub(crate) ty: Ty,
+    pub(crate) positions: Vec<TypePositionExplanation>,
+}
+
+/// Parse one complete type spelling and ask every parser type position about it.
+///
+/// These are syntax/lowering answers, not the full language-admission answers
+/// in `docs/type-matrix.md`: that matrix also runs constants,
+/// monomorphization, and checking, and it distinguishes call binding modes
+/// that are not individual [`TyPos`] variants.
+///
+/// There is intentionally no separate "explanation grammar": syntax,
+/// nesting limits, primitive names, resource kinds, and positional lowering
+/// all come from the parser used for source files. A nominal name has no
+/// meaning without a module, so this context contains no nominal declarations;
+/// the CLI consequently explains closed built-in/resource spellings and
+/// reports an ordinary `parse.unknown_type` for a module-relative name.
+pub(crate) fn parse_type_for_explanation(
+    tokens: &[Token],
+    lines: &LineMap,
+    text: &str,
+) -> PResult<ParsedTypeExplanation> {
+    let parser = Parser {
+        tokens,
+        pos: 0,
+        pending: Vec::new(),
+        pending_mut: false,
+        str_temps: 0,
+        blocks: &[],
+        consumed: Vec::new(),
+        lines,
+        text,
+        tparams: Vec::new(),
+        class_names: Vec::new(),
+        generic_class_names: Vec::new(),
+        record_names: Vec::new(),
+    };
+    let mut index = 0;
+    let mut budget = TypeBudget::default();
+    let syntax = parser.parse_type_syntax_at(&mut index, 1, &mut budget)?;
+    if parser.token_at(index).tok != Tok::Eof {
+        return Err(parser.token_expected(index, "end of type"));
+    }
+
+    let mut lowered = None;
+    let mut first_diagnostic = None;
+    let positions = TyPos::all()
+        .map(|position| match parser.lower_type(&syntax, position) {
+            Ok(ty) => {
+                lowered.get_or_insert(ty);
+                TypePositionExplanation {
+                    name: position.short_name(),
+                    diagnostic: None,
+                }
+            }
+            Err(diagnostic) => {
+                if first_diagnostic.is_none() {
+                    first_diagnostic = Some(diagnostic.clone());
+                }
+                TypePositionExplanation {
+                    name: position.short_name(),
+                    diagnostic: Some(diagnostic),
+                }
+            }
+        })
+        .collect();
+
+    match lowered {
+        Some(ty) => Ok(ParsedTypeExplanation { ty, positions }),
+        None => Err(first_diagnostic.expect("TyPos::all contains at least one position")),
+    }
 }
 
 /// Parse one module. `extern_classes` are non-generic classes from
@@ -3307,7 +3395,7 @@ impl<'a> Parser<'a> {
         // text, so neither the index nor the bounds' variables may be
         // assigned by the body.
         let mut assigned = std::collections::HashSet::new();
-        crate::vcgen::collect_assigned(&body, &mut assigned, crate::vcgen::ANY_RECV_MUTATES);
+        collect_for_assigned(&body, &mut assigned);
         if assigned.contains(&index) {
             return Err(Diagnostic {
                 name: "parse.for_assigns_index".into(),
@@ -4845,6 +4933,155 @@ fn reserved_name_error(name: &str, span: Span, what: &str) -> Diagnostic {
              with Lean keywords or Sable builtins are rejected"
                 .into(),
         )],
+    }
+}
+
+/// Conservative source-only mutation scan used while desugaring `for`.
+/// This is intentionally parser-local: verified loop havoc consumes the
+/// checker's typed `CheckedLoopEffects` and never consults this syntax walk.
+fn collect_for_assigned(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for statement in stmts {
+        match statement {
+            Stmt::Assign { name, value, .. } => {
+                out.insert(name.clone());
+                collect_for_expr_mutations(value, out);
+            }
+            Stmt::Store {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                out.insert(array.clone());
+                collect_for_expr_mutations(index, out);
+                collect_for_expr_mutations(value, out);
+            }
+            Stmt::FieldAssign { value, .. } => {
+                out.insert("self".into());
+                collect_for_expr_mutations(value, out);
+            }
+            Stmt::FieldStore { index, value, .. } => {
+                out.insert("self".into());
+                collect_for_expr_mutations(index, out);
+                collect_for_expr_mutations(value, out);
+            }
+            Stmt::ExprStmt(expression) => collect_for_expr_mutations(expression, out),
+            Stmt::Decl {
+                init: Some(init), ..
+            }
+            | Stmt::VarDecl { init, .. } => {
+                collect_for_expr_mutations(init, out);
+            }
+            Stmt::Return {
+                value: Some(value), ..
+            } => collect_for_expr_mutations(value, out),
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                collect_for_expr_mutations(cond, out);
+                collect_for_assigned(then_block, out);
+                if let Some(else_block) = else_block {
+                    collect_for_assigned(else_block, out);
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                collect_for_expr_mutations(cond, out);
+                collect_for_assigned(body, out);
+            }
+            Stmt::Unsafe { body, .. } => collect_for_assigned(body, out),
+            Stmt::Expose {
+                array,
+                mutable,
+                body,
+                ..
+            } => {
+                if *mutable {
+                    out.insert(array.clone());
+                }
+                collect_for_assigned(body, out);
+            }
+            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                collect_for_expr_mutations(size, out);
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                collect_for_expr_mutations(ptr, out);
+                collect_for_expr_mutations(res, out);
+                collect_for_expr_mutations(release, out);
+            }
+            Stmt::Assert(_) | Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
+        }
+    }
+}
+
+fn collect_for_expr_mutations(expression: &Expr, out: &mut std::collections::HashSet<String>) {
+    match &expression.kind {
+        ExprKind::Borrow { .. } => {
+            let borrowed =
+                BorrowedPlace::from_expr(expression).expect("the Borrow arm has an explicit place");
+            if borrowed.mutability() == Mutability::Mut {
+                out.insert(borrowed.place().root().to_string());
+            }
+        }
+        ExprKind::OptTake { option, .. } => {
+            out.insert(option.clone());
+        }
+        ExprKind::MethodCall { recv, args, .. } => {
+            // Before type checking, every receiver must conservatively count
+            // as mutable for the synthesized range invariant.
+            out.insert(recv.clone());
+            for argument in args {
+                collect_for_expr_mutations(argument, out);
+            }
+        }
+        ExprKind::Call { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::TraitCall { args, .. }
+        | ExprKind::RecordLit { args, .. }
+        | ExprKind::RawOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::DeviceOp { args, .. } => {
+            for argument in args {
+                collect_for_expr_mutations(argument, out);
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Widen { arg: operand, .. }
+        | ExprKind::Narrow { arg: operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => collect_for_expr_mutations(operand, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_for_expr_mutations(lhs, out);
+            collect_for_expr_mutations(rhs, out);
+        }
+        ExprKind::Index { index, .. }
+        | ExprKind::SelfFieldIndex { index, .. }
+        | ExprKind::ClassFieldIndex { index, .. } => {
+            collect_for_expr_mutations(index, out);
+        }
+        ExprKind::AllocArray { len, init, .. } => {
+            collect_for_expr_mutations(len, out);
+            collect_for_expr_mutations(init, out);
+        }
+        ExprKind::ArrayLit(elements) => {
+            for element in elements {
+                collect_for_expr_mutations(element, out);
+            }
+        }
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Len { .. }
+        | ExprKind::NoneE
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. } => {}
     }
 }
 

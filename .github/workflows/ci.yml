@@ -6,10 +6,60 @@ on:
   pull_request:
 
 jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        working-directory: compiler
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            compiler/target
+          key: cargo-clippy-${{ runner.os }}-${{ hashFiles('compiler/Cargo.lock') }}
+
+      - name: Lint all targets
+        working-directory: compiler
+        run: cargo clippy --locked --all-targets -- -D clippy::correctness
+
   test:
+    # Always report a real required status. Without `always()`, GitHub marks a
+    # job skipped when one of its dependencies fails, and a skipped required
+    # check may not block a merge.
+    needs: [fmt, clippy, native-differential]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Require static and native gates
+        run: |
+          test '${{ needs.fmt.result }}' = success
+          test '${{ needs.clippy.result }}' = success
+          test '${{ needs.native-differential.result }}' = success
+
       - uses: actions/checkout@v4
 
       - name: Install elan
@@ -49,3 +99,56 @@ jobs:
       - name: Full corpus + LSP tests
         working-directory: compiler
         run: cargo test --locked
+
+  native-differential:
+    name: Native differential (Clang O0/O2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install elan
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Lean toolchain and prelude
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            lean/.lake
+          key: lean-${{ runner.os }}-${{ hashFiles('lean/lean-toolchain', 'lean/lakefile.toml', 'lean/Sable.lean', 'lean/Sable/**') }}
+          restore-keys: lean-${{ runner.os }}-
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            compiler/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('compiler/Cargo.lock') }}
+
+      - name: Require Clang
+        run: clang --version
+
+      - name: Build Sable prelude
+        working-directory: lean
+        run: lake build
+
+      - name: Interpreter versus native code, ABI, and lifetime gates
+        working-directory: compiler
+        env:
+          SABLE_REQUIRE_CLANG: "1"
+          SABLE_LEAN_JOBS: "1"
+          SABLE_TEST_JOBS: "1"
+        run: >-
+          cargo test --locked
+          --test llvm_diff
+          --test llvm_generated_diff
+          --test llvm_cli
+          -- --test-threads=1

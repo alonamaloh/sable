@@ -5,9 +5,22 @@
 //!
 //! The checker writes types into the AST (`Expr::ty`) for the VC generator.
 
+#![deny(clippy::wildcard_enum_match_arm)]
+
 use crate::ast::*;
+use crate::control::{BlockId, ControlOutline, ControlOutlines, ControlProgram, StatementPlanKind};
 use crate::diag::Diagnostic;
+use crate::ownership::{
+    CheckedExposure, CheckedLoopEffects, CheckedMutation, CheckedOptionTake, CheckedOwnershipPlan,
+    CheckedSealedArgument, CheckedSealedOperation, CheckedSealedTarget, EffectSiteKey,
+    ValueTransfer, ValueTransferKind, ValueTransferSink,
+};
+use crate::place::{BorrowedPlace, Place};
 use crate::span::Span;
+use crate::transition::{
+    CallArgumentEffect, CallArgumentTransition, CallOwner, CallReceiverTransition, CallSiteKey,
+    CallTarget, CallTransition, CheckedCallTransition,
+};
 use std::collections::{HashMap, HashSet};
 
 pub struct FnSig {
@@ -34,6 +47,12 @@ pub struct RecordMeta {
 
 pub struct CheckResult {
     pub sigs: HashMap<String, FnSig>,
+    /// Checker-sealed lexical control plans for this exact typed AST.
+    pub(crate) control: ControlProgram,
+    /// Ephemeral, typed ownership and mutation facts read by VC generation
+    /// for this exact checked AST. They are never serialized into module
+    /// artifacts.
+    pub(crate) ownership: CheckedOwnershipPlan,
     /// How many `unsafe` regions the program opened. Reported by the
     /// driver: the number of places a reader must audit is a fact about
     /// the program, and burying it would defeat the point of having a
@@ -74,6 +93,10 @@ struct Ctx<'a> {
     unsafe_blocks: usize,
     sigs: &'a HashMap<String, FnSig>,
     current_fn: String,
+    /// Semantic callable identity used by the checker-to-VC call handoff.
+    /// This stays separate from `current_fn`, whose display spelling is also
+    /// used by call-graph and diagnostic code.
+    call_owner: CallOwner,
     current_has_variant: bool,
     /// `test_*` functions: dynamic-only, excluded from verification,
     /// allowed owned arrays / borrows / array-passing (design §9).
@@ -93,8 +116,13 @@ struct Ctx<'a> {
     /// Locals and parameters have pairwise-distinct names
     /// (keeps path-splitting and havoc in the VC generator scope-free).
     declared: HashSet<String>,
-    /// Non-self callees (for mutual-recursion detection).
-    calls: Vec<String>,
+    /// Non-self callees (for mutual-recursion detection), with callable
+    /// flavor retained so same-spelled member categories stay distinct.
+    calls: Vec<CallOwner>,
+    /// Checker-authored unique-borrow effects for free, constructor, and
+    /// method calls. Every admitted call gets a record, including an empty
+    /// one, so VC generation can distinguish "no effect" from "not checked".
+    ownership: &'a mut CheckedOwnershipPlan,
     /// Class-member context: (class meta index, self is &mut).
     in_class: Option<(usize, bool)>,
     /// Inside an `init`: fields start uninitialized, `return` forbidden.
@@ -242,7 +270,18 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
     if !matches!(f.ret, Ty::Unit | Ty::Int(_)) {
         let what = match &f.ret {
             Ty::Class(_) => "a class value".to_string(),
-            other => format!("`{}`", other.name()),
+            other @ (Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit) => format!("`{}`", other.name()),
         };
         return Err(Diagnostic {
             name: "extern.returns_storage".into(),
@@ -278,10 +317,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
         // Explicit resource whitelist: a new resource kind must make a
         // deliberate ABI decision. In particular, device-profile authority
         // is meaningful only to compiler intrinsics and may not cross FFI.
-        let ok = match p.ty.res_kind() {
-            Some(kind) => kind.extern_abi_allowed(),
-            None => matches!(p.ty, Ty::Int(_) | Ty::Raw(_) | Ty::RawRecord(_)),
-        };
+        let ok = extern_parameter_abi_allowed(&p.ty);
         if !ok {
             return Err(Diagnostic {
                 name: "extern.param_abi".into(),
@@ -327,9 +363,71 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
     Ok(())
 }
 
+/// The exact foreign-parameter whitelist, including borrowed resource views.
+///
+/// Keeping both axes exhaustive is important: the ABI has historically
+/// admitted `resource &RawSpan` / `resource &mut RawSpan` as erased authority
+/// paired with a raw pointer. A match only on the outer `Ty` silently drops
+/// those established borrow forms, while a wildcard would let a future type
+/// or resource kind inherit an ABI decision accidentally.
+fn extern_parameter_abi_allowed(ty: &Ty) -> bool {
+    fn resource(kind: ResKind) -> bool {
+        match kind {
+            ResKind::RawSpan | ResKind::OpenFile | ResKind::PosixWorld => true,
+            ResKind::PointsToU64
+            | ResKind::PointsToRecord(_)
+            | ResKind::Uart
+            | ResKind::SystemDealloc
+            | ResKind::AllocatorState
+            | ResKind::BlockLease
+            | ResKind::LeasedPointsToU64
+            | ResKind::FreeBlock
+            | ResKind::FreeHeader
+            | ResKind::ResourceMapPointsToU64
+            | ResKind::ResourceMapPointsToRecord(_) => false,
+        }
+    }
+
+    fn borrowed_referent(referent: &Ty) -> bool {
+        match referent {
+            Ty::Res(kind) => resource(*kind),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => false,
+        }
+    }
+
+    match ty {
+        Ty::Int(_) | Ty::Raw(_) | Ty::RawRecord(_) => true,
+        Ty::Res(kind) => resource(*kind),
+        Ty::Borrow(Mutability::Shared, referent) | Ty::Borrow(Mutability::Mut, referent) => {
+            borrowed_referent(referent)
+        }
+        Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Unit => false,
+    }
+}
+
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
     validate_declared_aggregate_payloads(program)?;
     let mut unsafe_regions = 0usize;
+    let mut ownership = CheckedOwnershipPlan::default();
+    let mut control_outlines = ControlOutlines::default();
     let traits_c: Vec<TraitDecl> = program.traits.clone();
     check_uart_trait_methods(&traits_c)?;
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
@@ -486,11 +584,56 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         }
     }
 
+    // Class signatures + validation. Initializers and methods occupy distinct
+    // callable flavors, so one of each may share a spelling; duplicates within
+    // either flavor would make lookup and semantic owner identities ambiguous.
+    let validate_member_names = |class: &ClassDecl| -> CResult<()> {
+        let mut inits = HashSet::new();
+        for init in &class.inits {
+            if !inits.insert(init.name.clone()) {
+                return Err(Diagnostic {
+                    name: "type.duplicate_init".into(),
+                    title: format!(
+                        "class `{}` defines initializer `{}` twice",
+                        class.name, init.name
+                    ),
+                    span: init.name_span,
+                    label: "second initializer with this name".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "an initializer and a method may share a name; two initializers may not"
+                            .into(),
+                    )],
+                });
+            }
+        }
+        let mut methods = HashSet::new();
+        for method in &class.methods {
+            if !methods.insert(method.f.name.clone()) {
+                return Err(Diagnostic {
+                    name: "type.duplicate_method".into(),
+                    title: format!(
+                        "class `{}` defines method `{}` twice",
+                        class.name, method.f.name
+                    ),
+                    span: method.f.name_span,
+                    label: "second method with this name".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "an initializer and a method may share a name; two methods may not".into(),
+                    )],
+                });
+            }
+        }
+        Ok(())
+    };
+
     // Class signatures + validation.
     let mut class_metas: Vec<ClassMeta> = Vec::new();
     {
         let mut seen = HashSet::new();
         for c in &program.classes {
+            validate_member_names(c)?;
             if !seen.insert(c.name.clone())
                 || sigs.contains_key(&c.name)
                 || program.records.iter().any(|r| r.name == c.name)
@@ -594,7 +737,8 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         }
     }
 
-    let mut call_graph: HashMap<String, Vec<String>> = HashMap::new();
+    let mut call_graph: HashMap<CallOwner, Vec<CallOwner>> = HashMap::new();
+    let mut callable_spans: HashMap<CallOwner, Span> = HashMap::new();
     // Operator bindings (ADR 0012): validate each binding's target and
     // signature, and build the (symbol, class) → fn resolution table the
     // Binary rewrite consults.
@@ -624,25 +768,19 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             label: why.to_string(),
             notes: vec![],
         };
-        let (ci_a, ci_b) = match (
-            sig.params.first().map(|p| p.ty.clone()),
-            sig.params.get(1).map(|p| p.ty.clone()),
-        ) {
-            (Some(a), Some(b))
-                if sig.params.len() == 2
-                    && matches!(
-                        (a.as_class_borrow(), b.as_class_borrow()),
-                        (Some((_, Mutability::Shared)), Some((_, Mutability::Shared)))
-                    ) =>
-            {
-                (
-                    a.class_index()
-                        .expect("a shared class borrow names a class"),
-                    b.class_index()
-                        .expect("a shared class borrow names a class"),
-                )
-            }
-            _ => return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`")),
+        if sig.params.len() != 2 {
+            return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`"));
+        }
+        let Some(a) = sig.params.first() else {
+            return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`"));
+        };
+        let Some(b) = sig.params.get(1) else {
+            return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`"));
+        };
+        let (Some((ci_a, Mutability::Shared)), Some((ci_b, Mutability::Shared))) =
+            (checked_class_borrow(&a.ty), checked_class_borrow(&b.ty))
+        else {
+            return Err(bad_sig("operators bind functions of shape `fn (&C, &C)`"));
         };
         if ci_a != ci_b {
             return Err(bad_sig("both operands must be the same class"));
@@ -655,7 +793,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     ));
                 }
             }
-            _ => {
+            OpSym::Add | OpSym::Sub | OpSym::Mul | OpSym::Div | OpSym::Rem => {
                 if sig.ret != Ty::Class(ci_a) {
                     return Err(bad_sig("arithmetic operators return the operand class"));
                 }
@@ -710,9 +848,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 )],
             });
         }
+        let call_owner = CallOwner::Function(f.name.clone());
+        let control_outline = ControlOutline::build(call_owner.clone(), f.span, &f.body);
         let mut ctx = Ctx {
             sigs: &sigs,
             current_fn: f.name.clone(),
+            call_owner,
             current_has_variant: f.variant.is_some(),
             in_test: is_test,
             vars: HashMap::new(),
@@ -723,6 +864,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_unsafe: false,
             unsafe_blocks: 0,
             calls: Vec::new(),
+            ownership: &mut ownership,
             in_class: None,
             in_init: false,
             in_deinit: false,
@@ -753,7 +895,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 },
             );
         }
-        let returns = check_block(&mut ctx, &mut f.body, f.ret.clone())?;
+        let returns = check_block(
+            &mut ctx,
+            &mut f.body,
+            f.ret.clone(),
+            &control_outline,
+            control_outline.body_block(),
+        )?;
         unsafe_regions += ctx.unsafe_blocks;
         if !returns && f.ret != Ty::Unit {
             return Err(Diagnostic {
@@ -767,7 +915,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         if !returns {
             reject_outstanding_obligations(&ctx, MARKED_NONE, f.name_span, &f.name, true)?;
         }
-        call_graph.insert(f.name.clone(), ctx.calls);
+        callable_spans.insert(ctx.call_owner.clone(), f.name_span);
+        call_graph.insert(ctx.call_owner.clone(), ctx.calls);
+        control_outlines.push(control_outline);
     }
 
     // Fn templates (ADR 0009): typecheck against the abstract integer
@@ -776,9 +926,12 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
     let mut templates = std::mem::take(&mut program.fn_templates);
     for f in &mut templates {
         check_uart_params(&f.params)?;
+        let call_owner = CallOwner::Function(f.name.clone());
+        let control_outline = ControlOutline::build(call_owner.clone(), f.span, &f.body);
         let mut ctx = Ctx {
             sigs: &sigs,
             current_fn: f.name.clone(),
+            call_owner,
             current_has_variant: f.variant.is_some(),
             in_test: false,
             vars: HashMap::new(),
@@ -789,6 +942,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             in_unsafe: false,
             unsafe_blocks: 0,
             calls: Vec::new(),
+            ownership: &mut ownership,
             in_class: None,
             in_init: false,
             in_deinit: false,
@@ -819,7 +973,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 },
             );
         }
-        let returns = check_block(&mut ctx, &mut f.body, f.ret.clone())?;
+        let returns = check_block(
+            &mut ctx,
+            &mut f.body,
+            f.ret.clone(),
+            &control_outline,
+            control_outline.body_block(),
+        )?;
         unsafe_regions += ctx.unsafe_blocks;
         if !returns && f.ret != Ty::Unit {
             return Err(Diagnostic {
@@ -833,6 +993,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         if !returns {
             reject_outstanding_obligations(&ctx, MARKED_NONE, f.name_span, &f.name, true)?;
         }
+        control_outlines.push(control_outline);
     }
     program.fn_templates = templates;
 
@@ -849,9 +1010,15 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             .collect();
         let class_span = class.name_span;
         for init in &mut class.inits {
+            let call_owner = CallOwner::Constructor {
+                class: meta.name.clone(),
+                init: init.name.clone(),
+            };
+            let control_outline = ControlOutline::build(call_owner.clone(), init.span, &init.body);
             let mut ctx = Ctx {
                 sigs: &sigs,
                 current_fn: format!("{}::{}", meta.name, init.name),
+                call_owner,
                 current_has_variant: false,
                 in_test: false,
                 vars: HashMap::new(),
@@ -862,6 +1029,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_unsafe: false,
                 unsafe_blocks: 0,
                 calls: Vec::new(),
+                ownership: &mut ownership,
                 in_class: Some((ci, true)),
                 in_init: true,
                 in_deinit: false,
@@ -899,7 +1067,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     },
                 );
             }
-            check_block(&mut ctx, &mut init.body, Ty::Unit)?;
+            check_block(
+                &mut ctx,
+                &mut init.body,
+                Ty::Unit,
+                &control_outline,
+                control_outline.body_block(),
+            )?;
             unsafe_regions += ctx.unsafe_blocks;
             reject_field_holes(&ctx, &meta.name, &init.name, init.name_span)?;
             reject_outstanding_obligations(&ctx, &marked, class_span, &init.name, false)?;
@@ -917,12 +1091,20 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     });
                 }
             }
-            call_graph.insert(ctx.current_fn.clone(), ctx.calls);
+            callable_spans.insert(ctx.call_owner.clone(), init.name_span);
+            call_graph.insert(ctx.call_owner.clone(), ctx.calls);
+            control_outlines.push(control_outline);
         }
         for m in &mut class.methods {
+            let call_owner = CallOwner::Method {
+                class: meta.name.clone(),
+                method: m.f.name.clone(),
+            };
+            let control_outline = ControlOutline::build(call_owner.clone(), m.f.span, &m.f.body);
             let mut ctx = Ctx {
                 sigs: &sigs,
                 current_fn: format!("{}::{}", meta.name, m.f.name),
+                call_owner,
                 current_has_variant: false,
                 in_test: false,
                 vars: HashMap::new(),
@@ -933,6 +1115,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_unsafe: false,
                 unsafe_blocks: 0,
                 calls: Vec::new(),
+                ownership: &mut ownership,
                 in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                 in_init: false,
                 in_deinit: false,
@@ -967,7 +1150,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     },
                 );
             }
-            let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret.clone())?;
+            let returns = check_block(
+                &mut ctx,
+                &mut m.f.body,
+                m.f.ret.clone(),
+                &control_outline,
+                control_outline.body_block(),
+            )?;
             unsafe_regions += ctx.unsafe_blocks;
             reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
             if !returns {
@@ -985,7 +1174,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     notes: vec![],
                 });
             }
-            call_graph.insert(ctx.current_fn.clone(), ctx.calls);
+            callable_spans.insert(ctx.call_owner.clone(), m.f.name_span);
+            call_graph.insert(ctx.call_owner.clone(), ctx.calls);
+            control_outlines.push(control_outline);
         }
         // `deinit` — the destructor. Its semantics differ from a method in
         // exactly the ways the value ceasing to exist implies (ADR 0029):
@@ -997,9 +1188,14 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         //   * a moved field is not dropped again, and the rest drop in
         //     reverse declaration order.
         if let Some(body) = &mut class.deinit {
+            let call_owner = CallOwner::Deinitializer {
+                class: meta.name.clone(),
+            };
+            let control_outline = ControlOutline::build(call_owner.clone(), class.span, body);
             let mut ctx = Ctx {
                 sigs: &sigs,
                 current_fn: format!("{}::deinit", meta.name),
+                call_owner,
                 current_has_variant: false,
                 in_test: false,
                 vars: HashMap::new(),
@@ -1010,6 +1206,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                 in_unsafe: false,
                 unsafe_blocks: 0,
                 calls: Vec::new(),
+                ownership: &mut ownership,
                 // `&mut self`-like: the body owns the value outright.
                 in_class: Some((ci, true)),
                 in_init: false,
@@ -1032,7 +1229,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     },
                 );
             }
-            let returns = check_block(&mut ctx, body, Ty::Unit)?;
+            let returns = check_block(
+                &mut ctx,
+                body,
+                Ty::Unit,
+                &control_outline,
+                control_outline.body_block(),
+            )?;
             unsafe_regions += ctx.unsafe_blocks;
             if returns {
                 return Err(Diagnostic {
@@ -1058,7 +1261,9 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             // takes it — which is why the check is "still live here", not
             // "was moved at some point".
             reject_outstanding_obligations(&ctx, &marked, class_span, "deinit", true)?;
-            call_graph.insert(ctx.current_fn.clone(), ctx.calls);
+            callable_spans.insert(ctx.call_owner.clone(), class.name_span);
+            call_graph.insert(ctx.call_owner.clone(), ctx.calls);
+            control_outlines.push(control_outline);
         }
     }
 
@@ -1070,6 +1275,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
     {
         let mut tmetas: Vec<ClassMeta> = Vec::new();
         for c in &ctemplates {
+            validate_member_names(c)?;
             let mut fields = Vec::new();
             let mut fseen = HashSet::new();
             for fld in &c.fields {
@@ -1136,9 +1342,16 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
             let class_span = class.name_span;
             for init in &mut class.inits {
                 check_uart_params(&init.params)?;
+                let call_owner = CallOwner::Constructor {
+                    class: meta.name.clone(),
+                    init: init.name.clone(),
+                };
+                let control_outline =
+                    ControlOutline::build(call_owner.clone(), init.span, &init.body);
                 let mut ctx = Ctx {
                     sigs: &sigs,
                     current_fn: format!("{}::{}", meta.name, init.name),
+                    call_owner,
                     current_has_variant: false,
                     in_test: false,
                     vars: HashMap::new(),
@@ -1149,6 +1362,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_unsafe: false,
                     unsafe_blocks: 0,
                     calls: Vec::new(),
+                    ownership: &mut ownership,
                     in_class: Some((ci, true)),
                     in_init: true,
                     in_deinit: false,
@@ -1183,7 +1397,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         },
                     );
                 }
-                check_block(&mut ctx, &mut init.body, Ty::Unit)?;
+                check_block(
+                    &mut ctx,
+                    &mut init.body,
+                    Ty::Unit,
+                    &control_outline,
+                    control_outline.body_block(),
+                )?;
                 unsafe_regions += ctx.unsafe_blocks;
                 reject_field_holes(&ctx, &meta.name, &init.name, init.name_span)?;
                 reject_outstanding_obligations(&ctx, &marked, class_span, &init.name, false)?;
@@ -1201,12 +1421,20 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         });
                     }
                 }
+                control_outlines.push(control_outline);
             }
             for m in &mut class.methods {
                 check_uart_params(&m.f.params)?;
+                let call_owner = CallOwner::Method {
+                    class: meta.name.clone(),
+                    method: m.f.name.clone(),
+                };
+                let control_outline =
+                    ControlOutline::build(call_owner.clone(), m.f.span, &m.f.body);
                 let mut ctx = Ctx {
                     sigs: &sigs,
                     current_fn: format!("{}::{}", meta.name, m.f.name),
+                    call_owner,
                     current_has_variant: false,
                     in_test: false,
                     vars: HashMap::new(),
@@ -1217,6 +1445,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_unsafe: false,
                     unsafe_blocks: 0,
                     calls: Vec::new(),
+                    ownership: &mut ownership,
                     in_class: Some((ci, m.self_kind == SelfKind::Mut)),
                     in_init: false,
                     in_deinit: false,
@@ -1251,7 +1480,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         },
                     );
                 }
-                let returns = check_block(&mut ctx, &mut m.f.body, m.f.ret.clone())?;
+                let returns = check_block(
+                    &mut ctx,
+                    &mut m.f.body,
+                    m.f.ret.clone(),
+                    &control_outline,
+                    control_outline.body_block(),
+                )?;
                 unsafe_regions += ctx.unsafe_blocks;
                 reject_field_holes(&ctx, &meta.name, &m.f.name, m.f.name_span)?;
                 if !returns {
@@ -1269,15 +1504,21 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         notes: vec![],
                     });
                 }
+                control_outlines.push(control_outline);
             }
             // A template's destructor is checked exactly as a monomorphic
             // one is. Skipping it would leave the one member where fields
             // may be moved out unchecked, and generic resource-owning
             // classes are the ones that need it most.
             if let Some(body) = &mut class.deinit {
+                let call_owner = CallOwner::Deinitializer {
+                    class: meta.name.clone(),
+                };
+                let control_outline = ControlOutline::build(call_owner.clone(), class.span, body);
                 let mut ctx = Ctx {
                     sigs: &sigs,
                     current_fn: format!("{}::deinit", meta.name),
+                    call_owner,
                     current_has_variant: false,
                     in_test: false,
                     vars: HashMap::new(),
@@ -1288,6 +1529,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     in_unsafe: false,
                     unsafe_blocks: 0,
                     calls: Vec::new(),
+                    ownership: &mut ownership,
                     in_class: Some((ci, true)),
                     in_init: false,
                     in_deinit: true,
@@ -1309,7 +1551,13 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                         },
                     );
                 }
-                let returns = check_block(&mut ctx, body, Ty::Unit)?;
+                let returns = check_block(
+                    &mut ctx,
+                    body,
+                    Ty::Unit,
+                    &control_outline,
+                    control_outline.body_block(),
+                )?;
                 unsafe_regions += ctx.unsafe_blocks;
                 if returns {
                     return Err(Diagnostic {
@@ -1324,6 +1572,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
                     });
                 }
                 reject_outstanding_obligations(&ctx, &marked, class_span, "deinit", true)?;
+                control_outlines.push(control_outline);
             }
         }
     }
@@ -1331,28 +1580,66 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
 
     // Mutual recursion (self-recursion with a variant is handled inline).
     if let Some(cycle_member) = find_cycle(&call_graph) {
-        let f = program.fns.iter().find(|f| f.name == cycle_member).unwrap();
+        let span = callable_spans
+            .get(&cycle_member)
+            .copied()
+            .unwrap_or_else(|| Span::new(0, 0));
         return Err(Diagnostic {
             name: "type.mutual_recursion".into(),
-            title: format!("`{}` is mutually recursive", f.name),
-            span: f.name_span,
+            title: format!("{} is mutually recursive", cycle_member.render()),
+            span,
             label: "mutual recursion is not supported yet (self-recursion with `variant` is)"
                 .into(),
             notes: vec![("note".into(), "see docs/PLAN.md".into())],
         });
     }
 
+    let control = ControlProgram::seal(program, &control_outlines).map_err(|error| Diagnostic {
+        name: "internal.check.control_plan".into(),
+        title: error.message,
+        span: error.span,
+        label: "the checked AST could not produce one exact control plan".into(),
+        notes: vec![],
+    })?;
+
     Ok(CheckResult {
         sigs,
+        control,
+        ownership,
         unsafe_regions,
     })
 }
 
-/// Returns whether every path through the block returns.
-fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
-    let mut returned = false;
-    for stmt in stmts.iter_mut() {
-        if returned {
+fn control_outline_mismatch(span: Span, detail: &str) -> Diagnostic {
+    Diagnostic {
+        name: "internal.check.control_outline".into(),
+        title: "body changed while the checker was consuming its control outline".into(),
+        span,
+        label: detail.into(),
+        notes: vec![],
+    }
+}
+
+/// Check one block through the exact pre-check structural outline. The return
+/// value is retained for existing callers, but it comes from the outline's
+/// single flow fact rather than being recomputed during the type walk.
+fn check_block(
+    ctx: &mut Ctx,
+    stmts: &mut [Stmt],
+    ret_ty: Ty,
+    outline: &ControlOutline,
+    block: BlockId,
+) -> CResult<bool> {
+    let planned_block = outline.block(block);
+    if planned_block.statements().len() != stmts.len() {
+        return Err(control_outline_mismatch(
+            planned_block.anchor(),
+            "statement count differs from the pre-check structural plan",
+        ));
+    }
+    for (index, stmt) in stmts.iter_mut().enumerate() {
+        let statement_plan = outline.statement(block, index);
+        if !statement_plan.entry_reachable() {
             let span = stmt_span(stmt);
             return Err(Diagnostic {
                 name: "type.unreachable".into(),
@@ -1469,23 +1756,20 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let mut branded = false;
                 let mut must_consume = false;
                 if let Some(e) = init {
-                    match (ty.clone(), &e.kind) {
-                        // The owning family is routed away from the copy
-                        // rules by the payload, and it is routed first: the
-                        // arms below build a copyable value out of whatever
-                        // the initializer evaluates to.
-                        (option, _) if option.is_affine_option() => {
-                            check_affine_option_initializer(ctx, e, &option)?;
-                        }
-                        (owned, ExprKind::OptTake { .. }) if owned.is_owned_array_of(&Ty::Bool) => {
+                    // The owning family is routed away from the copy rules by
+                    // the payload, and it is routed first: the paths below
+                    // build a copyable value out of whatever the initializer
+                    // evaluates to.
+                    if ty.is_affine_option() {
+                        check_affine_option_initializer(ctx, e, ty)?;
+                    } else if matches!(&e.kind, ExprKind::OptTake { .. }) {
+                        if ty.is_owned_array_of(&Ty::Bool) {
                             check_affine_option_take(ctx, e)?;
-                        }
-                        (_, ExprKind::OptTake { .. }) => {
+                        } else {
                             return Err(option_take_position(e.span));
                         }
-                        _ => {
-                            check_expr(ctx, e, Some(ty.clone()))?;
-                        }
+                    } else {
+                        check_expr(ctx, e, Some(ty.clone()))?;
                     }
                     // A local initialized from branded storage is branded
                     // — but only if it *names* storage. A byte loaded out
@@ -1504,7 +1788,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     // the same rule classes follow (ADR 0020/0024). A
                     // declaration is not an escape: the new local inherits
                     // the brand rather than laundering it.
-                    must_consume = transfer(ctx, e, None)?;
+                    must_consume = transfer_and_record(
+                        ctx,
+                        e,
+                        ValueTransferSink::Binding(name.clone()),
+                        None,
+                    )?
+                    .carried_obligation;
                 }
                 ctx.vars.insert(
                     name.clone(),
@@ -1573,7 +1863,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     // owned value that nothing else names.
                     let dest = Place::local(name);
                     reject_overwrite_of_obligation(ctx, &dest, *name_span)?;
-                    let carries = transfer(ctx, value, escape_sink(dest_branded, name_span))?;
+                    let carries = transfer_and_record(
+                        ctx,
+                        value,
+                        ValueTransferSink::Assignment(dest.clone()),
+                        escape_sink(dest_branded, name_span),
+                    )?
+                    .carried_obligation;
                     // The destination owns a value again even if it had
                     // been moved out earlier.
                     ctx.moved.retain(|m| !dest.contains(m));
@@ -1593,7 +1889,12 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                     check_expr(ctx, value, Some(ty))?;
-                    transfer(ctx, value, escape_sink(dest_branded, name_span))?;
+                    transfer_and_record(
+                        ctx,
+                        value,
+                        ValueTransferSink::Assignment(Place::local(name)),
+                        escape_sink(dest_branded, name_span),
+                    )?;
                     ctx.vars.get_mut(name.as_str()).unwrap().initialized = true;
                 }
             }
@@ -1603,6 +1904,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 then_block,
                 else_block,
             } => {
+                let StatementPlanKind::Branch(branch_id) = statement_plan.kind() else {
+                    return Err(control_outline_mismatch(
+                        cond.span,
+                        "an `if` no longer has its retained branch identity",
+                    ));
+                };
+                let branch_plan = outline.branch(branch_id);
+                if branch_plan.else_block().is_some() != else_block.is_some() {
+                    return Err(control_outline_mismatch(
+                        cond.span,
+                        "the branch's else-arm presence changed during checking",
+                    ));
+                }
                 check_expr(ctx, cond, Some(Ty::Bool))?;
                 // Every flow fact is per-path. A name is initialized after
                 // the `if` iff every falling-through branch initialized it;
@@ -1617,17 +1931,48 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // walk last, which is traversal order deciding a rule.
                 let before = snapshot(ctx);
                 let before_moved = ctx.moved.clone();
-                let then_ret = check_block(ctx, then_block, ret_ty.clone())?;
+                check_block(
+                    ctx,
+                    then_block,
+                    ret_ty.clone(),
+                    outline,
+                    branch_plan.then_block(),
+                )?;
+                let then_ret = outline
+                    .block(branch_plan.then_block())
+                    .flow()
+                    .definitely_returns();
                 let after_then = snapshot(ctx);
                 let after_then_moved = ctx.moved.clone();
                 restore(ctx, &before);
                 ctx.moved = before_moved.clone();
-                let else_ret = match else_block {
-                    Some(b) => check_block(ctx, b, ret_ty.clone())?,
-                    None => false,
+                let else_ret = match (else_block, branch_plan.else_block()) {
+                    (Some(body), Some(child)) => {
+                        check_block(ctx, body, ret_ty.clone(), outline, child)?;
+                        outline.block(child).flow().definitely_returns()
+                    }
+                    (None, None) => false,
+                    (Some(_body), None) => {
+                        return Err(control_outline_mismatch(
+                            cond.span,
+                            "the branch's retained else arm no longer matches the source",
+                        ));
+                    }
+                    (None, Some(_child)) => {
+                        return Err(control_outline_mismatch(
+                            cond.span,
+                            "the branch's retained else arm no longer matches the source",
+                        ));
+                    }
                 };
                 let after_else = snapshot(ctx);
                 let after_else_moved = ctx.moved.clone();
+                // Both arm-local lifetimes end before their states are joined.
+                // `declared` remains global, so the name cannot be reused, but
+                // it is no longer a source place an outer/sibling assignment
+                // can resurrect.
+                restore(ctx, &before);
+                ctx.moved = before_moved.clone();
                 // Reaching branches only: a branch that returns
                 // contributes nothing to the fall-through state.
                 let mut reaching_init: Vec<&HashMap<String, PlaceState>> = Vec::new();
@@ -1637,7 +1982,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     reaching_moved.push(&after_then_moved);
                 }
                 if !else_ret {
-                    match else_block {
+                    match branch_plan.else_block() {
                         Some(_) => {
                             reaching_init.push(&after_else);
                             reaching_moved.push(&after_else_moved);
@@ -1711,7 +2056,13 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         .flat_map(|s| s.iter().cloned())
                         .collect()
                 };
-                returned = then_ret && else_ret;
+                // A moved projection rooted in an arm-local place is no more
+                // visible than the local itself. Preserve projections of an
+                // outer root (and the explicit `self.f` pseudo-variables),
+                // but do not leak child-place identities past the join.
+                ctx.moved.retain(|place| {
+                    before.contains_key(&place.state_key()) || before.contains_key(place.root())
+                });
             }
             Stmt::While {
                 cond,
@@ -1720,6 +2071,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 body,
                 ..
             } => {
+                let StatementPlanKind::Loop(loop_id) = statement_plan.kind() else {
+                    return Err(control_outline_mismatch(
+                        *kw_span,
+                        "a `while` no longer has its retained loop identity",
+                    ));
+                };
+                let loop_plan = outline.loop_plan(loop_id);
+                if loop_plan.keyword_span() != *kw_span || loop_plan.condition_span() != cond.span {
+                    return Err(control_outline_mismatch(
+                        *kw_span,
+                        "the loop anchor or condition changed during checking",
+                    ));
+                }
                 if variant.is_none() {
                     return Err(Diagnostic {
                         name: "proof.missing_variant".into(),
@@ -1747,7 +2111,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // checking condition + body against the pre-condition head.
                 let after_cond = snapshot(ctx);
                 let after_cond_moved = ctx.moved.clone();
-                let _body_ret = check_block(ctx, body, ret_ty.clone())?;
+                check_block(ctx, body, ret_ty.clone(), outline, loop_plan.body())?;
                 // Affine shape must be preserved at the backedge
                 // (ADR 0024): a value consumed by the condition or body is
                 // not there for the next condition evaluation, and a
@@ -1817,6 +2181,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         });
                     }
                 }
+                let loop_effects = checked_loop_effects(ctx, *kw_span, cond, body)?;
+                ctx.ownership
+                    .insert_loop(loop_effects)
+                    .map_err(|duplicate| Diagnostic {
+                        name: "internal.check.duplicate_loop_effect".into(),
+                        title: format!(
+                            "duplicate loop-effect identity inside {}",
+                            duplicate.owner.render()
+                        ),
+                        span: duplicate.span,
+                        label: "owner and keyword span must identify exactly one loop".into(),
+                        notes: vec![],
+                    })?;
                 // The body may run zero times, but the condition does not:
                 // continuation is its false path. Restore the post-condition
                 // flow state, not the pre-condition head. Any condition/body
@@ -1835,33 +2212,56 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         notes: vec![],
                     });
                 }
-                match (value, ret_ty.clone()) {
-                    (None, Ty::Unit) => {}
-                    (Some(e), Ty::Unit) => {
-                        return Err(Diagnostic {
-                            name: "type.return_value_in_procedure".into(),
-                            title: "this function has no return type".into(),
-                            span: e.span,
-                            label: "remove the value (or declare `-> T`)".into(),
-                            notes: vec![],
-                        });
-                    }
-                    (None, _) => {
-                        return Err(Diagnostic {
-                            name: "type.missing_return_value".into(),
-                            title: format!("`return;` in a function returning `{}`", ret_ty.name()),
-                            span: *span,
-                            label: "a value is required".into(),
-                            notes: vec![],
-                        });
-                    }
-                    (Some(e), _) => {
-                        check_expr(ctx, e, Some(ret_ty.clone()))?;
-                        // Returning a place consumes it: the value leaves
-                        // with the caller, and a field returned this way is
-                        // authority the object no longer has.
-                        transfer(ctx, e, Some(("be returned", e.span)))?;
-                    }
+                match ret_ty.clone() {
+                    Ty::Unit => match value {
+                        None => {}
+                        Some(e) => {
+                            return Err(Diagnostic {
+                                name: "type.return_value_in_procedure".into(),
+                                title: "this function has no return type".into(),
+                                span: e.span,
+                                label: "remove the value (or declare `-> T`)".into(),
+                                notes: vec![],
+                            });
+                        }
+                    },
+                    return_ty @ (Ty::Int(_)
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)) => match value {
+                        None => {
+                            return Err(Diagnostic {
+                                name: "type.missing_return_value".into(),
+                                title: format!(
+                                    "`return;` in a function returning `{}`",
+                                    return_ty.name()
+                                ),
+                                span: *span,
+                                label: "a value is required".into(),
+                                notes: vec![],
+                            });
+                        }
+                        Some(e) => {
+                            check_expr(ctx, e, Some(return_ty))?;
+                            // Returning a place consumes it: the value leaves
+                            // with the caller, and a field returned this way is
+                            // authority the object no longer has.
+                            transfer_and_record(
+                                ctx,
+                                e,
+                                ValueTransferSink::Return,
+                                Some(("be returned", e.span)),
+                            )?;
+                        }
+                    },
                 }
                 // A return is a frame exit on this path. Mandatory
                 // resource parameters and locals must already have
@@ -1877,10 +2277,36 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     &current,
                     ctx.in_class.is_none() || ctx.in_deinit,
                 )?;
-                returned = true;
             }
             Stmt::ExprStmt(e) => {
                 let ty = check_expr(ctx, e, None)?;
+                // A discarded class *result* is a temporary and is destroyed
+                // at the end of this statement. A place projection is not a
+                // temporary: if an internal AST producer supplied an
+                // expression statement such as `self.child;`, it would only
+                // read the installed owner. Treating that read as the value to
+                // drop would run its destructor while the field still named it.
+                // Use the same place decoder as every ownership sink rather
+                // than maintaining a second list of place-shaped expressions.
+                if matches!(ty, Ty::Class(_)) {
+                    if let Some(source) = Place::from_value_expr(e) {
+                        return Err(Diagnostic {
+                            name: "type.class_temporary_source".into(),
+                            title: format!(
+                                "discarding class place `{}` as a temporary",
+                                source.render()
+                            ),
+                            span: e.span,
+                            label: "only a fresh class result can be discarded".into(),
+                            notes: vec![(
+                                "note".into(),
+                                "a discarded class result is destroyed at the end of the statement; \
+                                 a named place stays live and must not be destroyed through a read"
+                                    .into(),
+                            )],
+                        });
+                    }
+                }
                 // An owned array always has a place. Discarding one would
                 // leave an owner with no name and no lexical death, which is
                 // the one thing every array's storage story depends on
@@ -1911,6 +2337,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         label: "bind it and hand it to a consuming operation".into(),
                         notes: vec![],
                     });
+                }
+                // A discarded class result is still a by-value ownership
+                // boundary: the fresh value moves into a compiler-owned
+                // statement temporary whose retained control action destroys
+                // it before the continuation. Record that handoff only after
+                // every rejection above, so a place read or inadmissible
+                // affine temporary cannot leave a partial discard fact.
+                if matches!(ty, Ty::Class(_)) {
+                    transfer_and_record(ctx, e, ValueTransferSink::DiscardTemporary, None)?;
                 }
             }
             Stmt::VarDecl {
@@ -1991,7 +2426,21 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let moved_from = match &init.kind {
                     ExprKind::Var(src) => match ctx.vars.get(src.as_str()).map(|v| v.ty.clone()) {
                         Some(Ty::Class(ci)) => Some(ci),
-                        _ => None,
+                        Some(
+                            Ty::Int(_)
+                            | Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Res(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit,
+                        )
+                        | None => None,
                     },
                     ExprKind::SelfField { field } => {
                         match ctx
@@ -2000,10 +2449,53 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             .map(|v| v.ty.clone())
                         {
                             Some(Ty::Class(ci)) => Some(ci),
-                            _ => None,
+                            Some(
+                                Ty::Int(_)
+                                | Ty::Bool
+                                | Ty::Param(_)
+                                | Ty::Record(_)
+                                | Ty::Array(_)
+                                | Ty::Option(_)
+                                | Ty::OptionRaw(_)
+                                | Ty::Res(_)
+                                | Ty::Raw(_)
+                                | Ty::RawRecord(_)
+                                | Ty::Borrow(..)
+                                | Ty::Unit,
+                            )
+                            | None => None,
                         }
                     }
-                    _ => None,
+                    ExprKind::IntLit(_)
+                    | ExprKind::BoolLit(_)
+                    | ExprKind::Unary { .. }
+                    | ExprKind::Binary { .. }
+                    | ExprKind::Call { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::Len { .. }
+                    | ExprKind::RawOp { .. }
+                    | ExprKind::DeviceOp { .. }
+                    | ExprKind::ResOp { .. }
+                    | ExprKind::Widen { .. }
+                    | ExprKind::Narrow { .. }
+                    | ExprKind::IsSome { .. }
+                    | ExprKind::OptValue { .. }
+                    | ExprKind::OptTake { .. }
+                    | ExprKind::SomeE(_)
+                    | ExprKind::NoneE
+                    | ExprKind::ArrayLit(_)
+                    | ExprKind::AllocArray { .. }
+                    | ExprKind::SelfFieldLen { .. }
+                    | ExprKind::SelfFieldIndex { .. }
+                    | ExprKind::CtorCall { .. }
+                    | ExprKind::ClassField { .. }
+                    | ExprKind::RecordField { .. }
+                    | ExprKind::ClassFieldLen { .. }
+                    | ExprKind::ClassFieldIndex { .. }
+                    | ExprKind::TraitCall { .. }
+                    | ExprKind::MethodCall { .. }
+                    | ExprKind::Borrow { .. }
+                    | ExprKind::RecordLit { .. } => None,
                 };
                 // `var t = o.take;` — atomic extraction of an owned class
                 // payload into a fresh owner. The array family keeps its
@@ -2016,9 +2508,50 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         .and_then(|v| v.ty.as_affine_option_payload())
                         .and_then(|p| match p {
                             Ty::Class(ci) => Some(*ci),
-                            _ => None,
+                            Ty::Int(_)
+                            | Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Res(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit => None,
                         }),
-                    _ => None,
+                    ExprKind::IntLit(_)
+                    | ExprKind::BoolLit(_)
+                    | ExprKind::Var(_)
+                    | ExprKind::Unary { .. }
+                    | ExprKind::Binary { .. }
+                    | ExprKind::Call { .. }
+                    | ExprKind::Index { .. }
+                    | ExprKind::Len { .. }
+                    | ExprKind::RawOp { .. }
+                    | ExprKind::DeviceOp { .. }
+                    | ExprKind::ResOp { .. }
+                    | ExprKind::Widen { .. }
+                    | ExprKind::Narrow { .. }
+                    | ExprKind::IsSome { .. }
+                    | ExprKind::OptValue { .. }
+                    | ExprKind::SomeE(_)
+                    | ExprKind::NoneE
+                    | ExprKind::ArrayLit(_)
+                    | ExprKind::AllocArray { .. }
+                    | ExprKind::SelfField { .. }
+                    | ExprKind::SelfFieldLen { .. }
+                    | ExprKind::SelfFieldIndex { .. }
+                    | ExprKind::CtorCall { .. }
+                    | ExprKind::ClassField { .. }
+                    | ExprKind::RecordField { .. }
+                    | ExprKind::ClassFieldLen { .. }
+                    | ExprKind::ClassFieldIndex { .. }
+                    | ExprKind::TraitCall { .. }
+                    | ExprKind::MethodCall { .. }
+                    | ExprKind::Borrow { .. }
+                    | ExprKind::RecordLit { .. } => None,
                 };
                 let t = if take_class.is_some() {
                     check_affine_option_take(ctx, init)?
@@ -2041,7 +2574,9 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                     t,
                     Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) | Ty::Record(_) | Ty::Res(_)
                 ) && brand_of(ctx, init);
-                let must_consume = transfer(ctx, init, None)?;
+                let must_consume =
+                    transfer_and_record(ctx, init, ValueTransferSink::Binding(name.clone()), None)?
+                        .carried_obligation;
                 if t == Ty::Unit {
                     return Err(Diagnostic {
                         name: "type.unit_binding".into(),
@@ -2067,12 +2602,18 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             // inside outlive the block, exactly as in an `if` body would
             // not — the block only licenses raw operations (ADR 0026).
             Stmt::Unsafe { body, .. } => {
+                let StatementPlanKind::Unsafe(child) = statement_plan.kind() else {
+                    return Err(control_outline_mismatch(
+                        stmt_span(stmt),
+                        "an `unsafe` block no longer has its retained block identity",
+                    ));
+                };
                 let outer = ctx.in_unsafe;
                 ctx.in_unsafe = true;
                 ctx.unsafe_blocks += 1;
-                let r = check_block(ctx, body, ret_ty.clone());
+                let result = check_block(ctx, body, ret_ty.clone(), outline, child);
                 ctx.in_unsafe = outer;
-                returned = r?;
+                result?;
             }
             Stmt::StaticAlloc {
                 size,
@@ -2193,9 +2734,9 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             } => {
                 check_expr(ctx, ptr, Some(Ty::Raw(IntTy::U8)))?;
                 check_expr(ctx, res, Some(Ty::Res(ResKind::RawSpan)))?;
-                transfer(ctx, res, None)?;
+                transfer_and_record(ctx, res, ValueTransferSink::SystemDeallocResource, None)?;
                 check_expr(ctx, release, Some(Ty::Res(ResKind::SystemDealloc)))?;
-                transfer(ctx, release, None)?;
+                transfer_and_record(ctx, release, ValueTransferSink::SystemDeallocRelease, None)?;
                 ctx.unsafe_blocks += 1;
             }
             Stmt::Expose {
@@ -2209,18 +2750,25 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 res_span,
                 body,
             } => {
+                let StatementPlanKind::Exposure(exposure_id) = statement_plan.kind() else {
+                    return Err(control_outline_mismatch(
+                        *kw_span,
+                        "an exposure no longer has its retained block identity",
+                    ));
+                };
+                let exposure_plan = outline.exposure(exposure_id);
+                if exposure_plan.keyword_span() != *kw_span {
+                    return Err(control_outline_mismatch(
+                        *kw_span,
+                        "the exposure anchor changed during checking",
+                    ));
+                }
                 // A nested exposure of an already-exposed array would open
                 // a second loan on one buffer.
                 reject_exposed_owner(ctx, array, *array_span)?;
-                let (elem, src_mut, declared_mut) = match ctx.vars.get(array.as_str()) {
-                    Some(v) => match &v.ty {
-                        borrowed_or_owned if borrowed_or_owned.as_array().is_some() => {
-                            let (element, mode) = borrowed_or_owned
-                                .as_array()
-                                .expect("the arm's guard already matched this shape");
-                            (element, mode, v.mutable)
-                        }
-                        owning if owning.is_affine_option() => {
+                let (elem, src_mut, declared_mut, owner_ty) = match ctx.vars.get(array.as_str()) {
+                    Some(v) => {
+                        if v.ty.is_affine_option() {
                             return Err(Diagnostic {
                                 name: "option.affine_expose".into(),
                                 title: format!("cannot expose affine option `{array}`"),
@@ -2233,16 +2781,19 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                                 )],
                             });
                         }
-                        _ => {
-                            return Err(Diagnostic {
-                                name: "expose.not_an_array".into(),
-                                title: format!("`{array}` is not an array"),
-                                span: *array_span,
-                                label: format!("this has type `{}`", v.ty.clone().name()),
-                                notes: vec![],
-                            });
+                        match checked_array_binding(&v.ty) {
+                            Some((element, mode)) => (element, mode, v.mutable, v.ty.clone()),
+                            None => {
+                                return Err(Diagnostic {
+                                    name: "expose.not_an_array".into(),
+                                    title: format!("`{array}` is not an array"),
+                                    span: *array_span,
+                                    label: format!("this has type `{}`", v.ty.clone().name()),
+                                    notes: vec![],
+                                });
+                            }
                         }
-                    },
+                    }
                     None => {
                         return Err(Diagnostic {
                             name: "type.unknown_variable".into(),
@@ -2296,14 +2847,14 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // that exists only for this body, so nothing derived from
                 // them may outlive it.
                 for (name, span, ty) in [
-                    (ptr.as_str(), ptr_span, Ty::Raw(IntTy::U8)),
-                    (res.as_str(), res_span, Ty::Res(ResKind::RawSpan)),
+                    (ptr.as_str(), *ptr_span, Ty::Raw(IntTy::U8)),
+                    (res.as_str(), *res_span, Ty::Res(ResKind::RawSpan)),
                 ] {
                     if !ctx.declared.insert(name.to_string()) {
                         return Err(Diagnostic {
                             name: "type.duplicate_name".into(),
                             title: format!("duplicate variable name `{name}`"),
-                            span: *span,
+                            span,
                             label: "already declared in this function".into(),
                             notes: vec![],
                         });
@@ -2334,10 +2885,10 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 let outer = ctx.in_unsafe;
                 ctx.in_unsafe = true;
                 ctx.unsafe_blocks += 1;
-                let r = check_block(ctx, body, ret_ty.clone());
+                let result = check_block(ctx, body, ret_ty.clone(), outline, exposure_plan.body());
                 ctx.in_unsafe = outer;
-                let body_returned = r?;
-                if body_returned {
+                result?;
+                if exposure_plan.flow().contains_return() {
                     return Err(Diagnostic {
                         name: "expose.return_from_body".into(),
                         title: "cannot return from inside an exposure".into(),
@@ -2369,6 +2920,36 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                         )],
                     });
                 }
+                let effect = CheckedExposure {
+                    key: EffectSiteKey {
+                        owner: ctx.call_owner.clone(),
+                        span: *kw_span,
+                    },
+                    owner_place: Place::local(array),
+                    owner_span: *array_span,
+                    owner_ty,
+                    mutability: if *mutable {
+                        Mutability::Mut
+                    } else {
+                        Mutability::Shared
+                    },
+                    pointer: ptr.clone(),
+                    pointer_span: *ptr_span,
+                    resource: res.clone(),
+                    resource_span: *res_span,
+                };
+                ctx.ownership
+                    .insert_exposure(effect)
+                    .map_err(|duplicate| Diagnostic {
+                        name: "internal.check.duplicate_exposure".into(),
+                        title: format!(
+                            "duplicate exposure identity inside {}",
+                            duplicate.owner.render()
+                        ),
+                        span: duplicate.span,
+                        label: "owner and keyword span must identify exactly one exposure".into(),
+                        notes: vec![],
+                    })?;
                 // An exposure body *is* a scope, and this is the one place
                 // in the language where that matters: the loan ends here.
                 // Its own bindings go, and so does everything declared
@@ -2417,7 +2998,22 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                                     value.ty = Some(Ty::Array(e2));
                                     checked = true;
                                 }
-                                _ => {
+                                Some(
+                                    Ty::Int(_)
+                                    | Ty::Bool
+                                    | Ty::Param(_)
+                                    | Ty::Class(_)
+                                    | Ty::Record(_)
+                                    | Ty::Array(_)
+                                    | Ty::Option(_)
+                                    | Ty::OptionRaw(_)
+                                    | Ty::Res(_)
+                                    | Ty::Raw(_)
+                                    | Ty::RawRecord(_)
+                                    | Ty::Borrow(..)
+                                    | Ty::Unit,
+                                )
+                                | None => {
                                     return Err(Diagnostic {
                                         name: "type.field_array_move".into(),
                                         title: format!(
@@ -2432,7 +3028,36 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                             }
                         }
                         ExprKind::AllocArray { .. } => {}
-                        _ => {
+                        ExprKind::IntLit(_)
+                        | ExprKind::BoolLit(_)
+                        | ExprKind::Unary { .. }
+                        | ExprKind::Binary { .. }
+                        | ExprKind::Call { .. }
+                        | ExprKind::Index { .. }
+                        | ExprKind::Len { .. }
+                        | ExprKind::RawOp { .. }
+                        | ExprKind::DeviceOp { .. }
+                        | ExprKind::ResOp { .. }
+                        | ExprKind::Widen { .. }
+                        | ExprKind::Narrow { .. }
+                        | ExprKind::IsSome { .. }
+                        | ExprKind::OptValue { .. }
+                        | ExprKind::OptTake { .. }
+                        | ExprKind::SomeE(_)
+                        | ExprKind::NoneE
+                        | ExprKind::ArrayLit(_)
+                        | ExprKind::SelfField { .. }
+                        | ExprKind::SelfFieldLen { .. }
+                        | ExprKind::SelfFieldIndex { .. }
+                        | ExprKind::CtorCall { .. }
+                        | ExprKind::ClassField { .. }
+                        | ExprKind::RecordField { .. }
+                        | ExprKind::ClassFieldLen { .. }
+                        | ExprKind::ClassFieldIndex { .. }
+                        | ExprKind::TraitCall { .. }
+                        | ExprKind::MethodCall { .. }
+                        | ExprKind::Borrow { .. }
+                        | ExprKind::RecordLit { .. } => {
                             return Err(Diagnostic {
                                 name: "type.field_array_move".into(),
                                 title: format!("array field `{field}` needs an owned array"),
@@ -2449,12 +3074,15 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
                 // A field is a sink like any other: it takes the value, so
                 // the source place dies. And a field outlives the exposure
                 // body, so it is a place a brand may not reach.
-                let dest = Place {
-                    root: "self".to_string(),
-                    fields: vec![field.clone()],
-                };
+                let dest = Place::field("self", field);
                 reject_overwrite_of_obligation(ctx, &dest, *field_span)?;
-                let carries = transfer(ctx, value, Some(("be stored in a field", *field_span)))?;
+                let carries = transfer_and_record(
+                    ctx,
+                    value,
+                    ValueTransferSink::FieldAssignment(dest.clone()),
+                    Some(("be stored in a field", *field_span)),
+                )?
+                .carried_obligation;
                 // The field owns a value again even if it had been moved
                 // out earlier: `resource R old = self.f; self.f = new;` is
                 // how a member replaces authority rather than losing it.
@@ -2502,21 +3130,18 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             } => {
                 reject_exposed_owner(ctx, array, *array_span)?;
                 let (elem, mutability, arr_mutable) = match ctx.vars.get(array.as_str()) {
-                    Some(VarInfo { ty, mutable, .. }) if ty.as_array().is_some() => {
-                        let (element, mode) = ty
-                            .as_array()
-                            .expect("the arm's guard already matched this shape");
-                        (element.clone(), mode, *mutable)
-                    }
-                    Some(v) => {
-                        return Err(Diagnostic {
-                            name: "type.not_an_array".into(),
-                            title: format!("`{array}` is not an array"),
-                            span: *array_span,
-                            label: format!("this has type `{}`", v.ty.clone().name()),
-                            notes: vec![],
-                        });
-                    }
+                    Some(v) => match checked_array_binding(&v.ty) {
+                        Some((element, mode)) => (element.clone(), mode, v.mutable),
+                        None => {
+                            return Err(Diagnostic {
+                                name: "type.not_an_array".into(),
+                                title: format!("`{array}` is not an array"),
+                                span: *array_span,
+                                label: format!("this has type `{}`", v.ty.clone().name()),
+                                notes: vec![],
+                            });
+                        }
+                    },
                     None => {
                         return Err(Diagnostic {
                             name: "type.unknown_variable".into(),
@@ -2572,7 +3197,7 @@ fn check_block(ctx: &mut Ctx, stmts: &mut [Stmt], ret_ty: Ty) -> CResult<bool> {
             }
         }
     }
-    Ok(returned)
+    Ok(planned_block.flow().definitely_returns())
 }
 
 fn stmt_span(stmt: &Stmt) -> Span {
@@ -2612,7 +3237,35 @@ fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
                 .map_or_else(|| array.clone(), |f| format!("{array}.{f}"));
             ctx.vars.get(key.as_str()).map(|v| v.ty.clone())
         }
-        _ => e.ty.clone(),
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::RawOp { .. }
+        | ExprKind::DeviceOp { .. }
+        | ExprKind::ResOp { .. }
+        | ExprKind::Widen { .. }
+        | ExprKind::Narrow { .. }
+        | ExprKind::IsSome { .. }
+        | ExprKind::OptValue { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::SomeE(_)
+        | ExprKind::NoneE
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::RecordLit { .. } => e.ty.clone(),
     }?;
     ty.res_kind()
 }
@@ -2782,7 +3435,7 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
             ),
             "use the concrete owning-option local surface in a non-generic function",
         ),
-        _ => unreachable!("known affine-option boundary"),
+        unexpected => unreachable!("unknown affine-option boundary `{unexpected}`"),
     };
     Diagnostic {
         name: name.into(),
@@ -2993,9 +3646,30 @@ pub(crate) fn member_param_ty(ty: &Ty, span: Span, allow_shared_arrays: bool) ->
         Ty::Option(payload) => match payload.as_ref() {
             Ty::Int(IntTy::TParam(_)) => false,
             Ty::Int(_) | Ty::Bool => true,
-            _ => false,
+            Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => false,
         },
-        _ => false,
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => false,
     };
     let ok = matches!(ty, Ty::Int(_) | Ty::Bool)
         || value_option
@@ -3063,7 +3737,17 @@ pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
         let concrete_value = match payload.as_ref() {
             Ty::Int(IntTy::TParam(_)) => false,
             Ty::Int(_) | Ty::Bool => true,
-            _ => false,
+            Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => false,
         };
         if !concrete_value {
             return Err(Diagnostic {
@@ -3242,7 +3926,18 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
                         return Some(found);
                     }
                 }
-                _ => {}
+                Stmt::Decl { .. }
+                | Stmt::Assign { .. }
+                | Stmt::Return { .. }
+                | Stmt::ExprStmt(_)
+                | Stmt::Assert(_)
+                | Stmt::VarDecl { .. }
+                | Stmt::FieldAssign { .. }
+                | Stmt::FieldStore { .. }
+                | Stmt::Store { .. }
+                | Stmt::StaticAlloc { .. }
+                | Stmt::SystemAlloc { .. }
+                | Stmt::SystemDealloc { .. } => {}
             }
         }
         None
@@ -3332,13 +4027,136 @@ fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
 fn legacy_integer_ty(integer: IntTy) -> Ty {
     match integer {
         IntTy::TParam(index) => Ty::Param(TypeParamId::from_legacy(index)),
-        concrete => Ty::Int(concrete),
+        concrete @ (IntTy::U8
+        | IntTy::U16
+        | IntTy::U32
+        | IntTy::U64
+        | IntTy::I8
+        | IntTy::I16
+        | IntTy::I32
+        | IntTy::I64) => Ty::Int(concrete),
     }
 }
 
-fn is_integer_ty(ty: Ty) -> bool {
-    matches!(ty, Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)))
-        || matches!(ty, Ty::Param(_))
+/// Exhaustive checker-side view of an array binding.  Keeping this match in
+/// the trusted checker (rather than hiding the negative case behind an
+/// `Option<Ty>` wildcard) makes every new `Ty` constructor require an explicit
+/// ownership decision here.
+fn checked_array_binding(ty: &Ty) -> Option<(&Ty, BindingMode)> {
+    match ty {
+        Ty::Array(element) => Some((element, BindingMode::Owned)),
+        Ty::Borrow(Mutability::Shared, referent) => match referent.as_ref() {
+            Ty::Array(element) => Some((element, BindingMode::Shared)),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => None,
+        },
+        Ty::Borrow(Mutability::Mut, referent) => match referent.as_ref() {
+            Ty::Array(element) => Some((element, BindingMode::Mut)),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => None,
+        },
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Unit => None,
+    }
+}
+
+/// Exhaustive checker-side view of a class borrow.  The explicit mutability
+/// arms also ensure a future loan mode cannot silently inherit shared-borrow
+/// behavior.
+fn checked_class_borrow(ty: &Ty) -> Option<(usize, Mutability)> {
+    match ty {
+        Ty::Borrow(Mutability::Shared, referent) => match referent.as_ref() {
+            Ty::Class(class) => Some((*class, Mutability::Shared)),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => None,
+        },
+        Ty::Borrow(Mutability::Mut, referent) => match referent.as_ref() {
+            Ty::Class(class) => Some((*class, Mutability::Mut)),
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => None,
+        },
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Unit => None,
+    }
+}
+
+fn checked_class_index(ty: &Ty) -> Option<usize> {
+    match ty {
+        Ty::Class(class) => Some(*class),
+        Ty::Borrow(Mutability::Shared, _) | Ty::Borrow(Mutability::Mut, _) => {
+            checked_class_borrow(ty).map(|(class, _mutability)| class)
+        }
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Unit => None,
+    }
 }
 
 fn is_abstract_integer_ty(ty: Ty) -> bool {
@@ -3374,6 +4192,7 @@ fn check_affine_option_initializer(
             if matches!(&inner.kind, ExprKind::AllocArray { elem: Ty::Bool, .. }) =>
         {
             check_expr(ctx, inner, Some(Ty::array(Ty::Bool)))?;
+            transfer_and_record(ctx, inner, ValueTransferSink::OptionPayload, None)?;
         }
         // A class payload wraps an owned value: a fresh construction, or a
         // named local the wrap consumes (ADR 0030 — the move kills its
@@ -3384,9 +4203,39 @@ fn check_affine_option_initializer(
                 && matches!(&inner.kind, ExprKind::CtorCall { .. } | ExprKind::Var(_)) =>
         {
             check_expr(ctx, inner, Some(payload.clone()))?;
-            transfer(ctx, inner, None)?;
+            transfer_and_record(ctx, inner, ValueTransferSink::OptionPayload, None)?;
         }
-        _ => {
+        ExprKind::SomeE(_)
+        | ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::RawOp { .. }
+        | ExprKind::DeviceOp { .. }
+        | ExprKind::ResOp { .. }
+        | ExprKind::Widen { .. }
+        | ExprKind::Narrow { .. }
+        | ExprKind::IsSome { .. }
+        | ExprKind::OptValue { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::Borrow { .. }
+        | ExprKind::RecordLit { .. } => {
             return Err(Diagnostic {
                 name: "option.affine_initializer".into(),
                 title: "unsupported affine-option initializer".into(),
@@ -3476,6 +4325,27 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
         .expect("checked: affine-option local")
         .clone();
     expression.ty = Some(ty.clone());
+    let effect = CheckedOptionTake {
+        key: EffectSiteKey {
+            owner: ctx.call_owner.clone(),
+            span: expression.span,
+        },
+        source: Place::local(option),
+        source_span: *option_span,
+        payload: ty.clone(),
+    };
+    ctx.ownership
+        .insert_option_take(effect)
+        .map_err(|duplicate| Diagnostic {
+            name: "internal.check.duplicate_option_take".into(),
+            title: format!(
+                "duplicate affine-option take identity inside {}",
+                duplicate.owner.render()
+            ),
+            span: duplicate.span,
+            label: "owner and span must identify exactly one checked take".into(),
+            notes: vec![],
+        })?;
     Ok(ty)
 }
 
@@ -3518,8 +4388,33 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     let ty = match &mut e.kind {
         ExprKind::IntLit(n) => {
             let t = match expected {
-                Some(t) if is_integer_ty(t.clone()) => t,
-                Some(other) => {
+                Some(
+                    t @ (Ty::Int(
+                        IntTy::U8
+                        | IntTy::U16
+                        | IntTy::U32
+                        | IntTy::U64
+                        | IntTy::I8
+                        | IntTy::I16
+                        | IntTy::I32
+                        | IntTy::I64,
+                    )
+                    | Ty::Param(_)),
+                ) => t,
+                Some(
+                    other @ (Ty::Int(IntTy::TParam(_))
+                    | Ty::Bool
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit),
+                ) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
                         title: format!("expected `{}`, found an integer literal", other.name()),
@@ -3731,8 +4626,33 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::Widen { target, arg } => {
             let target_ty = legacy_integer_ty(*target);
             let src = match check_expr(ctx, arg, None) {
-                Ok(ty) if is_integer_ty(ty.clone()) => ty,
-                Ok(other) => {
+                Ok(
+                    ty @ (Ty::Int(
+                        IntTy::U8
+                        | IntTy::U16
+                        | IntTy::U32
+                        | IntTy::U64
+                        | IntTy::I8
+                        | IntTy::I16
+                        | IntTy::I32
+                        | IntTy::I64,
+                    )
+                    | Ty::Param(_)),
+                ) => ty,
+                Ok(
+                    other @ (Ty::Int(IntTy::TParam(_))
+                    | Ty::Bool
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit),
+                ) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
                         title: format!("`widen` applied to `{}`", other.name()),
@@ -3793,8 +4713,33 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // proof obligation (`narrow.range`), not a typing rule.
             let target_ty = legacy_integer_ty(*target);
             match check_expr(ctx, arg, None) {
-                Ok(ty) if is_integer_ty(ty.clone()) => {}
-                Ok(other) => {
+                Ok(
+                    Ty::Int(
+                        IntTy::U8
+                        | IntTy::U16
+                        | IntTy::U32
+                        | IntTy::U64
+                        | IntTy::I8
+                        | IntTy::I16
+                        | IntTy::I32
+                        | IntTy::I64,
+                    )
+                    | Ty::Param(_),
+                ) => {}
+                Ok(
+                    other @ (Ty::Int(IntTy::TParam(_))
+                    | Ty::Bool
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit),
+                ) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
                         title: format!("`narrow` applied to `{}`", other.name()),
@@ -3823,7 +4768,38 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 {
                     Some(option.clone())
                 }
-                _ => None,
+                ExprKind::Var(_)
+                | ExprKind::IntLit(_)
+                | ExprKind::BoolLit(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Call { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::Len { .. }
+                | ExprKind::RawOp { .. }
+                | ExprKind::DeviceOp { .. }
+                | ExprKind::ResOp { .. }
+                | ExprKind::Widen { .. }
+                | ExprKind::Narrow { .. }
+                | ExprKind::IsSome { .. }
+                | ExprKind::OptValue { .. }
+                | ExprKind::OptTake { .. }
+                | ExprKind::SomeE(_)
+                | ExprKind::NoneE
+                | ExprKind::ArrayLit(_)
+                | ExprKind::AllocArray { .. }
+                | ExprKind::SelfField { .. }
+                | ExprKind::SelfFieldLen { .. }
+                | ExprKind::SelfFieldIndex { .. }
+                | ExprKind::CtorCall { .. }
+                | ExprKind::ClassField { .. }
+                | ExprKind::RecordField { .. }
+                | ExprKind::ClassFieldLen { .. }
+                | ExprKind::ClassFieldIndex { .. }
+                | ExprKind::TraitCall { .. }
+                | ExprKind::MethodCall { .. }
+                | ExprKind::Borrow { .. }
+                | ExprKind::RecordLit { .. } => None,
             };
             if let Some(option) = affine_name {
                 let (option_ty, _) =
@@ -3832,7 +4808,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             } else {
                 match check_expr(ctx, operand, None)? {
                     Ty::Option(_) | Ty::OptionRaw(_) => {}
-                    other => {
+                    other @ (Ty::Int(_)
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit) => {
                         return Err(Diagnostic {
                             name: "type.mismatch".into(),
                             title: format!("`.is_some` on `{}`", other.name()),
@@ -3867,7 +4853,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             match check_expr(ctx, operand, None)? {
                 Ty::Option(payload) => option_payload_ty(*payload, span)?,
                 Ty::OptionRaw(ri) => Ty::RawRecord(ri),
-                other => {
+                other @ (Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Array(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
                         title: format!("`.value` on `{}`", other.name()),
@@ -3923,7 +4919,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     });
                 }
-                other => {
+                other @ (Ty::Bool
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit) => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
                         title: format!("field `{field}` has type `{}`", other.clone().name()),
@@ -3982,9 +4987,29 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::ClassFieldLen { obj, field } => {
             let ci = class_of(ctx, obj, span)?;
             let meta = &ctx.class_metas[ci];
-            match meta.fields.iter().find(|(n, _)| n == field) {
-                Some((_, Ty::Array(..))) => Ty::Int(IntTy::U64),
-                _ => {
+            let Some((_name, field_ty)) = meta.fields.iter().find(|(n, _ty)| n == field) else {
+                return Err(Diagnostic {
+                    name: "type.mismatch".into(),
+                    title: format!("`.len` needs an array field; `{field}` is not one"),
+                    span,
+                    label: "not an array field".into(),
+                    notes: vec![],
+                });
+            };
+            match field_ty {
+                Ty::Array(..) => Ty::Int(IntTy::U64),
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
                         title: format!("`.len` needs an array field; `{field}` is not one"),
@@ -4003,9 +5028,29 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         } => {
             let ci = class_of(ctx, obj, *obj_span)?;
             let meta = &ctx.class_metas[ci];
-            let elem = match meta.fields.iter().find(|(n, _)| n == field) {
-                Some((_, Ty::Array(el))) => el.clone(),
-                _ => {
+            let Some((_name, field_ty)) = meta.fields.iter().find(|(n, _ty)| n == field) else {
+                return Err(Diagnostic {
+                    name: "type.mismatch".into(),
+                    title: format!("`{field}` is not an array field"),
+                    span,
+                    label: "not indexable".into(),
+                    notes: vec![],
+                });
+            };
+            let elem = match field_ty {
+                Ty::Array(element) => element.clone(),
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit => {
                     return Err(Diagnostic {
                         name: "type.mismatch".into(),
                         title: format!("`{field}` is not an array field"),
@@ -4057,7 +5102,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         Ty::Param(TypeParamId::from_legacy(pidx))
                     }
                     Ty::Int(IntTy::TParam(0)) => Ty::Param(TypeParamId::from_legacy(pidx)),
-                    other => other,
+                    other @ (Ty::Int(_)
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit) => other,
                 };
                 match t {
                     Ty::Param(parameter) if parameter.index() == 0 => {
@@ -4072,10 +5129,30 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         mutability,
                         match *referent {
                             Ty::Array(payload) => Ty::array(remap_payload(*payload)),
-                            other => other,
+                            other @ (Ty::Int(_)
+                            | Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Class(_)
+                            | Ty::Record(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Res(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit) => other,
                         },
                     ),
-                    other => other,
+                    other @ (Ty::Int(_)
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Unit) => other,
                 }
             };
             if args.len() != m.params.len() {
@@ -4129,13 +5206,12 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            refuse_sealed_field_borrows(op.name(), args)?;
             let raw = Ty::Raw(IntTy::U8);
             let u8t = Ty::Int(IntTy::U8);
             let u64t = Ty::Int(IntTy::U64);
             let shared = Ty::borrow(Mutability::Shared, Ty::Res(ResKind::RawSpan));
             let unique = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::RawSpan));
-            let span = Ty::Res(ResKind::RawSpan);
+            let raw_span = Ty::Res(ResKind::RawSpan);
             let cell = Ty::Res(ResKind::PointsToU64);
             let cell_shared = Ty::borrow(Mutability::Shared, Ty::Res(ResKind::PointsToU64));
             let cell_unique = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::PointsToU64));
@@ -4157,7 +5233,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::CellReadRecord(_) | RawOp::CellTakeRecord(_) | RawOp::CellDropRecord(_) => {
                     arg_kind(1)
                 }
-                _ => None,
+                RawOp::Offset
+                | RawOp::Load8
+                | RawOp::Store8
+                | RawOp::Copy
+                | RawOp::CastRecord(_)
+                | RawOp::PointerOffsetRecord(_)
+                | RawOp::IntoFreeHeader
+                | RawOp::FromFreeHeader
+                | RawOp::HeaderInit
+                | RawOp::HeaderSize
+                | RawOp::HeaderNext
+                | RawOp::HeaderClear => None,
             };
             let leased_role = matches!(
                 cell_kind,
@@ -4177,7 +5264,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     if leased_role {
                         leased.clone()
                     } else {
-                        span.clone()
+                        raw_span.clone()
                     },
                 ],
                 RawOp::FromCellU64 => vec![
@@ -4240,15 +5327,15 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::HeaderSize | RawOp::HeaderNext => vec![raw.clone(), free_header_shared],
                 RawOp::HeaderClear => vec![raw.clone(), free_header_unique],
             };
-            for (arg, w) in args.iter_mut().zip(&want) {
+            let mut transfers = vec![None; args.len()];
+            for (index, (arg, w)) in args.iter_mut().zip(&want).enumerate() {
                 require_explicit_borrow(ctx, arg, w.clone())?;
                 check_expr(ctx, arg, Some(w.clone()))?;
                 if matches!(w, Ty::Res(_)) {
-                    transfer(ctx, arg, None)?;
+                    transfers[index] = Some(transfer(ctx, arg, None)?);
                 }
             }
-            check_borrow_conflicts(ctx, args, None)?;
-            match op {
+            let result = match op {
                 // A pointer derived from a branded one is branded too:
                 // provenance is what the brand tracks, and arithmetic
                 // preserves it.
@@ -4266,13 +5353,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     if leased_role {
                         leased
                     } else {
-                        span
+                        raw_span
                     }
                 }
                 RawOp::CellInitU64 | RawOp::CellDropU64 => Ty::Unit,
                 RawOp::CellReadU64 | RawOp::CellTakeU64 => u64t,
                 RawOp::IntoCellRecord(ri) => Ty::Res(ResKind::PointsToRecord(ri)),
-                RawOp::FromCellRecord(_) => span,
+                RawOp::FromCellRecord(_) => raw_span,
                 RawOp::CellInitRecord(_) | RawOp::CellDropRecord(_) => Ty::Unit,
                 RawOp::CellReadRecord(ri) | RawOp::CellTakeRecord(ri) => Ty::Record(ri),
                 RawOp::CastRecord(ri) => Ty::RawRecord(ri),
@@ -4281,7 +5368,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::FromFreeHeader => free_block,
                 RawOp::HeaderInit | RawOp::HeaderClear => Ty::Unit,
                 RawOp::HeaderSize | RawOp::HeaderNext => u64t,
-            }
+            };
+            record_sealed_operation(
+                ctx,
+                CheckedSealedTarget::Raw(op),
+                args,
+                &transfers,
+                result.clone(),
+                span,
+            )?;
+            result
         }
         ExprKind::DeviceOp { op, op_span, args } => {
             let op = *op;
@@ -4313,7 +5409,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            refuse_sealed_field_borrows(op.name(), args)?;
             let uart = Ty::borrow(Mutability::Mut, Ty::Res(ResKind::Uart));
             let want = match op {
                 DeviceOp::UartStatus => vec![uart],
@@ -4323,11 +5418,19 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 require_explicit_borrow(ctx, arg, expected.clone())?;
                 check_expr(ctx, arg, Some(expected))?;
             }
-            check_borrow_conflicts(ctx, args, None)?;
-            match op {
+            let result = match op {
                 DeviceOp::UartStatus => Ty::Int(IntTy::U8),
                 DeviceOp::UartWrite => Ty::Unit,
-            }
+            };
+            record_sealed_operation(
+                ctx,
+                CheckedSealedTarget::Device(op),
+                args,
+                &vec![None; args.len()],
+                result.clone(),
+                span,
+            )?;
+            result
         }
         ExprKind::ResOp { op, op_span, args } => {
             let op = *op;
@@ -4367,8 +5470,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            refuse_sealed_field_borrows(op.name(), args)?;
-            match op {
+            let mut transfers = vec![None; args.len()];
+            let result = match op {
                 // `split_off(&mut whole, n)` — the prefix stays in the
                 // borrowed token, the suffix leaves in the returned one.
                 // No product type is needed: one side is written back
@@ -4379,7 +5482,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     let got = check_expr(ctx, &mut args[0], Some(want.clone()))?;
                     debug_assert_eq!(got, want);
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(ResKind::RawSpan)
                 }
                 // `join(a, b)` — both are consumed; the result owns their
@@ -4394,9 +5496,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     // to itself, so the adjacency VC would not catch it
                     // either: the token would be duplicated out of
                     // nothing.
-                    for arg in args.iter_mut() {
+                    for (index, arg) in args.iter_mut().enumerate() {
                         check_expr(ctx, arg, Some(want.clone()))?;
-                        mark_moved(ctx, arg)?;
+                        transfers[index] = Some(transfer(ctx, arg, None)?);
                     }
                     want
                 }
@@ -4410,7 +5512,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::I32)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(ResKind::OpenFile)
                 }
                 // `posix_world(script)` — the one place authority appears
@@ -4457,7 +5558,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ResOp::AllocatorCreate => {
                     let want = Ty::Res(ResKind::RawSpan);
                     check_expr(ctx, &mut args[0], Some(want))?;
-                    mark_moved(ctx, &args[0])?;
+                    transfers[0] = Some(transfer(ctx, &args[0], None)?);
                     Ty::Res(ResKind::AllocatorState)
                 }
                 // The aggregate may unfold only when its free map once
@@ -4465,7 +5566,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 ResOp::AllocatorDestroy => {
                     let want = Ty::Res(ResKind::AllocatorState);
                     check_expr(ctx, &mut args[0], Some(want))?;
-                    transfer(ctx, &args[0], None)?;
+                    transfers[0] = Some(transfer(ctx, &args[0], None)?);
                     Ty::Res(ResKind::RawSpan)
                 }
                 ResOp::AllocatorTake => {
@@ -4473,7 +5574,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(ResKind::BlockLease)
                 }
                 ResOp::AllocatorPut => {
@@ -4482,8 +5582,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let lease = Ty::Res(ResKind::BlockLease);
                     check_expr(ctx, &mut args[1], Some(lease))?;
-                    transfer(ctx, &args[1], None)?;
-                    check_borrow_conflicts(ctx, args, None)?;
+                    transfers[1] = Some(transfer(ctx, &args[1], None)?);
                     Ty::Unit
                 }
                 ResOp::AllocatorTakeFree => {
@@ -4491,7 +5590,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(ResKind::FreeBlock)
                 }
                 ResOp::AllocatorPutFree => {
@@ -4500,8 +5598,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let block = Ty::Res(ResKind::FreeBlock);
                     check_expr(ctx, &mut args[1], Some(block))?;
-                    transfer(ctx, &args[1], None)?;
-                    check_borrow_conflicts(ctx, args, None)?;
+                    transfers[1] = Some(transfer(ctx, &args[1], None)?);
                     Ty::Unit
                 }
                 ResOp::AllocatorTakeHeader => {
@@ -4509,7 +5606,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     require_explicit_borrow(ctx, &args[0], want.clone())?;
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(ResKind::FreeHeader)
                 }
                 ResOp::AllocatorPutHeader => {
@@ -4518,8 +5614,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     check_expr(ctx, &mut args[0], Some(state))?;
                     let header = Ty::Res(ResKind::FreeHeader);
                     check_expr(ctx, &mut args[1], Some(header))?;
-                    transfer(ctx, &args[1], None)?;
-                    check_borrow_conflicts(ctx, args, None)?;
+                    transfers[1] = Some(transfer(ctx, &args[1], None)?);
                     Ty::Unit
                 }
                 ResOp::AllocatorStepHeader => {
@@ -4528,7 +5623,6 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     check_expr(ctx, &mut args[0], Some(want))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
                     check_expr(ctx, &mut args[2], Some(Ty::Int(IntTy::U64)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(ResKind::FreeHeader)
                 }
                 ResOp::FreeBlockSplit => {
@@ -4536,33 +5630,61 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     require_explicit_borrow(ctx, &args[0], block.clone())?;
                     check_expr(ctx, &mut args[0], Some(block))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(ResKind::FreeBlock)
                 }
                 ResOp::FreeBlockJoin => {
                     let block = Ty::Res(ResKind::FreeBlock);
-                    for arg in args.iter_mut() {
+                    for (index, arg) in args.iter_mut().enumerate() {
                         check_expr(ctx, arg, Some(block.clone()))?;
-                        transfer(ctx, arg, None)?;
+                        transfers[index] = Some(transfer(ctx, arg, None)?);
                     }
                     Ty::Res(ResKind::FreeBlock)
                 }
                 ResOp::FreeBlockLease => {
                     let block = Ty::Res(ResKind::FreeBlock);
                     check_expr(ctx, &mut args[0], Some(block))?;
-                    transfer(ctx, &args[0], None)?;
+                    transfers[0] = Some(transfer(ctx, &args[0], None)?);
                     Ty::Res(ResKind::BlockLease)
                 }
                 ResOp::BlockLeaseFree => {
                     let lease = Ty::Res(ResKind::BlockLease);
                     check_expr(ctx, &mut args[0], Some(lease))?;
-                    transfer(ctx, &args[0], None)?;
+                    transfers[0] = Some(transfer(ctx, &args[0], None)?);
                     Ty::Res(ResKind::FreeBlock)
                 }
                 ResOp::ResourceMapEmpty => match expected {
-                    Some(Ty::Res(kind @ ResKind::ResourceMapPointsToU64))
-                    | Some(Ty::Res(kind @ ResKind::ResourceMapPointsToRecord(_))) => Ty::Res(kind),
-                    _ => Ty::Res(ResKind::ResourceMapPointsToU64),
+                    Some(Ty::Res(kind)) => match kind {
+                        ResKind::ResourceMapPointsToU64 | ResKind::ResourceMapPointsToRecord(_) => {
+                            Ty::Res(kind)
+                        }
+                        ResKind::RawSpan
+                        | ResKind::PointsToU64
+                        | ResKind::PointsToRecord(_)
+                        | ResKind::OpenFile
+                        | ResKind::PosixWorld
+                        | ResKind::Uart
+                        | ResKind::SystemDealloc
+                        | ResKind::AllocatorState
+                        | ResKind::BlockLease
+                        | ResKind::LeasedPointsToU64
+                        | ResKind::FreeBlock
+                        | ResKind::FreeHeader => Ty::Res(ResKind::ResourceMapPointsToU64),
+                    },
+                    Some(
+                        Ty::Int(_)
+                        | Ty::Bool
+                        | Ty::Param(_)
+                        | Ty::Class(_)
+                        | Ty::Record(_)
+                        | Ty::Array(_)
+                        | Ty::Option(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit,
+                    )
+                    | None => Ty::Res(ResKind::ResourceMapPointsToU64),
                 },
                 ResOp::ResourceMapTake => {
                     let Some(
@@ -4582,11 +5704,21 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     require_explicit_borrow(ctx, &args[0], map.clone())?;
                     check_expr(ctx, &mut args[0], Some(map))?;
                     check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
-                    check_borrow_conflicts(ctx, args, None)?;
                     Ty::Res(match map_kind {
                         ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
                         ResKind::ResourceMapPointsToRecord(ri) => ResKind::PointsToRecord(ri),
-                        _ => unreachable!(),
+                        ResKind::RawSpan
+                        | ResKind::PointsToU64
+                        | ResKind::PointsToRecord(_)
+                        | ResKind::OpenFile
+                        | ResKind::PosixWorld
+                        | ResKind::Uart
+                        | ResKind::SystemDealloc
+                        | ResKind::AllocatorState
+                        | ResKind::BlockLease
+                        | ResKind::LeasedPointsToU64
+                        | ResKind::FreeBlock
+                        | ResKind::FreeHeader => unreachable!(),
                     })
                 }
                 ResOp::ResourceMapPut => {
@@ -4610,14 +5742,33 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     let cell = Ty::Res(match map_kind {
                         ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
                         ResKind::ResourceMapPointsToRecord(ri) => ResKind::PointsToRecord(ri),
-                        _ => unreachable!(),
+                        ResKind::RawSpan
+                        | ResKind::PointsToU64
+                        | ResKind::PointsToRecord(_)
+                        | ResKind::OpenFile
+                        | ResKind::PosixWorld
+                        | ResKind::Uart
+                        | ResKind::SystemDealloc
+                        | ResKind::AllocatorState
+                        | ResKind::BlockLease
+                        | ResKind::LeasedPointsToU64
+                        | ResKind::FreeBlock
+                        | ResKind::FreeHeader => unreachable!(),
                     });
                     check_expr(ctx, &mut args[2], Some(cell))?;
-                    transfer(ctx, &args[2], None)?;
-                    check_borrow_conflicts(ctx, args, None)?;
+                    transfers[2] = Some(transfer(ctx, &args[2], None)?);
                     Ty::Unit
                 }
-            }
+            };
+            record_sealed_operation(
+                ctx,
+                CheckedSealedTarget::Resource(op),
+                args,
+                &transfers,
+                result.clone(),
+                span,
+            )?;
+            result
         }
         ExprKind::AllocArray { elem, len, init } => {
             let elem = elem.clone();
@@ -4725,61 +5876,33 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             }
             let launders = class_holds_storage(ctx.class_metas, ci, 0);
+            let moved_before = ctx.moved.clone();
+            let mut transfers = Vec::with_capacity(args.len());
             for (arg, p) in args.iter_mut().zip(&params) {
                 // A constructor returns a class, and a class may hold
                 // resource fields (ADR 0029) — so it is exactly a container
                 // a brand could leave in.
                 let escapes = launders.then(|| ("be passed to a constructor", arg.span));
-                match &p.ty {
-                    borrowed_array if borrowed_array.as_array_borrow().is_some() => {
-                        let (_, m) = borrowed_array
-                            .as_array_borrow()
-                            .expect("the arm's guard already matched this shape");
-                        if !matches!(arg.kind, ExprKind::Borrow { .. }) {
-                            return Err(Diagnostic {
-                                name: "type.array_arg_borrow".into(),
-                                title: "a borrowed array parameter takes an explicit borrow".into(),
-                                span: arg.span,
-                                label: format!(
-                                    "write `{}name`",
-                                    if m == Mutability::Mut { "&mut " } else { "&" }
-                                ),
-                                notes: vec![(
-                                    "note".into(),
-                                    "an argument's form follows the parameter's binding mode: \
-                                     a borrow names the caller's storage, while an owned \
-                                     `[T]` parameter takes the array itself"
-                                        .into(),
-                                )],
-                            });
-                        }
-                        let got = check_expr(ctx, arg, None)?;
-                        if got != *borrowed_array {
-                            return Err(Diagnostic {
-                                name: "type.mismatch".into(),
-                                title: format!(
-                                    "expected `{}`, found `{}`",
-                                    borrowed_array.name(),
-                                    got.name()
-                                ),
-                                span: arg.span,
-                                label: "borrow with the required mutability".into(),
-                                notes: vec![],
-                            });
-                        }
-                    }
-                    borrowed if borrowed.as_borrow().is_some() => {
-                        require_explicit_borrow(ctx, arg, p.ty.clone())?;
-                        check_expr(ctx, arg, Some(p.ty.clone()))?;
-                    }
-                    _ => {
-                        check_expr(ctx, arg, Some(p.ty.clone()))?;
-                    }
-                }
-                transfer(ctx, arg, escapes)?;
+                check_user_call_argument(ctx, arg, &p.ty)?;
+                transfers.push(transfer(ctx, arg, escapes)?);
             }
-            check_borrow_conflicts(ctx, args, None)?;
-            ctx.calls.push(format!("{class}::{init}"));
+            record_call_transitions(
+                ctx,
+                CallTarget::Constructor {
+                    class: class.clone(),
+                    init: init.clone(),
+                },
+                &params,
+                args,
+                &transfers,
+                None,
+                &moved_before,
+                span,
+            )?;
+            ctx.calls.push(CallOwner::Constructor {
+                class: class.clone(),
+                init: init.clone(),
+            });
             Ty::Class(ci)
         }
         ExprKind::MethodCall {
@@ -4797,21 +5920,18 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     mutable,
                     ..
                 }) => (*ci, *mutable, true),
-                Some(VarInfo { ty, .. }) if ty.as_class_borrow().is_some() => {
-                    let (ci, m) = ty
-                        .as_class_borrow()
-                        .expect("the arm's guard already matched this shape");
-                    (ci, m == Mutability::Mut, false)
-                }
-                Some(v) => {
-                    return Err(Diagnostic {
-                        name: "type.not_a_class".into(),
-                        title: format!("`{recv}` is not a class value"),
-                        span: *recv_span,
-                        label: format!("this has type `{}`", v.ty.clone().name()),
-                        notes: vec![],
-                    });
-                }
+                Some(v) => match checked_class_borrow(&v.ty) {
+                    Some((ci, mutability)) => (ci, mutability == Mutability::Mut, false),
+                    None => {
+                        return Err(Diagnostic {
+                            name: "type.not_a_class".into(),
+                            title: format!("`{recv}` is not a class value"),
+                            span: *recv_span,
+                            label: format!("this has type `{}`", v.ty.clone().name()),
+                            notes: vec![],
+                        });
+                    }
+                },
                 None => {
                     return Err(Diagnostic {
                         name: "type.unknown_variable".into(),
@@ -4878,27 +5998,53 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // A method is a callee like any other: it can launder a brand
             // only if its signature can give storage back.
             let launders = match ret {
-                ref ty if ty.is_resource() => true,
-                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) => true,
+                Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::OptionRaw(_)
+                | Ty::Array(_)
+                | Ty::Borrow(..) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
-                _ => false,
+                Ty::Int(_) | Ty::Bool | Ty::Param(_) | Ty::Option(_) | Ty::Unit => false,
             };
+            let moved_before = ctx.moved.clone();
+            let mut transfers = Vec::with_capacity(args.len());
             for (arg, p) in args.iter_mut().zip(&params) {
-                check_expr(ctx, arg, Some(p.ty.clone()))?;
-                transfer(
+                check_user_call_argument(ctx, arg, &p.ty)?;
+                transfers.push(transfer(
                     ctx,
                     arg,
                     launders.then(|| ("be passed to a method", arg.span)),
-                )?;
+                )?);
             }
-            check_borrow_conflicts(
+            record_call_transitions(
                 ctx,
+                CallTarget::Method {
+                    class: ctx.class_metas[ci].name.clone(),
+                    method: method.clone(),
+                },
+                &params,
                 args,
-                Some((Place::local(recv), self_kind == SelfKind::Mut, *recv_span)),
+                &transfers,
+                Some((
+                    Place::local(recv),
+                    ctx.class_metas[ci].name.clone(),
+                    if self_kind == SelfKind::Mut {
+                        Mutability::Mut
+                    } else {
+                        Mutability::Shared
+                    },
+                    *recv_span,
+                    Ty::Class(ci),
+                )),
+                &moved_before,
+                span,
             )?;
-            ctx.calls
-                .push(format!("{}::{method}", ctx.class_metas[ci].name));
+            ctx.calls.push(CallOwner::Method {
+                class: ctx.class_metas[ci].name.clone(),
+                method: method.clone(),
+            });
             ret
         }
         ExprKind::ArrayLit(elems) => match expected {
@@ -4910,7 +6056,21 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 Ty::Array(t)
             }
-            _ => {
+            Some(
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit,
+            )
+            | None => {
                 return Err(Diagnostic {
                     name: "type.array_literal_position".into(),
                     title: "array literal outside an owned-array declaration".into(),
@@ -4948,10 +6108,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // `&o.f` are both dead once `o` has moved. Reading a name
             // goes through `ExprKind::Var`; this is the other door.
             {
-                let mut p = Place::local(array);
-                if let Some(f) = field {
-                    p.fields.push(f.clone());
-                }
+                let p = field
+                    .as_deref()
+                    .map_or_else(|| Place::local(array), |f| Place::field(array, f));
                 if ctx.is_moved(&p) {
                     return Err(moved_out(ctx, &p, span, "borrow"));
                 }
@@ -4983,7 +6142,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 }
                 let base = if array == "self" {
                     match ctx.in_class {
-                        Some((ci, _)) => Ty::borrow(Mutability::Shared, Ty::Class(ci)),
+                        Some((ci, _member_is_mutable)) => {
+                            Ty::borrow(Mutability::Shared, Ty::Class(ci))
+                        }
                         None => {
                             return Err(Diagnostic {
                                 name: "type.self_outside_class".into(),
@@ -5045,7 +6206,16 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
                     Ty::Array(elem) => Ok(Ty::borrow(Mutability::Shared, Ty::Array(elem.clone()))),
-                    _ => Err(Diagnostic {
+                    Ty::Int(_)
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Record(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit => Err(Diagnostic {
                         name: "type.not_a_place".into(),
                         title: format!("field `{fname}` is not a borrowable place"),
                         span,
@@ -5062,9 +6232,49 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // narrowed, and a mutable borrow needs a `mut` local.
             if let Some(v) = ctx.vars.get(array.as_str()) {
                 if let Some(k) = v.ty.res_kind() {
-                    let (src_mut, is_local) = match v.ty.as_res_borrow() {
-                        Some((_, m)) => (m, false),
-                        None => (Mutability::Mut, true),
+                    let (src_mut, is_local) = match &v.ty {
+                        Ty::Res(_) => (Mutability::Mut, true),
+                        Ty::Borrow(Mutability::Shared, referent) => match referent.as_ref() {
+                            Ty::Res(_) => (Mutability::Shared, false),
+                            Ty::Int(_)
+                            | Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Class(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit => unreachable!("res_kind classified the borrow"),
+                        },
+                        Ty::Borrow(Mutability::Mut, referent) => match referent.as_ref() {
+                            Ty::Res(_) => (Mutability::Mut, false),
+                            Ty::Int(_)
+                            | Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Class(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit => unreachable!("res_kind classified the borrow"),
+                        },
+                        Ty::Int(_)
+                        | Ty::Bool
+                        | Ty::Param(_)
+                        | Ty::Class(_)
+                        | Ty::Record(_)
+                        | Ty::Array(_)
+                        | Ty::Option(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Unit => unreachable!("res_kind classified the value"),
                     };
                     let declared_mut = v.mutable;
                     if *mutable {
@@ -5107,9 +6317,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // A shared re-borrow of a `&mut C` is fine; the other
             // direction would manufacture unique access out of shared.
             if let Some(v) = ctx.vars.get(array.as_str()) {
-                if let Some(ci) = v.ty.class_index() {
-                    let (src_mut, is_local) = match v.ty.as_class_borrow() {
-                        Some((_, m)) => (m, false),
+                if let Some(ci) = checked_class_index(&v.ty) {
+                    let (src_mut, is_local) = match checked_class_borrow(&v.ty) {
+                        Some((_borrowed_class, mutability)) => (mutability, false),
                         None => (Mutability::Mut, true),
                     };
                     let declared_mut = v.mutable;
@@ -5150,8 +6360,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             let elem = array_elem_ty(ctx, array, span)?;
             let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty.clone()) {
-                Some(ty) if ty.as_array().is_some() => ty.binding_mode(),
-                _ => unreachable!("array_elem_ty checked"),
+                Some(ty) => match checked_array_binding(&ty) {
+                    Some((_element, mode)) => mode,
+                    None => unreachable!("array_elem_ty checked"),
+                },
+                None => unreachable!("array_elem_ty checked"),
             };
             if *mutable
                 && src_mut == BindingMode::Owned
@@ -5192,7 +6405,20 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 check_expr(ctx, inner, Some(Ty::RawRecord(ri)))?;
                 Ty::OptionRaw(ri)
             }
-            _ => {
+            Some(
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Array(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit,
+            )
+            | None => {
                 return Err(Diagnostic {
                     name: "type.option_position".into(),
                     title: "`some(...)` outside an option-returning position".into(),
@@ -5205,7 +6431,20 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::NoneE => match expected {
             Some(Ty::Option(t)) => Ty::Option(t),
             Some(Ty::OptionRaw(ri)) => Ty::OptionRaw(ri),
-            _ => {
+            Some(
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Array(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit,
+            )
+            | None => {
                 return Err(Diagnostic {
                     name: "type.option_position".into(),
                     title: "`none` outside an option-returning position".into(),
@@ -5232,7 +6471,17 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             )],
                         });
                     }
-                    _ => {
+                    Ty::Bool
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit => {
                         return Err(Diagnostic {
                             name: "type.mismatch".into(),
                             title: "unary minus on a non-integer".into(),
@@ -5262,10 +6511,40 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // only ever see the ordinary call.
             let class_of = |ctx: &Ctx, e: &Expr| match &e.kind {
                 ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) {
-                    Some(ty) => ty.class_index().map(|ci| (n.clone(), ci)),
+                    Some(ty) => checked_class_index(&ty).map(|ci| (n.clone(), ci)),
                     None => None,
                 },
-                _ => None,
+                ExprKind::IntLit(_)
+                | ExprKind::BoolLit(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Call { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::Len { .. }
+                | ExprKind::RawOp { .. }
+                | ExprKind::DeviceOp { .. }
+                | ExprKind::ResOp { .. }
+                | ExprKind::Widen { .. }
+                | ExprKind::Narrow { .. }
+                | ExprKind::IsSome { .. }
+                | ExprKind::OptValue { .. }
+                | ExprKind::OptTake { .. }
+                | ExprKind::SomeE(_)
+                | ExprKind::NoneE
+                | ExprKind::ArrayLit(_)
+                | ExprKind::AllocArray { .. }
+                | ExprKind::SelfField { .. }
+                | ExprKind::SelfFieldLen { .. }
+                | ExprKind::SelfFieldIndex { .. }
+                | ExprKind::CtorCall { .. }
+                | ExprKind::ClassField { .. }
+                | ExprKind::RecordField { .. }
+                | ExprKind::ClassFieldLen { .. }
+                | ExprKind::ClassFieldIndex { .. }
+                | ExprKind::TraitCall { .. }
+                | ExprKind::MethodCall { .. }
+                | ExprKind::Borrow { .. }
+                | ExprKind::RecordLit { .. } => None,
             };
             let lc = class_of(ctx, lhs);
             let rc = class_of(ctx, rhs);
@@ -5359,8 +6638,34 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             }
             if op.is_arith() {
                 let expected_int = match expected {
-                    Some(ref ty) if is_integer_ty(ty.clone()) => expected,
-                    _ => None,
+                    Some(
+                        ty @ (Ty::Int(
+                            IntTy::U8
+                            | IntTy::U16
+                            | IntTy::U32
+                            | IntTy::U64
+                            | IntTy::I8
+                            | IntTy::I16
+                            | IntTy::I32
+                            | IntTy::I64,
+                        )
+                        | Ty::Param(_)),
+                    ) => Some(ty),
+                    Some(
+                        Ty::Int(IntTy::TParam(_))
+                        | Ty::Bool
+                        | Ty::Class(_)
+                        | Ty::Record(_)
+                        | Ty::Array(_)
+                        | Ty::Option(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Res(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit,
+                    )
+                    | None => None,
                 };
                 let t = infer_int_pair(ctx, lhs, rhs, expected_int, op_span)?;
                 if matches!(op, BinOp::Div | BinOp::Rem) && is_abstract_integer_ty(t.clone()) {
@@ -5443,7 +6748,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     )],
                 });
             }
-            let param_tys: Vec<Ty> = sig.params.iter().map(|p| p.ty.clone()).collect();
+            let params = sig.params.clone();
             let ret = sig.ret.clone();
             // Only a signature that *returns* storage can launder a brand
             // out — and since ADR 0029 a class counts, because it may have
@@ -5457,65 +6762,35 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             // stops C stashing the pointer in a foreign global — and it is
             // part of what the contract's audit id covers.
             let launders = match ret {
-                ref ty if ty.is_resource() => true,
-                Ty::Raw(_) | Ty::RawRecord(_) | Ty::OptionRaw(_) => true,
+                Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::OptionRaw(_)
+                | Ty::Array(_)
+                | Ty::Borrow(..) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
-                _ => false,
+                Ty::Int(_) | Ty::Bool | Ty::Param(_) | Ty::Option(_) | Ty::Unit => false,
             };
-            for (arg, pty) in args.iter_mut().zip(param_tys) {
+            let moved_before = ctx.moved.clone();
+            let mut transfers = Vec::with_capacity(args.len());
+            for (arg, parameter) in args.iter_mut().zip(&params) {
                 let escapes = launders.then(|| ("be passed to a function", arg.span));
-                match pty {
-                    ref borrowed_array if borrowed_array.as_array_borrow().is_some() => {
-                        let (_, m) = borrowed_array
-                            .as_array_borrow()
-                            .expect("the arm's guard already matched this shape");
-                        if !matches!(arg.kind, ExprKind::Borrow { .. }) {
-                            return Err(Diagnostic {
-                                name: "type.array_arg_borrow".into(),
-                                title: "a borrowed array parameter takes an explicit borrow".into(),
-                                span: arg.span,
-                                label: format!(
-                                    "write `{}name`",
-                                    if m == Mutability::Mut { "&mut " } else { "&" }
-                                ),
-                                notes: vec![(
-                                    "note".into(),
-                                    "an argument's form follows the parameter's binding mode: \
-                                     a borrow names the caller's storage, while an owned \
-                                     `[T]` parameter takes the array itself"
-                                        .into(),
-                                )],
-                            });
-                        }
-                        let got = check_expr(ctx, arg, None)?;
-                        if got != *borrowed_array {
-                            return Err(Diagnostic {
-                                name: "type.mismatch".into(),
-                                title: format!(
-                                    "expected `{}`, found `{}`",
-                                    borrowed_array.name(),
-                                    got.name()
-                                ),
-                                span: arg.span,
-                                label: "borrow with the required mutability".into(),
-                                notes: vec![],
-                            });
-                        }
-                    }
-                    ref borrowed if borrowed.as_borrow().is_some() => {
-                        require_explicit_borrow(ctx, arg, pty.clone())?;
-                        check_expr(ctx, arg, Some(pty))?;
-                    }
-                    _ => {
-                        check_expr(ctx, arg, Some(pty))?;
-                    }
-                }
-                transfer(ctx, arg, escapes)?;
+                check_user_call_argument(ctx, arg, &parameter.ty)?;
+                transfers.push(transfer(ctx, arg, escapes)?);
             }
-            check_borrow_conflicts(ctx, args, None)?;
+            record_call_transitions(
+                ctx,
+                CallTarget::Function(callee.clone()),
+                &params,
+                args,
+                &transfers,
+                None,
+                &moved_before,
+                span,
+            )?;
             if *callee != ctx.current_fn {
-                ctx.calls.push(callee.clone());
+                ctx.calls.push(CallOwner::Function(callee.clone()));
             }
             ret
         }
@@ -5558,84 +6833,852 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     Ok(ty)
 }
 
-/// A place: a local (or `self`), optionally projected through fields.
-/// Ownership and borrowing are questions about places, not names — a
-/// field is a place in its own right (ADR 0020, ADR 0022).
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct Place {
-    root: String,
-    fields: Vec<String>,
-}
-
-impl Place {
-    fn local(name: &str) -> Place {
-        Place {
-            root: name.to_string(),
-            fields: Vec::new(),
-        }
-    }
-
-    /// `self` contains `other`: same root, and `self`'s field path is a
-    /// prefix of `other`'s. `o` contains `o.inner`; not conversely.
-    fn contains(&self, other: &Place) -> bool {
-        self.root == other.root
-            && self.fields.len() <= other.fields.len()
-            && self.fields[..] == other.fields[..self.fields.len()]
-    }
-
-    /// Two places overlap when either contains the other. `o` overlaps
-    /// `o.inner`; `o.a` and `o.b` do not.
-    fn overlaps(&self, other: &Place) -> bool {
-        self.contains(other) || other.contains(self)
-    }
-
-    fn render(&self) -> String {
-        let mut s = self.root.clone();
-        for f in &self.fields {
-            s.push('.');
-            s.push_str(f);
-        }
-        s
-    }
-
-    /// The `VarInfo` entry that carries this place's flow state. Fields
-    /// of `self` are represented as pseudo-variables (`self.f`), so using
-    /// only `root` would ask for `self`, an entry that does not exist.
-    fn state_key(&self) -> String {
-        self.render()
-    }
-}
-
 /// The place an argument borrows, and whether the borrow is mutable. A
 /// bare name that is already a class borrow counts too: it hands the
 /// borrowed place on without an `&` at the call site.
 fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
-    match &arg.kind {
-        ExprKind::Borrow {
-            array,
-            field,
-            mutable,
-        } => {
-            let mut p = Place::local(array);
-            if let Some(f) = field {
-                p.fields.push(f.clone());
-            }
-            Some((p, *mutable))
-        }
+    match BorrowedPlace::from_expr(arg) {
+        Some(borrowed) => Some((
+            borrowed.place().clone(),
+            borrowed.mutability() == Mutability::Mut,
+        )),
         // A borrowed class or resource parameter is itself a place that can
         // be re-borrowed. A borrowed array is not: its element storage is
         // named by an index, which `Place` has no path for.
-        ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) {
-            Some(ty) => match ty.as_borrow() {
-                Some((m, Ty::Class(_) | Ty::Res(_))) => {
-                    Some((Place::local(n), m == Mutability::Mut))
-                }
-                _ => None,
+        None => match &arg.kind {
+            ExprKind::Var(n) => match ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) {
+                Some(ty) => match ty {
+                    Ty::Borrow(Mutability::Shared, referent) => match referent.as_ref() {
+                        Ty::Class(_) | Ty::Res(_) => Some((Place::local(n), false)),
+                        Ty::Int(_)
+                        | Ty::Bool
+                        | Ty::Param(_)
+                        | Ty::Record(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Array(_)
+                        | Ty::Option(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit => None,
+                    },
+                    Ty::Borrow(Mutability::Mut, referent) => match referent.as_ref() {
+                        Ty::Class(_) | Ty::Res(_) => Some((Place::local(n), true)),
+                        Ty::Int(_)
+                        | Ty::Bool
+                        | Ty::Param(_)
+                        | Ty::Record(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Array(_)
+                        | Ty::Option(_)
+                        | Ty::OptionRaw(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit => None,
+                    },
+                    Ty::Int(_)
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Unit => None,
+                },
+                None => None,
             },
-            None => None,
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Len { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::Unary { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Call { .. }
+            | ExprKind::TraitCall { .. }
+            | ExprKind::SomeE(_)
+            | ExprKind::NoneE
+            | ExprKind::IsSome { .. }
+            | ExprKind::OptValue { .. }
+            | ExprKind::OptTake { .. }
+            | ExprKind::Widen { .. }
+            | ExprKind::Narrow { .. }
+            | ExprKind::AllocArray { .. }
+            | ExprKind::ArrayLit(_)
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::SelfFieldIndex { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::ClassFieldIndex { .. }
+            | ExprKind::MethodCall { .. }
+            | ExprKind::CtorCall { .. }
+            | ExprKind::RawOp { .. }
+            | ExprKind::ResOp { .. }
+            | ExprKind::DeviceOp { .. }
+            | ExprKind::Borrow { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::RecordLit { .. } => None,
         },
-        _ => None,
     }
+}
+
+/// Preserve the checker's resolved unique-borrow effects for VC generation.
+///
+/// This runs only after argument typing. Alias admission consumes the completed
+/// record plus the checker's flow-sensitive move delta for argument evaluation,
+/// so a nested expression cannot hide a move behind a fresh outer result.
+fn record_call_transitions(
+    ctx: &mut Ctx,
+    target: CallTarget,
+    params: &[Param],
+    args: &[Expr],
+    transfers: &[ValueTransfer],
+    receiver: Option<(Place, String, Mutability, Span, Ty)>,
+    moved_before: &HashSet<Place>,
+    span: Span,
+) -> CResult<()> {
+    if params.len() != args.len() || args.len() != transfers.len() {
+        return Err(Diagnostic {
+            name: "internal.check.call_transition_arity".into(),
+            title: "checked call arguments and ownership outcomes have different lengths".into(),
+            span,
+            label: "the ownership handoff requires one outcome per argument".into(),
+            notes: vec![],
+        });
+    }
+    let mut arguments = Vec::with_capacity(args.len());
+    for (parameter_index, ((parameter, argument), transfer)) in
+        params.iter().zip(args).zip(transfers).enumerate()
+    {
+        let effect = match &parameter.ty {
+            Ty::Borrow(mutability, referent) => {
+                let Some((place, actual_mutable)) = borrow_place(ctx, argument) else {
+                    return Err(Diagnostic {
+                        name: "internal.check.call_transition_shape".into(),
+                        title: format!(
+                            "checked borrowed parameter `{}` has no borrowed place",
+                            parameter.name
+                        ),
+                        span: argument.span,
+                        label: "the ownership handoff cannot identify this argument".into(),
+                        notes: vec![],
+                    });
+                };
+                let actual = if actual_mutable {
+                    Mutability::Mut
+                } else {
+                    Mutability::Shared
+                };
+                if actual != *mutability {
+                    return Err(Diagnostic {
+                        name: "internal.check.call_transition_mutability".into(),
+                        title: format!(
+                            "checked borrow for `{}` has the wrong mutability",
+                            parameter.name
+                        ),
+                        span: argument.span,
+                        label: "argument admission and ownership handoff disagree".into(),
+                        notes: vec![],
+                    });
+                }
+                CallArgumentEffect::Loan(
+                    CallTransition::borrow(
+                        place,
+                        *mutability,
+                        referent.as_ref().clone(),
+                        argument.span,
+                    )
+                    .map_err(|message| Diagnostic {
+                        name: "internal.check.call_transition_unsupported".into(),
+                        title: message,
+                        span: argument.span,
+                        label: "the checked loan has no admitted ownership transition".into(),
+                        notes: vec![],
+                    })?,
+                )
+            }
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Unit => CallArgumentEffect::Value(transfer.clone()),
+        };
+        arguments.push(CallArgumentTransition {
+            parameter_index,
+            parameter: parameter.name.clone(),
+            parameter_ty: parameter.ty.clone(),
+            argument_span: argument.span,
+            effect,
+        });
+    }
+
+    let receiver = receiver
+        .map(|(place, class, mutability, receiver_span, referent)| {
+            CallTransition::borrow(place, mutability, referent, receiver_span)
+                .map(|transition| CallReceiverTransition { class, transition })
+                .map_err(|message| Diagnostic {
+                    name: "internal.check.call_receiver_unsupported".into(),
+                    title: message,
+                    span: receiver_span,
+                    label: "the checked receiver has no admitted ownership transition".into(),
+                    notes: vec![],
+                })
+        })
+        .transpose()?;
+
+    let call = CheckedCallTransition {
+        key: CallSiteKey {
+            owner: ctx.call_owner.clone(),
+            span,
+            target,
+        },
+        receiver,
+        arguments,
+    };
+    check_recorded_call_conflicts(ctx, moved_before, &call)?;
+    ctx.ownership
+        .calls
+        .insert(call)
+        .map_err(|duplicate| Diagnostic {
+            name: "internal.check.duplicate_call_transition".into(),
+            title: format!(
+                "duplicate checked-call identity for {} inside {}",
+                duplicate.target.render(),
+                duplicate.owner.render()
+            ),
+            span: duplicate.span,
+            label: "owner, span, and resolved target must identify exactly one call".into(),
+            notes: vec![],
+        })
+}
+
+/// Build the single checker-authored mutation summary consumed by loop havoc.
+/// This walk runs only after condition/body checking has succeeded, so call,
+/// sealed-operation, option, and exposure records are already resolved. It is
+/// deliberately checker-side: VC generation must not infer effects by walking
+/// expression syntax a second time.
+fn checked_loop_effects(
+    ctx: &Ctx,
+    keyword_span: Span,
+    condition: &Expr,
+    body: &[Stmt],
+) -> CResult<CheckedLoopEffects> {
+    let mut mutations = Vec::new();
+    collect_checked_expr_mutations(ctx, condition, &mut mutations)?;
+    collect_checked_stmt_mutations(ctx, body, &mut mutations)?;
+    Ok(CheckedLoopEffects {
+        key: EffectSiteKey {
+            owner: ctx.call_owner.clone(),
+            span: keyword_span,
+        },
+        condition_span: condition.span,
+        mutations,
+    })
+}
+
+fn collect_checked_stmt_mutations(
+    ctx: &Ctx,
+    statements: &[Stmt],
+    out: &mut Vec<CheckedMutation>,
+) -> CResult<()> {
+    for statement in statements {
+        match statement {
+            Stmt::Assign { name, value, .. } => {
+                out.push(CheckedMutation::DirectWrite {
+                    place: Place::local(name),
+                });
+                collect_checked_expr_mutations(ctx, value, out)?;
+            }
+            Stmt::Store {
+                array,
+                index,
+                value,
+                ..
+            } => {
+                out.push(CheckedMutation::DirectWrite {
+                    place: Place::local(array),
+                });
+                collect_checked_expr_mutations(ctx, index, out)?;
+                collect_checked_expr_mutations(ctx, value, out)?;
+            }
+            Stmt::FieldAssign { value, .. } => {
+                out.push(CheckedMutation::DirectWrite {
+                    place: Place::local("self"),
+                });
+                collect_checked_expr_mutations(ctx, value, out)?;
+            }
+            Stmt::FieldStore { index, value, .. } => {
+                out.push(CheckedMutation::DirectWrite {
+                    place: Place::local("self"),
+                });
+                collect_checked_expr_mutations(ctx, index, out)?;
+                collect_checked_expr_mutations(ctx, value, out)?;
+            }
+            Stmt::ExprStmt(expression) => {
+                collect_checked_expr_mutations(ctx, expression, out)?;
+            }
+            Stmt::Decl {
+                init: Some(init), ..
+            }
+            | Stmt::VarDecl { init, .. } => {
+                collect_checked_expr_mutations(ctx, init, out)?;
+            }
+            Stmt::Return {
+                value: Some(value), ..
+            } => collect_checked_expr_mutations(ctx, value, out)?,
+            Stmt::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                collect_checked_expr_mutations(ctx, cond, out)?;
+                collect_checked_stmt_mutations(ctx, then_block, out)?;
+                if let Some(else_block) = else_block {
+                    collect_checked_stmt_mutations(ctx, else_block, out)?;
+                }
+            }
+            Stmt::While { cond, body, .. } => {
+                collect_checked_expr_mutations(ctx, cond, out)?;
+                collect_checked_stmt_mutations(ctx, body, out)?;
+            }
+            Stmt::Unsafe { body, .. } => collect_checked_stmt_mutations(ctx, body, out)?,
+            Stmt::Expose {
+                kw_span,
+                mutable,
+                body,
+                ..
+            } => {
+                let key = EffectSiteKey {
+                    owner: ctx.call_owner.clone(),
+                    span: *kw_span,
+                };
+                let Some(exposure) = ctx.ownership.exposure(&key) else {
+                    return Err(Diagnostic {
+                        name: "internal.check.loop_exposure_missing".into(),
+                        title: "checked loop exposure has no ownership record".into(),
+                        span: *kw_span,
+                        label: "loop effects require the admitted exposure boundary".into(),
+                        notes: vec![],
+                    });
+                };
+                if *mutable {
+                    out.push(CheckedMutation::ExposureRebuild {
+                        owner_place: exposure.owner_place.clone(),
+                    });
+                }
+                collect_checked_stmt_mutations(ctx, body, out)?;
+            }
+            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                collect_checked_expr_mutations(ctx, size, out)?;
+            }
+            Stmt::SystemDealloc {
+                ptr, res, release, ..
+            } => {
+                collect_checked_expr_mutations(ctx, ptr, out)?;
+                collect_checked_expr_mutations(ctx, res, out)?;
+                collect_checked_expr_mutations(ctx, release, out)?;
+            }
+            Stmt::Assert(_) | Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_checked_expr_mutations(
+    ctx: &Ctx,
+    expression: &Expr,
+    out: &mut Vec<CheckedMutation>,
+) -> CResult<()> {
+    match &expression.kind {
+        ExprKind::Call { args, .. }
+        | ExprKind::CtorCall { args, .. }
+        | ExprKind::MethodCall { args, .. } => {
+            for argument in args {
+                collect_checked_expr_mutations(ctx, argument, out)?;
+            }
+            let mut records = ctx
+                .ownership
+                .calls
+                .for_owner_span(&ctx.call_owner, expression.span);
+            let Some((_, call)) = records.next() else {
+                return Err(Diagnostic {
+                    name: "internal.check.loop_call_missing".into(),
+                    title: "checked loop call has no ownership record".into(),
+                    span: expression.span,
+                    label: "loop effects require the admitted call boundary".into(),
+                    notes: vec![],
+                });
+            };
+            if records.next().is_some() {
+                return Err(Diagnostic {
+                    name: "internal.check.loop_call_ambiguous".into(),
+                    title: "checked loop call span has more than one ownership record".into(),
+                    span: expression.span,
+                    label: "one source call must have one resolved transition".into(),
+                    notes: vec![],
+                });
+            }
+            if let Some(receiver) = &call.receiver {
+                if receiver.transition.effect == crate::transition::CallEffect::HavocUniqueBorrow {
+                    out.push(CheckedMutation::UniqueLoan(receiver.transition.clone()));
+                }
+            }
+            for argument in &call.arguments {
+                if let CallArgumentEffect::Loan(loan) = &argument.effect {
+                    if loan.effect == crate::transition::CallEffect::HavocUniqueBorrow {
+                        out.push(CheckedMutation::UniqueLoan(loan.clone()));
+                    }
+                }
+            }
+        }
+        ExprKind::RawOp { args, .. }
+        | ExprKind::ResOp { args, .. }
+        | ExprKind::DeviceOp { args, .. } => {
+            for argument in args {
+                collect_checked_expr_mutations(ctx, argument, out)?;
+            }
+            let key = EffectSiteKey {
+                owner: ctx.call_owner.clone(),
+                span: expression.span,
+            };
+            let Some(operation) = ctx.ownership.sealed_operation(&key) else {
+                return Err(Diagnostic {
+                    name: "internal.check.loop_sealed_missing".into(),
+                    title: "checked sealed operation has no ownership record".into(),
+                    span: expression.span,
+                    label: "loop effects require the admitted sealed boundary".into(),
+                    notes: vec![],
+                });
+            };
+            for argument in &operation.arguments {
+                if let CallArgumentEffect::Loan(loan) = &argument.effect {
+                    if loan.effect == crate::transition::CallEffect::HavocUniqueBorrow {
+                        out.push(CheckedMutation::UniqueLoan(loan.clone()));
+                    }
+                }
+            }
+        }
+        ExprKind::OptTake { .. } => {
+            let key = EffectSiteKey {
+                owner: ctx.call_owner.clone(),
+                span: expression.span,
+            };
+            let Some(take) = ctx.ownership.option_take(&key) else {
+                return Err(Diagnostic {
+                    name: "internal.check.loop_option_take_missing".into(),
+                    title: "checked option take has no ownership record".into(),
+                    span: expression.span,
+                    label: "loop effects require the admitted extraction boundary".into(),
+                    notes: vec![],
+                });
+            };
+            out.push(CheckedMutation::OptionTake {
+                source: take.source.clone(),
+                payload: take.payload.clone(),
+            });
+        }
+        ExprKind::TraitCall { args, .. } | ExprKind::RecordLit { args, .. } => {
+            for argument in args {
+                collect_checked_expr_mutations(ctx, argument, out)?;
+            }
+        }
+        ExprKind::Unary { operand, .. }
+        | ExprKind::Widen { arg: operand, .. }
+        | ExprKind::Narrow { arg: operand, .. }
+        | ExprKind::IsSome { operand }
+        | ExprKind::OptValue { operand }
+        | ExprKind::SomeE(operand) => collect_checked_expr_mutations(ctx, operand, out)?,
+        ExprKind::Binary { lhs, rhs, .. } => {
+            collect_checked_expr_mutations(ctx, lhs, out)?;
+            collect_checked_expr_mutations(ctx, rhs, out)?;
+        }
+        ExprKind::Index { index, .. }
+        | ExprKind::SelfFieldIndex { index, .. }
+        | ExprKind::ClassFieldIndex { index, .. } => {
+            collect_checked_expr_mutations(ctx, index, out)?;
+        }
+        ExprKind::AllocArray { len, init, .. } => {
+            collect_checked_expr_mutations(ctx, len, out)?;
+            collect_checked_expr_mutations(ctx, init, out)?;
+        }
+        ExprKind::ArrayLit(elements) => {
+            for element in elements {
+                collect_checked_expr_mutations(ctx, element, out)?;
+            }
+        }
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Len { .. }
+        | ExprKind::NoneE
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::Borrow { .. } => {}
+    }
+    Ok(())
+}
+
+/// Seal the ownership boundary of one compiler-defined operation after its
+/// ordinary typing rules have succeeded. Transfers are captured at the point
+/// they occur; the remaining arguments are loans or non-affine copies whose
+/// state cannot change while the rest of this operation is checked.
+fn record_sealed_operation(
+    ctx: &mut Ctx,
+    target: CheckedSealedTarget,
+    args: &[Expr],
+    transfers: &[Option<ValueTransfer>],
+    result_ty: Ty,
+    span: Span,
+) -> CResult<()> {
+    if args.len() != transfers.len() {
+        return Err(Diagnostic {
+            name: "internal.check.sealed_transition_arity".into(),
+            title: format!(
+                "checked `{}` arguments and ownership outcomes have different lengths",
+                target.render()
+            ),
+            span,
+            label: "the ownership handoff requires one outcome per argument".into(),
+            notes: vec![],
+        });
+    }
+    let mut arguments = Vec::with_capacity(args.len());
+    for (index, (argument, transferred)) in args.iter().zip(transfers).enumerate() {
+        let argument_ty = argument
+            .ty
+            .clone()
+            .expect("sealed operation record follows successful expression checking");
+        let effect = match &argument_ty {
+            Ty::Borrow(mutability, referent) => {
+                let Some((place, actual_mutable)) = borrow_place(ctx, argument) else {
+                    return Err(Diagnostic {
+                        name: "internal.check.sealed_transition_shape".into(),
+                        title: format!(
+                            "checked borrowed argument {index} of `{}` has no borrowed place",
+                            target.render()
+                        ),
+                        span: argument.span,
+                        label: "the ownership handoff cannot identify this argument".into(),
+                        notes: vec![],
+                    });
+                };
+                let actual = if actual_mutable {
+                    Mutability::Mut
+                } else {
+                    Mutability::Shared
+                };
+                if actual != *mutability {
+                    return Err(Diagnostic {
+                        name: "internal.check.sealed_transition_mutability".into(),
+                        title: format!(
+                            "checked borrow argument {index} of `{}` has the wrong mutability",
+                            target.render()
+                        ),
+                        span: argument.span,
+                        label: "argument admission and ownership handoff disagree".into(),
+                        notes: vec![],
+                    });
+                }
+                if !place.is_root() {
+                    return Err(Diagnostic {
+                        name: "resource.field_borrow_op".into(),
+                        title: format!(
+                            "`{}` cannot borrow the field `{}`",
+                            target.render(),
+                            place.render()
+                        ),
+                        span: argument.span,
+                        label: "sealed operations take whole named resources".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "move the field into a local resource binding first (a destructor \
+                             may move fields out); a sealed operation's fresh state is written \
+                             back under the borrow's root name, and a field has no root of its \
+                             own"
+                            .into(),
+                        )],
+                    });
+                }
+                CallArgumentEffect::Loan(
+                    CallTransition::borrow(
+                        place,
+                        *mutability,
+                        referent.as_ref().clone(),
+                        argument.span,
+                    )
+                    .map_err(|message| Diagnostic {
+                        name: "internal.check.sealed_transition_unsupported".into(),
+                        title: message,
+                        span: argument.span,
+                        label: "the checked loan has no admitted ownership transition".into(),
+                        notes: vec![],
+                    })?,
+                )
+            }
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Unit => {
+                let value = if let Some(value) = transferred {
+                    value.clone()
+                } else {
+                    if is_affine(&argument_ty) {
+                        return Err(Diagnostic {
+                            name: "internal.check.sealed_transition_missing_move".into(),
+                            title: format!(
+                                "affine argument {index} of `{}` has no transfer outcome",
+                                target.render()
+                            ),
+                            span: argument.span,
+                            label: "the checked move must be captured when it occurs".into(),
+                            notes: vec![],
+                        });
+                    }
+                    ValueTransfer {
+                        source: Place::from_value_expr(argument),
+                        value_ty: argument_ty.clone(),
+                        kind: ValueTransferKind::Copy,
+                        carried_obligation: false,
+                        branded: brand_of(ctx, argument),
+                        span: argument.span,
+                    }
+                };
+                CallArgumentEffect::Value(value)
+            }
+        };
+        arguments.push(CheckedSealedArgument {
+            index,
+            argument_ty,
+            argument_span: argument.span,
+            effect,
+        });
+    }
+
+    check_recorded_argument_conflicts(target.render(), &arguments)?;
+    let operation = CheckedSealedOperation {
+        key: EffectSiteKey {
+            owner: ctx.call_owner.clone(),
+            span,
+        },
+        target,
+        arguments,
+        result_ty,
+    };
+    ctx.ownership
+        .insert_sealed_operation(operation)
+        .map_err(|duplicate| Diagnostic {
+            name: "internal.check.duplicate_sealed_transition".into(),
+            title: format!(
+                "duplicate sealed-operation identity inside {}",
+                duplicate.owner.render()
+            ),
+            span: duplicate.span,
+            label: "owner and span must identify exactly one sealed operation".into(),
+            notes: vec![],
+        })
+}
+
+fn check_recorded_argument_conflicts(
+    operation: &str,
+    arguments: &[CheckedSealedArgument],
+) -> CResult<()> {
+    let loans: Vec<(&Place, bool, Span)> = arguments
+        .iter()
+        .filter_map(|argument| match &argument.effect {
+            CallArgumentEffect::Loan(loan) => Some((
+                &loan.place,
+                loan.effect == crate::transition::CallEffect::HavocUniqueBorrow,
+                loan.span,
+            )),
+            CallArgumentEffect::Value(_) => None,
+        })
+        .collect();
+    for i in 0..loans.len() {
+        for j in (i + 1)..loans.len() {
+            let (left, left_mut, _) = loans[i];
+            let (right, right_mut, right_span) = loans[j];
+            if (left_mut || right_mut) && left.overlaps(right) {
+                return Err(Diagnostic {
+                    name: "borrow.conflict".into(),
+                    title: format!(
+                        "conflicting borrows of `{}` in `{operation}`",
+                        left.render()
+                    ),
+                    span: right_span,
+                    label: format!("this overlaps the borrow of `{}`", left.render()),
+                    notes: vec![(
+                        "note".into(),
+                        "a mutable borrow must not overlap another borrow in the same \
+                         operation: its symbolic effects frame them as distinct storage"
+                            .into(),
+                    )],
+                });
+            }
+        }
+    }
+    for argument in arguments {
+        let CallArgumentEffect::Value(value) = &argument.effect else {
+            continue;
+        };
+        if value.kind != ValueTransferKind::Move {
+            continue;
+        }
+        let Some(moved) = value.source.as_ref() else {
+            continue;
+        };
+        if let Some((loaned, _, loan_span)) = loans
+            .iter()
+            .copied()
+            .find(|(loaned, _, _)| loaned.overlaps(moved))
+        {
+            return Err(Diagnostic {
+                name: "borrow.moved_in_call".into(),
+                title: format!(
+                    "`{}` is both lent and handed over in `{operation}`",
+                    loaned.render()
+                ),
+                span: loan_span,
+                label: format!(
+                    "this borrow promises the caller keeps `{}`, which the same operation moves",
+                    loaned.render()
+                ),
+                notes: vec![],
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Alias and move conflicts consume the same resolved record VC generation
+/// receives. The flow delta is checker state, not a second source walk: it
+/// retains moves performed by nested argument evaluation whose outer argument
+/// transfer is necessarily `Fresh`.
+fn check_recorded_call_conflicts(
+    ctx: &Ctx,
+    moved_before: &HashSet<Place>,
+    call: &CheckedCallTransition,
+) -> CResult<()> {
+    let mut loans: Vec<(&Place, bool, Span)> = Vec::new();
+    if let Some(receiver) = &call.receiver {
+        loans.push((
+            &receiver.transition.place,
+            receiver.transition.effect == crate::transition::CallEffect::HavocUniqueBorrow,
+            receiver.transition.span,
+        ));
+    }
+    for argument in &call.arguments {
+        if let CallArgumentEffect::Loan(loan) = &argument.effect {
+            loans.push((
+                &loan.place,
+                loan.effect == crate::transition::CallEffect::HavocUniqueBorrow,
+                loan.span,
+            ));
+        }
+    }
+    for i in 0..loans.len() {
+        for j in (i + 1)..loans.len() {
+            let (left, left_mut, _) = loans[i];
+            let (right, right_mut, right_span) = loans[j];
+            if (left_mut || right_mut) && left.overlaps(right) {
+                return Err(Diagnostic {
+                    name: "borrow.conflict".into(),
+                    title: format!("conflicting borrows of `{}` in one call", left.render()),
+                    span: right_span,
+                    label: format!("this overlaps the borrow of `{}`", left.render()),
+                    notes: vec![(
+                        "note".into(),
+                        "a mutable borrow must not overlap another borrow in the same call: \
+                         the callee's contract frames them as distinct storage"
+                            .into(),
+                    )],
+                });
+            }
+        }
+    }
+    for argument in &call.arguments {
+        let CallArgumentEffect::Value(value) = &argument.effect else {
+            continue;
+        };
+        if value.kind != ValueTransferKind::Move {
+            continue;
+        }
+        let Some(moved) = value.source.as_ref() else {
+            continue;
+        };
+        if let Some((loaned, _, loan_span)) = loans
+            .iter()
+            .copied()
+            .find(|(loaned, _, _)| loaned.overlaps(moved))
+        {
+            return Err(Diagnostic {
+                name: "borrow.moved_in_call".into(),
+                title: format!(
+                    "`{}` is both lent and handed over in one call",
+                    loaned.render()
+                ),
+                span: loan_span,
+                label: format!(
+                    "this borrow promises the caller keeps `{}`, which the same call moves",
+                    loaned.render()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    "a borrow and a move of one storage reach the callee as two values its \
+                     contract frames separately, so a write through one is invisible to the other"
+                        .into(),
+                )],
+            });
+        }
+    }
+    for (loaned, _, loan_span) in loans {
+        if ctx
+            .moved
+            .difference(moved_before)
+            .any(|moved| loaned.overlaps(moved))
+        {
+            return Err(Diagnostic {
+                name: "borrow.moved_in_call".into(),
+                title: format!(
+                    "`{}` is both lent and handed over in one call",
+                    loaned.render()
+                ),
+                span: loan_span,
+                label: format!(
+                    "this borrow promises the caller keeps `{}`, which argument evaluation moves",
+                    loaned.render()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    "a nested argument may return a fresh value while moving caller storage; \
+                     the move still conflicts with another argument's loan"
+                        .into(),
+                )],
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Within one call, a mutable borrow must not overlap any other borrow, and
@@ -5711,56 +7754,127 @@ fn check_borrow_conflicts(
     Ok(())
 }
 
-/// A sealed raw/resource/device operation writes its fresh state back under
-/// its borrow argument's ROOT name. A *field* borrow (`&mut self.mem` — the
-/// destructor's field-borrow allowance, ADR 0029) has no root of its own:
-/// threading the fresh view back into the owning object is a rule no sealed
-/// operation states, and keying by the root would overwrite the whole object.
-/// Refuse the shape by name, before any per-operation typing (ADR 0074).
-fn refuse_sealed_field_borrows(op: &str, args: &[Expr]) -> CResult<()> {
-    for arg in args {
-        if let ExprKind::Borrow {
-            array,
-            field: Some(f),
-            ..
-        } = &arg.kind
-        {
-            return Err(Diagnostic {
-                name: "resource.field_borrow_op".into(),
-                title: format!("`{op}` cannot borrow the field `{array}.{f}`"),
-                span: arg.span,
-                label: "sealed operations take whole named resources".into(),
-                notes: vec![(
-                    "note".into(),
-                    "move the field into a local resource binding first (a destructor \
-                     may move fields out); a sealed operation's fresh state is written \
-                     back under the borrow's root name, and a field has no root of its \
-                     own"
-                    .into(),
-                )],
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Handing a *value* over to a borrow is written at the call site, with
 /// its mutability, so a reader sees where access — and, for `&mut`,
 /// unique access — is given up. This is the rule array borrows already
-/// follow (ADR 0023, ADR 0024). Passing along a borrow already held at
-/// the same mutability hands over nothing new and needs no `&`.
+/// follow (ADR 0023, ADR 0024). Only an already-held shared borrow may be
+/// forwarded bare; unique access is visibly reborrowed with `&mut`.
+fn check_user_call_argument(ctx: &mut Ctx, arg: &mut Expr, parameter_ty: &Ty) -> CResult<()> {
+    match parameter_ty {
+        borrowed_array @ Ty::Borrow(mutability, referent)
+            if matches!(referent.as_ref(), Ty::Array(_)) =>
+        {
+            if !matches!(arg.kind, ExprKind::Borrow { .. }) {
+                return Err(Diagnostic {
+                    name: "type.array_arg_borrow".into(),
+                    title: "a borrowed array parameter takes an explicit borrow".into(),
+                    span: arg.span,
+                    label: format!(
+                        "write `{}name`",
+                        if *mutability == Mutability::Mut {
+                            "&mut "
+                        } else {
+                            "&"
+                        }
+                    ),
+                    notes: vec![(
+                        "note".into(),
+                        "an argument's form follows the parameter's binding mode: a borrow \
+                         names the caller's storage, while an owned `[T]` parameter takes the \
+                         array itself"
+                            .into(),
+                    )],
+                });
+            }
+            let got = check_expr(ctx, arg, None)?;
+            if got != *borrowed_array {
+                return Err(Diagnostic {
+                    name: "type.mismatch".into(),
+                    title: format!(
+                        "expected `{}`, found `{}`",
+                        borrowed_array.name(),
+                        got.name()
+                    ),
+                    span: arg.span,
+                    label: "borrow with the required mutability".into(),
+                    notes: vec![],
+                });
+            }
+            Ok(())
+        }
+        Ty::Borrow(..) => {
+            require_explicit_borrow(ctx, arg, parameter_ty.clone())?;
+            check_expr(ctx, arg, Some(parameter_ty.clone()))?;
+            Ok(())
+        }
+        other @ (Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Unit) => {
+            check_expr(ctx, arg, Some(other.clone()))?;
+            Ok(())
+        }
+    }
+}
+
+/// Validate the explicit syntax of a class or resource borrow argument.
+/// A bare shared borrow may be forwarded; unique access is always spelled
+/// `&mut` at each call boundary (ADR 0023).
 fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
     // Only a class or resource borrow names an owner a diagnostic can
     // print. An array borrow is written `&`/`&mut` at the call site by its
     // own rule, and a borrow of anything else is refused before this runs.
-    let (m, owner, flipped) = match pty.as_borrow() {
-        Some((m, Ty::Class(ci))) => (
-            m,
-            ctx.class_metas[*ci].name.clone(),
-            Ty::borrow(flip(m), Ty::Class(*ci)),
-        ),
-        Some((m, Ty::Res(k))) => (m, k.name().to_string(), Ty::borrow(flip(m), Ty::Res(*k))),
-        _ => return Ok(()),
+    let original_parameter_ty = pty.clone();
+    let (m, owner, flipped) = match pty {
+        Ty::Borrow(mutability, referent) => {
+            let mutability = match mutability {
+                Mutability::Shared => Mutability::Shared,
+                Mutability::Mut => Mutability::Mut,
+            };
+            match *referent {
+                Ty::Class(ci) => (
+                    mutability,
+                    ctx.class_metas[ci].name.clone(),
+                    Ty::borrow(flip(mutability), Ty::Class(ci)),
+                ),
+                Ty::Res(kind) => (
+                    mutability,
+                    kind.name().to_string(),
+                    Ty::borrow(flip(mutability), Ty::Res(kind)),
+                ),
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Record(_)
+                | Ty::Array(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit => return Ok(()),
+            }
+        }
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Unit => return Ok(()),
     };
     // Passing along a *shared* borrow already held under the same type:
     // nothing is handed over that the caller did not already have, and
@@ -5770,27 +7884,15 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
     // havoc both rely on).
     if m == Mutability::Shared {
         if let ExprKind::Var(n) = &arg.kind {
-            if ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) == Some(pty.clone()) {
+            if ctx.vars.get(n.as_str()).map(|v| v.ty.clone()) == Some(original_parameter_ty.clone())
+            {
                 return Ok(());
             }
         }
     }
     let want = if m == Mutability::Mut { "&mut " } else { "&" };
-    match arg.kind {
-        ExprKind::Borrow { mutable, .. } if mutable == (m == Mutability::Mut) => Ok(()),
-        ExprKind::Borrow { .. } => Err(Diagnostic {
-            name: "type.borrow_mutability".into(),
-            title: format!("expected `{}`, found `{}`", pty.name(), flipped.name()),
-            span: arg.span,
-            label: format!("write `{want}name`"),
-            notes: vec![(
-                "note".into(),
-                "a borrow's mutability is written at the call site, not \
-                 inferred from the parameter"
-                    .into(),
-            )],
-        }),
-        _ => Err(Diagnostic {
+    let Some(borrowed) = BorrowedPlace::from_expr(arg) else {
+        return Err(Diagnostic {
             name: "type.arg_borrow".into(),
             title: format!("`{owner}` is borrowed here, not moved"),
             span: arg.span,
@@ -5801,7 +7903,27 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
                  access is given up"
                     .into(),
             )],
-        }),
+        });
+    };
+    if borrowed.mutability() != m {
+        Err(Diagnostic {
+            name: "type.borrow_mutability".into(),
+            title: format!(
+                "expected `{}`, found `{}`",
+                original_parameter_ty.name(),
+                flipped.name()
+            ),
+            span: arg.span,
+            label: format!("write `{want}name`"),
+            notes: vec![(
+                "note".into(),
+                "a borrow's mutability is written at the call site, not \
+                 inferred from the parameter"
+                    .into(),
+            )],
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -5810,44 +7932,6 @@ fn flip(m: Mutability) -> Mutability {
         Mutability::Mut => Mutability::Shared,
         Mutability::Shared => Mutability::Mut,
     }
-}
-
-/// A class value passed by value is moved out of the local that named
-/// it (ADR 0020). Only a plain name can be moved: a borrow keeps the
-/// value, and a call result is already a temporary.
-fn mark_moved(ctx: &mut Ctx, arg: &Expr) -> CResult<()> {
-    match &arg.kind {
-        ExprKind::Var(name) => {
-            if ctx
-                .vars
-                .get(name.as_str())
-                .is_some_and(|v| is_affine(&v.ty))
-            {
-                ctx.moved.insert(Place::local(name));
-            }
-        }
-        // `self.f` handed on by value: the *field* is the place that dies,
-        // not the object. The object becomes partially moved, which is what
-        // lets a `deinit` pass one field on and still read another
-        // (ADR 0029).
-        ExprKind::SelfField { field } => {
-            let fty = ctx.in_class.and_then(|(ci, _)| {
-                ctx.class_metas[ci]
-                    .fields
-                    .iter()
-                    .find(|(n, _)| n == field)
-                    .map(|(_, t)| t.clone())
-            });
-            if fty.as_ref().is_some_and(is_affine) {
-                ctx.moved.insert(Place {
-                    root: "self".to_string(),
-                    fields: vec![field.clone()],
-                });
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// Values that can be transferred but not duplicated.
@@ -5882,28 +7966,22 @@ fn mandatory_ty(ty: Ty) -> bool {
 /// argument moves the authority into a callee whose parameter inherits
 /// a type-level obligation; a return moves it to a caller whose receiving
 /// place derives the same obligation from the result type.
-fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<bool> {
+fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<ValueTransfer> {
     if let Some((how, span)) = escapes {
         reject_brand_escape(ctx, e, how, span)?;
     }
-    let source = match &e.kind {
-        ExprKind::Var(n) => Some(Place::local(n).state_key()),
-        ExprKind::SelfField { field } => Some(
-            Place {
-                root: "self".to_string(),
-                fields: vec![field.clone()],
-            }
-            .state_key(),
-        ),
-        _ => None,
-    };
+    let source = Place::from_value_expr(e);
+    let value_ty =
+        e.ty.clone()
+            .expect("transfer follows successful expression checking");
+    let branded = brand_of(ctx, e);
     // A fresh result of a mandatory resource type starts with an
     // obligation even though it has no source place. A move normally
     // finds the same obligation on its source; deriving it from the type
     // as well makes returns and compiler-sealed resource producers obey
     // the same rule without one-off minting hooks.
     let mut carries = e.ty.clone().is_some_and(mandatory_ty);
-    if let Some(name) = source {
+    if let Some(name) = source.as_ref().map(Place::state_key) {
         if let Some(v) = ctx.vars.get_mut(name.as_str()) {
             carries |= v.obligation;
             // The obligation goes with the token. Whether it is discharged
@@ -5912,8 +7990,55 @@ fn transfer(ctx: &mut Ctx, e: &Expr, escapes: Option<(&str, Span)>) -> CResult<b
             v.obligation = false;
         }
     }
-    mark_moved(ctx, e)?;
-    Ok(carries)
+    // A borrow has no source place here, and a temporary already has no
+    // caller-owned place. A named affine value has exactly the place decoded
+    // above, shared with borrow conflict checking and VC call havoc.
+    let kind = if is_affine(&value_ty) {
+        if let Some(source) = source.as_ref() {
+            ctx.moved.insert(source.clone());
+            ValueTransferKind::Move
+        } else {
+            ValueTransferKind::Fresh
+        }
+    } else {
+        ValueTransferKind::Copy
+    };
+    Ok(ValueTransfer {
+        source,
+        value_ty,
+        kind,
+        carried_obligation: carries,
+        branded,
+        span: e.span,
+    })
+}
+
+/// Perform and retain a non-call value transfer. Calls and sealed operations
+/// store their argument transfers in their complete boundary records instead;
+/// every other admitted sink uses an exact owner+expression+semantic-sink
+/// identity. The sink component keeps parser-desugared expressions with one
+/// source anchor distinct without relying on traversal order.
+fn transfer_and_record(
+    ctx: &mut Ctx,
+    expression: &Expr,
+    sink: ValueTransferSink,
+    escapes: Option<(&str, Span)>,
+) -> CResult<ValueTransfer> {
+    let transfer = transfer(ctx, expression, escapes)?;
+    ctx.ownership
+        .insert_value_transfer(ctx.call_owner.clone(), sink, transfer.clone())
+        .map_err(|duplicate| Diagnostic {
+            name: "internal.check.duplicate_value_transfer".into(),
+            title: format!(
+                "duplicate value-transfer identity inside {}",
+                duplicate.owner.render()
+            ),
+            span: duplicate.span,
+            label: "owner, expression span, and semantic sink must identify exactly one transfer"
+                .into(),
+            notes: vec![],
+        })?;
+    Ok(transfer)
 }
 
 /// No `#[must_consume]` fields: the marker list outside a class member.
@@ -5955,16 +8080,16 @@ fn snapshot_has_place(snap: &HashMap<String, PlaceState>, place: &Place) -> bool
 }
 
 fn restore(ctx: &mut Ctx, snap: &HashMap<String, PlaceState>) {
+    // A lexical child block does not merely make its locals uninitialized:
+    // their names cease to denote places. Keep `ctx.declared` untouched so
+    // function-wide uniqueness remains authoritative, but remove child-only
+    // entries from the live source environment before restoring outer state.
+    ctx.vars.retain(|name, _| snap.contains_key(name));
     for (name, v) in ctx.vars.iter_mut() {
-        if let Some(st) = snap.get(name) {
-            v.initialized = st.initialized;
-            v.branded = st.branded;
-            v.obligation = st.obligation;
-        } else {
-            // Declared inside the block that is being unwound: it exists
-            // only where it was declared.
-            v.initialized = false;
-        }
+        let st = &snap[name];
+        v.initialized = st.initialized;
+        v.branded = st.branded;
+        v.obligation = st.obligation;
     }
 }
 
@@ -6137,7 +8262,7 @@ fn reject_field_holes(ctx: &Ctx, class: &str, member: &str, span: Span) -> CResu
     let mut holes: Vec<String> = ctx
         .moved
         .iter()
-        .filter(|p| p.root == "self")
+        .filter(|p| p.root() == "self")
         .map(|p| p.render())
         .collect();
     holes.sort();
@@ -6216,10 +8341,7 @@ impl<'a> Ctx<'a> {
         // object; its untouched siblings are still readable. This is what
         // `partially-moved` means, and it is what a `deinit` body that
         // hands one field on and reads another needs (ADR 0029).
-        let place = Place {
-            root: "self".to_string(),
-            fields: vec![field.to_string()],
-        };
+        let place = Place::field("self", field);
         if self.is_moved(&place) {
             return Err(moved_out(self, &place, span, "read"));
         }
@@ -6330,7 +8452,27 @@ fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
         ExprKind::OptTake { .. } => false,
         ExprKind::RecordLit { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
         ExprKind::RecordField { obj, .. } => ctx.vars.get(obj.as_str()).is_some_and(|v| v.branded),
-        _ => false,
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::Widen { .. }
+        | ExprKind::Narrow { .. }
+        | ExprKind::NoneE
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. } => false,
     }
 }
 
@@ -6356,7 +8498,36 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
         ExprKind::Var(n) | ExprKind::Borrow { array: n, .. } => {
             ctx.vars.get(n.as_str()).map(|v| v.ty.clone())
         }
-        _ => e.ty.clone(),
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::RawOp { .. }
+        | ExprKind::DeviceOp { .. }
+        | ExprKind::ResOp { .. }
+        | ExprKind::Widen { .. }
+        | ExprKind::Narrow { .. }
+        | ExprKind::IsSome { .. }
+        | ExprKind::OptValue { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::SomeE(_)
+        | ExprKind::NoneE
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::RecordLit { .. } => e.ty.clone(),
     };
     if !ty.is_some_and(|t| {
         matches!(
@@ -6368,7 +8539,36 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
     }
     let name = match &e.kind {
         ExprKind::Var(n) | ExprKind::Borrow { array: n, .. } => format!("`{n}`"),
-        _ => "storage derived from this exposure".to_string(),
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::RawOp { .. }
+        | ExprKind::DeviceOp { .. }
+        | ExprKind::ResOp { .. }
+        | ExprKind::Widen { .. }
+        | ExprKind::Narrow { .. }
+        | ExprKind::IsSome { .. }
+        | ExprKind::OptValue { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::SomeE(_)
+        | ExprKind::NoneE
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::RecordLit { .. } => "storage derived from this exposure".to_string(),
     };
     Err(Diagnostic {
         name: "expose.brand_escapes".into(),
@@ -6393,7 +8593,7 @@ fn moved_out(ctx: &Ctx, p: &Place, span: Span, how: &str) -> Diagnostic {
     let label = match how {
         "borrow" => "borrowing a moved-from place",
         "store" => "writing into a moved-from place",
-        _ => "the value was passed by value earlier",
+        _other => "the value was passed by value earlier",
     }
     .to_string();
     if ctx.is_array_place(p) {
@@ -6554,8 +8754,29 @@ fn infer_int_pair(
 
 fn int_of(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>, op_span: Span) -> CResult<Ty> {
     match check_expr(ctx, e, expected)? {
-        ty if is_integer_ty(ty.clone()) => Ok(ty),
-        other => Err(Diagnostic {
+        ty @ (Ty::Int(
+            IntTy::U8
+            | IntTy::U16
+            | IntTy::U32
+            | IntTy::U64
+            | IntTy::I8
+            | IntTy::I16
+            | IntTy::I32
+            | IntTy::I64,
+        )
+        | Ty::Param(_)) => Ok(ty),
+        other @ (Ty::Int(IntTy::TParam(_))
+        | Ty::Bool
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit) => Err(Diagnostic {
             name: "type.mismatch".into(),
             title: format!("arithmetic/comparison on `{}`", other.name()),
             span: op_span,
@@ -6575,38 +8796,66 @@ fn is_literal_only(e: &Expr) -> bool {
         ExprKind::Binary { op, lhs, rhs, .. } if op.is_arith() => {
             is_literal_only(lhs) && is_literal_only(rhs)
         }
-        _ => false,
+        ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::RawOp { .. }
+        | ExprKind::DeviceOp { .. }
+        | ExprKind::ResOp { .. }
+        | ExprKind::Widen { .. }
+        | ExprKind::Narrow { .. }
+        | ExprKind::IsSome { .. }
+        | ExprKind::OptValue { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::SomeE(_)
+        | ExprKind::NoneE
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::Borrow { .. }
+        | ExprKind::RecordLit { .. } => false,
     }
 }
 
-fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<String> {
+fn find_cycle(graph: &HashMap<CallOwner, Vec<CallOwner>>) -> Option<CallOwner> {
     #[derive(Clone, Copy, PartialEq)]
     enum State {
         Unvisited,
         InProgress,
         Done,
     }
-    let mut state: HashMap<&str, State> = graph
-        .keys()
-        .map(|k| (k.as_str(), State::Unvisited))
-        .collect();
+    let mut state: HashMap<&CallOwner, State> =
+        graph.keys().map(|key| (key, State::Unvisited)).collect();
 
     fn dfs<'a>(
-        node: &'a str,
-        graph: &'a HashMap<String, Vec<String>>,
-        state: &mut HashMap<&'a str, State>,
-    ) -> Option<String> {
+        node: &'a CallOwner,
+        graph: &'a HashMap<CallOwner, Vec<CallOwner>>,
+        state: &mut HashMap<&'a CallOwner, State>,
+    ) -> Option<CallOwner> {
         state.insert(node, State::InProgress);
         if let Some(callees) = graph.get(node) {
-            for c in callees {
-                match state.get(c.as_str()).copied() {
-                    Some(State::InProgress) => return Some(c.clone()),
+            for callee in callees {
+                match state.get(callee).copied() {
+                    Some(State::InProgress) => return Some(callee.clone()),
                     Some(State::Unvisited) => {
-                        if let Some(found) = dfs(c.as_str(), graph, state) {
+                        if let Some(found) = dfs(callee, graph, state) {
                             return Some(found);
                         }
                     }
-                    _ => {}
+                    Some(State::Done) | None => {}
                 }
             }
         }
@@ -6614,10 +8863,11 @@ fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<String> {
         None
     }
 
-    let keys: Vec<&str> = graph.keys().map(|k| k.as_str()).collect();
-    for k in keys {
-        if state.get(k) == Some(&State::Unvisited) {
-            if let Some(found) = dfs(k, graph, &mut state) {
+    let mut keys: Vec<&CallOwner> = graph.keys().collect();
+    keys.sort();
+    for key in keys {
+        if state.get(key) == Some(&State::Unvisited) {
+            if let Some(found) = dfs(key, graph, &mut state) {
                 return Some(found);
             }
         }
@@ -6629,6 +8879,30 @@ fn find_cycle(graph: &HashMap<String, Vec<String>>) -> Option<String> {
 mod concrete_aggregate_tests {
     use super::*;
     use crate::span::LineMap;
+
+    #[test]
+    fn trusted_checker_and_vcgen_do_not_use_bare_match_catchalls() {
+        for (name, source) in [
+            ("check.rs", include_str!("check.rs")),
+            ("vcgen.rs", include_str!("vcgen.rs")),
+        ] {
+            let production_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for (line_index, line) in production_source.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("").trim();
+                let compact: String = code.chars().filter(|ch| !ch.is_whitespace()).collect();
+                let bare_arm = compact.starts_with("_=>");
+                let leading_tuple_slot = compact.starts_with("(_,");
+                let trailing_tuple_slot = compact.starts_with('(')
+                    && (compact.contains(",_)=>") || compact.contains(",_)if"));
+
+                assert!(
+                    !bare_arm && !leading_tuple_slot && !trailing_tuple_slot,
+                    "{name}:{} uses a wildcard match catch-all in trusted semantic code: {code}",
+                    line_index + 1
+                );
+            }
+        }
+    }
 
     fn parse_program(source: &str) -> Program {
         let scanned = crate::scan::scan(source);
@@ -6653,6 +8927,108 @@ mod concrete_aggregate_tests {
             Err(error) => error,
             Ok(_) => panic!("test source unexpectedly typechecked"),
         }
+    }
+
+    #[test]
+    fn borrowed_whitelisted_resources_remain_extern_abi_parameters() {
+        let mut program = parse_program(
+            r#"
+pub extern "C" #[audit(id := "test.borrowed-resource.v1",
+                        reason := "pins the established erased-resource ABI")]
+fn foreign(raw<u8> p, resource &RawSpan shared,
+           resource &mut RawSpan unique, resource &mut OpenFile file,
+           resource &mut PosixWorld world);
+"#,
+        );
+        check(&mut program).expect("borrowed whitelisted resources remain ABI-admitted");
+    }
+
+    #[test]
+    fn extern_resource_abi_table_covers_owned_and_borrowed_forms() {
+        for kind in [ResKind::RawSpan, ResKind::OpenFile, ResKind::PosixWorld] {
+            let owned = Ty::Res(kind);
+            let shared = Ty::Borrow(Mutability::Shared, Box::new(owned.clone()));
+            let unique = Ty::Borrow(Mutability::Mut, Box::new(owned.clone()));
+
+            assert!(extern_parameter_abi_allowed(&owned));
+            assert!(extern_parameter_abi_allowed(&shared));
+            assert!(extern_parameter_abi_allowed(&unique));
+        }
+
+        let rejected = Ty::Res(ResKind::PointsToU64);
+        for ty in [
+            rejected.clone(),
+            Ty::Borrow(Mutability::Shared, Box::new(rejected.clone())),
+            Ty::Borrow(Mutability::Mut, Box::new(rejected)),
+        ] {
+            assert!(!extern_parameter_abi_allowed(&ty));
+        }
+    }
+
+    #[test]
+    fn lexical_child_bindings_are_not_visible_after_their_control_edge() {
+        let cases = [
+            r#"
+fn subject() -> u64 {
+    if (true) {
+        mut u64 hidden = 0;
+    }
+    hidden = 1;
+    return hidden;
+}
+"#,
+            r#"
+fn subject() -> u64 {
+    mut u64 iteration = 0;
+    /// invariant iteration <= 1
+    /// variant 1 - iteration
+    while (iteration < 1) {
+        mut u64 hidden = iteration;
+        iteration = iteration + 1;
+    }
+    hidden = 1;
+    return hidden;
+}
+"#,
+        ];
+
+        for source in cases {
+            let mut program = monomorphized_program(source);
+            let error = check_error(&mut program);
+            assert_eq!(error.name, "type.unknown_variable");
+            assert_ne!(error.name, "internal.check.control_outline");
+            assert_ne!(error.name, "internal.check.control_plan");
+        }
+    }
+
+    #[test]
+    fn source_type_and_duplicate_diagnostics_precede_control_sealing() {
+        let mut duplicate = monomorphized_program(
+            r#"
+fn subject() -> u64 {
+    u64 value = 0;
+    u64 value = 1;
+    return value;
+}
+"#,
+        );
+        assert_eq!(check_error(&mut duplicate).name, "type.duplicate_name");
+
+        let mut malformed = monomorphized_program(
+            r#"
+fn subject() {
+    u64 value = 0;
+}
+"#,
+        );
+        let Stmt::Decl { ty, .. } = &mut malformed.fns[0].body[0] else {
+            panic!("fixture declaration changed shape");
+        };
+        *ty = Ty::array(Ty::array(Ty::Int(IntTy::U64)));
+        let error = check_error(&mut malformed);
+        assert_eq!(error.name, "type.array_payload_unsupported");
+        assert_ne!(error.name, "internal.check.control_outline");
+        assert_ne!(error.name, "internal.check.control_plan");
     }
 
     fn affine_bool_option() -> Ty {
@@ -7024,6 +9400,120 @@ fn move_box() -> Box {
     }
 
     #[test]
+    fn only_fresh_class_results_can_be_discarded_as_temporaries() {
+        let mut projected = monomorphized_program(
+            r#"
+class Child {
+    u64 value;
+
+    init new() {
+        self.value = 1;
+    }
+}
+
+class Parent {
+    Child child;
+
+    init new() {
+        self.child = Child::new();
+    }
+
+    fn discard_child(&mut self) {
+    }
+}
+"#,
+        );
+        // The source parser deliberately admits only calls as expression
+        // statements. Forge the otherwise well-typed projection shape to pin
+        // the checker's trust boundary too: an internal AST producer must not
+        // turn a read of an installed owner into a temporary destruction.
+        projected.classes[1].methods[0]
+            .f
+            .body
+            .push(Stmt::ExprStmt(Expr {
+                kind: ExprKind::SelfField {
+                    field: "child".into(),
+                },
+                span: Span::new(200, 210),
+                ty: Some(Ty::Class(0)),
+            }));
+        let error = check_error(&mut projected);
+        assert_eq!(error.name, "type.class_temporary_source");
+        assert!(error.title.contains("self.child"));
+
+        let mut fresh = monomorphized_program(
+            r#"
+class Child {
+    u64 value;
+
+    init new() {
+        self.value = 1;
+    }
+}
+
+fn make_child() -> Child {
+    return Child::new();
+}
+
+class Maker {
+    init new() {}
+
+    fn make(&self) -> Child {
+        return Child::new();
+    }
+}
+
+fn discard_fresh_results() {
+    make_child();
+    var maker = Maker::new();
+    maker.make();
+}
+"#,
+        );
+        // Non-generic constructor calls are not source-level statement
+        // starters, but an internal producer may still form the legitimate
+        // temporary. Keep that side of the boundary pinned beside the two
+        // source-admitted call forms.
+        fresh.fns[1].body.insert(
+            0,
+            Stmt::ExprStmt(Expr {
+                kind: ExprKind::CtorCall {
+                    class: "Child".into(),
+                    class_span: Span::new(300, 305),
+                    type_args: Vec::new(),
+                    init: "new".into(),
+                    args: Vec::new(),
+                },
+                span: Span::new(300, 312),
+                ty: Some(Ty::Class(0)),
+            }),
+        );
+        let checked = check(&mut fresh).expect("fresh class results are owned temporaries");
+        let body = &fresh.fns[1].body;
+        let discarded = [&body[0], &body[1], &body[3]];
+        for statement in discarded {
+            let Stmt::ExprStmt(result) = statement else {
+                panic!("expected discarded fresh class result");
+            };
+            assert_eq!(result.ty, Some(Ty::Class(0)));
+        }
+        let owner = CallOwner::Function("discard_fresh_results".into());
+        let discard_transfers: Vec<_> = checked
+            .ownership
+            .value_transfers_for_owner(&owner)
+            .filter(|(key, _)| key.sink == ValueTransferSink::DiscardTemporary)
+            .collect();
+        assert_eq!(discard_transfers.len(), 3);
+        for (key, transfer) in discard_transfers {
+            assert_eq!(key.owner, owner);
+            assert_eq!(key.span, transfer.span);
+            assert_eq!(transfer.source, None);
+            assert_eq!(transfer.value_ty, Ty::Class(0));
+            assert_eq!(transfer.kind, ValueTransferKind::Fresh);
+        }
+    }
+
+    #[test]
     fn owned_local_bool_arrays_cache_exact_types_for_literals_alloc_index_len_and_store() {
         let mut program = monomorphized_program(
             r#"
@@ -7371,6 +9861,25 @@ fn bad() {
             Err(error) => error,
         };
         assert_eq!(error.name, "type.mismatch");
+    }
+
+    #[test]
+    fn nested_argument_moves_still_conflict_with_an_outer_recorded_loan() {
+        let mut program = monomorphized_program(
+            r#"
+fn hand_over([u64] values) -> [u64] {
+    return values;
+}
+
+fn use_both(&mut [u64] borrowed, [u64] owned) {}
+
+fn bad() {
+    mut [u64] values = alloc_array<u64>(1, 0);
+    use_both(&mut values, hand_over(values));
+}
+"#,
+        );
+        assert_eq!(check_error(&mut program).name, "borrow.moved_in_call");
     }
 
     #[test]

@@ -326,10 +326,13 @@ fn use_it() -> u64 {
 }
 ```
 
-Class values are owned, like arrays: they move, and the destructor runs exactly
-once, at the end of the owner's scope. `corpus/verifies/bounded_stack.sable`
-is the canonical example; `corpus/verifies/ownership.sable` walks the transfer
-rules.
+Class values are owned, like arrays: they move, and a moved-from place is not
+destroyed again. On a non-trapping path, each live owner is destroyed exactly
+once when its lifetime ends — on ordinary scope fallthrough, loop cleanup,
+return unwinding, or replacement of an initialized destination. A trap
+terminates immediately: Sable does not unwind the stack or run destructors or
+array cleanup on that path. `corpus/verifies/bounded_stack.sable` is the
+canonical example; `corpus/verifies/ownership.sable` walks the transfer rules.
 
 ## 10. Modules
 

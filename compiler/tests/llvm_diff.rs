@@ -12,6 +12,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+
+// Verification remains intentionally recursive over proof/control structure.
+// Rust's test harness runs each test on a smaller spawned-thread stack than the
+// CLI's main thread, which is insufficient for the largest differential cases.
+// Give this bounded end-to-end worker the same explicit budget as the corpus
+// harness so the test observes compiler behavior rather than harness stack size.
+const LLVM_DIFF_WORKER_STACK: usize = 16 * 1024 * 1024;
 
 struct Case {
     label: &'static str,
@@ -105,6 +113,18 @@ fn repo_root() -> &'static Path {
 
 #[test]
 fn verified_llvm_matches_the_interpreter_at_o0_and_o2() {
+    let result = thread::Builder::new()
+        .name("sable-llvm-differential".into())
+        .stack_size(LLVM_DIFF_WORKER_STACK)
+        .spawn(run_verified_llvm_differential)
+        .expect("spawn LLVM differential worker")
+        .join();
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+fn run_verified_llvm_differential() {
     let Some(clang) = find_clang() else {
         assert_ne!(
             std::env::var("SABLE_REQUIRE_CLANG").as_deref(),
@@ -134,7 +154,7 @@ fn verified_llvm_matches_the_interpreter_at_o0_and_o2() {
         });
 
         eprintln!("llvm-diff {}: interpret", case.label);
-        let interpreted = sable::interp::run_fn(verified.program(), &mods, case.entry)
+        let interpreted = sable::interp::run_verified_fn(&verified, &mods, case.entry)
             .unwrap_or_else(|trap| panic!("{} interpreter trapped: {trap}", case.label));
         let expected_status = bounded_process_status(case, interpreted);
 

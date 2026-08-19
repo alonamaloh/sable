@@ -1,0 +1,42 @@
+// SVM differential subjects for the checker-sealed control plan. These keep
+// lexical cleanup observable in the emitted formal program while the ordinary
+// outcome comparison pins early return and unique-loan restoration.
+
+fn early_set(&mut [bool] values, bool take_return) {
+    if (take_return) {
+        [bool] scratch = [false];
+        values[0] = true;
+        return;
+    }
+    values[0] = false;
+}
+
+fn nested_early_return_restores_the_loan() -> bool {
+    mut [bool] values = [false];
+    early_set(&mut values, true);
+    return values[0];
+}
+
+fn branch_fallthrough_closes_its_local() -> u64 {
+    mut u64 out = 0;
+    if (true) {
+        u64 branch_local = 7;
+        out = branch_local;
+    }
+    return out;
+}
+
+fn loop_backedge_closes_its_local() -> u64 {
+    mut u64 iteration = 0;
+    /// variant 1 - iteration
+    while (iteration < 1) {
+        u64 loop_local = iteration;
+        iteration = loop_local + 1;
+    }
+    return iteration;
+}
+
+fn trapping_return_evaluates_before_cleanup() -> bool {
+    [bool] values = [true];
+    return values[7];
+}

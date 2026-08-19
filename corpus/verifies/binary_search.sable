@@ -12,8 +12,8 @@ pub fn binary_search(&[i32] a, i32 key) -> option<u64> {
     mut u64 lo = 0;
     mut u64 hi = a.len;
     /// invariant hi ≤ a.len
-    /// invariant ∀ k, 0 ≤ k → k < lo → a.get k < key
-    /// invariant ∀ k, hi ≤ k → k < a.len → key < a.get k
+    /// invariant #[label(elements_under_lo_are_less_than_key)] ∀ k, 0 ≤ k → k < lo → a.get k < key
+    /// invariant #[label(elements_hi_and_above_lo_are_more_than_key)] ∀ k, hi ≤ k → k < a.len → key < a.get k
     /// variant   hi - lo
     while (lo < hi) {
         u64 m = lo + (hi - lo) / 2;
@@ -33,17 +33,17 @@ pub fn binary_search(&[i32] a, i32 key) -> option<u64> {
 // array is sorted, and instantiating the sortedness quantifier is beyond
 // the portfolio. Hypothesis names come from the failure output.
 
-/// discharge binary_search.inv_preserved.k_0_k_k_lo_a_get_k_key by
+/// discharge binary_search.inv_preserved.elements_under_lo_are_less_than_key by
 ///   intro k hk0 hk
 ///   by_cases hklo : k < lo
-///   · exact h_inv_k_0_k_k_lo_a_get_k_key k hk0 hklo
+///   · exact h_inv_elements_under_lo_are_less_than_key k hk0 hklo
 ///   · by_cases hkm : k = lo + ((hi - lo) / 2)
 ///     · rw [hkm]; exact h_path_a_get_lo_hi_lo_2_key
 ///     · calc a.get k ≤ a.get (lo + ((hi - lo) / 2)) :=
 ///             h_pre_sorted_a k _ hk0 (by omega) (by omega)
 ///         _ < key := h_path_a_get_lo_hi_lo_2_key
 
-/// discharge binary_search.inv_preserved.k_hi_k_k_a_len_key_a_get_k.2 by
+/// discharge binary_search.inv_preserved.elements_hi_and_above_lo_are_more_than_key.2 by
 ///   intro k hk hka
 ///   by_cases hkm : k = lo + ((hi - lo) / 2)
 ///   · rw [hkm]; omega

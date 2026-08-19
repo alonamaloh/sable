@@ -10,8 +10,14 @@
 
 use crate::ast;
 use crate::ast::*;
+use crate::control::{
+    AssignmentStaging, BlockId, BodyPlan, ClassDropPhase, ClassDropPlan, ControlProgram, DropId,
+    ExitRoute, PlanError, ScopeId, StatementPlanKind, TrapSite,
+};
+use crate::place::Place;
 use crate::span::Span;
 use crate::speceval::{self, GhostDefs, SpecArray, SpecEnv, SpecVal};
+use crate::transition::CallOwner;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -393,8 +399,8 @@ fn validate_interp_param_ty(ty: Ty, context: &str) -> Result<(), String> {
         ));
     }
     // An owner crossing here is what a move is (ADR 0085): the caller's place
-    // dies at the argument, `drop_owned_params` matches the bare constructors
-    // so the callee's frame destroys what it received, and a borrow stays a
+    // dies at the argument, the BodyPlan frame candidate destroys what the
+    // callee received after postcondition monitoring, and a borrow stays a
     // second name for storage its caller keeps.
     validate_interp_ty(ty, context)
 }
@@ -1306,8 +1312,9 @@ fn validate_interp_sink(
 
 /// Reject an *owned* Boolean array crossing a boundary that would give a
 /// second place a claim on the same storage. Lending one is not that: a
-/// borrow hands over a name, and `drop_owned_params` destroys only the bare
-/// constructors, so `&[bool]` crosses a call boundary exactly as `&[T]` does.
+/// borrow hands over a name, and only an owning type receives a BodyPlan frame
+/// cleanup candidate, so `&[bool]` crosses a call boundary exactly as `&[T]`
+/// does.
 fn reject_owned_bool_array_transport(
     expr: &Expr,
     locals: &InterpLocals,
@@ -1378,18 +1385,42 @@ fn has_resource_shadow(ty: Ty) -> bool {
     )
 }
 
+#[cfg(test)]
 pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<TestReport> {
+    let control = match ControlProgram::build(program) {
+        Ok(control) => control,
+        Err(error) => return control_failure_reports(program, control_plan_message(error)),
+    };
+    run_tests_with_control(program, mods, &control)
+}
+
+pub(crate) fn run_checked_tests(
+    checked: &crate::CheckedProgram,
+    mods: &crate::modules::ModuleSet,
+) -> Vec<TestReport> {
+    run_tests_with_control(checked.program(), mods, checked.control())
+}
+
+fn control_failure_reports(program: &Program, error: String) -> Vec<TestReport> {
+    program
+        .fns
+        .iter()
+        .filter(|function| function.name.starts_with("test_"))
+        .map(|function| TestReport {
+            name: function.name.clone(),
+            outcome: Err(error.clone()),
+            skipped: Vec::new(),
+        })
+        .collect()
+}
+
+fn run_tests_with_control(
+    program: &Program,
+    mods: &crate::modules::ModuleSet,
+    control: &ControlProgram,
+) -> Vec<TestReport> {
     if let Err(error) = validate_interp_program(program) {
-        return program
-            .fns
-            .iter()
-            .filter(|function| function.name.starts_with("test_"))
-            .map(|function| TestReport {
-                name: function.name.clone(),
-                outcome: Err(error.clone()),
-                skipped: Vec::new(),
-            })
-            .collect();
+        return control_failure_reports(program, error);
     }
 
     let source = mods.combined_source.as_str();
@@ -1403,6 +1434,7 @@ pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<Tes
         .filter(|f| f.name.starts_with("test_"))
         .map(|test| {
             let mut interp = Interp {
+                control,
                 fns: &fns,
                 classes,
                 records: &program.records,
@@ -1427,23 +1459,73 @@ pub fn run_tests(program: &Program, mods: &crate::modules::ModuleSet) -> Vec<Tes
         .collect()
 }
 
-/// Run one zero-argument function, returning its value or the raw trap
-/// message (no source location) — the interpreter side of the SVM
-/// differential harness.
-pub fn run_fn(
+/// Execute a deliberately unsealed AST for focused interpreter unit probes.
+///
+/// This is compiled only with the library's own unit tests. Integration and
+/// production callers must enter through a [`crate::CheckedProgram`] or
+/// [`crate::VerifiedProgram`], so they cannot rebuild structural control from
+/// a raw AST.
+#[cfg(test)]
+fn run_unchecked_fn(
     program: &Program,
     mods: &crate::modules::ModuleSet,
     name: &str,
 ) -> Result<RtVal, String> {
-    run_fn_observed(program, mods, name).outcome
+    run_unchecked_fn_observed(program, mods, name).outcome
 }
 
-/// Run one zero-argument function while retaining its ordered MMIO trace.
-/// Existing callers that observe only the return/trap keep using `run_fn`.
-pub fn run_fn_observed(
+/// Execute a function using the exact control plan sealed by the checker.
+pub fn run_checked_fn(
+    checked: &crate::CheckedProgram,
+    mods: &crate::modules::ModuleSet,
+    name: &str,
+) -> Result<RtVal, String> {
+    run_fn_observed_with_control(checked.program(), mods, name, checked.control()).outcome
+}
+
+/// Execute a function using the control plan that travelled through Lean
+/// verification with the exact typed AST.
+pub fn run_verified_fn(
+    verified: &crate::VerifiedProgram,
+    mods: &crate::modules::ModuleSet,
+    name: &str,
+) -> Result<RtVal, String> {
+    run_fn_observed_with_control(verified.program(), mods, name, verified.control()).outcome
+}
+
+#[cfg(test)]
+fn run_unchecked_fn_observed(
     program: &Program,
     mods: &crate::modules::ModuleSet,
     name: &str,
+) -> ObservedRun {
+    let control = match ControlProgram::build(program) {
+        Ok(control) => control,
+        Err(error) => {
+            return ObservedRun {
+                outcome: Err(control_plan_message(error)),
+                mmio: Vec::new(),
+                uart_profile: None,
+                uart_cursor: 0,
+            };
+        }
+    };
+    run_fn_observed_with_control(program, mods, name, &control)
+}
+
+pub fn run_checked_fn_observed(
+    checked: &crate::CheckedProgram,
+    mods: &crate::modules::ModuleSet,
+    name: &str,
+) -> ObservedRun {
+    run_fn_observed_with_control(checked.program(), mods, name, checked.control())
+}
+
+fn run_fn_observed_with_control(
+    program: &Program,
+    mods: &crate::modules::ModuleSet,
+    name: &str,
+    control: &ControlProgram,
 ) -> ObservedRun {
     if let Err(error) = validate_interp_program(program) {
         return ObservedRun {
@@ -1458,6 +1540,7 @@ pub fn run_fn_observed(
     let fns: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let f = fns[name];
     let mut interp = Interp {
+        control,
         fns: &fns,
         classes: &program.classes,
         records: &program.records,
@@ -1496,6 +1579,7 @@ enum Flow {
 }
 
 struct Interp<'a> {
+    control: &'a ControlProgram,
     fns: &'a HashMap<&'a str, &'a Fn>,
     classes: &'a [ClassDecl],
     records: &'a [RecordDecl],
@@ -1725,6 +1809,106 @@ struct Frame {
     self_ctx: Option<(usize, Rc<RefCell<HashMap<String, RtVal>>>)>,
 }
 
+/// Dynamic activation state for one shared lexical control plan.
+///
+/// The plan owns candidate identity and exit ordering. The interpreter still
+/// owns the dynamic question: a declaration is reached on this run, and a
+/// moved place may be empty by the time its candidate is visited.
+struct ExecutionControl<'a> {
+    plan: &'a BodyPlan,
+    reached: HashSet<DropId>,
+}
+
+#[derive(Clone, Copy)]
+struct TrapContext<'a> {
+    plan: &'a BodyPlan,
+    scope: ScopeId,
+}
+
+impl<'a> TrapContext<'a> {
+    const fn new(plan: &'a BodyPlan, scope: ScopeId) -> Self {
+        Self { plan, scope }
+    }
+
+    fn consume_expression(self, expression: &Expr) -> IResult<()> {
+        let sites = self
+            .plan
+            .expression_trap_sites(self.scope, expression)
+            .map_err(control_plan_trap)?;
+        consume_trap_sites(&sites, Some(self.scope))
+    }
+
+    fn consume_statement(self, statement: &Stmt) -> IResult<()> {
+        let sites = self
+            .plan
+            .statement_trap_sites(self.scope, statement)
+            .map_err(control_plan_trap)?;
+        consume_trap_sites(&sites, None)
+    }
+}
+
+fn consume_trap_sites(sites: &[&TrapSite], expected_scope: Option<ScopeId>) -> IResult<()> {
+    for site in sites {
+        let route = site.route();
+        if expected_scope.is_some_and(|scope| site.scope() != scope)
+            || route.kind() != crate::control::ExitKind::Trap
+            || !route.scopes().is_empty()
+            || !route.clears().is_empty()
+            || !route.drops().is_empty()
+        {
+            return Err(Trap {
+                undef: true,
+                message: "internal trap site does not abort through the empty no-unwind route"
+                    .into(),
+                span: site.span(),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl<'a> ExecutionControl<'a> {
+    fn new(plan: &'a BodyPlan) -> Self {
+        Self {
+            plan,
+            reached: HashSet::new(),
+        }
+    }
+
+    fn arm(&mut self, name: &str, scope: ScopeId, span: Span) -> IResult<()> {
+        let place = Place::local(name);
+        let Some(candidate) = self.plan.candidate_for_place(&place) else {
+            return Ok(());
+        };
+        if candidate.scope() != scope {
+            return Err(Trap {
+                undef: true,
+                message: format!(
+                    "internal control plan assigned `{name}` to a different lexical scope"
+                ),
+                span,
+            });
+        }
+        self.reached.insert(candidate.id());
+        Ok(())
+    }
+}
+
+fn control_plan_trap(error: PlanError) -> Trap {
+    Trap {
+        undef: true,
+        message: control_plan_message(error.clone()),
+        span: error.span,
+    }
+}
+
+fn control_plan_message(error: PlanError) -> String {
+    format!(
+        "internal control plan rejected the checked body: {}",
+        error.message
+    )
+}
+
 impl<'a> Interp<'a> {
     /// The deterministic test shims. An extern has no Sable body, so
     /// `sable test` has to supply one — and it is keyed on the *audit id*,
@@ -1871,6 +2055,16 @@ impl<'a> Interp<'a> {
     }
 
     fn call(&mut self, f: &'a Fn, args: Vec<RtVal>) -> IResult<RtVal> {
+        let owner = CallOwner::Function(f.name.clone());
+        let control_body = self
+            .control
+            .body(&owner, f.span)
+            .map_err(control_plan_trap)?;
+        control_body
+            .validate_callable(f.span, &f.params, &f.body)
+            .map_err(control_plan_trap)?;
+        let plan = control_body.plan();
+        let mut control = ExecutionControl::new(plan);
         let mut frame = Frame {
             vars: HashMap::new(),
             entry_scalars: HashMap::new(),
@@ -1925,13 +2119,14 @@ impl<'a> Interp<'a> {
             if p.ty.clone().is_resource() && !has_resource_shadow(p.ty.clone()) {
                 frame.vars.insert(p.name.clone(), RtVal::Unit);
             }
+            control.arm(&p.name, plan.frame_scope(), p.span)?;
         }
 
         for pre in &f.pres {
             self.check_clause(&frame, pre, None, &format!("pre of `{}`", f.name))?;
         }
 
-        let flow = self.exec_block(&f.body, &mut frame)?;
+        let flow = self.exec_body(&f.body, &mut frame, &mut control)?;
         let result = match flow {
             Flow::Return(v) => v,
             Flow::Normal => RtVal::Unit,
@@ -1945,26 +2140,9 @@ impl<'a> Interp<'a> {
                 &format!("post of `{}`", f.name),
             )?;
         }
-        self.drop_owned_params(&f.params, &mut frame)?;
+        let frame_exit = plan.implicit_return().frame().clone();
+        self.cleanup_route(&frame_exit, &mut frame, &mut control)?;
         Ok(result)
-    }
-
-    /// Owned parameters die with the frame, after the contract has been
-    /// checked against them. A by-value class or array argument was handed
-    /// over, so the callee is who destroys it — unless the body moved it on,
-    /// in which case its place is already empty.
-    fn drop_owned_params(&mut self, params: &[Param], frame: &mut Frame) -> IResult<()> {
-        for p in params.iter().rev() {
-            // Bare constructors only. A borrow's runtime value is the same
-            // `Rc` the caller holds (`ExprKind::Borrow` clones the handle),
-            // so a rule that looked through `Ty::Borrow` here would free the
-            // caller's storage. `Ty::Borrow` being a separate constructor is
-            // what makes that unwritable rather than merely unwritten.
-            if matches!(p.ty, Ty::Class(_) | Ty::Array(_)) {
-                self.drop_place(&RtPlace::Local(p.name.clone()), frame)?;
-            }
-        }
-        Ok(())
     }
 
     /// Contract-clause check with the right environment: entry values for
@@ -2084,55 +2262,116 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Run a block that owns its declarations: whatever it declares is
-    /// destroyed at the closing brace, in reverse declaration order.
-    fn exec_block(&mut self, stmts: &[Stmt], frame: &mut Frame) -> IResult<Flow> {
-        let mut locals: Vec<String> = Vec::new();
-        let out = self.exec_stmts(stmts, frame, &mut locals);
-        // RAII: drop block-local values in reverse declaration order.
-        // A local the block moved away is no longer in its place, which is
-        // the whole reason a move removes it: the value belongs to whoever
-        // took it, and this scope has nothing left to destroy.
-        //
-        // The drops run whether the block fell off its end or returned,
-        // but not after a trap: a trapped program has stopped, and running
-        // destructors past the failure would report the *second* thing that
-        // went wrong.
-        let out = out?;
-        for name in locals.iter().rev() {
-            self.drop_place(&RtPlace::Local(name.clone()), frame)?;
+    /// Run one lexical scope using the shared plan's candidate order.
+    ///
+    /// A normal close consumes the scope's fallthrough/backedge route. An
+    /// explicit return already consumed its complete lexical route at the
+    /// return site. Rust error propagation intentionally consumes neither:
+    /// Sable traps abort without unwinding.
+    fn exec_body(
+        &mut self,
+        stmts: &[Stmt],
+        frame: &mut Frame,
+        control: &mut ExecutionControl<'_>,
+    ) -> IResult<Flow> {
+        let block = control.plan.body_block().id();
+        let normal_exit = control
+            .plan
+            .body_block()
+            .flow()
+            .can_fall_through()
+            .then(|| control.plan.implicit_return().lexical().clone());
+        self.exec_block(stmts, frame, control, block, normal_exit)
+    }
+
+    fn exec_block(
+        &mut self,
+        stmts: &[Stmt],
+        frame: &mut Frame,
+        control: &mut ExecutionControl<'_>,
+        block: BlockId,
+        normal_exit: Option<ExitRoute>,
+    ) -> IResult<Flow> {
+        let (can_fall_through, anchor) = {
+            let planned = control.plan.block(block);
+            (planned.flow().can_fall_through(), planned.anchor())
+        };
+        if can_fall_through != normal_exit.is_some() {
+            return Err(control_plan_trap(PlanError {
+                span: anchor,
+                message: "retained block fallthrough disagrees with its normal exit route".into(),
+            }));
+        }
+        let out = self.exec_stmts(stmts, frame, control, block)?;
+        if let Flow::Normal = out {
+            let Some(route) = normal_exit.as_ref() else {
+                return Err(control_plan_trap(PlanError {
+                    span: anchor,
+                    message: "non-fallthrough retained block completed normally".into(),
+                }));
+            };
+            self.cleanup_route(route, frame, control)?;
         }
         Ok(out)
     }
 
     /// Run a block whose declarations belong to the *enclosing* scope.
     ///
-    /// `unsafe { ... }` and an exposure body are markers, not scopes: the
-    /// checker keeps their locals in the function (ADR 0026), so a value
-    /// declared inside one is still live at the closing brace and must not
-    /// be destroyed there. The two sides have to agree about this, and the
-    /// checker's answer is the language's.
+    /// `unsafe { ... }` is a marker, not a scope: the checker keeps its locals
+    /// in the enclosing lifetime (ADR 0026), so they must not be destroyed at
+    /// this closing brace. An exposure body is the opposite case and runs
+    /// through `exec_block`, because closing the loan is a lexical lifetime.
     fn exec_open_block(
         &mut self,
         stmts: &[Stmt],
         frame: &mut Frame,
-        locals: &mut Vec<String>,
+        control: &mut ExecutionControl<'_>,
+        block: BlockId,
     ) -> IResult<Flow> {
-        self.exec_stmts(stmts, frame, locals)
+        self.exec_stmts(stmts, frame, control, block)
     }
 
     fn exec_stmts(
         &mut self,
         stmts: &[Stmt],
         frame: &mut Frame,
-        locals: &mut Vec<String>,
+        control: &mut ExecutionControl<'_>,
+        block: BlockId,
     ) -> IResult<Flow> {
+        let (scope, anchor, planned) = {
+            let block = control.plan.block(block);
+            (block.scope(), block.anchor(), block.statements().to_vec())
+        };
+        if planned.len() != stmts.len() {
+            return Err(control_plan_trap(PlanError {
+                span: anchor,
+                message: "runtime block length disagrees with its retained block plan".into(),
+            }));
+        }
         let mut out = Flow::Normal;
-        for stmt in stmts {
-            if let Stmt::VarDecl { name, .. } | Stmt::Decl { name, .. } = stmt {
-                locals.push(name.clone());
+        for (stmt, statement) in stmts.iter().zip(planned) {
+            if !statement.entry_reachable() {
+                return Err(control_plan_trap(PlanError {
+                    span: stmt_span(stmt),
+                    message: "runtime reached a statement sealed as structurally unreachable"
+                        .into(),
+                }));
             }
-            match self.exec_stmt(stmt, frame, locals)? {
+            let flow = self.exec_stmt(stmt, statement.kind(), frame, control, scope)?;
+            if let Stmt::VarDecl {
+                name, name_span, ..
+            }
+            | Stmt::Decl {
+                name, name_span, ..
+            } = stmt
+            {
+                // A declaration that completed on this dynamic path arms its
+                // candidate. Uninitialized owning places are still armed: a
+                // later assignment may install a value, while `drop_place`
+                // remains the authority for whether one is present.
+                control.arm(name, scope, *name_span)?;
+            }
+            match flow {
                 Flow::Normal => {}
                 ret => {
                     out = ret;
@@ -2141,6 +2380,97 @@ impl<'a> Interp<'a> {
             }
         }
         Ok(out)
+    }
+
+    fn cleanup_route(
+        &mut self,
+        route: &ExitRoute,
+        frame: &mut Frame,
+        control: &mut ExecutionControl<'_>,
+    ) -> IResult<()> {
+        // Resolve the complete route before mutating the frame. This both
+        // keeps an invalid shared plan from performing a partial cleanup and
+        // lets recursive destructor execution mutably borrow the interpreter
+        // without retaining a borrow into the plan.
+        let drops = route
+            .drops()
+            .iter()
+            .filter(|drop| control.reached.contains(drop))
+            .map(|drop| {
+                let candidate = control.plan.candidate(*drop);
+                if !candidate.place().is_root() {
+                    return Err(Trap {
+                        undef: true,
+                        message: format!(
+                            "internal lexical cleanup candidate `{}` is not a local",
+                            candidate.place().render()
+                        ),
+                        span: candidate.span(),
+                    });
+                }
+                Ok((*drop, candidate.place().root().to_owned()))
+            })
+            .collect::<IResult<Vec<_>>>()?;
+        let clears = route
+            .clears()
+            .iter()
+            .map(|place| {
+                if !place.is_root() {
+                    return Err(Trap {
+                        undef: true,
+                        message: format!(
+                            "internal lexical clear `{}` is not a local",
+                            place.render()
+                        ),
+                        span: Span::new(0, 0),
+                    });
+                }
+                Ok(place.root().to_owned())
+            })
+            .collect::<IResult<Vec<_>>>()?;
+
+        // A drop consumes an owning value before the binding itself dies.
+        // Non-owning locals, moved-from owners, and erased proof bindings are
+        // then cleared by the same normalized route rather than by
+        // statement-specific cleanup code.
+        for (drop, name) in drops {
+            self.drop_place(&RtPlace::Local(name), frame)?;
+            control.reached.remove(&drop);
+        }
+        for name in clears {
+            frame.vars.remove(name.as_str());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn exec_test_block(&mut self, stmts: &[Stmt], frame: &mut Frame) -> IResult<Flow> {
+        let owner_span = Span::new(usize::MAX - 1, usize::MAX);
+        let plan = BodyPlan::build(
+            CallOwner::Function("__interpreter_block_probe".into()),
+            owner_span,
+            &[],
+            stmts,
+        )
+        .map_err(control_plan_trap)?;
+        let mut control = ExecutionControl::new(&plan);
+        self.exec_body(stmts, frame, &mut control)
+    }
+
+    #[cfg(test)]
+    fn exec_test_stmt(&mut self, stmt: &Stmt, frame: &mut Frame) -> IResult<Flow> {
+        let owner_span = Span::new(usize::MAX - 1, usize::MAX);
+        let body = std::slice::from_ref(stmt);
+        let plan = BodyPlan::build(
+            CallOwner::Function("__interpreter_statement_probe".into()),
+            owner_span,
+            &[],
+            body,
+        )
+        .map_err(control_plan_trap)?;
+        let mut control = ExecutionControl::new(&plan);
+        let statement = plan.body_block().statements()[0].kind();
+        self.exec_stmt(stmt, statement, frame, &mut control, plan.body_scope())
     }
 
     /// Remove a value from its source place, returning it.
@@ -2255,8 +2585,13 @@ impl<'a> Interp<'a> {
     /// transport remains rejected by the checked owned-local slice; fresh
     /// literals and allocations have no source place to clear. Other resources
     /// are erased (ADR 0024), and scalars are copied.
-    fn eval_moved(&mut self, e: &Expr, frame: &mut Frame) -> IResult<RtVal> {
-        let v = self.eval(e, frame)?;
+    fn eval_moved(
+        &mut self,
+        e: &Expr,
+        frame: &mut Frame,
+        traps: TrapContext<'_>,
+    ) -> IResult<RtVal> {
+        let v = self.eval(e, frame, traps)?;
         if matches!(v, RtVal::Obj { .. } | RtVal::Arr(_) | RtVal::ResMap(_)) {
             if let Some(place) = Self::source_place(e) {
                 self.take_place(&place, frame);
@@ -2270,7 +2605,12 @@ impl<'a> Interp<'a> {
     /// itself has no runtime read to perform; constructors, transformations,
     /// and ordinary calls still execute, preserving source call-by-value
     /// order even though no value crosses the callee's runtime signature.
-    fn eval_erased_resource_arg(&mut self, e: &Expr, frame: &mut Frame) -> IResult<()> {
+    fn eval_erased_resource_arg(
+        &mut self,
+        e: &Expr,
+        frame: &mut Frame,
+        traps: TrapContext<'_>,
+    ) -> IResult<()> {
         // The checked formal parameter or sealed primitive operand is the
         // authority for erasedness here. Resource variables and borrows may
         // have no cached `Expr::ty`: their checker arms return as soon as the
@@ -2283,7 +2623,7 @@ impl<'a> Interp<'a> {
         match &e.kind {
             ExprKind::Var(_) | ExprKind::Borrow { .. } | ExprKind::SelfField { .. } => Ok(()),
             _ => {
-                self.eval_moved(e, frame)?;
+                self.eval_moved(e, frame, traps)?;
                 Ok(())
             }
         }
@@ -2292,50 +2632,171 @@ impl<'a> Interp<'a> {
     /// Operand evaluation for a resource transformation whose result is
     /// erased. Nested resource expressions recurse through the same effect
     /// boundary; ordinary operands use their normal runtime evaluator.
-    fn eval_erased_resource_operand(&mut self, e: &Expr, frame: &mut Frame) -> IResult<()> {
+    fn eval_erased_resource_operand(
+        &mut self,
+        e: &Expr,
+        frame: &mut Frame,
+        traps: TrapContext<'_>,
+    ) -> IResult<()> {
         if e.ty
             .clone()
             .is_some_and(|arg0: ast::Ty| Ty::is_resource(&arg0))
         {
-            self.eval_erased_resource_arg(e, frame)
+            self.eval_erased_resource_arg(e, frame, traps)
         } else {
-            self.eval_moved(e, frame)?;
+            self.eval_moved(e, frame, traps)?;
             Ok(())
         }
     }
 
-    /// Drop one class value: invariant, body, then the remaining fields in
-    /// reverse declaration order. A field the body moved out is *not*
-    /// dropped again — a moved field is somebody else's now, and dropping
-    /// it twice is the failure the affine discipline exists to prevent.
+    /// Consume the checker-retained destruction recipe for one class value.
+    /// A field the body moved out is *not* dropped again — dynamic presence
+    /// stays in the runtime map — but invariant/deinitializer/field order and
+    /// the terminal no-unwind policy come only from `ClassDropPlan`.
     fn drop_value(
         &mut self,
         class: usize,
         fields: &Rc<RefCell<HashMap<String, RtVal>>>,
         what: &str,
     ) -> IResult<()> {
-        let cd = self.classes[class].clone();
-        self.check_invariants_at(&cd, fields, what)?;
-        if let Some(body) = cd.deinit.clone() {
-            let mut frame = Frame {
-                vars: HashMap::new(),
-                entry_scalars: HashMap::new(),
-                olds: HashMap::new(),
-                self_ctx: Some((class, fields.clone())),
-            };
-            self.exec_block(&body, &mut frame)?;
-        }
-        // The remaining fields, in reverse declaration order. A field the
-        // body handed on is gone from the map, which is exactly the record
-        // of "already somebody else's".
-        for f in cd.fields.iter().rev() {
-            let held = fields.borrow().get(f.name.as_str()).cloned();
-            if let Some(RtVal::Obj {
-                class: fc,
-                fields: ff,
-            }) = held
-            {
-                self.drop_value(fc, &ff, &format!("{what}.{}", f.name))?;
+        let Some(cd) = self.classes.get(class).cloned() else {
+            return Err(control_plan_trap(PlanError {
+                span: Span::new(0, 0),
+                message: format!("runtime class index {class} has no concrete declaration"),
+            }));
+        };
+        let drop_plan = self
+            .control
+            .class_drop(class, &cd)
+            .map_err(control_plan_trap)?
+            .clone();
+        self.drop_value_with_plan(class, fields, what, &drop_plan, cd.span)
+    }
+
+    /// Execute an already-resolved class action. Statement cleanup sites use
+    /// this entry so their retained `ClassDropAction`, rather than the runtime
+    /// payload tag, selects the destruction recipe.
+    fn drop_value_with_plan(
+        &mut self,
+        class: usize,
+        fields: &Rc<RefCell<HashMap<String, RtVal>>>,
+        what: &str,
+        drop_plan: &ClassDropPlan,
+        use_span: Span,
+    ) -> IResult<()> {
+        let Some(cd) = self.classes.get(class).cloned() else {
+            return Err(control_plan_trap(PlanError {
+                span: use_span,
+                message: format!("runtime class index {class} has no concrete declaration"),
+            }));
+        };
+        drop_plan.validate(class, &cd).map_err(control_plan_trap)?;
+        // All three potentially failing phase kinds share this one empty
+        // route. The `?` on each operation below is therefore deliberate: a
+        // failure returns immediately and never executes the phase suffix.
+        drop_plan
+            .validate_terminal_trap_route()
+            .map_err(control_plan_trap)?;
+        debug_assert_eq!(drop_plan.class(), class);
+        let terminal = drop_plan.terminal_trap_route();
+        debug_assert_eq!(terminal.kind(), crate::control::ExitKind::Trap);
+        debug_assert!(
+            terminal.scopes().is_empty()
+                && terminal.clears().is_empty()
+                && terminal.drops().is_empty()
+        );
+
+        for phase in drop_plan.phases() {
+            match phase {
+                ClassDropPhase::CheckInvariant => {
+                    self.check_invariants_at(&cd, fields, what)?;
+                }
+                ClassDropPhase::RunDeinitializer(owner) => {
+                    let Some(body) = cd.deinit.clone() else {
+                        return Err(control_plan_trap(PlanError {
+                            span: cd.span,
+                            message: format!(
+                                "class-drop plan for `{}` retained a missing deinitializer",
+                                cd.name
+                            ),
+                        }));
+                    };
+                    let control_body = self
+                        .control
+                        .body(owner, cd.span)
+                        .map_err(control_plan_trap)?;
+                    control_body
+                        .validate_callable(cd.span, &[], &body)
+                        .map_err(control_plan_trap)?;
+                    let plan = control_body.plan();
+                    let mut control = ExecutionControl::new(plan);
+                    let mut frame = Frame {
+                        vars: HashMap::new(),
+                        entry_scalars: HashMap::new(),
+                        olds: HashMap::new(),
+                        self_ctx: Some((class, fields.clone())),
+                    };
+                    match self.exec_body(&body, &mut frame, &mut control)? {
+                        Flow::Normal => {}
+                        Flow::Return(_) => {
+                            return Err(control_plan_trap(PlanError {
+                                span: cd.span,
+                                message: format!(
+                                    "deinitializer for `{}` returned instead of completing its class-drop phase",
+                                    cd.name
+                                ),
+                            }));
+                        }
+                    }
+                }
+                ClassDropPhase::DropField(field) => {
+                    // Remove before recursively destroying: the field is no
+                    // longer live in its owner while its own deinitializer
+                    // runs. An absent entry is the representation-specific
+                    // record that the parent deinitializer moved it out.
+                    let held = fields.borrow_mut().remove(field.name());
+                    let Some(held) = held else {
+                        continue;
+                    };
+                    match (field.ty(), held) {
+                        (
+                            Ty::Class(expected),
+                            RtVal::Obj {
+                                class: actual,
+                                fields: child_fields,
+                            },
+                        ) if *expected == actual => {
+                            self.drop_value(
+                                actual,
+                                &child_fields,
+                                &format!("{what}.{}", field.name()),
+                            )?;
+                        }
+                        (Ty::Class(expected), _) => {
+                            return Err(control_plan_trap(PlanError {
+                                span: field.span(),
+                                message: format!(
+                                    "runtime field `{}` does not hold planned class index {expected}",
+                                    field.name()
+                                ),
+                            }));
+                        }
+                        (_, RtVal::Obj { class: actual, .. }) => {
+                            return Err(control_plan_trap(PlanError {
+                                span: field.span(),
+                                message: format!(
+                                    "runtime field `{}` unexpectedly holds class index {actual}",
+                                    field.name()
+                                ),
+                            }));
+                        }
+                        // Arrays and scalar/plain fields have no Sable
+                        // destructor. Removing their runtime value completes
+                        // the phase; host storage release is representation
+                        // cleanup, not a language-level unwind.
+                        (_, _) => {}
+                    }
+                }
             }
         }
         Ok(())
@@ -2390,32 +2851,271 @@ impl<'a> Interp<'a> {
     fn exec_stmt(
         &mut self,
         stmt: &Stmt,
+        statement: StatementPlanKind,
         frame: &mut Frame,
-        locals: &mut Vec<String>,
+        control: &mut ExecutionControl<'_>,
+        scope: ScopeId,
     ) -> IResult<Flow> {
+        let structurally_matches = match stmt {
+            Stmt::Return { .. } => matches!(statement, StatementPlanKind::Return),
+            Stmt::If { .. } => matches!(statement, StatementPlanKind::Branch(_)),
+            Stmt::While { .. } => matches!(statement, StatementPlanKind::Loop(_)),
+            Stmt::Unsafe { .. } => matches!(statement, StatementPlanKind::Unsafe(_)),
+            Stmt::Expose { .. } => matches!(statement, StatementPlanKind::Exposure(_)),
+            Stmt::Decl { .. }
+            | Stmt::Assign { .. }
+            | Stmt::ExprStmt(_)
+            | Stmt::Assert(_)
+            | Stmt::VarDecl { .. }
+            | Stmt::FieldAssign { .. }
+            | Stmt::FieldStore { .. }
+            | Stmt::Store { .. }
+            | Stmt::StaticAlloc { .. }
+            | Stmt::SystemAlloc { .. }
+            | Stmt::SystemDealloc { .. } => {
+                matches!(statement, StatementPlanKind::Linear(_))
+            }
+        };
+        if !structurally_matches {
+            return Err(control_plan_trap(PlanError {
+                span: stmt_span(stmt),
+                message: "runtime statement disagrees with its retained structural role".into(),
+            }));
+        }
+        // Exposure opens a raw loan, so authenticate every source identity
+        // against the retained epilogue before even consuming dynamic fuel or
+        // trap sites. In particular, a post-check AST cannot redirect the
+        // planned copyback to another array or rename the body capabilities.
+        let planned_exposure = match stmt {
+            Stmt::Expose {
+                kw_span,
+                array,
+                mutable,
+                ptr,
+                res,
+                ..
+            } => {
+                let exposure = control
+                    .plan
+                    .exposure_plan(scope, *kw_span)
+                    .map_err(control_plan_trap)?
+                    .clone();
+                let body_plan = control.plan.block(exposure.body());
+                let Some(normal) = exposure.normal().cloned() else {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "interpreter exposure has no admitted normal close plan".into(),
+                    }));
+                };
+                if exposure.parent_scope() != scope
+                    || exposure.keyword_span() != *kw_span
+                    || body_plan.kind() != crate::control::BlockKind::Exposure
+                    || body_plan.anchor() != *kw_span
+                    || body_plan.scope() != exposure.body_scope()
+                    || body_plan.flow() != exposure.body_flow()
+                    || exposure.flow() != exposure.body_flow()
+                    || exposure.body_flow().contains_return()
+                    || normal.parent_scope() != scope
+                    || normal.body_exit().kind() != crate::control::ExitKind::Fallthrough
+                    || normal.body_exit().scopes() != [exposure.body_scope()]
+                    || normal.close().kind() != crate::control::ExitKind::ExposureClose
+                    || !normal.close().scopes().is_empty()
+                    || !normal.close().clears().contains(normal.release_loan())
+                    || normal.capture() != normal.rebuild().resource()
+                    || normal.release_loan() == normal.rebuild().pointer()
+                    || &exposure.effect_key().owner != control.plan.owner()
+                    || exposure.effect_key().span != *kw_span
+                {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message:
+                            "exposure plan is detached from its retained body or normal epilogue"
+                                .into(),
+                    }));
+                }
+                let rebuild = normal.rebuild();
+                let expected_mutability = if *mutable {
+                    Mutability::Mut
+                } else {
+                    Mutability::Shared
+                };
+                if rebuild.owner() != &Place::local(array)
+                    || rebuild.pointer() != &Place::local(ptr)
+                    || rebuild.resource() != &Place::local(res)
+                    || rebuild.mutability() != expected_mutability
+                    || rebuild.keyword_span() != *kw_span
+                    || !matches!(rebuild.owner_ty().as_array(), Some((Ty::Int(IntTy::U8), _)))
+                {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "exposure source bindings, owner type, or mutability disagree with the retained rebuild action"
+                            .into(),
+                    }));
+                }
+                Some((exposure, normal))
+            }
+            _ => None,
+        };
+        // Replacement/drop actions are authenticated before fuel or runtime
+        // state changes. The interpreter may decide only whether a retained
+        // destination is dynamically present, never which cleanup recipe or
+        // staging identity belongs to this source site.
+        let planned_field_assignment = match stmt {
+            Stmt::FieldAssign {
+                field,
+                field_span,
+                value,
+            } => {
+                let destination = Place::field("self", field);
+                let action = control
+                    .plan
+                    .field_assignment(scope, *field_span, &destination, value)
+                    .map_err(control_plan_trap)?
+                    .clone();
+                if action.scope() != scope
+                    || action.span() != *field_span
+                    || action.destination() != &destination
+                {
+                    return Err(control_plan_trap(PlanError {
+                        span: *field_span,
+                        message: "field assignment is detached from its retained action".into(),
+                    }));
+                }
+                match (action.drop_if_present(), action.staging()) {
+                    (true, AssignmentStaging::Temporary(temp)) if temp.is_root() => {}
+                    (false, AssignmentStaging::Direct) => {}
+                    _ => {
+                        return Err(control_plan_trap(PlanError {
+                            span: *field_span,
+                            message: "field assignment has inconsistent retained staging".into(),
+                        }));
+                    }
+                }
+                let drop_plan = action
+                    .class_drop()
+                    .map(|drop| {
+                        self.control
+                            .class_drop_for_action(drop, self.classes, *field_span)
+                            .cloned()
+                    })
+                    .transpose()
+                    .map_err(control_plan_trap)?;
+                Some((action, drop_plan))
+            }
+            _ => None,
+        };
+        let planned_temporary_drop = match stmt {
+            Stmt::ExprStmt(expression) if matches!(expression.ty, Some(Ty::Class(_))) => {
+                let action = control
+                    .plan
+                    .temporary_drop(scope, expression)
+                    .map_err(control_plan_trap)?
+                    .clone();
+                if action.scope() != scope
+                    || action.span() != expression.span
+                    || !action.temporary().is_root()
+                {
+                    return Err(control_plan_trap(PlanError {
+                        span: expression.span,
+                        message:
+                            "discarded class result is detached from its retained temporary action"
+                                .into(),
+                    }));
+                }
+                let drop_plan = self
+                    .control
+                    .class_drop_for_action(action.class_drop(), self.classes, expression.span)
+                    .map_err(control_plan_trap)?
+                    .clone();
+                Some((action, drop_plan))
+            }
+            _ => None,
+        };
         self.burn(stmt_span(stmt))?;
+        let traps = TrapContext::new(control.plan, scope);
+        traps.consume_statement(stmt)?;
         match stmt {
             Stmt::Decl { name, init, .. } => {
                 if let Some(e) = init {
-                    let v = self.eval_moved(e, frame)?;
+                    let v = self.eval_moved(e, frame, traps)?;
                     frame.vars.insert(name.clone(), v);
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::Assign { name, value, .. } => {
-                let v = self.eval_moved(value, frame)?;
-                // Overwriting a place destroys what it held: the same drop
-                // as at scope exit, destructor and fields included. The
-                // new value goes in afterwards, so a self-assignment
-                // cannot destroy what it is about to store.
-                self.drop_place(&RtPlace::Local(name.clone()), frame)?;
-                frame.vars.insert(name.clone(), v);
+            Stmt::Assign {
+                name,
+                name_span,
+                value,
+            } => {
+                let destination = Place::local(name);
+                let action = control
+                    .plan
+                    .assignment(scope, *name_span, &destination)
+                    .map_err(control_plan_trap)?
+                    .clone();
+                if action.scope() != scope {
+                    return Err(Trap {
+                        undef: true,
+                        message: "internal control assignment has a mismatched lexical scope"
+                            .into(),
+                        span: action.span(),
+                    });
+                }
+                match (action.previous(), action.staging()) {
+                    (Some(_), AssignmentStaging::Temporary(temp)) if temp.is_root() => {}
+                    (None, AssignmentStaging::Direct) => {}
+                    _ => {
+                        return Err(Trap {
+                            undef: true,
+                            message: "internal control assignment has inconsistent staging".into(),
+                            span: action.span(),
+                        });
+                    }
+                }
+                let v = self.eval_moved(value, frame, traps)?;
+                // The action, rather than the runtime value's shape, decides
+                // whether replacement has an old cleanup candidate. Runtime
+                // liveness still decides whether a moved-out place contains
+                // anything for that planned drop to destroy.
+                if let Some(drop) = action.previous() {
+                    if !control.reached.contains(&drop) {
+                        return Err(Trap {
+                            undef: true,
+                            message: format!(
+                                "internal control assignment reached `{}` before its binding",
+                                action.destination().render()
+                            ),
+                            span: action.span(),
+                        });
+                    }
+                    let candidate = control.plan.candidate(drop);
+                    if candidate.place() != action.destination() || candidate.ty() != action.ty() {
+                        return Err(Trap {
+                            undef: true,
+                            message:
+                                "internal control assignment names a mismatched drop candidate"
+                                    .into(),
+                            span: action.span(),
+                        });
+                    }
+                    self.drop_place(
+                        &RtPlace::Local(action.destination().root().to_owned()),
+                        frame,
+                    )?;
+                }
+                frame.vars.insert(action.destination().root().to_owned(), v);
                 Ok(Flow::Normal)
             }
-            // `unsafe { ... }` is a marker: the block runs like any other.
-            Stmt::Unsafe { body, .. } => self.exec_open_block(body, frame, locals),
+            // `unsafe { ... }` is a marker: its retained block shares the
+            // active lexical scope and therefore has no close at this brace.
+            Stmt::Unsafe { body, .. } => {
+                let StatementPlanKind::Unsafe(block) = statement else {
+                    unreachable!("the structural guard above matched `unsafe`")
+                };
+                self.exec_open_block(body, frame, control, block)
+            }
             Stmt::StaticAlloc { size, ptr, res, .. } => {
-                let RtVal::Int(n) = self.eval(size, frame)? else {
+                let RtVal::Int(n) = self.eval(size, frame, traps)? else {
                     unreachable!("checked: u64 literal")
                 };
                 let alloc = self.raw.fresh(vec![None; n as usize]);
@@ -2430,7 +3130,7 @@ impl<'a> Interp<'a> {
                 release,
                 ..
             } => {
-                let RtVal::Int(n) = self.eval(size, frame)? else {
+                let RtVal::Int(n) = self.eval(size, frame, traps)? else {
                     unreachable!("checked: u64 literal")
                 };
                 let alloc = self.raw.fresh(vec![None; n as usize]);
@@ -2445,11 +3145,11 @@ impl<'a> Interp<'a> {
                 release,
                 kw_span,
             } => {
-                let RtVal::Ptr(alloc, off) = self.eval(ptr, frame)? else {
+                let RtVal::Ptr(alloc, off) = self.eval(ptr, frame, traps)? else {
                     unreachable!("checked: raw pointer")
                 };
-                self.eval_moved(res, frame)?;
-                self.eval_moved(release, frame)?;
+                self.eval_moved(res, frame, traps)?;
+                self.eval_moved(release, frame, traps)?;
                 let Some(al) = self.raw.allocs.get_mut(&alloc) else {
                     return Err(Trap {
                         undef: true,
@@ -2472,18 +3172,58 @@ impl<'a> Interp<'a> {
             // kill the allocation. Modelling it as a real copy is what
             // makes a leaked pointer observable at runtime rather than
             // silently fine (ADR 0026).
-            Stmt::Expose {
-                kw_span,
-                array,
-                mutable,
-                ptr,
-                res,
-                body,
-                ..
-            } => {
-                let RtVal::Arr(a) = frame.vars[array.as_str()].clone() else {
-                    unreachable!("checked: u8 array")
+            Stmt::Expose { kw_span, body, .. } => {
+                // The AST supplies the executable body; the preflight above
+                // authenticated and selected every retained identity and edge
+                // before this arm may create the loan.
+                let (exposure, normal) =
+                    planned_exposure.expect("the structural guard identified an exposure");
+                let root = |place: &Place, role: &str| -> IResult<String> {
+                    if !place.is_root() {
+                        return Err(control_plan_trap(PlanError {
+                            span: *kw_span,
+                            message: format!(
+                                "interpreter exposure {role} `{}` is not a local",
+                                place.render()
+                            ),
+                        }));
+                    }
+                    Ok(place.root().to_owned())
                 };
+                let rebuild = normal.rebuild();
+                let owner = root(rebuild.owner(), "owner")?;
+                let pointer = root(rebuild.pointer(), "pointer")?;
+                let resource = root(rebuild.resource(), "resource")?;
+                let capture = root(normal.capture(), "capture")?;
+                let release = root(normal.release_loan(), "release")?;
+                if capture != resource || rebuild.keyword_span() != *kw_span {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message:
+                            "exposure capture/rebuild identities disagree with the retained site"
+                                .into(),
+                    }));
+                }
+                let Some(RtVal::Arr(a)) = frame.vars.get(owner.as_str()).cloned() else {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: format!(
+                            "interpreter exposure owner `{owner}` is absent or not an array"
+                        ),
+                    }));
+                };
+                let (owner_payload, _) = rebuild
+                    .owner_ty()
+                    .as_array()
+                    .expect("exposure preflight retained a byte-array owner");
+                if a.borrow().payload() != owner_payload.clone() {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message:
+                            "exposure runtime owner payload disagrees with its retained owner type"
+                                .into(),
+                    }));
+                }
                 let bytes: Vec<Option<i128>> = a
                     .borrow()
                     .int_values()
@@ -2494,22 +3234,47 @@ impl<'a> Interp<'a> {
                     .collect();
                 let n = bytes.len();
                 let alloc = self.raw.fresh(bytes);
-                frame.vars.insert(ptr.clone(), RtVal::Ptr(alloc, 0));
+                frame.vars.insert(pointer, RtVal::Ptr(alloc, 0));
                 // The resource has no runtime representation (ADR 0024);
                 // the binding exists so the body's names resolve.
-                frame.vars.insert(res.clone(), RtVal::Unit);
-                // An exposure body is a scope on both sides: the loan ends
-                // at the closing brace, so anything the body declared ends
-                // with it (ADR 0030). `unsafe { ... }` is the other case —
-                // vocabulary, no lifetime, no scope.
-                let flow = self.exec_block(body, frame)?;
-                let final_bytes = self
-                    .raw
-                    .allocs
-                    .get(&alloc)
-                    .map(|al| al.bytes.clone())
-                    .expect("the loan allocation is ours");
-                if *mutable {
+                frame.vars.insert(resource, RtVal::Unit);
+                // This consumer represents the plan's loan-release authority
+                // by the allocation identity itself. It survives body_exit
+                // and is removed only by the retained close route.
+                frame.vars.insert(release.clone(), RtVal::Ptr(alloc, 0));
+
+                let flow = self.exec_open_block(body, frame, control, exposure.body())?;
+                if !matches!(flow, Flow::Normal) {
+                    // Checked exposures cannot return. Keeping the edge
+                    // explicit preserves the plan's rule that only a normal
+                    // body edge may run capture/rebuild/release/close.
+                    return Ok(flow);
+                }
+
+                // ExposureNormalPlan fixes this order: capture final storage,
+                // end body bindings, rebuild/copy back, release, close scratch.
+                if !frame.vars.contains_key(capture.as_str()) {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "exposure capture action reached an absent resource binding"
+                            .into(),
+                    }));
+                }
+                let Some(allocation) = self.raw.allocs.get(&alloc) else {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "exposure capture action names an absent raw loan".into(),
+                    }));
+                };
+                if !allocation.live {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "exposure capture action names a released raw loan".into(),
+                    }));
+                }
+                let final_bytes = allocation.bytes.clone();
+                self.cleanup_route(normal.body_exit(), frame, control)?;
+                if rebuild.mutability() == Mutability::Mut {
                     for (i, b) in final_bytes.iter().enumerate().take(n) {
                         match b {
                             Some(v) => a.borrow_mut().set_int(i, *v),
@@ -2517,7 +3282,7 @@ impl<'a> Interp<'a> {
                                 return Err(Trap {
                                     undef: false,
                                     message: format!(
-                                        "exposure of `{array}` ends with byte {i} \
+                                        "exposure of `{owner}` ends with byte {i} \
                                          uninitialized"
                                     ),
                                     span: *kw_span,
@@ -2526,21 +3291,57 @@ impl<'a> Interp<'a> {
                         }
                     }
                 }
-                if let Some(al) = self.raw.allocs.get_mut(&alloc) {
-                    al.live = false;
+                let Some(RtVal::Ptr(release_alloc, 0)) = frame.vars.get(release.as_str()) else {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "exposure release action has no live retained loan".into(),
+                    }));
+                };
+                if *release_alloc != alloc {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "exposure release action names a different raw loan".into(),
+                    }));
                 }
-                frame.vars.remove(ptr.as_str());
-                frame.vars.remove(res.as_str());
-                Ok(flow)
+                let Some(allocation) = self.raw.allocs.get_mut(&alloc) else {
+                    return Err(control_plan_trap(PlanError {
+                        span: *kw_span,
+                        message: "exposure release action names an absent raw loan".into(),
+                    }));
+                };
+                allocation.live = false;
+                self.cleanup_route(normal.close(), frame, control)?;
+                Ok(Flow::Normal)
             }
             Stmt::ExprStmt(e) => {
-                // A discarded class value is a temporary that nothing
-                // names, and it dies at the end of the statement that made
-                // it. It is the one owned value with no place, so it is
-                // also the one drop that cannot go through `drop_place`.
-                let v = self.eval(e, frame)?;
-                if let RtVal::Obj { class, fields } = v {
-                    self.drop_value(class, &fields, "temporary")?;
+                let v = self.eval(e, frame, traps)?;
+                if let Some((action, drop_plan)) = planned_temporary_drop {
+                    let Ty::Class(expected) = action.ty() else {
+                        unreachable!("temporary_drop exact-lookup admits only a class")
+                    };
+                    let RtVal::Obj { class, fields } = v else {
+                        return Err(control_plan_trap(PlanError {
+                            span: action.span(),
+                            message: format!(
+                                "discarded class temporary does not hold retained class index {expected}"
+                            ),
+                        }));
+                    };
+                    if class != *expected || class != drop_plan.class() {
+                        return Err(control_plan_trap(PlanError {
+                            span: action.span(),
+                            message: format!(
+                                "discarded class temporary holds class index {class}, not retained index {expected}"
+                            ),
+                        }));
+                    }
+                    self.drop_value_with_plan(
+                        class,
+                        &fields,
+                        &action.temporary().render(),
+                        &drop_plan,
+                        action.span(),
+                    )?;
                 }
                 Ok(Flow::Normal)
             }
@@ -2549,17 +3350,76 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::VarDecl { name, init, .. } => {
-                let v = self.eval_moved(init, frame)?;
+                let v = self.eval_moved(init, frame, traps)?;
                 frame.vars.insert(name.clone(), v);
                 Ok(Flow::Normal)
             }
             Stmt::FieldAssign { field, value, .. } => {
-                let v = self.eval_moved(value, frame)?;
-                // A field is a place like any other: overwriting it
-                // destroys what it held. An `init` is the exception —
-                // there is nothing there yet — and `drop_place` on an
-                // uninitialized field finds nothing to do.
-                self.drop_place(&RtPlace::SelfField(field.clone()), frame)?;
+                let (action, drop_plan) = planned_field_assignment
+                    .expect("field-assignment preflight selected its retained action");
+                let v = self.eval_moved(value, frame, traps)?;
+                if let Ty::Class(expected) = action.ty() {
+                    match &v {
+                        RtVal::Obj { class, .. }
+                            if class == expected
+                                && drop_plan
+                                    .as_ref()
+                                    .is_some_and(|plan| plan.class() == *expected) => {}
+                        _ => {
+                            return Err(control_plan_trap(PlanError {
+                                span: action.span(),
+                                message: format!(
+                                    "field-assignment RHS does not hold retained class index {expected}"
+                                ),
+                            }));
+                        }
+                    }
+                }
+                if action.drop_if_present() {
+                    if let Some(drop_plan) = drop_plan.as_ref() {
+                        let (_, fields) = frame.self_ctx.clone().ok_or_else(|| {
+                            control_plan_trap(PlanError {
+                                span: action.span(),
+                                message: "field-assignment action has no active self object".into(),
+                            })
+                        })?;
+                        let previous = fields.borrow_mut().remove(field.as_str());
+                        if let Some(previous) = previous {
+                            let RtVal::Obj {
+                                class,
+                                fields: old_fields,
+                            } = previous
+                            else {
+                                return Err(control_plan_trap(PlanError {
+                                    span: action.span(),
+                                    message:
+                                        "class field destination held a non-class runtime value"
+                                            .into(),
+                                }));
+                            };
+                            if class != drop_plan.class() {
+                                return Err(control_plan_trap(PlanError {
+                                    span: action.span(),
+                                    message: format!(
+                                        "class field destination held index {class}, not retained index {}",
+                                        drop_plan.class()
+                                    ),
+                                }));
+                            }
+                            self.drop_value_with_plan(
+                                class,
+                                &old_fields,
+                                &action.destination().render(),
+                                drop_plan,
+                                action.span(),
+                            )?;
+                        }
+                    } else {
+                        // Arrays have no class recipe. Their presence in the
+                        // object map remains the interpreter's liveness bit.
+                        self.drop_place(&RtPlace::SelfField(field.clone()), frame)?;
+                    }
+                }
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
                 fields.borrow_mut().insert(field.clone(), v);
                 Ok(Flow::Normal)
@@ -2570,8 +3430,8 @@ impl<'a> Interp<'a> {
                 index,
                 value,
             } => {
-                let idx = self.eval_int(index, frame)?;
-                let val = self.eval(value, frame)?;
+                let idx = self.eval_int(index, frame, traps)?;
+                let val = self.eval(value, frame, traps)?;
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
                 let arr = match fields.borrow().get(field.as_str()) {
                     Some(RtVal::Arr(a)) => a.clone(),
@@ -2594,8 +3454,8 @@ impl<'a> Interp<'a> {
                 index,
                 value,
             } => {
-                let idx = self.eval_int(index, frame)?;
-                let val = self.eval(value, frame)?;
+                let idx = self.eval_int(index, frame, traps)?;
+                let val = self.eval(value, frame, traps)?;
                 let RtVal::Arr(a) = frame.vars[array.as_str()].clone() else {
                     unreachable!()
                 };
@@ -2610,14 +3470,21 @@ impl<'a> Interp<'a> {
                 a.borrow_mut().set(idx as usize, val, *array_span)?;
                 Ok(Flow::Normal)
             }
-            Stmt::Return { value, .. } => {
+            Stmt::Return { value, span } => {
                 // Returning a place is a move: the value leaves with the
                 // caller, so the scopes unwinding behind it must not find
                 // it still sitting in its source and destroy it.
                 let v = match value {
-                    Some(e) => self.eval_moved(e, frame)?,
+                    Some(e) => self.eval_moved(e, frame, traps)?,
                     None => RtVal::Unit,
                 };
+                let route = control
+                    .plan
+                    .explicit_return(*span, scope)
+                    .map_err(control_plan_trap)?
+                    .lexical()
+                    .clone();
+                self.cleanup_route(&route, frame, control)?;
                 Ok(Flow::Return(v))
             }
             Stmt::If {
@@ -2625,10 +3492,28 @@ impl<'a> Interp<'a> {
                 then_block,
                 else_block,
             } => {
-                if self.eval_bool(cond, frame)? {
-                    self.exec_block(then_block, frame)
+                let branch = control
+                    .plan
+                    .branch(scope, cond.span, else_block.is_some())
+                    .map_err(control_plan_trap)?
+                    .clone();
+                if self.eval_bool(cond, frame, traps)? {
+                    let arm = branch.then_arm();
+                    self.exec_block(
+                        then_block,
+                        frame,
+                        control,
+                        arm.block(),
+                        arm.normal_exit().cloned(),
+                    )
                 } else if let Some(eb) = else_block {
-                    self.exec_block(eb, frame)
+                    let Some(arm) = branch.else_arm() else {
+                        return Err(control_plan_trap(PlanError {
+                            span: cond.span,
+                            message: "retained branch lost its source else arm".into(),
+                        }));
+                    };
+                    self.exec_block(eb, frame, control, arm.block(), arm.normal_exit().cloned())
                 } else {
                     Ok(Flow::Normal)
                 }
@@ -2640,6 +3525,11 @@ impl<'a> Interp<'a> {
                 kw_span,
                 body,
             } => {
+                let loop_plan = control
+                    .plan
+                    .loop_plan(scope, *kw_span, cond.span)
+                    .map_err(control_plan_trap)?
+                    .clone();
                 loop {
                     self.burn(*kw_span)?;
                     for inv in invariants {
@@ -2651,7 +3541,7 @@ impl<'a> Interp<'a> {
                     // unmonitorable measure only if the condition is true:
                     // the verifier owes descent only on a body path.
                     let head_variant = variant.as_ref().map(|v| (v, self.variant_value(frame, v)));
-                    if !self.eval_bool(cond, frame)? {
+                    if !self.eval_bool(cond, frame, traps)? {
                         break;
                     }
 
@@ -2673,7 +3563,13 @@ impl<'a> Interp<'a> {
                         None => None,
                     };
 
-                    match self.exec_block(body, frame)? {
+                    match self.exec_block(
+                        body,
+                        frame,
+                        control,
+                        loop_plan.body(),
+                        loop_plan.backedge().cloned(),
+                    )? {
                         Flow::Normal => {}
                         ret => return Ok(ret),
                     }
@@ -2742,6 +3638,19 @@ impl<'a> Interp<'a> {
             .find(|i| i.name == init_name)
             .expect("checked: init exists")
             .clone();
+        let owner = CallOwner::Constructor {
+            class: class.name.clone(),
+            init: ifn.name.clone(),
+        };
+        let control_body = self
+            .control
+            .body(&owner, ifn.span)
+            .map_err(control_plan_trap)?;
+        control_body
+            .validate_callable(ifn.span, &ifn.params, &ifn.body)
+            .map_err(control_plan_trap)?;
+        let plan = control_body.plan();
+        let mut control = ExecutionControl::new(plan);
         let fields = Rc::new(RefCell::new(HashMap::new()));
         let mut frame = Frame {
             vars: HashMap::new(),
@@ -2761,6 +3670,7 @@ impl<'a> Interp<'a> {
                 }
             }
             frame.vars.insert(p.name.clone(), v);
+            control.arm(&p.name, plan.frame_scope(), p.span)?;
         }
         for pre in &ifn.pres {
             self.check_clause(
@@ -2770,7 +3680,7 @@ impl<'a> Interp<'a> {
                 &format!("pre of `{}::{}`", class.name, ifn.name),
             )?;
         }
-        self.exec_block(&ifn.body, &mut frame)?;
+        self.exec_body(&ifn.body, &mut frame, &mut control)?;
         for post in &ifn.posts {
             self.check_clause(
                 &frame,
@@ -2784,7 +3694,8 @@ impl<'a> Interp<'a> {
             &fields,
             &format!("{}::{} exit", class.name, ifn.name),
         )?;
-        self.drop_owned_params(&ifn.params, &mut frame)?;
+        let frame_exit = plan.implicit_return().frame().clone();
+        self.cleanup_route(&frame_exit, &mut frame, &mut control)?;
         Ok(RtVal::Obj { class: ci, fields })
     }
 
@@ -2802,6 +3713,19 @@ impl<'a> Interp<'a> {
             .find(|m| m.f.name == method)
             .expect("checked: method exists")
             .clone();
+        let owner = CallOwner::Method {
+            class: class.name.clone(),
+            method: m.f.name.clone(),
+        };
+        let control_body = self
+            .control
+            .body(&owner, m.f.span)
+            .map_err(control_plan_trap)?;
+        control_body
+            .validate_callable(m.f.span, &m.f.params, &m.f.body)
+            .map_err(control_plan_trap)?;
+        let plan = control_body.plan();
+        let mut control = ExecutionControl::new(plan);
         let mut frame = Frame {
             vars: HashMap::new(),
             entry_scalars: HashMap::new(),
@@ -2837,6 +3761,7 @@ impl<'a> Interp<'a> {
                 }
             }
             frame.vars.insert(p.name.clone(), v);
+            control.arm(&p.name, plan.frame_scope(), p.span)?;
         }
         for pre in &m.f.pres {
             self.check_clause(
@@ -2846,7 +3771,7 @@ impl<'a> Interp<'a> {
                 &format!("pre of `{}::{method}`", class.name),
             )?;
         }
-        let flow = self.exec_block(&m.f.body, &mut frame)?;
+        let flow = self.exec_body(&m.f.body, &mut frame, &mut control)?;
         let result = match flow {
             Flow::Return(v) => v,
             Flow::Normal => RtVal::Unit,
@@ -2862,26 +3787,28 @@ impl<'a> Interp<'a> {
                 &format!("post of `{}::{method}`", class.name),
             )?;
         }
-        self.drop_owned_params(&m.f.params, &mut frame)?;
+        let frame_exit = plan.implicit_return().frame().clone();
+        self.cleanup_route(&frame_exit, &mut frame, &mut control)?;
         Ok(result)
     }
 
-    fn eval_int(&mut self, e: &Expr, frame: &mut Frame) -> IResult<i128> {
-        match self.eval(e, frame)? {
+    fn eval_int(&mut self, e: &Expr, frame: &mut Frame, traps: TrapContext<'_>) -> IResult<i128> {
+        match self.eval(e, frame, traps)? {
             RtVal::Int(n) => Ok(n),
             _ => unreachable!("checked: int expression"),
         }
     }
 
-    fn eval_bool(&mut self, e: &Expr, frame: &mut Frame) -> IResult<bool> {
-        match self.eval(e, frame)? {
+    fn eval_bool(&mut self, e: &Expr, frame: &mut Frame, traps: TrapContext<'_>) -> IResult<bool> {
+        match self.eval(e, frame, traps)? {
             RtVal::Bool(b) => Ok(b),
             _ => unreachable!("checked: bool expression"),
         }
     }
 
-    fn eval(&mut self, e: &Expr, frame: &mut Frame) -> IResult<RtVal> {
+    fn eval(&mut self, e: &Expr, frame: &mut Frame, traps: TrapContext<'_>) -> IResult<RtVal> {
         self.burn(e.span)?;
+        traps.consume_expression(e)?;
         match &e.kind {
             ExprKind::IntLit(n) => Ok(RtVal::Int(*n)),
             ExprKind::BoolLit(b) => Ok(RtVal::Bool(*b)),
@@ -2900,7 +3827,7 @@ impl<'a> Interp<'a> {
             ExprKind::ResOp { op, args, .. } => {
                 match op {
                     ResOp::TestWorld => {
-                        let script = self.eval_int(&args[0], frame)?;
+                        let script = self.eval_int(&args[0], frame, traps)?;
                         self.world = Some(PosixWorld::scripted(script));
                     }
                     ResOp::TestUart => {
@@ -2911,7 +3838,7 @@ impl<'a> Interp<'a> {
                                 span: e.span,
                             });
                         }
-                        let script = self.eval_int(&args[0], frame)?;
+                        let script = self.eval_int(&args[0], frame, traps)?;
                         self.uart = Some(ScriptedUart::new(script));
                     }
                     // Adoption spends the world's claim on a descriptor.
@@ -2919,8 +3846,8 @@ impl<'a> Interp<'a> {
                     // this is the monitor saying so independently, the
                     // same two layers the raw operations have.
                     ResOp::OpenFileOf => {
-                        self.eval_erased_resource_arg(&args[0], frame)?;
-                        let fd = self.eval_int(&args[1], frame)?;
+                        self.eval_erased_resource_arg(&args[0], frame, traps)?;
+                        let fd = self.eval_int(&args[1], frame, traps)?;
                         if let Some(w) = &mut self.world {
                             if fd < 0 || fd >= w.fds {
                                 return Err(Trap {
@@ -2947,10 +3874,10 @@ impl<'a> Interp<'a> {
                         return Ok(RtVal::ResMap(Rc::new(RefCell::new(HashSet::new()))));
                     }
                     ResOp::ResourceMapTake => {
-                        let RtVal::ResMap(entries) = self.eval(&args[0], frame)? else {
+                        let RtVal::ResMap(entries) = self.eval(&args[0], frame, traps)? else {
                             unreachable!("checked: resource map borrow")
                         };
-                        let key = self.eval_int(&args[1], frame)?;
+                        let key = self.eval_int(&args[1], frame, traps)?;
                         if !entries.borrow_mut().remove(&key) {
                             return Err(Trap {
                                 undef: false,
@@ -2960,11 +3887,11 @@ impl<'a> Interp<'a> {
                         }
                     }
                     ResOp::ResourceMapPut => {
-                        let RtVal::ResMap(entries) = self.eval(&args[0], frame)? else {
+                        let RtVal::ResMap(entries) = self.eval(&args[0], frame, traps)? else {
                             unreachable!("checked: resource map borrow")
                         };
-                        let key = self.eval_int(&args[1], frame)?;
-                        self.eval_erased_resource_arg(&args[2], frame)?;
+                        let key = self.eval_int(&args[1], frame, traps)?;
+                        self.eval_erased_resource_arg(&args[2], frame, traps)?;
                         // The consumed cell is ordinary erased authority; only the
                         // aggregate's key set has sanitizer shadow state.
                         if !entries.borrow_mut().insert(key) {
@@ -2982,7 +3909,7 @@ impl<'a> Interp<'a> {
                     // in source order before discarding the result.
                     _ => {
                         for arg in args {
-                            self.eval_erased_resource_operand(arg, frame)?;
+                            self.eval_erased_resource_operand(arg, frame, traps)?;
                         }
                     }
                 }
@@ -3007,7 +3934,7 @@ impl<'a> Interp<'a> {
                             span: e.span,
                         });
                     }
-                    let byte = self.eval_int(&args[0], frame)?;
+                    let byte = self.eval_int(&args[0], frame, traps)?;
                     let uart = self.uart.as_mut().expect("checked above");
                     if !uart.ready {
                         return Err(Trap {
@@ -3029,7 +3956,7 @@ impl<'a> Interp<'a> {
                 let vals: Vec<RtVal> = {
                     let mut vs = Vec::with_capacity(args.len());
                     for a in args {
-                        vs.push(self.eval(a, frame)?);
+                        vs.push(self.eval(a, frame, traps)?);
                     }
                     vs
                 };
@@ -3505,7 +4432,7 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Int(a.borrow().len() as i128))
             }
             ExprKind::Index { array, index, .. } => {
-                let idx = self.eval_int(index, frame)?;
+                let idx = self.eval_int(index, frame, traps)?;
                 let RtVal::Arr(a) = &frame.vars[array.as_str()] else {
                     unreachable!()
                 };
@@ -3532,13 +4459,13 @@ impl<'a> Interp<'a> {
                         return Ok(RtVal::Bool(value.is_some()));
                     }
                 }
-                match self.eval(operand, frame)? {
+                match self.eval(operand, frame, traps)? {
                     RtVal::Opt { value, .. } => Ok(RtVal::Bool(value.is_some())),
                     RtVal::PtrOpt(o) => Ok(RtVal::Bool(o.is_some())),
                     _ => unreachable!("checked: option operand"),
                 }
             }
-            ExprKind::OptValue { operand } => match self.eval(operand, frame)? {
+            ExprKind::OptValue { operand } => match self.eval(operand, frame, traps)? {
                 RtVal::Opt {
                     value: Some(value), ..
                 } => Ok(*value),
@@ -3610,7 +4537,7 @@ impl<'a> Interp<'a> {
                 let RtVal::Arr(a) = fields.borrow()[field.as_str()].clone() else {
                     unreachable!("checked: array field")
                 };
-                let idx = self.eval_int(index, frame)?;
+                let idx = self.eval_int(index, frame, traps)?;
                 let arr = a.borrow();
                 if idx < 0 || idx as usize >= arr.len() {
                     return Err(Trap {
@@ -3621,9 +4548,9 @@ impl<'a> Interp<'a> {
                 }
                 Ok(arr.get(idx as usize))
             }
-            ExprKind::Widen { arg, .. } => self.eval(arg, frame),
+            ExprKind::Widen { arg, .. } => self.eval(arg, frame, traps),
             ExprKind::Narrow { target, arg } => {
-                let v = self.eval_int(arg, frame)?;
+                let v = self.eval_int(arg, frame, traps)?;
                 if v < target.min() || v > target.max() {
                     return Err(Trap {
                         undef: false,
@@ -3644,7 +4571,7 @@ impl<'a> Interp<'a> {
             // — would see neither of them.
             ExprKind::SomeE(inner) => match &e.ty {
                 Some(option) if option.is_affine_option() => {
-                    match self.eval_moved(inner, frame)? {
+                    match self.eval_moved(inner, frame, traps)? {
                         RtVal::Arr(array) => {
                             debug_assert_eq!(array.borrow().payload(), Ty::Bool);
                             Ok(RtVal::AffineOptBoolArray(Some(array)))
@@ -3660,14 +4587,14 @@ impl<'a> Interp<'a> {
                     }
                 }
                 Some(Ty::Option(payload)) => {
-                    let value = self.eval(inner, frame)?;
+                    let value = self.eval(inner, frame, traps)?;
                     Ok(RtVal::Opt {
                         payload: *payload.clone(),
                         value: Some(Box::new(value)),
                     })
                 }
                 Some(Ty::OptionRaw(_)) => {
-                    let RtVal::Ptr(a, o) = self.eval(inner, frame)? else {
+                    let RtVal::Ptr(a, o) = self.eval(inner, frame, traps)? else {
                         unreachable!("checked: raw pointer option")
                     };
                     Ok(RtVal::PtrOpt(Some((a, o))))
@@ -3697,7 +4624,7 @@ impl<'a> Interp<'a> {
                 };
                 let mut values = Vec::with_capacity(elems.len());
                 for el in elems {
-                    values.push(self.eval(el, frame)?);
+                    values.push(self.eval(el, frame, traps)?);
                 }
                 Ok(RtVal::Arr(Rc::new(RefCell::new(RtArray::from_values(
                     *payload.clone(),
@@ -3726,8 +4653,8 @@ impl<'a> Interp<'a> {
                 }
             }
             ExprKind::AllocArray { elem, len, init } => {
-                let n = self.eval_int(len, frame)?;
-                let initial = self.eval(init, frame)?;
+                let n = self.eval_int(len, frame, traps)?;
+                let initial = self.eval(init, frame, traps)?;
                 // Defined allocation-failure behavior: the named OOM trap.
                 if n < 0 || n > 50_000_000 {
                     return Err(Trap {
@@ -3762,7 +4689,7 @@ impl<'a> Interp<'a> {
                 Ok(RtVal::Int(n))
             }
             ExprKind::SelfFieldIndex { field, index } => {
-                let idx = self.eval_int(index, frame)?;
+                let idx = self.eval_int(index, frame, traps)?;
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
                 let arr = match fields.borrow().get(field.as_str()) {
                     Some(RtVal::Arr(a)) => a.clone(),
@@ -3788,7 +4715,7 @@ impl<'a> Interp<'a> {
                     .expect("checked: class exists");
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
-                    vals.push(self.eval_moved(a, frame)?);
+                    vals.push(self.eval_moved(a, frame, traps)?);
                 }
                 self.construct(ci, init, vals, e.span)
             }
@@ -3805,7 +4732,7 @@ impl<'a> Interp<'a> {
                     .collect();
                 let mut fields = HashMap::new();
                 for (name, arg) in field_names.into_iter().zip(args) {
-                    fields.insert(name, self.eval(arg, frame)?);
+                    fields.insert(name, self.eval(arg, frame, traps)?);
                 }
                 Ok(RtVal::Record { record: ri, fields })
             }
@@ -3817,17 +4744,17 @@ impl<'a> Interp<'a> {
                 };
                 let mut vals = Vec::with_capacity(args.len());
                 for a in args {
-                    vals.push(self.eval_moved(a, frame)?);
+                    vals.push(self.eval_moved(a, frame, traps)?);
                 }
                 self.invoke(class, method, fields, vals)
             }
             ExprKind::Unary { op, operand } => match op {
                 UnOp::Not => {
-                    let b = self.eval_bool(operand, frame)?;
+                    let b = self.eval_bool(operand, frame, traps)?;
                     Ok(RtVal::Bool(!b))
                 }
                 UnOp::Neg => {
-                    let v = self.eval_int(operand, frame)?;
+                    let v = self.eval_int(operand, frame, traps)?;
                     let Ty::Int(it) = e.ty.clone().unwrap() else {
                         unreachable!()
                     };
@@ -3837,16 +4764,16 @@ impl<'a> Interp<'a> {
             },
             ExprKind::Binary { op, lhs, rhs, .. } => {
                 if matches!(op, BinOp::And | BinOp::Or) {
-                    let l = self.eval_bool(lhs, frame)?;
+                    let l = self.eval_bool(lhs, frame, traps)?;
                     // Short-circuit, matching the VC semantics.
                     return Ok(RtVal::Bool(match op {
-                        BinOp::And => l && self.eval_bool(rhs, frame)?,
-                        BinOp::Or => l || self.eval_bool(rhs, frame)?,
+                        BinOp::And => l && self.eval_bool(rhs, frame, traps)?,
+                        BinOp::Or => l || self.eval_bool(rhs, frame, traps)?,
                         _ => unreachable!(),
                     }));
                 }
-                let a = self.eval_int(lhs, frame)?;
-                let b = self.eval_int(rhs, frame)?;
+                let a = self.eval_int(lhs, frame, traps)?;
+                let b = self.eval_int(rhs, frame, traps)?;
                 if op.is_comparison() {
                     return Ok(RtVal::Bool(match op {
                         BinOp::Lt => a < b,
@@ -3916,10 +4843,10 @@ impl<'a> Interp<'a> {
                     if p.ty.clone().is_resource()
                         && (f.extern_info.is_some() || !has_resource_shadow(p.ty.clone()))
                     {
-                        self.eval_erased_resource_arg(a, frame)?;
+                        self.eval_erased_resource_arg(a, frame, traps)?;
                         continue;
                     }
-                    vals.push(self.eval_moved(a, frame)?);
+                    vals.push(self.eval_moved(a, frame, traps)?);
                 }
                 if f.extern_info.is_some() {
                     // The foreign implementation receives only ABI values:
@@ -4102,6 +5029,7 @@ pub(crate) fn rt_bools_of(array: &RtArray) -> Vec<bool> {
 #[cfg(test)]
 mod payload_guard_tests {
     use super::*;
+    use crate::scan::{Clause, ClauseKind};
     use crate::span::Span;
 
     /// The tag beside the elements is what every later read, store, and
@@ -4152,6 +5080,190 @@ mod payload_guard_tests {
         }
     }
 
+    fn drop_clause(kind: ClauseKind, text: &str, start: usize) -> Clause {
+        Clause {
+            kind,
+            label: None,
+            fact: false,
+            unfold: false,
+            text: text.into(),
+            span: Span::new(start, start + 1),
+            line_span: Span::new(start, start + 1),
+        }
+    }
+
+    fn trapping_deinitializer(text: &str, start: usize) -> Vec<Stmt> {
+        vec![Stmt::Assert(drop_clause(ClauseKind::Assert, text, start))]
+    }
+
+    fn drop_class(
+        name: &str,
+        start: usize,
+        fields: Vec<Field>,
+        invariants: Vec<Clause>,
+        deinit: Option<Vec<Stmt>>,
+    ) -> ClassDecl {
+        ClassDecl {
+            is_pub: false,
+            name: name.into(),
+            name_span: Span::new(start, start + 1),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            fields,
+            invariants,
+            inits: Vec::new(),
+            methods: Vec::new(),
+            deinit,
+            span: Span::new(start, start + 10),
+        }
+    }
+
+    fn class_field(name: &str, class: usize, start: usize) -> Field {
+        Field {
+            name: name.into(),
+            ty: Ty::Class(class),
+            span: Span::new(start, start + 1),
+            must_consume: false,
+        }
+    }
+
+    fn runtime_object(class: usize) -> RtVal {
+        RtVal::Obj {
+            class,
+            fields: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    fn drop_runtime_object(
+        classes: Vec<ClassDecl>,
+        class: usize,
+        fields: &Rc<RefCell<HashMap<String, RtVal>>>,
+    ) -> IResult<()> {
+        let mut program = empty_program();
+        program.classes = classes;
+        let control = ControlProgram::build(&program).expect("class-drop probe has exact plans");
+        let functions: HashMap<&str, &Fn> = HashMap::new();
+        let ghosts = GhostDefs::from_items(&[]);
+        let mut interpreter = Interp {
+            control: &control,
+            fns: &functions,
+            classes: &program.classes,
+            records: &program.records,
+            ghosts: &ghosts,
+            source: "",
+            fuel: FUEL,
+            skipped: Vec::new(),
+            raw: RawHeap::default(),
+            world: None,
+            uart: None,
+        };
+        interpreter.drop_value(class, fields, "probe")
+    }
+
+    #[test]
+    fn class_invariant_failure_aborts_the_deinitializer_and_field_suffix() {
+        let child = drop_class(
+            "Child",
+            10,
+            Vec::new(),
+            Vec::new(),
+            Some(trapping_deinitializer("2 = 3", 12)),
+        );
+        let parent = drop_class(
+            "Parent",
+            30,
+            vec![class_field("child", 0, 31)],
+            vec![drop_clause(ClauseKind::Invariant, "1 = 2", 32)],
+            Some(trapping_deinitializer("3 = 4", 33)),
+        );
+        let fields = Rc::new(RefCell::new(HashMap::from([(
+            "child".into(),
+            runtime_object(0),
+        )])));
+
+        let trap = drop_runtime_object(vec![child, parent], 1, &fields)
+            .expect_err("the parent invariant must trap");
+        assert!(trap.message.contains("class invariant of `Parent`"));
+        assert!(trap.message.contains("1 = 2"));
+        assert!(
+            fields.borrow().contains_key("child"),
+            "an invariant trap must not run any later destruction phase"
+        );
+    }
+
+    #[test]
+    fn deinitializer_failure_aborts_the_field_suffix_without_unwind() {
+        let child = drop_class(
+            "Child",
+            10,
+            Vec::new(),
+            Vec::new(),
+            Some(trapping_deinitializer("2 = 3", 12)),
+        );
+        let parent = drop_class(
+            "Parent",
+            30,
+            vec![class_field("child", 0, 31)],
+            Vec::new(),
+            Some(trapping_deinitializer("3 = 4", 33)),
+        );
+        let fields = Rc::new(RefCell::new(HashMap::from([(
+            "child".into(),
+            runtime_object(0),
+        )])));
+
+        let trap = drop_runtime_object(vec![child, parent], 1, &fields)
+            .expect_err("the parent deinitializer must trap");
+        assert_eq!(trap.message, "inline assert violated: 3 = 4");
+        assert!(
+            fields.borrow().contains_key("child"),
+            "a deinitializer trap must not unwind into field destruction"
+        );
+    }
+
+    #[test]
+    fn recursive_field_failure_uses_reverse_order_and_aborts_the_suffix() {
+        let first = drop_class(
+            "First",
+            10,
+            Vec::new(),
+            Vec::new(),
+            Some(trapping_deinitializer("1 = 2", 12)),
+        );
+        let second = drop_class(
+            "Second",
+            30,
+            Vec::new(),
+            Vec::new(),
+            Some(trapping_deinitializer("2 = 3", 32)),
+        );
+        let parent = drop_class(
+            "Parent",
+            50,
+            vec![class_field("first", 0, 51), class_field("second", 1, 52)],
+            Vec::new(),
+            None,
+        );
+        let fields = Rc::new(RefCell::new(HashMap::from([
+            ("first".into(), runtime_object(0)),
+            ("second".into(), runtime_object(1)),
+        ])));
+
+        let trap = drop_runtime_object(vec![first, second, parent], 2, &fields)
+            .expect_err("the last-declared child must trap first");
+        assert_eq!(trap.message, "inline assert violated: 2 = 3");
+        let remaining = fields.borrow();
+        assert!(
+            !remaining.contains_key("second"),
+            "the active child leaves its parent place before recursive destruction"
+        );
+        assert!(
+            remaining.contains_key("first"),
+            "a recursive trap must not unwind into the remaining field suffix"
+        );
+    }
+
     fn function(name: &str, ret: Ty, body: Vec<Stmt>) -> Fn {
         Fn {
             is_pub: false,
@@ -4190,7 +5302,7 @@ mod payload_guard_tests {
 
     fn public_interp_error(program: &Program) -> String {
         let modules = crate::modules::ModuleSet::single("synthetic".into(), String::new());
-        run_fn(program, &modules, "subject")
+        run_unchecked_fn(program, &modules, "subject")
             .expect_err("synthetic affine-option program reached interpreter execution")
     }
 
@@ -4261,7 +5373,12 @@ mod payload_guard_tests {
                 },
             ],
         ));
-        assert!(public_interp_error(&program).starts_with("interp.duplicate_local:"));
+        let error = public_interp_error(&program);
+        assert!(
+            error.starts_with("internal control plan rejected the checked body:"),
+            "the shared control identity gate must reject the duplicate before execution: {error}"
+        );
+        assert!(error.contains("duplicate local `pending`"), "{error}");
     }
 
     #[test]
@@ -4356,7 +5473,9 @@ mod payload_guard_tests {
         let classes: Vec<ClassDecl> = Vec::new();
         let records: Vec<RecordDecl> = Vec::new();
         let ghosts = GhostDefs::from_items(&[]);
+        let control = ControlProgram::default();
         let mut interpreter = Interp {
+            control: &control,
             fns: &fns,
             classes: &classes,
             records: &records,
@@ -4369,6 +5488,66 @@ mod payload_guard_tests {
             uart: None,
         };
         run(&mut interpreter)
+    }
+
+    fn with_program_interpreter<R>(
+        program: &Program,
+        run: impl FnOnce(&mut Interp<'_>, &ControlProgram) -> R,
+    ) -> R {
+        let control = ControlProgram::build(program).expect("test program has exact control");
+        let functions: HashMap<&str, &Fn> = program
+            .fns
+            .iter()
+            .map(|function| (function.name.as_str(), function))
+            .collect();
+        let ghosts = GhostDefs::from_items(&program.ghosts);
+        let mut interpreter = Interp {
+            control: &control,
+            fns: &functions,
+            classes: &program.classes,
+            records: &program.records,
+            ghosts: &ghosts,
+            source: "",
+            fuel: FUEL,
+            skipped: Vec::new(),
+            raw: RawHeap::default(),
+            world: None,
+            uart: None,
+        };
+        run(&mut interpreter, &control)
+    }
+
+    fn fresh_child(span: Span) -> Expr {
+        Expr {
+            kind: ExprKind::CtorCall {
+                class: "Child".into(),
+                class_span: span,
+                type_args: Vec::new(),
+                init: "new".into(),
+                args: Vec::new(),
+            },
+            span,
+            ty: Some(Ty::Class(0)),
+        }
+    }
+
+    fn child_with_deinit(deinit: Option<Vec<Stmt>>) -> ClassDecl {
+        let mut child = drop_class("Child", 100, Vec::new(), Vec::new(), deinit);
+        let mut initializer = function("new", Ty::Unit, Vec::new());
+        initializer.span = Span::new(110, 111);
+        initializer.name_span = initializer.span;
+        child.inits.push(initializer);
+        child
+    }
+
+    fn cleanup_statement_program(statement: Stmt, deinit: Option<Vec<Stmt>>) -> Program {
+        let mut program = empty_program();
+        program.classes.push(child_with_deinit(deinit));
+        let mut subject = function("cleanup_subject", Ty::Unit, vec![statement]);
+        subject.span = Span::new(200, 240);
+        subject.name_span = Span::new(200, 201);
+        program.fns.push(subject);
+        program
     }
 
     fn frame_with(vars: HashMap<String, RtVal>) -> Frame {
@@ -4398,12 +5577,137 @@ mod payload_guard_tests {
         }
     }
 
+    fn bool_decl(name: &str, value: bool) -> Stmt {
+        Stmt::Decl {
+            ty: Ty::Bool,
+            name: name.into(),
+            name_span: Span::new(0, 0),
+            init: Some(expr(ExprKind::BoolLit(value), Some(Ty::Bool))),
+            mutable: false,
+        }
+    }
+
     fn eval_with_frame(expression: &Expr, vars: HashMap<String, RtVal>) -> Result<RtVal, String> {
         with_empty_interpreter(|interpreter| {
-            interpreter
-                .eval(expression, &mut frame_with(vars))
+            eval_test_expression(interpreter, expression, &mut frame_with(vars))
                 .map_err(|trap| trap.message)
         })
+    }
+
+    fn eval_test_expression(
+        interpreter: &mut Interp<'_>,
+        expression: &Expr,
+        frame: &mut Frame,
+    ) -> IResult<RtVal> {
+        let owner_span = Span::new(usize::MAX - 2, usize::MAX - 1);
+        let body = [Stmt::ExprStmt(expression.clone())];
+        let plan = BodyPlan::build(
+            CallOwner::Function("__interpreter_expression_probe".into()),
+            owner_span,
+            &[],
+            &body,
+        )
+        .map_err(control_plan_trap)?;
+        interpreter.eval(
+            expression,
+            frame,
+            TrapContext::new(&plan, plan.body_scope()),
+        )
+    }
+
+    fn eval_test_moved(
+        interpreter: &mut Interp<'_>,
+        expression: &Expr,
+        frame: &mut Frame,
+    ) -> IResult<RtVal> {
+        let owner_span = Span::new(usize::MAX - 2, usize::MAX - 1);
+        let body = [Stmt::ExprStmt(expression.clone())];
+        let plan = BodyPlan::build(
+            CallOwner::Function("__interpreter_move_probe".into()),
+            owner_span,
+            &[],
+            &body,
+        )
+        .map_err(control_plan_trap)?;
+        interpreter.eval_moved(
+            expression,
+            frame,
+            TrapContext::new(&plan, plan.body_scope()),
+        )
+    }
+
+    #[test]
+    fn interpreter_operations_reject_mismatched_and_moved_retained_trap_sites() {
+        let trap_span = Span::new(20, 21);
+        let integer = |value| Expr {
+            kind: ExprKind::IntLit(value),
+            span: Span::new(30 + value as usize, 31 + value as usize),
+            ty: Some(Ty::Int(IntTy::I32)),
+        };
+        let arithmetic = |op| Expr {
+            kind: ExprKind::Binary {
+                op,
+                op_span: trap_span,
+                lhs: Box::new(integer(4)),
+                rhs: Box::new(integer(2)),
+            },
+            span: trap_span,
+            ty: Some(Ty::Int(IntTy::I32)),
+        };
+        let original = arithmetic(BinOp::Add);
+        let body = [Stmt::ExprStmt(original.clone())];
+        let plan = BodyPlan::build(
+            CallOwner::Function("__retained_trap_probe".into()),
+            Span::new(100, 101),
+            &[],
+            &body,
+        )
+        .unwrap();
+
+        with_empty_interpreter(|interpreter| {
+            let mut frame = frame_with(HashMap::new());
+            let error = interpreter
+                .eval(
+                    &arithmetic(BinOp::Sub),
+                    &mut frame,
+                    TrapContext::new(&plan, plan.body_scope()),
+                )
+                .expect_err("the operation must exact-lookup its sealed semantic kind");
+            assert!(error.undef);
+            assert!(error.message.contains("SubOverflow"), "{}", error.message);
+        });
+
+        let branch_anchor = Span::new(110, 111);
+        let scoped_body = [Stmt::If {
+            cond: Expr {
+                kind: ExprKind::BoolLit(true),
+                span: branch_anchor,
+                ty: Some(Ty::Bool),
+            },
+            then_block: vec![Stmt::ExprStmt(original.clone())],
+            else_block: Some(Vec::new()),
+        }];
+        let scoped = BodyPlan::build(
+            CallOwner::Function("__moved_trap_probe".into()),
+            Span::new(120, 121),
+            &[],
+            &scoped_body,
+        )
+        .unwrap();
+        let else_scope = scoped
+            .branch(scoped.body_scope(), branch_anchor, true)
+            .unwrap()
+            .else_arm()
+            .unwrap()
+            .scope();
+        with_empty_interpreter(|interpreter| {
+            let mut frame = frame_with(HashMap::new());
+            let error = interpreter
+                .eval(&original, &mut frame, TrapContext::new(&scoped, else_scope))
+                .expect_err("moving the same operation to a sibling scope must fail");
+            assert!(error.undef);
+            assert!(error.message.contains("active lexical scope"));
+        });
     }
 
     fn eval_with_empty_runtime(expression: &Expr) -> Result<RtVal, String> {
@@ -4461,8 +5765,7 @@ mod payload_guard_tests {
         let mut frame = frame_with(HashMap::from([("pending".into(), option)]));
 
         let presence = with_empty_interpreter(|interpreter| {
-            interpreter
-                .eval(&affine_is_some("pending"), &mut frame)
+            eval_test_expression(interpreter, &affine_is_some("pending"), &mut frame)
                 .unwrap_or_else(|trap| panic!("presence test trapped: {}", trap.message))
         });
         assert!(matches!(presence, RtVal::Bool(true)));
@@ -4473,8 +5776,7 @@ mod payload_guard_tests {
         assert_eq!(Rc::strong_count(&array), 2);
 
         let taken = with_empty_interpreter(|interpreter| {
-            interpreter
-                .eval(&affine_take("pending"), &mut frame)
+            eval_test_expression(interpreter, &affine_take("pending"), &mut frame)
                 .unwrap_or_else(|trap| panic!("present take trapped: {}", trap.message))
         });
         let RtVal::Arr(taken_array) = taken else {
@@ -4487,8 +5789,7 @@ mod payload_guard_tests {
         ));
 
         let trap = with_empty_interpreter(|interpreter| {
-            interpreter
-                .eval(&affine_take("pending"), &mut frame)
+            eval_test_expression(interpreter, &affine_take("pending"), &mut frame)
                 .expect_err("second take must trap")
         });
         assert_eq!(trap.message, "`.take` of an empty affine option");
@@ -4520,8 +5821,21 @@ mod payload_guard_tests {
     #[test]
     fn a_trap_does_not_unwind_a_present_affine_option() {
         let mut frame = frame_with(HashMap::new());
+        let mut pending = affine_some_decl("pending");
+        let Stmt::Decl {
+            init:
+                Some(Expr {
+                    kind: ExprKind::SomeE(payload),
+                    ..
+                }),
+            ..
+        } = &mut pending
+        else {
+            unreachable!("fixture is an affine option containing a fresh array")
+        };
+        payload.span = Span::new(10, 11);
         let body = vec![
-            affine_some_decl("pending"),
+            pending,
             bool_array_decl("trap_source"),
             Stmt::ExprStmt(expr(
                 ExprKind::Index {
@@ -4533,13 +5847,12 @@ mod payload_guard_tests {
             )),
         ];
 
-        let trap =
-            with_empty_interpreter(
-                |interpreter| match interpreter.exec_block(&body, &mut frame) {
-                    Ok(_) => panic!("out-of-bounds access must trap"),
-                    Err(trap) => trap,
-                },
-            );
+        let trap = with_empty_interpreter(|interpreter| {
+            match interpreter.exec_test_block(&body, &mut frame) {
+                Ok(_) => panic!("out-of-bounds access must trap"),
+                Err(trap) => trap,
+            }
+        });
         assert_eq!(trap.message, "index out of bounds: index 1, length 1");
         let Some(RtVal::AffineOptBoolArray(value)) = frame.vars.get("pending") else {
             panic!("trap unwound the affine option place")
@@ -4601,8 +5914,7 @@ mod payload_guard_tests {
         );
 
         let value = with_empty_interpreter(|interpreter| {
-            interpreter
-                .eval_moved(&read, &mut frame)
+            eval_test_moved(interpreter, &read, &mut frame)
                 .unwrap_or_else(|trap| panic!("unexpected array-move trap: {}", trap.message))
         });
 
@@ -4612,11 +5924,285 @@ mod payload_guard_tests {
     }
 
     #[test]
-    fn successful_branch_and_loop_blocks_remove_array_locals() {
-        let mut frame = frame_with(HashMap::from([("again".into(), RtVal::Bool(true))]));
+    fn planned_assignment_installs_into_a_moved_out_owner_without_dropping_twice() {
+        let declaration_span = Span::new(10, 11);
+        let assignment_span = Span::new(20, 21);
+        let assignment = Stmt::Assign {
+            name: "destination".into(),
+            name_span: assignment_span,
+            value: expr(ExprKind::Var("fresh".into()), Some(Ty::Class(0))),
+        };
+        let body = vec![
+            Stmt::Decl {
+                ty: Ty::Class(0),
+                name: "destination".into(),
+                name_span: declaration_span,
+                init: None,
+                mutable: true,
+            },
+            assignment.clone(),
+        ];
+        let plan = BodyPlan::build(
+            CallOwner::Function("moved_out_assignment_probe".into()),
+            Span::new(1, 30),
+            &[],
+            &body,
+        )
+        .expect("class replacement has a planned action");
+        let mut control = ExecutionControl::new(&plan);
+        control
+            .arm("destination", plan.body_scope(), declaration_span)
+            .unwrap();
+        let fields = Rc::new(RefCell::new(HashMap::new()));
+        let mut frame = frame_with(HashMap::from([(
+            "fresh".into(),
+            RtVal::Obj {
+                class: 0,
+                fields: fields.clone(),
+            },
+        )]));
+
+        with_empty_interpreter(|interpreter| {
+            assert!(matches!(
+                interpreter.exec_stmt(
+                    &assignment,
+                    plan.body_block().statements()[1].kind(),
+                    &mut frame,
+                    &mut control,
+                    plan.body_scope(),
+                ),
+                Ok(Flow::Normal)
+            ));
+        });
+
+        assert!(!frame.vars.contains_key("fresh"));
+        let Some(RtVal::Obj {
+            fields: installed, ..
+        }) = frame.vars.get("destination")
+        else {
+            panic!("planned assignment did not install the staged owner")
+        };
+        assert!(Rc::ptr_eq(installed, &fields));
+    }
+
+    #[test]
+    fn trapping_assignment_rhs_leaves_the_old_planned_owner_live() {
+        let declaration_span = Span::new(10, 11);
+        let assignment = Stmt::Assign {
+            name: "destination".into(),
+            name_span: Span::new(20, 21),
+            value: expr(
+                ExprKind::Index {
+                    array: "trap_source".into(),
+                    array_span: Span::new(22, 23),
+                    index: Box::new(int_lit(1)),
+                },
+                Some(Ty::Class(0)),
+            ),
+        };
+        let body = vec![
+            Stmt::Decl {
+                ty: Ty::Class(0),
+                name: "destination".into(),
+                name_span: declaration_span,
+                init: None,
+                mutable: true,
+            },
+            assignment.clone(),
+        ];
+        let plan = BodyPlan::build(
+            CallOwner::Function("trapping_assignment_probe".into()),
+            Span::new(1, 30),
+            &[],
+            &body,
+        )
+        .expect("class replacement has a planned action");
+        let mut control = ExecutionControl::new(&plan);
+        control
+            .arm("destination", plan.body_scope(), declaration_span)
+            .unwrap();
+        let old_fields = Rc::new(RefCell::new(HashMap::new()));
+        let trap_source = Rc::new(RefCell::new(rt_bools(&[true])));
+        let mut frame = frame_with(HashMap::from([
+            (
+                "destination".into(),
+                RtVal::Obj {
+                    class: 0,
+                    fields: old_fields.clone(),
+                },
+            ),
+            ("trap_source".into(), RtVal::Arr(trap_source)),
+        ]));
+
+        let trap = with_empty_interpreter(|interpreter| {
+            match interpreter.exec_stmt(
+                &assignment,
+                plan.body_block().statements()[1].kind(),
+                &mut frame,
+                &mut control,
+                plan.body_scope(),
+            ) {
+                Err(trap) => trap,
+                Ok(_) => panic!("the RHS index must trap before replacement"),
+            }
+        });
+
+        assert_eq!(trap.message, "index out of bounds: index 1, length 1");
+        let Some(RtVal::Obj {
+            fields: retained, ..
+        }) = frame.vars.get("destination")
+        else {
+            panic!("trapping RHS destroyed the old destination")
+        };
+        assert!(Rc::ptr_eq(retained, &old_fields));
+    }
+
+    #[test]
+    fn retained_field_action_uses_dynamic_presence_for_first_install_moved_absence_and_replacement()
+    {
+        let field_span = Span::new(210, 211);
+        let statement = Stmt::FieldAssign {
+            field: "child".into(),
+            field_span,
+            value: expr(ExprKind::Var("fresh".into()), Some(Ty::Class(0))),
+        };
+        let program = cleanup_statement_program(statement.clone(), None);
+
+        // `None` is deliberately both a constructor's first install and a
+        // method destination whose old owner was moved out: representation
+        // liveness makes them the same action state.
+        for old in [None, Some(runtime_object(0))] {
+            with_program_interpreter(&program, |interpreter, control_program| {
+                let body = control_program
+                    .body(
+                        &CallOwner::Function("cleanup_subject".into()),
+                        program.fns[0].span,
+                    )
+                    .unwrap();
+                let plan = body.plan();
+                let mut execution = ExecutionControl::new(plan);
+                let installed_fields = Rc::new(RefCell::new(HashMap::new()));
+                let object_fields = Rc::new(RefCell::new(HashMap::new()));
+                if let Some(old) = old {
+                    object_fields.borrow_mut().insert("child".into(), old);
+                }
+                let mut frame = frame_with(HashMap::from([(
+                    "fresh".into(),
+                    RtVal::Obj {
+                        class: 0,
+                        fields: installed_fields.clone(),
+                    },
+                )]));
+                frame.self_ctx = Some((0, object_fields.clone()));
+
+                assert!(matches!(
+                    interpreter.exec_stmt(
+                        &statement,
+                        plan.body_block().statements()[0].kind(),
+                        &mut frame,
+                        &mut execution,
+                        plan.body_scope(),
+                    ),
+                    Ok(Flow::Normal)
+                ));
+                assert!(!frame.vars.contains_key("fresh"));
+                let fields = object_fields.borrow();
+                let Some(RtVal::Obj {
+                    fields: installed, ..
+                }) = fields.get("child")
+                else {
+                    panic!("retained field action did not install its staged RHS")
+                };
+                assert!(Rc::ptr_eq(installed, &installed_fields));
+            });
+        }
+    }
+
+    #[test]
+    fn trapping_field_rhs_precedes_the_retained_destination_drop() {
+        let statement = Stmt::FieldAssign {
+            field: "child".into(),
+            field_span: Span::new(210, 211),
+            value: Expr {
+                kind: ExprKind::Index {
+                    array: "trap_source".into(),
+                    array_span: Span::new(212, 213),
+                    index: Box::new(int_lit(1)),
+                },
+                span: Span::new(212, 214),
+                ty: Some(Ty::Class(0)),
+            },
+        };
+        let program = cleanup_statement_program(statement.clone(), None);
+        with_program_interpreter(&program, |interpreter, control_program| {
+            let body = control_program
+                .body(
+                    &CallOwner::Function("cleanup_subject".into()),
+                    program.fns[0].span,
+                )
+                .unwrap();
+            let plan = body.plan();
+            let mut execution = ExecutionControl::new(plan);
+            let old_fields = Rc::new(RefCell::new(HashMap::new()));
+            let object_fields = Rc::new(RefCell::new(HashMap::from([(
+                "child".into(),
+                RtVal::Obj {
+                    class: 0,
+                    fields: old_fields.clone(),
+                },
+            )])));
+            let mut frame = frame_with(HashMap::from([(
+                "trap_source".into(),
+                RtVal::Arr(Rc::new(RefCell::new(rt_bools(&[true])))),
+            )]));
+            frame.self_ctx = Some((0, object_fields.clone()));
+
+            let trap = match interpreter.exec_stmt(
+                &statement,
+                plan.body_block().statements()[0].kind(),
+                &mut frame,
+                &mut execution,
+                plan.body_scope(),
+            ) {
+                Err(trap) => trap,
+                Ok(_) => panic!("RHS must trap before replacement"),
+            };
+            assert_eq!(trap.message, "index out of bounds: index 1, length 1");
+            let fields = object_fields.borrow();
+            let Some(RtVal::Obj {
+                fields: retained, ..
+            }) = fields.get("child")
+            else {
+                panic!("RHS trap removed the old field destination")
+            };
+            assert!(Rc::ptr_eq(retained, &old_fields));
+        });
+    }
+
+    #[test]
+    fn discarded_class_temporary_runs_its_retained_drop_and_trap_skips_continuation() {
+        let temporary = Stmt::ExprStmt(fresh_child(Span::new(210, 211)));
+        let mut program =
+            cleanup_statement_program(temporary, Some(trapping_deinitializer("1 = 2", 120)));
+        program.fns[0]
+            .body
+            .push(Stmt::Assert(drop_clause(ClauseKind::Assert, "3 = 4", 220)));
+
+        let modules = crate::modules::ModuleSet::single("synthetic".into(), String::new());
+        let trap = run_unchecked_fn(&program, &modules, "cleanup_subject")
+            .expect_err("discarded result deinitializer must trap");
+        assert!(trap.contains("inline assert violated: 1 = 2"), "{trap}");
+    }
+
+    #[test]
+    fn successful_branch_and_loop_blocks_clear_all_planned_locals() {
+        let mut frame = frame_with(HashMap::new());
         let branch = Stmt::If {
             cond: expr(ExprKind::BoolLit(true), Some(Ty::Bool)),
-            then_block: vec![bool_array_decl("branch_flags")],
+            then_block: vec![
+                bool_array_decl("branch_flags"),
+                bool_decl("branch_scalar", true),
+            ],
             else_block: None,
         };
         let loop_stmt = Stmt::While {
@@ -4626,6 +6212,7 @@ mod payload_guard_tests {
             kw_span: Span::new(0, 0),
             body: vec![
                 bool_array_decl("loop_flags"),
+                bool_decl("loop_scalar", true),
                 Stmt::Assign {
                     name: "again".into(),
                     name_span: Span::new(0, 0),
@@ -4633,27 +6220,245 @@ mod payload_guard_tests {
                 },
             ],
         };
+        let loop_probe = vec![
+            Stmt::Decl {
+                ty: Ty::Bool,
+                name: "again".into(),
+                name_span: Span::new(1, 2),
+                init: Some(expr(ExprKind::BoolLit(true), Some(Ty::Bool))),
+                mutable: true,
+            },
+            loop_stmt,
+        ];
 
         with_empty_interpreter(|interpreter| {
-            let mut outer_locals = Vec::new();
             assert!(matches!(
-                interpreter.exec_stmt(&branch, &mut frame, &mut outer_locals),
+                interpreter.exec_test_stmt(&branch, &mut frame),
                 Ok(Flow::Normal)
             ));
             assert!(!frame.vars.contains_key("branch_flags"));
+            assert!(!frame.vars.contains_key("branch_scalar"));
             assert!(matches!(
-                interpreter.exec_stmt(&loop_stmt, &mut frame, &mut outer_locals),
+                interpreter.exec_test_block(&loop_probe, &mut frame),
                 Ok(Flow::Normal)
             ));
         });
 
         assert!(!frame.vars.contains_key("loop_flags"));
+        assert!(!frame.vars.contains_key("loop_scalar"));
+        assert!(!frame.vars.contains_key("again"));
     }
 
     #[test]
-    fn trapped_blocks_retain_array_places_without_running_cleanup() {
+    fn early_return_consumes_the_planned_nested_cleanup_route() {
+        let mut frame = frame_with(HashMap::new());
+        let mut condition = expr(ExprKind::BoolLit(true), Some(Ty::Bool));
+        condition.span = Span::new(10, 11);
+        let body = vec![
+            bool_array_decl("outer_flags"),
+            bool_decl("outer_scalar", true),
+            Stmt::If {
+                cond: condition,
+                then_block: vec![
+                    bool_array_decl("inner_flags"),
+                    bool_decl("inner_scalar", true),
+                    Stmt::Return {
+                        value: None,
+                        span: Span::new(20, 21),
+                    },
+                ],
+                else_block: None,
+            },
+        ];
+
+        with_empty_interpreter(|interpreter| {
+            assert!(matches!(
+                interpreter.exec_test_block(&body, &mut frame),
+                Ok(Flow::Return(RtVal::Unit))
+            ));
+        });
+        assert!(!frame.vars.contains_key("inner_flags"));
+        assert!(!frame.vars.contains_key("inner_scalar"));
+        assert!(!frame.vars.contains_key("outer_flags"));
+        assert!(!frame.vars.contains_key("outer_scalar"));
+    }
+
+    #[test]
+    fn exposure_uses_its_planned_clear_route_for_source_and_body_bindings() {
+        let span = Span::new(40, 41);
+        let bytes = RtArray::from_values(Ty::Int(IntTy::U8), vec![RtVal::Int(7)], span)
+            .expect("byte array fixture");
+        let mut frame = frame_with(HashMap::from([(
+            "bytes".into(),
+            RtVal::Arr(Rc::new(RefCell::new(bytes))),
+        )]));
+        let exposure = Stmt::Expose {
+            kw_span: span,
+            array: "bytes".into(),
+            array_span: Span::new(41, 42),
+            mutable: false,
+            ptr: "loan_ptr".into(),
+            ptr_span: Span::new(42, 43),
+            res: "loan_res".into(),
+            res_span: Span::new(43, 44),
+            body: vec![bool_decl("loan_scalar", true)],
+        };
+        let parameter = Param {
+            name: "bytes".into(),
+            ty: Ty::array(Ty::Int(IntTy::U8)),
+            span: Span::new(39, 40),
+            consumes: false,
+        };
+        let owner_span = Span::new(38, 39);
+        let body = std::slice::from_ref(&exposure);
+        let plan = BodyPlan::build(
+            CallOwner::Function("__interpreter_exposure_probe".into()),
+            owner_span,
+            std::slice::from_ref(&parameter),
+            body,
+        )
+        .expect("exposure probe has a typed source binding");
+        let release = plan
+            .exposure_plan(plan.body_scope(), span)
+            .unwrap()
+            .normal()
+            .unwrap()
+            .release_loan()
+            .root()
+            .to_owned();
+
+        with_empty_interpreter(|interpreter| {
+            let mut control = ExecutionControl::new(&plan);
+            control
+                .arm("bytes", plan.frame_scope(), parameter.span)
+                .expect("the owned parameter has its retained cleanup candidate");
+            assert!(matches!(
+                interpreter.exec_stmt(
+                    &exposure,
+                    plan.body_block().statements()[0].kind(),
+                    &mut frame,
+                    &mut control,
+                    plan.body_scope(),
+                ),
+                Ok(Flow::Normal)
+            ));
+            assert!(!frame.vars.contains_key(release.as_str()));
+            assert!(
+                interpreter
+                    .raw
+                    .allocs
+                    .values()
+                    .all(|allocation| !allocation.live)
+            );
+        });
+
+        assert!(frame.vars.contains_key("bytes"));
+        assert!(!frame.vars.contains_key("loan_ptr"));
+        assert!(!frame.vars.contains_key("loan_res"));
+        assert!(!frame.vars.contains_key("loan_scalar"));
+    }
+
+    #[test]
+    fn exposure_rejects_forged_source_mutability_and_pointer_before_opening_loan() {
+        let span = Span::new(60, 61);
+        let exposure = Stmt::Expose {
+            kw_span: span,
+            array: "bytes".into(),
+            array_span: Span::new(61, 62),
+            mutable: false,
+            ptr: "loan_ptr".into(),
+            ptr_span: Span::new(62, 63),
+            res: "loan_res".into(),
+            res_span: Span::new(63, 64),
+            body: vec![bool_decl("loan_scalar", true)],
+        };
+        let parameters = [
+            Param {
+                name: "bytes".into(),
+                ty: Ty::array(Ty::Int(IntTy::U8)),
+                span: Span::new(58, 59),
+                consumes: false,
+            },
+            Param {
+                name: "other".into(),
+                ty: Ty::array(Ty::Int(IntTy::U8)),
+                span: Span::new(59, 60),
+                consumes: false,
+            },
+        ];
+        let body = std::slice::from_ref(&exposure);
+        let plan = BodyPlan::build(
+            CallOwner::Function("__interpreter_exposure_identity_probe".into()),
+            Span::new(57, 58),
+            &parameters,
+            body,
+        )
+        .expect("exposure identity probe has two typed byte-array bindings");
+
+        let mut swapped_owner = exposure.clone();
+        let Stmt::Expose { array, .. } = &mut swapped_owner else {
+            unreachable!()
+        };
+        *array = "other".into();
+
+        let mut changed_mutability = exposure.clone();
+        let Stmt::Expose { mutable, .. } = &mut changed_mutability else {
+            unreachable!()
+        };
+        *mutable = true;
+
+        let mut changed_pointer = exposure.clone();
+        let Stmt::Expose { ptr, .. } = &mut changed_pointer else {
+            unreachable!()
+        };
+        *ptr = "forged_ptr".into();
+
+        for forged in [swapped_owner, changed_mutability, changed_pointer] {
+            with_empty_interpreter(|interpreter| {
+                let array = |value| {
+                    RtVal::Arr(Rc::new(RefCell::new(
+                        RtArray::from_values(Ty::Int(IntTy::U8), vec![RtVal::Int(value)], span)
+                            .expect("byte array fixture"),
+                    )))
+                };
+                let mut frame = frame_with(HashMap::from([
+                    ("bytes".into(), array(7)),
+                    ("other".into(), array(9)),
+                ]));
+                let mut control = ExecutionControl::new(&plan);
+                let outcome = interpreter.exec_stmt(
+                    &forged,
+                    plan.body_block().statements()[0].kind(),
+                    &mut frame,
+                    &mut control,
+                    plan.body_scope(),
+                );
+                let Err(trap) = outcome else {
+                    panic!("forged exposure identity reached execution")
+                };
+                assert!(trap.undef, "{}", trap.message);
+                assert!(
+                    trap.message.contains("retained rebuild action"),
+                    "{}",
+                    trap.message
+                );
+                assert!(
+                    interpreter.raw.allocs.is_empty(),
+                    "identity rejection must precede loan allocation"
+                );
+                assert!(!frame.vars.contains_key("loan_ptr"));
+                assert!(!frame.vars.contains_key("forged_ptr"));
+                assert!(!frame.vars.contains_key("loan_res"));
+                assert!(!frame.vars.contains_key("loan_scalar"));
+            });
+        }
+    }
+
+    #[test]
+    fn trapped_blocks_retain_scalar_and_owner_places_without_running_cleanup() {
         let mut frame = frame_with(HashMap::new());
         let body = vec![
+            bool_decl("trapped_scalar", true),
             bool_array_decl("trapped_flags"),
             Stmt::ExprStmt(expr(
                 ExprKind::Index {
@@ -4665,15 +6470,15 @@ mod payload_guard_tests {
             )),
         ];
 
-        let trapped =
-            with_empty_interpreter(
-                |interpreter| match interpreter.exec_block(&body, &mut frame) {
-                    Err(trap) => trap,
-                    Ok(_) => panic!("out-of-bounds index should trap"),
-                },
-            );
+        let trapped = with_empty_interpreter(|interpreter| {
+            match interpreter.exec_test_block(&body, &mut frame) {
+                Err(trap) => trap,
+                Ok(_) => panic!("out-of-bounds index should trap"),
+            }
+        });
 
         assert_eq!(trapped.message, "index out of bounds: index 1, length 1");
+        assert!(frame.vars.contains_key("trapped_scalar"));
         assert!(frame.vars.contains_key("trapped_flags"));
     }
 
@@ -4684,17 +6489,14 @@ mod payload_guard_tests {
             kw_span: Span::new(0, 0),
             body: vec![bool_array_decl("open_flags")],
         };
-        let mut enclosing_locals = Vec::new();
-
         with_empty_interpreter(|interpreter| {
             assert!(matches!(
-                interpreter.exec_stmt(&unsafe_block, &mut frame, &mut enclosing_locals),
+                interpreter.exec_test_stmt(&unsafe_block, &mut frame),
                 Ok(Flow::Normal)
             ));
         });
 
         assert!(frame.vars.contains_key("open_flags"));
-        assert_eq!(enclosing_locals, vec!["open_flags".to_string()]);
     }
 
     #[test]
@@ -4759,9 +6561,9 @@ mod payload_guard_tests {
                 .expect("a borrowed Boolean array is an ordinary parameter");
         }
         // An owner crosses too, by moving: the caller's place dies at the
-        // argument and `drop_owned_params` destroys what the callee received
-        // (ADR 0085). What stays refused is an affine option, which has no
-        // call boundary at all.
+        // argument and the shared frame-exit route destroys what the callee
+        // received after its posts (ADR 0085). What stays refused is an affine
+        // option, which has no call boundary at all.
         validate_interp_param_ty(Ty::array(Ty::Bool), "parameter `flags`")
             .expect("an owned Boolean array is handed over at a call");
         assert!(
@@ -4849,7 +6651,10 @@ mod payload_guard_tests {
 
         let modules = crate::modules::ModuleSet::single("synthetic".into(), String::new());
         assert!(
-            matches!(run_fn(&program, &modules, "subject"), Ok(RtVal::Bool(true))),
+            matches!(
+                run_unchecked_fn(&program, &modules, "subject"),
+                Ok(RtVal::Bool(true))
+            ),
             "a store through a unique borrow must be visible to the owner"
         );
     }

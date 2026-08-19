@@ -1,0 +1,16 @@
+// expect-error: GenericAssert::deinit.assert.impossible
+// A retained generic class is verified once at the template, including its
+// destructor. Skipping `deinit` here would make this false obligation vanish
+// while concrete proof-reuse instances claimed the template had proved it.
+
+pub class GenericAssert<T> {
+    T value;
+
+    init of(T initial) {
+        self.value = initial;
+    }
+
+    deinit {
+        /// assert #[label(impossible)] false
+    }
+}

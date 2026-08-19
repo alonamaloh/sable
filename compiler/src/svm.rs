@@ -13,7 +13,16 @@
 
 use crate::ast;
 use crate::ast::*;
+#[cfg(test)]
+use crate::control::summarize_block;
+use crate::control::{
+    AssignmentStaging, BlockKind, BodyPlan, BranchArm, BranchArmPlan, ClassDropAction,
+    CompilerTempKind, ControlProgram, ExitKind, ExitRoute, FlowSummary, ScopeId, TrapSite,
+};
 use crate::interp::{MmioEvent, ObservedRun, RtArray, RtVal};
+use crate::ownership::ValueTransferSink;
+use crate::place::Place;
+use crate::transition::CallOwner;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone)]
@@ -29,6 +38,15 @@ struct LocalBinding {
 #[derive(Clone)]
 struct LowerCtx<'a> {
     program: &'a Program,
+    /// The whole checker-sealed control table is retained alongside the body
+    /// plan so statement-local class cleanup actions can be linked back to
+    /// their exact concrete class recipe before the SVM refuses the class
+    /// surface at its subset boundary.
+    control: Option<&'a ControlProgram>,
+    plan: Option<&'a BodyPlan>,
+    scope: Option<ScopeId>,
+    block_flow: Option<FlowSummary>,
+    normal_exit: Option<ExitRoute>,
     locals: HashMap<String, LocalBinding>,
     declared: HashSet<String>,
     return_ty: Option<Ty>,
@@ -41,6 +59,11 @@ impl<'a> LowerCtx<'a> {
     fn bare(program: &'a Program) -> LowerCtx<'a> {
         LowerCtx {
             program,
+            control: None,
+            plan: None,
+            scope: None,
+            block_flow: None,
+            normal_exit: None,
             locals: HashMap::new(),
             declared: HashSet::new(),
             return_ty: None,
@@ -50,9 +73,60 @@ impl<'a> LowerCtx<'a> {
     /// Begin with parameters only. Locals enter `locals` as their declaration
     /// is crossed, so named array operations cannot resolve a future or
     /// out-of-scope declaration from a forged checked AST.
+    #[cfg(test)]
     fn for_function(program: &'a Program, function: &Fn) -> Result<LowerCtx<'a>, String> {
+        Self::for_function_with_plan(program, function, None, None)
+    }
+
+    fn for_function_with_plan(
+        program: &'a Program,
+        function: &Fn,
+        control: Option<&'a ControlProgram>,
+        plan: Option<&'a BodyPlan>,
+    ) -> Result<LowerCtx<'a>, String> {
+        if control.is_some() != plan.is_some() {
+            return Err(
+                "internal.svm.control_plan: checked lowering lost either its body plan or whole control table"
+                    .into(),
+            );
+        }
+        let (scope, block_flow, normal_exit) = match plan {
+            Some(plan) => {
+                let block = plan.body_block();
+                if block.kind() != BlockKind::Body
+                    || block.parent().is_some()
+                    || block.scope() != plan.body_scope()
+                    || block.anchor() != function.span
+                {
+                    return Err(
+                        "internal.svm.control_plan: retained root block does not match the checked callable body"
+                            .into(),
+                    );
+                }
+                let flow = block.flow();
+                let normal_exit = if flow.can_fall_through() {
+                    let route = plan.implicit_return().lexical().clone();
+                    validate_structural_exit(
+                        &route,
+                        ExitKind::Return,
+                        block.scope(),
+                        "callable-body fallthrough",
+                    )?;
+                    Some(route)
+                } else {
+                    None
+                };
+                (Some(block.scope()), Some(flow), normal_exit)
+            }
+            None => (None, None, None),
+        };
         let mut ctx = LowerCtx {
             program,
+            control,
+            plan,
+            scope,
+            block_flow,
+            normal_exit,
             locals: HashMap::new(),
             declared: HashSet::new(),
             return_ty: Some(function.ret.clone()),
@@ -111,6 +185,331 @@ impl<'a> LowerCtx<'a> {
     }
 }
 
+#[derive(Clone)]
+struct PlannedBlockControl {
+    scope: ScopeId,
+    flow: FlowSummary,
+    normal_exit: Option<ExitRoute>,
+}
+
+#[derive(Clone)]
+struct PlannedExposureNormal {
+    capture: Place,
+    owner: Place,
+    owner_ty: Ty,
+    mutability: Mutability,
+    pointer: Place,
+    resource: Place,
+    release_loan: Place,
+    close: ExitRoute,
+    parent_scope: ScopeId,
+}
+
+#[derive(Clone)]
+struct PlannedExposureControl {
+    body: PlannedBlockControl,
+    normal: Option<PlannedExposureNormal>,
+}
+
+fn control_plan_error(error: crate::control::PlanError) -> String {
+    format!("internal.svm.control_plan: {}", error.message)
+}
+
+#[cfg(test)]
+fn unsealed_test_block_flow(statements: &[Stmt]) -> Result<FlowSummary, String> {
+    Ok(summarize_block(statements))
+}
+
+#[cfg(not(test))]
+fn unsealed_test_block_flow(_statements: &[Stmt]) -> Result<FlowSummary, String> {
+    Err(
+        "internal.svm.control_plan: production SVM lowering requires a checker-sealed block flow"
+            .into(),
+    )
+}
+
+fn active_control<'a>(ctx: &LowerCtx<'a>) -> Result<Option<(&'a BodyPlan, ScopeId)>, String> {
+    match (ctx.plan, ctx.scope) {
+        (Some(plan), Some(scope)) => Ok(Some((plan, scope))),
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("internal.svm.control_plan: lowering lost its active checked scope".into())
+        }
+    }
+}
+
+fn validate_structural_exit(
+    route: &ExitRoute,
+    kind: ExitKind,
+    scope: ScopeId,
+    role: &str,
+) -> Result<(), String> {
+    if route.kind() != kind || route.scopes() != [scope] {
+        return Err(format!(
+            "internal.svm.control_plan: retained {role} route does not close exactly its planned scope"
+        ));
+    }
+    Ok(())
+}
+
+fn planned_branch_arm(
+    plan: &BodyPlan,
+    arm: &BranchArmPlan,
+    kind: BlockKind,
+    anchor: crate::span::Span,
+    role: &str,
+) -> Result<PlannedBlockControl, String> {
+    let block = plan.block(arm.block());
+    if block.kind() != kind
+        || block.anchor() != anchor
+        || block.scope() != arm.scope()
+        || block.flow() != arm.flow()
+    {
+        return Err(format!(
+            "internal.svm.control_plan: retained {role} block disagrees with its branch arm"
+        ));
+    }
+    if arm.normal_exit().is_some() != arm.flow().can_fall_through() {
+        return Err(format!(
+            "internal.svm.control_plan: retained {role} fallthrough presence disagrees with its flow"
+        ));
+    }
+    if let Some(route) = arm.normal_exit() {
+        validate_structural_exit(route, ExitKind::Fallthrough, arm.scope(), role)?;
+    }
+    Ok(PlannedBlockControl {
+        scope: arm.scope(),
+        flow: arm.flow(),
+        normal_exit: arm.normal_exit().cloned(),
+    })
+}
+
+fn planned_branch(
+    ctx: &LowerCtx<'_>,
+    anchor: crate::span::Span,
+    has_else: bool,
+) -> Result<
+    Option<(
+        PlannedBlockControl,
+        Option<PlannedBlockControl>,
+        FlowSummary,
+    )>,
+    String,
+> {
+    let Some((plan, parent_scope)) = active_control(ctx)? else {
+        return Ok(None);
+    };
+    let branch = plan
+        .branch(parent_scope, anchor, has_else)
+        .map_err(control_plan_error)?;
+    if branch.parent_scope() != parent_scope || branch.anchor() != anchor {
+        return Err(
+            "internal.svm.control_plan: retained branch moved away from its active parent or anchor"
+                .into(),
+        );
+    }
+    let then_arm = planned_branch_arm(
+        plan,
+        branch.then_arm(),
+        BlockKind::BranchArm(BranchArm::Then),
+        anchor,
+        "then-arm",
+    )?;
+    let else_arm = branch
+        .else_arm()
+        .map(|arm| {
+            planned_branch_arm(
+                plan,
+                arm,
+                BlockKind::BranchArm(BranchArm::Else),
+                anchor,
+                "else-arm",
+            )
+        })
+        .transpose()?;
+    Ok(Some((then_arm, else_arm, branch.flow())))
+}
+
+fn planned_loop_body(
+    ctx: &LowerCtx<'_>,
+    keyword_span: crate::span::Span,
+    condition_span: crate::span::Span,
+) -> Result<Option<(PlannedBlockControl, FlowSummary)>, String> {
+    let Some((plan, parent_scope)) = active_control(ctx)? else {
+        return Ok(None);
+    };
+    let loop_plan = plan
+        .loop_plan(parent_scope, keyword_span, condition_span)
+        .map_err(control_plan_error)?;
+    let block = plan.block(loop_plan.body());
+    if loop_plan.parent_scope() != parent_scope
+        || loop_plan.keyword_span() != keyword_span
+        || loop_plan.condition_span() != condition_span
+        || block.kind() != BlockKind::LoopBody
+        || block.anchor() != keyword_span
+        || block.scope() != loop_plan.body_scope()
+        || block.flow() != loop_plan.body_flow()
+    {
+        return Err(
+            "internal.svm.control_plan: retained loop body disagrees with its checked edge".into(),
+        );
+    }
+    if loop_plan.backedge().is_some() != loop_plan.body_flow().can_fall_through() {
+        return Err(
+            "internal.svm.control_plan: retained loop backedge presence disagrees with its body flow"
+                .into(),
+        );
+    }
+    if let Some(route) = loop_plan.backedge() {
+        validate_structural_exit(
+            route,
+            ExitKind::Backedge,
+            loop_plan.body_scope(),
+            "loop backedge",
+        )?;
+    }
+    Ok(Some((
+        PlannedBlockControl {
+            scope: loop_plan.body_scope(),
+            flow: loop_plan.body_flow(),
+            normal_exit: loop_plan.backedge().cloned(),
+        },
+        loop_plan.flow(),
+    )))
+}
+
+fn planned_exposure(
+    ctx: &LowerCtx<'_>,
+    keyword_span: crate::span::Span,
+) -> Result<Option<PlannedExposureControl>, String> {
+    let Some((plan, parent_scope)) = active_control(ctx)? else {
+        return Ok(None);
+    };
+    let exposure = plan
+        .exposure_plan(parent_scope, keyword_span)
+        .map_err(control_plan_error)?;
+    let block = plan.block(exposure.body());
+    if exposure.parent_scope() != parent_scope
+        || exposure.keyword_span() != keyword_span
+        || block.kind() != BlockKind::Exposure
+        || block.anchor() != keyword_span
+        || block.scope() != exposure.body_scope()
+        || block.flow() != exposure.body_flow()
+        || exposure.flow() != exposure.body_flow()
+    {
+        return Err(
+            "internal.svm.control_plan: retained exposure body disagrees with its checked edge"
+                .into(),
+        );
+    }
+    if exposure.normal().is_some() != exposure.body_flow().can_fall_through() {
+        return Err(
+            "internal.svm.control_plan: retained exposure normal edge presence disagrees with its body flow"
+                .into(),
+        );
+    }
+    let normal = exposure
+        .normal()
+        .map(|normal| -> Result<PlannedExposureNormal, String> {
+            validate_structural_exit(
+                normal.body_exit(),
+                ExitKind::Fallthrough,
+                exposure.body_scope(),
+                "exposure body",
+            )?;
+            if normal.parent_scope() != parent_scope
+                || normal.close().kind() != ExitKind::ExposureClose
+                || !normal.close().scopes().is_empty()
+                || normal.rebuild().keyword_span() != keyword_span
+                || normal.capture() != normal.rebuild().resource()
+                || normal.release_loan() == normal.rebuild().pointer()
+            {
+                return Err(
+                    "internal.svm.control_plan: retained exposure epilogue identities or order are inconsistent"
+                        .into(),
+                );
+            }
+            Ok(PlannedExposureNormal {
+                capture: normal.capture().clone(),
+                owner: normal.rebuild().owner().clone(),
+                owner_ty: normal.rebuild().owner_ty().clone(),
+                mutability: normal.rebuild().mutability(),
+                pointer: normal.rebuild().pointer().clone(),
+                resource: normal.rebuild().resource().clone(),
+                release_loan: normal.release_loan().clone(),
+                close: normal.close().clone(),
+                parent_scope: normal.parent_scope(),
+            })
+        })
+        .transpose()?;
+    Ok(Some(PlannedExposureControl {
+        body: PlannedBlockControl {
+            scope: exposure.body_scope(),
+            flow: exposure.body_flow(),
+            normal_exit: exposure.normal().map(|normal| normal.body_exit().clone()),
+        },
+        normal,
+    }))
+}
+
+fn enter_planned_block(ctx: &mut LowerCtx<'_>, block: PlannedBlockControl) {
+    ctx.scope = Some(block.scope);
+    ctx.block_flow = Some(block.flow);
+    ctx.normal_exit = block.normal_exit;
+}
+
+/// Resolve the exact checker-sealed trap identities at the operation that can
+/// take them. The SVM instruction itself already implements the trap; this
+/// bridge consumes the plan by proving that the source operation still names
+/// the canonical no-unwind route before emitting that instruction.
+fn consume_trap_sites(plan: &BodyPlan, sites: &[&TrapSite]) -> Result<(), String> {
+    let canonical = plan.trap_route();
+    for site in sites {
+        if site.route() != &canonical
+            || site.route().kind() != ExitKind::Trap
+            || !site.route().scopes().is_empty()
+            || !site.route().clears().is_empty()
+            || !site.route().drops().is_empty()
+        {
+            return Err(format!(
+                "internal.svm.control_plan: retained trap at {}..{} is not the canonical empty no-unwind route",
+                site.span().start,
+                site.span().end
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn consume_expression_trap_sites(ctx: &LowerCtx<'_>, expression: &Expr) -> Result<(), String> {
+    let Some((plan, scope)) = active_control(ctx)? else {
+        return Ok(());
+    };
+    let sites = plan
+        .expression_trap_sites(scope, expression)
+        .map_err(control_plan_error)?;
+    if sites.iter().any(|site| site.scope() != scope) {
+        return Err(
+            "internal.svm.control_plan: retained expression trap moved outside its active lexical scope"
+                .into(),
+        );
+    }
+    consume_trap_sites(plan, &sites)
+}
+
+fn consume_statement_trap_sites(ctx: &LowerCtx<'_>, statement: &Stmt) -> Result<(), String> {
+    let Some((plan, scope)) = active_control(ctx)? else {
+        return Ok(());
+    };
+    // Mutable exposure closes are deliberately retained in the exposure-body
+    // scope rather than the parent statement scope. `statement_trap_sites`
+    // resolves that structural edge from the retained ExposurePlan itself.
+    let sites = plan
+        .statement_trap_sites(scope, statement)
+        .map_err(control_plan_error)?;
+    consume_trap_sites(plan, &sites)
+}
+
 /// Keep the aggregate representation boundary explicit. Arrays admit concrete
 /// integers and, in the narrowly checked owned-local position, `bool`;
 /// ordinary options admit both as well. The Lean constructors are intentionally
@@ -141,7 +540,17 @@ fn validate_fn_payloads(ctx: &mut LowerCtx<'_>, f: &Fn) -> Result<(), String> {
         ));
     }
     validate_stmt_payloads(ctx, &f.body)?;
-    if f.ret != Ty::Unit && !block_definitely_returns(&f.body) {
+    let body_flow = match (ctx.plan, ctx.block_flow) {
+        (Some(_), Some(flow)) => flow,
+        (None, None) => unsealed_test_block_flow(&f.body)?,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "internal.svm.control_plan: function validation lost its retained root block flow"
+                    .into(),
+            );
+        }
+    };
+    if f.ret != Ty::Unit && !body_flow.definitely_returns() {
         return Err(format!(
             "svm.missing_return: non-unit function `{}` can fall through without an SVM value",
             f.name
@@ -1527,34 +1936,6 @@ fn validate_scoped_stmts(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), S
     result
 }
 
-fn block_definitely_returns(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|stmt| match stmt {
-        Stmt::Return { .. } => true,
-        Stmt::If {
-            then_block,
-            else_block: Some(else_block),
-            ..
-        } => block_definitely_returns(then_block) && block_definitely_returns(else_block),
-        Stmt::Unsafe { body, .. } => block_definitely_returns(body),
-        _ => false,
-    })
-}
-
-fn contains_return(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|stmt| match stmt {
-        Stmt::Return { .. } => true,
-        Stmt::If {
-            then_block,
-            else_block,
-            ..
-        } => contains_return(then_block) || else_block.as_deref().is_some_and(contains_return),
-        Stmt::While { body, .. } | Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
-            contains_return(body)
-        }
-        _ => false,
-    })
-}
-
 fn merge_if_initialization(
     ctx: &mut LowerCtx<'_>,
     before: &HashMap<String, LocalBinding>,
@@ -1660,7 +2041,18 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                     .expect("resolved assignment")
                     .initialized = true;
             }
-            Stmt::ExprStmt(value) | Stmt::FieldAssign { value, .. } => {
+            Stmt::ExprStmt(value) => {
+                if matches!(value.ty.as_ref(), Some(Ty::Class(_))) {
+                    validate_checked_temporary_drop_action(ctx, value)?;
+                }
+                validate_expr_payloads(ctx, value)?;
+            }
+            Stmt::FieldAssign {
+                field,
+                field_span,
+                value,
+            } => {
+                validate_checked_field_assignment_action(ctx, field, *field_span, value)?;
                 validate_expr_payloads(ctx, value)?;
             }
             Stmt::If {
@@ -1670,25 +2062,48 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
             } => {
                 validate_expr_payloads(ctx, cond)?;
                 validate_sink_type(ctx, Ty::Bool, cond, "if condition")?;
+                let planned = planned_branch(ctx, cond.span, else_block.is_some())?;
                 let before = ctx.locals.clone();
                 let mut then_ctx = ctx.clone();
+                if let Some((then_arm, _, _)) = &planned {
+                    enter_planned_block(&mut then_ctx, then_arm.clone());
+                }
                 validate_stmt_payloads(&mut then_ctx, then_block)?;
                 ctx.declared = then_ctx.declared.clone();
 
                 let mut else_ctx = ctx.clone();
                 else_ctx.locals = before.clone();
                 if let Some(else_block) = else_block {
+                    if let Some((_, Some(else_arm), _)) = &planned {
+                        enter_planned_block(&mut else_ctx, else_arm.clone());
+                    }
                     validate_stmt_payloads(&mut else_ctx, else_block)?;
                     ctx.declared = else_ctx.declared.clone();
                 }
+
+                let (then_returns, else_returns) = match &planned {
+                    Some((then_arm, else_arm, _)) => (
+                        then_arm.flow.definitely_returns(),
+                        else_arm
+                            .as_ref()
+                            .is_some_and(|arm| arm.flow.definitely_returns()),
+                    ),
+                    None => (
+                        unsealed_test_block_flow(then_block)?.definitely_returns(),
+                        match else_block {
+                            Some(body) => unsealed_test_block_flow(body)?.definitely_returns(),
+                            None => false,
+                        },
+                    ),
+                };
 
                 merge_if_initialization(
                     ctx,
                     &before,
                     &then_ctx.locals,
-                    block_definitely_returns(then_block),
+                    then_returns,
                     &else_ctx.locals,
-                    else_block.as_deref().is_some_and(block_definitely_returns),
+                    else_returns,
                 );
             }
             Stmt::Return { value, .. } => {
@@ -1744,13 +2159,27 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 value,
                 ..
             } => validate_array_store(ctx, array, index, value)?,
-            Stmt::While { cond, body, .. } => {
+            Stmt::While {
+                cond,
+                body,
+                kw_span,
+                ..
+            } => {
                 validate_expr_payloads(ctx, cond)?;
                 validate_sink_type(ctx, Ty::Bool, cond, "while condition")?;
-                validate_scoped_stmts(ctx, body)?;
+                if let Some((body_control, _)) = planned_loop_body(ctx, *kw_span, cond.span)? {
+                    let mut child = ctx.clone();
+                    enter_planned_block(&mut child, body_control);
+                    let result = validate_stmt_payloads(&mut child, body);
+                    ctx.declared = child.declared;
+                    result?;
+                } else {
+                    validate_scoped_stmts(ctx, body)?;
+                }
             }
             Stmt::Unsafe { body, .. } => validate_stmt_payloads(ctx, body)?,
             Stmt::Expose {
+                kw_span,
                 array,
                 mutable,
                 ptr,
@@ -1759,7 +2188,12 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 ..
             } => {
                 validate_array_exposure(ctx, array, *mutable)?;
-                if contains_return(body) {
+                let planned = planned_exposure(ctx, *kw_span)?;
+                let body_flow = match &planned {
+                    Some(edge) => edge.body.flow,
+                    None => unsealed_test_block_flow(body)?,
+                };
+                if body_flow.contains_return() {
                     return Err(
                         "svm.expose_return: return inside array exposure would bypass generated copyback and release"
                             .into(),
@@ -1767,6 +2201,9 @@ fn validate_stmt_payloads(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<(), 
                 }
                 let before = ctx.locals.clone();
                 let mut child = ctx.clone();
+                if let Some(edge) = &planned {
+                    enter_planned_block(&mut child, edge.body.clone());
+                }
                 child.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
                 child.insert_local(res, Ty::Res(ResKind::RawSpan), *mutable, true)?;
                 let result = validate_stmt_payloads(&mut child, body);
@@ -2129,7 +2566,21 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
 }
 
 /// Lower a zero-argument function's body to a Lean `List Stmt` term.
+#[cfg(test)]
 pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
+    lower_fn_with_plan(program, f, None, None)
+}
+
+fn lower_fn_with_plan<'a>(
+    program: &'a Program,
+    f: &Fn,
+    control: Option<&'a ControlProgram>,
+    plan: Option<&'a BodyPlan>,
+) -> Result<String, String> {
+    if let Some(plan) = plan {
+        plan.validate_callable(&f.params, &f.body)
+            .map_err(|error| format!("internal.svm.control_plan: {}", error.message))?;
+    }
     if let Some(parameter) = f
         .params
         .iter()
@@ -2150,10 +2601,19 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
         return Err("differential subjects must take no parameters".into());
     }
     validate_program_option_positions(program)?;
-    let mut validation_ctx = LowerCtx::for_function(program, f)?;
+    let mut validation_ctx = LowerCtx::for_function_with_plan(program, f, control, plan)?;
     validate_fn_payloads(&mut validation_ctx, f)?;
-    let mut lowering_ctx = LowerCtx::for_function(program, f)?;
+    let mut lowering_ctx = LowerCtx::for_function_with_plan(program, f, control, plan)?;
     lower_block(&mut lowering_ctx, &f.body)
+}
+
+/// Lower through the exact checker-sealed control carrier. Stage-specific SVM
+/// admission still applies, but a missing or mismatched callable plan is an
+/// internal refusal rather than an invitation to reconstruct identities.
+pub fn lower_checked_fn(checked: &crate::CheckedProgram, name: &str) -> Result<String, String> {
+    let f = require_checked_function(checked, name)?;
+    let plan = require_control_body(checked.control(), f)?;
+    lower_fn_with_plan(checked.program(), f, Some(checked.control()), Some(plan))
 }
 
 /// Lower any function to a `Prog.ofList` entry: `("name", ⟨[params],
@@ -2161,11 +2621,25 @@ pub fn lower_fn(program: &Program, f: &Fn) -> Result<String, String> {
 /// the machine binds the caller's sequence, and a unique borrow's exit
 /// value returns to the caller's local when the frame pops (`Arg.lend`).
 /// Resources, class receivers, and owned arrays stay outside.
+#[cfg(test)]
 pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
+    lower_fn_entry_with_plan(program, f, None, None)
+}
+
+fn lower_fn_entry_with_plan<'a>(
+    program: &'a Program,
+    f: &Fn,
+    control: Option<&'a ControlProgram>,
+    plan: Option<&'a BodyPlan>,
+) -> Result<String, String> {
+    if let Some(plan) = plan {
+        plan.validate_callable(&f.params, &f.body)
+            .map_err(|error| format!("internal.svm.control_plan: {}", error.message))?;
+    }
     validate_program_option_positions(program)?;
-    let mut validation_ctx = LowerCtx::for_function(program, f)?;
+    let mut validation_ctx = LowerCtx::for_function_with_plan(program, f, control, plan)?;
     validate_fn_payloads(&mut validation_ctx, f)?;
-    let mut lowering_ctx = LowerCtx::for_function(program, f)?;
+    let mut lowering_ctx = LowerCtx::for_function_with_plan(program, f, control, plan)?;
     for p in &f.params {
         match &p.ty {
             Ty::Int(_) | Ty::Bool => {}
@@ -2198,16 +2672,343 @@ pub fn lower_fn_entry(program: &Program, f: &Fn) -> Result<String, String> {
     ))
 }
 
-/// Fresh names for the statements an exposure expands into. A counter is
-/// enough: lowering is single-threaded and one pass.
-fn next_loan() -> usize {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static N: AtomicUsize = AtomicUsize::new(0);
-    N.fetch_add(1, Ordering::Relaxed)
+pub fn lower_checked_fn_entry(
+    checked: &crate::CheckedProgram,
+    name: &str,
+) -> Result<String, String> {
+    let f = require_checked_function(checked, name)?;
+    let plan = require_control_body(checked.control(), f)?;
+    lower_fn_entry_with_plan(checked.program(), f, Some(checked.control()), Some(plan))
+}
+
+fn require_checked_function<'a>(
+    checked: &'a crate::CheckedProgram,
+    name: &str,
+) -> Result<&'a Fn, String> {
+    checked
+        .program()
+        .fns
+        .iter()
+        .find(|function| function.name == name)
+        .ok_or_else(|| {
+            format!(
+                "internal.svm.checked_function: checked program has no ordinary function `{name}`"
+            )
+        })
+}
+
+fn require_control_body<'a>(
+    control: &'a ControlProgram,
+    function: &Fn,
+) -> Result<&'a BodyPlan, String> {
+    let owner = CallOwner::Function(function.name.clone());
+    let body = control
+        .body(&owner, function.span)
+        .map_err(|error| format!("internal.svm.control_plan: {}", error.message))?;
+    if body.owner() != &owner
+        || body.plan().owner() != &owner
+        || body.declaration_span() != function.span
+    {
+        return Err(format!(
+            "internal.svm.control_plan: retained plan for `{}` at {}..{} does not match its checked body at {}..{}",
+            function.name,
+            body.declaration_span().start,
+            body.declaration_span().end,
+            function.span.start,
+            function.span.end,
+        ));
+    }
+    Ok(body.plan())
+}
+
+/// Consume the checker-sealed replacement action for one source assignment.
+///
+/// The current formal-machine subset admits only direct, non-cleanup-bearing
+/// replacement: owned arrays cannot be rebound, affine options cannot be
+/// assigned wholesale, and class values are outside SVM lowering. Keeping the
+/// exact action lookup here still matters: a renamed, moved, or retyped
+/// assignment in a post-check AST must not recover its destination or scope
+/// from syntax and silently lower as a different machine assignment.
+fn validate_checked_assignment_action(
+    ctx: &LowerCtx<'_>,
+    name: &str,
+    span: crate::span::Span,
+    ty: &Ty,
+) -> Result<(), String> {
+    let (plan, scope) = match (ctx.plan, ctx.scope) {
+        (Some(plan), Some(scope)) => (plan, scope),
+        (None, None) => return Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(
+                "internal.svm.control_plan: assignment lowering lost its active checked scope"
+                    .into(),
+            );
+        }
+    };
+    let destination = Place::local(name);
+    let action = plan
+        .assignment(scope, span, &destination)
+        .map_err(|error| format!("internal.svm.control_plan: {}", error.message))?;
+    if action.scope() != scope
+        || action.span() != span
+        || action.destination() != &destination
+        || action.ty() != ty
+    {
+        return Err(format!(
+            "internal.svm.control_plan: checked assignment to `{name}` at {}..{} disagrees with its active scope, destination, or type",
+            span.start, span.end
+        ));
+    }
+    if action.previous().is_some() || !matches!(action.staging(), AssignmentStaging::Direct) {
+        return Err(format!(
+            "svm.assignment_replacement_unsupported: assignment to `{name}` requires cleanup-bearing replacement outside the SVM core subset"
+        ));
+    }
+    Ok(())
+}
+
+/// Link a statement-local class cleanup edge to the exact concrete class
+/// recipe retained by the same checked control table. The SVM does not lower
+/// class destruction yet, but that subset refusal is allowed only after the
+/// action has proved its canonical terminal no-unwind identity.
+fn validate_checked_class_drop_action(
+    ctx: &LowerCtx<'_>,
+    action: &ClassDropAction,
+    span: crate::span::Span,
+    role: &str,
+) -> Result<(), String> {
+    let Some(control) = ctx.control else {
+        return Err(format!(
+            "internal.svm.control_plan: checked {role} lost its whole control table"
+        ));
+    };
+    let recipe = control
+        .class_drop_for_action(action, &ctx.program.classes, span)
+        .map_err(control_plan_error)?;
+    let route = action.terminal_trap_route();
+    if recipe.class() != action.class()
+        || recipe.terminal_trap_route() != route
+        || route.kind() != ExitKind::Trap
+        || !route.scopes().is_empty()
+        || !route.clears().is_empty()
+        || !route.drops().is_empty()
+    {
+        return Err(format!(
+            "internal.svm.control_plan: retained {role} class cleanup is not its canonical terminal no-unwind recipe"
+        ));
+    }
+    Ok(())
+}
+
+/// Consume the exact retained replacement/install sequence for
+/// `self.field = value` before preserving the SVM's class-member boundary.
+/// In particular, destination identity and the RHS transfer span/type come
+/// from the action; syntax is used only to resolve that already-sealed key.
+fn validate_checked_field_assignment_action(
+    ctx: &LowerCtx<'_>,
+    field: &str,
+    field_span: crate::span::Span,
+    value: &Expr,
+) -> Result<(), String> {
+    let Some((plan, scope)) = active_control(ctx)? else {
+        return Ok(());
+    };
+    let destination = Place::field("self", field);
+    let action = plan
+        .field_assignment(scope, field_span, &destination, value)
+        .map_err(control_plan_error)?;
+    let Some(value_ty) = value.ty.as_ref() else {
+        return Err(
+            "internal.svm.control_plan: checked field-assignment RHS lost its retained type".into(),
+        );
+    };
+    if action.scope() != scope
+        || action.span() != field_span
+        || action.destination() != &destination
+        || action.ty() != value_ty
+        || action.transfer_key().owner != *plan.owner()
+        || action.transfer_key().span != value.span
+        || !matches!(
+            &action.transfer_key().sink,
+            ValueTransferSink::FieldAssignment(place) if place == &destination
+        )
+    {
+        return Err(
+            "internal.svm.control_plan: retained field-assignment action disagrees with its active scope, destination, checked RHS, or transfer identity"
+                .into(),
+        );
+    }
+    match (action.drop_if_present(), action.staging()) {
+        (false, AssignmentStaging::Direct) => {}
+        (true, AssignmentStaging::Temporary(temporary)) => {
+            let expected = plan
+                .compiler_temp(scope, field_span, CompilerTempKind::FieldAssignmentValue)
+                .map_err(control_plan_error)?;
+            if temporary != expected {
+                return Err(
+                    "internal.svm.control_plan: retained field-assignment staging temporary changed identity"
+                        .into(),
+                );
+            }
+        }
+        (false, AssignmentStaging::Temporary(_)) | (true, AssignmentStaging::Direct) => {
+            return Err(
+                "internal.svm.control_plan: retained field-assignment staging no longer matches its cleanup policy"
+                    .into(),
+            );
+        }
+    }
+    match (value_ty, action.class_drop()) {
+        (Ty::Class(class), Some(class_drop)) if *class == class_drop.class() => {
+            validate_checked_class_drop_action(ctx, class_drop, field_span, "field assignment")?;
+        }
+        (Ty::Class(_), Some(_)) | (Ty::Class(_), None) => {
+            return Err(
+                "internal.svm.control_plan: retained class field assignment lost its exact class-drop action"
+                    .into(),
+            );
+        }
+        (
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::Raw(_)
+            | Ty::Res(_)
+            | Ty::Borrow(..)
+            | Ty::Record(_)
+            | Ty::RawRecord(_)
+            | Ty::OptionRaw(_)
+            | Ty::Param(_)
+            | Ty::Unit,
+            None,
+        ) => {}
+        (
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::Raw(_)
+            | Ty::Res(_)
+            | Ty::Borrow(..)
+            | Ty::Record(_)
+            | Ty::RawRecord(_)
+            | Ty::OptionRaw(_)
+            | Ty::Param(_)
+            | Ty::Unit,
+            Some(_),
+        ) => {
+            return Err(
+                "internal.svm.control_plan: retained non-class field assignment acquired a class-drop action"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Consume the exact compiler-owned destination and class-drop recipe for a
+/// discarded fresh class result. The machine still refuses this surface, but
+/// cannot silently reinterpret it as an ordinary effect-only expression.
+fn validate_checked_temporary_drop_action(
+    ctx: &LowerCtx<'_>,
+    expression: &Expr,
+) -> Result<(), String> {
+    let Some((plan, scope)) = active_control(ctx)? else {
+        return Ok(());
+    };
+    let action = plan
+        .temporary_drop(scope, expression)
+        .map_err(control_plan_error)?;
+    let expected_temporary = plan
+        .compiler_temp(
+            scope,
+            expression.span,
+            CompilerTempKind::DiscardedClassValue,
+        )
+        .map_err(control_plan_error)?;
+    let Some(expression_ty) = expression.ty.as_ref() else {
+        return Err(
+            "internal.svm.control_plan: discarded class temporary lost its checked type".into(),
+        );
+    };
+    if action.scope() != scope
+        || action.span() != expression.span
+        || action.ty() != expression_ty
+        || action.transfer_key().owner != *plan.owner()
+        || action.transfer_key().span != expression.span
+        || !matches!(
+            action.transfer_key().sink,
+            ValueTransferSink::DiscardTemporary
+        )
+        || action.temporary() != expected_temporary
+    {
+        return Err(
+            "internal.svm.control_plan: retained discarded-class action disagrees with its active scope, type, transfer, or compiler destination"
+                .into(),
+        );
+    }
+    let Ty::Class(class) = expression_ty else {
+        return Err(
+            "internal.svm.control_plan: retained temporary-drop action no longer targets a class value"
+                .into(),
+        );
+    };
+    if action.class_drop().class() != *class {
+        return Err(
+            "internal.svm.control_plan: retained discarded-class action names the wrong class-drop recipe"
+                .into(),
+        );
+    }
+    validate_checked_class_drop_action(
+        ctx,
+        action.class_drop(),
+        expression.span,
+        "discarded class temporary",
+    )
 }
 
 fn lower_block(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
-    lower_block_erasing(ctx, stmts)
+    let lowered = lower_block_erasing(ctx, stmts)?;
+    let Some((_plan, _scope)) = active_control(ctx)? else {
+        if ctx.block_flow.is_some() || ctx.normal_exit.is_some() {
+            return Err(
+                "internal.svm.control_plan: unsealed lowering retained a checked block edge".into(),
+            );
+        }
+        return Ok(lowered);
+    };
+    let Some(flow) = ctx.block_flow else {
+        return Err(
+            "internal.svm.control_plan: checked block lowering lost its retained flow".into(),
+        );
+    };
+    if ctx.normal_exit.is_some() != flow.can_fall_through() {
+        return Err(
+            "internal.svm.control_plan: checked block normal edge disagrees with its retained flow"
+                .into(),
+        );
+    }
+    let Some(route) = &ctx.normal_exit else {
+        return Ok(lowered);
+    };
+    let close = lower_scope_exit(&route);
+    let inner = lowered.trim_start_matches('[').trim_end_matches(']');
+    if inner.is_empty() {
+        Ok(format!("[{close}]"))
+    } else {
+        Ok(format!("[{inner}, {close}]"))
+    }
+}
+
+fn lower_scope_exit(route: &ExitRoute) -> String {
+    let names = route
+        .clears()
+        .iter()
+        .map(|place| format!("\"{}\"", place.render()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("(.scopeExit [{names}])")
 }
 
 fn lower_block_erasing(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
@@ -2220,14 +3021,8 @@ fn lower_block_erasing(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String,
     Ok(format!("[{}]", out.join(", ")))
 }
 
-fn lower_scoped_block(ctx: &mut LowerCtx<'_>, stmts: &[Stmt]) -> Result<String, String> {
-    let mut child = ctx.clone();
-    let result = lower_block_erasing(&mut child, stmts);
-    ctx.declared = child.declared;
-    result
-}
-
 fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>, String> {
+    consume_statement_trap_sites(ctx, s)?;
     Ok(match s {
         Stmt::Decl {
             name,
@@ -2400,6 +3195,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
         // existing buffer instead; nonescape is what makes the two
         // observationally equivalent (ADR 0026).
         Stmt::Expose {
+            kw_span,
             array,
             mutable,
             ptr,
@@ -2408,23 +3204,95 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             ..
         } => {
             validate_array_exposure(ctx, array, *mutable)?;
-            if contains_return(body) {
+            let planned = planned_exposure(ctx, *kw_span)?;
+            let body_flow = match &planned {
+                Some(edge) => edge.body.flow,
+                None => unsealed_test_block_flow(body)?,
+            };
+            if body_flow.contains_return() {
                 return Err(
                     "svm.expose_return: return inside array exposure would bypass generated copyback and release"
                         .into(),
                 );
             }
-            let id = next_loan();
-            let loan = format!("_loan{id}");
-            let i = format!("_li{id}");
-            let t = format!("_lb{id}");
-            let n = format!("(.len \"{array}\")");
-            let at = format!("(.ptrAdd (.var \"{loan}\") (.var \"{i}\"))");
+            let planned_normal = planned.as_ref().and_then(|edge| edge.normal.as_ref());
+            if planned.is_some() && planned_normal.is_none() {
+                return Err(
+                    "internal.svm.control_plan: normally completing exposure has no retained epilogue"
+                        .into(),
+                );
+            }
+            let (array_name, ptr_name, res_name, mutable) = if let Some(normal) = planned_normal {
+                let expected_mutability = if *mutable {
+                    Mutability::Mut
+                } else {
+                    Mutability::Shared
+                };
+                let binding = ctx.local(array).ok_or_else(|| {
+                    format!(
+                        "internal.svm.control_plan: retained exposure owner `{array}` has no active binding"
+                    )
+                })?;
+                if normal.owner != Place::local(array)
+                    || normal.owner_ty != binding.ty
+                    || normal.mutability != expected_mutability
+                    || normal.pointer != Place::local(ptr)
+                    || normal.resource != Place::local(res)
+                    || normal.capture != normal.resource
+                    || normal.parent_scope != ctx.scope.expect("checked exposure scope")
+                {
+                    return Err(
+                        "internal.svm.control_plan: retained exposure rebuild action disagrees with the checked statement"
+                            .into(),
+                    );
+                }
+                (
+                    normal.owner.render(),
+                    normal.pointer.render(),
+                    normal.resource.render(),
+                    matches!(normal.mutability, Mutability::Mut),
+                )
+            } else {
+                (array.clone(), ptr.clone(), res.clone(), *mutable)
+            };
+            let n = format!("(.len \"{array_name}\")");
             let before = ctx.locals.clone();
             let mut child = ctx.clone();
-            child.insert_local(ptr, Ty::Raw(IntTy::U8), false, true)?;
-            child.insert_local(res, Ty::Res(ResKind::RawSpan), *mutable, true)?;
-            let inner_result = lower_block_erasing(&mut child, body);
+            if let Some(edge) = &planned {
+                enter_planned_block(&mut child, edge.body.clone());
+            }
+            let (loan, i, t, exposure_close) = if let (Some(plan), Some(scope)) =
+                (child.plan, child.scope)
+            {
+                let temp = |kind| {
+                    plan.compiler_temp(scope, *kw_span, kind)
+                        .map(|place| place.render())
+                        .map_err(|error| format!("internal.svm.control_plan: {}", error.message))
+                };
+                let loan = planned_normal
+                    .expect("checked exposure has a retained epilogue")
+                    .release_loan
+                    .render();
+                let i = temp(CompilerTempKind::ExposureIndex)?;
+                let t = temp(CompilerTempKind::ExposureByte)?;
+                let close = planned_normal
+                    .expect("checked exposure has a retained epilogue")
+                    .close
+                    .clone();
+                (loan, i, t, Some(close))
+            } else {
+                let suffix = format!("{}${}", kw_span.start, kw_span.end);
+                (
+                    format!("$sable$unchecked_exposure_loan${suffix}"),
+                    format!("$sable$unchecked_exposure_index${suffix}"),
+                    format!("$sable$unchecked_exposure_byte${suffix}"),
+                    None,
+                )
+            };
+            let at = format!("(.ptrAdd (.var \"{loan}\") (.var \"{i}\"))");
+            child.insert_local(&ptr_name, Ty::Raw(IntTy::U8), false, true)?;
+            child.insert_local(&res_name, Ty::Res(ResKind::RawSpan), mutable, true)?;
+            let inner_result = lower_block(&mut child, body);
             ctx.declared = child.declared.clone();
             let inner = inner_result?;
             merge_executed_scope_initialization(ctx, &before, &child.locals);
@@ -2434,28 +3302,35 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             parts.push(format!("(.assign \"{i}\" (.intLit .u64 0))"));
             parts.push(format!(
                 "(.while (.cmp .lt (.var \"{i}\") {n}) \
-                 [(.rawStore8 {at} (.index \"{array}\" (.var \"{i}\"))), \
+                 [(.rawStore8 {at} (.index \"{array_name}\" (.var \"{i}\"))), \
                   (.assign \"{i}\" (.wrapArith .add .u64 (.var \"{i}\") (.intLit .u64 1)))])"
             ));
             // The body's own pointer name is the loan's start. `res` is
             // erased: authority has no runtime representation.
-            parts.push(format!("(.assign \"{ptr}\" (.var \"{loan}\"))"));
+            parts.push(format!("(.assign \"{ptr_name}\" (.var \"{loan}\"))"));
             if !inner.is_empty() {
                 parts.push(inner.to_string());
             }
-            if *mutable {
+            if mutable {
                 parts.push(format!("(.assign \"{i}\" (.intLit .u64 0))"));
                 parts.push(format!(
                     "(.while (.cmp .lt (.var \"{i}\") {n}) \
                      [(.rawLoad8 \"{t}\" {at}), \
-                      (.store \"{array}\" (.var \"{i}\") (.var \"{t}\")), \
+                      (.store \"{array_name}\" (.var \"{i}\") (.var \"{t}\")), \
                       (.assign \"{i}\" (.wrapArith .add .u64 (.var \"{i}\") (.intLit .u64 1)))])"
                 ));
             }
             parts.push(format!("(.rawFree (.var \"{loan}\"))"));
+            if let Some(route) = exposure_close {
+                parts.push(lower_scope_exit(&route));
+            }
             Some(parts.join(", "))
         }
-        Stmt::Assign { name, value, .. } => {
+        Stmt::Assign {
+            name,
+            name_span,
+            value,
+        } => {
             let Some(binding) = ctx.local(name) else {
                 return Err(format!(
                     "svm.local_type: assignment names unknown or out-of-scope local `{name}`"
@@ -2479,6 +3354,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
                 &format!("assignment to `{name}`"),
             )?;
             validate_array_rebind(ctx, name)?;
+            validate_checked_assignment_action(ctx, name, *name_span, &binding.ty)?;
             let lowered = if binding.ty.is_resource() {
                 lower_erased_resource_bind(ctx, name, value)?
             } else {
@@ -2510,26 +3386,50 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
         } => {
             validate_sink_type(ctx, Ty::Bool, cond, "if condition")?;
             let condition = lower_expr(ctx, cond)?;
+            let planned = planned_branch(ctx, cond.span, else_block.is_some())?;
             let before = ctx.locals.clone();
 
             let mut then_ctx = ctx.clone();
-            let then = lower_block_erasing(&mut then_ctx, then_block)?;
+            if let Some((then_arm, _, _)) = &planned {
+                enter_planned_block(&mut then_ctx, then_arm.clone());
+            }
+            let then = lower_block(&mut then_ctx, then_block)?;
             ctx.declared = then_ctx.declared.clone();
 
             let mut else_ctx = ctx.clone();
             else_ctx.locals = before.clone();
             let els = match else_block {
-                Some(block) => lower_block_erasing(&mut else_ctx, block)?,
+                Some(block) => {
+                    if let Some((_, Some(else_arm), _)) = &planned {
+                        enter_planned_block(&mut else_ctx, else_arm.clone());
+                    }
+                    lower_block(&mut else_ctx, block)?
+                }
                 None => "[]".into(),
             };
             ctx.declared = else_ctx.declared.clone();
+            let (then_returns, else_returns) = match &planned {
+                Some((then_arm, else_arm, _)) => (
+                    then_arm.flow.definitely_returns(),
+                    else_arm
+                        .as_ref()
+                        .is_some_and(|arm| arm.flow.definitely_returns()),
+                ),
+                None => (
+                    unsealed_test_block_flow(then_block)?.definitely_returns(),
+                    match else_block {
+                        Some(body) => unsealed_test_block_flow(body)?.definitely_returns(),
+                        None => false,
+                    },
+                ),
+            };
             merge_if_initialization(
                 ctx,
                 &before,
                 &then_ctx.locals,
-                block_definitely_returns(then_block),
+                then_returns,
                 &else_ctx.locals,
-                else_block.as_deref().is_some_and(block_definitely_returns),
+                else_returns,
             );
             Some(format!("(.ite {condition} {then} {els})"))
         }
@@ -2537,6 +3437,7 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             cond,
             invariants,
             body,
+            kw_span,
             ..
         } => {
             if !invariants.is_empty() {
@@ -2548,129 +3449,186 @@ fn lower_stmt_erasing(ctx: &mut LowerCtx<'_>, s: &Stmt) -> Result<Option<String>
             }
             validate_sink_type(ctx, Ty::Bool, cond, "while condition")?;
             let condition = lower_expr(ctx, cond)?;
-            let body = lower_scoped_block(ctx, body)?;
-            Some(format!("(.while {condition} {body})"))
+            let planned = planned_loop_body(ctx, *kw_span, cond.span)?;
+            let mut child = ctx.clone();
+            if let Some((body_control, _)) = planned {
+                enter_planned_block(&mut child, body_control);
+            }
+            let lowered_body = lower_block(&mut child, body)?;
+            ctx.declared = child.declared;
+            Some(format!("(.while {condition} {lowered_body})"))
         }
-        Stmt::Return { value: Some(e), .. } => {
+        Stmt::Return {
+            value: Some(e),
+            span,
+        } => {
             validate_return(ctx, e)?;
-            if let (true, ExprKind::Var(name)) = (returned_owner(ctx, e)?, &e.kind) {
-                // Reading the owner's name is the move itself, and the frame
-                // it names is discarded at the pop (ADR 0085).
+            let returned_owner = returned_owner(ctx, e)?;
+            if let (Some(plan), Some(scope)) = (ctx.plan, ctx.scope) {
+                let routes = plan
+                    .explicit_return(*span, scope)
+                    .map_err(|error| format!("internal.svm.control_plan: {}", error.message))?;
+                let slot = routes
+                    .result_slot()
+                    .expect("an explicit checked return has a result slot")
+                    .render();
+                let save = if let (true, ExprKind::Var(name)) = (returned_owner, &e.kind) {
+                    format!("(.moveLocal \"{slot}\" \"{name}\")")
+                } else {
+                    format!("(.assign \"{slot}\" {})", lower_expr(ctx, e)?)
+                };
+                Some(format!(
+                    "{save}, {}, (.ret (.var \"{slot}\"))",
+                    lower_scope_exit(routes.lexical())
+                ))
+            } else if let (true, ExprKind::Var(name)) = (returned_owner, &e.kind) {
+                // The legacy unsealed helper is retained for focused lowering
+                // tests. Exact checked lowering uses `moveLocal` above.
                 Some(format!("(.ret (.var \"{name}\"))"))
             } else {
                 Some(format!("(.ret {})", lower_expr(ctx, e)?))
             }
         }
-        Stmt::Return { value: None, .. } => {
-            return Err("bare `return;` has no SVM form (fall off the end instead)".into());
+        Stmt::Return { value: None, span } => {
+            let (Some(plan), Some(scope)) = (ctx.plan, ctx.scope) else {
+                return Err(
+                    "bare `return;` requires the checker-sealed control plan in SVM lowering"
+                        .into(),
+                );
+            };
+            let routes = plan
+                .explicit_return(*span, scope)
+                .map_err(|error| format!("internal.svm.control_plan: {}", error.message))?;
+            Some(format!(
+                "{}, (.retUnit)",
+                lower_scope_exit(routes.lexical())
+            ))
         }
         // A call for effect: `f(args);` — the discarded-result form of
         // the machine's A-normal call.
-        Stmt::ExprStmt(e) => match &e.kind {
-            // Raw operations are statements in the machine (ADR 0025).
-            // Resource arguments are erased: authority has no runtime
-            // representation, so only the pointer and value lower.
-            ExprKind::RawOp { op, args, .. } => {
-                let result = validate_raw_op(ctx, *op, args)?;
-                if e.ty != Some(result.clone()) {
-                    return Err(format!(
-                        "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
-                        op.name(),
-                        result.name(),
-                        e.ty.clone()
-                            .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
-                    ));
-                }
-                Some(match op {
-                    RawOp::Store8 => format!(
-                        "(.rawStore8 {} {})",
-                        lower_expr(ctx, &args[0])?,
-                        lower_expr(ctx, &args[1])?
-                    ),
-                    RawOp::CellInitU64 => format!(
-                        "(.rawCellInitU64 {} {})",
-                        lower_expr(ctx, &args[0])?,
-                        lower_expr(ctx, &args[1])?
-                    ),
-                    RawOp::CellDropU64 => {
-                        format!("(.rawCellDropU64 {})", lower_expr(ctx, &args[0])?)
+        Stmt::ExprStmt(e) => {
+            if matches!(e.ty.as_ref(), Some(Ty::Class(_))) {
+                validate_checked_temporary_drop_action(ctx, e)?;
+            }
+            consume_expression_trap_sites(ctx, e)?;
+            match &e.kind {
+                // Raw operations are statements in the machine (ADR 0025).
+                // Resource arguments are erased: authority has no runtime
+                // representation, so only the pointer and value lower.
+                ExprKind::RawOp { op, args, .. } => {
+                    let result = validate_raw_op(ctx, *op, args)?;
+                    if e.ty != Some(result.clone()) {
+                        return Err(format!(
+                            "svm.raw_result_type: `{}` produces `{}` but is annotated `{}`",
+                            op.name(),
+                            result.name(),
+                            e.ty.clone().map_or_else(
+                                || "<missing>".into(),
+                                |arg0: ast::Ty| Ty::name(&arg0)
+                            )
+                        ));
                     }
-                    RawOp::CellInitRecord(ri) => {
-                        ctx.record(*ri)?;
-                        format!(
-                            "(.rawCellInitRecord {ri} {} {})",
+                    Some(match op {
+                        RawOp::Store8 => format!(
+                            "(.rawStore8 {} {})",
                             lower_expr(ctx, &args[0])?,
                             lower_expr(ctx, &args[1])?
-                        )
-                    }
-                    RawOp::CellDropRecord(ri) => {
-                        ctx.record(*ri)?;
-                        format!("(.rawCellDropRecord {ri} {})", lower_expr(ctx, &args[0])?)
-                    }
-                    RawOp::HeaderInit => {
-                        let p = lower_expr(ctx, &args[0])?;
-                        let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
-                        format!(
-                            "(.rawCellInitU64 {p} {}), (.rawCellInitU64 {next_p} {})",
-                            lower_expr(ctx, &args[1])?,
-                            lower_expr(ctx, &args[2])?
-                        )
-                    }
-                    RawOp::HeaderClear => {
-                        let p = lower_expr(ctx, &args[0])?;
-                        let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
-                        format!("(.rawCellDropU64 {p}), (.rawCellDropU64 {next_p})")
-                    }
-                    RawOp::Copy => {
-                        return Err("`raw_copy_nonoverlapping` has no single machine step: \
+                        ),
+                        RawOp::CellInitU64 => format!(
+                            "(.rawCellInitU64 {} {})",
+                            lower_expr(ctx, &args[0])?,
+                            lower_expr(ctx, &args[1])?
+                        ),
+                        RawOp::CellDropU64 => {
+                            format!("(.rawCellDropU64 {})", lower_expr(ctx, &args[0])?)
+                        }
+                        RawOp::CellInitRecord(ri) => {
+                            ctx.record(*ri)?;
+                            format!(
+                                "(.rawCellInitRecord {ri} {} {})",
+                                lower_expr(ctx, &args[0])?,
+                                lower_expr(ctx, &args[1])?
+                            )
+                        }
+                        RawOp::CellDropRecord(ri) => {
+                            ctx.record(*ri)?;
+                            format!("(.rawCellDropRecord {ri} {})", lower_expr(ctx, &args[0])?)
+                        }
+                        RawOp::HeaderInit => {
+                            let p = lower_expr(ctx, &args[0])?;
+                            let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                            format!(
+                                "(.rawCellInitU64 {p} {}), (.rawCellInitU64 {next_p} {})",
+                                lower_expr(ctx, &args[1])?,
+                                lower_expr(ctx, &args[2])?
+                            )
+                        }
+                        RawOp::HeaderClear => {
+                            let p = lower_expr(ctx, &args[0])?;
+                            let next_p = format!("(.ptrAdd {p} (.intLit .u64 8))");
+                            format!("(.rawCellDropU64 {p}), (.rawCellDropU64 {next_p})")
+                        }
+                        RawOp::Copy => {
+                            return Err("`raw_copy_nonoverlapping` has no single machine step: \
                                 the machine copies a byte at a time, and lowering it \
                                 would invent a loop the source did not write"
-                            .into());
-                    }
-                    _ => return Err(format!("`{}` produces a value", op.name())),
-                })
-            }
-            ExprKind::DeviceOp { op, args, .. } => {
-                let result = validate_device_op(ctx, *op, args)?;
-                if e.ty != Some(result.clone()) {
-                    return Err(format!(
-                        "svm.device_result_type: `{}` produces `{}` but is annotated `{}`",
-                        op.name(),
-                        result.name(),
-                        e.ty.clone()
-                            .map_or_else(|| "<missing>".into(), |arg0: ast::Ty| Ty::name(&arg0))
-                    ));
+                                .into());
+                        }
+                        _ => return Err(format!("`{}` produces a value", op.name())),
+                    })
                 }
-                Some(match op {
-                    DeviceOp::UartWrite => {
-                        format!("(.uartWrite {})", lower_expr(ctx, &args[0])?)
+                ExprKind::DeviceOp { op, args, .. } => {
+                    let result = validate_device_op(ctx, *op, args)?;
+                    if e.ty != Some(result.clone()) {
+                        return Err(format!(
+                            "svm.device_result_type: `{}` produces `{}` but is annotated `{}`",
+                            op.name(),
+                            result.name(),
+                            e.ty.clone().map_or_else(
+                                || "<missing>".into(),
+                                |arg0: ast::Ty| Ty::name(&arg0)
+                            )
+                        ));
                     }
-                    DeviceOp::UartStatus => {
-                        return Err("`uart_status` produces a value".into());
-                    }
-                })
+                    Some(match op {
+                        DeviceOp::UartWrite => {
+                            format!("(.uartWrite {})", lower_expr(ctx, &args[0])?)
+                        }
+                        DeviceOp::UartStatus => {
+                            return Err("`uart_status` produces a value".into());
+                        }
+                    })
+                }
+                ExprKind::Call { .. } => Some(lower_call(ctx, &None, e)?),
+                ExprKind::ResOp { op, args, .. } => {
+                    semantic_expr_ty(
+                        ctx,
+                        e,
+                        e.ty.clone().unwrap_or(Ty::Unit),
+                        "sealed resource expression statement",
+                    )?;
+                    lower_resource_op_stmt(ctx, *op, args)?
+                }
+                ExprKind::OptTake { option, .. } => {
+                    return Err(affine_option_take_position(option));
+                }
+                _ => {
+                    return Err("expression statements are outside the SVM core subset".into());
+                }
             }
-            ExprKind::Call { .. } => Some(lower_call(ctx, &None, e)?),
-            ExprKind::ResOp { op, args, .. } => {
-                semantic_expr_ty(
-                    ctx,
-                    e,
-                    e.ty.clone().unwrap_or(Ty::Unit),
-                    "sealed resource expression statement",
-                )?;
-                lower_resource_op_stmt(ctx, *op, args)?
-            }
-            ExprKind::OptTake { option, .. } => {
-                return Err(affine_option_take_position(option));
-            }
-            _ => {
-                return Err("expression statements are outside the SVM core subset".into());
-            }
-        },
+        }
         Stmt::Assert(_) => {
             return Err("`/// assert` is outside the SVM core subset".into());
         }
-        Stmt::FieldAssign { .. } | Stmt::FieldStore { .. } => {
+        Stmt::FieldAssign {
+            field,
+            field_span,
+            value,
+        } => {
+            validate_checked_field_assignment_action(ctx, field, *field_span, value)?;
+            return Err("class members are outside the SVM core subset".into());
+        }
+        Stmt::FieldStore { .. } => {
             return Err("class members are outside the SVM core subset".into());
         }
     })
@@ -3262,6 +4220,7 @@ fn lower_erased_resource_bind(
     name: &str,
     e: &Expr,
 ) -> Result<Option<String>, String> {
+    consume_expression_trap_sites(ctx, e)?;
     match &e.kind {
         ExprKind::Var(_) => Ok(None),
         ExprKind::ResOp { op, args, .. } => lower_resource_op_stmt(ctx, *op, args),
@@ -3284,9 +4243,11 @@ fn lower_affine_bool_option_bind(
 ) -> Result<String, String> {
     validate_affine_bool_option_decl(ctx, name, declared_ty, mutable, initializer)?;
     let initializer = initializer.expect("validated affine option initializer");
+    consume_expression_trap_sites(ctx, initializer)?;
     match &initializer.kind {
         ExprKind::NoneE => Ok(format!("(.assign \"{name}\" (.noneE))")),
         ExprKind::SomeE(payload) => {
+            consume_expression_trap_sites(ctx, payload)?;
             let ExprKind::AllocArray { len, init, .. } = &payload.kind else {
                 unreachable!("validated affine-option payload")
             };
@@ -3314,6 +4275,7 @@ fn lower_fresh_bool_array_bind(
     initializer: &Expr,
 ) -> Result<String, String> {
     validate_fresh_bool_array_initializer(ctx, declared_ty, initializer, name)?;
+    consume_expression_trap_sites(ctx, initializer)?;
     match &initializer.kind {
         ExprKind::AllocArray { len, init, .. } => Ok(format!(
             "(.assign \"{name}\" (.allocArray {} {}))",
@@ -3325,16 +4287,28 @@ fn lower_fresh_bool_array_bind(
                 .iter()
                 .enumerate()
                 .map(|(index, value)| {
-                    // Source identifiers beginning with `_` are reserved by
-                    // the lexer, and checked local names are function-unique.
-                    // The explicit lookup keeps the public lowerer fail-closed
-                    // if a forged checked AST bypasses those front-end rules.
-                    let temporary = format!("_bool_lit_{name}_{index}");
-                    if ctx.local(&temporary).is_some() {
-                        return Err(format!(
-                            "svm.bool_array_temp_collision: compiler Boolean-literal temporary `{temporary}` collides with a forged checked local"
-                        ));
-                    }
+                    let temporary = if let (Some(plan), Some(scope)) = (ctx.plan, ctx.scope) {
+                        plan.compiler_temp(
+                            scope,
+                            initializer.span,
+                            CompilerTempKind::BoolLiteralElement(index),
+                        )
+                        .map(|place| place.render())
+                        .map_err(|error| {
+                            format!("internal.svm.control_plan: {}", error.message)
+                        })?
+                    } else {
+                        // The unsealed helper exists only for focused unit
+                        // tests. Keep its old deterministic reservation and
+                        // fail closed on forged test ASTs.
+                        let temporary = format!("_bool_lit_{name}_{index}");
+                        if ctx.local(&temporary).is_some() {
+                            return Err(format!(
+                                "svm.bool_array_temp_collision: compiler Boolean-literal temporary `{temporary}` collides with a forged checked local"
+                            ));
+                        }
+                        temporary
+                    };
                     Ok((temporary, lower_expr(ctx, value)?))
                 })
                 .collect();
@@ -3365,6 +4339,7 @@ fn lower_fresh_bool_array_bind(
 /// `x = e;` — an assign, or (A-normalized, ADR 0005) a call when `e`
 /// is exactly a call; calls nested deeper stay outside the subset.
 fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String> {
+    consume_expression_trap_sites(ctx, e)?;
     match &e.kind {
         ExprKind::OptTake { option, .. } => Err(affine_option_take_position(option)),
         ExprKind::Call { .. } => lower_call(ctx, &Some(name.to_string()), e),
@@ -3502,6 +4477,7 @@ fn lower_bind(ctx: &LowerCtx<'_>, name: &str, e: &Expr) -> Result<String, String
 }
 
 fn lower_call(ctx: &LowerCtx<'_>, dst: &Option<String>, call: &Expr) -> Result<String, String> {
+    consume_expression_trap_sites(ctx, call)?;
     let ExprKind::Call { callee, args, .. } = &call.kind else {
         unreachable!("lower_call requires an ordinary call expression")
     };
@@ -3563,6 +4539,7 @@ fn lower_arg(ctx: &LowerCtx<'_>, arg: &Expr) -> Result<String, String> {
 }
 
 fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
+    consume_expression_trap_sites(ctx, e)?;
     validate_expr_payloads(ctx, e)?;
     Ok(match &e.kind {
         ExprKind::IntLit(n) => {
@@ -3994,6 +4971,14 @@ mod tests {
         }
     }
 
+    fn expr_at(kind: ExprKind, ty: Ty, start: usize) -> Expr {
+        Expr {
+            kind,
+            span: Span::new(start, start + 1),
+            ty: Some(ty),
+        }
+    }
+
     fn empty_program() -> Program {
         Program {
             fns: Vec::new(),
@@ -4031,6 +5016,772 @@ mod tests {
             body,
             span: Span::new(0, 0),
         }
+    }
+
+    fn sealed_checked_program(function: Fn) -> crate::CheckedProgram {
+        sealed_checked_program_with_classes(function, Vec::new())
+    }
+
+    fn sealed_checked_program_with_classes(
+        function: Fn,
+        classes: Vec<ClassDecl>,
+    ) -> crate::CheckedProgram {
+        let mut program = empty_program();
+        program.fns.push(function);
+        program.classes = classes;
+        let control = ControlProgram::build(&program)
+            .expect("the typed test body has one exact checker-style control plan");
+        crate::CheckedProgram {
+            program,
+            control,
+            ownership: crate::ownership::CheckedOwnershipPlan::default(),
+        }
+    }
+
+    fn cleanup_test_class(name: &str, start: usize) -> ClassDecl {
+        ClassDecl {
+            is_pub: false,
+            name: name.into(),
+            name_span: Span::new(start, start + 1),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            fields: Vec::new(),
+            invariants: Vec::new(),
+            inits: Vec::new(),
+            methods: Vec::new(),
+            deinit: None,
+            span: Span::new(start, start + 1),
+        }
+    }
+
+    fn fresh_class_value(class: &str, class_index: usize, start: usize) -> Expr {
+        Expr {
+            kind: ExprKind::CtorCall {
+                class: class.into(),
+                class_span: Span::new(start, start + 1),
+                type_args: Vec::new(),
+                init: "new".into(),
+                args: Vec::new(),
+            },
+            span: Span::new(start, start + 2),
+            ty: Some(Ty::Class(class_index)),
+        }
+    }
+
+    fn cleanup_test_context<'a>(checked: &'a crate::CheckedProgram) -> (&'a Fn, LowerCtx<'a>) {
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed cleanup plan");
+        let ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("checked cleanup lowering context");
+        (function, ctx)
+    }
+
+    #[test]
+    fn checked_assignment_actions_refuse_scope_destination_and_type_mutation() {
+        let scalar_function = || {
+            checked_fn(
+                Ty::Unit,
+                vec![
+                    Stmt::Decl {
+                        ty: Ty::Int(IntTy::U64),
+                        name: "x".into(),
+                        name_span: Span::new(10, 11),
+                        init: Some(expr_at(ExprKind::IntLit(0), Ty::Int(IntTy::U64), 11)),
+                        mutable: true,
+                    },
+                    Stmt::Decl {
+                        ty: Ty::Int(IntTy::U64),
+                        name: "y".into(),
+                        name_span: Span::new(12, 13),
+                        init: Some(expr_at(ExprKind::IntLit(0), Ty::Int(IntTy::U64), 13)),
+                        mutable: true,
+                    },
+                    Stmt::Assign {
+                        name: "x".into(),
+                        name_span: Span::new(20, 21),
+                        value: expr_at(ExprKind::IntLit(1), Ty::Int(IntTy::U64), 21),
+                    },
+                    Stmt::If {
+                        cond: expr_at(ExprKind::BoolLit(true), Ty::Bool, 30),
+                        then_block: Vec::new(),
+                        else_block: None,
+                    },
+                ],
+            )
+        };
+
+        let checked = sealed_checked_program(scalar_function());
+        let lowered = lower_checked_fn(&checked, "subject")
+            .expect("an unchanged scalar assignment consumes its direct checked action");
+        assert!(
+            lowered.contains("(.assign \"x\" (.intLit .u64 1))"),
+            "{lowered}"
+        );
+
+        let mut respanned = sealed_checked_program(scalar_function());
+        respanned.program.fns[0].span = Span::new(90, 99);
+        let error = lower_checked_fn(&respanned, "subject")
+            .expect_err("a checked function cannot move after its plan is retained");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("at 0..0"), "{error}");
+        assert!(error.contains("checked body at 90..99"), "{error}");
+
+        let mut deleted = sealed_checked_program(scalar_function());
+        deleted.program.fns[0].body.remove(2);
+        let error = lower_checked_fn(&deleted, "subject")
+            .expect_err("deleting a checked assignment cannot leave its plan action unused");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("planned assignment"), "{error}");
+
+        let mut deleted_entry = sealed_checked_program(scalar_function());
+        deleted_entry.program.fns[0].body.remove(2);
+        let error = lower_checked_fn_entry(&deleted_entry, "subject")
+            .expect_err("entry lowering also reconciles every checked assignment action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("planned assignment"), "{error}");
+
+        let mut renamed = sealed_checked_program(scalar_function());
+        let Stmt::Assign { name, .. } = &mut renamed.program.fns[0].body[2] else {
+            panic!("fixture has an assignment")
+        };
+        *name = "y".into();
+        let error = lower_checked_fn(&renamed, "subject")
+            .expect_err("a checked assignment cannot be retargeted after planning");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("targets `x`, not `y`"), "{error}");
+
+        let mut moved = sealed_checked_program(scalar_function());
+        let assignment = moved.program.fns[0].body.remove(2);
+        let Stmt::If { then_block, .. } = &mut moved.program.fns[0].body[2] else {
+            panic!("fixture ends with an if")
+        };
+        then_block.push(assignment);
+        let error = lower_checked_fn(&moved, "subject")
+            .expect_err("a checked assignment cannot move into another lexical scope");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("no assignment at this span"), "{error}");
+
+        let mut retyped = sealed_checked_program(scalar_function());
+        let Stmt::Decl { ty, init, .. } = &mut retyped.program.fns[0].body[0] else {
+            panic!("fixture starts with a declaration")
+        };
+        *ty = Ty::Int(IntTy::I64);
+        init.as_mut().expect("initialized declaration").ty = Some(Ty::Int(IntTy::I64));
+        let Stmt::Assign { value, .. } = &mut retyped.program.fns[0].body[2] else {
+            panic!("fixture has an assignment")
+        };
+        value.ty = Some(Ty::Int(IntTy::I64));
+        let error = lower_checked_fn(&retyped, "subject")
+            .expect_err("a checked assignment cannot change destination type after planning");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(
+            error.contains("assignment action no longer matches its checked RHS type"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn checked_field_assignment_action_is_consumed_before_the_class_subset_boundary() {
+        let field_statement = Stmt::FieldAssign {
+            field: "slot".into(),
+            field_span: Span::new(20, 21),
+            value: fresh_class_value("Owner", 0, 30),
+        };
+        let checked = sealed_checked_program_with_classes(
+            checked_fn(Ty::Unit, vec![field_statement.clone()]),
+            vec![cleanup_test_class("Owner", 200)],
+        );
+        let public_error = lower_checked_fn(&checked, "subject")
+            .expect_err("checked SVM lowering preserves the class-member boundary");
+        assert_eq!(
+            public_error,
+            "class members are outside the SVM core subset"
+        );
+        let (function, ctx) = cleanup_test_context(&checked);
+        let Stmt::FieldAssign {
+            field,
+            field_span,
+            value,
+        } = &function.body[0]
+        else {
+            unreachable!()
+        };
+        validate_checked_field_assignment_action(&ctx, field, *field_span, value)
+            .expect("the exact retained field replacement action and class recipe agree");
+        let error = lower_stmt_erasing(&mut ctx.clone(), &function.body[0])
+            .expect_err("SVM still refuses class-member lowering after consuming the action");
+        assert_eq!(error, "class members are outside the SVM core subset");
+
+        let mut moved_key = field_statement.clone();
+        let Stmt::FieldAssign { field_span, .. } = &mut moved_key else {
+            unreachable!()
+        };
+        *field_span = Span::new(21, 22);
+        let Stmt::FieldAssign {
+            field,
+            field_span,
+            value,
+        } = &moved_key
+        else {
+            unreachable!()
+        };
+        let error = validate_checked_field_assignment_action(&ctx, field, *field_span, value)
+            .expect_err("a moved field-action key cannot reach the generic subset refusal");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("no field assignment"), "{error}");
+
+        let mut retargeted = field_statement.clone();
+        let Stmt::FieldAssign { field, .. } = &mut retargeted else {
+            unreachable!()
+        };
+        *field = "other".into();
+        let Stmt::FieldAssign {
+            field,
+            field_span,
+            value,
+        } = &retargeted
+        else {
+            unreachable!()
+        };
+        let error = validate_checked_field_assignment_action(&ctx, field, *field_span, value)
+            .expect_err("a forged destination cannot reuse the retained field action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("destination `self.other`"), "{error}");
+
+        let mut respanned_value = field_statement.clone();
+        let Stmt::FieldAssign { value, .. } = &mut respanned_value else {
+            unreachable!()
+        };
+        value.span = Span::new(31, 33);
+        let Stmt::FieldAssign {
+            field,
+            field_span,
+            value,
+        } = &respanned_value
+        else {
+            unreachable!()
+        };
+        let error = validate_checked_field_assignment_action(&ctx, field, *field_span, value)
+            .expect_err("the RHS transfer span is part of the exact retained action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("checked RHS type/span"), "{error}");
+
+        let mut retyped_value = field_statement;
+        let Stmt::FieldAssign { value, .. } = &mut retyped_value else {
+            unreachable!()
+        };
+        value.ty = Some(Ty::Class(1));
+        let Stmt::FieldAssign {
+            field,
+            field_span,
+            value,
+        } = &retyped_value
+        else {
+            unreachable!()
+        };
+        let error = validate_checked_field_assignment_action(&ctx, field, *field_span, value)
+            .expect_err("the checked RHS class is part of the retained action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("checked RHS type/span"), "{error}");
+
+        let mut relabeled = sealed_checked_program_with_classes(
+            checked_fn(
+                Ty::Unit,
+                vec![Stmt::FieldAssign {
+                    field: "slot".into(),
+                    field_span: Span::new(20, 21),
+                    value: fresh_class_value("Owner", 0, 30),
+                }],
+            ),
+            vec![cleanup_test_class("Owner", 200)],
+        );
+        relabeled.program.classes[0].name = "Other".into();
+        let (function, ctx) = cleanup_test_context(&relabeled);
+        let Stmt::FieldAssign {
+            field,
+            field_span,
+            value,
+        } = &function.body[0]
+        else {
+            unreachable!()
+        };
+        let error = validate_checked_field_assignment_action(&ctx, field, *field_span, value)
+            .expect_err("a post-check class-table mutation cannot reuse the cleanup recipe");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("class-drop plan"), "{error}");
+        assert!(error.contains("declaration"), "{error}");
+    }
+
+    #[test]
+    fn checked_temporary_drop_action_is_consumed_before_expression_refusal() {
+        let temporary_statement = Stmt::ExprStmt(fresh_class_value("Owner", 0, 50));
+        let checked = sealed_checked_program_with_classes(
+            checked_fn(Ty::Unit, vec![temporary_statement.clone()]),
+            vec![cleanup_test_class("Owner", 200)],
+        );
+        let public_error = lower_checked_fn(&checked, "subject")
+            .expect_err("checked SVM lowering preserves the expression-statement boundary");
+        assert_eq!(
+            public_error,
+            "expression statements are outside the SVM core subset"
+        );
+        let (function, ctx) = cleanup_test_context(&checked);
+        let Stmt::ExprStmt(expression) = &function.body[0] else {
+            unreachable!()
+        };
+        validate_checked_temporary_drop_action(&ctx, expression)
+            .expect("the exact discarded-class destination and recipe agree");
+        let error = lower_stmt_erasing(&mut ctx.clone(), &function.body[0])
+            .expect_err("discarded class values remain outside the SVM subset");
+        assert_eq!(
+            error,
+            "expression statements are outside the SVM core subset"
+        );
+
+        let mut respanned = temporary_statement.clone();
+        let Stmt::ExprStmt(expression) = &mut respanned else {
+            unreachable!()
+        };
+        expression.span = Span::new(51, 53);
+        let Stmt::ExprStmt(expression) = &respanned else {
+            unreachable!()
+        };
+        let error = validate_checked_temporary_drop_action(&ctx, expression)
+            .expect_err("the discarded temporary span is its retained lookup key");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("no discarded class temporary"), "{error}");
+
+        let mut retyped = temporary_statement.clone();
+        let Stmt::ExprStmt(expression) = &mut retyped else {
+            unreachable!()
+        };
+        expression.ty = Some(Ty::Class(1));
+        let Stmt::ExprStmt(expression) = &retyped else {
+            unreachable!()
+        };
+        let error = validate_checked_temporary_drop_action(&ctx, expression)
+            .expect_err("the discarded temporary's checked class cannot change");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("no longer matches its type"), "{error}");
+
+        let mut source_shaped = temporary_statement;
+        let Stmt::ExprStmt(expression) = &mut source_shaped else {
+            unreachable!()
+        };
+        expression.kind = ExprKind::Var("owner".into());
+        let Stmt::ExprStmt(expression) = &source_shaped else {
+            unreachable!()
+        };
+        let error = validate_checked_temporary_drop_action(&ctx, expression)
+            .expect_err("a compiler temporary cannot become a discarded source place");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(
+            error.contains("unexpectedly names source place `owner`"),
+            "{error}"
+        );
+
+        let mut unvisited = sealed_checked_program_with_classes(
+            checked_fn(
+                Ty::Unit,
+                vec![Stmt::ExprStmt(fresh_class_value("Owner", 0, 50))],
+            ),
+            vec![cleanup_test_class("Owner", 200)],
+        );
+        unvisited.program.fns[0].body[0] = Stmt::ExprStmt(Expr {
+            kind: ExprKind::IntLit(0),
+            span: Span::new(50, 52),
+            ty: Some(Ty::Int(IntTy::U64)),
+        });
+        let error = lower_checked_fn(&unvisited, "subject")
+            .expect_err("whole-callable validation rejects an unvisited temporary action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(
+            error.contains("planned discarded class temporary"),
+            "{error}"
+        );
+
+        let mut deleted_field = sealed_checked_program_with_classes(
+            checked_fn(
+                Ty::Unit,
+                vec![Stmt::FieldAssign {
+                    field: "slot".into(),
+                    field_span: Span::new(20, 21),
+                    value: fresh_class_value("Owner", 0, 30),
+                }],
+            ),
+            vec![cleanup_test_class("Owner", 200)],
+        );
+        deleted_field.program.fns[0].body.clear();
+        let error = lower_checked_fn_entry(&deleted_field, "subject")
+            .expect_err("entry lowering also rejects a deleted field action");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(!error.contains("class members are outside"), "{error}");
+    }
+
+    #[test]
+    fn checked_body_shape_refuses_else_presence_and_moved_subtree_mutation() {
+        let branch = |start| Stmt::If {
+            cond: expr_at(ExprKind::BoolLit(true), Ty::Bool, start),
+            then_block: Vec::new(),
+            else_block: None,
+        };
+
+        let mut gained_else = sealed_checked_program(checked_fn(Ty::Unit, vec![branch(30)]));
+        let Stmt::If { else_block, .. } = &mut gained_else.program.fns[0].body[0] else {
+            panic!("fixture has one branch")
+        };
+        *else_block = Some(Vec::new());
+        let error = lower_checked_fn(&gained_else, "subject")
+            .expect_err("a checked branch cannot gain an unplanned else arm");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("gained an unplanned else scope"), "{error}");
+
+        let mut lost_else = sealed_checked_program(checked_fn(
+            Ty::Unit,
+            vec![Stmt::If {
+                cond: expr_at(ExprKind::BoolLit(true), Ty::Bool, 40),
+                then_block: Vec::new(),
+                else_block: Some(Vec::new()),
+            }],
+        ));
+        let Stmt::If { else_block, .. } = &mut lost_else.program.fns[0].body[0] else {
+            panic!("fixture has one branch")
+        };
+        *else_block = None;
+        let error = lower_checked_fn(&lost_else, "subject")
+            .expect_err("a checked branch cannot lose its planned else arm");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(
+            error.contains("no longer contains its planned else scope"),
+            "{error}"
+        );
+
+        let mut moved_subtree =
+            sealed_checked_program(checked_fn(Ty::Unit, vec![branch(50), branch(60)]));
+        let moved = moved_subtree.program.fns[0].body.remove(1);
+        let Stmt::If { then_block, .. } = &mut moved_subtree.program.fns[0].body[0] else {
+            panic!("fixture starts with a branch")
+        };
+        then_block.push(moved);
+        let error = lower_checked_fn(&moved_subtree, "subject")
+            .expect_err("a checked subtree cannot move under another lexical parent");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(
+            error.contains("moved under a different lexical parent"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn direct_lowering_consumes_expression_and_statement_trap_sites() {
+        let integer = Ty::Int(IntTy::I32);
+        let arithmetic = expr_at(
+            ExprKind::Binary {
+                op: BinOp::Add,
+                op_span: Span::new(20, 21),
+                lhs: Box::new(expr_at(ExprKind::IntLit(4), integer.clone(), 21)),
+                rhs: Box::new(expr_at(ExprKind::IntLit(2), integer.clone(), 22)),
+            },
+            integer.clone(),
+            20,
+        );
+        let checked = sealed_checked_program(checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: integer.clone(),
+                name: "sum".into(),
+                name_span: Span::new(10, 11),
+                init: Some(arithmetic.clone()),
+                mutable: false,
+            }],
+        ));
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed plan");
+        let ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("checked lowering context");
+        assert!(lower_expr(&ctx, &arithmetic).is_ok());
+
+        let mut changed_operator = arithmetic.clone();
+        let ExprKind::Binary { op, .. } = &mut changed_operator.kind else {
+            unreachable!()
+        };
+        *op = BinOp::Sub;
+        let error = lower_expr(&ctx, &changed_operator)
+            .expect_err("direct expression lowering must resolve the exact retained trap kind");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("SubOverflow"), "{error}");
+
+        // Fresh Boolean arrays bypass ordinary `lower_expr` at their binding
+        // position, so their allocation traps must be consumed there too.
+        let bool_array = Ty::array(Ty::Bool);
+        let allocation = expr_at(
+            ExprKind::AllocArray {
+                elem: Ty::Bool,
+                len: Box::new(expr_at(ExprKind::IntLit(1), Ty::Int(IntTy::U64), 41)),
+                init: Box::new(expr_at(ExprKind::BoolLit(false), Ty::Bool, 42)),
+            },
+            bool_array.clone(),
+            40,
+        );
+        let checked = sealed_checked_program(checked_fn(
+            Ty::Unit,
+            vec![Stmt::Decl {
+                ty: bool_array.clone(),
+                name: "bits".into(),
+                name_span: Span::new(30, 31),
+                init: Some(allocation.clone()),
+                mutable: false,
+            }],
+        ));
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed plan");
+        let ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("checked lowering context");
+        assert!(lower_fresh_bool_array_bind(&ctx, "bits", bool_array.clone(), &allocation).is_ok());
+        let mut moved_allocation = allocation.clone();
+        moved_allocation.span = Span::new(45, 46);
+        let error =
+            lower_fresh_bool_array_bind(&ctx, "bits", bool_array.clone(), &moved_allocation)
+                .expect_err("special Boolean-array lowering must consume allocation trap sites");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("ArrayAllocation"), "{error}");
+
+        let byte_array = Ty::array(Ty::Int(IntTy::U8));
+        let store = Stmt::Store {
+            array: "left".into(),
+            array_span: Span::new(70, 71),
+            index: expr_at(ExprKind::IntLit(0), Ty::Int(IntTy::U64), 71),
+            value: expr_at(ExprKind::IntLit(9), Ty::Int(IntTy::U8), 72),
+        };
+        let checked = sealed_checked_program(checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: byte_array.clone(),
+                    name: "left".into(),
+                    name_span: Span::new(60, 61),
+                    init: None,
+                    mutable: true,
+                },
+                Stmt::Decl {
+                    ty: byte_array.clone(),
+                    name: "right".into(),
+                    name_span: Span::new(62, 63),
+                    init: None,
+                    mutable: true,
+                },
+                store.clone(),
+            ],
+        ));
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed plan");
+        let mut ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("checked lowering context");
+        ctx.insert_local("left", byte_array.clone(), true, true)
+            .expect("left array is active");
+        ctx.insert_local("right", byte_array, true, true)
+            .expect("right array is active");
+        assert!(lower_stmt_erasing(&mut ctx, &store).is_ok());
+
+        let mut retargeted_store = store;
+        let Stmt::Store { array, .. } = &mut retargeted_store else {
+            unreachable!()
+        };
+        *array = "right".into();
+        let error = lower_stmt_erasing(&mut ctx, &retargeted_store)
+            .expect_err("direct statement lowering must resolve the exact retained store trap");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("ArrayStore"), "{error}");
+    }
+
+    #[test]
+    fn direct_lowering_consumes_retained_branch_loop_and_exposure_edges() {
+        let branch = Stmt::If {
+            cond: expr_at(ExprKind::BoolLit(true), Ty::Bool, 80),
+            then_block: Vec::new(),
+            else_block: None,
+        };
+        let checked = sealed_checked_program(checked_fn(Ty::Unit, vec![branch.clone()]));
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed plan");
+        let mut ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("checked lowering context");
+        assert!(lower_stmt_erasing(&mut ctx, &branch).is_ok());
+        let mut gained_else = branch;
+        let Stmt::If { else_block, .. } = &mut gained_else else {
+            unreachable!()
+        };
+        *else_block = Some(Vec::new());
+        let error = lower_stmt_erasing(&mut ctx, &gained_else)
+            .expect_err("direct branch lowering must consume retained arm presence");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("else-arm presence changed"), "{error}");
+
+        let loop_stmt = Stmt::While {
+            kw_span: Span::new(90, 91),
+            cond: expr_at(ExprKind::BoolLit(false), Ty::Bool, 91),
+            invariants: Vec::new(),
+            variant: None,
+            body: Vec::new(),
+        };
+        let checked = sealed_checked_program(checked_fn(Ty::Unit, vec![loop_stmt.clone()]));
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed plan");
+        let mut ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("checked lowering context");
+        assert!(lower_stmt_erasing(&mut ctx, &loop_stmt).is_ok());
+        let mut moved_condition = loop_stmt;
+        let Stmt::While { cond, .. } = &mut moved_condition else {
+            unreachable!()
+        };
+        cond.span = Span::new(92, 93);
+        let error = lower_stmt_erasing(&mut ctx, &moved_condition)
+            .expect_err("direct loop lowering must consume the retained condition identity");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("condition identity changed"), "{error}");
+
+        let byte_array = Ty::array(Ty::Int(IntTy::U8));
+        let exposure = Stmt::Expose {
+            kw_span: Span::new(110, 111),
+            array: "bytes".into(),
+            array_span: Span::new(111, 112),
+            mutable: true,
+            ptr: "pointer".into(),
+            ptr_span: Span::new(112, 113),
+            res: "memory".into(),
+            res_span: Span::new(113, 114),
+            body: Vec::new(),
+        };
+        let checked = sealed_checked_program(checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: byte_array.clone(),
+                    name: "bytes".into(),
+                    name_span: Span::new(100, 101),
+                    init: None,
+                    mutable: true,
+                },
+                exposure.clone(),
+            ],
+        ));
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed plan");
+        let mut ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("checked lowering context");
+        ctx.insert_local("bytes", byte_array, true, true)
+            .expect("exposed array is active");
+        assert!(lower_stmt_erasing(&mut ctx, &exposure).is_ok());
+        let mut renamed_pointer = exposure;
+        let Stmt::Expose { ptr, .. } = &mut renamed_pointer else {
+            unreachable!()
+        };
+        *ptr = "other_pointer".into();
+        let error = lower_stmt_erasing(&mut ctx, &renamed_pointer)
+            .expect_err("direct exposure lowering must consume retained rebuild identities");
+        assert!(error.starts_with("internal.svm.control_plan:"), "{error}");
+        assert!(error.contains("rebuild action disagrees"), "{error}");
+    }
+
+    #[test]
+    fn checked_assignment_action_names_the_cleanup_replacement_subset_boundary() {
+        let array_ty = Ty::array(Ty::Bool);
+        let allocation = |start| {
+            expr_at(
+                ExprKind::AllocArray {
+                    elem: Ty::Bool,
+                    len: Box::new(expr_at(ExprKind::IntLit(1), Ty::Int(IntTy::U64), start + 1)),
+                    init: Box::new(expr_at(ExprKind::BoolLit(false), Ty::Bool, start + 2)),
+                },
+                array_ty.clone(),
+                start,
+            )
+        };
+        let function = checked_fn(
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: array_ty.clone(),
+                    name: "bits".into(),
+                    name_span: Span::new(10, 11),
+                    init: Some(allocation(11)),
+                    mutable: true,
+                },
+                Stmt::Assign {
+                    name: "bits".into(),
+                    name_span: Span::new(20, 21),
+                    value: allocation(21),
+                },
+            ],
+        );
+        let checked = sealed_checked_program(function);
+        let public_error = lower_checked_fn(&checked, "subject")
+            .expect_err("owned-array replacement remains outside the SVM subset");
+        assert!(
+            public_error.starts_with("svm.bool_array_position_unsupported:")
+                || public_error.starts_with("svm.array_rebind_unsupported:"),
+            "{public_error}"
+        );
+
+        let function = &checked.program.fns[0];
+        let plan = require_control_body(&checked.control, function).expect("sealed plan");
+        let mut ctx = LowerCtx::for_function_with_plan(
+            &checked.program,
+            function,
+            Some(&checked.control),
+            Some(plan),
+        )
+        .expect("test context");
+        ctx.insert_local("bits", array_ty.clone(), true, true)
+            .expect("the declaration is active at its assignment");
+        let Stmt::Assign {
+            name, name_span, ..
+        } = &function.body[1]
+        else {
+            panic!("fixture has an array assignment")
+        };
+        let error = validate_checked_assignment_action(&ctx, name, *name_span, &array_ty)
+            .expect_err("temporary+previous replacement is not silently treated as direct");
+        assert!(
+            error.starts_with("svm.assignment_replacement_unsupported:"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6038,9 +7789,13 @@ mod tests {
                     res_span: Span::new(0, 0),
                     body: vec![Stmt::Unsafe {
                         kw_span: Span::new(0, 0),
-                        body: vec![Stmt::Return {
-                            value: Some(expr(ExprKind::IntLit(1), Ty::Int(IntTy::I32))),
-                            span: Span::new(0, 0),
+                        body: vec![Stmt::If {
+                            cond: expr(ExprKind::BoolLit(true), Ty::Bool),
+                            then_block: vec![Stmt::Return {
+                                value: Some(expr(ExprKind::IntLit(1), Ty::Int(IntTy::I32))),
+                                span: Span::new(0, 0),
+                            }],
+                            else_block: None,
                         }],
                     }],
                 },

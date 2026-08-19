@@ -13,8 +13,15 @@ use crate::ast::{
     BinOp, BindingMode, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl,
     SelfKind, Stmt, Ty, UnOp,
 };
+use crate::control::{
+    AssignmentAction, AssignmentStaging, BlockId, BodyPlan, ClassDropAction, ClassDropPhase,
+    ClassDropPlan, ControlProgram, DropId, ExitRoute, PlanError, ScopeId, StatementPlanKind,
+    TrapSite,
+};
 use crate::diag::Diagnostic;
+use crate::place::Place;
 use crate::span::Span;
+use crate::transition::CallOwner;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 const ARRAY_CAPACITY: u64 = 50_000_000;
@@ -51,7 +58,12 @@ pub fn emit_verified(
             format!("`{name}` is an audited axiom: {reason}"),
         )]);
     }
-    let mut ir = emit_program(verified.program(), verified.root_span_end(), options)?;
+    let mut ir = emit_program_with_control(
+        verified.program(),
+        verified.control(),
+        verified.root_span_end(),
+        options,
+    )?;
     let insert_at = ir.find('\n').map_or(ir.len(), |index| index + 1);
     ir.insert_str(
         insert_at,
@@ -64,19 +76,39 @@ pub fn emit_verified(
     Ok(ir)
 }
 
+#[cfg(test)]
 fn emit_program(
     program: &Program,
+    root_span_end: usize,
+    options: &EmitOptions,
+) -> Result<String, Vec<BackendError>> {
+    emit_program_inner(program, None, root_span_end, options)
+}
+
+fn emit_program_with_control(
+    program: &Program,
+    control: &ControlProgram,
+    root_span_end: usize,
+    options: &EmitOptions,
+) -> Result<String, Vec<BackendError>> {
+    emit_program_inner(program, Some(control), root_span_end, options)
+}
+
+fn emit_program_inner(
+    program: &Program,
+    control: Option<&ControlProgram>,
     root_span_end: usize,
     options: &EmitOptions,
 ) -> Result<String, Vec<BackendError>> {
     let selected = select_callables(program, root_span_end, options)?;
     validate_acyclic(program, &selected)?;
     for &index in &selected.functions {
-        validate_function(program, &program.fns[index], root_span_end)?;
+        validate_function(program, control, &program.fns[index], root_span_end)?;
     }
     for &(class, initializer) in &selected.initializers {
         validate_initializer(
             program,
+            control,
             class,
             &program.classes[class].inits[initializer],
             root_span_end,
@@ -85,6 +117,7 @@ fn emit_program(
     for &(class, method) in &selected.methods {
         validate_method(
             program,
+            control,
             class,
             method,
             &program.classes[class].methods[method],
@@ -107,17 +140,19 @@ fn emit_program(
         }
     }
     for &(class, initializer) in &selected.initializers {
-        FunctionEmitter::new_initializer(program, class, initializer, &mut support)
+        FunctionEmitter::new_initializer(program, control, class, initializer, &mut support)?
             .emit(&mut definitions)?;
         definitions.push('\n');
     }
     for &(class, method) in &selected.methods {
-        FunctionEmitter::new_method(program, class, method, &mut support).emit(&mut definitions)?;
+        FunctionEmitter::new_method(program, control, class, method, &mut support)?
+            .emit(&mut definitions)?;
         definitions.push('\n');
     }
     for (index, function) in program.fns.iter().enumerate() {
         if selected_set.contains(&index) {
-            FunctionEmitter::new(program, function, &mut support).emit(&mut definitions)?;
+            FunctionEmitter::new(program, control, function, &mut support)?
+                .emit(&mut definitions)?;
             definitions.push('\n');
         }
     }
@@ -579,8 +614,42 @@ fn validate_acyclic(
     Ok(())
 }
 
+fn llvm_validation_plan<'a>(
+    control: Option<&'a ControlProgram>,
+    program: &Program,
+    owner: &CallOwner,
+    function: &Fn,
+) -> Result<Option<&'a BodyPlan>, Vec<BackendError>> {
+    let Some(control) = control else {
+        // Raw AST lowering exists only for focused unit tests. Production
+        // callers always provide the checker-retained carrier.
+        return Ok(None);
+    };
+    let body = control
+        .body(owner, function.span)
+        .map_err(|error| vec![control_plan_backend_error(error)])?;
+    body.validate_callable(function.span, &function.params, &function.body)
+        .map_err(|error| vec![control_plan_backend_error(error)])?;
+    for action in body.plan().field_assignments() {
+        if let Some(class_drop) = action.class_drop() {
+            control
+                .class_drop_for_action(class_drop, &program.classes, action.span())
+                .map_err(|error| vec![control_plan_backend_error(error)])?;
+        }
+    }
+    for action in body.plan().temporary_drops() {
+        control
+            .class_drop_for_action(action.class_drop(), &program.classes, action.span())
+            .map_err(|error| vec![control_plan_backend_error(error)])?;
+    }
+    validate_llvm_exposure_plan_tree(body.plan(), &function.body, body.plan().body_block().id())
+        .map_err(|error| vec![control_plan_backend_error(error)])?;
+    Ok(Some(body.plan()))
+}
+
 fn validate_function(
     program: &Program,
+    control: Option<&ControlProgram>,
     function: &Fn,
     root_span_end: usize,
 ) -> Result<(), Vec<BackendError>> {
@@ -602,6 +671,12 @@ fn validate_function(
             ),
         )]);
     }
+    let plan = llvm_validation_plan(
+        control,
+        program,
+        &CallOwner::Function(function.name.clone()),
+        function,
+    )?;
     if let Some(parameter) = function
         .params
         .iter()
@@ -661,6 +736,8 @@ fn validate_function(
         function.ret.clone(),
         None,
         None,
+        plan,
+        plan.map(|plan| plan.body_block().id()),
     )
     .map(|_| ())
 }
@@ -673,6 +750,7 @@ struct InitializerValidation {
 
 fn validate_initializer(
     program: &Program,
+    control: Option<&ControlProgram>,
     class: usize,
     initializer: &Fn,
     root_span_end: usize,
@@ -696,6 +774,15 @@ fn validate_initializer(
             ),
         )]);
     }
+    let plan = llvm_validation_plan(
+        control,
+        program,
+        &CallOwner::Constructor {
+            class: program.classes[class].name.clone(),
+            init: initializer.name.clone(),
+        },
+        initializer,
+    )?;
     let mut locals = ValidationLocals::new();
     for parameter in &initializer.params {
         require_initializer_parameter(
@@ -725,6 +812,8 @@ fn validate_initializer(
         Ty::Unit,
         Some(&mut context),
         None,
+        plan,
+        plan.map(|plan| plan.body_block().id()),
     )?;
     if context
         .fields_initialized
@@ -744,6 +833,7 @@ fn validate_initializer(
 
 fn validate_method(
     program: &Program,
+    control: Option<&ControlProgram>,
     class: usize,
     method_index: usize,
     method: &crate::ast::Method,
@@ -767,6 +857,15 @@ fn validate_method(
             "the backend lowers only `Integer::flip_sign(&mut self) -> ()`, with no explicit arguments",
         )]);
     }
+    let plan = llvm_validation_plan(
+        control,
+        program,
+        &CallOwner::Method {
+            class: program.classes[class].name.clone(),
+            method: method.f.name.clone(),
+        },
+        &method.f,
+    )?;
     let mut locals = ValidationLocals::new();
     locals.insert(
         "self".into(),
@@ -784,6 +883,8 @@ fn validate_method(
         Ty::Unit,
         None,
         Some((class, method.self_kind)),
+        plan,
+        plan.map(|plan| plan.body_block().id()),
     )
     .map(|_| ())
 }
@@ -873,6 +974,124 @@ impl ValidationLocals {
     }
 }
 
+fn validate_llvm_exposure_plan_shape(
+    plan: &BodyPlan,
+    parent_block: BlockId,
+    parent_scope: ScopeId,
+    kw_span: Span,
+    array: &str,
+    mutable: bool,
+    ptr: &str,
+    res: &str,
+) -> Result<(), PlanError> {
+    let exposure = plan.exposure_plan(parent_scope, kw_span)?;
+    let body = plan.block(exposure.body());
+    let Some(normal) = exposure.normal() else {
+        return Err(PlanError {
+            span: kw_span,
+            message: "checked LLVM exposure has no retained normal epilogue".into(),
+        });
+    };
+    let rebuild = normal.rebuild();
+    let mutability = if mutable {
+        Mutability::Mut
+    } else {
+        Mutability::Shared
+    };
+    if exposure.parent_scope() != parent_scope
+        || exposure.keyword_span() != kw_span
+        || body.parent() != Some(parent_block)
+        || body.scope() != exposure.body_scope()
+        || !exposure.body_flow().can_fall_through()
+        || normal.parent_scope() != parent_scope
+        || normal.capture() != &Place::local(res)
+        || normal.body_exit().scopes() != [exposure.body_scope()]
+        || rebuild.owner() != &Place::local(array)
+        || !matches!(rebuild.owner_ty().as_array(), Some((Ty::Int(IntTy::U8), _)))
+        || rebuild.mutability() != mutability
+        || rebuild.pointer() != &Place::local(ptr)
+        || rebuild.resource() != &Place::local(res)
+        || rebuild.keyword_span() != kw_span
+        || !normal.release_loan().is_root()
+        || normal.close().clears().last() != Some(normal.release_loan())
+    {
+        return Err(PlanError {
+            span: kw_span,
+            message: "LLVM exposure disagrees with its retained parent/body/epilogue shape".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_llvm_exposure_plan_tree(
+    plan: &BodyPlan,
+    statements: &[Stmt],
+    block: BlockId,
+) -> Result<(), PlanError> {
+    let retained = plan.block(block);
+    if retained.statements().len() != statements.len() {
+        return Err(PlanError {
+            span: retained.anchor(),
+            message: "LLVM exposure preflight found a changed retained block length".into(),
+        });
+    }
+    let scope = retained.scope();
+    let statement_plans = retained.statements().to_vec();
+    for (statement, statement_plan) in statements.iter().zip(statement_plans) {
+        match (statement_plan.kind(), statement) {
+            (StatementPlanKind::Unsafe(child), Stmt::Unsafe { body, .. }) => {
+                validate_llvm_exposure_plan_tree(plan, body, child)?;
+            }
+            (
+                StatementPlanKind::Branch(_),
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                },
+            ) => {
+                let branch = plan.branch(scope, cond.span, else_block.is_some())?;
+                validate_llvm_exposure_plan_tree(plan, then_block, branch.then_arm().block())?;
+                if let (Some(source), Some(arm)) = (else_block.as_deref(), branch.else_arm()) {
+                    validate_llvm_exposure_plan_tree(plan, source, arm.block())?;
+                }
+            }
+            (
+                StatementPlanKind::Loop(_),
+                Stmt::While {
+                    cond,
+                    kw_span,
+                    body,
+                    ..
+                },
+            ) => {
+                let loop_plan = plan.loop_plan(scope, *kw_span, cond.span)?;
+                validate_llvm_exposure_plan_tree(plan, body, loop_plan.body())?;
+            }
+            (
+                StatementPlanKind::Exposure(_),
+                Stmt::Expose {
+                    kw_span,
+                    array,
+                    mutable,
+                    ptr,
+                    res,
+                    body,
+                    ..
+                },
+            ) => {
+                validate_llvm_exposure_plan_shape(
+                    plan, block, scope, *kw_span, array, *mutable, ptr, res,
+                )?;
+                let exposure = plan.exposure_plan(scope, *kw_span)?;
+                validate_llvm_exposure_plan_tree(plan, body, exposure.body())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate_block(
     program: &Program,
     statements: &[Stmt],
@@ -881,11 +1100,116 @@ fn validate_block(
     ret_ty: Ty,
     mut initializer: Option<&mut InitializerValidation>,
     method: Option<(usize, SelfKind)>,
+    plan: Option<&BodyPlan>,
+    block: Option<BlockId>,
 ) -> Result<bool, Vec<BackendError>> {
+    let retained = match (plan, block) {
+        (Some(plan), Some(block)) => {
+            let block = plan.block(block);
+            if block.statements().len() != statements.len() {
+                return Err(vec![control_plan_backend_error(PlanError {
+                    span: block.anchor(),
+                    message: "LLVM validation block length changed after checking".into(),
+                })]);
+            }
+            Some((
+                block.scope(),
+                block.flow(),
+                block.anchor(),
+                block.statements().to_vec(),
+            ))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: Span::new(0, 0),
+                message: "LLVM validation received a partial retained block context".into(),
+            })]);
+        }
+    };
     let mut returned = false;
-    for statement in statements {
-        if returned {
+    for (index, statement) in statements.iter().enumerate() {
+        let statement_plan = retained
+            .as_ref()
+            .map(|(_, _, _, statements)| &statements[index]);
+        let entry_reachable =
+            statement_plan.map_or(!returned, |statement| statement.entry_reachable());
+        if !entry_reachable {
             break;
+        }
+        if let Some(statement_plan) = statement_plan {
+            let kind = statement_plan.kind();
+            let matches = match statement {
+                Stmt::Return { .. } => matches!(kind, StatementPlanKind::Return),
+                Stmt::If { .. } => matches!(kind, StatementPlanKind::Branch(_)),
+                Stmt::While { .. } => matches!(kind, StatementPlanKind::Loop(_)),
+                Stmt::Unsafe { .. } => matches!(kind, StatementPlanKind::Unsafe(_)),
+                Stmt::Expose { .. } => matches!(kind, StatementPlanKind::Exposure(_)),
+                Stmt::Decl { .. }
+                | Stmt::Assign { .. }
+                | Stmt::ExprStmt(_)
+                | Stmt::Assert(_)
+                | Stmt::VarDecl { .. }
+                | Stmt::FieldAssign { .. }
+                | Stmt::FieldStore { .. }
+                | Stmt::Store { .. }
+                | Stmt::StaticAlloc { .. }
+                | Stmt::SystemAlloc { .. }
+                | Stmt::SystemDealloc { .. } => matches!(kind, StatementPlanKind::Linear(_)),
+            };
+            if !matches {
+                return Err(vec![control_plan_backend_error(PlanError {
+                    span: retained
+                        .as_ref()
+                        .map_or(Span::new(0, 0), |(_, _, anchor, _)| *anchor),
+                    message: "LLVM validation statement changed its retained structural role"
+                        .into(),
+                })]);
+            }
+        }
+        if let (Some(plan), Some((scope, _, _, _))) = (plan, retained.as_ref()) {
+            match statement {
+                Stmt::FieldAssign {
+                    field,
+                    field_span,
+                    value,
+                } => {
+                    let destination = Place::field("self", field);
+                    let action = plan
+                        .field_assignment(*scope, *field_span, &destination, value)
+                        .map_err(|error| vec![control_plan_backend_error(error)])?;
+                    let staging_matches = matches!(
+                        (action.drop_if_present(), action.staging()),
+                        (true, AssignmentStaging::Temporary(temp)) if temp.is_root()
+                    ) || matches!(
+                        (action.drop_if_present(), action.staging()),
+                        (false, AssignmentStaging::Direct)
+                    );
+                    if action.scope() != *scope
+                        || action.destination() != &destination
+                        || !staging_matches
+                    {
+                        return Err(vec![control_plan_backend_error(PlanError {
+                            span: *field_span,
+                            message: "LLVM field assignment is detached from its retained action"
+                                .into(),
+                        })]);
+                    }
+                }
+                Stmt::ExprStmt(expression) if matches!(expression.ty, Some(Ty::Class(_))) => {
+                    let action = plan
+                        .temporary_drop(*scope, expression)
+                        .map_err(|error| vec![control_plan_backend_error(error)])?;
+                    if action.scope() != *scope || !action.temporary().is_root() {
+                        return Err(vec![control_plan_backend_error(PlanError {
+                            span: expression.span,
+                            message: "LLVM discarded class result is detached from its retained temporary action"
+                                .into(),
+                        })]);
+                    }
+                }
+                _ => {}
+            }
         }
         match statement {
             Stmt::Decl {
@@ -932,6 +1256,17 @@ fn validate_block(
                     } else {
                         validate_fresh_u32_array_initializer(
                             program,
+                            value,
+                            root_span_end,
+                            locals,
+                        )?;
+                    }
+                } else if let Ty::Class(class) = ty {
+                    require_fixed_class(program, *class, *name_span, "local variable")?;
+                    if let Some(value) = init {
+                        validate_fixed_class_initializer(
+                            program,
+                            *class,
                             value,
                             root_span_end,
                             locals,
@@ -1104,6 +1439,10 @@ fn validate_block(
             }
             Stmt::Assert(_) => {}
             Stmt::Unsafe { body, .. } => {
+                let child = statement_plan.and_then(|statement| match statement.kind() {
+                    StatementPlanKind::Unsafe(child) => Some(child),
+                    _ => None,
+                });
                 returned = validate_block(
                     program,
                     body,
@@ -1112,6 +1451,8 @@ fn validate_block(
                     ret_ty.clone(),
                     initializer.as_deref_mut(),
                     method,
+                    plan,
+                    child,
                 )?;
             }
             Stmt::If {
@@ -1119,6 +1460,15 @@ fn validate_block(
                 then_block,
                 else_block,
             } => {
+                let branch_plan = match (plan, retained.as_ref()) {
+                    (Some(plan), Some((scope, _, _, _))) => Some(
+                        plan.branch(*scope, cond.span, else_block.is_some())
+                            .map_err(|error| vec![control_plan_backend_error(error)])?
+                            .clone(),
+                    ),
+                    (None, None) => None,
+                    _ => unreachable!("retained validation context is all-or-none"),
+                };
                 validate_bool_expr(program, cond, "`if` condition", root_span_end, locals)?;
                 let base_initializer = initializer.as_deref().cloned();
                 let before_moved = locals.moved_classes.clone();
@@ -1132,6 +1482,8 @@ fn validate_block(
                     ret_ty.clone(),
                     then_initializer.as_mut(),
                     method,
+                    plan,
+                    branch_plan.as_ref().map(|branch| branch.then_arm().block()),
                 )?;
                 locals.pop_scope();
                 let then_moved = locals.moved_classes.clone();
@@ -1147,6 +1499,11 @@ fn validate_block(
                         ret_ty.clone(),
                         else_initializer.as_mut(),
                         method,
+                        plan,
+                        branch_plan
+                            .as_ref()
+                            .and_then(|branch| branch.else_arm())
+                            .map(|arm| arm.block()),
                     )?;
                     locals.pop_scope();
                     (else_returned, locals.moved_classes.clone())
@@ -1179,7 +1536,21 @@ fn validate_block(
                 };
                 returned = then_returned && else_returned;
             }
-            Stmt::While { cond, body, .. } => {
+            Stmt::While {
+                cond,
+                kw_span,
+                body,
+                ..
+            } => {
+                let loop_plan = match (plan, retained.as_ref()) {
+                    (Some(plan), Some((scope, _, _, _))) => Some(
+                        plan.loop_plan(*scope, *kw_span, cond.span)
+                            .map_err(|error| vec![control_plan_backend_error(error)])?
+                            .clone(),
+                    ),
+                    (None, None) => None,
+                    _ => unreachable!("retained validation context is all-or-none"),
+                };
                 validate_bool_expr(program, cond, "`while` condition", root_span_end, locals)?;
                 let before = initializer.as_deref().cloned();
                 let before_moved = locals.moved_classes.clone();
@@ -1193,6 +1564,8 @@ fn validate_block(
                     ret_ty.clone(),
                     body_initializer.as_mut(),
                     method,
+                    plan,
+                    loop_plan.as_ref().map(|loop_plan| loop_plan.body()),
                 )?;
                 locals.pop_scope();
                 if body_initializer != before {
@@ -1258,9 +1631,20 @@ fn validate_block(
                 kw_span,
                 array,
                 array_span,
+                mutable,
+                ptr,
+                res,
                 ..
             } => {
                 reject_named_affine_option(locals, array, *array_span, "array exposure source")?;
+                if let (Some(plan), Some(block), Some((scope, _, _, _))) =
+                    (plan, block, retained.as_ref())
+                {
+                    validate_llvm_exposure_plan_shape(
+                        plan, block, *scope, *kw_span, array, *mutable, ptr, res,
+                    )
+                    .map_err(|error| vec![control_plan_backend_error(error)])?;
+                }
                 return Err(vec![unsupported(
                     *kw_span,
                     "raw/resource storage is outside the scalar LLVM subset",
@@ -1275,8 +1659,33 @@ fn validate_block(
                 )]);
             }
         }
+        if let Some(statement_plan) = statement_plan {
+            let planned_return = statement_plan.flow().definitely_returns();
+            if returned != planned_return {
+                return Err(vec![control_plan_backend_error(PlanError {
+                    span: retained
+                        .as_ref()
+                        .map_or(Span::new(0, 0), |(_, _, anchor, _)| *anchor),
+                    message:
+                        "LLVM validation reachability disagrees with its retained statement flow"
+                            .into(),
+                })]);
+            }
+            returned = planned_return;
+        }
     }
-    Ok(returned)
+    if let Some((_, flow, anchor, _)) = retained {
+        let planned_return = flow.definitely_returns();
+        if returned != planned_return {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: anchor,
+                message: "LLVM validation block result disagrees with its retained flow".into(),
+            })]);
+        }
+        Ok(planned_return)
+    } else {
+        Ok(returned)
+    }
 }
 
 fn is_owned_u32_array(ty: Ty) -> bool {
@@ -3634,12 +4043,12 @@ struct Value {
     operand: Option<String>,
 }
 
-#[derive(Clone)]
-enum OwnedCleanup {
-    BoolArray(String),
-    U32Array(String),
-    AffineBoolOption(String),
-    FixedClass(String, usize),
+struct ActiveCleanupScope {
+    id: ScopeId,
+    /// Candidate identity comes from BodyPlan. The backend records only
+    /// whether this structured path reached the declaration; place, type, and
+    /// exit order stay authoritative in the shared plan.
+    reached: HashSet<DropId>,
 }
 
 struct FunctionEmitter<'a, 'support> {
@@ -3649,10 +4058,10 @@ struct FunctionEmitter<'a, 'support> {
     initializer_class: Option<usize>,
     method: Option<(usize, usize)>,
     locals: HashMap<String, Local>,
-    /// Entry-block scratch owners for class reassignment. Each RHS is fully
-    /// evaluated here before the old destination is destroyed, preserving
-    /// expressions that borrow their own assignment target.
-    class_reassignment_slots: HashMap<String, String>,
+    /// Entry-block storage for plan-named assignment temporaries. The shared
+    /// action decides which cleanup-bearing RHS must survive while the old
+    /// destination is destroyed.
+    assignment_staging_slots: HashMap<Place, String>,
     late_entry_allocas: Vec<String>,
     next_local: usize,
     next_temp: usize,
@@ -3662,52 +4071,139 @@ struct FunctionEmitter<'a, 'support> {
     /// that its terminator has been emitted; a sibling or merge may still be
     /// started afterwards.
     current_block: Option<String>,
-    /// Ownership-bearing locals initialized on the current structured path,
-    /// grouped by lexical lifetime. An `unsafe` block deliberately shares its
-    /// caller's scope; `if` branches and loop bodies push one of their own.
-    cleanup_scopes: Vec<Vec<OwnedCleanup>>,
+    /// Ownership-bearing locals with a live or backend-neutral slot on the
+    /// current structured path, keyed by the shared plan's candidates and
+    /// grouped by lexical lifetime. An explicitly uninitialized fixed class is
+    /// registered at its declaration after its slot receives the recursively
+    /// null-safe `zeroinitializer`; this keeps cleanup correct on one-arm and
+    /// zero-iteration paths without inventing a traversal-order notion of
+    /// initialization.
+    /// An `unsafe` block deliberately shares its caller's scope; `if` branches
+    /// and loop bodies push the stable scope selected by their source anchor.
+    cleanup_scopes: Vec<ActiveCleanupScope>,
+    control: BodyPlan,
+    /// Concrete-class destruction recipes retained by the checker. Production
+    /// lowering clones these from `ControlProgram`; only test-only unsealed
+    /// lowering constructs recipes directly from its synthetic AST.
+    class_drop_plans: Vec<ClassDropPlan>,
 }
 
 impl<'a, 'support> FunctionEmitter<'a, 'support> {
-    fn new(program: &'a Program, function: &'a Fn, support: &'support mut ModuleSupport) -> Self {
-        Self {
+    fn new(
+        program: &'a Program,
+        control: Option<&ControlProgram>,
+        function: &'a Fn,
+        support: &'support mut ModuleSupport,
+    ) -> Result<Self, Vec<BackendError>> {
+        Self::new_with_owner(
+            program,
+            control,
+            function,
+            support,
+            CallOwner::Function(function.name.clone()),
+        )
+    }
+
+    fn new_with_owner(
+        program: &'a Program,
+        control_program: Option<&ControlProgram>,
+        function: &'a Fn,
+        support: &'support mut ModuleSupport,
+        owner: CallOwner,
+    ) -> Result<Self, Vec<BackendError>> {
+        let (control, class_drop_plans) = match control_program {
+            Some(program) => {
+                let body = program
+                    .body(&owner, function.span)
+                    .map_err(|error| vec![control_plan_backend_error(error)])?;
+                body.validate_callable(function.span, &function.params, &function.body)
+                    .map_err(|error| vec![control_plan_backend_error(error)])?;
+                (body.plan().clone(), program.class_drops().to_vec())
+            }
+            None => (
+                BodyPlan::build(owner, function.span, &function.params, &function.body)
+                    .map_err(|error| vec![control_plan_backend_error(error)])?,
+                program
+                    .classes
+                    .iter()
+                    .enumerate()
+                    .map(|(class, declaration)| ClassDropPlan::build(class, declaration))
+                    .collect(),
+            ),
+        };
+        Ok(Self {
             program,
             function,
             support,
             initializer_class: None,
             method: None,
             locals: HashMap::new(),
-            class_reassignment_slots: HashMap::new(),
+            assignment_staging_slots: HashMap::new(),
             late_entry_allocas: Vec::new(),
             next_local: 0,
             next_temp: 0,
             next_block: 0,
             lines: Vec::new(),
             current_block: Some("entry".into()),
-            cleanup_scopes: vec![Vec::new()],
-        }
+            cleanup_scopes: vec![
+                ActiveCleanupScope {
+                    id: control.frame_scope(),
+                    reached: HashSet::new(),
+                },
+                ActiveCleanupScope {
+                    id: control.body_scope(),
+                    reached: HashSet::new(),
+                },
+            ],
+            control,
+            class_drop_plans,
+        })
     }
 
     fn new_initializer(
         program: &'a Program,
+        control: Option<&ControlProgram>,
         class: usize,
         initializer: usize,
         support: &'support mut ModuleSupport,
-    ) -> Self {
-        let mut emitter = Self::new(program, &program.classes[class].inits[initializer], support);
+    ) -> Result<Self, Vec<BackendError>> {
+        let declaration = &program.classes[class];
+        let function = &declaration.inits[initializer];
+        let mut emitter = Self::new_with_owner(
+            program,
+            control,
+            function,
+            support,
+            CallOwner::Constructor {
+                class: declaration.name.clone(),
+                init: function.name.clone(),
+            },
+        )?;
         emitter.initializer_class = Some(class);
-        emitter
+        Ok(emitter)
     }
 
     fn new_method(
         program: &'a Program,
+        control: Option<&ControlProgram>,
         class: usize,
         method: usize,
         support: &'support mut ModuleSupport,
-    ) -> Self {
-        let mut emitter = Self::new(program, &program.classes[class].methods[method].f, support);
+    ) -> Result<Self, Vec<BackendError>> {
+        let declaration = &program.classes[class];
+        let function = &declaration.methods[method].f;
+        let mut emitter = Self::new_with_owner(
+            program,
+            control,
+            function,
+            support,
+            CallOwner::Method {
+                class: declaration.name.clone(),
+                method: function.name.clone(),
+            },
+        )?;
         emitter.method = Some((class, method));
-        emitter
+        Ok(emitter)
     }
 
     fn emit(mut self, out: &mut String) -> Result<(), Vec<BackendError>> {
@@ -3798,20 +4294,87 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 },
             );
         }
-        let mut assignment_targets = BTreeSet::new();
-        collect_assignment_targets(&self.function.body, &mut assignment_targets);
-        for name in assignment_targets {
-            let ty = self
-                .locals
-                .get(&name)
-                .expect("validated assignment target was preallocated")
-                .ty
-                .clone();
-            if let Ty::Class(class) = ty {
-                let slot = self.new_slot();
-                self.instruction(format!("{slot} = alloca {}", llvm_class_ty(class)));
-                self.class_reassignment_slots.insert(name, slot);
+        let assignment_staging = self
+            .control
+            .assignments()
+            .filter_map(|action| match (action.ty(), action.staging()) {
+                (Ty::Class(class), AssignmentStaging::Temporary(place)) => {
+                    Some(Ok((place.clone(), *class, action.span())))
+                }
+                (_, AssignmentStaging::Direct) => None,
+                (ty, AssignmentStaging::Temporary(_)) => Some(Err(vec![diag(
+                    "backend.control_plan_unsupported",
+                    "LLVM cannot allocate a planned assignment temporary",
+                    action.span(),
+                    format!(
+                        "assignment to `{}` stages unsupported type `{}`",
+                        action.destination().render(),
+                        ty.clone().name()
+                    ),
+                )])),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (place, class, span) in assignment_staging {
+            let slot = self.new_slot();
+            self.instruction(format!("{slot} = alloca {}", llvm_class_ty(class)));
+            if self.assignment_staging_slots.insert(place, slot).is_some() {
+                return Err(vec![diag(
+                    "internal.control_plan_invalid",
+                    "duplicate LLVM assignment temporary",
+                    span,
+                    "one planned assignment temporary must identify one entry slot",
+                )]);
             }
+        }
+        let field_staging = self
+            .control
+            .field_assignments()
+            .filter_map(|action| match action.staging() {
+                AssignmentStaging::Direct => None,
+                AssignmentStaging::Temporary(place) => Some((
+                    place.clone(),
+                    action.ty().clone(),
+                    action.span(),
+                    action.destination().render(),
+                )),
+            })
+            .collect::<Vec<_>>();
+        for (place, ty, span, destination) in field_staging {
+            let slot_ty = match ty.clone() {
+                Ty::Class(class) => llvm_class_ty(class),
+                ty if is_owned_u32_array(ty.clone()) => LLVM_ARRAY_U32.to_string(),
+                other => {
+                    return Err(vec![diag(
+                        "backend.control_plan_unsupported",
+                        "LLVM cannot allocate a planned field-assignment temporary",
+                        span,
+                        format!(
+                            "field assignment to `{destination}` stages unsupported type `{}`",
+                            other.name()
+                        ),
+                    )]);
+                }
+            };
+            let slot = self.new_slot();
+            self.instruction(format!("{slot} = alloca {slot_ty}"));
+            if self.assignment_staging_slots.insert(place, slot).is_some() {
+                return Err(vec![diag(
+                    "internal.control_plan_invalid",
+                    "duplicate LLVM field-assignment temporary",
+                    span,
+                    "one planned field-assignment temporary must identify one entry slot",
+                )]);
+            }
+        }
+        if let Some(class) = self.initializer_class {
+            // A native constructor begins with every field absent. The
+            // neutral aggregate is the backend's dynamic-liveness encoding;
+            // every retained field action can therefore run the same
+            // stage/drop-if-present/install sequence as a method replacement.
+            self.instruction(format!(
+                "store {} zeroinitializer, ptr %self",
+                llvm_class_ty(class)
+            ));
         }
         for (index, (name, ty)) in parameters.iter().enumerate() {
             let slot = self
@@ -3826,15 +4389,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 &format!("parameter `{name}`"),
             )?;
             self.instruction(format!("store {stored} %p{index}, ptr {slot}"));
-            if let Ty::Class(class) = ty {
-                self.cleanup_scopes[0].push(OwnedCleanup::FixedClass(name.clone(), *class));
-            }
+            self.arm_cleanup(name)?;
         }
 
-        self.emit_block(&self.function.body)?;
+        let body_block = self.control.body_block().id();
+        self.emit_block(&self.function.body, body_block)?;
         if self.current_block.is_some() {
             if self.function.ret == Ty::Unit {
-                self.emit_current_scope_cleanups();
+                self.emit_implicit_return_cleanups()?;
                 self.terminate("ret void");
             } else {
                 return Err(vec![diag(
@@ -3884,11 +4446,159 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         }
     }
 
-    fn emit_block(&mut self, statements: &[Stmt]) -> Result<(), Vec<BackendError>> {
-        for statement in statements {
+    fn active_scope(&self) -> ScopeId {
+        self.cleanup_scopes
+            .last()
+            .expect("lowering has an active lexical scope")
+            .id
+    }
+
+    fn consume_expression_trap_sites(&self, expression: &Expr) -> Result<(), Vec<BackendError>> {
+        let scope = self.active_scope();
+        let sites = self
+            .control
+            .expression_trap_sites(scope, expression)
+            .map_err(|error| vec![control_plan_backend_error(error)])?;
+        self.consume_trap_sites(&sites, Some(scope))
+    }
+
+    fn consume_statement_trap_sites(&self, statement: &Stmt) -> Result<(), Vec<BackendError>> {
+        let sites = self
+            .control
+            .statement_trap_sites(self.active_scope(), statement)
+            .map_err(|error| vec![control_plan_backend_error(error)])?;
+        self.consume_trap_sites(&sites, None)
+    }
+
+    fn consume_trap_sites(
+        &self,
+        sites: &[&TrapSite],
+        expected_scope: Option<ScopeId>,
+    ) -> Result<(), Vec<BackendError>> {
+        for site in sites {
+            let route = site.route();
+            if expected_scope.is_some_and(|scope| site.scope() != scope)
+                || route.kind() != crate::control::ExitKind::Trap
+                || !route.scopes().is_empty()
+                || !route.clears().is_empty()
+                || !route.drops().is_empty()
+            {
+                return Err(vec![diag(
+                    "internal.control_plan_invalid",
+                    "trap site does not abort through the empty no-unwind route",
+                    site.span(),
+                    "a source trap may not run lexical cleanup",
+                )]);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_block(&mut self, statements: &[Stmt], block: BlockId) -> Result<(), Vec<BackendError>> {
+        let (scope, anchor, flow, planned) = {
+            let block = self.control.block(block);
+            (
+                block.scope(),
+                block.anchor(),
+                block.flow(),
+                block.statements().to_vec(),
+            )
+        };
+        if scope != self.active_scope() || planned.len() != statements.len() {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: anchor,
+                message: "LLVM block disagrees with its retained scope or statement shape".into(),
+            })]);
+        }
+        for (statement, statement_plan) in statements.iter().zip(planned) {
             if self.current_block.is_none() {
+                if statement_plan.entry_reachable() {
+                    return Err(vec![control_plan_backend_error(PlanError {
+                        span: anchor,
+                        message: "LLVM terminated before a retained reachable statement".into(),
+                    })]);
+                }
                 break;
             }
+            if !statement_plan.entry_reachable() {
+                return Err(vec![control_plan_backend_error(PlanError {
+                    span: anchor,
+                    message: "LLVM reached a statement sealed as structurally unreachable".into(),
+                })]);
+            }
+            let statement_kind = statement_plan.kind();
+            let structurally_matches = match statement {
+                Stmt::Return { .. } => matches!(statement_kind, StatementPlanKind::Return),
+                Stmt::If { .. } => matches!(statement_kind, StatementPlanKind::Branch(_)),
+                Stmt::While { .. } => matches!(statement_kind, StatementPlanKind::Loop(_)),
+                Stmt::Unsafe { .. } => matches!(statement_kind, StatementPlanKind::Unsafe(_)),
+                Stmt::Expose { .. } => matches!(statement_kind, StatementPlanKind::Exposure(_)),
+                Stmt::Decl { .. }
+                | Stmt::Assign { .. }
+                | Stmt::ExprStmt(_)
+                | Stmt::Assert(_)
+                | Stmt::VarDecl { .. }
+                | Stmt::FieldAssign { .. }
+                | Stmt::FieldStore { .. }
+                | Stmt::Store { .. }
+                | Stmt::StaticAlloc { .. }
+                | Stmt::SystemAlloc { .. }
+                | Stmt::SystemDealloc { .. } => {
+                    matches!(statement_kind, StatementPlanKind::Linear(_))
+                }
+            };
+            if !structurally_matches {
+                return Err(vec![control_plan_backend_error(PlanError {
+                    span: anchor,
+                    message: "LLVM statement disagrees with its retained structural role".into(),
+                })]);
+            }
+            let scope = self
+                .cleanup_scopes
+                .last()
+                .expect("statement has an active lexical scope")
+                .id;
+            let planned_field_assignment = match statement {
+                Stmt::FieldAssign {
+                    field,
+                    field_span,
+                    value,
+                } => {
+                    let destination = Place::field("self", field);
+                    let action = self
+                        .control
+                        .field_assignment(scope, *field_span, &destination, value)
+                        .map_err(|error| vec![control_plan_backend_error(error)])?
+                        .clone();
+                    if action.scope() != scope || action.destination() != &destination {
+                        return Err(vec![control_plan_backend_error(PlanError {
+                            span: *field_span,
+                            message: "LLVM field assignment is detached from its retained action"
+                                .into(),
+                        })]);
+                    }
+                    let drop_plan = action
+                        .class_drop()
+                        .map(|class_drop| self.class_drop_for_action(class_drop, *field_span))
+                        .transpose()?;
+                    Some((action, drop_plan))
+                }
+                _ => None,
+            };
+            let planned_temporary_drop = match statement {
+                Stmt::ExprStmt(expression) if matches!(expression.ty, Some(Ty::Class(_))) => {
+                    let action = self
+                        .control
+                        .temporary_drop(scope, expression)
+                        .map_err(|error| vec![control_plan_backend_error(error)])?
+                        .clone();
+                    let drop_plan =
+                        self.class_drop_for_action(action.class_drop(), expression.span)?;
+                    Some((action, drop_plan))
+                }
+                _ => None,
+            };
+            self.consume_statement_trap_sites(statement)?;
             match statement {
                 Stmt::Decl { ty, name, init, .. } => {
                     self.emit_decl(name, ty.clone(), init.as_ref())?;
@@ -3905,30 +4615,98 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     name_span,
                     value,
                 } => {
-                    let Some(local) = self.locals.get(name) else {
+                    let scope = self
+                        .cleanup_scopes
+                        .last()
+                        .expect("assignment has an active lexical scope")
+                        .id;
+                    let destination = Place::local(name);
+                    let action = self
+                        .control
+                        .assignment(scope, *name_span, &destination)
+                        .map_err(|error| vec![control_plan_backend_error(error)])?
+                        .clone();
+                    if action.scope() != scope {
+                        return Err(vec![diag(
+                            "internal.control_plan_invalid",
+                            "assignment has a mismatched lexical scope",
+                            *name_span,
+                            "the exact action must belong to the active structured scope",
+                        )]);
+                    }
+                    if !action.destination().is_root() {
+                        return Err(vec![diag(
+                            "internal.control_plan_invalid",
+                            "assignment destination is not a local",
+                            *name_span,
+                            format!("planned destination `{}`", action.destination().render()),
+                        )]);
+                    }
+                    let planned_name = action.destination().root();
+                    let Some(local) = self.locals.get(planned_name) else {
                         return Err(vec![unsupported(
                             *name_span,
-                            format!("LLVM local `{name}` was not declared"),
+                            format!("LLVM local `{planned_name}` was not declared"),
                         )]);
                     };
-                    let ty = local.ty.clone();
+                    let local_ty = local.ty.clone();
                     let slot = local.slot.clone();
+                    if action.ty() != &local_ty {
+                        return Err(vec![diag(
+                            "internal.control_plan_invalid",
+                            "assignment type disagrees with its planned action",
+                            *name_span,
+                            format!(
+                                "`{planned_name}` is lowered as `{}` but planned as `{}`",
+                                local_ty.name(),
+                                action.ty().clone().name()
+                            ),
+                        )]);
+                    }
+                    let ty = action.ty().clone();
                     if let Ty::Class(class) = ty {
-                        let scratch = self
-                            .class_reassignment_slots
-                            .get(name)
-                            .expect("validated class assignment has entry scratch")
-                            .clone();
+                        let (Some(_), AssignmentStaging::Temporary(staging)) =
+                            (action.previous(), action.staging())
+                        else {
+                            return Err(vec![diag(
+                                "internal.control_plan_invalid",
+                                "class assignment lacks its planned replacement phases",
+                                *name_span,
+                                "a class replacement must stage, drop-if-live, then install",
+                            )]);
+                        };
+                        let Some(scratch) = self.assignment_staging_slots.get(staging).cloned()
+                        else {
+                            return Err(vec![diag(
+                                "internal.control_plan_invalid",
+                                "class assignment has no planned staging slot",
+                                *name_span,
+                                format!("missing temporary `{}`", staging.render()),
+                            )]);
+                        };
                         // Evaluate completely before destroying the old value:
                         // real Nat assignments borrow their own destination.
                         self.emit_fixed_class_into(class, &scratch, value)?;
-                        self.emit_fixed_class_drop(name, class);
+                        self.emit_assignment_previous(&action)?;
                         self.emit_fixed_class_move(class, &slot, &scratch);
                         continue;
                     }
+                    if action.previous().is_some()
+                        || !matches!(action.staging(), AssignmentStaging::Direct)
+                    {
+                        return Err(vec![diag(
+                            "internal.control_plan_invalid",
+                            "direct assignment has cleanup-bearing replacement phases",
+                            *name_span,
+                            format!("`{planned_name}` is not a cleanup-bearing LLVM local"),
+                        )]);
+                    }
                     let emitted = self.emit_expr(value)?;
-                    let stored =
-                        require_llvm_ty(ty, value.span, &format!("assignment to `{name}`"))?;
+                    let stored = require_llvm_ty(
+                        ty,
+                        value.span,
+                        &format!("assignment to `{planned_name}`"),
+                    )?;
                     self.instruction(format!(
                         "store {stored} {}, ptr {}",
                         emitted.operand.expect("assignment value is non-unit"),
@@ -3936,13 +4714,25 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     ));
                 }
                 Stmt::ExprStmt(expression) => {
+                    if let Some((action, drop_plan)) = planned_temporary_drop {
+                        return Err(vec![diag(
+                            "backend.class_unsupported",
+                            "discarded class temporary is outside the LLVM destination-passing subset",
+                            action.span(),
+                            format!(
+                                "temporary `{}` has retained class-drop recipe `{}`; bind or return the owned result",
+                                action.temporary().render(),
+                                drop_plan.class_name()
+                            ),
+                        )]);
+                    }
                     self.emit_expr(expression)?;
                 }
-                Stmt::Return { value, .. } => {
+                Stmt::Return { value, span } => {
                     if let Some(value) = value {
                         if let Ty::Class(class) = self.function.ret {
                             self.emit_fixed_class_into(class, "%result", value)?;
-                            self.emit_all_cleanups();
+                            self.emit_return_cleanups(*span)?;
                             self.terminate("ret void");
                             continue;
                         }
@@ -3962,7 +4752,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                             // A unit-returning call is still effectful.  Its
                             // absent LLVM operand is consumed by `ret void`,
                             // rather than being unwrapped as a scalar.
-                            self.emit_all_cleanups();
+                            self.emit_return_cleanups(*span)?;
                             self.terminate("ret void");
                         } else {
                             let returned = require_llvm_ty(
@@ -3970,7 +4760,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                                 self.function.name_span,
                                 &format!("the return value of `{}`", self.function.name),
                             )?;
-                            self.emit_all_cleanups();
+                            self.emit_return_cleanups(*span)?;
                             self.terminate(format!(
                                 "ret {returned} {}",
                                 emitted.operand.expect("non-unit return value")
@@ -3986,18 +4776,28 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                                 ),
                             )]);
                         }
-                        self.emit_all_cleanups();
+                        self.emit_return_cleanups(*span)?;
                         self.terminate("ret void");
                     }
                 }
                 Stmt::Assert(_) => {}
-                Stmt::Unsafe { body, .. } => self.emit_block(body)?,
+                Stmt::Unsafe { body, .. } => {
+                    let StatementPlanKind::Unsafe(child) = statement_kind else {
+                        unreachable!("the structural guard above matched `unsafe`")
+                    };
+                    self.emit_block(body, child)?;
+                }
                 Stmt::If {
                     cond,
                     then_block,
                     else_block,
                 } => self.emit_if(cond, then_block, else_block.as_deref())?,
-                Stmt::While { cond, body, .. } => self.emit_while(cond, body)?,
+                Stmt::While {
+                    cond,
+                    kw_span,
+                    body,
+                    ..
+                } => self.emit_while(cond, *kw_span, body)?,
                 Stmt::Store {
                     array,
                     index,
@@ -4010,24 +4810,121 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     value,
                     ..
                 } => {
+                    let (action, drop_plan) = planned_field_assignment
+                        .expect("field-assignment preflight retained its exact action");
                     let class = self
                         .initializer_class
                         .or(self.method.map(|(class, _)| class))
                         .expect("validated field assignment is in a class member");
                     let (field_index, field_ty) = self.class_field(class, field);
+                    if action.ty() != &field_ty {
+                        return Err(vec![control_plan_backend_error(PlanError {
+                            span: *field_span,
+                            message:
+                                "LLVM class-field layout type disagrees with its retained action"
+                                    .into(),
+                        })]);
+                    }
                     let field_slot = self.emit_class_field_slot(class, "%self", field_index);
                     match field_ty {
                         Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
-                            let value = self.emit_fresh_u32_array(value)?;
+                            let AssignmentStaging::Temporary(staging) = action.staging() else {
+                                return Err(vec![control_plan_backend_error(PlanError {
+                                    span: *field_span,
+                                    message: "cleanup-bearing array field assignment has no retained staging temporary"
+                                        .into(),
+                                })]);
+                            };
+                            let scratch = self
+                                .assignment_staging_slots
+                                .get(staging)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    vec![control_plan_backend_error(PlanError {
+                                        span: *field_span,
+                                        message:
+                                            "LLVM field assignment has no allocated staging slot"
+                                                .into(),
+                                    })]
+                                })?;
+                            let staged = self.emit_fresh_u32_array(value)?;
                             self.instruction(format!(
-                                "store {LLVM_ARRAY_U32} {}, ptr {field_slot}",
-                                value.operand.expect("owned class field initializer")
+                                "store {LLVM_ARRAY_U32} {}, ptr {scratch}",
+                                staged.operand.expect("owned class field initializer")
+                            ));
+                            if !action.drop_if_present() || drop_plan.is_some() {
+                                return Err(vec![control_plan_backend_error(PlanError {
+                                    span: *field_span,
+                                    message: "array field action has inconsistent retained cleanup phases"
+                                        .into(),
+                                })]);
+                            }
+                            self.emit_u32_array_drop_from_slot(&field_slot);
+                            let installed = self.new_temp();
+                            self.instruction(format!(
+                                "{installed} = load {LLVM_ARRAY_U32}, ptr {scratch}"
+                            ));
+                            self.instruction(format!(
+                                "store {LLVM_ARRAY_U32} {installed}, ptr {field_slot}"
+                            ));
+                            self.instruction(format!(
+                                "store {LLVM_ARRAY_U32} zeroinitializer, ptr {scratch}"
                             ));
                         }
                         Ty::Class(child) => {
-                            self.emit_fixed_class_into(child, &field_slot, value)?;
+                            let AssignmentStaging::Temporary(staging) = action.staging() else {
+                                return Err(vec![control_plan_backend_error(PlanError {
+                                    span: *field_span,
+                                    message:
+                                        "class field assignment has no retained staging temporary"
+                                            .into(),
+                                })]);
+                            };
+                            let scratch = self
+                                .assignment_staging_slots
+                                .get(staging)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    vec![control_plan_backend_error(PlanError {
+                                        span: *field_span,
+                                        message:
+                                            "LLVM class-field action has no allocated staging slot"
+                                                .into(),
+                                    })]
+                                })?;
+                            let drop_plan = drop_plan.as_ref().ok_or_else(|| {
+                                vec![control_plan_backend_error(PlanError {
+                                    span: *field_span,
+                                    message: "class field action has no exact class-drop recipe"
+                                        .into(),
+                                })]
+                            })?;
+                            if !action.drop_if_present() || drop_plan.class() != child {
+                                return Err(vec![control_plan_backend_error(PlanError {
+                                    span: *field_span,
+                                    message: "class field action has inconsistent retained cleanup phases"
+                                        .into(),
+                                })]);
+                            }
+                            self.emit_fixed_class_into(child, &scratch, value)?;
+                            self.emit_fixed_class_drop_from_slot_with_plan(
+                                &field_slot,
+                                child,
+                                drop_plan,
+                            )?;
+                            self.emit_fixed_class_move(child, &field_slot, &scratch);
                         }
                         Ty::Int(_) => {
+                            if action.drop_if_present()
+                                || !matches!(action.staging(), AssignmentStaging::Direct)
+                                || drop_plan.is_some()
+                            {
+                                return Err(vec![control_plan_backend_error(PlanError {
+                                    span: *field_span,
+                                    message: "scalar field action retained cleanup-only phases"
+                                        .into(),
+                                })]);
+                            }
                             let value = self.emit_expr(value)?;
                             let stored = require_llvm_ty(
                                 field_ty,
@@ -4050,8 +4947,38 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 } => {
                     self.emit_self_u32_field_store(field, index, value)?;
                 }
+                Stmt::Expose {
+                    kw_span,
+                    array,
+                    mutable,
+                    ptr,
+                    res,
+                    ..
+                } => {
+                    validate_llvm_exposure_plan_shape(
+                        &self.control,
+                        block,
+                        self.active_scope(),
+                        *kw_span,
+                        array,
+                        *mutable,
+                        ptr,
+                        res,
+                    )
+                    .map_err(|error| vec![control_plan_backend_error(error)])?;
+                    return Err(vec![unsupported(
+                        *kw_span,
+                        "raw/resource storage is outside the scalar LLVM subset",
+                    )]);
+                }
                 _ => unreachable!("validated before lowering"),
             }
+        }
+        if self.current_block.is_some() != flow.can_fall_through() {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: anchor,
+                message: "LLVM block reachability disagrees with its retained flow".into(),
+            })]);
         }
         Ok(())
     }
@@ -4072,17 +4999,11 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         if let Some(init) = init {
             if let Ty::Class(class) = ty {
                 self.emit_fixed_class_into(class, &slot, init)?;
-                self.cleanup_scopes
-                    .last_mut()
-                    .expect("class declaration has a lexical cleanup scope")
-                    .push(OwnedCleanup::FixedClass(name.to_owned(), class));
+                self.arm_cleanup(name)?;
                 return Ok(());
             }
             let value = if ty.is_owned_bool_array() {
-                match &init.kind {
-                    ExprKind::OptTake { option, .. } => self.emit_affine_option_take(option)?,
-                    _ => self.emit_fresh_bool_array(init)?,
-                }
+                self.emit_fresh_bool_array(init)?
             } else if is_owned_u32_array(ty.clone()) {
                 self.emit_fresh_u32_array(init)?
             } else if is_affine_bool_option(&ty.clone()) {
@@ -4099,22 +5020,20 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 "store {stored} {}, ptr {slot}",
                 value.operand.expect("local initializer is non-unit")
             ));
-            if ty.is_owned_bool_array() {
-                self.cleanup_scopes
-                    .last_mut()
-                    .expect("array declaration has a lexical cleanup scope")
-                    .push(OwnedCleanup::BoolArray(name.to_owned()));
-            } else if is_owned_u32_array(ty.clone()) {
-                self.cleanup_scopes
-                    .last_mut()
-                    .expect("array declaration has a lexical cleanup scope")
-                    .push(OwnedCleanup::U32Array(name.to_owned()));
-            } else if is_affine_bool_option(&ty) {
-                self.cleanup_scopes
-                    .last_mut()
-                    .expect("affine option declaration has a lexical cleanup scope")
-                    .push(OwnedCleanup::AffineBoolOption(name.to_owned()));
-            }
+            self.arm_cleanup(name)?;
+        } else if let Ty::Class(class) = ty {
+            // The admitted fixed-owner class layouts contain only integers,
+            // owned u32-array descriptors, and recursively admitted classes,
+            // with no executable `deinit`. Their aggregate zero value is
+            // therefore a non-owner sentinel: recursive drop sees only null
+            // array pointers and is a semantic no-op. Registering that neutral
+            // slot now makes later assignment and every lexical exit safe even
+            // when a branch or loop never performs the first assignment.
+            self.instruction(format!(
+                "store {} zeroinitializer, ptr {slot}",
+                llvm_class_ty(class)
+            ));
+            self.arm_cleanup(name)?;
         }
         Ok(())
     }
@@ -4125,6 +5044,13 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         then_block: &[Stmt],
         else_block: Option<&[Stmt]>,
     ) -> Result<(), Vec<BackendError>> {
+        let anchor = condition.span;
+        let parent_scope = self.active_scope();
+        let branch = self
+            .control
+            .branch(parent_scope, anchor, else_block.is_some())
+            .map_err(|error| vec![control_plan_backend_error(error)])?
+            .clone();
         let condition = self.emit_expr(condition)?;
         let then_label = self.new_label("if.then");
         let merge_label = self.new_label("if.end");
@@ -4137,38 +5063,55 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         ));
 
         self.start_block(then_label);
-        self.cleanup_scopes.push(Vec::new());
-        self.emit_block(then_block)?;
-        let then_reaches_merge = self.current_block.is_some();
-        if then_reaches_merge {
-            self.emit_current_scope_cleanups();
+        let then_arm = branch.then_arm().clone();
+        self.cleanup_scopes.push(ActiveCleanupScope {
+            id: then_arm.scope(),
+            reached: HashSet::new(),
+        });
+        self.emit_block(then_block, then_arm.block())?;
+        if let Some(route) = then_arm.normal_exit() {
+            self.emit_cleanup_route(route)?;
             self.terminate(format!("br label %{merge_label}"));
         }
         self.cleanup_scopes.pop();
 
-        let else_reaches_merge = if let Some(else_block) = else_block {
+        if let Some(else_block) = else_block {
             self.start_block(false_label);
-            self.cleanup_scopes.push(Vec::new());
-            self.emit_block(else_block)?;
-            let reaches = self.current_block.is_some();
-            if reaches {
-                self.emit_current_scope_cleanups();
+            let Some(else_arm) = branch.else_arm().cloned() else {
+                return Err(vec![control_plan_backend_error(PlanError {
+                    span: anchor,
+                    message: "retained LLVM branch lost its source else arm".into(),
+                })]);
+            };
+            self.cleanup_scopes.push(ActiveCleanupScope {
+                id: else_arm.scope(),
+                reached: HashSet::new(),
+            });
+            self.emit_block(else_block, else_arm.block())?;
+            if let Some(route) = else_arm.normal_exit() {
+                self.emit_cleanup_route(route)?;
                 self.terminate(format!("br label %{merge_label}"));
             }
             self.cleanup_scopes.pop();
-            reaches
-        } else {
-            // The condition's false edge targets the merge directly.
-            true
-        };
+        }
 
-        if then_reaches_merge || else_reaches_merge {
+        if branch.flow().can_fall_through() {
             self.start_block(merge_label);
         }
         Ok(())
     }
 
-    fn emit_while(&mut self, condition: &Expr, body: &[Stmt]) -> Result<(), Vec<BackendError>> {
+    fn emit_while(
+        &mut self,
+        condition: &Expr,
+        anchor: Span,
+        body: &[Stmt],
+    ) -> Result<(), Vec<BackendError>> {
+        let loop_plan = self
+            .control
+            .loop_plan(self.active_scope(), anchor, condition.span)
+            .map_err(|error| vec![control_plan_backend_error(error)])?
+            .clone();
         let header_label = self.new_label("while.head");
         self.terminate(format!("br label %{header_label}"));
         self.start_block(header_label.clone());
@@ -4185,17 +5128,22 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         ));
 
         self.start_block(body_label);
-        self.cleanup_scopes.push(Vec::new());
-        self.emit_block(body)?;
-        if self.current_block.is_some() {
-            self.emit_current_scope_cleanups();
+        self.cleanup_scopes.push(ActiveCleanupScope {
+            id: loop_plan.body_scope(),
+            reached: HashSet::new(),
+        });
+        self.emit_block(body, loop_plan.body())?;
+        if let Some(route) = loop_plan.backedge() {
+            self.emit_cleanup_route(route)?;
             self.terminate(format!("br label %{header_label}"));
         }
         self.cleanup_scopes.pop();
 
         // The header's false edge always reaches this block, even when every
         // body path returns.
-        self.start_block(exit_label);
+        if loop_plan.flow().can_fall_through() {
+            self.start_block(exit_label);
+        }
         Ok(())
     }
 
@@ -4231,6 +5179,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         destination: &str,
         expression: &Expr,
     ) -> Result<(), Vec<BackendError>> {
+        self.consume_expression_trap_sites(expression)?;
         match &expression.kind {
             ExprKind::CtorCall { .. } => self.emit_constructor_into(class, destination, expression),
             ExprKind::Call { callee, args, .. } => {
@@ -4430,6 +5379,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit_fresh_bool_array(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
+        self.consume_expression_trap_sites(expression)?;
         self.support.require_array_bool();
         match &expression.kind {
             ExprKind::ArrayLit(elements) => self.emit_bool_array_literal(elements),
@@ -4440,6 +5390,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit_fresh_u32_array(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
+        self.consume_expression_trap_sites(expression)?;
         self.support.require_array_u32();
         match &expression.kind {
             ExprKind::ArrayLit(elements) => self.emit_u32_array_literal(elements),
@@ -4918,40 +5869,148 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.emit_trap_branch(&outside, TRAP_ARRAY_OOB, 0, index, len);
     }
 
-    fn emit_current_scope_cleanups(&mut self) {
-        let cleanups = self
+    fn arm_cleanup(&mut self, name: &str) -> Result<(), Vec<BackendError>> {
+        let place = Place::local(name);
+        let Some(candidate) = self.control.candidate_for_place(&place) else {
+            return Ok(());
+        };
+        let id = candidate.id();
+        let scope = candidate.scope();
+        let span = candidate.span();
+        let Some(active) = self
+            .cleanup_scopes
+            .iter_mut()
+            .find(|active| active.id == scope)
+        else {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "cleanup candidate is outside the active lexical scopes",
+                span,
+                format!("`{name}` was assigned a non-active scope"),
+            )]);
+        };
+        if !active.reached.insert(id) {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "cleanup candidate was armed twice",
+                span,
+                format!("`{name}` has one declaration and must have one cleanup identity"),
+            )]);
+        }
+        Ok(())
+    }
+
+    fn emit_return_cleanups(&mut self, span: Span) -> Result<(), Vec<BackendError>> {
+        let scope = self
             .cleanup_scopes
             .last()
-            .expect("cleanup has a function scope")
-            .iter()
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>();
-        for cleanup in cleanups {
-            self.emit_owned_cleanup(cleanup);
-        }
+            .expect("return has an active lexical scope")
+            .id;
+        let routes = self
+            .control
+            .explicit_return(span, scope)
+            .map_err(|error| vec![control_plan_backend_error(error)])?;
+        let lexical = routes.lexical().clone();
+        let frame = routes.frame().clone();
+        self.emit_cleanup_route(&lexical)?;
+        self.emit_cleanup_route(&frame)?;
+        Ok(())
     }
 
-    fn emit_all_cleanups(&mut self) {
-        let cleanups = self
+    fn emit_implicit_return_cleanups(&mut self) -> Result<(), Vec<BackendError>> {
+        let routes = self.control.implicit_return();
+        let lexical = routes.lexical().clone();
+        let frame = routes.frame().clone();
+        self.emit_cleanup_route(&lexical)?;
+        self.emit_cleanup_route(&frame)
+    }
+
+    fn emit_assignment_previous(
+        &mut self,
+        action: &AssignmentAction,
+    ) -> Result<(), Vec<BackendError>> {
+        let Some(drop) = action.previous() else {
+            return Ok(());
+        };
+        if !self
             .cleanup_scopes
             .iter()
             .rev()
-            .flat_map(|scope| scope.iter().rev())
-            .cloned()
-            .collect::<Vec<_>>();
-        for cleanup in cleanups {
-            self.emit_owned_cleanup(cleanup);
+            .any(|scope| scope.reached.contains(&drop))
+        {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "assignment reached an inactive cleanup candidate",
+                action.span(),
+                format!(
+                    "old destination `{}` was not reached on this structured path",
+                    action.destination().render()
+                ),
+            )]);
         }
+        let candidate = self.control.candidate(drop);
+        if candidate.place() != action.destination() || candidate.ty() != action.ty() {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "assignment disagrees with its prior cleanup candidate",
+                action.span(),
+                "destination place and type must match the candidate exactly",
+            )]);
+        }
+        self.emit_drop_candidate(drop)
     }
 
-    fn emit_owned_cleanup(&mut self, cleanup: OwnedCleanup) {
-        match cleanup {
-            OwnedCleanup::BoolArray(name) => self.emit_bool_array_drop(&name),
-            OwnedCleanup::U32Array(name) => self.emit_u32_array_drop(&name),
-            OwnedCleanup::AffineBoolOption(name) => self.emit_affine_bool_option_drop(&name),
-            OwnedCleanup::FixedClass(name, class) => self.emit_fixed_class_drop(&name, class),
+    fn emit_cleanup_route(&mut self, route: &ExitRoute) -> Result<(), Vec<BackendError>> {
+        // The active registry is path-sensitive but stores reachability only;
+        // the plan is the sole source of candidate identity, place, type, and
+        // order. Candidates after an early return are absent here, and moved
+        // places remain registered for their null-safe no-op drop.
+        let candidates = route
+            .drops()
+            .iter()
+            .filter(|drop| {
+                self.cleanup_scopes
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.reached.contains(*drop))
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        for candidate in candidates {
+            self.emit_drop_candidate(candidate)?;
         }
+        Ok(())
+    }
+
+    fn emit_drop_candidate(&mut self, drop: DropId) -> Result<(), Vec<BackendError>> {
+        let candidate = self.control.candidate(drop);
+        let place = candidate.place().clone();
+        let ty = candidate.ty().clone();
+        let span = candidate.span();
+        if !place.is_root() {
+            return Err(vec![diag(
+                "internal.control_plan_invalid",
+                "LLVM cleanup candidate is not a local",
+                span,
+                format!("planned cleanup `{}` is not a root place", place.render()),
+            )]);
+        }
+        let name = place.root();
+        match ty {
+            Ty::Class(class) => self.emit_fixed_class_drop(name, class)?,
+            ty if ty.is_owned_bool_array() => self.emit_bool_array_drop(name),
+            ty if is_owned_u32_array(ty.clone()) => self.emit_u32_array_drop(name),
+            ty if is_affine_bool_option(&ty) => self.emit_affine_bool_option_drop(name),
+            ty => {
+                return Err(vec![diag(
+                    "backend.control_plan_unsupported",
+                    "LLVM cannot lower a planned cleanup candidate",
+                    span,
+                    format!("`{name}` has cleanup-bearing type `{}`", ty.name()),
+                )]);
+            }
+        }
+        Ok(())
     }
 
     fn emit_bool_array_drop(&mut self, array: &str) {
@@ -4984,38 +6043,180 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.start_block(done_label);
     }
 
-    fn emit_fixed_class_drop(&mut self, object: &str, class: usize) {
+    fn emit_fixed_class_drop(
+        &mut self,
+        object: &str,
+        class: usize,
+    ) -> Result<(), Vec<BackendError>> {
         let slot = self
             .locals
             .get(object)
             .expect("validated fixed-owner class local")
             .slot
             .clone();
-        self.emit_fixed_class_drop_from_slot(&slot, class);
+        self.emit_fixed_class_drop_from_slot(&slot, class)
     }
 
-    fn emit_fixed_class_drop_from_slot(&mut self, slot: &str, class: usize) {
-        let fields = self.program.classes[class]
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(index, field)| (index, field.ty.clone()))
-            .collect::<Vec<_>>();
-        for (field_index, field_ty) in fields.into_iter().rev() {
-            let field_slot = self.emit_class_field_slot(class, slot, field_index);
-            match field_ty {
-                Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
-                    self.emit_u32_array_drop_from_slot(&field_slot);
+    fn emit_fixed_class_drop_from_slot(
+        &mut self,
+        slot: &str,
+        class: usize,
+    ) -> Result<(), Vec<BackendError>> {
+        let Some(declaration) = self.program.classes.get(class) else {
+            return Err(vec![diag(
+                "backend.control_plan_unsupported",
+                "LLVM cannot resolve a planned concrete-class cleanup",
+                self.function.name_span,
+                format!("class index {class} is outside the checked program"),
+            )]);
+        };
+        let Some(drop_plan) = self.class_drop_plans.get(class).cloned() else {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: declaration.name_span,
+                message: format!(
+                    "control program has no class-drop plan for concrete class index {class}"
+                ),
+            })]);
+        };
+        self.emit_fixed_class_drop_from_slot_with_plan(slot, class, &drop_plan)
+    }
+
+    fn class_drop_for_action(
+        &self,
+        action: &ClassDropAction,
+        use_span: Span,
+    ) -> Result<ClassDropPlan, Vec<BackendError>> {
+        let Some(declaration) = self.program.classes.get(action.class()) else {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: use_span,
+                message: format!(
+                    "cleanup action names missing concrete class index {}",
+                    action.class()
+                ),
+            })]);
+        };
+        let Some(drop_plan) = self.class_drop_plans.get(action.class()).cloned() else {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: use_span,
+                message: format!(
+                    "control program has no class-drop plan for cleanup action index {}",
+                    action.class()
+                ),
+            })]);
+        };
+        drop_plan
+            .validate(action.class(), declaration)
+            .and_then(|()| drop_plan.validate_terminal_trap_route())
+            .map_err(|error| vec![control_plan_backend_error(error)])?;
+        if action.terminal_trap_route() != drop_plan.terminal_trap_route() {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: use_span,
+                message: "LLVM cleanup action no longer links its exact terminal class-drop recipe"
+                    .into(),
+            })]);
+        }
+        Ok(drop_plan)
+    }
+
+    fn emit_fixed_class_drop_from_slot_with_plan(
+        &mut self,
+        slot: &str,
+        class: usize,
+        drop_plan: &ClassDropPlan,
+    ) -> Result<(), Vec<BackendError>> {
+        let Some(declaration) = self.program.classes.get(class) else {
+            return Err(vec![diag(
+                "backend.control_plan_unsupported",
+                "LLVM cannot resolve a planned concrete-class cleanup",
+                self.function.name_span,
+                format!("class index {class} is outside the checked program"),
+            )]);
+        };
+        drop_plan
+            .validate(class, declaration)
+            .and_then(|()| drop_plan.validate_terminal_trap_route())
+            .map_err(|error| vec![control_plan_backend_error(error)])?;
+
+        // No phase may unwind into the remaining suffix. The invariant and
+        // empty-deinitializer phases below are erased, while recursive field
+        // cleanup emits only native null-safe cleanup; any unsupported phase
+        // is rejected instead of being silently skipped.
+        for phase in drop_plan.phases() {
+            match phase {
+                ClassDropPhase::CheckInvariant => {
+                    self.instruction(format!(
+                        "; class-drop invariant for `{}` erased after verification",
+                        drop_plan.class_name()
+                    ));
                 }
-                Ty::Class(child) => self.emit_fixed_class_drop_from_slot(&field_slot, child),
-                Ty::Int(_) => {}
-                _ => unreachable!("validated native class cleanup field"),
+                ClassDropPhase::RunDeinitializer(owner) => {
+                    let body = declaration.deinit.as_deref().ok_or_else(|| {
+                        vec![control_plan_backend_error(PlanError {
+                            span: declaration.span,
+                            message: format!(
+                                "class-drop phase {} no longer has a deinitializer body",
+                                owner.render()
+                            ),
+                        })]
+                    })?;
+                    if !body.is_empty() {
+                        return Err(vec![diag(
+                            "backend.control_plan_unsupported",
+                            "LLVM cannot execute a planned class deinitializer",
+                            declaration.span,
+                            format!(
+                                "{} has a non-empty body; the fixed native class subset admits only absent or empty destruction",
+                                owner.render()
+                            ),
+                        )]);
+                    }
+                    self.instruction(format!(
+                        "; empty class-drop deinitializer {}",
+                        owner.render()
+                    ));
+                }
+                ClassDropPhase::DropField(field) => {
+                    if field.must_consume() {
+                        return Err(vec![diag(
+                            "backend.control_plan_unsupported",
+                            "LLVM cannot lower a must-consume class field cleanup",
+                            field.span(),
+                            format!(
+                                "planned field `{}` carries an erased authority",
+                                field.name()
+                            ),
+                        )]);
+                    }
+                    let field_slot = self.emit_class_field_slot(class, slot, field.index());
+                    match field.ty().clone() {
+                        Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+                            self.emit_u32_array_drop_from_slot(&field_slot);
+                        }
+                        Ty::Class(child) => {
+                            self.emit_fixed_class_drop_from_slot(&field_slot, child)?;
+                        }
+                        Ty::Int(_) => {}
+                        other => {
+                            return Err(vec![diag(
+                                "backend.control_plan_unsupported",
+                                "LLVM cannot lower a planned class-field cleanup",
+                                field.span(),
+                                format!(
+                                    "field `{}` has unsupported cleanup type `{}`",
+                                    field.name(),
+                                    other.name()
+                                ),
+                            )]);
+                        }
+                    }
+                }
             }
         }
         self.instruction(format!(
             "store {} zeroinitializer, ptr {slot}",
             llvm_class_ty(class)
         ));
+        Ok(())
     }
 
     fn emit_u32_array_drop_from_slot(&mut self, field_slot: &str) {
@@ -5082,6 +6283,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit_expr(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
+        self.consume_expression_trap_sites(expression)?;
         match &expression.kind {
             ExprKind::IntLit(value) => Ok(Value {
                 ty: expression.ty.clone().expect("validated literal type"),
@@ -6131,30 +7333,6 @@ fn find_declared_type(statements: &[Stmt], target: &str) -> Option<Ty> {
     None
 }
 
-fn collect_assignment_targets(statements: &[Stmt], targets: &mut BTreeSet<String>) {
-    for statement in statements {
-        match statement {
-            Stmt::Assign { name, .. } => {
-                targets.insert(name.clone());
-            }
-            Stmt::If {
-                then_block,
-                else_block,
-                ..
-            } => {
-                collect_assignment_targets(then_block, targets);
-                if let Some(else_block) = else_block {
-                    collect_assignment_targets(else_block, targets);
-                }
-            }
-            Stmt::While { body, .. } | Stmt::Unsafe { body, .. } => {
-                collect_assignment_targets(body, targets);
-            }
-            _ => {}
-        }
-    }
-}
-
 fn emit_main_bridge(function: &Fn, out: &mut String) -> Result<(), Vec<BackendError>> {
     let symbol = mangle(function)?;
     out.push_str("define i32 @main() {\nentry:\n");
@@ -6743,6 +7921,15 @@ fn affine_option_initializer_unsupported(span: Span, local: &str) -> BackendErro
     )
 }
 
+fn control_plan_backend_error(error: PlanError) -> BackendError {
+    diag(
+        "internal.control_plan_invalid",
+        "LLVM rejected the checked lexical control plan",
+        error.span,
+        error.message,
+    )
+}
+
 fn diag(
     name: &str,
     title: impl Into<String>,
@@ -6765,6 +7952,7 @@ mod tests {
         ExternInfo, Field, GenericTy, Method, Param, Program, ProofReuse, RecordField, SelfKind,
         StorageLayout, Ty, TypeArg,
     };
+    use crate::scan::{Clause, ClauseKind};
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
         Expr {
@@ -7673,12 +8861,19 @@ mod tests {
     #[test]
     fn affine_option_cleanups_follow_branch_loop_unsafe_and_return_lifetimes() {
         let affine = affine_bool_option_ty();
-        let option_decl = |name: &str, len: u64| Stmt::Decl {
-            ty: affine.clone(),
-            name: name.into(),
-            name_span: Span::new(0, 1),
-            init: Some(affine_some_alloc(len, true)),
-            mutable: true,
+        let option_decl = |name: &str, len: u64| {
+            let mut init = affine_some_alloc(len, true);
+            let ExprKind::SomeE(payload) = &mut init.kind else {
+                unreachable!("fixture constructs a present affine option")
+            };
+            payload.span = Span::new(100 + len as usize, 101 + len as usize);
+            Stmt::Decl {
+                ty: affine.clone(),
+                name: name.into(),
+                name_span: Span::new(0, 1),
+                init: Some(init),
+                mutable: true,
+            }
         };
         let subject = function(
             "affine_cfg",
@@ -8380,6 +9575,11 @@ mod tests {
     fn owned_boolean_arrays_lower_bytes_guards_and_reverse_cleanups() {
         let array = bool_array_ty();
         let len = expression(ExprKind::IntLit(3), Ty::Int(IntTy::U64));
+        let mut first_initializer = bool_array_literal(&[true, false]);
+        first_initializer.span = Span::new(10, 11);
+        let mut second_initializer =
+            bool_array_alloc(len, expression(ExprKind::BoolLit(true), Ty::Bool));
+        second_initializer.span = Span::new(20, 21);
         let mut f = function(
             "arrays",
             Ty::Bool,
@@ -8388,7 +9588,7 @@ mod tests {
                     ty: array.clone(),
                     name: "first".into(),
                     name_span: Span::new(0, 1),
-                    init: Some(bool_array_literal(&[true, false])),
+                    init: Some(first_initializer),
                     mutable: true,
                 },
                 Stmt::Unsafe {
@@ -8397,10 +9597,7 @@ mod tests {
                         ty: array,
                         name: "second".into(),
                         name_span: Span::new(0, 1),
-                        init: Some(bool_array_alloc(
-                            len,
-                            expression(ExprKind::BoolLit(true), Ty::Bool),
-                        )),
+                        init: Some(second_initializer),
                         mutable: true,
                     }],
                 },
@@ -8511,13 +9708,19 @@ mod tests {
             expression(ExprKind::IntLit(2), Ty::Int(IntTy::U64)),
         );
 
-        let literal = expression(
+        let mut literal = expression(
             ExprKind::ArrayLit(vec![
                 call("lit_first", Ty::Bool),
                 call("lit_second", Ty::Bool),
             ]),
             bool_array_ty(),
         );
+        literal.span = Span::new(10, 11);
+        let mut allocated = bool_array_alloc(
+            call("allocation_length", Ty::Int(IntTy::U64)),
+            call("allocation_init", Ty::Bool),
+        );
+        allocated.span = Span::new(20, 21);
         let subject = function(
             "array_effects",
             Ty::Bool,
@@ -8533,10 +9736,7 @@ mod tests {
                     ty: bool_array_ty(),
                     name: "allocated".into(),
                     name_span: Span::new(0, 1),
-                    init: Some(bool_array_alloc(
-                        call("allocation_length", Ty::Int(IntTy::U64)),
-                        call("allocation_init", Ty::Bool),
-                    )),
+                    init: Some(allocated),
                     mutable: true,
                 },
                 Stmt::Store {
@@ -8666,6 +9866,226 @@ mod tests {
                 && read_guard < read_gep
                 && read_gep < read_byte
         );
+    }
+
+    #[test]
+    fn planned_nested_return_route_drops_inner_then_outer_owner() {
+        let array = bool_array_ty();
+        let mut condition = expression(ExprKind::BoolLit(true), Ty::Bool);
+        condition.span = Span::new(10, 11);
+        let subject = function(
+            "planned_return_cleanup",
+            Ty::Bool,
+            vec![
+                Stmt::Decl {
+                    ty: array.clone(),
+                    name: "outer".into(),
+                    name_span: Span::new(1, 2),
+                    init: Some(bool_array_literal(&[true])),
+                    mutable: false,
+                },
+                Stmt::If {
+                    cond: condition,
+                    then_block: vec![
+                        Stmt::Decl {
+                            ty: array,
+                            name: "inner".into(),
+                            name_span: Span::new(3, 4),
+                            init: Some(bool_array_literal(&[false])),
+                            mutable: false,
+                        },
+                        Stmt::Return {
+                            value: Some(expression(ExprKind::BoolLit(true), Ty::Bool)),
+                            span: Span::new(20, 21),
+                        },
+                    ],
+                    else_block: None,
+                },
+                Stmt::Return {
+                    value: Some(expression(ExprKind::BoolLit(false), Ty::Bool)),
+                    span: Span::new(30, 31),
+                },
+            ],
+        );
+
+        let ir = emit_program(&program(vec![subject]), 1, &EmitOptions::default()).unwrap();
+        let branch = ir.find("if.then").expect("then branch");
+        let branch_ir = &ir[branch..];
+        let inner = branch_ir
+            .find("load %sable.array.bool, ptr %v1")
+            .expect("inner owner cleanup");
+        let inner_free = branch_ir[inner..]
+            .find("call void @__sable_rt_array_free_v1")
+            .expect("inner owner free")
+            + inner;
+        let outer = branch_ir[inner_free..]
+            .find("load %sable.array.bool, ptr %v0")
+            .expect("outer owner cleanup")
+            + inner_free;
+        let outer_free = branch_ir[outer..]
+            .find("call void @__sable_rt_array_free_v1")
+            .expect("outer owner free")
+            + outer;
+        let returned = branch_ir[outer_free..]
+            .find("ret i1 1")
+            .expect("then return")
+            + outer_free;
+        assert!(inner < inner_free && inner_free < outer && outer < outer_free);
+        assert!(outer_free < returned);
+    }
+
+    #[test]
+    fn exact_route_skips_a_cleanup_candidate_whose_declaration_was_not_reached() {
+        let subject = function(
+            "unreached_cleanup",
+            Ty::Unit,
+            vec![
+                Stmt::Return {
+                    value: None,
+                    span: Span::new(10, 11),
+                },
+                Stmt::Decl {
+                    ty: bool_array_ty(),
+                    name: "after_return".into(),
+                    name_span: Span::new(20, 21),
+                    init: Some(bool_array_literal(&[true])),
+                    mutable: false,
+                },
+            ],
+        );
+        let program = program(vec![subject]);
+        let control = ControlProgram::build(&program).expect("typed control plan");
+        let ir = emit_program_with_control(&program, &control, 1, &EmitOptions::default())
+            .expect("exact checked control lowering");
+
+        assert!(!ir.contains("call ptr @__sable_rt_array_alloc_v1"));
+        assert!(!ir.contains("call void @__sable_rt_array_free_v1"));
+        assert!(ir.contains("ret void"));
+    }
+
+    #[test]
+    fn unsupported_exposure_consumes_its_retained_plan_before_native_refusal() {
+        let exposure_span = Span::new(20, 21);
+        let mut subject = function(
+            "exposure_boundary",
+            Ty::Unit,
+            vec![Stmt::Expose {
+                kw_span: exposure_span,
+                array: "bytes".into(),
+                array_span: Span::new(21, 22),
+                mutable: false,
+                ptr: "pointer".into(),
+                ptr_span: Span::new(22, 23),
+                res: "memory".into(),
+                res_span: Span::new(23, 24),
+                body: Vec::new(),
+            }],
+        );
+        subject.params = vec![parameter(
+            "bytes",
+            Ty::array_ref(Ty::Int(IntTy::U8), Mutability::Shared),
+        )];
+        let source = program(vec![subject]);
+        let control = ControlProgram::build(&source).expect("exact exposure control plan");
+
+        let refusal = emit_program_with_control(&source, &control, 100, &EmitOptions::default())
+            .expect_err("byte-array exposure remains outside LLVM admission");
+        assert_eq!(refusal[0].name, "backend.unsupported");
+
+        let mut changed = source.clone();
+        let Stmt::Expose { ptr, .. } = &mut changed.fns[0].body[0] else {
+            unreachable!()
+        };
+        *ptr = "changed_pointer".into();
+        let mismatch = emit_program_with_control(&changed, &control, 100, &EmitOptions::default())
+            .expect_err("a changed exposure may not reuse the retained native boundary");
+        assert_eq!(mismatch[0].name, "internal.control_plan_invalid");
+    }
+
+    #[test]
+    fn llvm_operations_and_entry_ledger_reject_changed_retained_trap_sites() {
+        let trap_span = Span::new(20, 21);
+        let arithmetic = |op| Expr {
+            kind: ExprKind::Binary {
+                op,
+                op_span: trap_span,
+                lhs: Box::new(Expr {
+                    kind: ExprKind::IntLit(4),
+                    span: Span::new(22, 23),
+                    ty: Some(Ty::Int(IntTy::I32)),
+                }),
+                rhs: Box::new(Expr {
+                    kind: ExprKind::IntLit(2),
+                    span: Span::new(24, 25),
+                    ty: Some(Ty::Int(IntTy::I32)),
+                }),
+            },
+            span: trap_span,
+            ty: Some(Ty::Int(IntTy::I32)),
+        };
+        let original = arithmetic(BinOp::Add);
+        let source = program(vec![function(
+            "retained_trap",
+            Ty::Unit,
+            vec![Stmt::ExprStmt(original.clone())],
+        )]);
+        let control = ControlProgram::build(&source).unwrap();
+
+        let mut support = ModuleSupport::default();
+        let emitter =
+            FunctionEmitter::new(&source, Some(&control), &source.fns[0], &mut support).unwrap();
+        let mismatch = emitter
+            .consume_expression_trap_sites(&arithmetic(BinOp::Sub))
+            .expect_err("the lowering operation must exact-lookup its sealed kind");
+        assert_eq!(mismatch[0].name, "internal.control_plan_invalid");
+        assert!(mismatch[0].label.contains("SubOverflow"));
+
+        let mut deleted = source.clone();
+        deleted.fns[0].body.clear();
+        let missing = emit_program_with_control(&deleted, &control, 1, &EmitOptions::default())
+            .expect_err("entry reconciliation must find even unreachable retained sites");
+        assert_eq!(missing[0].name, "internal.control_plan_invalid");
+        assert!(missing[0].label.contains("planned trap site"));
+
+        let branch_anchor = Span::new(30, 31);
+        let scoped_source = program(vec![function(
+            "scoped_trap",
+            Ty::Unit,
+            vec![Stmt::If {
+                cond: Expr {
+                    kind: ExprKind::BoolLit(true),
+                    span: branch_anchor,
+                    ty: Some(Ty::Bool),
+                },
+                then_block: vec![Stmt::ExprStmt(original.clone())],
+                else_block: Some(Vec::new()),
+            }],
+        )]);
+        let scoped_control = ControlProgram::build(&scoped_source).unwrap();
+        let mut scoped_support = ModuleSupport::default();
+        let mut scoped_emitter = FunctionEmitter::new(
+            &scoped_source,
+            Some(&scoped_control),
+            &scoped_source.fns[0],
+            &mut scoped_support,
+        )
+        .unwrap();
+        let branch = scoped_emitter
+            .control
+            .branch(scoped_emitter.control.body_scope(), branch_anchor, true)
+            .unwrap();
+        let then_scope = branch.then_arm().scope();
+        let else_scope = branch.else_arm().unwrap().scope();
+        scoped_emitter.cleanup_scopes.last_mut().unwrap().id = then_scope;
+        scoped_emitter
+            .consume_expression_trap_sites(&original)
+            .expect("the operation consumes the exact retained branch site");
+        scoped_emitter.cleanup_scopes.last_mut().unwrap().id = else_scope;
+        let moved = scoped_emitter
+            .consume_expression_trap_sites(&original)
+            .expect_err("a sibling branch may not consume the retained site");
+        assert_eq!(moved[0].name, "internal.control_plan_invalid");
+        assert!(moved[0].label.contains("active lexical scope"));
     }
 
     #[test]
@@ -9433,6 +10853,146 @@ mod tests {
     }
 
     #[test]
+    fn initializer_field_action_stages_then_conditionally_drops_neutral_storage_and_installs() {
+        let result = fixed_class_program();
+        let control = ControlProgram::build(&result).expect("exact field-assignment action");
+        let ir = emit_program_with_control(
+            &result,
+            &control,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .expect("u32 field initializer is in the native subset");
+        let symbol = mangle_initializer(0, &result.classes[0].inits[0]).unwrap();
+        let start = ir
+            .find(&format!("define internal void @{symbol}"))
+            .expect("initializer definition");
+        let end = ir[start..].find("\n}\n").unwrap() + start;
+        let initializer = &ir[start..end];
+
+        let staging = initializer
+            .find("alloca %sable.array.u32")
+            .expect("retained field temporary has one entry slot");
+        let neutral = initializer
+            .find("store %sable.class.0 zeroinitializer, ptr %self")
+            .expect("constructor starts with every field dynamically absent");
+        let rhs = initializer
+            .find("call ptr @__sable_rt_array_alloc_v1")
+            .expect("RHS is fully evaluated into the planned staging value");
+        let drop_guard = initializer[rhs..]
+            .find("icmp eq ptr")
+            .map(|offset| rhs + offset)
+            .expect("old neutral field is dropped through a null-safe presence guard");
+        let drop_done = initializer[drop_guard..]
+            .find("class.free.done:")
+            .map(|offset| drop_guard + offset)
+            .expect("conditional drop rejoins before install");
+        let install = initializer[drop_done..]
+            .find("load %sable.array.u32, ptr")
+            .map(|offset| drop_done + offset)
+            .expect("staged descriptor is loaded only after the old drop");
+        let clear = initializer[install..]
+            .find("store %sable.array.u32 zeroinitializer")
+            .map(|offset| install + offset)
+            .expect("install consumes and neutralizes the planned temporary");
+        assert!(staging < neutral && neutral < rhs && rhs < drop_guard);
+        assert!(drop_guard < drop_done && drop_done < install && install < clear);
+    }
+
+    #[test]
+    fn fixed_owner_cleanup_consumes_the_checked_class_drop_plan() {
+        let mut result = fixed_class_program();
+        result.classes[0].invariants.push(Clause {
+            kind: ClauseKind::Invariant,
+            label: Some("native_nat".into()),
+            fact: false,
+            unfold: false,
+            text: "true".into(),
+            span: Span::new(20, 21),
+            line_span: Span::new(20, 21),
+        });
+        let control = ControlProgram::build(&result).expect("exact concrete class-drop plan");
+        let ir = emit_program_with_control(
+            &result,
+            &control,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .expect("verified native invariants are explicitly erased");
+        assert!(ir.contains("; class-drop invariant for `Nat` erased after verification"));
+        assert!(ir.contains("; empty class-drop deinitializer destructor `Nat::deinit`"));
+
+        let mut mutated = result.clone();
+        mutated.classes[0].fields[0].span = Span::new(90, 91);
+        let error = emit_program_with_control(
+            &mutated,
+            &control,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .expect_err("a mutated class field must not reuse a checked drop plan");
+        assert_eq!(error[0].name, "internal.control_plan_invalid");
+        assert!(error[0].title.contains("control plan"));
+        assert!(error[0].label.contains("no longer matches its declaration"));
+    }
+
+    #[test]
+    fn llvm_class_drop_phases_keep_reverse_order_and_reject_executable_deinit() {
+        let mut ordered = fixed_class_program();
+        ordered.classes[0].fields.push(Field {
+            name: "tail".into(),
+            ty: Ty::Int(IntTy::U64),
+            span: Span::new(30, 31),
+            must_consume: false,
+        });
+        let control = ControlProgram::build(&ordered).expect("synthetic ordered class-drop plan");
+        let mut support = ModuleSupport::default();
+        let emitter = FunctionEmitter::new(&ordered, Some(&control), &ordered.fns[1], &mut support)
+            .expect("entry body has exact control");
+        let mut ir = String::new();
+        emitter
+            .emit(&mut ir)
+            .expect("the direct emitter supports integer and u32-array field cleanup");
+        let tail = ir
+            .find("getelementptr %sable.class.0, ptr %v0, i32 0, i32 1")
+            .expect("last-declared scalar field phase");
+        let limbs = ir[tail..]
+            .find("getelementptr %sable.class.0, ptr %v0, i32 0, i32 0")
+            .map(|offset| tail + offset)
+            .expect("first-declared array field phase");
+        assert!(tail < limbs);
+
+        let mut executable = fixed_class_program();
+        executable.classes[0].deinit = Some(vec![Stmt::ExprStmt(expression(
+            ExprKind::BoolLit(true),
+            Ty::Bool,
+        ))]);
+        let control =
+            ControlProgram::build(&executable).expect("non-empty deinit remains a planned phase");
+        let mut support = ModuleSupport::default();
+        let emitter = FunctionEmitter::new(
+            &executable,
+            Some(&control),
+            &executable.fns[1],
+            &mut support,
+        )
+        .expect("entry body has exact control");
+        let mut ignored = String::new();
+        let error = emitter
+            .emit(&mut ignored)
+            .expect_err("LLVM must reject, not erase, an executable deinitializer");
+        assert_eq!(error[0].name, "backend.control_plan_unsupported");
+        assert!(error[0].title.contains("class deinitializer"));
+        assert!(error[0].label.contains("non-empty body"));
+    }
+
+    #[test]
     fn fixed_owner_class_returns_and_named_moves_use_destination_passing() {
         let mut result = fixed_class_program();
         result.fns.push(function(
@@ -9658,6 +11218,273 @@ mod tests {
             .expect("scratch is transferred and neutralized after the drop");
         assert!(call < drop && drop < transfer);
         assert_eq!(ir.matches("%v1 = alloca %sable.class.0").count(), 1);
+    }
+
+    #[test]
+    fn planned_replacement_of_a_moved_out_class_drops_the_neutral_destination_then_installs() {
+        let mut result = fixed_class_program();
+        let entry = &mut result.fns[1];
+        let Stmt::VarDecl { mutable, .. } = &mut entry.body[0] else {
+            unreachable!()
+        };
+        *mutable = true;
+        entry.body.insert(
+            1,
+            Stmt::VarDecl {
+                ty: Some(Ty::Class(0)),
+                name: "moved".into(),
+                name_span: Span::new(10, 11),
+                init: typed_variable("value", Ty::Class(0)),
+                mutable: false,
+            },
+        );
+        entry.body.insert(
+            2,
+            Stmt::Assign {
+                name: "value".into(),
+                name_span: Span::new(20, 21),
+                value: {
+                    let mut replacement = fixed_class_constructor();
+                    replacement.span = Span::new(22, 23);
+                    replacement
+                },
+            },
+        );
+        let entry_symbol = mangle(entry).unwrap();
+        let initializer_symbol = mangle_initializer(0, &result.classes[0].inits[0]).unwrap();
+        let control = ControlProgram::build(&result).expect("exact assignment actions");
+        let ir = emit_program_with_control(
+            &result,
+            &control,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .unwrap();
+        let start = ir
+            .find(&format!("define internal i32 @{entry_symbol}"))
+            .unwrap();
+        let end = ir[start..].find("\n}\n").unwrap() + start;
+        let entry_ir = &ir[start..end];
+
+        let moved_out = entry_ir
+            .find("store %sable.class.0 zeroinitializer, ptr %v0")
+            .expect("the first move neutralizes its source");
+        let replacement = entry_ir[moved_out..]
+            .find(&format!("call void @{initializer_symbol}(ptr %v2)"))
+            .map(|offset| moved_out + offset)
+            .expect("the replacement is evaluated into its planned temporary");
+        let planned_drop = entry_ir[replacement..]
+            .find("getelementptr %sable.class.0, ptr %v0")
+            .map(|offset| replacement + offset)
+            .expect("the planned old-destination drop still runs null-safely");
+        let staged_load = entry_ir[planned_drop..]
+            .find("load %sable.class.0, ptr %v2")
+            .map(|offset| planned_drop + offset)
+            .expect("the staged replacement is installed after the drop");
+        let staged_clear = entry_ir[staged_load..]
+            .find("store %sable.class.0 zeroinitializer, ptr %v2")
+            .map(|offset| staged_load + offset)
+            .expect("install consumes the planned temporary");
+        assert!(moved_out < replacement && replacement < planned_drop);
+        assert!(planned_drop < staged_load && staged_load < staged_clear);
+    }
+
+    #[test]
+    fn trapping_class_rhs_precedes_the_planned_old_destination_drop() {
+        let mut result = fixed_class_program();
+        let mut may_trap = function(
+            "may_trap",
+            Ty::Class(0),
+            vec![
+                Stmt::ExprStmt(expression(
+                    ExprKind::Binary {
+                        op: BinOp::Div,
+                        op_span: Span::new(30, 31),
+                        lhs: Box::new(expression(ExprKind::IntLit(1.into()), Ty::Int(IntTy::I32))),
+                        rhs: Box::new(expression(
+                            ExprKind::Var("divisor".into()),
+                            Ty::Int(IntTy::I32),
+                        )),
+                    },
+                    Ty::Int(IntTy::I32),
+                )),
+                Stmt::Return {
+                    value: Some(fixed_class_constructor()),
+                    span: Span::new(40, 41),
+                },
+            ],
+        );
+        may_trap.params = vec![parameter("divisor", Ty::Int(IntTy::I32))];
+        let may_trap_symbol = mangle(&may_trap).unwrap();
+        result.fns.push(may_trap);
+
+        let entry = &mut result.fns[1];
+        let Stmt::VarDecl { mutable, .. } = &mut entry.body[0] else {
+            unreachable!()
+        };
+        *mutable = true;
+        entry.body.insert(
+            1,
+            Stmt::Assign {
+                name: "value".into(),
+                name_span: Span::new(50, 51),
+                value: call_with(
+                    "may_trap",
+                    Ty::Class(0),
+                    vec![expression(ExprKind::IntLit(0.into()), Ty::Int(IntTy::I32))],
+                ),
+            },
+        );
+        let entry_symbol = mangle(entry).unwrap();
+        let control = ControlProgram::build(&result).expect("exact assignment actions");
+        let ir = emit_program_with_control(
+            &result,
+            &control,
+            1,
+            &EmitOptions {
+                entry: Some("entry".into()),
+            },
+        )
+        .unwrap();
+        let start = ir
+            .find(&format!("define internal i32 @{entry_symbol}"))
+            .unwrap();
+        let end = ir[start..].find("\n}\n").unwrap() + start;
+        let entry_ir = &ir[start..end];
+        let rhs = entry_ir
+            .find(&format!("call void @{may_trap_symbol}(ptr %v1, i32 0)"))
+            .expect("potentially trapping RHS fills the planned temporary");
+        let old_drop = entry_ir[rhs..]
+            .find("getelementptr %sable.class.0, ptr %v0")
+            .map(|offset| rhs + offset)
+            .expect("old destination drop follows a successful RHS return");
+        assert!(rhs < old_drop);
+
+        let callee_start = ir
+            .find(&format!("define internal void @{may_trap_symbol}"))
+            .unwrap();
+        let callee_end = ir[callee_start..].find("\n}\n").unwrap() + callee_start;
+        assert!(ir[callee_start..callee_end].contains("@__sable_rt_fail_v1"));
+    }
+
+    #[test]
+    fn uninitialized_fixed_owner_uses_a_neutral_slot_on_optional_paths() {
+        fn function_ir<'a>(ir: &'a str, symbol: &str) -> &'a str {
+            let start = ir
+                .find(&format!("define internal i32 @{symbol}"))
+                .expect("subject definition");
+            let end = ir[start..]
+                .find("\n}\n")
+                .map(|offset| start + offset)
+                .expect("subject definition end");
+            &ir[start..end]
+        }
+
+        fn uninitialized_nat(name: &str, control: Stmt) -> Fn {
+            let mut function = function(
+                name,
+                Ty::Int(IntTy::I32),
+                vec![
+                    Stmt::Decl {
+                        ty: Ty::Class(0),
+                        name: "value".into(),
+                        name_span: Span::new(2, 3),
+                        init: None,
+                        mutable: true,
+                    },
+                    control,
+                    Stmt::Return {
+                        value: Some(expression(ExprKind::IntLit(0.into()), Ty::Int(IntTy::I32))),
+                        span: Span::new(30, 31),
+                    },
+                ],
+            );
+            function.span = Span::new(1, 40);
+            function
+        }
+
+        let assign = || Stmt::Assign {
+            name: "value".into(),
+            name_span: Span::new(12, 13),
+            value: fixed_class_constructor(),
+        };
+        let mut branch_condition = expression(ExprKind::BoolLit(false), Ty::Bool);
+        branch_condition.span = Span::new(10, 11);
+        let branch = uninitialized_nat(
+            "optional_branch_init",
+            Stmt::If {
+                cond: branch_condition,
+                then_block: vec![assign()],
+                else_block: None,
+            },
+        );
+        let mut loop_condition = expression(ExprKind::BoolLit(false), Ty::Bool);
+        loop_condition.span = Span::new(20, 21);
+        let looped = uninitialized_nat(
+            "optional_loop_init",
+            Stmt::While {
+                cond: loop_condition,
+                invariants: Vec::new(),
+                variant: None,
+                kw_span: Span::new(19, 20),
+                body: vec![assign()],
+            },
+        );
+
+        let branch_symbol = mangle(&branch).expect("branch subject has a symbol");
+        let loop_symbol = mangle(&looped).expect("loop subject has a symbol");
+        let mut result = fixed_class_program();
+        result.fns.extend([branch, looped]);
+        let branch_module = emit_program(
+            &result,
+            1,
+            &EmitOptions {
+                entry: Some("optional_branch_init".into()),
+            },
+        )
+        .unwrap();
+        let loop_module = emit_program(
+            &result,
+            1,
+            &EmitOptions {
+                entry: Some("optional_loop_init".into()),
+            },
+        )
+        .unwrap();
+
+        for subject in [
+            function_ir(&branch_module, &branch_symbol),
+            function_ir(&loop_module, &loop_symbol),
+        ] {
+            let neutral = subject
+                .find("store %sable.class.0 zeroinitializer, ptr %v0")
+                .expect("uninitialized class receives the neutral aggregate");
+            let first_destination_read = subject
+                .find("getelementptr %sable.class.0, ptr %v0")
+                .expect("assignment or exit drops through the class slot");
+            assert!(
+                neutral < first_destination_read,
+                "no path may inspect the class slot before its neutral store"
+            );
+            assert!(
+                subject[first_destination_read..].contains("call void @__sable_rt_array_free_v1"),
+                "the BodyPlan route retains the eventual owner cleanup"
+            );
+        }
+
+        let branch_ir = function_ir(&branch_module, &branch_symbol);
+        let merge = branch_ir
+            .find("if.end")
+            .expect("the false edge reaches the merge");
+        assert!(branch_ir[merge..].contains("getelementptr %sable.class.0, ptr %v0"));
+
+        let loop_ir = function_ir(&loop_module, &loop_symbol);
+        let exit = loop_ir
+            .find("while.end")
+            .expect("the condition has a zero-iteration exit");
+        assert!(loop_ir[exit..].contains("getelementptr %sable.class.0, ptr %v0"));
     }
 
     #[test]
@@ -9930,6 +11757,18 @@ mod tests {
         let error = emit_program(&discarded_result, 1, &options).unwrap_err();
         assert_eq!(error[0].name, "backend.class_unsupported");
         assert!(error[0].label.contains("bind or return"));
+
+        let control = ControlProgram::build(&discarded_result)
+            .expect("unsupported lowering still retains the discarded-temp action");
+        let mut respanned = discarded_result.clone();
+        let Stmt::ExprStmt(expression) = &mut respanned.fns[1].body[1] else {
+            unreachable!()
+        };
+        expression.span = Span::new(90, 91);
+        let mismatch = emit_program_with_control(&respanned, &control, 1, &options)
+            .expect_err("LLVM must exact-consume the retained action before refusing the subset");
+        assert_eq!(mismatch[0].name, "internal.control_plan_invalid");
+        assert!(mismatch[0].label.contains("discarded class temporary"));
     }
 
     #[test]

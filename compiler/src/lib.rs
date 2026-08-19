@@ -5,8 +5,10 @@ pub mod artifacts;
 pub mod ast;
 pub mod check;
 pub mod consts;
+mod control;
 pub mod daemon;
 pub mod diag;
+pub mod doctor;
 pub mod interp;
 pub mod lean;
 pub mod lexer;
@@ -14,19 +16,27 @@ pub mod llvm;
 pub mod lsp;
 pub mod modules;
 pub mod mono;
+mod ownership;
 pub mod parser;
+mod place;
 pub mod profile;
 pub mod scan;
-#[cfg(test)]
 mod shape_admission;
 pub mod span;
 pub mod speceval;
 pub mod svm;
+mod transition;
 pub mod vcgen;
 
 use diag::Diagnostic;
 use span::LineMap;
 use std::path::{Path, PathBuf};
+
+/// Explain one closed type spelling using the parser-position authority and
+/// the stage gates that generate Sable's shape-admission matrix.
+pub fn explain_type(spelling: &str) -> Result<String, Diagnostic> {
+    shape_admission::explain_type(spelling)
+}
 
 pub struct Failure {
     /// Machine-matchable name (obligation name or error code).
@@ -79,6 +89,35 @@ pub struct VerifiedInfo {
     pub warnings: Vec<Diagnostic>,
 }
 
+/// A typed, monomorphized program and the checker-sealed semantic plans built
+/// for that exact AST.
+///
+/// Keeping the control table beside the AST prevents dynamic and formal
+/// execution paths from silently rebuilding scope/drop identities after the
+/// checker has finished. The table is intentionally opaque outside the crate;
+/// public callers may inspect the typed program, while compiler consumers use
+/// the exact sealed plan through the crate-private accessor.
+#[derive(Debug)]
+pub struct CheckedProgram {
+    program: ast::Program,
+    control: control::ControlProgram,
+    ownership: ownership::CheckedOwnershipPlan,
+}
+
+impl CheckedProgram {
+    pub fn program(&self) -> &ast::Program {
+        &self.program
+    }
+
+    pub(crate) fn control(&self) -> &control::ControlProgram {
+        &self.control
+    }
+
+    pub(crate) fn ownership(&self) -> &ownership::CheckedOwnershipPlan {
+        &self.ownership
+    }
+}
+
 /// A typed, monomorphized program together with the exact Lean verification
 /// that authorizes a production backend to consume it.
 ///
@@ -90,6 +129,11 @@ pub struct VerifiedInfo {
 #[derive(Debug)]
 pub struct VerifiedProgram {
     program: ast::Program,
+    /// The checker-sealed control table that accompanied `program` through
+    /// VC generation and Lean verification.
+    control: control::ControlProgram,
+    /// Checker-authored ownership/mutation facts paired with the exact AST.
+    ownership: ownership::CheckedOwnershipPlan,
     info: VerifiedInfo,
     /// End of the root module's coordinate range in `program` spans. Keeping
     /// this inside the capability prevents callers from pairing the verified
@@ -105,6 +149,14 @@ impl VerifiedProgram {
     /// The exact checked and monomorphized AST authorized by Lean.
     pub fn program(&self) -> &ast::Program {
         &self.program
+    }
+
+    pub(crate) fn control(&self) -> &control::ControlProgram {
+        &self.control
+    }
+
+    pub(crate) fn ownership(&self) -> &ownership::CheckedOwnershipPlan {
+        &self.ownership
     }
 
     /// Verification and audit metadata for reporting and backend policy.
@@ -173,7 +225,7 @@ impl Default for Options {
 pub fn load_checked(
     path: &Path,
     opts: &Options,
-) -> Result<(ast::Program, modules::ModuleSet), Vec<Failure>> {
+) -> Result<(CheckedProgram, modules::ModuleSet), Vec<Failure>> {
     let (mut program, mods) = modules::load(path, &opts.module_paths).map_err(|(d, partial)| {
         vec![Failure {
             name: d.name.clone(),
@@ -186,8 +238,15 @@ pub fn load_checked(
     };
     consts::apply(&mut program).map_err(|d| vec![render(&d)])?;
     mono::monomorphize(&mut program).map_err(|d| vec![render(&d)])?;
-    check::check(&mut program).map_err(|d| vec![render(&d)])?;
-    Ok((program, mods))
+    let checked = check::check(&mut program).map_err(|d| vec![render(&d)])?;
+    Ok((
+        CheckedProgram {
+            program,
+            control: checked.control,
+            ownership: checked.ownership,
+        },
+        mods,
+    ))
 }
 
 /// Lean-free front end plus VC generation over a file and its imports:
@@ -199,7 +258,7 @@ pub fn load_checked(
 pub fn load_obligations(
     path: &Path,
     opts: &Options,
-) -> Result<(ast::Program, modules::ModuleSet, vcgen::VcResult), Vec<Failure>> {
+) -> Result<(CheckedProgram, modules::ModuleSet, vcgen::VcResult), Vec<Failure>> {
     let (mut program, mods) = modules::load(path, &opts.module_paths).map_err(|(d, partial)| {
         vec![Failure {
             name: d.name.clone(),
@@ -224,7 +283,7 @@ pub fn load_obligations(
                 .into(),
         }]);
     };
-    let vc = vcgen::generate(&program, &checked.sigs, &mods.combined_source, &repo_root).map_err(
+    let vc = vcgen::generate(&program, &checked, &mods.combined_source, &repo_root).map_err(
         |message| {
             // Fail-closed vcgen refusals carry their name as a `name:` prefix.
             let name = message
@@ -239,14 +298,22 @@ pub fn load_obligations(
             }]
         },
     )?;
-    Ok((program, mods, vc))
+    Ok((
+        CheckedProgram {
+            program,
+            control: checked.control,
+            ownership: checked.ownership,
+        },
+        mods,
+        vc,
+    ))
 }
 
 /// Run the front end and the dynamic test interpreter (`sable test`).
 /// Never invokes Lean; contracts are checked dynamically (design §9).
 pub fn test_file(path: &Path, opts: &Options) -> Result<Vec<interp::TestReport>, Vec<Failure>> {
-    let (program, mods) = load_checked(path, opts)?;
-    Ok(interp::run_tests(&program, &mods))
+    let (checked, mods) = load_checked(path, opts)?;
+    Ok(interp::run_checked_tests(&checked, &mods))
 }
 
 /// Rendered-output wrapper around `check_file_structured`.
@@ -444,6 +511,8 @@ fn verify_prepared(
             .map_or(0, |module| module.base + module.len.max(1));
         Ok(VerifiedProgram {
             program: prep.program,
+            control: prep.control,
+            ownership: prep.ownership,
             info,
             root_span_end,
             artifact_name: prep.lean_name,

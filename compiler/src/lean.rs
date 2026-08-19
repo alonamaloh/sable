@@ -23,6 +23,8 @@ enum MapTarget {
         span: Span,
         desc: String,
     },
+    /// Fixed-proof compiler certificate for a selected symbolic transition.
+    Certificate(usize),
     Obligation(usize),
     /// Theorem proved by a user discharge script; errors point at the
     /// discharge block.
@@ -52,6 +54,8 @@ pub struct EmittedNames {
     pub wfs: std::collections::HashSet<String>,
     /// Obligation theorem names.
     pub thms: std::collections::HashSet<String>,
+    /// Non-skippable symbolic-transition certificate theorem names.
+    pub certificates: std::collections::HashSet<String>,
     /// Obligation names (escape-hatch ownership checks).
     pub obligations: std::collections::HashSet<String>,
 }
@@ -62,6 +66,7 @@ impl EmittedNames {
             && self.ghosts.is_empty()
             && self.wfs.is_empty()
             && self.thms.is_empty()
+            && self.certificates.is_empty()
     }
 }
 
@@ -342,6 +347,38 @@ pub fn emit(
                 span: wf.span,
                 desc: wf.desc.clone(),
             },
+        });
+    }
+
+    for (i, certificate) in vc.transition_certificates.iter().enumerate() {
+        if exclude.certificates.contains(&certificate.thm_name) {
+            continue;
+        }
+        names.certificates.insert(certificate.thm_name.clone());
+        let first = e.line + 1;
+        e.push(&format!(
+            "/-- `{}` — kernel-checked call-havoc transition for `{}` -/",
+            certificate.name,
+            doc_safe(&certificate.transition.place.render())
+        ));
+        e.push(&format!(
+            "theorem {} {}",
+            certificate.thm_name,
+            binder_list(&certificate.binders)
+        ));
+        for (hname, hprop) in &certificate.hyps {
+            e.push(&format!("    ({hname} : {hprop})"));
+        }
+        e.push(&format!(
+            "    : ({}) := {}",
+            certificate.lean_goal(),
+            certificate.lean_proof()
+        ));
+        e.push("");
+        map.push(MapEntry {
+            first_line: first,
+            last_line: e.line,
+            target: MapTarget::Certificate(i),
         });
     }
 
@@ -1152,6 +1189,32 @@ pub fn diagnose(
                     ("lean".into(), msg.data.clone()),
                 ],
             }),
+            Some(MapTarget::Certificate(i)) => {
+                let certificate = &vc.transition_certificates[*i];
+                diags.push(Diagnostic {
+                    name: "internal.transition_certificate_rejected".into(),
+                    title: format!(
+                        "Lean rejected call-havoc transition certificate `{}`",
+                        certificate.name
+                    ),
+                    span: certificate.transition.span,
+                    label: format!(
+                        "fresh symbolic state was not certified at `{}`",
+                        certificate.transition.place.render()
+                    ),
+                    notes: vec![
+                        (
+                            "certificate".into(),
+                            format!(
+                                "goal: {}\nthis fixed-proof theorem cannot be deferred, \
+                                 assumed, or replaced by a user discharge",
+                                certificate.lean_goal()
+                            ),
+                        ),
+                        ("lean".into(), msg.data.clone()),
+                    ],
+                });
+            }
             Some(MapTarget::Obligation(i)) => {
                 let ob: &Obligation = &vc.obligations[*i];
                 let mut notes = vec![("goal".into(), ob.goal.clone())];

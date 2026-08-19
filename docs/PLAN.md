@@ -37,7 +37,17 @@ shape. N2 closes the real imported `add` closure, N3 closes the real imported
 lexical loop cleanup. N5 closes the exact nested signed-`Integer` call closure
 with owned-`Nat` take parameters, per-field construction, nested field borrows,
 `&mut Integer`, the private `flip_sign` method, and recursive destruction;
-broader class transport remains fenced.
+broader class transport remains fenced. **C0 consolidation is complete and no
+longer blocks generic owner slots:** shared place identity, exhaustive trusted
+dispatch, systematic scalar/control and admitted-ownership native generation,
+public assurance profiles, and local toolchain diagnostics are landed. The
+first Lean-checked call-havoc certificate and the complete admitted
+checker-to-VC ownership/mutation handoff are also landed. A total pre-check
+control outline drives the checker and is sealed into the retained structured
+plan consumed by VC, SVM, interpreter, and LLVM. Exact local/field replacement
+and discarded-class-temporary actions link checker transfers, staging, cleanup,
+and terminal class-drop recipes across those consumers. All six C0 criteria are
+closed; G3 may begin.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -696,7 +706,8 @@ aggregate-generics/backend track continues at M46+; G2.0's affine-option
 representation/fail-closed checkpoint and G2.1's local semantic slice are
 closed, as is G2.2's formal-SVM slice. G2.3's exact local native slice is
 closed as well. N0–N5's native `Nat`/`Integer` ladder is closed. The order
-remains a working hypothesis, not a promise that evidence cannot reorder it:
+remains a working hypothesis, not a promise that evidence cannot reorder it;
+C0 is the explicit consolidation gate before the later G3/G4 feature work:
 
 1. **M45 complete:** preserve the scalar LLVM boundary with exact
    interpreter/native differentials and end-to-end trap tests as later work
@@ -1873,10 +1884,133 @@ remains a working hypothesis, not a promise that evidence cannot reorder it:
      class shapes, nonempty destructors, array whole-value transport, and every
      public, extern, or cross-module class ABI remain rejected.
 
-   - **G3 — slots and `Vec` (later planning target):** make generic element
-     storage and movement real for the existing growable-vector benchmark;
-     neither N0 nor the bignum ladder broadens the option ABI or authorizes
-     generic owner storage.
+   - **C0 — trust-boundary consolidation (complete; unblocks G3; ADR 0086):**
+     the trusted implementations now share the identities that determine
+     ownership, proof state, structural control, and cleanup. All six exit
+     criteria are closed. The checker and VC generator
+     decode value and borrow expressions through one `compiler/src/place.rs`
+     representation, and `CheckedOwnershipPlan` makes the checker the sole
+     author of admitted moves/copies, call arguments and receivers, loans,
+     sealed operations, option takes, exposures, and loop mutations. VCgen
+     requires exact immutable records and per-callable coverage instead of
+     reconstructing effects from syntax. This joins the existing single checker
+     `transfer`, single VC `fresh_state_for`, exhaustive semantic dispatch, and
+     shape/type admission matrices rather than creating a parallel engine.
+
+     Core semantic enum matches in `check.rs` and `vcgen.rs` are linted as
+     exhaustive, with Clippy required in public CI. Native validation has a
+     separate required Clang job and now includes a deterministic typed-case
+     generator over all eight integer widths, five arithmetic operations,
+     comparisons, conversions, calls, branches, and bounded loops. Every
+     scalar result is checked as exactly zero or one, with any other `i32`
+     mapped to reserved exit status 255; valid Boolean cases occupy distinct
+     bits in batches of at most seven, so arbitrary returns and opposite
+     disagreements cannot cancel.
+
+     Criterion 4 is closed for the current admitted native boundary. The same
+     typed test IR renders ownership-bearing Sable subjects for fixed-owner
+     class moves/revival, shared and unique Boolean/`u32` array borrows,
+     three-deep fallthrough and early-return cleanup, loop-carried class
+     replacement, Boolean-array affine-option present/take/none paths, and the
+     admitted mutable `Integer` receiver call. Every normal case runs
+     individually through the exact checked `VerifiedProgram` and Clang
+     `-O0`/`-O2`, with ordered strong-hook allocation/free traces exposing
+     leaks, double frees, and wrong cleanup routes. Boolean and `u32` array OOB
+     probes pin native trap payloads, live-owner no-unwind state, and the fact
+     that a returning hook cannot suppress `llvm.trap`; their interpreter side
+     is explicitly a derived, unverified AST probe rather than verified-call
+     evidence. The generator also pins fail-closed refusal of the unadmitted
+     `option<class>` and discarded class-result paths. This test-only typed case
+     IR is distinct from the retained production control/action plan; it is not
+     the basis for criterion 3's closure. The README publishes the assurance
+     boundary and showcase evidence profiles, while `sable doctor` makes the
+     documented bootstrap testable.
+
+     Structured control now begins before checking (ADRs 0089, 0091, 0092).
+     `ControlOutline` is a total plan over the parser AST: it assigns block,
+     scope, statement, branch, loop, and exposure identities and retains normal
+     fallthrough/return reachability before the flow-sensitive checker runs.
+     The checker consumes that outline, and successful checking seals the exact
+     structure into `ControlProgram`. The checker consumes outline flow; VC,
+     SVM, interpreter, and LLVM consume the retained copy. Syntax-based
+     reconstruction is confined to deliberately unsealed tests.
+
+     `BodyPlan` retains `BlockPlan`, `BranchPlan`, `LoopPlan`, and
+     `ExposurePlan` edges alongside typed scopes/drop candidates, compiler
+     temporaries, local and field assignments, discarded-class temporary
+     actions, returns, and exact direct trap sites. Branch
+     normal exits and loop backedges exist only on planned fallthrough paths.
+     Loop and exposure structures name their exact checker-authored effect
+     records, and the exposure normal edge fixes capture → body close → owner
+     rebuild/copyback → loan release → scratch close order. Callable-wide
+     reconciliation rejects missing, moved, or reshaped scopes, statements,
+     bindings, returns, local/field assignments, discarded temporaries,
+     compiler temporaries, effects, and trap sites.
+
+     Each local or field replacement and discarded-class temporary carries its
+     exact scope/site/type/destination, checker-authored `ValueTransferKey`,
+     staging identity, conditional-drop policy, and any terminal
+     `ClassDropAction`. VC consumes those links while treating destruction as a
+     proof-state no-op. SVM consumes them before admitted lowering or named
+     class-subset refusal. The interpreter executes them; LLVM executes its
+     admitted replacements and consumes a discarded-class action before its
+     current refusal. Runtime slot liveness, moved-field presence, native
+     null/neutral storage, and concrete value representation remain consumer
+     state rather than independently chosen policy.
+
+     The first symbolic-transition certificate and its bounded checker-to-VC
+     handoff are also landed (ADRs 0087–0088). For every admitted free,
+     constructor, or method call, the checker records an ephemeral,
+     flavor-preserving call identity and its unique-borrow argument effects.
+     VCgen requires and validates the exact immutable record on every symbolic
+     visit, plus at-least-once coverage for every checked site in each verified
+     callable, instead of re-decoding the argument expression. It then snapshots
+     the symbolic fresh state and the
+     state observed after write-back. Lean checks a fixed, non-skippable
+     theorem that observed state is the fresh state; arrays additionally use
+     the exact generated fresh-length = pre-call-length hypothesis. A
+     regression tampers a real generated array certificate back to its stale
+     pre-call state and requires Lean to reject it as
+     `internal.transition_certificate_rejected`.
+
+     Callable flavor now also keys recursion analysis and generated VC/clause
+     identities. Same-spelled constructors and methods remain distinct;
+     duplicate members within one flavor are rejected. Transition-certificate
+     theorem names encode typed owner, resolved target, raw place,
+     body-relative site, parameter index, and deterministic symbolic-visit
+     ordinal injectively. A branch/join regression requires two visits to one
+     checked call to produce two distinct certificates. Artifact preparation
+     refuses root/import generated-name collisions before name subtraction;
+     importer-demanded generic instances are classified by actual category
+     emission, not merely by their cloned dependency-template spans.
+
+     The consolidation also closes a checker drift: method arguments now use
+     the same `require_explicit_borrow` authority as free functions and
+     constructors, so unique class/resource access is always visibly
+     reborrowed with `&mut`. Bare shared-borrow forwarding has no havoc effect;
+     borrowed arrays retain their explicit call-site syntax gate.
+
+     The Lean certificate remains deliberately bounded to explicit
+     unique-borrow call write-back and the array length fact inside the emitted
+     symbolic state; it does not establish complete source translation. ADR
+     0090 separately closes criterion 2 at the trusted checker-to-VC boundary:
+     moves, mandatory-consumption state, loans, receivers, option takes, sealed
+     operations, exposures, and loop mutations have one checker-authored plan
+     with exact fail-closed VC consumers.
+
+     Criterion 3 is closed. One checker-sealed structured typed control/action
+     model now covers structural edges, lexical exits, exposure close, direct
+     traps, local and field replacement, discarded class-valued temporaries,
+     and concrete class destruction across the admitted proof/execution
+     boundaries. Callable-wide reconciliation and per-consumer exact lookup
+     fail closed on deleted, moved, or forged actions. This is not a full
+     expression CFG or a mechanized source-translation proof, and stages may
+     still refuse shapes outside their admitted subsets.
+
+   - **G3 — slots and `Vec` (unblocked; next after closed C0):** make generic element storage
+     and movement real for the existing growable-vector benchmark; neither N0
+     nor the bignum ladder broadens the option ABI or authorizes generic owner
+     storage.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
      key/value storage, probing, and its existing verified contracts.
 

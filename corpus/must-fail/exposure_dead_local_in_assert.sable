@@ -1,0 +1,11 @@
+// expect-error: proof.clause_syntax
+// A proof clause after an exposure may not name a program local whose
+// lexical lifetime ended with the exposure body. VC generation must consume
+// the checked scope route rather than retaining the local as a Lean binder.
+
+fn exposure_dead_local(&[u8] bytes) {
+    unsafe expose &bytes as (ptr, resource mem) {
+        u64 hidden = 3;
+    }
+    /// assert hidden = 3
+}

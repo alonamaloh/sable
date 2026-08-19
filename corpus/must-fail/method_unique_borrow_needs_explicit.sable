@@ -1,0 +1,29 @@
+// expect-error: type.arg_borrow
+// ADR 0023 makes every grant of unique access visible at the call site.
+// Free calls and constructors already used the shared argument validator;
+// methods must not infer `&mut` merely because the local already has a
+// unique-borrow type.
+
+class Cell {
+    u64 value;
+
+    init zero() {
+        self.value = 0;
+    }
+}
+
+class Driver {
+    u64 runs;
+
+    init idle() {
+        self.runs = 0;
+    }
+
+    fn touch(&self, &mut Cell cell) {
+    }
+}
+
+pub fn bare_unique_method_argument(&mut Cell cell) {
+    var driver = Driver::idle();
+    driver.touch(cell);
+}

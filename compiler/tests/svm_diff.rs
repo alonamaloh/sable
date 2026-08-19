@@ -46,7 +46,7 @@ fn svm_differential() {
     let mut progs: Vec<(usize, String)> = Vec::new();
     let mut cases: Vec<(String, usize, String, String)> = Vec::new();
     for (fi, path) in files.iter().enumerate() {
-        let (program, mods) = match load_checked(path, &opts) {
+        let (checked, mods) = match load_checked(path, &opts) {
             Ok(x) => x,
             Err(fs) => panic!(
                 "{} failed the front end:\n{}",
@@ -57,12 +57,13 @@ fn svm_differential() {
                     .join("\n")
             ),
         };
+        let program = checked.program();
         let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
         let entries: Vec<String> = program
             .fns
             .iter()
             .map(|f| {
-                sable::svm::lower_fn_entry(&program, f).unwrap_or_else(|e| {
+                sable::svm::lower_checked_fn_entry(&checked, &f.name).unwrap_or_else(|e| {
                     panic!("{stem}::{} is not in the SVM core subset: {e}", f.name)
                 })
             })
@@ -70,11 +71,11 @@ fn svm_differential() {
         progs.push((fi, entries.join(", ")));
         for f in program.fns.iter().filter(|f| f.params.is_empty()) {
             let id = format!("{stem}::{}", f.name);
-            let term = sable::svm::lower_fn(&program, f)
+            let term = sable::svm::lower_checked_fn(&checked, &f.name)
                 .unwrap_or_else(|e| panic!("{id} is not in the SVM core subset: {e}"));
             let outcome = sable::svm::canonical_observed(
                 &program,
-                sable::interp::run_fn_observed(&program, &mods, &f.name),
+                sable::interp::run_checked_fn_observed(&checked, &mods, &f.name),
             );
             cases.push((id, fi, term, outcome));
         }
@@ -139,4 +140,86 @@ fn svm_differential() {
         failures.join("\n")
     );
     println!("svm-diff: {} subjects agree", cases.len());
+}
+
+fn checked_subject(file: &str) -> sable::CheckedProgram {
+    let path = repo_root().join("corpus").join("svm-diff").join(file);
+    match load_checked(&path, &Options::default()) {
+        Ok((checked, _)) => checked,
+        Err(failures) => panic!(
+            "{} failed the front end:\n{}",
+            path.display(),
+            failures
+                .iter()
+                .map(|failure| failure.rendered.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
+}
+
+fn position(term: &str, needle: &str) -> usize {
+    term.find(needle)
+        .unwrap_or_else(|| panic!("lowered term has no `{needle}`:\n{term}"))
+}
+
+#[test]
+fn checked_control_routes_are_explicit_and_deterministic() {
+    let checked = checked_subject("control_cleanup.sable");
+
+    let early = sable::svm::lower_checked_fn_entry(&checked, "early_set")
+        .expect("checked bare return lowers through retUnit");
+    let save = position(&early, "(.scopeExit [");
+    let ret = position(&early, "(.retUnit)");
+    assert!(save < ret, "lexical cleanup must precede the early return");
+    assert!(
+        early[save..ret].contains("\"scratch\""),
+        "the early-return route must clear its branch owner"
+    );
+    assert!(
+        !early[..ret].contains("scopeExit [\"values\"]"),
+        "the borrowed parameter must survive until retUnit restores its loan"
+    );
+
+    let branch = sable::svm::lower_checked_fn(&checked, "branch_fallthrough_closes_its_local")
+        .expect("checked branch lowers");
+    assert!(branch.contains("(.scopeExit [\"branch_local\"])"));
+
+    let loop_term = sable::svm::lower_checked_fn(&checked, "loop_backedge_closes_its_local")
+        .expect("checked loop lowers");
+    let loop_body = position(&loop_term, "(.while");
+    let loop_close = position(&loop_term, "(.scopeExit [\"loop_local\"])");
+    assert!(loop_body < loop_close, "loop local closes on the backedge");
+
+    let trapping =
+        sable::svm::lower_checked_fn(&checked, "trapping_return_evaluates_before_cleanup")
+            .expect("checked trapping expression lowers");
+    let load = position(&trapping, "(.index \"values\"");
+    let cleanup = position(&trapping, "(.scopeExit [");
+    assert!(
+        load < cleanup,
+        "a trapping result is evaluated before cleanup"
+    );
+
+    let exposure = checked_subject("typed_cell_round_trip.sable");
+    let first = sable::svm::lower_checked_fn(&exposure, "subj").expect("checked exposure lowers");
+    let second = sable::svm::lower_checked_fn(&exposure, "subj")
+        .expect("repeated checked exposure lowering succeeds");
+    assert_eq!(
+        first, second,
+        "compiler temporary identities must be stable"
+    );
+    let free = first
+        .rfind("(.rawFree")
+        .expect("exposure epilogue releases its raw loan");
+    let before_free = &first[..free];
+    let after_free = &first[free..];
+    assert!(
+        before_free.contains("(.scopeExit ["),
+        "the exposure body closes before copyback/release"
+    );
+    assert!(
+        after_free.contains("$sable$exposure_"),
+        "compiler exposure scratch closes after release"
+    );
 }

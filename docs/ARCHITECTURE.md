@@ -6,7 +6,7 @@ One sentence: **the Rust compiler owns the program language; Lean owns the proof
 
 The Rust compiler never understands proof expressions. It tokenizes `///` content only enough to find block boundaries and clause keywords (`pre`, `post`, …). Everything else about the proof language — elaboration, typing, semantics — belongs to Lean: proof-language text is spliced nearly verbatim into generated Lean files and elaborated against the `Sable` prelude (`lean/Sable/`). The proof language *is* Lean; there is no second implementation of it to drift.
 
-There is **no external SMT solver**. Routine obligations are discharged by an automation portfolio inside Lean (`sable_auto`: `assumption`/`omega`/`sable_instantiate` quantifier instantiation (ADR 0082, plus `#[fact]` ghost theorems per ADR 0084)/`simp_all`/`sable_cases` match splitting (ADR 0081)/budgeted `grind`, see `lean/Sable/Auto.lean`); every proof, automated or hand-written, is checked by the Lean kernel. The grind tier runs under a heartbeat budget (`sable.grindHeartbeats`, ADR 0011): exceeding it fails the obligation promptly instead of churning, and a success spending ≥ 1/5 of the budget is reported as a warning diagnostic — obligation name, clause span, and a minimized `discharge` suggestion from `grind?` — with the corpus held warning-clean by the harness. Stage-1 trust (design §10.1) = the Rust VCgen/emitter; nothing else.
+There is **no external SMT solver**. Routine obligations are discharged by an automation portfolio inside Lean (`sable_auto`: `assumption`/`omega`/`sable_instantiate` quantifier instantiation (ADR 0082, plus `#[fact]` ghost theorems per ADR 0084)/`simp_all`/`sable_cases` match splitting (ADR 0081)/budgeted `grind`, see `lean/Sable/Auto.lean`); every proof, automated or hand-written, is checked by the Lean kernel. The grind tier runs under a heartbeat budget (`sable.grindHeartbeats`, ADR 0011): exceeding it fails the obligation promptly instead of churning, and a success spending ≥ 1/5 of the budget is reported as a warning diagnostic — obligation name, clause span, and a minimized `discharge` suggestion from `grind?` — with the corpus held warning-clean by the harness. Stage-1 translation trust (design §10.1) is the Rust checker, VC generator, and emitter. The consolidated ownership/control plans narrow duplicated decisions inside that boundary; they do not retire it.
 
 ## Pipeline
 
@@ -67,15 +67,25 @@ typecheck (compiler/src/check.rs)     types, call graph, and one flow-sensitive
   │                                   iff every reaching branch initialized it,
   │                                   moved iff any reaching branch moved it —
   │                                   a branch that returns reaches nothing);
-  │                                   ownership is keyed by `Place` (root + field
-  │                                   path) with `contains`/`overlaps`, so a field
-  │                                   is a place in its own right and a mutable
+  │                                   ownership is keyed by the shared `Place`
+  │                                   representation (`compiler/src/place.rs`:
+  │                                   root + field path) with `contains`/`overlaps`,
+  │                                   so a field is a place in its own right and a mutable
   │                                   borrow overlapping another in one call is
   │                                   rejected (ADR 0022/0023); the same engine
   │                                   tracks resources — authority the checker
   │                                   keeps affine, whose *view* is all the logic
   │                                   sees and which the runtime never sees at
-  │                                   all (ADR 0024);
+  │                                   all (ADR 0024); a total pre-check
+  │                                   `ControlOutline` supplies block/statement
+  │                                   reachability and branch/loop/exposure
+  │                                   identity to this walk; successful checking
+  │                                   seals it into the retained `ControlProgram`;
+  │                                   `CheckedOwnershipPlan` records every admitted
+  │                                   move/copy, call argument and receiver, loan,
+  │                                   option take, sealed operation, exposure, and
+  │                                   loop mutation for exact VC consumption
+  │                                   (ADRs 0090, 0092);
   │                                   operator-binding rewrite (ADR 0012: `a + b`
   │                                   on class values becomes the bound
   │                                   contracted call)
@@ -98,19 +108,26 @@ vcgen (compiler/src/vcgen.rs)         forward symbolic execution over the AST;
   │                                   path-splitting at `if`; per-operation VCs;
   │                                   call sites: callee pres become obligations,
   │                                   callee posts become hypotheses on a fresh symbol;
-  │                                   `&mut` arguments (arrays, classes, `&mut self`)
-  │                                   are havocked at the call and at every loop
-  │                                   head, with the entry state kept for `old p`
-  │                                   (ADR 0023)
+  │                                   exact immutable lookups consume the checker's
+  │                                   ownership/mutation plan, including method
+  │                                   receivers and loop effects; explicit unique-
+  │                                   borrow havoc additionally records the symbolic
+  │                                   pre/fresh/observed-state certificate witness;
+  │                                   retained block, branch, loop, exposure, return,
+  │                                   and direct-trap plans drive symbolic control,
+  │                                   with entry state kept for `old p`
+  │                                   (ADRs 0023, 0088, 0090, 0092)
   ▼
-emit (compiler/src/lean.rs)           one Lean theorem per obligation:
+emit (compiler/src/lean.rs)           one Lean theorem per obligation, plus fixed-proof,
+  │                                   non-skippable call-havoc certificates:
   │                                     binders = params + intermediate symbols,
   │                                     hypotheses = range facts + pres + path conditions,
   │                                     proof = `by sable_auto` (or spliced discharge, M1);
   │                                   per-module (compiler/src/artifacts.rs, ADR 0018):
   │                                   imports name dep artifacts, name subtraction
   │                                   keeps one declaration per DAG;
-  │                                   records a source map: lean lines → obligation
+  │                                   records a source map: lean lines → obligation or
+  │                                   internal transition certificate
   │                                   (name, .sable span, goal text, context)
   ▼
 check                                 capture one immutable ProofEnvironment before
@@ -178,6 +195,35 @@ mandatory `llvm.trap`. The same serial run kept the SVM differential green at
 randomized allocator, grind-budget, LSP, and documentation tests. LLVM remains
 optional for emitting IR. At that checkpoint, aggregate lowering and aggregate
 ABIs remained outside the completed scalar boundary.
+
+Native validation now has its own required CI job with
+`SABLE_REQUIRE_CLANG=1`. The curated fixtures retain semantic and ABI cases
+whose exact shape matters; `compiler/tests/llvm_generated_diff.rs` adds a
+typed test IR rendered deterministically to source rather than another fixture.
+It exhausts all eight integer widths across
+add/subtract/multiply/divide/remainder over bounded operands, rotates all
+comparison forms, exercises widening/narrowing where a wider fixed type exists,
+and adds generated calls, branches, and bounded loops. Each scalar result is
+checked as exactly zero or one before packing. Any other native `i32` maps to
+reserved exit status 255; valid Boolean cases occupy distinct bits in a batch
+of at most seven cases. Arbitrary native returns and opposite Boolean
+disagreements therefore cannot cancel in a total.
+
+The same typed test IR generates the admitted ownership compositions:
+fixed-owner class moves/revival, shared and unique Boolean/`u32` array borrows,
+three-deep fallthrough and early-return scopes, loop-carried class replacement,
+Boolean-array affine-option present/take/none paths, and mutable `Integer`
+receiver calls. Each normal case is interpreted through the exact checked
+`VerifiedProgram`, compiled with Clang at `-O0` and `-O2`, and run in its own
+process with an ordered strong-hook allocation/free trace. Out-of-bounds
+Boolean and `u32` array probes check native trap payloads and live-owner
+no-unwind state; their interpreter comparison is deliberately derived from a
+test-only unverified AST clone because a verified caller cannot violate the
+guard. Fail-closed generation also pins the backend's deliberate refusal of
+`option<class>` and discarded class results. This closes generated differential
+coverage for the current admitted native boundary, not a proof of the LLVM
+emitter. The generator is test-only typed case IR, distinct from the retained
+production control/action plan that closes C0 criterion 3.
 
 G1.3 adds one internal aggregate representation without declaring an ABI:
 `%sable.option.bool = type { i8, i8 }`, with a tag byte followed by a
@@ -332,10 +378,10 @@ foreign, or cross-module array ABI.
   option owns exactly when its payload does, and `Ty::Borrow` is a **terminal**
   `false` — never `referent.is_affine()`, which would move a borrow's place into
   the moved set and hand the runtime's owned-storage cleanup the caller's
-  buffer. `interp::drop_owned_params` matches the bare constructors for the same
-  reason: a borrow's runtime value is the same `Rc` the caller holds, so
-  `Ty::Borrow` being a separate constructor is what makes the double free
-  unwritable rather than merely unwritten.
+  buffer. The interpreter's `BodyPlan` frame cleanup likewise creates a drop
+  candidate only for the bare owning constructors: a borrow's runtime value is
+  the same `Rc` the caller holds, so `Ty::Borrow` being a separate constructor
+  is what makes the double free unwritable rather than merely unwritten.
 
   Three named accessors carry what used to be pattern-matching on a constructor:
   `Ty::binding_mode` (owned / shared / unique), `Ty::as_unique_borrow` (the one
@@ -677,9 +723,10 @@ foreign, or cross-module array ABI.
   execution code. `RtArray` carries its payload tag beside its values, so
   length, an index read, and an element store are one implementation over the
   tag; `ExprKind::Borrow` clones the `Rc`, so a `&mut [bool]` argument *is* the
-  caller's storage and the callee's writes need no write-back; and
-  `drop_owned_params` matches the bare constructors, so a lent array dies with
-  its owner. The monitor snapshots a unique borrow at entry for `old p`, and
+  caller's storage and the callee's writes need no write-back; and only an
+  owned array parameter receives a `BodyPlan` frame cleanup candidate, so a
+  lent array dies with its owner. The monitor snapshots a unique borrow at
+  entry for `old p`, and
   that snapshot is payload-carrying, with `false` as the Boolean junk value
   Lean's `default` supplies — so a borrowed Boolean array's clauses are
   monitorable at zero skips.
@@ -1177,7 +1224,7 @@ foreign, or cross-module array ABI.
   424.42s, LLVM CLI 6/6, the exact verified-program interpreter↔Clang
   differential at `-O0` and `-O2`, and SVM differential 69/69.
 - **Verbatim splice.** Contract clauses appear in generated Lean exactly as written (module call-site substitution of parameter names by argument expressions). Generated theorems bind program variables under their source names so clauses elaborate unchanged. If a clause doesn't elaborate, the error must point at the `.sable` clause, not at generated code.
-- **Every obligation and every hypothesis is named by content.** Hypothesis names are content-anchored slugs (`h_pre_sorted_a`, `h_inv_<slug>`, `h_path_<slug>`, `h_<callee>_post_<slug>`, `h_cinv_<slug>`; same-slug collisions get `_2` suffixes rather than shadowing) — discharge scripts survive unrelated edits. Obligation names are `fn.kind.<expression-slug>`, or `fn.kind.<label>` where the clause carries `#[label(name)]` (stable semantic names; hypotheses become `h_inv_<label>` etc.). Lean theorem names are sanitized versions; user-facing names live in the source map.
+- **Every obligation and every hypothesis is named by content.** Hypothesis names are content-anchored slugs (`h_pre_sorted_a`, `h_inv_<slug>`, `h_path_<slug>`, `h_<callee>_post_<slug>`, `h_cinv_<slug>`; same-slug collisions get `_2` suffixes rather than shadowing) — discharge scripts survive unrelated edits. Obligation names are `fn.kind.<expression-slug>`, or `fn.kind.<label>` where the clause carries `#[label(name)]` (stable semantic names; hypotheses become `h_inv_<label>` etc.). Lean theorem and clause-helper identifiers use a versioned, length-framed encoding of their typed semantic owner and content identity; user-facing names live in the source map. An initializer and method with the same member spelling gain a flavor suffix only in their otherwise-ambiguous user-facing obligation scopes.
 - **Class structures are emitted under mangled names** (`SableC_<name>`) so user class names can never collide with Lean root-namespace names (`class Nat` vs core `Nat`). Clauses never name the class — only values — so the verbatim-splice invariant is untouched; the prefix appears only in compiler-built binder types and `.mk` literals.
 - **Binders carry source names.** A call/alloc/ctor result bound to a local binds under the local's name (`u64 p = probe_step(...)` → binder `p`, hypothesis `h_p_range`), not a positional `_r16`; a `&mut` method call rebinds the receiver's name (`m_2`); the mid-loop self state is `_self_loop`. Same motivation as content-anchored hypotheses: discharge scripts must survive unrelated edits.
 - **Havoc is SSA-style versioning.** At a loop head, binders holding havocked names are renamed to stale versions (`_oldN_x`) and surviving hypotheses are *rewritten* to the stale names under `h_stale_*` — facts about pre-loop values (e.g. alloc facts) stay available instead of being dropped; fresh loop-invariant hypotheses keep the content-anchored names. Mutation discovery is exhaustive over the condition and body, including nested statement operands, `unsafe`/`expose`, ordinary and trait calls, and sealed raw/resource/device operations. Affine shape and the variant are captured before the condition; a false condition exits with its post-condition state, while a taken iteration proves decrease from that head value to the post-body value. Mid-method `self` havoc keeps *only* the loop invariants (the class invariant is not in force mid-method, design §7): a self-mutating loop states its full working payload — lengths, element facts, and a frame invariant against `old self` — as loop invariants. Record-field projections through update chains are reduced at generation time (`{ x with vals := v }.occ` → `x.occ`), so goals stay over stable atoms omega can use.
@@ -1193,6 +1240,129 @@ foreign, or cross-module array ABI.
   the SVM's `rawFree`.
 - **A destructor owns the value outright** (ADR 0029). `deinit` bodies run; the class invariant holds on *entry* and is not re-established, so a destructor owes no `inv_exit` and has no `_old_self`. It may move fields out — the *field* is the place that dies, and untouched siblings stay readable — and a moved field is not dropped again. The interpreter's order within a drop is **invariant → body → remaining fields in reverse declaration order**. Classes hold resource fields; `#[must_consume]` turns an abandoned one from a permitted leak into a diagnostic. `&mut self.f` is legal in a destructor and nowhere else, because the invariant it could break no longer has to hold.
 - **A move is one operation, and every sink performs it** (ADR 0030). A declaration, an assignment, a field assignment, a call/constructor/method argument and a return all *take* a value: the source place stops holding it, and whatever the destination held is destroyed. The interpreter has one `take_place`/`drop_place` behind `eval_moved` — overwriting a place runs a full drop (invariant → destructor → remaining fields), a returned local leaves with the caller rather than being destroyed behind it, and an owned parameter dies with the callee's frame after its contract has been checked. The checker has one `transfer` at the matching sinks: it kills the source place, applies the loan-brand rule (recursively, so `raw_offset(p, 1)` cannot launder what `p` may not), and reports whether a `#[must_consume]` obligation travelled with the value. Affinity covers class values, resources, **and owned arrays** — two names reaching the same elements is unsound the same way, and the diagnostic names the category (`class`/`resource`/`array` prefixes on `use_after_move` and `loop_shape`). A member may move a field out but must restore it before it exits (`class.field_not_restored`); only a `deinit` may leave a hole, because only there is the invariant already gone. A contract still reads a moved-from parameter's entry value: a value outlives the transfer of authority over it. Branch joins and loop checks operate over the whole per-place state (`PlaceState`: initialized, branded, obligation) rather than a chosen subset: branches join initialization by AND and brand/obligation by OR over reaching paths, while a loop requires its backedge to preserve affine liveness, brands, and obligations before restoring the zero-iteration entry state. Every `Place` maps to that state by its complete rendered key (`self.f`, not merely `self`). The `#[must_consume]` obligation is a *state of the place*: moving the token clears it, landing sets it, a marked field regains it on assignment, and a live one may not be assigned over.
+
+  `compiler/src/place.rs` is the single structural conversion from value and
+  borrow expressions to that identity. Move sources, checker call conflicts,
+  VC call-havoc write-back, sealed-operation targets, and resource-view lookup
+  therefore agree on `self.f` versus `self` before applying their stage-specific
+  policy. Shared decoding alone was not criterion 2: ADR 0090 now makes the
+  checker-authored `CheckedOwnershipPlan` authoritative for admitted transfers,
+  loans, and loop mutations at the VC boundary. A checker-computed mutation may
+  still conservatively freshen a base object when code mutates one of its
+  fields; that is a sealed effect, not a second VC syntax walk. Neither the
+  decoder nor the ownership plan is the normalized control/cleanup model of
+  criterion 3.
+
+  `compiler/src/transition.rs` carries the first Lean-checked transition
+  slice and its checker-to-VC handoff (ADRs 0087–0088). For every admitted
+  free, constructor, or method call, the checker records a flavor-preserving
+  `CallOwner`,
+  source span, resolved target/flavor, and the unique-borrow argument effects.
+  Each effect is a stage-neutral `CallTransition` (`Place` + referent type +
+  unique-borrow havoc effect); calls without such an effect retain an empty
+  record so absence cannot mean "unchecked". VCgen requires the exact record,
+  validates its immutable facts against the resolved parameter positions on
+  every symbolic visit, requires every checked site to be visited at least
+  once per verified callable, and only then adds a symbolic witness
+  containing the actual fresh binder and the value read back from that place
+  after write-back. The generated fixed-proof theorem must build
+  `Sable.CallHavocWriteback`; an array theorem must additionally build
+  `Sable.ArrayCallHavoc` from the exact generated equality between fresh and
+  pre-call lengths. These theorems are part of the content-addressed artifact,
+  cannot be deferred, assumed, or user-discharged, and map a Lean failure to
+  `internal.transition_certificate_rejected` at the call argument.
+
+  The same typed callable identity keys the checker's recursion graph. An
+  initializer and method may share a source spelling without overwriting each
+  other's edges; duplicates within either member flavor are rejected as
+  `type.duplicate_init` or `type.duplicate_method`, and member cycles report
+  `type.mutual_recursion` at the member declaration.
+
+  Certificate theorem identifiers encode typed owner, resolved target, raw
+  structural `Place`, body-relative call span, parameter index, and deterministic
+  symbolic-visit ordinal as length-framed UTF-8 bytes. A branch continuation may
+  therefore revisit one immutable checked site while every path still receives
+  a distinct havoc certificate. Artifact preparation rejects any declaration
+  emitted by the root artifact whose Lean name is already imported, across
+  declaration categories, before name subtraction can suppress it. Root
+  emission ownership follows source ownership or absence from the exact
+  same-category import set, so importer-demanded generic instances remain root
+  declarations even though their cloned spans point into dependency templates.
+
+  Centralizing the boundary also closes a checker drift: free functions and
+  constructors already required unique class/resource access to be visibly
+  reborrowed with `&mut`, while method arguments only checked the resulting
+  type and admitted a bare unique-borrow variable. All three call flavors now
+  use one argument validator and the same `require_explicit_borrow` authority.
+  A bare shared borrow may still be forwarded, but it has no havoc effect;
+  borrowed arrays retain their separate explicit call-site syntax gate.
+
+  The handoff is ephemeral within one checked AST and is never serialized in
+  module artifacts. ADR 0090 extends the call table into one
+  `CheckedOwnershipPlan`: every admitted user-call argument and receiver,
+  sealed-operation argument/result, option take, exposure, checker-computed loop
+  mutation, and non-call value-transfer sink has one typed checker-authored
+  record. Lookup remains left-to-right after child evaluation. Duplicate,
+  missing, mismatched, or per-callable unvisited identities fail closed, while a
+  valid symbolic revisit applies the immutable effect again. Trait calls remain
+  scalar-only and therefore have no owning effect to hand off. C0 criterion 2 is
+  closed for this admitted checker-to-VC boundary.
+
+  The certificate validates fresh-state write-back and the array length fact
+  *within the emitted symbolic state*. It does not prove that mutation
+  discovery found every call, that source expressions were translated
+  completely, that every fresh-state fact is justified, or that loop havoc,
+  moves, cleanup, and traps share a validated transition system. The Rust
+  checker and generator remain trusted for those boundaries; this is the
+  first bounded path toward translation validation, not general translation
+  validation.
+
+  `compiler/src/control.rs::ControlOutline` is now the total pre-check
+  structural authority (ADR 0092). It assigns blocks, lexical scopes,
+  statement roles, branch/loop/exposure identity and parentage, and one
+  `FlowSummary` for each block and statement before the flow-sensitive checker
+  runs. The checker consumes that exact outline for reachability and structural
+  flow, then successful checking seals it into `BodyPlan`. Production consumers
+  never reconstruct flow by walking statement syntax; the remaining standalone
+  summarizer is confined to deliberately unsealed tests.
+
+  The retained `BodyPlan` carries `BlockPlan`, `BranchPlan`, `LoopPlan`, and
+  `ExposurePlan` structure alongside typed scopes, drop candidates, local and
+  field assignment actions, discarded-class temporary actions, compiler
+  temporaries, return routes, and an exact direct-trap ledger.
+  Loop and exposure plans name their exact checker-authored ownership effect
+  keys. An exposure's normal plan fixes capture → body exit → rebuild/copyback →
+  loan release → scratch close order. Full callable reconciliation rejects a
+  changed statement role, flow edge, scope parent, binding/type/span, return,
+  local or field assignment, discarded temporary, compiler temporary, effect
+  key, or trap site—even when the source node is unreachable. Each replacement
+  or temporary-drop action carries the checker-authored `ValueTransferKey` and,
+  where class cleanup is possible, an exact terminal `ClassDropAction` linked
+  to the concrete `ClassDropPlan`.
+
+  The checker consumes the pre-check outline at its admitted boundary. VC, SVM,
+  interpreter, and LLVM consume the retained typed structural model. VC uses
+  structured routes for symbolic continuation and dead-name removal. It
+  exact-consumes local/field replacement and discarded-temporary actions together
+  with their checker-authored transfers; destruction is a proof-state no-op.
+  SVM directly consumes routes, return slots, exposure actions, admitted local
+  assignments, direct trap sites, and the new cleanup actions before either
+  admitted lowering or a named class-subset refusal. The interpreter executes
+  all three replacement/temporary action kinds and their concrete class-drop
+  recipes. LLVM executes the admitted local and field replacements and
+  exact-consumes a discarded-class action before its current destination-passing
+  refusal. Every direct source trap site carries the canonical empty no-unwind
+  route, while each consumer still constructs its own proof obligation or
+  runtime payload.
+
+  This closes ADR 0086 criterion 3 and therefore C0: the admitted proof and
+  execution paths share one checker-sealed structured typed control/action
+  model for structural edges, lexical exits, traps, replacements, temporary
+  cleanup, and class destruction. It is not a full expression CFG or a
+  mechanized translation proof, and a stage may still reject a shape outside
+  its admitted subset after consuming its exact action. Dynamic slot liveness,
+  moved-field presence, native null/neutral representation, and concrete value
+  representation remain consumer state rather than semantic-policy choices.
 
   G1.6's lifetime audit closed a legacy exception to that rule: array-field
   assignment has a special whole-array consuming path, and it had stamped a

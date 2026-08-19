@@ -138,7 +138,7 @@ struct Loaded {
     diag_names: BTreeSet<String>,
     rendered: Vec<String>,
     ok: Option<(
-        sable::ast::Program,
+        sable::CheckedProgram,
         sable::modules::ModuleSet,
         sable::vcgen::VcResult,
     )>,
@@ -161,15 +161,16 @@ fn load(path: &Path) -> Loaded {
 
 /// Canonical interpreter outcome of every zero-argument function, by name.
 fn run_outcomes(
-    program: &sable::ast::Program,
+    checked: &sable::CheckedProgram,
     mods: &sable::modules::ModuleSet,
 ) -> BTreeMap<String, String> {
+    let program = checked.program();
     program
         .fns
         .iter()
         .filter(|f| f.params.is_empty())
         .map(|f| {
-            let outcome = sable::interp::run_fn(program, mods, &f.name);
+            let outcome = sable::interp::run_checked_fn(checked, mods, &f.name);
             (
                 f.name.clone(),
                 sable::svm::canonical_outcome(program, outcome),

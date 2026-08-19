@@ -796,6 +796,16 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
       some (match evalE cap ρ e with
         | .ok v => .run k (ρ.update x v) σ μ
         | .abort a => a.toConfig)
+  | .run (.scopeExit locals :: k) ρ σ μ =>
+      some (.run k (ρ.clearMany locals) σ μ)
+  | .run (.moveLocal dst src :: k) ρ σ μ =>
+      some (if dst = src then .undef else
+        match ρ dst with
+        | some _ => .undef
+        | none =>
+            match ρ src with
+            | some value => .run k ((ρ.clear src).update dst value) σ μ
+            | none => .undef)
   | .run (.optTake dst src :: k) ρ σ μ =>
       some (if dst = src then .undef else
         match ρ src with
@@ -834,6 +844,11 @@ def stepF (P : Prog) (cap : Int) : Config → Option Config
             | [] => .done v
             | fr :: σ' => .run fr.k ((fr.ρ.restore fr.loans ρ).bindDst fr.dst v) σ' μ
         | .abort a => a.toConfig)
+  | .run (.retUnit :: _) ρ σ μ =>
+      some (match σ with
+        | [] => .done .unit
+        | fr :: σ' =>
+            .run fr.k ((fr.ρ.restore fr.loans ρ).bindDst fr.dst .unit) σ' μ)
   | .run (.check name c :: k) ρ σ μ =>
       some ((evalE cap ρ c).stepBool fun b =>
         if b then .run k ρ σ μ else .trapped (.deferViolation name))
@@ -953,6 +968,11 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
   cases h with
   | assign_ok h => simp [stepF, h.evalE_eq]
   | assign_abort h => simp [stepF, h.evalE_eq]
+  | scopeExit => rfl
+  | moveLocal_ok hne hd hs => simp [stepF, hne, hd, hs]
+  | moveLocal_undef_alias heq => simp [stepF, heq]
+  | moveLocal_undef_dst hne hd => simp [stepF, hne, hd]
+  | moveLocal_undef_src hne hd hs => simp [stepF, hne, hd, hs]
   | optTake_ok hne hs => simp [stepF, hne, hs]
   | optTake_none hne hs => simp [stepF, hne, hs]
   | optTake_undef_alias heq => simp [stepF, heq]
@@ -1005,6 +1025,8 @@ theorem Step.stepF_eq {P : Prog} {cap : Int} {c c' : Config} (h : Step P cap c c
       cases ‹List Frame› with
       | nil => simp [stepF, h.evalE_eq]
       | cons fr σ => simp [stepF, h.evalE_eq]
+  | retUnit_ok => rfl
+  | retUnit_pop => rfl
   | nil_ret => rfl
   | nil_pop => rfl
   -- raw heap
@@ -1213,6 +1235,32 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
           cases ho : evalE cap ρ e with
           | ok v => exact .assign_ok (ho ▸ evalE_eval cap ρ e)
           | abort a => exact .assign_abort (ho ▸ evalE_eval cap ρ e)
+      | scopeExit locals =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          exact .scopeExit
+      | moveLocal dst src =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          by_cases heq : dst = src
+          · rw [if_pos heq]
+            exact .moveLocal_undef_alias heq
+          · rw [if_neg heq]
+            cases hd : ρ dst with
+            | some existing =>
+                simpa [hd] using
+                  Step.moveLocal_undef_dst (P := P) (k := k) (σ := σ) (μ := μ)
+                    heq hd
+            | none =>
+                cases hs : ρ src with
+                | none =>
+                    simpa [hd, hs] using
+                      Step.moveLocal_undef_src (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq hd hs
+                | some value =>
+                    simpa [hd, hs] using
+                      Step.moveLocal_ok (P := P) (k := k) (σ := σ) (μ := μ)
+                        heq hd hs
       | optTake dst src =>
           simp only [stepF, Option.some.injEq] at h
           subst h
@@ -1316,6 +1364,12 @@ theorem stepF_sound {P : Prog} {cap : Int} {c c' : Config}
               cases σ with
               | nil => exact .ret_ok (ho ▸ evalE_eval cap ρ e)
               | cons fr σ' => exact .ret_pop (ho ▸ evalE_eval cap ρ e)
+      | retUnit =>
+          simp only [stepF, Option.some.injEq] at h
+          subst h
+          cases σ with
+          | nil => exact .retUnit_ok
+          | cons fr σ' => exact .retUnit_pop
       | check name c =>
           simp only [stepF, Option.some.injEq] at h
           subst h

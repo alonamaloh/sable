@@ -84,7 +84,10 @@ Write the SVM as a Sable program and prove it implements the inductive step rela
 
 Payoff: the language's own semantics becomes a program in the language; the Lean formalization becomes executably testable; and every future "does the compiler match the SVM?" question gains a differential-testing oracle for free. Bignum proves the language can verify *other* things; this proves it can verify *itself*. Together they make the project undeniable.
 
-It is also the load-bearing artifact of the stage-1 trust posture (design §10.1): while the VC generator is still trusted engineering, this interpreter plus the Lean formalization is what cross-checks it.
+It is also a load-bearing artifact of the stage-1 trust posture (design §10.1):
+while the VC generator remains trusted engineering, this interpreter plus the
+Lean formalization independently cross-checks the executable semantics. It does
+not validate the VCs selected from source.
 
 ## Tier 3″ — Metatheory track: mechanizing soundness
 
@@ -92,7 +95,7 @@ It is also the load-bearing artifact of the stage-1 trust posture (design §10.1
 
 This is scheduled as its own tier — not folded into the design pillars — because it is the one item on this roadmap that is *not* PhD-scale-with-precedent in the comfortable sense the other tiers are. The nearest precedent, RustBelt, took a team at MPI-SWS years for a fragment of Rust. Three things keep it tractable here, and they are design decisions, not hopes: the language surface is deliberately small (lexical borrows, no closures, no lifetimes, no concurrency); monomorphization means the metatheory never sees type variables; and the SVM is a boring ~40-rule stack machine rather than a real ISA.
 
-Sequencing: it sits on the critical path of nothing in Tiers 0–3. It starts only after the language surface stabilizes (post-stdlib tier — mechanizing a moving target is wasted work), runs long, and its first standalone publishable artifact is the frame-rule metatheorem for the ownership discipline alone. Until it completes, every verification claim is honestly labeled stage 1: "verified, modulo trusted VCgen, differentially tested against the formal semantics."
+Sequencing: it sits on the critical path of nothing in Tiers 0–3. It starts only after the language surface stabilizes (post-stdlib tier — mechanizing a moving target is wasted work), runs long, and its first standalone publishable artifact is the frame-rule metatheorem for the ownership discipline alone. Until it completes, every verification claim is honestly labeled stage 1: "Lean-checked obligations selected by trusted Rust; interpreter behavior differentially checked against the formal SVM only on their admitted overlap."
 
 ## Tier 4 — The kernel direction
 

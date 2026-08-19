@@ -1,0 +1,18 @@
+// expect-error: type.mutual_recursion
+// A member cycle is diagnosed at the member declaration rather than being
+// looked up as a free function.
+
+class RecursiveMember {
+    u64 value;
+
+    init make() {
+        self.value = 0;
+    }
+
+    fn recurse(&self, &RecursiveMember next) {
+        next.recurse(next);
+    }
+}
+
+fn subject() {
+}

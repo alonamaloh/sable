@@ -19,10 +19,26 @@
 //! descent `a % b < b`) close by `assumption` instead of re-deriving
 //! nonlinear facts the portfolio cannot reach.
 
+#![deny(clippy::wildcard_enum_match_arm)]
+
 use crate::ast::*;
-use crate::check::FnSig;
+use crate::check::{CheckResult, FnSig};
+use crate::control::{
+    AssignmentAction, AssignmentStaging, BodyPlan, CompilerTempKind, ControlBody, ExitKind,
+    ExitRoute, FieldAssignmentAction, ReturnRoutes, ScopeId, TemporaryDropAction, TrapSite,
+};
+use crate::ownership::{
+    CheckedExposure, CheckedLoopEffects, CheckedMutation, CheckedOptionTake, CheckedOwnershipPlan,
+    CheckedSealedArgument, CheckedSealedOperation, CheckedSealedTarget, EffectSiteKey,
+    ValueTransfer, ValueTransferKey, ValueTransferKind, ValueTransferSink,
+};
+use crate::place::{BorrowedPlace, Place};
 use crate::scan::Clause;
 use crate::span::Span;
+use crate::transition::{
+    CallArgumentEffect, CallEffect, CallOwner, CallSiteKey, CallTarget, CheckedCallTransition,
+    TransitionCertificate,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -59,6 +75,9 @@ pub struct VcResult {
     pub records: Vec<RecordEmit>,
     pub clause_wfs: Vec<ClauseWf>,
     pub obligations: Vec<Obligation>,
+    /// Fixed-proof Lean certificates for selected symbolic transitions.
+    /// They are not user obligations and cannot be skipped or discharged.
+    pub(crate) transition_certificates: Vec<TransitionCertificate>,
     /// What this module trusts (ADR 0027). Emitted into the generated
     /// Lean as a comment header so it lands inside the artifact hash: an
     /// artifact must not survive a change to what it trusted, and the
@@ -320,41 +339,34 @@ fn take_vc_type_refusal() -> Option<String> {
     VC_TYPE_REFUSAL.with(|latch| latch.borrow_mut().take())
 }
 
-/// The root name a sealed raw/resource operation's borrow argument writes its
-/// fresh state back under.
-///
-/// Every sealed-op arm keys its write-back by this name, so a *field* borrow
-/// (`&mut self.mem` — spellable in a destructor, ADR 0029) has no honest
-/// answer here: using the root would overwrite the whole object with a view.
-/// The checker refuses the shape first (`resource.field_borrow_op`); this is
-/// the same refusal at the arm, fail-closed (ADR 0074) — latch and return a
-/// key no environment entry uses, so nothing is clobbered before `generate`
-/// fails on the latch.
-fn sealed_borrow_root(arg: &Expr, op: &str) -> String {
-    match &arg.kind {
-        ExprKind::Borrow {
-            array, field: None, ..
-        } => array.clone(),
-        ExprKind::Borrow {
-            array,
-            field: Some(f),
-            ..
-        } => {
-            refuse_vc_type(format!(
-                "internal.vcgen.sealed_field_borrow: a borrow of the field `{array}.{f}` \
-                 reached sealed `{op}`; the checker's `resource.field_borrow_op` gate \
-                 refuses this shape first"
-            ));
-            format!("_refused_{op}")
-        }
-        _ => {
-            refuse_vc_type(format!(
-                "internal.vcgen.sealed_borrow_shape: sealed `{op}` needs an explicit \
-                 borrow argument"
-            ));
-            format!("_refused_{op}")
-        }
+/// The checker-authored root a sealed operation writes its fresh state back
+/// under. No proof-state consumer decodes the borrow expression again.
+fn sealed_borrow_root(operation: &CheckedSealedOperation, index: usize) -> String {
+    let Some(argument) = operation.arguments.get(index) else {
+        refuse_vc_type(format!(
+            "internal.vcgen.sealed_borrow_shape: sealed `{}` has no checked argument {index}",
+            operation.target.render()
+        ));
+        return format!("_refused_{}", operation.target.render());
+    };
+    let CallArgumentEffect::Loan(loan) = &argument.effect else {
+        refuse_vc_type(format!(
+            "internal.vcgen.sealed_borrow_shape: argument {index} of sealed `{}` is not a checked loan",
+            operation.target.render()
+        ));
+        return format!("_refused_{}", operation.target.render());
+    };
+    if !loan.place.is_root() {
+        refuse_vc_type(format!(
+            "internal.vcgen.sealed_field_borrow: a borrow of the field `{}` reached \
+             sealed `{op}`; the checker's `resource.field_borrow_op` gate refuses this \
+             shape first",
+            loan.place.render(),
+            op = operation.target.render()
+        ));
+        return format!("_refused_{}", operation.target.render());
     }
+    loan.place.root().to_string()
 }
 
 /// The Lean type name used where a payload has none. It does not exist in the
@@ -394,7 +406,17 @@ fn adr0009_ty_int_model(ty: Ty) -> IntTy {
         }
         Ty::Int(integer) => integer,
         Ty::Param(parameter) => adr0009_int_model(&Ty::Param(parameter)),
-        other => {
+        other @ (Ty::Bool
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit) => {
             refuse_vc_type(format!(
                 "internal.vcgen.int_model_unsupported: `{}` is not an integer or an ADR 0009 \
                  template parameter",
@@ -416,7 +438,15 @@ fn lean_array_ty(element: &Ty, records: &[RecordDecl]) -> String {
         }
         // A record element's sequence is the record's own structure type.
         Ty::Record(ri) => format!("Sable.Seq {}", lean_record_name(&records[*ri].name)),
-        _ => {
+        Ty::Class(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => {
             refuse_vc_type(format!(
                 "internal.vcgen.lean_type_unsupported: array payload `{}` has no Lean sequence \
                  element type",
@@ -446,8 +476,17 @@ fn lean_option_ty(element: &Ty, classes: &[ClassDecl]) -> String {
         // The owning class payload: the present case is the class's own
         // structure value.
         Ty::Class(ci) => format!("Option {}", lean_class_name(&classes[*ci].name)),
-        owned if owned.is_owned_array_of(&Ty::Bool) => "Option (Sable.Seq Bool)".into(),
-        _ => {
+        owned @ Ty::Array(_) if owned.is_owned_array_of(&Ty::Bool) => {
+            "Option (Sable.Seq Bool)".into()
+        }
+        Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => {
             refuse_vc_type(format!(
                 "internal.vcgen.lean_type_unsupported: option payload `{}` has no Lean type",
                 element.name()
@@ -937,7 +976,36 @@ fn validate_vc_scalar_operator(
                 ));
             }
         }
-        _ => unreachable!("scalar-operator validation called for a different expression"),
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::RawOp { .. }
+        | ExprKind::DeviceOp { .. }
+        | ExprKind::ResOp { .. }
+        | ExprKind::IsSome { .. }
+        | ExprKind::OptValue { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::SomeE(_)
+        | ExprKind::NoneE
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::Borrow { .. }
+        | ExprKind::RecordLit { .. } => {
+            unreachable!("scalar-operator validation called for a different expression")
+        }
     }
     Ok(())
 }
@@ -962,7 +1030,17 @@ fn validate_vc_option_operator(
             let expected = match operand {
                 Ty::Option(payload) => *payload,
                 Ty::OptionRaw(record) => Ty::RawRecord(record),
-                _ => {
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Array(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit => {
                     return Err(format!(
                         "internal.vcgen.type_error: `.value` requires an option operand in {context}"
                     ));
@@ -978,7 +1056,17 @@ fn validate_vc_option_operator(
             let expected = match result {
                 Ty::Option(ref payload) => payload.clone(),
                 Ty::OptionRaw(record) => Box::new(Ty::RawRecord(record)),
-                _ => {
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Array(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit => {
                     return Err(format!(
                         "internal.vcgen.type_error: `some` requires an option result in {context}"
                     ));
@@ -1014,7 +1102,36 @@ fn validate_vc_option_operator(
                 ));
             }
         }
-        _ => unreachable!("option-operator validation called for a different expression"),
+        ExprKind::IntLit(_)
+        | ExprKind::BoolLit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Unary { .. }
+        | ExprKind::Binary { .. }
+        | ExprKind::Call { .. }
+        | ExprKind::Index { .. }
+        | ExprKind::Len { .. }
+        | ExprKind::RawOp { .. }
+        | ExprKind::DeviceOp { .. }
+        | ExprKind::ResOp { .. }
+        | ExprKind::Widen { .. }
+        | ExprKind::Narrow { .. }
+        | ExprKind::OptTake { .. }
+        | ExprKind::ArrayLit(_)
+        | ExprKind::AllocArray { .. }
+        | ExprKind::SelfField { .. }
+        | ExprKind::SelfFieldLen { .. }
+        | ExprKind::SelfFieldIndex { .. }
+        | ExprKind::CtorCall { .. }
+        | ExprKind::ClassField { .. }
+        | ExprKind::RecordField { .. }
+        | ExprKind::ClassFieldLen { .. }
+        | ExprKind::ClassFieldIndex { .. }
+        | ExprKind::TraitCall { .. }
+        | ExprKind::MethodCall { .. }
+        | ExprKind::Borrow { .. }
+        | ExprKind::RecordLit { .. } => {
+            unreachable!("option-operator validation called for a different expression")
+        }
     }
     Ok(())
 }
@@ -1048,7 +1165,34 @@ fn validate_vc_expr(
                         "internal.vcgen.type_error: Boolean array variable has an inconsistent source type in {context}"
                     ));
                 }
-                _ => {
+                ExprKind::IntLit(_)
+                | ExprKind::BoolLit(_)
+                | ExprKind::Unary { .. }
+                | ExprKind::Binary { .. }
+                | ExprKind::Index { .. }
+                | ExprKind::Len { .. }
+                | ExprKind::RawOp { .. }
+                | ExprKind::DeviceOp { .. }
+                | ExprKind::ResOp { .. }
+                | ExprKind::Widen { .. }
+                | ExprKind::Narrow { .. }
+                | ExprKind::IsSome { .. }
+                | ExprKind::OptValue { .. }
+                | ExprKind::OptTake { .. }
+                | ExprKind::SomeE(_)
+                | ExprKind::NoneE
+                | ExprKind::SelfField { .. }
+                | ExprKind::SelfFieldLen { .. }
+                | ExprKind::SelfFieldIndex { .. }
+                | ExprKind::CtorCall { .. }
+                | ExprKind::ClassField { .. }
+                | ExprKind::RecordField { .. }
+                | ExprKind::ClassFieldLen { .. }
+                | ExprKind::ClassFieldIndex { .. }
+                | ExprKind::TraitCall { .. }
+                | ExprKind::MethodCall { .. }
+                | ExprKind::Borrow { .. }
+                | ExprKind::RecordLit { .. } => {
                     return Err(format!(
                         "internal.vcgen.type_error: Boolean array value has an unsupported producer in {context}"
                     ));
@@ -1650,14 +1794,43 @@ fn validate_vc_block_with_mutability(
             } => {
                 reject_affine_option_named_source(array, locals, "an exposure source", context)?;
                 match locals.get(array) {
-                    Some(found) if found.is_array_of(&Ty::Bool) => {
-                        return Err(format!(
-                            "internal.vcgen.type_error: Boolean array exposure is not supported in {context}"
-                        ));
-                    }
-                    Some(found) if matches!(found.as_array(), Some((Ty::Int(integer), _)) if !matches!(integer, IntTy::TParam(_))) =>
-                        {}
-                    _ => {
+                    Some(found) => match checked_array_payload(found) {
+                        Some(Ty::Bool) => {
+                            return Err(format!(
+                                "internal.vcgen.type_error: Boolean array exposure is not supported in {context}"
+                            ));
+                        }
+                        Some(Ty::Int(
+                            IntTy::U8
+                            | IntTy::U16
+                            | IntTy::U32
+                            | IntTy::U64
+                            | IntTy::I8
+                            | IntTy::I16
+                            | IntTy::I32
+                            | IntTy::I64,
+                        )) => {}
+                        Some(
+                            Ty::Int(IntTy::TParam(_))
+                            | Ty::Param(_)
+                            | Ty::Class(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Res(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit,
+                        )
+                        | None => {
+                            return Err(format!(
+                                "internal.vcgen.type_error: exposure source `{array}` is not an executable integer array in {context}"
+                            ));
+                        }
+                    },
+                    None => {
                         return Err(format!(
                             "internal.vcgen.type_error: exposure source `{array}` is not an executable integer array in {context}"
                         ));
@@ -1942,7 +2115,7 @@ fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> Strin
         Ty::Raw(_) | Ty::RawRecord(_) => "Sable.RawPtr".into(),
         Ty::Option(element) => lean_option_ty(element, classes),
         Ty::OptionRaw(_) => "Option Sable.RawPtr".into(),
-        _ => unreachable!("checked: field types"),
+        Ty::Borrow(..) | Ty::Unit => unreachable!("checked: field types"),
     }
 }
 
@@ -1950,7 +2123,16 @@ fn lean_record_field_layout(ty: Ty) -> String {
     match ty {
         Ty::Int(it) => it.lean_layout(),
         Ty::RawRecord(_) | Ty::OptionRaw(_) => "Sable.rawPtr.layout".into(),
-        _ => unreachable!("checked: record fields are raw-storable"),
+        Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => unreachable!("checked: record fields are raw-storable"),
     }
 }
 
@@ -1963,7 +2145,18 @@ fn lean_res_view_ty(kind: ResKind, records: &[RecordDecl]) -> String {
             "Sable.ResourceMapView Int (Sable.PointsToView {})",
             lean_record_name(&records[ri].name)
         ),
-        _ => kind.view_ty().into(),
+        kind @ (ResKind::RawSpan
+        | ResKind::PointsToU64
+        | ResKind::OpenFile
+        | ResKind::PosixWorld
+        | ResKind::Uart
+        | ResKind::SystemDealloc
+        | ResKind::AllocatorState
+        | ResKind::BlockLease
+        | ResKind::LeasedPointsToU64
+        | ResKind::FreeBlock
+        | ResKind::FreeHeader
+        | ResKind::ResourceMapPointsToU64) => kind.view_ty().into(),
     }
 }
 
@@ -1977,6 +2170,36 @@ enum Cctx<'a> {
     /// entry, but it is **not** re-established at exit: the value ceases to
     /// exist, so there is nothing left to hold it (ADR 0029).
     Deinit(&'a ClassDecl),
+}
+
+/// Present a class destructor body to the ordinary callable generator.
+///
+/// Destructors have no source-level `Fn`, but both concrete classes and
+/// retained ADR 0009 templates must traverse exactly the same symbolic body.
+/// Keeping the synthetic signature here prevents those two verification
+/// loops from silently disagreeing about what a destructor is.
+fn synthesized_deinit(class: &ClassDecl) -> Option<Fn> {
+    class
+        .deinit
+        .as_ref()
+        .filter(|body| !body.is_empty())
+        .map(|body| Fn {
+            is_pub: false,
+            extern_info: None,
+            name: "deinit".to_string(),
+            name_span: class.name_span,
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            requires: Vec::new(),
+            proof_reuse: ProofReuse::None,
+            params: Vec::new(),
+            ret: Ty::Unit,
+            pres: Vec::new(),
+            posts: Vec::new(),
+            variant: None,
+            body: body.clone(),
+            span: class.span,
+        })
 }
 
 /// Well-formedness defs for an audited extern's clauses. Its parameters
@@ -2021,8 +2244,9 @@ fn emit_extern_clause_wfs(
         }
     }
     for (i, c) in f.pres.iter().enumerate() {
+        let owner = CallOwner::Function(f.name.clone());
         result.clause_wfs.push(ClauseWf {
-            def_name: format!("wf_{}_pre_{}", sanitize(&f.name), i + 1),
+            def_name: callable_lean_name("wf", &owner, "pre", i + 1),
             binders: binders.clone(),
             text: preprocess_old_params(&c.text, &f.params),
             span: c.span,
@@ -2035,8 +2259,9 @@ fn emit_extern_clause_wfs(
         post_binders.push(("result".to_string(), "Int".to_string()));
     }
     for (i, c) in f.posts.iter().enumerate() {
+        let owner = CallOwner::Function(f.name.clone());
         result.clause_wfs.push(ClauseWf {
-            def_name: format!("wf_{}_post_{}", sanitize(&f.name), i + 1),
+            def_name: callable_lean_name("wf", &owner, "post", i + 1),
             binders: post_binders.clone(),
             text: preprocess_old_params(&c.text, &f.params),
             span: c.span,
@@ -2048,7 +2273,7 @@ fn emit_extern_clause_wfs(
 
 pub(crate) fn generate(
     program: &Program,
-    sigs: &HashMap<String, FnSig>,
+    checked: &CheckResult,
     source: &str,
     repo_root: &Path,
 ) -> Result<VcResult, String> {
@@ -2056,6 +2281,7 @@ pub(crate) fn generate(
     // earlier failed generation on this thread cannot be attributed to this one.
     let _ = take_vc_type_refusal();
     validate_vc_type_domain(program)?;
+    let sigs = &checked.sigs;
     let fn_map: HashMap<&str, &Fn> = program.fns.iter().map(|f| (f.name.as_str(), f)).collect();
     let trait_map: HashMap<&str, &TraitDecl> = program
         .traits
@@ -2115,7 +2341,18 @@ pub(crate) fn generate(
                                 f.name,
                                 it.lean_max()
                             )),
-                            _ => None,
+                            Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Class(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Res(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit => None,
                         },
                     })
                     .collect(),
@@ -2125,6 +2362,7 @@ pub(crate) fn generate(
             .collect(),
         clause_wfs: Vec::new(),
         obligations: Vec::new(),
+        transition_certificates: Vec::new(),
         trust: TrustManifest {
             externs: {
                 // Sorted, so the artifact hash is stable across the
@@ -2195,7 +2433,10 @@ pub(crate) fn generate(
             }
             wf_binders.extend(binders.clone());
             result.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_invariant_{}", sanitize(&c.name), i + 1),
+                def_name: injective_lean_components(
+                    "wf",
+                    &["class", c.name.as_str(), "invariant", &(i + 1).to_string()],
+                ),
                 binders: wf_binders,
                 text: inv.text.clone(),
                 span: inv.span,
@@ -2205,14 +2446,38 @@ pub(crate) fn generate(
         }
     }
 
-    let run_one = |f: &Fn, fname: String, cctx: Cctx, result: &mut VcResult| {
+    let run_one = |f: &Fn,
+                   fname: String,
+                   call_owner: CallOwner,
+                   cctx: Cctx,
+                   result: &mut VcResult|
+     -> Result<(), String> {
+        let control = checked.control.body(&call_owner, f.span).map_err(|error| {
+            format!(
+                "internal.vcgen.control_plan_missing: {} at {}..{}",
+                error.message, error.span.start, error.span.end
+            )
+        })?;
         let mut generator = Generator {
             f,
             fname,
+            call_owner,
             cctx,
+            control: Some(control),
             classes: &program.classes,
             records: &program.records,
             sigs,
+            ownership: &checked.ownership,
+            visited_checked_calls: HashSet::new(),
+            checked_call_visits: HashMap::new(),
+            visited_option_takes: HashSet::new(),
+            visited_exposures: HashSet::new(),
+            visited_sealed_operations: HashSet::new(),
+            visited_loops: HashSet::new(),
+            visited_value_transfers: HashSet::new(),
+            visited_assignments: HashSet::new(),
+            visited_field_assignments: HashSet::new(),
+            visited_temporary_drops: HashSet::new(),
             fn_map: &fn_map,
             class_map: &class_map,
             source,
@@ -2230,6 +2495,8 @@ pub(crate) fn generate(
             out: result,
         };
         generator.run();
+        generator.finish_checked_ownership();
+        Ok(())
     };
 
     for f in &program.fns {
@@ -2263,8 +2530,12 @@ pub(crate) fn generate(
             }
             for (i, req) in f.requires.iter().enumerate() {
                 let name = format!("{}.requires.{}", f.name, cslug(req));
+                let owner = CallOwner::Function(f.name.clone()).certificate_component();
                 result.obligations.push(Obligation {
-                    thm_name: format!("vc_{}_{}", sanitize(&name), i),
+                    thm_name: injective_lean_components(
+                        "vc",
+                        &[owner.as_str(), name.as_str(), &(i + 1).to_string()],
+                    ),
                     name,
                     kind_desc: format!("`requires` of template `{tname}` at this instantiation"),
                     span: req.span,
@@ -2276,20 +2547,46 @@ pub(crate) fn generate(
             }
             continue;
         }
-        run_one(f, f.name.clone(), Cctx::None, &mut result);
+        run_one(
+            f,
+            f.name.clone(),
+            CallOwner::Function(f.name.clone()),
+            Cctx::None,
+            &mut result,
+        )?;
     }
 
     // Fn templates (ADR 0009): verified once against the abstract
     // model — obligations bind `(T : Sable.IntModel)` with `T.wf` and
     // the declared `requires` as hypotheses.
     for f in &program.fn_templates {
+        let call_owner = CallOwner::Function(f.name.clone());
+        let control = checked.control.body(&call_owner, f.span).map_err(|error| {
+            format!(
+                "internal.vcgen.control_plan_missing: {} at {}..{}",
+                error.message, error.span.start, error.span.end
+            )
+        })?;
         let mut generator = Generator {
             f,
             fname: f.name.clone(),
+            call_owner,
             cctx: Cctx::None,
+            control: Some(control),
             classes: &program.classes,
             records: &program.records,
             sigs,
+            ownership: &checked.ownership,
+            visited_checked_calls: HashSet::new(),
+            checked_call_visits: HashMap::new(),
+            visited_option_takes: HashSet::new(),
+            visited_exposures: HashSet::new(),
+            visited_sealed_operations: HashSet::new(),
+            visited_loops: HashSet::new(),
+            visited_value_transfers: HashSet::new(),
+            visited_assignments: HashSet::new(),
+            visited_field_assignments: HashSet::new(),
+            visited_temporary_drops: HashSet::new(),
             fn_map: &fn_map,
             class_map: &class_map,
             source,
@@ -2336,32 +2633,80 @@ pub(crate) fn generate(
                 .push((format!("requires {}", req.text), req.line_span));
         }
         generator.run();
+        generator.finish_checked_ownership();
     }
 
-    // Class templates (ADR 0009): members verified once against
-    // the abstract model — the acceptance test is Vec<T>'s per-instance
-    // discharges collapsing to one template set.
+    // Class templates (ADR 0009): members, including the destructor, are
+    // verified once against the abstract model — the acceptance test is
+    // Vec<T>'s per-instance discharges collapsing to one template set.
     for c in &program.class_templates {
-        let members: Vec<(&Fn, String, Cctx)> = c
+        // A destructor has no source-level `Fn`; retain this synthetic owner
+        // through the member loop so its body visits the checker's
+        // `<Template>::deinit` call records under the same abstract context.
+        let deinit = synthesized_deinit(c);
+        let members: Vec<(&Fn, String, CallOwner, Cctx)> = c
             .inits
             .iter()
-            .map(|i| (i, format!("{}::{}", c.name, i.name), Cctx::Init(c)))
+            .map(|i| {
+                (
+                    i,
+                    format!("{}::{}", c.name, i.name),
+                    CallOwner::Constructor {
+                        class: c.name.clone(),
+                        init: i.name.clone(),
+                    },
+                    Cctx::Init(c),
+                )
+            })
             .chain(c.methods.iter().map(|m| {
                 (
                     &m.f,
                     format!("{}::{}", c.name, m.f.name),
+                    CallOwner::Method {
+                        class: c.name.clone(),
+                        method: m.f.name.clone(),
+                    },
                     Cctx::Method(c, m.self_kind),
                 )
             }))
+            .chain(deinit.iter().map(|f| {
+                (
+                    f,
+                    format!("{}::deinit", c.name),
+                    CallOwner::Deinitializer {
+                        class: c.name.clone(),
+                    },
+                    Cctx::Deinit(c),
+                )
+            }))
             .collect();
-        for (f, fname, cctx) in members {
+        for (f, fname, call_owner, cctx) in members {
+            let control = checked.control.body(&call_owner, f.span).map_err(|error| {
+                format!(
+                    "internal.vcgen.control_plan_missing: {} at {}..{}",
+                    error.message, error.span.start, error.span.end
+                )
+            })?;
             let mut generator = Generator {
                 f,
                 fname,
+                call_owner,
                 cctx,
+                control: Some(control),
                 classes: &program.classes,
                 records: &program.records,
                 sigs,
+                ownership: &checked.ownership,
+                visited_checked_calls: HashSet::new(),
+                checked_call_visits: HashMap::new(),
+                visited_option_takes: HashSet::new(),
+                visited_exposures: HashSet::new(),
+                visited_sealed_operations: HashSet::new(),
+                visited_loops: HashSet::new(),
+                visited_value_transfers: HashSet::new(),
+                visited_assignments: HashSet::new(),
+                visited_field_assignments: HashSet::new(),
+                visited_temporary_drops: HashSet::new(),
                 fn_map: &fn_map,
                 class_map: &class_map,
                 source,
@@ -2400,6 +2745,7 @@ pub(crate) fn generate(
                 }
             }
             generator.run();
+            generator.finish_checked_ownership();
         }
     }
     // Destructor bodies are collected first and run after, because the
@@ -2426,51 +2772,43 @@ pub(crate) fn generate(
             run_one(
                 init,
                 format!("{}::{}", c.name, init.name),
+                CallOwner::Constructor {
+                    class: c.name.clone(),
+                    init: init.name.clone(),
+                },
                 Cctx::Init(c),
                 &mut result,
-            );
+            )?;
         }
         for m in &c.methods {
             run_one(
                 &m.f,
                 format!("{}::{}", c.name, m.f.name),
+                CallOwner::Method {
+                    class: c.name.clone(),
+                    method: m.f.name.clone(),
+                },
                 Cctx::Method(c, m.self_kind),
                 &mut result,
-            );
+            )?;
         }
         // A destructor's body is verified like any other: its statements
         // owe their own obligations. What it does *not* owe is the class
         // invariant at exit (ADR 0029).
-        if let Some(body) = &c.deinit {
-            if !body.is_empty() {
-                let synth = Fn {
-                    is_pub: false,
-                    extern_info: None,
-                    name: "deinit".to_string(),
-                    name_span: c.name_span,
-                    type_params: Vec::new(),
-                    type_bounds: Vec::new(),
-                    requires: Vec::new(),
-                    proof_reuse: ProofReuse::None,
-                    params: Vec::new(),
-                    ret: Ty::Unit,
-                    pres: Vec::new(),
-                    posts: Vec::new(),
-                    variant: None,
-                    body: body.clone(),
-                    span: c.span,
-                };
-                deinit_fns.push((synth, c));
-            }
+        if let Some(synth) = synthesized_deinit(c) {
+            deinit_fns.push((synth, c));
         }
     }
     for (f, c) in &deinit_fns {
         run_one(
             f,
             format!("{}::deinit", c.name),
+            CallOwner::Deinitializer {
+                class: c.name.clone(),
+            },
             Cctx::Deinit(c),
             &mut result,
-        );
+        )?;
     }
     // A type the preflight should have refused reached a helper with no error
     // channel. Fail here rather than publish a theorem naming a Lean type that
@@ -2495,6 +2833,17 @@ enum LenFact {
     Skip,
 }
 
+/// Which checked call boundary is asking for a result state.
+///
+/// Ordinary functions transport records and owned arrays. Member calls have
+/// not admitted those two result shapes yet, so the shared result dispatcher
+/// keeps their defensive VC refusal until the checker boundary moves with it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallResultSite {
+    Function,
+    Member,
+}
+
 #[derive(Debug, Clone)]
 enum Val {
     Int(String),
@@ -2516,10 +2865,152 @@ enum Val {
     Unit,
 }
 
+impl Val {
+    /// The Lean term stored in the symbolic environment for place write-back.
+    fn writeback_term(&self) -> Option<String> {
+        match self {
+            Val::Int(term)
+            | Val::Opt(term)
+            | Val::Arr(term)
+            | Val::Obj(term)
+            | Val::Record(term)
+            | Val::View(term)
+            | Val::Ptr(term) => Some(term.clone()),
+            Val::Prop(proposition) => Some(lean_bool_value(proposition)),
+            Val::Unit => None,
+        }
+    }
+}
+
+/// Exhaustive VC-side view of the element carried by an owned or borrowed
+/// array.  This is intentionally local to the trusted generator: a new `Ty`
+/// or loan mode must receive an explicit symbolic-array decision before the
+/// generator compiles.
+fn checked_array_payload(ty: &Ty) -> Option<&Ty> {
+    match ty {
+        Ty::Array(element) => Some(element),
+        Ty::Borrow(Mutability::Shared, referent) | Ty::Borrow(Mutability::Mut, referent) => {
+            match referent.as_ref() {
+                Ty::Array(element) => Some(element),
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Class(_)
+                | Ty::Record(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit => None,
+            }
+        }
+        Ty::Int(_)
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Unit => None,
+    }
+}
+
+/// Convert one evaluated array element to its Lean term.  Both axes are
+/// exhaustive instead of ending a `(Ty, Val)` product match in a wildcard;
+/// extending either semantic enum therefore forces a compiler error here.
+fn checked_array_payload_value(
+    payload: &Ty,
+    evaluated: Val,
+    unsupported: impl std::ops::Fn(&Ty) -> String,
+) -> String {
+    let reject = |payload: &Ty| {
+        refuse_vc_type(unsupported(payload));
+        UNSUPPORTED_LEAN_VALUE.to_string()
+    };
+    match payload {
+        Ty::Bool => match evaluated {
+            Val::Prop(proposition) => lean_bool_value(&proposition),
+            Val::Int(_)
+            | Val::Opt(_)
+            | Val::Arr(_)
+            | Val::Obj(_)
+            | Val::Record(_)
+            | Val::View(_)
+            | Val::Ptr(_)
+            | Val::Unit => reject(payload),
+        },
+        Ty::Int(_) | Ty::Param(_) => match evaluated {
+            Val::Int(value) => value,
+            Val::Prop(_)
+            | Val::Opt(_)
+            | Val::Arr(_)
+            | Val::Obj(_)
+            | Val::Record(_)
+            | Val::View(_)
+            | Val::Ptr(_)
+            | Val::Unit => reject(payload),
+        },
+        Ty::Record(_) => match evaluated {
+            Val::Record(value) => value,
+            Val::Int(_)
+            | Val::Prop(_)
+            | Val::Opt(_)
+            | Val::Arr(_)
+            | Val::Obj(_)
+            | Val::View(_)
+            | Val::Ptr(_)
+            | Val::Unit => reject(payload),
+        },
+        Ty::Class(_)
+        | Ty::Array(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => reject(payload),
+    }
+}
+
+/// A typed dead-end value for a latched internal refusal. The generator never
+/// publishes it: [`generate`] returns the refusal instead. Keeping the shape
+/// aligned with the checked expression prevents a failed trap-site lookup
+/// from cascading into an unrelated pattern-match panic on the way out.
+fn refused_expression_value(expression: &Expr) -> Val {
+    match expression.ty.as_ref().map(Ty::referent) {
+        Some(Ty::Int(_) | Ty::Param(_)) => Val::Int(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Bool) => Val::Prop("False".into()),
+        Some(Ty::Option(_) | Ty::OptionRaw(_)) => Val::Opt(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Array(_)) => Val::Arr(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Class(_)) => Val::Obj(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Record(_)) => Val::Record(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Res(_)) => Val::View(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Raw(_) | Ty::RawRecord(_)) => Val::Ptr(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Borrow(..) | Ty::Unit) | None => Val::Unit,
+    }
+}
+
 #[derive(Clone)]
 enum Tail<'a> {
     FnEnd,
+    /// The end of a lexical branch arm. Falling through consumes the exact
+    /// checked scope route before symbolic execution resumes in the parent
+    /// scope. Keeping the continuation explicit prevents an arm local from
+    /// leaking into `rest` when paths are flattened for symbolic execution.
+    Scope {
+        normal_exit: Option<ExitRoute>,
+        rest: Vec<&'a Stmt>,
+        parent_scope: ScopeId,
+        outer: Box<Tail<'a>>,
+    },
     Loop {
+        backedge: Option<ExitRoute>,
         invariants: &'a [Clause],
         variant: &'a Clause,
         v0: String,
@@ -2528,11 +3019,14 @@ enum Tail<'a> {
     /// array is reconstructed, which is why an exposure body may not
     /// `return`: leaving any other way would skip the reconstruction.
     Expose {
-        array: &'a str,
-        res: &'a str,
-        ptr: &'a str,
+        body_exit: ExitRoute,
+        close: ExitRoute,
+        parent_scope: ScopeId,
+        array: String,
+        res: String,
         mutable: bool,
         kw_span: Span,
+        release_loan: Place,
         loan: String,
         entry_arr: String,
         rest: Vec<&'a Stmt>,
@@ -2544,10 +3038,41 @@ struct Generator<'a> {
     f: &'a Fn,
     /// Display name for obligations: `f` or `Class::member`.
     fname: String,
+    /// Flavor-preserving identity for the checker-authored call handoff.
+    call_owner: CallOwner,
     cctx: Cctx<'a>,
+    /// The checker-sealed lexical plan for this exact semantic owner.
+    /// Symbolic execution consumes its branch, loop, exposure, and return
+    /// routes and direct source trap sites; missing/aliased body,
+    /// parent-scope, or trap identities fail before a path can mutate proof
+    /// state.
+    control: Option<&'a ControlBody>,
     classes: &'a [ClassDecl],
     records: &'a [RecordDecl],
     sigs: &'a HashMap<String, FnSig>,
+    ownership: &'a CheckedOwnershipPlan,
+    /// Checked call sites reached by at least one symbolic path. The facts
+    /// themselves remain immutable: a join can make the same source call
+    /// execute once per incoming symbolic path.
+    visited_checked_calls: HashSet<CallSiteKey>,
+    /// Deterministic DFS visit ordinal for each source call. Each visit
+    /// performs a distinct havoc and therefore receives a distinct fixed
+    /// transition certificate.
+    checked_call_visits: HashMap<CallSiteKey, usize>,
+    /// Checker-authored non-call ownership effects reached by at least one
+    /// symbolic path. Like calls, the records are immutable and may be
+    /// revisited after a path split; this set proves per-body coverage.
+    visited_option_takes: HashSet<EffectSiteKey>,
+    visited_exposures: HashSet<EffectSiteKey>,
+    visited_sealed_operations: HashSet<EffectSiteKey>,
+    visited_loops: HashSet<EffectSiteKey>,
+    visited_value_transfers: HashSet<crate::ownership::ValueTransferKey>,
+    /// Retained cleanup actions reached by at least one symbolic path. A set
+    /// (rather than destructive consumption) deliberately permits the same
+    /// source action to be revisited after a symbolic branch split.
+    visited_assignments: HashSet<(ScopeId, Span)>,
+    visited_field_assignments: HashSet<(ScopeId, Span)>,
+    visited_temporary_drops: HashSet<(ScopeId, Span)>,
     fn_map: &'a HashMap<&'a str, &'a Fn>,
     class_map: &'a HashMap<&'a str, &'a ClassDecl>,
     source: &'a str,
@@ -3022,6 +3547,1416 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Bind one call result and return its symbolic value.
+    ///
+    /// Free and member calls used to carry four parallel `Ty` case lists:
+    /// two that chose the Lean binder/facts and two that reconstructed the
+    /// corresponding [`Val`]. Keeping those lists synchronized is a semantic
+    /// requirement, not presentation, so the answer lives in one exhaustive
+    /// dispatch. Option payload facts remain at each caller after user posts;
+    /// a match-shaped post must not capture their motive (ADR 0074).
+    fn bind_call_result(&mut self, ty: &Ty, binder: &str, site: CallResultSite) -> Val {
+        let base = binder.trim_start_matches('_').to_string();
+        match ty {
+            ty @ (Ty::Int(_) | Ty::Param(_)) => {
+                self.binders.push((binder.to_string(), "Int".into()));
+                self.push_hyp_unique(
+                    format!("h_{base}_range"),
+                    self.r_prop(binder, adr0009_ty_int_model(ty.clone())),
+                );
+                Val::Int(binder.to_string())
+            }
+            Ty::Bool => {
+                // A call result is the logic's proposition `result`; other
+                // fresh Boolean program states are `Bool` binders read as a
+                // proposition. This is why call results do not simply use
+                // `fresh_state_for` (ADR 0074).
+                self.binders.push((binder.to_string(), "Prop".into()));
+                Val::Prop(binder.to_string())
+            }
+            Ty::Option(element) => {
+                self.binders
+                    .push((binder.to_string(), lean_option_ty(element, self.classes)));
+                Val::Opt(binder.to_string())
+            }
+            Ty::OptionRaw(_) => {
+                self.binders
+                    .push((binder.to_string(), "Option Sable.RawPtr".into()));
+                Val::Opt(binder.to_string())
+            }
+            Ty::Class(ci) => {
+                let class = self.classes[*ci].clone();
+                self.binders
+                    .push((binder.to_string(), lean_class_name(&class.name)));
+                self.push_class_state_facts(&class, binder);
+                self.push_invariant_hyps(&class, binder);
+                Val::Obj(binder.to_string())
+            }
+            Ty::Record(ri) if site == CallResultSite::Function => {
+                let record = lean_record_name(&self.records[*ri].name);
+                self.binders.push((binder.to_string(), record.clone()));
+                self.push_hyp_unique(format!("h_{base}_wf"), format!("{record}.wf {binder}"));
+                Val::Record(binder.to_string())
+            }
+            Ty::Array(_) if site == CallResultSite::Function => {
+                // A return names fresh storage, not a mutation of a prior
+                // chain, so it gets a representability bound rather than an
+                // equality length fact (ADR 0085).
+                self.fresh_state_for(ty, binder, &base, LenFact::Bounded)
+            }
+            Ty::Res(kind) => {
+                self.binders
+                    .push((binder.to_string(), lean_res_view_ty(*kind, self.records)));
+                for (name, prop) in view_wf_hyps(*kind, binder, binder, self.records) {
+                    self.push_hyp_unique(name, prop);
+                }
+                Val::View(binder.to_string())
+            }
+            Ty::Raw(_) | Ty::RawRecord(_) => {
+                self.binders
+                    .push((binder.to_string(), "Sable.RawPtr".into()));
+                Val::Ptr(binder.to_string())
+            }
+            Ty::Unit => Val::Unit,
+            returned @ (Ty::Record(_) | Ty::Array(_) | Ty::Borrow(..)) => {
+                // Records/arrays arrive here only at a member boundary; a
+                // borrow has no result-state story at either boundary. The
+                // checker refuses all three first, and this latch keeps the
+                // trusted generator fail-closed if that gate drifts.
+                refuse_vc_type(format!(
+                    "internal.vcgen.call_return_unsupported: `{}` has no call-result state",
+                    returned.name()
+                ));
+                self.binders
+                    .push((binder.to_string(), UNSUPPORTED_LEAN_TY.into()));
+                Val::Int(binder.to_string())
+            }
+        }
+    }
+
+    /// Validate and visit the checker-authored record for this exact call
+    /// boundary.
+    ///
+    /// The lookup deliberately happens at the boundary where havoc used to
+    /// decode the arguments, after nested arguments have been evaluated. This
+    /// preserves source evaluation order while making the checker the only
+    /// authority for which place a unique borrow names.
+    fn checked_call(
+        &mut self,
+        target: CallTarget,
+        span: Span,
+        params: &[Param],
+        args: &[Expr],
+        expected_receiver: Option<(&str, Place, Mutability, Span, Ty)>,
+    ) -> (CheckedCallTransition, usize) {
+        let key = CallSiteKey {
+            owner: self.call_owner.clone(),
+            span,
+            target,
+        };
+        let empty = || CheckedCallTransition {
+            key: key.clone(),
+            receiver: None,
+            arguments: Vec::new(),
+        };
+
+        let Some(call) = self.ownership.calls.get(&key).cloned() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.call_transition_missing: no checked effect for {} at {}..{} inside {}",
+                key.target.render(),
+                span.start,
+                span.end,
+                self.call_owner.render()
+            ));
+            return (empty(), 0);
+        };
+
+        let mismatch = if call.key != key {
+            Some("the stored record carries a different call-site key".to_string())
+        } else if args.len() != params.len() {
+            Some(format!(
+                "the checked signature has {} parameter(s), but the AST has {} argument(s)",
+                params.len(),
+                args.len()
+            ))
+        } else if call.arguments.len() != params.len() {
+            Some(format!(
+                "the signature has {} parameter(s), but the checker supplied {} argument effect(s)",
+                params.len(),
+                call.arguments.len()
+            ))
+        } else {
+            let receiver_mismatch = match (&call.receiver, &expected_receiver) {
+                (None, None) => None,
+                (Some(_actual_receiver), None) => {
+                    Some("the checker supplied an unexpected method receiver".into())
+                }
+                (None, Some(_expected_receiver)) => {
+                    Some("the checked method call has no receiver effect".into())
+                }
+                (Some(actual), Some((class, place, mutability, receiver_span, referent))) => {
+                    let expected_effect = match mutability {
+                        Mutability::Shared => CallEffect::SharedLoan,
+                        Mutability::Mut => CallEffect::HavocUniqueBorrow,
+                    };
+                    if actual.class != *class {
+                        Some(format!(
+                            "receiver effect names class `{}`, expected `{class}`",
+                            actual.class
+                        ))
+                    } else if actual.transition.place != *place {
+                        Some(format!(
+                            "receiver effect names `{}`, expected `{}`",
+                            actual.transition.place.render(),
+                            place.render()
+                        ))
+                    } else if actual.transition.referent != *referent {
+                        Some(format!(
+                            "receiver effect has referent `{}`, expected `{}`",
+                            actual.transition.referent.name(),
+                            referent.name()
+                        ))
+                    } else if actual.transition.effect != expected_effect {
+                        Some("receiver effect has the wrong mutability".into())
+                    } else if actual.transition.span != *receiver_span {
+                        Some(format!(
+                            "receiver effect has span {}..{}, expected {}..{}",
+                            actual.transition.span.start,
+                            actual.transition.span.end,
+                            receiver_span.start,
+                            receiver_span.end
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            };
+            receiver_mismatch.or_else(|| {
+                call.arguments.iter().zip(params.iter().zip(args)).enumerate().find_map(
+                |(index, (actual, (parameter, argument)))| {
+                    if actual.parameter_index != index {
+                        Some(format!(
+                            "effect {} names parameter index {}, expected {}",
+                            actual.parameter, actual.parameter_index, index
+                        ))
+                    } else if actual.parameter != parameter.name {
+                        Some(format!(
+                            "effect at index {index} names parameter `{}`, expected `{}`",
+                            actual.parameter, parameter.name
+                        ))
+                    } else if actual.parameter_ty != parameter.ty {
+                        Some(format!(
+                            "effect for `{}` has parameter type `{}`, expected `{}`",
+                            parameter.name,
+                            actual.parameter_ty.name(),
+                            parameter.ty.name()
+                        ))
+                    } else if actual.argument_span != argument.span {
+                        Some(format!(
+                            "effect for `{}` has argument span {}..{}, expected {}..{}",
+                            parameter.name,
+                            actual.argument_span.start,
+                            actual.argument_span.end,
+                            argument.span.start,
+                            argument.span.end
+                        ))
+                    } else {
+                        match (&parameter.ty, &actual.effect) {
+                            (Ty::Borrow(mutability, referent), CallArgumentEffect::Loan(loan)) => {
+                                let expected_place = BorrowedPlace::from_expr(argument)
+                                    .map(BorrowedPlace::into_place)
+                                    .or_else(|| Place::from_value_expr(argument));
+                                let expected_effect = match mutability {
+                                    Mutability::Shared => CallEffect::SharedLoan,
+                                    Mutability::Mut => CallEffect::HavocUniqueBorrow,
+                                };
+                                if expected_place.as_ref() != Some(&loan.place) {
+                                    Some(format!(
+                                        "loan for `{}` names a different place",
+                                        parameter.name
+                                    ))
+                                } else if loan.referent != **referent {
+                                    Some(format!(
+                                        "loan for `{}` has referent `{}`, expected `{}`",
+                                        parameter.name,
+                                        loan.referent.name(),
+                                        referent.name()
+                                    ))
+                                } else if loan.effect != expected_effect {
+                                    Some(format!("loan for `{}` has the wrong mutability", parameter.name))
+                                } else if loan.span != argument.span {
+                                    Some(format!("loan for `{}` has the wrong source span", parameter.name))
+                                } else {
+                                    None
+                                }
+                            }
+                            (Ty::Borrow(..), CallArgumentEffect::Value(_value)) => Some(format!(
+                                "borrowed parameter `{}` was recorded as a value transfer",
+                                parameter.name
+                            )),
+                            (Ty::Int(_)
+                            | Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Class(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Res(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Unit, CallArgumentEffect::Loan(_)) => Some(format!(
+                                "by-value parameter `{}` was recorded as a loan",
+                                parameter.name
+                            )),
+                            (Ty::Int(_)
+                            | Ty::Bool
+                            | Ty::Param(_)
+                            | Ty::Class(_)
+                            | Ty::Record(_)
+                            | Ty::Array(_)
+                            | Ty::Option(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Res(_)
+                            | Ty::Raw(_)
+                            | Ty::RawRecord(_)
+                            | Ty::Unit, CallArgumentEffect::Value(value)) => {
+                                let expected_source = Place::from_value_expr(argument);
+                                let expected_kind = if parameter.ty.is_affine() {
+                                    if expected_source.is_some() {
+                                        ValueTransferKind::Move
+                                    } else {
+                                        ValueTransferKind::Fresh
+                                    }
+                                } else {
+                                    ValueTransferKind::Copy
+                                };
+                                if value.value_ty != parameter.ty || value.span != argument.span {
+                                    Some(format!(
+                                        "value transfer for `{}` disagrees with its checked type or span",
+                                        parameter.name
+                                    ))
+                                } else if value.source != expected_source
+                                    || value.kind != expected_kind
+                                {
+                                    Some(format!(
+                                        "value transfer for `{}` names a different source or transfer kind",
+                                        parameter.name
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+            })
+        };
+        if let Some(detail) = mismatch {
+            refuse_vc_type(format!(
+                "internal.vcgen.call_transition_mismatch: {} at {}..{} inside {}: {detail}",
+                key.target.render(),
+                span.start,
+                span.end,
+                self.call_owner.render()
+            ));
+            return (empty(), 0);
+        }
+        self.visited_checked_calls.insert(key.clone());
+        let visit = self.checked_call_visits.entry(key).or_default();
+        *visit += 1;
+        (call, *visit)
+    }
+
+    /// Validate the checker-authored ownership transition for one affine
+    /// option extraction. The record remains immutable so a symbolic path
+    /// split may revisit the source expression; coverage is at least once.
+    fn checked_option_take(
+        &mut self,
+        expression: &Expr,
+        option: &str,
+        source_span: Span,
+    ) -> CheckedOptionTake {
+        let key = EffectSiteKey {
+            owner: self.call_owner.clone(),
+            span: expression.span,
+        };
+        let expected_source = Place::local(option);
+        let expected_payload = expression.ty.clone().unwrap_or(Ty::Unit);
+        let fallback = || CheckedOptionTake {
+            key: key.clone(),
+            source: expected_source.clone(),
+            source_span,
+            payload: expected_payload.clone(),
+        };
+        let Some(effect) = self.ownership.option_take(&key).cloned() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.option_take_missing: no checked ownership effect at {}..{} inside {}",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return fallback();
+        };
+        let mismatch = if effect.key != key {
+            Some("the stored record carries a different effect-site key")
+        } else if effect.source != expected_source {
+            Some("the stored record names a different option place")
+        } else if effect.source_span != source_span {
+            Some("the stored record carries a different source span")
+        } else if effect.payload != expected_payload {
+            Some("the stored record carries a different payload type")
+        } else {
+            None
+        };
+        if let Some(detail) = mismatch {
+            refuse_vc_type(format!(
+                "internal.vcgen.option_take_mismatch: checked ownership effect at {}..{} inside {}: {detail}",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return fallback();
+        }
+        self.visited_option_takes.insert(key);
+        effect
+    }
+
+    /// Validate the checker-authored exposure boundary before opening its
+    /// symbolic loan. Exact binder/type matching prevents a forged typed AST
+    /// from redirecting the checker's ownership fact to different storage.
+    fn checked_exposure(
+        &mut self,
+        key: &EffectSiteKey,
+        owner_place: &Place,
+        array_span: Span,
+        owner_ty: &Ty,
+        mutability: Mutability,
+        pointer: &str,
+        pointer_span: Span,
+        resource: &str,
+        resource_span: Span,
+    ) -> Option<CheckedExposure> {
+        let Some(effect) = self.ownership.exposure(key).cloned() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.exposure_missing: no checked ownership effect at {}..{} inside {}",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        };
+        let mismatch = if effect.key != *key {
+            Some("the stored record carries a different effect-site key")
+        } else if effect.owner_place != *owner_place {
+            Some("the stored record names a different exposed place")
+        } else if effect.owner_span != array_span {
+            Some("the stored record carries a different owner span")
+        } else if effect.owner_ty != *owner_ty {
+            Some("the stored record carries a different owner type")
+        } else if effect.mutability != mutability {
+            Some("the stored record carries a different exposure mutability")
+        } else if effect.pointer != pointer || effect.pointer_span != pointer_span {
+            Some("the stored record carries a different pointer binding")
+        } else if effect.resource != resource || effect.resource_span != resource_span {
+            Some("the stored record carries a different resource binding")
+        } else {
+            None
+        };
+        if let Some(detail) = mismatch {
+            refuse_vc_type(format!(
+                "internal.vcgen.exposure_mismatch: checked ownership effect at {}..{} inside {}: {detail}",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        }
+        self.visited_exposures.insert(key.clone());
+        Some(effect)
+    }
+
+    /// Validate and visit one checker-authored sealed-operation boundary.
+    /// Child expressions are evaluated before this lookup by each family arm;
+    /// the returned record is the only proof-state authority for loan places,
+    /// resource roles, and the resolved result shape.
+    fn checked_sealed_operation(
+        &mut self,
+        target: CheckedSealedTarget,
+        expression: &Expr,
+        arguments: &[Expr],
+    ) -> CheckedSealedOperation {
+        let key = EffectSiteKey {
+            owner: self.call_owner.clone(),
+            span: expression.span,
+        };
+        let expected_result = expression.ty.clone().unwrap_or(Ty::Unit);
+        let fallback = || CheckedSealedOperation {
+            key: key.clone(),
+            target,
+            arguments: arguments
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    let argument_ty = argument.ty.clone().unwrap_or(Ty::Unit);
+                    CheckedSealedArgument {
+                        index,
+                        argument_ty: argument_ty.clone(),
+                        argument_span: argument.span,
+                        // A missing/mismatched checked record has already
+                        // latched a fatal refusal. Keep walking with an inert
+                        // placeholder so downstream arms cannot accidentally
+                        // recover ownership facts from source syntax.
+                        effect: CallArgumentEffect::Value(ValueTransfer {
+                            source: None,
+                            value_ty: argument_ty,
+                            kind: ValueTransferKind::Copy,
+                            carried_obligation: false,
+                            branded: false,
+                            span: argument.span,
+                        }),
+                    }
+                })
+                .collect(),
+            result_ty: expected_result.clone(),
+        };
+        let Some(operation) = self.ownership.sealed_operation(&key).cloned() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.sealed_transition_missing: no checked `{}` effect at {}..{} inside {}",
+                target.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return fallback();
+        };
+        let mismatch = if operation.key != key {
+            Some("the stored record carries a different effect-site key".to_string())
+        } else if operation.target != target {
+            Some(format!(
+                "the stored target is `{}`, expected `{}`",
+                operation.target.render(),
+                target.render()
+            ))
+        } else if operation.result_ty != expected_result {
+            Some("the stored record carries a different result type".to_string())
+        } else if operation.arguments.len() != arguments.len() {
+            Some(format!(
+                "the checker supplied {} argument effect(s), but the AST has {} argument(s)",
+                operation.arguments.len(),
+                arguments.len()
+            ))
+        } else {
+            operation
+                .arguments
+                .iter()
+                .zip(arguments)
+                .enumerate()
+                .find_map(|(index, (actual, argument))| {
+                    let expected_ty = argument.ty.clone().unwrap_or(Ty::Unit);
+                    if actual.index != index {
+                        Some(format!(
+                            "effect at position {index} names argument index {}",
+                            actual.index
+                        ))
+                    } else if actual.argument_ty != expected_ty {
+                        Some(format!("argument {index} has a different checked type"))
+                    } else if actual.argument_span != argument.span {
+                        Some(format!("argument {index} has a different checked span"))
+                    } else {
+                        match (&expected_ty, &actual.effect) {
+                            (Ty::Borrow(mutability, referent), CallArgumentEffect::Loan(loan)) => {
+                                let expected_place = BorrowedPlace::from_expr(argument)
+                                    .map(BorrowedPlace::into_place);
+                                let expected_effect = match mutability {
+                                    Mutability::Shared => CallEffect::SharedLoan,
+                                    Mutability::Mut => CallEffect::HavocUniqueBorrow,
+                                };
+                                if expected_place.as_ref() != Some(&loan.place) {
+                                    Some(format!("loan argument {index} names a different place"))
+                                } else if loan.referent != **referent {
+                                    Some(format!(
+                                        "loan argument {index} has a different referent type"
+                                    ))
+                                } else if loan.effect != expected_effect {
+                                    Some(format!("loan argument {index} has the wrong mutability"))
+                                } else if loan.span != argument.span {
+                                    Some(format!("loan argument {index} has a different span"))
+                                } else {
+                                    None
+                                }
+                            }
+                            (Ty::Borrow(..), CallArgumentEffect::Value(_value)) => Some(format!(
+                                "borrowed argument {index} was recorded as a value transfer"
+                            )),
+                            (
+                                Ty::Int(_)
+                                | Ty::Bool
+                                | Ty::Param(_)
+                                | Ty::Class(_)
+                                | Ty::Record(_)
+                                | Ty::Array(_)
+                                | Ty::Option(_)
+                                | Ty::OptionRaw(_)
+                                | Ty::Res(_)
+                                | Ty::Raw(_)
+                                | Ty::RawRecord(_)
+                                | Ty::Unit,
+                                CallArgumentEffect::Loan(_),
+                            ) => Some(format!("by-value argument {index} was recorded as a loan")),
+                            (
+                                Ty::Int(_)
+                                | Ty::Bool
+                                | Ty::Param(_)
+                                | Ty::Class(_)
+                                | Ty::Record(_)
+                                | Ty::Array(_)
+                                | Ty::Option(_)
+                                | Ty::OptionRaw(_)
+                                | Ty::Res(_)
+                                | Ty::Raw(_)
+                                | Ty::RawRecord(_)
+                                | Ty::Unit,
+                                CallArgumentEffect::Value(value),
+                            ) => {
+                                let expected_source = Place::from_value_expr(argument);
+                                let expected_kind = if expected_ty.is_affine() {
+                                    if expected_source.is_some() {
+                                        ValueTransferKind::Move
+                                    } else {
+                                        ValueTransferKind::Fresh
+                                    }
+                                } else {
+                                    ValueTransferKind::Copy
+                                };
+                                if value.value_ty != expected_ty || value.span != argument.span {
+                                    Some(format!(
+                                        "value argument {index} has a different type or span"
+                                    ))
+                                } else if value.source != expected_source
+                                    || value.kind != expected_kind
+                                {
+                                    Some(format!(
+                                        "value argument {index} has a different transfer identity"
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    }
+                })
+        };
+        if let Some(detail) = mismatch {
+            refuse_vc_type(format!(
+                "internal.vcgen.sealed_transition_mismatch: checked `{}` effect at {}..{} inside {}: {detail}",
+                target.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return fallback();
+        }
+        self.visited_sealed_operations.insert(key);
+        operation
+    }
+
+    /// Exact immutable lookup of the mutation set the checker computed for
+    /// one loop transition. Symbolic revisits are allowed, but every checked
+    /// loop in a verified body must be reached at least once.
+    fn checked_loop_effects(
+        &mut self,
+        key: &EffectSiteKey,
+        condition_span: Span,
+    ) -> Option<CheckedLoopEffects> {
+        let Some(effects) = self.ownership.loop_effects(key).cloned() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.loop_effect_missing: no checked loop effect at {}..{} inside {}",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        };
+        let mismatch = if effects.key != *key {
+            Some("the stored record carries a different effect-site key")
+        } else if effects.condition_span != condition_span {
+            Some("the stored record carries a different condition span")
+        } else if effects.mutations.iter().any(|mutation| match mutation {
+            CheckedMutation::UniqueLoan(transition) => {
+                transition.effect != CallEffect::HavocUniqueBorrow
+            }
+            CheckedMutation::DirectWrite { .. }
+            | CheckedMutation::OptionTake { .. }
+            | CheckedMutation::ExposureRebuild { .. } => false,
+        }) {
+            Some("the stored mutation set contains a non-unique loan")
+        } else {
+            None
+        };
+        if let Some(detail) = mismatch {
+            refuse_vc_type(format!(
+                "internal.vcgen.loop_effect_mismatch: checked loop effect at {}..{} inside {}: {detail}",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        }
+        self.visited_loops.insert(key.clone());
+        Some(effects)
+    }
+
+    /// Consume one retained local replacement action before evaluating its
+    /// RHS. Symbolic destruction has no separate heap effect in the VC model,
+    /// but it is not omitted structurally: the exact old drop candidate and
+    /// staging temporary are authenticated here before the later environment
+    /// update forgets the previous symbolic value.
+    fn checked_assignment_action(
+        &mut self,
+        scope: ScopeId,
+        span: Span,
+        destination: &Place,
+        value: &Expr,
+    ) -> Option<AssignmentAction> {
+        let action = {
+            let plan = self.control_plan()?;
+            let action = match plan.assignment(scope, span, destination) {
+                Ok(action) => action,
+                Err(error) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.assignment_action_missing: {} at {}..{} inside {}",
+                        error.message,
+                        error.span.start,
+                        error.span.end,
+                        self.call_owner.render()
+                    ));
+                    return None;
+                }
+            };
+            let Some(value_ty) = value.ty.as_ref() else {
+                refuse_vc_type(format!(
+                    "internal.vcgen.assignment_action_mismatch: assignment at {}..{} inside {} has no checked RHS type",
+                    span.start,
+                    span.end,
+                    self.call_owner.render()
+                ));
+                return None;
+            };
+            let expected_previous = plan
+                .candidate_for_place(destination)
+                .map(|candidate| candidate.id());
+            let expected_key = ValueTransferKey {
+                owner: self.call_owner.clone(),
+                span: value.span,
+                sink: ValueTransferSink::Assignment(destination.clone()),
+            };
+            let expected_staging = match expected_previous {
+                Some(_) => {
+                    let temporary = match plan.compiler_temp(
+                        scope,
+                        span,
+                        CompilerTempKind::AssignmentValue,
+                    ) {
+                        Ok(temporary) => temporary.clone(),
+                        Err(error) => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.assignment_action_mismatch: {} at {}..{} inside {}",
+                                error.message,
+                                error.span.start,
+                                error.span.end,
+                                self.call_owner.render()
+                            ));
+                            return None;
+                        }
+                    };
+                    AssignmentStaging::Temporary(temporary)
+                }
+                None => AssignmentStaging::Direct,
+            };
+            let binding_ty = self.var_tys.get(destination.root());
+            if action.scope() != scope
+                || action.span() != span
+                || action.destination() != destination
+                || action.ty() != value_ty
+                || binding_ty != Some(action.ty())
+                || action.transfer_key() != &expected_key
+                || action.previous() != expected_previous
+                || action.staging() != &expected_staging
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.assignment_action_mismatch: retained assignment to `{}` at {}..{} inside {} disagrees with its scope, type, drop candidate, or staging temporary",
+                    destination.render(),
+                    span.start,
+                    span.end,
+                    self.call_owner.render()
+                ));
+                return None;
+            }
+            if let Some(previous) = action.previous() {
+                let candidate = plan.candidate(previous);
+                if candidate.place() != destination || candidate.ty() != action.ty() {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.assignment_action_mismatch: retained assignment to `{}` inside {} names a different cleanup candidate",
+                        destination.render(),
+                        self.call_owner.render()
+                    ));
+                    return None;
+                }
+            }
+            action.clone()
+        };
+        self.visited_assignments.insert((scope, span));
+        Some(action)
+    }
+
+    /// Consume one retained field replacement/install action and its exact
+    /// checker-authored ownership handoff. Constructor first-install and
+    /// method replacement deliberately share this structural rule; dynamic
+    /// field liveness decides whether the authenticated conditional drop has
+    /// an old value to destroy.
+    fn checked_field_assignment_action(
+        &mut self,
+        scope: ScopeId,
+        span: Span,
+        destination: &Place,
+        value: &Expr,
+    ) -> Option<FieldAssignmentAction> {
+        let action = {
+            let plan = self.control_plan()?;
+            let action = match plan.field_assignment(scope, span, destination, value) {
+                Ok(action) => action,
+                Err(error) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.field_assignment_action_missing: {} at {}..{} inside {}",
+                        error.message,
+                        error.span.start,
+                        error.span.end,
+                        self.call_owner.render()
+                    ));
+                    return None;
+                }
+            };
+            let Some(value_ty) = value.ty.as_ref() else {
+                refuse_vc_type(format!(
+                    "internal.vcgen.field_assignment_action_mismatch: field assignment at {}..{} inside {} has no checked RHS type",
+                    span.start,
+                    span.end,
+                    self.call_owner.render()
+                ));
+                return None;
+            };
+            let expected_key = ValueTransferKey {
+                owner: self.call_owner.clone(),
+                span: value.span,
+                sink: ValueTransferSink::FieldAssignment(destination.clone()),
+            };
+            let cleanup_bearing =
+                matches!(value_ty, Ty::Class(_) | Ty::Array(_)) || value_ty.is_affine_option();
+            let expected_staging = if cleanup_bearing {
+                let temporary = match plan.compiler_temp(
+                    scope,
+                    span,
+                    CompilerTempKind::FieldAssignmentValue,
+                ) {
+                    Ok(temporary) => temporary.clone(),
+                    Err(error) => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.field_assignment_action_mismatch: {} at {}..{} inside {}",
+                            error.message,
+                            error.span.start,
+                            error.span.end,
+                            self.call_owner.render()
+                        ));
+                        return None;
+                    }
+                };
+                AssignmentStaging::Temporary(temporary)
+            } else {
+                AssignmentStaging::Direct
+            };
+            let expected_class = if let Ty::Class(class) = value_ty {
+                Some(*class)
+            } else {
+                None
+            };
+            let retained_class = action.class_drop().map(|drop| drop.class());
+            let bad_terminal = action
+                .class_drop()
+                .is_some_and(|drop| drop.terminal_trap_route() != &plan.trap_route());
+            if action.scope() != scope
+                || action.span() != span
+                || action.destination() != destination
+                || action.ty() != value_ty
+                || action.transfer_key() != &expected_key
+                || action.drop_if_present() != cleanup_bearing
+                || action.staging() != &expected_staging
+                || retained_class != expected_class
+                || bad_terminal
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.field_assignment_action_mismatch: retained field assignment to `{}` at {}..{} inside {} disagrees with its type, transfer, staging, conditional drop, or terminal no-unwind class action",
+                    destination.render(),
+                    span.start,
+                    span.end,
+                    self.call_owner.render()
+                ));
+                return None;
+            }
+            action.clone()
+        };
+        self.visited_field_assignments.insert((scope, span));
+        Some(action)
+    }
+
+    /// Consume the mandatory statement-end destruction of one discarded
+    /// fresh class result. The destruction itself is a proof no-op: a fresh
+    /// result has no symbolic place to update, and class destruction has no
+    /// normal-return state. Its type, compiler temporary, transfer identity,
+    /// concrete class, and terminal no-unwind route are nevertheless exact
+    /// retained inputs, validated before expression evaluation.
+    fn checked_temporary_drop_action(
+        &mut self,
+        scope: ScopeId,
+        expression: &Expr,
+    ) -> Option<TemporaryDropAction> {
+        let span = expression.span;
+        let action = {
+            let plan = self.control_plan()?;
+            let action = match plan.temporary_drop(scope, expression) {
+                Ok(action) => action,
+                Err(error) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.temporary_drop_action_missing: {} at {}..{} inside {}",
+                        error.message,
+                        error.span.start,
+                        error.span.end,
+                        self.call_owner.render()
+                    ));
+                    return None;
+                }
+            };
+            let Some(value_ty) = expression.ty.as_ref() else {
+                refuse_vc_type(format!(
+                    "internal.vcgen.temporary_drop_action_mismatch: discarded value at {}..{} inside {} has no checked type",
+                    span.start,
+                    span.end,
+                    self.call_owner.render()
+                ));
+                return None;
+            };
+            let expected_key = ValueTransferKey {
+                owner: self.call_owner.clone(),
+                span,
+                sink: ValueTransferSink::DiscardTemporary,
+            };
+            let expected_temporary =
+                match plan.compiler_temp(scope, span, CompilerTempKind::DiscardedClassValue) {
+                    Ok(temporary) => temporary,
+                    Err(error) => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.temporary_drop_action_mismatch: {} at {}..{} inside {}",
+                            error.message,
+                            error.span.start,
+                            error.span.end,
+                            self.call_owner.render()
+                        ));
+                        return None;
+                    }
+                };
+            let expected_class = if let Ty::Class(class) = value_ty {
+                Some(*class)
+            } else {
+                None
+            };
+            if action.scope() != scope
+                || action.span() != span
+                || action.ty() != value_ty
+                || action.transfer_key() != &expected_key
+                || action.temporary() != expected_temporary
+                || Some(action.class_drop().class()) != expected_class
+                || action.class_drop().terminal_trap_route() != &plan.trap_route()
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.temporary_drop_action_mismatch: retained discarded value at {}..{} inside {} disagrees with its class type, transfer, compiler temporary, or terminal no-unwind action",
+                    span.start,
+                    span.end,
+                    self.call_owner.render()
+                ));
+                return None;
+            }
+            action.clone()
+        };
+        self.visited_temporary_drops.insert((scope, span));
+        Some(action)
+    }
+
+    /// Validate a checker-authored value transfer at a non-call sink. The
+    /// flow-sensitive obligation/brand payload is intentionally consumed as
+    /// data rather than recomputed; only structural identity can be checked
+    /// against the typed expression here.
+    fn checked_value_transfer(
+        &mut self,
+        expression: &Expr,
+        sink: ValueTransferSink,
+    ) -> ValueTransfer {
+        let key = ValueTransferKey {
+            owner: self.call_owner.clone(),
+            span: expression.span,
+            sink,
+        };
+        self.checked_value_transfer_key(expression, &key)
+    }
+
+    /// Consume a transfer through a cleanup action's retained identity. This
+    /// prevents the VC path from independently selecting a field/discard sink
+    /// after the control plan has already sealed that semantic boundary.
+    fn checked_value_transfer_key(
+        &mut self,
+        expression: &Expr,
+        key: &ValueTransferKey,
+    ) -> ValueTransfer {
+        let expected_ty = expression.ty.clone().unwrap_or(Ty::Unit);
+        let expected_source = Place::from_value_expr(expression);
+        let expected_kind = if expected_ty.is_affine() {
+            if expected_source.is_some() {
+                ValueTransferKind::Move
+            } else {
+                ValueTransferKind::Fresh
+            }
+        } else {
+            ValueTransferKind::Copy
+        };
+        let fallback = || ValueTransfer {
+            source: expected_source.clone(),
+            value_ty: expected_ty.clone(),
+            kind: expected_kind,
+            carried_obligation: false,
+            branded: false,
+            span: expression.span,
+        };
+        if key.owner != self.call_owner || key.span != expression.span {
+            refuse_vc_type(format!(
+                "internal.vcgen.value_transfer_key_mismatch: retained transfer for {} at {}..{} does not identify this expression inside {}",
+                key.sink.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return fallback();
+        }
+        let Some(transfer) = self.ownership.value_transfer(key).cloned() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.value_transfer_missing: no checked value transfer for {} at {}..{} inside {}",
+                key.sink.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return fallback();
+        };
+        if transfer.value_ty != expected_ty
+            || transfer.source != expected_source
+            || transfer.kind != expected_kind
+            || transfer.span != expression.span
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.value_transfer_mismatch: checked value transfer for {} at {}..{} inside {} disagrees with the typed expression",
+                key.sink.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return fallback();
+        }
+        self.visited_value_transfers.insert(key.clone());
+        transfer
+    }
+
+    /// Every checker record for a verified callable must be visited by at
+    /// least one path in the corresponding symbolic walk. Tests, externs, and
+    /// proof-reuse bodies do not construct a `Generator`, so their
+    /// intentionally skipped records are outside this per-callable assertion.
+    fn finish_checked_ownership(&self) {
+        if let Some((key, _)) = self
+            .ownership
+            .calls
+            .for_owner(&self.call_owner)
+            .filter(|(key, _)| !self.visited_checked_calls.contains(*key))
+            .min_by_key(|(key, _)| (key.span.start, key.span.end, key.target.render()))
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.call_transition_unvisited: checked effect for {} at {}..{} inside {} was not visited",
+                key.target.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+        }
+        if let Some((key, _)) = self
+            .ownership
+            .option_takes_for_owner(&self.call_owner)
+            .filter(|(key, _)| !self.visited_option_takes.contains(*key))
+            .min_by_key(|(key, _)| (key.span.start, key.span.end))
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.option_take_unvisited: checked ownership effect at {}..{} inside {} was not visited",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+        }
+        if let Some((key, _)) = self
+            .ownership
+            .exposures_for_owner(&self.call_owner)
+            .filter(|(key, _)| !self.visited_exposures.contains(*key))
+            .min_by_key(|(key, _)| (key.span.start, key.span.end))
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.exposure_unvisited: checked ownership effect at {}..{} inside {} was not visited",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+        }
+        if let Some((key, operation)) = self
+            .ownership
+            .sealed_operations_for_owner(&self.call_owner)
+            .filter(|(key, _)| !self.visited_sealed_operations.contains(*key))
+            .min_by_key(|(key, operation)| {
+                (key.span.start, key.span.end, operation.target.render())
+            })
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.sealed_transition_unvisited: checked `{}` effect at {}..{} inside {} was not visited",
+                operation.target.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+        }
+        if let Some((key, _)) = self
+            .ownership
+            .loops_for_owner(&self.call_owner)
+            .filter(|(key, _)| !self.visited_loops.contains(*key))
+            .min_by_key(|(key, _)| (key.span.start, key.span.end))
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.loop_effect_unvisited: checked loop effect at {}..{} inside {} was not visited",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+        }
+        if let Some((key, _)) = self
+            .ownership
+            .value_transfers_for_owner(&self.call_owner)
+            .filter(|(key, _)| !self.visited_value_transfers.contains(*key))
+            .min_by_key(|(key, _)| (key.span.start, key.span.end, key.sink.render()))
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.value_transfer_unvisited: checked value transfer for {} at {}..{} inside {} was not visited",
+                key.sink.render(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+        }
+        if let Some(control) = self.control {
+            let plan = control.plan();
+            if let Some(action) = plan
+                .assignments()
+                .filter(|action| {
+                    !self
+                        .visited_assignments
+                        .contains(&(action.scope(), action.span()))
+                })
+                .min_by_key(|action| {
+                    (
+                        action.span().start,
+                        action.span().end,
+                        action.destination().render(),
+                    )
+                })
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.assignment_action_unvisited: retained assignment to `{}` at {}..{} inside {} was not visited",
+                    action.destination().render(),
+                    action.span().start,
+                    action.span().end,
+                    self.call_owner.render()
+                ));
+            }
+            if let Some(action) = plan
+                .field_assignments()
+                .filter(|action| {
+                    !self
+                        .visited_field_assignments
+                        .contains(&(action.scope(), action.span()))
+                })
+                .min_by_key(|action| {
+                    (
+                        action.span().start,
+                        action.span().end,
+                        action.destination().render(),
+                    )
+                })
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.field_assignment_action_unvisited: retained field assignment to `{}` at {}..{} inside {} was not visited",
+                    action.destination().render(),
+                    action.span().start,
+                    action.span().end,
+                    self.call_owner.render()
+                ));
+            }
+            if let Some(action) = plan
+                .temporary_drops()
+                .filter(|action| {
+                    !self
+                        .visited_temporary_drops
+                        .contains(&(action.scope(), action.span()))
+                })
+                .min_by_key(|action| (action.span().start, action.span().end))
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.temporary_drop_action_unvisited: retained discarded class temporary at {}..{} inside {} was not visited",
+                    action.span().start,
+                    action.span().end,
+                    self.call_owner.render()
+                ));
+            }
+        }
+    }
+
+    /// The exact checker-sealed control plan for this generator. Production
+    /// construction always supplies one; keeping this as a fallible lookup
+    /// makes forged unit fixtures latch the same named refusal instead of
+    /// silently rebuilding scope identity from the AST.
+    fn control_plan(&self) -> Option<&BodyPlan> {
+        let Some(control) = self.control else {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_missing: no retained checked plan for {}",
+                self.call_owner.render()
+            ));
+            return None;
+        };
+        if control.owner() != &self.call_owner || control.declaration_span() != self.f.span {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_mismatch: retained plan for {} at {}..{} does not match {} at {}..{}",
+                control.owner().render(),
+                control.declaration_span().start,
+                control.declaration_span().end,
+                self.call_owner.render(),
+                self.f.span.start,
+                self.f.span.end
+            ));
+            return None;
+        }
+        Some(control.plan())
+    }
+
+    /// Reconcile the whole retained callable before symbolic execution can
+    /// add a binder, hypothesis, or obligation. Per-node lookups below still
+    /// consume each direct trap edge when the corresponding source node is
+    /// reached, including repeated visits along distinct symbolic paths.
+    fn checked_body_scope(&self) -> Option<ScopeId> {
+        let plan = self.control_plan()?;
+        if let Err(error) = plan.validate_callable(&self.f.params, &self.f.body) {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_shape_mismatch: {} at {}..{} inside {}",
+                error.message,
+                error.span.start,
+                error.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        }
+        let block = plan.body_block();
+        if block.scope() != plan.body_scope() {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_body_edge_mismatch: retained root block inside {} does not use the checked body scope",
+                self.call_owner.render()
+            ));
+            return None;
+        }
+        Some(block.scope())
+    }
+
+    /// Consume the exact checker-sealed trap sites for one reached source
+    /// expression. The shared plan owns classification and structural keys;
+    /// VC generation only checks that every retained edge is the canonical
+    /// empty no-unwind route. Some operational traps (for example allocator
+    /// failure or a callee trapping) have no proof obligation on the normal
+    /// continuation, but their source edge is still consumed here.
+    fn consume_expression_trap_sites(&self, scope: ScopeId, expression: &Expr) -> bool {
+        let plan = match self.control_plan() {
+            Some(plan) => plan,
+            None => return false,
+        };
+        let sites = match plan.expression_trap_sites(scope, expression) {
+            Ok(sites) => sites,
+            Err(error) => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.control_plan_trap_site_missing: {} at {}..{} inside {}",
+                    error.message,
+                    error.span.start,
+                    error.span.end,
+                    self.call_owner.render()
+                ));
+                return false;
+            }
+        };
+        self.consume_trap_sites(plan, &sites)
+    }
+
+    /// Statement sites are direct only. Child expressions and structured
+    /// bodies consume their own sites upon entry, preserving short-circuit
+    /// and branch evaluation order instead of pre-walking descendants.
+    fn consume_statement_trap_sites(&self, scope: ScopeId, statement: &Stmt) -> bool {
+        let plan = match self.control_plan() {
+            Some(plan) => plan,
+            None => return false,
+        };
+        let sites = match plan.statement_trap_sites(scope, statement) {
+            Ok(sites) => sites,
+            Err(error) => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.control_plan_trap_site_missing: {} at {}..{} inside {}",
+                    error.message,
+                    error.span.start,
+                    error.span.end,
+                    self.call_owner.render()
+                ));
+                return false;
+            }
+        };
+        self.consume_trap_sites(plan, &sites)
+    }
+
+    fn consume_trap_sites(&self, plan: &BodyPlan, sites: &[&TrapSite]) -> bool {
+        // A source trap identity is not an obligation identity. The normal
+        // path may need zero obligations (allocator/callee failure), one
+        // guard, or several clauses (exposure close and loop reasoning).
+        // What this handoff seals uniformly is the abort edge: none of those
+        // failures may acquire lexical cleanup or be mistaken for a join.
+        let canonical = plan.trap_route();
+        if let Some(site) = sites.iter().find(|site| site.route() != &canonical) {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_trap_route_mismatch: trap site at {}..{} inside {} does not use the canonical empty no-unwind route",
+                site.span().start,
+                site.span().end,
+                self.call_owner.render()
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn checked_return_routes(
+        &self,
+        span: Span,
+        scope: ScopeId,
+        has_value: bool,
+    ) -> Option<ReturnRoutes> {
+        let plan = self.control_plan()?;
+        let routes = match plan.explicit_return(span, scope) {
+            Ok(routes) => routes,
+            Err(error) => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.control_plan_return_missing: {} at {}..{} inside {}",
+                    error.message,
+                    error.span.start,
+                    error.span.end,
+                    self.call_owner.render()
+                ));
+                return None;
+            }
+        };
+        if routes.result_slot().is_some() != has_value {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_return_mismatch: return at {}..{} inside {} changed valued/unit shape after checking",
+                span.start,
+                span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        }
+        Some(routes)
+    }
+
+    /// Consume one normalized lexical edge. VC generation has no runtime
+    /// destructor to execute, but it does consume the exact drop identities
+    /// and ordering before removing every source binding whose lifetime ends
+    /// on the edge. Historical Lean binders and hypotheses deliberately stay:
+    /// they are pure facts that may witness an outer value, while the removed
+    /// source maps ensure later clauses cannot name dead storage.
+    fn apply_control_route(&mut self, route: &ExitRoute, expected: ExitKind) -> bool {
+        if route.kind() != expected {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_route_mismatch: {} route inside {} was expected to be {expected:?}, found {:?}",
+                self.fname,
+                self.call_owner.render(),
+                route.kind()
+            ));
+            return false;
+        }
+
+        // Validate the entire edge before mutating any proof state. A future
+        // plan extension that accidentally puts a projection here must fail
+        // atomically rather than partly clearing the environment.
+        if let Some(place) = route.clears().iter().find(|place| !place.is_root()) {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_place_unsupported: lexical route inside {} contains projected clear `{}`",
+                self.call_owner.render(),
+                place.render()
+            ));
+            return false;
+        }
+
+        let drop_places = {
+            let Some(plan) = self.control_plan() else {
+                return false;
+            };
+            route
+                .drops()
+                .iter()
+                .map(|drop| plan.candidate(*drop).place().clone())
+                .collect::<Vec<_>>()
+        };
+        if let Some(place) = drop_places
+            .iter()
+            .find(|place| !place.is_root() || !route.clears().contains(place))
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_drop_mismatch: lexical route inside {} drops `{}` without the matching root clear",
+                self.call_owner.render(),
+                place.render()
+            ));
+            return false;
+        }
+
+        for place in route.clears() {
+            let name = place.root();
+            self.env.remove(name);
+            self.var_tys.remove(name);
+            self.entry_states.remove(name);
+        }
+        true
+    }
+
+    fn apply_scope_route(&mut self, route: &ExitRoute, scope: ScopeId, expected: ExitKind) -> bool {
+        if route.scopes() != [scope] {
+            refuse_vc_type(format!(
+                "internal.vcgen.control_plan_active_scope_mismatch: lexical route inside {} does not exit the active checked scope",
+                self.call_owner.render()
+            ));
+            return false;
+        }
+        self.apply_control_route(route, expected)
+    }
+
     /// `&mut C` arguments come back in a fresh state — the callee may have
     /// mutated them within its posts, and keeping the pre-call symbol
     /// would assert those posts over storage the callee changed. Assuming
@@ -3043,50 +4978,63 @@ impl<'a> Generator<'a> {
     /// substituted over the fresh symbol, say the rest.
     ///
     /// Returns param name → post-call state, for the callee's posts.
-    fn havoc_mut_borrow_args(&mut self, params: &[Param], args: &[Expr]) -> Vec<(String, String)> {
+    fn havoc_mut_borrow_args(
+        &mut self,
+        checked_call: &CheckedCallTransition,
+        symbolic_visit: usize,
+    ) -> Vec<(String, String)> {
         // The borrowed *place*, which may be a field: `&mut self.w` names
         // `w` inside `self`, so the fresh state has to be written back into
         // the object rather than replacing it. Getting this wrong replaced
         // `self` with a view and lost the whole self-chain.
         //
-        // Only a *unique* borrow lets the callee change storage the caller
-        // still names, so only these come back fresh. That is a
-        // binding-mode filter; the dispatch over what the borrow names is
-        // `fresh_state_for`'s, and is exhaustive (ADR 0074).
-        let targets: Vec<(String, Ty, String, Option<String>)> = params
-            .iter()
-            .zip(args.iter())
-            .filter_map(|(p, arg)| {
-                let referent = p.ty.as_unique_borrow()?.clone();
-                let ExprKind::Borrow { array, field, .. } = &arg.kind else {
-                    refuse_vc_type(format!(
-                        "internal.vcgen.mut_borrow_arg_shape: `&mut` parameter `{}` was \
-                         passed a non-borrow argument",
-                        p.name
-                    ));
-                    return None;
-                };
-                Some((p.name.clone(), referent, array.clone(), field.clone()))
-            })
-            .collect();
         let mut out = Vec::new();
-        for (pname, referent, array, field) in targets {
-            let hint = match &field {
-                Some(f) => format!("{array}_{f}"),
-                None => array.clone(),
+        for argument in &checked_call.arguments {
+            let CallArgumentEffect::Loan(transition) = &argument.effect else {
+                continue;
+            };
+            match transition.effect {
+                CallEffect::SharedLoan => continue,
+                CallEffect::HavocUniqueBorrow => {}
+            }
+            let pname = argument.parameter.clone();
+            let transition = transition.clone();
+            let referent = transition.referent.clone();
+            let place = transition.place.clone();
+            let array = place.root().to_string();
+            let hint = place.binder_hint();
+            let field = if place.is_root() {
+                None
+            } else if let Some(field) = place.direct_field() {
+                Some(field.to_string())
+            } else {
+                refuse_vc_type(format!(
+                    "internal.vcgen.mut_borrow_arg_place: `&mut` argument `{}` has a \
+                     projected place the call write-back does not support",
+                    place.render()
+                ));
+                continue;
             };
             // Binder naming is site policy: an array keeps its positional
             // `_arrN` name, a class state or view its source-anchored hint.
             // (The `_st` fallback names shapes `fresh_state_for` refuses.)
+            let mut array_before = None;
             let (b, len) = match &referent {
                 Ty::Array(_) => {
-                    let chain = match (&field, self.env.get(array.as_str())) {
-                        (None, Some(Val::Arr(s))) => Some(s.clone()),
-                        (Some(f), Some(Val::Obj(base))) => Some(project_field(base, f)),
-                        _ => None,
+                    let chain = if let Some(field) = field.as_deref() {
+                        if let Some(Val::Obj(base)) = self.env.get(array.as_str()) {
+                            Some(project_field(base, field))
+                        } else {
+                            None
+                        }
+                    } else if let Some(Val::Arr(sequence)) = self.env.get(array.as_str()) {
+                        Some(sequence.clone())
+                    } else {
+                        None
                     };
+                    array_before = chain.clone();
                     let len = match chain {
-                        Some(chain) => LenFact::Eq(chain),
+                        Some(prior) => LenFact::Eq(prior),
                         None => {
                             refuse_vc_type(format!(
                                 "internal.vcgen.mut_borrow_arg_state: `&mut` array \
@@ -3100,37 +5048,131 @@ impl<'a> Generator<'a> {
                 }
                 Ty::Class(_) => (self.hinted_sym("_obj", Some(hint)), LenFact::Skip),
                 Ty::Res(_) => (self.hinted_sym("_view", Some(hint)), LenFact::Skip),
-                _ => (self.hinted_sym("_st", Some(hint)), LenFact::Skip),
+                Ty::Int(_)
+                | Ty::Bool
+                | Ty::Param(_)
+                | Ty::Record(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Borrow(..)
+                | Ty::Unit => (self.hinted_sym("_st", Some(hint)), LenFact::Skip),
             };
+            let first_fresh_hyp = self.hyps.len();
             let fresh = self.fresh_state_for(&referent, &b, &array, len);
-            match field {
+            let length_hyp = array_before.as_ref().and_then(|before| {
+                let expected = format!("({b}.len) = ({before}.len)");
+                self.hyps[first_fresh_hyp..]
+                    .iter()
+                    .find(|(_, proposition)| proposition == &expected)
+                    .map(|(name, _)| name.clone())
+            });
+            match field.as_deref() {
                 // A whole place: the name now holds the fresh state.
                 None => {
-                    self.env.insert(array, fresh);
+                    self.env.insert(array.clone(), fresh);
                 }
                 // A field place: write the fresh state back into the base,
                 // leaving every sibling where it was.
                 Some(f) => {
-                    let vs = match &fresh {
-                        Val::Int(s)
-                        | Val::Opt(s)
-                        | Val::Arr(s)
-                        | Val::Obj(s)
-                        | Val::Record(s)
-                        | Val::View(s)
-                        | Val::Ptr(s) => s.clone(),
-                        Val::Prop(p) => lean_bool_value(p),
+                    let Some(vs) = fresh.writeback_term() else {
                         // `fresh_state_for` refused the shape and latched;
                         // leave the base untouched rather than write junk.
-                        Val::Unit => continue,
+                        continue;
                     };
-                    let base = match self.env.get(array.as_str()) {
-                        Some(Val::Obj(chain)) => chain.clone(),
-                        _ => array.clone(),
-                    };
-                    self.env
-                        .insert(array, Val::Obj(format!("{{ {base} with {f} := {vs} }}")));
+                    let base = self
+                        .env
+                        .get(array.as_str())
+                        .and_then(|value| {
+                            if let Val::Obj(chain) = value {
+                                Some(chain.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| array.clone());
+                    self.env.insert(
+                        array.clone(),
+                        Val::Obj(format!("{{ {base} with {f} := {vs} }}")),
+                    );
                 }
+            }
+
+            // Read the target back from the environment after write-back.
+            // The fixed Lean proof below cannot close if this still names the
+            // pre-call state, the wrong field, or the owning object itself.
+            let observed = match field.as_deref() {
+                None => self.env.get(array.as_str()).and_then(Val::writeback_term),
+                Some(field) => match self.env.get(array.as_str()) {
+                    Some(Val::Obj(base)) => Some(project_field(base, field)),
+                    Some(
+                        Val::Int(_)
+                        | Val::Prop(_)
+                        | Val::Opt(_)
+                        | Val::Arr(_)
+                        | Val::Record(_)
+                        | Val::View(_)
+                        | Val::Ptr(_)
+                        | Val::Unit,
+                    )
+                    | None => None,
+                },
+            }
+            .unwrap_or_default();
+            let Some(call_start) = checked_call.key.span.start.checked_sub(self.f.span.start)
+            else {
+                refuse_vc_type(format!(
+                    "internal.transition_certificate_identity: call span {}..{} precedes its {} body",
+                    checked_call.key.span.start,
+                    checked_call.key.span.end,
+                    self.call_owner.render()
+                ));
+                continue;
+            };
+            let Some(call_end) = checked_call.key.span.end.checked_sub(self.f.span.start) else {
+                refuse_vc_type(format!(
+                    "internal.transition_certificate_identity: call span {}..{} precedes its {} body",
+                    checked_call.key.span.start,
+                    checked_call.key.span.end,
+                    self.call_owner.render()
+                ));
+                continue;
+            };
+            let owner = self.call_owner.certificate_component();
+            let target = checked_call.key.target.certificate_component();
+            let raw_place = place.render();
+            let occurrence = format!("{call_start}:{call_end}");
+            let parameter_index = argument.parameter_index.to_string();
+            let symbolic_visit = symbolic_visit.to_string();
+            let cert_name = format!(
+                "transition.{owner}.call_havoc.{raw_place}.site.{call_start}-{call_end}.arg.{}.visit.{symbolic_visit}.to.{target}",
+                argument.parameter_index,
+            );
+            let thm_name = injective_lean_components(
+                "cert",
+                &[
+                    owner.as_str(),
+                    target.as_str(),
+                    raw_place.as_str(),
+                    occurrence.as_str(),
+                    parameter_index.as_str(),
+                    symbolic_visit.as_str(),
+                ],
+            );
+            match TransitionCertificate::call_havoc(
+                cert_name,
+                thm_name,
+                transition,
+                b.clone(),
+                observed,
+                array_before,
+                length_hyp,
+                self.binders.clone(),
+                self.hyps.clone(),
+            ) {
+                Ok(certificate) => self.out.transition_certificates.push(certificate),
+                Err(message) => refuse_vc_type(message),
             }
             out.push((pname, b));
         }
@@ -3138,6 +5180,9 @@ impl<'a> Generator<'a> {
     }
 
     fn run(&mut self) {
+        let Some(body_scope) = self.checked_body_scope() else {
+            return;
+        };
         // Class-member setup: methods get the entry-state binder
         // `_old_self` with field facts and the class invariant assumed
         // (design §7 desugaring); inits start with no self at all.
@@ -3193,7 +5238,7 @@ impl<'a> Generator<'a> {
                 .push((format!("pre {}", pre.text), pre.line_span));
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_pre_{}", sanitize(&self.fname), i + 1),
+                def_name: callable_lean_name("wf", &self.call_owner, "pre", i + 1),
                 binders,
                 text,
                 span: pre.span,
@@ -3207,7 +5252,7 @@ impl<'a> Generator<'a> {
                 binders.push(("result".to_string(), self.result_lean_ty()));
             }
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_post_{}", sanitize(&self.fname), i + 1),
+                def_name: callable_lean_name("wf", &self.call_owner, "post", i + 1),
                 binders,
                 text: self.preprocess(&post.text),
                 span: post.span,
@@ -3218,7 +5263,7 @@ impl<'a> Generator<'a> {
         if let Some(v) = &f.variant {
             let binders = self.wf_binders();
             self.out.clause_wfs.push(ClauseWf {
-                def_name: format!("wf_{}_variant", sanitize(&self.fname)),
+                def_name: callable_lean_name("wf", &self.call_owner, "variant", 1),
                 binders,
                 text: self.preprocess(&v.text),
                 span: v.span,
@@ -3228,7 +5273,7 @@ impl<'a> Generator<'a> {
         }
 
         let stmts: Vec<&Stmt> = self.f.body.iter().collect();
-        self.exec(&stmts, &Tail::FnEnd);
+        self.exec(&stmts, body_scope, &Tail::FnEnd);
     }
 
     fn result_lean_ty(&self) -> String {
@@ -3257,113 +5302,185 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn exec(&mut self, stmts: &[&'a Stmt], tail: &Tail<'a>) {
+    fn exec(&mut self, stmts: &[&'a Stmt], scope: ScopeId, tail: &Tail<'a>) {
         let Some((stmt, rest)) = stmts.split_first() else {
-            // A procedure path falling off the end is its implicit return.
-            if matches!(tail, Tail::FnEnd) && self.f.ret == Ty::Unit {
-                self.emit_posts(None);
-            }
-            // A path fell off the end of a loop body: prove preservation.
-            if let Tail::Loop {
-                invariants,
-                variant,
-                v0,
-            } = tail
-            {
-                for inv in *invariants {
-                    let goal = self.subst_env(&self.preprocess(&inv.text));
+            match tail {
+                Tail::FnEnd => {
+                    let Some(plan) = self.control_plan() else {
+                        return;
+                    };
+                    if scope != plan.body_scope() {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_active_scope_mismatch: function end inside {} is not in the checked body scope",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    // Falling off a procedure body is its implicit return:
+                    // lexical locals die before posts, while parameter-frame
+                    // state remains available until after the posts.
+                    if self.f.ret != Ty::Unit {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_nonunit_fallthrough: non-unit function {} reached its checked body end without a return edge",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    let routes = plan.implicit_return();
+                    if !self.apply_control_route(routes.lexical(), ExitKind::Return) {
+                        return;
+                    }
+                    self.emit_posts(None);
+                    let _ = self.apply_control_route(routes.frame(), ExitKind::Return);
+                }
+                Tail::Scope {
+                    normal_exit,
+                    rest,
+                    parent_scope,
+                    outer,
+                } => {
+                    let Some(exit) = normal_exit else {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_branch_normal_edge_missing: a checked non-fallthrough branch arm inside {} reached its parent continuation",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    };
+                    if !self.apply_scope_route(exit, scope, ExitKind::Fallthrough) {
+                        return;
+                    }
+                    let rest = rest.clone();
+                    let outer = (**outer).clone();
+                    self.exec(&rest, *parent_scope, &outer);
+                }
+                Tail::Loop {
+                    backedge,
+                    invariants,
+                    variant,
+                    v0,
+                } => {
+                    let Some(exit) = backedge else {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_loop_backedge_missing: a checked non-fallthrough loop body inside {} reached its header",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    };
+                    // Loop-body storage dies on the backedge before the
+                    // preservation obligations are stated.
+                    if !self.apply_scope_route(exit, scope, ExitKind::Backedge) {
+                        return;
+                    }
+                    for inv in *invariants {
+                        let goal = self.subst_env(&self.preprocess(&inv.text));
+                        let ob = self.obligation(
+                            &format!("{}.inv_preserved.{}", self.fname, cslug(inv)),
+                            "loop invariant must be preserved by the body".into(),
+                            inv.span,
+                            goal,
+                        );
+                        self.push_obligation(ob);
+                    }
+                    let goal = format!(
+                        "0 ≤ {v0} ∧ ({}) < {v0}",
+                        self.subst_env(&self.preprocess(&variant.text))
+                    );
                     let ob = self.obligation(
-                        &format!("{}.inv_preserved.{}", self.fname, cslug(inv)),
-                        "loop invariant must be preserved by the body".into(),
-                        inv.span,
+                        &format!("{}.variant_decreases.{}", self.fname, cslug(variant)),
+                        "loop variant must be a nonnegative measure that strictly decreases".into(),
+                        variant.span,
                         goal,
                     );
                     self.push_obligation(ob);
                 }
-                let goal = format!(
-                    "0 ≤ {v0} ∧ ({}) < {v0}",
-                    self.subst_env(&self.preprocess(&variant.text))
-                );
-                let ob = self.obligation(
-                    &format!("{}.variant_decreases.{}", self.fname, cslug(variant)),
-                    "loop variant must be a nonnegative measure that strictly decreases".into(),
-                    variant.span,
-                    goal,
-                );
-                self.push_obligation(ob);
-            }
-            // A path fell off the end of an exposure body: reconstruct.
-            if let Tail::Expose {
-                array,
-                res,
-                ptr,
-                mutable,
-                kw_span,
-                loan,
-                entry_arr,
-                rest,
-                outer,
-            } = tail
-            {
-                let view = self.view_str(res);
-                // What "the safe world owns this again" means, stated as
-                // obligations rather than assumed: the whole extent came
-                // back, and every byte the array needs is present. A
-                // split descendant that was never rejoined fails the
-                // first; a byte left `uninit` fails the second.
-                let ob = self.obligation(
-                    &format!("{}.expose.{array}.extent", self.fname),
-                    format!("the whole of `{array}` must be owned again here"),
-                    *kw_span,
-                    format!(
-                        "({view}).len = ({entry_arr}).len ∧ ({view}).off = 0 \
-                         ∧ ({view}).alloc = {loan}"
-                    ),
-                );
-                self.push_obligation(ob);
-                let ob = self.obligation(
-                    &format!("{}.expose.{array}.bytes", self.fname),
-                    format!("every byte of `{array}` must be present and in `u8` range here"),
-                    *kw_span,
-                    format!("Sable.SpanView.reconstructible ({view})"),
-                );
-                self.push_obligation(ob);
-                if *mutable {
-                    // The array becomes what the bytes say. Its element
-                    // range is not a separate obligation: it is the other
-                    // half of reconstructibility, which the one obligation
-                    // above already asked for.
-                    let a2 = self.hinted_sym("_arr", Some((*array).to_string()));
-                    self.binders.push((a2.clone(), "Sable.Seq Int".into()));
-                    self.push_hyp_unique(
-                        format!("h_{array}_bytes"),
-                        format!("{a2} = Sable.SpanView.toSeq ({view})"),
+                Tail::Expose {
+                    body_exit,
+                    close,
+                    parent_scope,
+                    array,
+                    res,
+                    mutable,
+                    kw_span,
+                    release_loan,
+                    loan,
+                    entry_arr,
+                    rest,
+                    outer,
+                } => {
+                    // Snapshot the final view before its source binding dies;
+                    // reconstruction consumes the pure Lean term afterward.
+                    let view = self.view_str(res);
+                    if !self.apply_scope_route(body_exit, scope, ExitKind::Fallthrough) {
+                        return;
+                    }
+                    // What "the safe world owns this again" means, stated as
+                    // obligations rather than assumed: the whole extent came
+                    // back, and every byte the array needs is present. A
+                    // split descendant that was never rejoined fails the
+                    // first; a byte left `uninit` fails the second.
+                    let ob = self.obligation(
+                        &format!("{}.expose.{array}.extent", self.fname),
+                        format!("the whole of `{array}` must be owned again here"),
+                        *kw_span,
+                        format!(
+                            "({view}).len = ({entry_arr}).len ∧ ({view}).off = 0 \
+                             ∧ ({view}).alloc = {loan}"
+                        ),
                     );
-                    // Both of these were just proved above; restating them
-                    // in the shape every other array fact has is what
-                    // keeps downstream automation on familiar ground.
-                    self.push_hyp_unique(
-                        format!("h_{array}_len"),
-                        format!("({a2}.len) = ({entry_arr}.len)"),
+                    self.push_obligation(ob);
+                    let ob = self.obligation(
+                        &format!("{}.expose.{array}.bytes", self.fname),
+                        format!("every byte of `{array}` must be present and in `u8` range here"),
+                        *kw_span,
+                        format!("Sable.SpanView.reconstructible ({view})"),
                     );
-                    self.push_hyp_unique(
-                        format!("h_{array}_elems"),
-                        format!("∀ k, 0 ≤ k → k < {a2}.len → 0 ≤ {a2}.get k ∧ {a2}.get k ≤ u8.max"),
-                    );
-                    self.env.insert((*array).to_string(), Val::Arr(a2));
+                    self.push_obligation(ob);
+                    if *mutable {
+                        // The array becomes what the bytes say. Its element
+                        // range is not a separate obligation: it is the other
+                        // half of reconstructibility, which the one obligation
+                        // above already asked for.
+                        let a2 = self.hinted_sym("_arr", Some((*array).to_string()));
+                        self.binders.push((a2.clone(), "Sable.Seq Int".into()));
+                        self.push_hyp_unique(
+                            format!("h_{array}_bytes"),
+                            format!("{a2} = Sable.SpanView.toSeq ({view})"),
+                        );
+                        // Both of these were just proved above; restating them
+                        // in the shape every other array fact has is what
+                        // keeps downstream automation on familiar ground.
+                        self.push_hyp_unique(
+                            format!("h_{array}_len"),
+                            format!("({a2}.len) = ({entry_arr}.len)"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{array}_elems"),
+                            format!(
+                                "∀ k, 0 ≤ k → k < {a2}.len → 0 ≤ {a2}.get k ∧ {a2}.get k ≤ u8.max"
+                            ),
+                        );
+                        self.env.insert(array.clone(), Val::Arr(a2));
+                    }
+                    if !close.clears().contains(release_loan) {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_exposure_release_missing: checked exposure close inside {} does not release its retained loan identity",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    if !self.apply_control_route(close, ExitKind::ExposureClose) {
+                        return;
+                    }
+                    let rest = rest.clone();
+                    let outer = (**outer).clone();
+                    self.exec(&rest, *parent_scope, &outer);
                 }
-                // The loan is over: the bindings go out of scope, which is
-                // what the brand rules already guarantee nothing survived.
-                self.env.remove(*res);
-                self.env.remove(*ptr);
-                self.var_tys.remove(*res);
-                self.var_tys.remove(*ptr);
-                let rest = rest.clone();
-                let outer = (**outer).clone();
-                self.exec(&rest, &outer);
             }
             return;
         };
+        if !self.consume_statement_trap_sites(scope, stmt) {
+            return;
+        }
         match stmt {
             Stmt::Decl { name, ty, init, .. } => {
                 self.var_tys.insert(name.clone(), ty.clone());
@@ -3380,15 +5497,29 @@ impl<'a> Generator<'a> {
                     ) {
                         self.name_hint = Some(name.clone());
                     }
-                    let v = self.eval(e);
+                    let v = self.eval(e, scope);
+                    let _transfer = self.checked_value_transfer(
+                        e,
+                        crate::ownership::ValueTransferSink::Binding(name.clone()),
+                    );
                     self.name_hint = None;
                     self.env.insert(name.clone(), v);
                 } else {
                     self.env.remove(name);
                 }
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
-            Stmt::Assign { name, value, .. } => {
+            Stmt::Assign {
+                name,
+                name_span,
+                value,
+            } => {
+                let destination = Place::local(name);
+                let Some(action) =
+                    self.checked_assignment_action(scope, *name_span, &destination, value)
+                else {
+                    return;
+                };
                 if matches!(
                     value.kind,
                     ExprKind::Call { .. }
@@ -3401,14 +5532,28 @@ impl<'a> Generator<'a> {
                 ) {
                     self.name_hint = Some(name.clone());
                 }
-                let v = self.eval(value);
+                let v = self.eval(value, scope);
+                let _transfer = self.checked_value_transfer_key(value, action.transfer_key());
                 self.name_hint = None;
+                // The exact conditional destruction/staging action was
+                // consumed above. Destruction contributes no normal-state
+                // proposition in this symbolic value model; installing `v`
+                // is the observable post-action state.
                 self.env.insert(name.clone(), v);
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
-            Stmt::Return { value, .. } => {
+            Stmt::Return { value, span } => {
+                // Validate the checked edge identity before evaluating a
+                // possibly forged replacement result. The lookup is static;
+                // runtime ordering remains evaluate-result, then cleanup.
+                let Some(routes) = self.checked_return_routes(*span, scope, value.is_some()) else {
+                    return;
+                };
                 let result_eq = value.as_ref().map(|value| {
-                    match self.eval(value) {
+                    let evaluated = self.eval(value, scope);
+                    let _transfer = self
+                        .checked_value_transfer(value, crate::ownership::ValueTransferSink::Return);
+                    match evaluated {
                         Val::Int(v) => format!("(result = {v})"),
                         Val::Opt(v) => format!("(result = {v})"),
                         Val::Prop(p) => format!("(result ↔ ({p}))"),
@@ -3448,10 +5593,14 @@ impl<'a> Generator<'a> {
                         // A raw pointer is data: provenance and an offset,
                         // no authority, nothing to re-establish (ADR 0026).
                         Val::Ptr(chain) => format!("(result = {chain})"),
-                        _ => unreachable!("unit values cannot be returned"),
+                        Val::Unit => unreachable!("unit values cannot be returned"),
                     }
                 });
+                if !self.apply_control_route(routes.lexical(), ExitKind::Return) {
+                    return;
+                }
                 self.emit_posts(result_eq);
+                let _ = self.apply_control_route(routes.frame(), ExitKind::Return);
             }
             // `unsafe { ... }`: a marker with no verification content of
             // its own. Splice the body into the continuation, which is
@@ -3459,10 +5608,10 @@ impl<'a> Generator<'a> {
             Stmt::Unsafe { body, .. } => {
                 let mut inner: Vec<&Stmt> = body.iter().collect();
                 inner.extend_from_slice(rest);
-                self.exec(&inner, tail);
+                self.exec(&inner, scope, tail);
             }
             Stmt::StaticAlloc { size, ptr, res, .. } => {
-                let Val::Int(n) = self.eval(size) else {
+                let Val::Int(n) = self.eval(size, scope) else {
                     unreachable!("checked: u64 size")
                 };
                 let alloc = self.hinted_sym("_static_alloc", Some(ptr.clone()));
@@ -3488,7 +5637,7 @@ impl<'a> Generator<'a> {
                 );
                 self.env.insert(ptr.clone(), Val::Ptr(p));
                 self.var_tys.insert(ptr.clone(), Ty::Raw(IntTy::U8));
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
             Stmt::SystemAlloc {
                 size,
@@ -3497,7 +5646,7 @@ impl<'a> Generator<'a> {
                 release,
                 ..
             } => {
-                let Val::Int(n) = self.eval(size) else {
+                let Val::Int(n) = self.eval(size, scope) else {
                     unreachable!("checked: u64 size")
                 };
                 let alloc = self.hinted_sym("_system_alloc", Some(ptr.clone()));
@@ -3539,20 +5688,28 @@ impl<'a> Generator<'a> {
                 );
                 self.env.insert(ptr.clone(), Val::Ptr(p));
                 self.var_tys.insert(ptr.clone(), Ty::Raw(IntTy::U8));
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
             Stmt::SystemDealloc {
                 ptr, res, release, ..
             } => {
-                let Val::Ptr(p) = self.eval(ptr) else {
+                let Val::Ptr(p) = self.eval(ptr, scope) else {
                     unreachable!("checked: raw pointer")
                 };
-                let Val::View(bytes) = self.eval(res) else {
+                let Val::View(bytes) = self.eval(res, scope) else {
                     unreachable!("checked: RawSpan")
                 };
-                let Val::View(rel) = self.eval(release) else {
+                let _resource_transfer = self.checked_value_transfer(
+                    res,
+                    crate::ownership::ValueTransferSink::SystemDeallocResource,
+                );
+                let Val::View(rel) = self.eval(release, scope) else {
                     unreachable!("checked: SystemDealloc")
                 };
+                let _release_transfer = self.checked_value_transfer(
+                    release,
+                    crate::ownership::ValueTransferSink::SystemDeallocRelease,
+                );
                 let goal = format!(
                     "({p}).alloc = ({rel}).alloc ∧ ({p}).off = 0 ∧ \
                      ({bytes}).alloc = ({rel}).alloc ∧ ({bytes}).off = 0 ∧ \
@@ -3567,7 +5724,7 @@ impl<'a> Generator<'a> {
                 );
                 self.push_obligation(ob);
                 self.push_hyp_unique("h_system_dealloc".into(), goal);
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
             // Lexical exposure. Entry hands the body a span whose bytes
             // are the array's elements, all initialized, at offset 0 of a
@@ -3577,13 +5734,152 @@ impl<'a> Generator<'a> {
             Stmt::Expose {
                 kw_span,
                 array,
+                array_span,
                 mutable,
                 ptr,
+                ptr_span,
                 res,
+                res_span,
                 body,
                 ..
             } => {
-                let entry_arr = self.arr_str(array);
+                // Resolve the complete normal phase and link its effect key
+                // before opening a symbolic loan. Source syntax is checked
+                // against the retained rebuild action, but never becomes a
+                // second authority for names, type, mutability, or exits.
+                let (
+                    exposure_scope,
+                    effect_key,
+                    body_exit,
+                    close,
+                    parent_scope,
+                    capture,
+                    planned_owner,
+                    owner_ty,
+                    planned_mutability,
+                    planned_pointer,
+                    planned_resource,
+                    planned_keyword,
+                    release_loan,
+                ) = {
+                    let Some(plan) = self.control_plan() else {
+                        return;
+                    };
+                    let exposure = match plan.exposure_plan(scope, *kw_span) {
+                        Ok(exposure) => exposure,
+                        Err(error) => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.control_plan_exposure_edge_missing: {} at {}..{} inside {}",
+                                error.message,
+                                error.span.start,
+                                error.span.end,
+                                self.call_owner.render()
+                            ));
+                            return;
+                        }
+                    };
+                    let body_plan = plan.block(exposure.body());
+                    if body_plan.scope() != exposure.body_scope()
+                        || body_plan.flow() != exposure.body_flow()
+                        || exposure.body_flow().can_fall_through() != exposure.normal().is_some()
+                    {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_exposure_edge_mismatch: retained exposure body inside {} disagrees with its sealed normal edge",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    let Some(normal) = exposure.normal() else {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_exposure_normal_missing: exposure at {}..{} inside {} has no checked reconstruction edge",
+                            kw_span.start,
+                            kw_span.end,
+                            self.call_owner.render()
+                        ));
+                        return;
+                    };
+                    if exposure.body_flow().contains_return() {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_exposure_return_edge: exposure at {}..{} inside {} contains a retained return edge that would bypass reconstruction",
+                            kw_span.start,
+                            kw_span.end,
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    let rebuild = normal.rebuild();
+                    let expected_owner = Place::local(array);
+                    let expected_pointer = Place::local(ptr);
+                    let expected_resource = Place::local(res);
+                    let expected_mutability = if *mutable {
+                        Mutability::Mut
+                    } else {
+                        Mutability::Shared
+                    };
+                    if normal.parent_scope() != scope
+                        || normal.capture() != rebuild.resource()
+                        || normal.body_exit().kind() != ExitKind::Fallthrough
+                        || normal.body_exit().scopes() != [exposure.body_scope()]
+                        || normal.close().kind() != ExitKind::ExposureClose
+                        || !normal.close().clears().contains(normal.release_loan())
+                        || rebuild.owner() != &expected_owner
+                        || rebuild.pointer() != &expected_pointer
+                        || rebuild.resource() != &expected_resource
+                        || rebuild.mutability() != expected_mutability
+                        || rebuild.keyword_span() != *kw_span
+                        || self.var_tys.get(array) != Some(rebuild.owner_ty())
+                    {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_exposure_edge_mismatch: retained exposure phases at {}..{} inside {} disagree with the checked source edge",
+                            kw_span.start,
+                            kw_span.end,
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    if exposure.effect_key().owner != self.call_owner
+                        || exposure.effect_key().span != *kw_span
+                    {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_exposure_effect_mismatch: retained exposure edge inside {} names a different ownership effect",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    (
+                        exposure.body_scope(),
+                        exposure.effect_key().clone(),
+                        normal.body_exit().clone(),
+                        normal.close().clone(),
+                        normal.parent_scope(),
+                        normal.capture().clone(),
+                        rebuild.owner().clone(),
+                        rebuild.owner_ty().clone(),
+                        rebuild.mutability(),
+                        rebuild.pointer().clone(),
+                        rebuild.resource().clone(),
+                        rebuild.keyword_span(),
+                        normal.release_loan().clone(),
+                    )
+                };
+                let Some(_effect) = self.checked_exposure(
+                    &effect_key,
+                    &planned_owner,
+                    *array_span,
+                    &owner_ty,
+                    planned_mutability,
+                    planned_pointer.root(),
+                    *ptr_span,
+                    planned_resource.root(),
+                    *res_span,
+                ) else {
+                    return;
+                };
+                let array = planned_owner.root().to_string();
+                let ptr = planned_pointer.root().to_string();
+                let res = capture.root().to_string();
+                let mutable = planned_mutability == Mutability::Mut;
+                let entry_arr = self.arr_str(&array);
                 let loan = {
                     self.fresh += 1;
                     format!("_loan{}", self.fresh)
@@ -3623,22 +5919,39 @@ impl<'a> Generator<'a> {
                 // is why a `return` inside is a checker error.
                 let inner: Vec<&Stmt> = body.iter().collect();
                 let etail = Tail::Expose {
+                    body_exit,
+                    close,
+                    parent_scope,
                     array,
                     res,
-                    ptr,
-                    mutable: *mutable,
-                    kw_span: *kw_span,
+                    mutable,
+                    kw_span: planned_keyword,
+                    release_loan,
                     loan,
                     entry_arr,
                     rest: rest.to_vec(),
                     outer: Box::new(tail.clone()),
                 };
-                self.exec(&inner, &etail);
+                self.exec(&inner, exposure_scope, &etail);
             }
             Stmt::ExprStmt(e) => {
-                // Evaluated for obligations/assumptions only.
-                let _ = self.eval(e);
-                self.exec(rest, tail);
+                let temporary_drop = if matches!(e.ty.as_ref(), Some(Ty::Class(_))) {
+                    let Some(action) = self.checked_temporary_drop_action(scope, e) else {
+                        return;
+                    };
+                    Some(action)
+                } else {
+                    None
+                };
+                // Evaluated for obligations/assumptions. A retained class
+                // result then transfers into its compiler temporary and is
+                // destroyed before the continuation; destruction is the
+                // authenticated proof no-op described by the action helper.
+                let _ = self.eval(e, scope);
+                if let Some(action) = temporary_drop.as_ref() {
+                    let _transfer = self.checked_value_transfer_key(e, action.transfer_key());
+                }
+                self.exec(rest, scope, tail);
             }
             Stmt::VarDecl { name, init, ty, .. } => {
                 if matches!(
@@ -3652,15 +5965,33 @@ impl<'a> Generator<'a> {
                 ) {
                     self.name_hint = Some(name.clone());
                 }
-                let v = self.eval(init);
+                let v = self.eval(init, scope);
+                let _transfer = self.checked_value_transfer(
+                    init,
+                    crate::ownership::ValueTransferSink::Binding(name.clone()),
+                );
                 self.name_hint = None;
                 self.var_tys
                     .insert(name.clone(), ty.clone().expect("checked: var type"));
                 self.env.insert(name.clone(), v);
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
-            Stmt::FieldAssign { field, value, .. } => {
-                let v = self.eval(value);
+            Stmt::FieldAssign {
+                field,
+                field_span,
+                value,
+            } => {
+                let destination = Place::field("self", field);
+                let Some(action) =
+                    self.checked_field_assignment_action(scope, *field_span, &destination, value)
+                else {
+                    return;
+                };
+                let v = self.eval(value, scope);
+                let _transfer = self.checked_value_transfer_key(value, action.transfer_key());
+                // The retained action has already authenticated conditional
+                // destruction of the old field and RHS staging. The proof
+                // state models only the normal installed value.
                 match self.cctx {
                     Cctx::Init(_) => {
                         self.env.insert(format!("self.{field}"), v);
@@ -3700,7 +6031,7 @@ impl<'a> Generator<'a> {
                     }
                     Cctx::None => unreachable!("checked: fields only in members"),
                 }
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
             Stmt::FieldStore {
                 field,
@@ -3708,10 +6039,10 @@ impl<'a> Generator<'a> {
                 index,
                 value,
             } => {
-                let Val::Int(i) = self.eval(index) else {
+                let Val::Int(i) = self.eval(index, scope) else {
                     unreachable!()
                 };
-                let v = match self.eval(value) {
+                let v = match self.eval(value, scope) {
                     Val::Int(v) | Val::Record(v) => v,
                     Val::Prop(p) => lean_bool_value(&p),
                     Val::Arr(_)
@@ -3754,7 +6085,7 @@ impl<'a> Generator<'a> {
                     }
                     Cctx::None => unreachable!("checked: fields only in members"),
                 }
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
             Stmt::Store {
                 array,
@@ -3762,29 +6093,36 @@ impl<'a> Generator<'a> {
                 index,
                 value,
             } => {
-                let Val::Int(i) = self.eval(index) else {
+                let Val::Int(i) = self.eval(index, scope) else {
                     unreachable!()
                 };
-                let v = match (self.var_tys.get(array).cloned(), self.eval(value)) {
-                    (Some(ref found), Val::Prop(prop)) if found.is_array_of(&Ty::Bool) => {
-                        lean_bool_value(&prop)
-                    }
-                    (Some(ref found), Val::Int(value))
-                        if matches!(found.as_array(), Some((Ty::Int(_) | Ty::Param(_), _))) =>
-                    {
-                        value
-                    }
-                    (Some(ref found), Val::Record(value))
-                        if matches!(found.as_array(), Some((Ty::Record(_), _))) =>
-                    {
-                        value
-                    }
-                    (payload, _) => {
-                        refuse_vc_type(format!(
-                            "internal.vcgen.lean_type_unsupported: an element store into `{}` \
-                             has no proof value",
-                            payload.map_or_else(|| "<unknown>".to_string(), |found| found.name())
-                        ));
+                let evaluated = self.eval(value, scope);
+                let v = match self.var_tys.get(array).cloned() {
+                    Some(found) => match checked_array_payload(&found) {
+                        Some(payload) => {
+                            checked_array_payload_value(payload, evaluated, |_payload| {
+                                format!(
+                                    "internal.vcgen.lean_type_unsupported: an element store into `{}` \
+                                 has no proof value",
+                                    found.name()
+                                )
+                            })
+                        }
+                        None => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.lean_type_unsupported: an element store into `{}` \
+                                 has no proof value",
+                                found.name()
+                            ));
+                            UNSUPPORTED_LEAN_VALUE.into()
+                        }
+                    },
+                    None => {
+                        refuse_vc_type(
+                            "internal.vcgen.lean_type_unsupported: an element store into \
+                             `<unknown>` has no proof value"
+                                .to_string(),
+                        );
                         UNSUPPORTED_LEAN_VALUE.into()
                     }
                 };
@@ -3803,51 +6141,140 @@ impl<'a> Generator<'a> {
                 self.assume_fact(&goal);
                 self.env
                     .insert(array.clone(), Val::Arr(format!("({arr}.set {i} {v})")));
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
             Stmt::If {
                 cond,
                 then_block,
                 else_block,
             } => {
-                let p = self.eval_prop(cond);
+                let (then_scope, then_normal_exit, else_control) = {
+                    let Some(plan) = self.control_plan() else {
+                        return;
+                    };
+                    let branch = match plan.branch(scope, cond.span, else_block.is_some()) {
+                        Ok(branch) => branch,
+                        Err(error) => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.control_plan_branch_edge_missing: {} at {}..{} inside {}",
+                                error.message,
+                                error.span.start,
+                                error.span.end,
+                                self.call_owner.render()
+                            ));
+                            return;
+                        }
+                    };
+                    let then_arm = branch.then_arm();
+                    let then_block_plan = plan.block(then_arm.block());
+                    if then_block_plan.scope() != then_arm.scope()
+                        || then_block_plan.flow() != then_arm.flow()
+                    {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_branch_edge_mismatch: retained then-arm block inside {} disagrees with its sealed edge",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    let else_control = branch.else_arm().map(|arm| {
+                        let block = plan.block(arm.block());
+                        (block, arm)
+                    });
+                    if else_control.as_ref().is_some_and(|(block, arm)| {
+                        block.scope() != arm.scope() || block.flow() != arm.flow()
+                    }) {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_branch_edge_mismatch: retained else-arm block inside {} disagrees with its sealed edge",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    let else_control =
+                        else_control.map(|(_, arm)| (arm.scope(), arm.normal_exit().cloned()));
+                    let reaches_continuation = then_arm.normal_exit().is_some()
+                        || else_control
+                            .as_ref()
+                            .is_none_or(|(_, normal_exit)| normal_exit.is_some());
+                    if branch.flow().can_fall_through() != reaches_continuation {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_branch_edge_mismatch: retained branch flow inside {} disagrees with its normal exits",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    (
+                        then_arm.scope(),
+                        then_arm.normal_exit().cloned(),
+                        else_control,
+                    )
+                };
+                let p = self.eval_prop(cond, scope);
                 // Full clones, not length-truncation: a havoc in a
                 // nested loop REWRITES earlier hypotheses in place
                 // (SSA versioning), which truncation cannot undo.
                 let snap_env = self.env.clone();
                 let snap_hyps = self.hyps.clone();
                 let snap_ctx = self.context.clone();
+                let snap_var_tys = self.var_tys.clone();
+                let snap_entry_states = self.entry_states.clone();
 
                 self.hyps.push((format!("h_path_{}", hslug(&p)), p.clone()));
                 self.context.push((format!("path {p}"), cond.span));
-                let then_stmts: Vec<&Stmt> =
-                    then_block.iter().chain(rest.iter().copied()).collect();
-                self.exec(&then_stmts, tail);
+                let then_stmts: Vec<&Stmt> = then_block.iter().collect();
+                let then_tail = Tail::Scope {
+                    normal_exit: then_normal_exit,
+                    rest: rest.to_vec(),
+                    parent_scope: scope,
+                    outer: Box::new(tail.clone()),
+                };
+                self.exec(&then_stmts, then_scope, &then_tail);
 
-                self.env = snap_env;
+                self.env = snap_env.clone();
                 self.hyps = snap_hyps.clone();
                 self.context = snap_ctx.clone();
+                self.var_tys = snap_var_tys.clone();
+                self.entry_states = snap_entry_states.clone();
 
                 self.hyps
                     .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
                 self.context.push((format!("path ¬{p}"), cond.span));
-                match else_block {
-                    Some(eb) => {
-                        let else_stmts: Vec<&Stmt> =
-                            eb.iter().chain(rest.iter().copied()).collect();
-                        self.exec(&else_stmts, tail);
+                match (else_block, else_control) {
+                    (Some(else_block), Some((else_scope, else_normal_exit))) => {
+                        let else_stmts: Vec<&Stmt> = else_block.iter().collect();
+                        let else_tail = Tail::Scope {
+                            normal_exit: else_normal_exit,
+                            rest: rest.to_vec(),
+                            parent_scope: scope,
+                            outer: Box::new(tail.clone()),
+                        };
+                        self.exec(&else_stmts, else_scope, &else_tail);
                     }
-                    None => self.exec(rest, tail),
+                    (None, None) => self.exec(rest, scope, tail),
+                    (Some(_else_block), None) => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_branch_mismatch: checked branch shape inside {} disagrees with its retained routes",
+                            self.call_owner.render()
+                        ));
+                    }
+                    (None, Some(_else_control)) => {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_branch_mismatch: checked branch shape inside {} disagrees with its retained routes",
+                            self.call_owner.render()
+                        ));
+                    }
                 }
+                self.env = snap_env;
                 self.hyps = snap_hyps;
                 self.context = snap_ctx;
+                self.var_tys = snap_var_tys;
+                self.entry_states = snap_entry_states;
             }
             Stmt::Assert(clause) => {
                 // Well-formedness def so a clause that fails to elaborate
                 // maps to its own span.
                 self.fresh += 1;
                 self.out.clause_wfs.push(ClauseWf {
-                    def_name: format!("wf_{}_assert{}", sanitize(&self.fname), self.fresh),
+                    def_name: callable_lean_name("wf", &self.call_owner, "assert", self.fresh),
                     binders: self.scope_binders(),
                     text: self.preprocess(&clause.text),
                     span: clause.line_span,
@@ -3868,15 +6295,65 @@ impl<'a> Generator<'a> {
                 self.push_hyp_unique(format!("h_assert_{}", chslug(clause)), format!("({goal})"));
                 self.context
                     .push((format!("assert {}", clause.text), clause.line_span));
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
             }
             Stmt::While {
                 cond,
                 invariants,
                 variant,
+                kw_span,
                 body,
                 ..
             } => {
+                // Resolve and link both retained authorities before emitting a
+                // clause definition, obligation, binder, hypothesis, or havoc.
+                let (body_scope, backedge, effect_key) = {
+                    let Some(plan) = self.control_plan() else {
+                        return;
+                    };
+                    let loop_plan = match plan.loop_plan(scope, *kw_span, cond.span) {
+                        Ok(loop_plan) => loop_plan,
+                        Err(error) => {
+                            refuse_vc_type(format!(
+                                "internal.vcgen.control_plan_loop_edge_missing: {} at {}..{} inside {}",
+                                error.message,
+                                error.span.start,
+                                error.span.end,
+                                self.call_owner.render()
+                            ));
+                            return;
+                        }
+                    };
+                    let body_plan = plan.block(loop_plan.body());
+                    if body_plan.scope() != loop_plan.body_scope()
+                        || body_plan.flow() != loop_plan.body_flow()
+                        || loop_plan.body_flow().can_fall_through()
+                            != loop_plan.backedge().is_some()
+                    {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_loop_edge_mismatch: retained loop body inside {} disagrees with its sealed backedge",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    if loop_plan.effect_key().owner != self.call_owner
+                        || loop_plan.effect_key().span != *kw_span
+                    {
+                        refuse_vc_type(format!(
+                            "internal.vcgen.control_plan_loop_effect_mismatch: retained loop edge inside {} names a different ownership effect",
+                            self.call_owner.render()
+                        ));
+                        return;
+                    }
+                    (
+                        loop_plan.body_scope(),
+                        loop_plan.backedge().cloned(),
+                        loop_plan.effect_key().clone(),
+                    )
+                };
+                let Some(loop_effects) = self.checked_loop_effects(&effect_key, cond.span) else {
+                    return;
+                };
                 let variant = variant.as_ref().expect("checked: variant present");
 
                 // Well-formedness defs so clause elaboration errors map to
@@ -3889,7 +6366,12 @@ impl<'a> Generator<'a> {
                 {
                     self.fresh += 1;
                     self.out.clause_wfs.push(ClauseWf {
-                        def_name: format!("wf_{}_loop{}_{}", sanitize(&self.fname), self.fresh, i),
+                        def_name: callable_lean_name(
+                            "wf",
+                            &self.call_owner,
+                            &format!("loop.{i}"),
+                            self.fresh,
+                        ),
                         binders: scope_binders.clone(),
                         text: self.preprocess(&clause.text),
                         span: clause.span,
@@ -3910,8 +6392,9 @@ impl<'a> Generator<'a> {
                     self.push_obligation(ob);
                 }
 
-                // 2. Havoc assigned state (fresh source-named binders).
-                self.havoc(cond, body);
+                // 2. Havoc the exact checker-linked mutation set (fresh
+                // source-named binders).
+                self.havoc(&loop_effects);
 
                 // 3. Assume invariants; evaluate the condition once in the
                 // havocked context (its VCs must follow from invariants).
@@ -3933,12 +6416,14 @@ impl<'a> Generator<'a> {
                 // binder below so existing numbering and branch contexts do
                 // not change.
                 let vtext = self.subst_env(&self.preprocess(&variant.text));
-                let p = self.eval_prop(cond);
+                let p = self.eval_prop(cond, scope);
 
                 // Full clones — see the If arm.
                 let snap_env = self.env.clone();
                 let snap_hyps = self.hyps.clone();
                 let snap_ctx = self.context.clone();
+                let snap_var_tys = self.var_tys.clone();
+                let snap_entry_states = self.entry_states.clone();
 
                 // 4. Body path.
                 self.fresh += 1;
@@ -3952,23 +6437,29 @@ impl<'a> Generator<'a> {
                 self.context.push((format!("path {p}"), cond.span));
                 let body_stmts: Vec<&Stmt> = body.iter().collect();
                 let loop_tail = Tail::Loop {
+                    backedge,
                     invariants,
                     variant,
                     v0,
                 };
-                self.exec(&body_stmts, &loop_tail);
+                self.exec(&body_stmts, body_scope, &loop_tail);
 
-                self.env = snap_env;
+                self.env = snap_env.clone();
                 self.hyps = snap_hyps.clone();
                 self.context = snap_ctx.clone();
+                self.var_tys = snap_var_tys.clone();
+                self.entry_states = snap_entry_states.clone();
 
                 // 5. Continuation: invariants + ¬cond.
                 self.hyps
                     .push((format!("h_path_not_{}", hslug(&p)), format!("¬{p}")));
                 self.context.push((format!("path ¬{p}"), cond.span));
-                self.exec(rest, tail);
+                self.exec(rest, scope, tail);
+                self.env = snap_env;
                 self.hyps = snap_hyps;
                 self.context = snap_ctx;
+                self.var_tys = snap_var_tys;
+                self.entry_states = snap_entry_states;
             }
         }
     }
@@ -3976,36 +6467,12 @@ impl<'a> Generator<'a> {
     /// Fresh source-named binders for everything the loop body assigns
     /// (plus locals whose symbolic value mentions a havocked variable,
     /// transitively). Hypotheses mentioning havocked names are dropped.
-    fn havoc(&mut self, cond: &Expr, body: &[Stmt]) {
-        let mut havoc_set: HashSet<String> = HashSet::new();
-        {
-            // `c.m()` havocs `c` only when `m` takes `&mut self`; a
-            // shared-receiver call cannot write, so keeping its facts is
-            // both sound and what framing across a loop depends on.
-            let classes = self.classes;
-            let var_tys = &self.var_tys;
-            let cctx_class = match self.cctx {
-                Cctx::Init(c) | Cctx::Method(c, _) | Cctx::Deinit(c) => Some(c),
-                Cctx::None => None,
-            };
-            let resolver = |recv: &str, method: &str| {
-                let cd = match var_tys.get(recv).and_then(Ty::class_index) {
-                    Some(ci) => Some(&classes[ci]),
-                    None if recv == "self" => cctx_class,
-                    None => None,
-                };
-                match cd.and_then(|cd| cd.methods.iter().find(|m| m.f.name == method)) {
-                    Some(m) => m.self_kind == SelfKind::Mut,
-                    // Unresolvable receiver: over-approximate.
-                    None => true,
-                }
-            };
-            // The condition is executed once per iteration and may call a
-            // mutating method or pass an explicit `&mut` argument. It belongs
-            // to the loop transition just as much as the lexical body does.
-            collect_mut_borrows(cond, &mut havoc_set, &resolver);
-            collect_assigned(body, &mut havoc_set, &resolver);
-        }
+    fn havoc(&mut self, effects: &CheckedLoopEffects) {
+        let mut havoc_set: HashSet<String> = effects
+            .mutations
+            .iter()
+            .map(|mutation| mutation.place().root().to_string())
+            .collect();
         // Cascade: symbolic values referring to havocked names die too.
         loop {
             let mut grew = false;
@@ -4147,7 +6614,14 @@ impl<'a> Generator<'a> {
                                         LenFact::Eq(prior)
                                     }
                                 }
-                                _ => LenFact::Skip,
+                                Val::Int(_)
+                                | Val::Prop(_)
+                                | Val::Opt(_)
+                                | Val::Obj(_)
+                                | Val::Record(_)
+                                | Val::View(_)
+                                | Val::Ptr(_)
+                                | Val::Unit => LenFact::Skip,
                             };
                             let ty = fld.ty.clone();
                             let base = format!("self_{}", fld.name);
@@ -4257,7 +6731,17 @@ impl<'a> Generator<'a> {
                             LenFact::Eq(prior)
                         }
                     }
-                    _ => LenFact::Skip,
+                    Some(
+                        Val::Int(_)
+                        | Val::Prop(_)
+                        | Val::Opt(_)
+                        | Val::Obj(_)
+                        | Val::Record(_)
+                        | Val::View(_)
+                        | Val::Ptr(_)
+                        | Val::Unit,
+                    )
+                    | None => LenFact::Skip,
                 }
             };
             let value = self.fresh_state_for(&ty, name, name, len);
@@ -4265,7 +6749,18 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn eval(&mut self, e: &Expr) -> Val {
+    fn eval(&mut self, e: &Expr, scope: ScopeId) -> Val {
+        if !self.consume_expression_trap_sites(scope, e) {
+            return refused_expression_value(e);
+        }
+        self.eval_after_trap_lookup(e, scope)
+    }
+
+    /// Translate an expression whose direct source trap edge has already
+    /// been consumed. Recursive calls go through [`Generator::eval`] (or
+    /// [`Generator::eval_prop`]) so every child consumes its own direct site
+    /// only when source evaluation reaches it.
+    fn eval_after_trap_lookup(&mut self, e: &Expr, scope: ScopeId) -> Val {
         match &e.kind {
             ExprKind::IntLit(n) => {
                 let v = if *n < 0 {
@@ -4296,7 +6791,7 @@ impl<'a> Generator<'a> {
                 Val::Int(format!("({arr}.len)"))
             }
             ExprKind::IsSome { operand } => {
-                let Val::Opt(o) = self.eval(operand) else {
+                let Val::Opt(o) = self.eval(operand, scope) else {
                     unreachable!()
                 };
                 Val::Prop(format!("({o} ≠ none)"))
@@ -4304,7 +6799,7 @@ impl<'a> Generator<'a> {
             ExprKind::OptValue { operand } => {
                 // Junk-on-none like `Seq.get` off-range; the someness VC
                 // keeps verified code away from the junk (ADR 0008).
-                let Val::Opt(o) = self.eval(operand) else {
+                let Val::Opt(o) = self.eval(operand, scope) else {
                     unreachable!()
                 };
                 let goal = format!("({o}) ≠ none");
@@ -4349,6 +6844,14 @@ impl<'a> Generator<'a> {
                 option,
                 option_span,
             } => {
+                let effect = self.checked_option_take(e, option, *option_span);
+                if !effect.source.is_root() {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.option_take_place: checked option take names unsupported projected place `{}`",
+                        effect.source.render()
+                    ));
+                }
+                let source = effect.source.root().to_string();
                 // This is a single ownership transition in the symbolic
                 // state: snapshot the old option, require presence, then
                 // clear the source before handing the payload to the new
@@ -4356,7 +6859,7 @@ impl<'a> Generator<'a> {
                 // in which both names own the same sequence.
                 let Val::Opt(old_option) = self
                     .env
-                    .get(option)
+                    .get(&source)
                     .cloned()
                     .expect("checked: affine-option take source is initialized")
                 else {
@@ -4365,20 +6868,15 @@ impl<'a> Generator<'a> {
                 let goal = format!("({old_option}) ≠ none");
                 let ob = self.obligation(
                     &format!("{}.option_take.{}", self.fname, slug(self.src(e.span))),
-                    format!("`{}.take` must hold an owned value here", option),
-                    option_span.join(e.span),
+                    format!("`{}.take` must hold an owned value here", source),
+                    effect.source_span.join(e.span),
                     goal.clone(),
                 );
                 self.push_obligation(ob);
                 self.assume_fact(&goal);
-                let payload = self
-                    .var_tys
-                    .get(option)
-                    .and_then(|ty| ty.as_affine_option_payload())
-                    .cloned()
-                    .expect("checked: affine-option take source type");
+                let payload = effect.payload;
                 let reset = format!("(none : {})", lean_option_ty(&payload, self.classes));
-                self.env.insert(option.clone(), Val::Opt(reset));
+                self.env.insert(source, Val::Opt(reset));
                 match payload {
                     // The array payload has a spellable junk default, and
                     // the proven presence keeps every reader away from it.
@@ -4401,7 +6899,17 @@ impl<'a> Generator<'a> {
                         );
                         taken
                     }
-                    _ => {
+                    Ty::Int(_)
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Record(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit => {
                         refuse_vc_type(format!(
                             "internal.vcgen.type_error: `.take` has no extraction model \
                              for this payload in {}",
@@ -4411,9 +6919,9 @@ impl<'a> Generator<'a> {
                     }
                 }
             }
-            ExprKind::Widen { arg, .. } => self.eval(arg),
+            ExprKind::Widen { arg, .. } => self.eval(arg, scope),
             ExprKind::Narrow { target, arg } => {
-                let Val::Int(v) = self.eval(arg) else {
+                let Val::Int(v) = self.eval(arg, scope) else {
                     unreachable!()
                 };
                 let goal = self.r_prop(&v, *target);
@@ -4432,7 +6940,14 @@ impl<'a> Generator<'a> {
                 Val::Int(v)
             }
             ExprKind::SomeE(inner) => {
-                let value = match self.eval(inner) {
+                let evaluated = self.eval(inner, scope);
+                if e.ty.as_ref().is_some_and(Ty::is_affine_option) {
+                    let _transfer = self.checked_value_transfer(
+                        inner,
+                        crate::ownership::ValueTransferSink::OptionPayload,
+                    );
+                }
+                let value = match evaluated {
                     Val::Int(v) | Val::Ptr(v) | Val::Arr(v) => v,
                     Val::Prop(p) => lean_bool_value(&p),
                     // A nested inner option is one chain; `some (...)`
@@ -4454,7 +6969,20 @@ impl<'a> Generator<'a> {
                 let ty = match &e.ty {
                     Some(Ty::Option(element)) => lean_option_ty(element, self.classes),
                     Some(Ty::OptionRaw(_)) => "Option Sable.RawPtr".into(),
-                    _ => unreachable!("checked: contextual none has an option type"),
+                    Some(
+                        Ty::Int(_)
+                        | Ty::Bool
+                        | Ty::Param(_)
+                        | Ty::Class(_)
+                        | Ty::Record(_)
+                        | Ty::Array(_)
+                        | Ty::Res(_)
+                        | Ty::Raw(_)
+                        | Ty::RawRecord(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit,
+                    )
+                    | None => unreachable!("checked: contextual none has an option type"),
                 };
                 Val::Opt(format!("(none : {ty})"))
             }
@@ -4465,24 +6993,29 @@ impl<'a> Generator<'a> {
             // that is a checker fact with no VC (ADR 0026).
             ExprKind::RawOp { op, args, .. } => {
                 let hint = self.name_hint.take();
+                let values: Vec<Val> = args
+                    .iter()
+                    .map(|argument| self.eval(argument, scope))
+                    .collect();
+                let checked = self.checked_sealed_operation(CheckedSealedTarget::Raw(*op), e, args);
                 match op {
                     RawOp::Offset => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::Int(d) = self.eval(&args[1]) else {
+                        let Val::Int(d) = values[1].clone() else {
                             unreachable!("checked: u64")
                         };
                         Val::Ptr(format!("(Sable.RawPtr.add {p} {d})"))
                     }
                     RawOp::CastRecord(_) => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
                         Val::Ptr(p)
                     }
                     RawOp::PointerOffsetRecord(_) => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw record pointer")
                         };
                         let value = format!("({p}).off");
@@ -4498,10 +7031,10 @@ impl<'a> Generator<'a> {
                         Val::Int(value)
                     }
                     RawOp::Load8 => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(m) = self.eval(&args[1]) else {
+                        let Val::View(m) = values[1].clone() else {
                             unreachable!("checked: span borrow")
                         };
                         let k = format!("(({p}).off - ({m}).off)");
@@ -4531,13 +7064,13 @@ impl<'a> Generator<'a> {
                         Val::Int(b)
                     }
                     RawOp::Store8 => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::Int(w) = self.eval(&args[1]) else {
+                        let Val::Int(w) = values[1].clone() else {
                             unreachable!("checked: u8")
                         };
-                        let Val::View(m) = self.eval(&args[2]) else {
+                        let Val::View(m) = values[2].clone() else {
                             unreachable!("checked: span borrow")
                         };
                         let k = format!("(({p}).off - ({m}).off)");
@@ -4548,7 +7081,7 @@ impl<'a> Generator<'a> {
                             format!("Sable.SpanView.namesByte ({m}) ({p}) {k}"),
                         );
                         self.push_obligation(ob);
-                        let mname = sealed_borrow_root(&args[2], op.name());
+                        let mname = sealed_borrow_root(&checked, 2);
                         let m2 = self.hinted_sym("_view", Some(mname.clone()));
                         self.binders
                             .push((m2.clone(), ResKind::RawSpan.view_ty().into()));
@@ -4574,19 +7107,19 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     RawOp::Copy => {
-                        let Val::Ptr(sp) = self.eval(&args[0]) else {
+                        let Val::Ptr(sp) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::Ptr(dp) = self.eval(&args[1]) else {
+                        let Val::Ptr(dp) = values[1].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::Int(n) = self.eval(&args[2]) else {
+                        let Val::Int(n) = values[2].clone() else {
                             unreachable!("checked: u64")
                         };
-                        let Val::View(sm) = self.eval(&args[3]) else {
+                        let Val::View(sm) = values[3].clone() else {
                             unreachable!("checked: span borrow")
                         };
-                        let Val::View(dm) = self.eval(&args[4]) else {
+                        let Val::View(dm) = values[4].clone() else {
                             unreachable!("checked: span borrow")
                         };
                         // Both pointers must sit at their span's start and
@@ -4614,7 +7147,7 @@ impl<'a> Generator<'a> {
                             ),
                         );
                         self.push_obligation(ob);
-                        let dname = sealed_borrow_root(&args[4], op.name());
+                        let dname = sealed_borrow_root(&checked, 4);
                         let d2 = self.hinted_sym("_view", Some(dname.clone()));
                         self.binders
                             .push((d2.clone(), ResKind::RawSpan.view_ty().into()));
@@ -4639,16 +7172,14 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     RawOp::IntoCellU64 => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(m) = self.eval(&args[1]) else {
+                        let Val::View(m) = values[1].clone() else {
                             unreachable!("checked: span value")
                         };
-                        let leased = matches!(
-                            vc_resource_kind(&self.var_tys, &args[1]),
-                            Some(ResKind::BlockLease)
-                        );
+                        let leased =
+                            matches!(sealed_resource_kind(&checked, 1), Some(ResKind::BlockLease));
                         let bytes = if leased {
                             format!("({m}).span")
                         } else {
@@ -4686,14 +7217,14 @@ impl<'a> Generator<'a> {
                         Val::View(c)
                     }
                     RawOp::FromCellU64 => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(c) = self.eval(&args[1]) else {
+                        let Val::View(c) = values[1].clone() else {
                             unreachable!("checked: cell value")
                         };
                         let leased = matches!(
-                            vc_resource_kind(&self.var_tys, &args[1]),
+                            sealed_resource_kind(&checked, 1),
                             Some(ResKind::LeasedPointsToU64)
                         );
                         let cell = if leased {
@@ -4738,17 +7269,17 @@ impl<'a> Generator<'a> {
                         Val::View(m)
                     }
                     RawOp::CellInitU64 => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::Int(w) = self.eval(&args[1]) else {
+                        let Val::Int(w) = values[1].clone() else {
                             unreachable!("checked: u64")
                         };
-                        let Val::View(c) = self.eval(&args[2]) else {
+                        let Val::View(c) = values[2].clone() else {
                             unreachable!("checked: cell borrow")
                         };
                         let leased = matches!(
-                            vc_resource_kind(&self.var_tys, &args[2]),
+                            sealed_resource_kind(&checked, 2),
                             Some(ResKind::LeasedPointsToU64)
                         );
                         let cell = if leased {
@@ -4769,7 +7300,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let name = sealed_borrow_root(&args[2], op.name());
+                        let name = sealed_borrow_root(&checked, 2);
                         let c2 = self.hinted_sym("_cell", Some(name.clone()));
                         let kind = if leased {
                             ResKind::LeasedPointsToU64
@@ -4789,14 +7320,14 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     RawOp::CellReadU64 | RawOp::CellTakeU64 => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(c) = self.eval(&args[1]) else {
+                        let Val::View(c) = values[1].clone() else {
                             unreachable!("checked: cell borrow")
                         };
                         let leased = matches!(
-                            vc_resource_kind(&self.var_tys, &args[1]),
+                            sealed_resource_kind(&checked, 1),
                             Some(ResKind::LeasedPointsToU64)
                         );
                         let cell = if leased {
@@ -4834,7 +7365,7 @@ impl<'a> Generator<'a> {
                             range_prop(&value, IntTy::U64),
                         );
                         if matches!(op, RawOp::CellTakeU64) {
-                            let name = sealed_borrow_root(&args[1], op.name());
+                            let name = sealed_borrow_root(&checked, 1);
                             let c2 = self.hinted_sym("_cell", Some(name.clone()));
                             let kind = if leased {
                                 ResKind::LeasedPointsToU64
@@ -4855,14 +7386,14 @@ impl<'a> Generator<'a> {
                         Val::Int(value)
                     }
                     RawOp::CellDropU64 => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(c) = self.eval(&args[1]) else {
+                        let Val::View(c) = values[1].clone() else {
                             unreachable!("checked: cell borrow")
                         };
                         let leased = matches!(
-                            vc_resource_kind(&self.var_tys, &args[1]),
+                            sealed_resource_kind(&checked, 1),
                             Some(ResKind::LeasedPointsToU64)
                         );
                         let cell = if leased {
@@ -4882,7 +7413,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let name = sealed_borrow_root(&args[1], op.name());
+                        let name = sealed_borrow_root(&checked, 1);
                         let c2 = self.hinted_sym("_cell", Some(name.clone()));
                         let kind = if leased {
                             ResKind::LeasedPointsToU64
@@ -4902,10 +7433,10 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     RawOp::IntoCellRecord(ri) => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw record pointer")
                         };
-                        let Val::View(bytes) = self.eval(&args[1]) else {
+                        let Val::View(bytes) = values[1].clone() else {
                             unreachable!("checked: raw span value")
                         };
                         let record = lean_record_name(&self.records[*ri].name);
@@ -4941,10 +7472,10 @@ impl<'a> Generator<'a> {
                         Val::View(cell)
                     }
                     RawOp::FromCellRecord(ri) => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw record pointer")
                         };
-                        let Val::View(cell) = self.eval(&args[1]) else {
+                        let Val::View(cell) = values[1].clone() else {
                             unreachable!("checked: record cell value")
                         };
                         let record = lean_record_name(&self.records[*ri].name);
@@ -4977,13 +7508,13 @@ impl<'a> Generator<'a> {
                         Val::View(bytes)
                     }
                     RawOp::CellInitRecord(ri) => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw record pointer")
                         };
-                        let Val::Record(value) = self.eval(&args[1]) else {
+                        let Val::Record(value) = values[1].clone() else {
                             unreachable!("checked: record value")
                         };
-                        let Val::View(cell) = self.eval(&args[2]) else {
+                        let Val::View(cell) = values[2].clone() else {
                             unreachable!("checked: record cell borrow")
                         };
                         let record = lean_record_name(&self.records[*ri].name);
@@ -5002,7 +7533,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let name = sealed_borrow_root(&args[2], op.name());
+                        let name = sealed_borrow_root(&checked, 2);
                         let next = self.hinted_sym("_cell", Some(name.clone()));
                         self.binders.push((
                             next.clone(),
@@ -5024,10 +7555,10 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     RawOp::CellReadRecord(ri) | RawOp::CellTakeRecord(ri) => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw record pointer")
                         };
-                        let Val::View(cell) = self.eval(&args[1]) else {
+                        let Val::View(cell) = values[1].clone() else {
                             unreachable!("checked: record cell borrow")
                         };
                         let taking = matches!(op, RawOp::CellTakeRecord(_));
@@ -5059,7 +7590,7 @@ impl<'a> Generator<'a> {
                             format!("{record}.wf {value}"),
                         );
                         if taking {
-                            let name = sealed_borrow_root(&args[1], op.name());
+                            let name = sealed_borrow_root(&checked, 1);
                             let next = self.hinted_sym("_cell", Some(name.clone()));
                             self.binders.push((
                                 next.clone(),
@@ -5082,10 +7613,10 @@ impl<'a> Generator<'a> {
                         Val::Record(value)
                     }
                     RawOp::CellDropRecord(ri) => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw record pointer")
                         };
-                        let Val::View(cell) = self.eval(&args[1]) else {
+                        let Val::View(cell) = values[1].clone() else {
                             unreachable!("checked: record cell borrow")
                         };
                         let goal = format!(
@@ -5103,7 +7634,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let name = sealed_borrow_root(&args[1], op.name());
+                        let name = sealed_borrow_root(&checked, 1);
                         let next = self.hinted_sym("_cell", Some(name.clone()));
                         let record = lean_record_name(&self.records[*ri].name);
                         self.binders.push((
@@ -5126,10 +7657,10 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     RawOp::IntoFreeHeader => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(block) = self.eval(&args[1]) else {
+                        let Val::View(block) = values[1].clone() else {
                             unreachable!("checked: free block value")
                         };
                         let goal = format!(
@@ -5160,10 +7691,10 @@ impl<'a> Generator<'a> {
                         Val::View(header)
                     }
                     RawOp::FromFreeHeader => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(header) = self.eval(&args[1]) else {
+                        let Val::View(header) = values[1].clone() else {
                             unreachable!("checked: free header value")
                         };
                         let goal = format!(
@@ -5195,16 +7726,16 @@ impl<'a> Generator<'a> {
                         Val::View(block)
                     }
                     RawOp::HeaderInit => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::Int(size) = self.eval(&args[1]) else {
+                        let Val::Int(size) = values[1].clone() else {
                             unreachable!("checked: u64 size")
                         };
-                        let Val::Int(next) = self.eval(&args[2]) else {
+                        let Val::Int(next) = values[2].clone() else {
                             unreachable!("checked: u64 next")
                         };
-                        let Val::View(header) = self.eval(&args[3]) else {
+                        let Val::View(header) = values[3].clone() else {
                             unreachable!("checked: free header borrow")
                         };
                         let goal = format!(
@@ -5225,7 +7756,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let name = sealed_borrow_root(&args[3], op.name());
+                        let name = sealed_borrow_root(&checked, 3);
                         let h2 = self.hinted_sym("_header", Some(name.clone()));
                         self.binders
                             .push((h2.clone(), ResKind::FreeHeader.view_ty().into()));
@@ -5243,10 +7774,10 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     RawOp::HeaderSize | RawOp::HeaderNext => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(header) = self.eval(&args[1]) else {
+                        let Val::View(header) = values[1].clone() else {
                             unreachable!("checked: free header borrow")
                         };
                         let is_size = matches!(op, RawOp::HeaderSize);
@@ -5284,10 +7815,10 @@ impl<'a> Generator<'a> {
                         Val::Int(value)
                     }
                     RawOp::HeaderClear => {
-                        let Val::Ptr(p) = self.eval(&args[0]) else {
+                        let Val::Ptr(p) = values[0].clone() else {
                             unreachable!("checked: raw<u8>")
                         };
-                        let Val::View(header) = self.eval(&args[1]) else {
+                        let Val::View(header) = values[1].clone() else {
                             unreachable!("checked: free header borrow")
                         };
                         let goal = format!(
@@ -5305,7 +7836,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let name = sealed_borrow_root(&args[1], op.name());
+                        let name = sealed_borrow_root(&checked, 1);
                         let h2 = self.hinted_sym("_header", Some(name.clone()));
                         self.binders
                             .push((h2.clone(), ResKind::FreeHeader.view_ty().into()));
@@ -5324,12 +7855,18 @@ impl<'a> Generator<'a> {
             }
             ExprKind::DeviceOp { op, args, .. } => {
                 let hint = self.name_hint.take();
+                let values: Vec<Val> = args
+                    .iter()
+                    .map(|argument| self.eval(argument, scope))
+                    .collect();
+                let checked =
+                    self.checked_sealed_operation(CheckedSealedTarget::Device(*op), e, args);
                 match op {
                     DeviceOp::UartStatus => {
-                        let Val::View(old) = self.eval(&args[0]) else {
+                        let Val::View(old) = values[0].clone() else {
                             unreachable!("checked: UART borrow")
                         };
-                        let name = sealed_borrow_root(&args[0], op.name());
+                        let name = sealed_borrow_root(&checked, 0);
                         let status = self.hinted_sym("_uart_status", hint);
                         self.binders.push((status.clone(), "Int".into()));
                         self.push_hyp_unique(
@@ -5355,10 +7892,10 @@ impl<'a> Generator<'a> {
                         Val::Int(status)
                     }
                     DeviceOp::UartWrite => {
-                        let Val::Int(byte) = self.eval(&args[0]) else {
+                        let Val::Int(byte) = values[0].clone() else {
                             unreachable!("checked: UART byte")
                         };
-                        let Val::View(old) = self.eval(&args[1]) else {
+                        let Val::View(old) = values[1].clone() else {
                             unreachable!("checked: UART borrow")
                         };
                         let ready = format!("({old}).ready = true");
@@ -5370,7 +7907,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&ready);
-                        let name = sealed_borrow_root(&args[1], op.name());
+                        let name = sealed_borrow_root(&checked, 1);
                         let next = self.hinted_sym("_uart", Some(name.clone()));
                         self.binders
                             .push((next.clone(), ResKind::Uart.view_ty().into()));
@@ -5395,15 +7932,21 @@ impl<'a> Generator<'a> {
             // about how views relate.
             ExprKind::ResOp { op, args, .. } => {
                 let hint = self.name_hint.take();
+                let values: Vec<Val> = args
+                    .iter()
+                    .map(|argument| self.eval(argument, scope))
+                    .collect();
+                let checked =
+                    self.checked_sealed_operation(CheckedSealedTarget::Resource(*op), e, args);
                 match op {
                     // `split_off(&mut whole, n)`: the prefix stays, the
                     // suffix leaves. `whole` is rebound to the prefix
                     // view, exactly as any `&mut` argument is rebound.
                     ResOp::SplitOff => {
-                        let Val::View(whole) = self.eval(&args[0]) else {
+                        let Val::View(whole) = values[0].clone() else {
                             unreachable!("checked: span borrow")
                         };
-                        let Val::Int(n) = self.eval(&args[1]) else {
+                        let Val::Int(n) = values[1].clone() else {
                             unreachable!("checked: u64 count")
                         };
                         let goal = format!("0 ≤ {n} ∧ {n} ≤ ({whole}).len");
@@ -5415,7 +7958,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let prefix = self.hinted_sym("_view", Some(array.clone()));
                         self.binders
                             .push((prefix.clone(), ResKind::RawSpan.view_ty().into()));
@@ -5452,10 +7995,10 @@ impl<'a> Generator<'a> {
                     // failed VC and not a checker error — the checker has
                     // no idea where a span sits.
                     ResOp::Join => {
-                        let Val::View(a) = self.eval(&args[0]) else {
+                        let Val::View(a) = values[0].clone() else {
                             unreachable!("checked: span value")
                         };
-                        let Val::View(b) = self.eval(&args[1]) else {
+                        let Val::View(b) = values[1].clone() else {
                             unreachable!("checked: span value")
                         };
                         let goal = format!(
@@ -5492,10 +8035,10 @@ impl<'a> Generator<'a> {
                     // twice. Affinity governs one token; this is what
                     // stops a second token being minted beside it.
                     ResOp::OpenFileOf => {
-                        let Val::View(w) = self.eval(&args[0]) else {
+                        let Val::View(w) = values[0].clone() else {
                             unreachable!("checked: world borrow")
                         };
-                        let Val::Int(fd) = self.eval(&args[1]) else {
+                        let Val::Int(fd) = values[1].clone() else {
                             unreachable!("checked: i32 descriptor")
                         };
                         let goal = format!("Sable.PosixWorldView.available ({w}) {fd}");
@@ -5509,7 +8052,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let w2 = self.hinted_sym("_world", Some(array.clone()));
                         self.binders
                             .push((w2.clone(), ResKind::PosixWorld.view_ty().into()));
@@ -5532,7 +8075,7 @@ impl<'a> Generator<'a> {
                     // out, and the *view* says nothing about it — no
                     // contract can predict a short read.
                     ResOp::TestWorld => {
-                        let Val::Int(_script) = self.eval(&args[0]) else {
+                        let Val::Int(_script) = values[0].clone() else {
                             unreachable!("checked: u64 script")
                         };
                         let w = self.hinted_sym("_world", hint);
@@ -5552,7 +8095,7 @@ impl<'a> Generator<'a> {
                         Val::View(w)
                     }
                     ResOp::TestUart => {
-                        let Val::Int(_script) = self.eval(&args[0]) else {
+                        let Val::Int(_script) = values[0].clone() else {
                             unreachable!("checked: u64 script")
                         };
                         let uart = self.hinted_sym("_uart", hint);
@@ -5564,13 +8107,14 @@ impl<'a> Generator<'a> {
                         Val::View(uart)
                     }
                     ResOp::ResourceMapEmpty => {
-                        let Some(Ty::Res(
+                        let Ty::Res(
                             map_kind @ (ResKind::ResourceMapPointsToU64
                             | ResKind::ResourceMapPointsToRecord(_)),
-                        )) = e.ty
+                        ) = &checked.result_ty
                         else {
                             unreachable!("checked: resource-map result type")
                         };
+                        let map_kind = *map_kind;
                         let map = self.hinted_sym("_resource_map", hint);
                         self.binders
                             .push((map.clone(), lean_res_view_ty(map_kind, self.records)));
@@ -5589,19 +8133,30 @@ impl<'a> Generator<'a> {
                         let Some(
                             map_kind @ (ResKind::ResourceMapPointsToU64
                             | ResKind::ResourceMapPointsToRecord(_)),
-                        ) = vc_resource_kind(&self.var_tys, &args[0])
+                        ) = sealed_resource_kind(&checked, 0)
                         else {
                             unreachable!("checked: resource-map borrow")
                         };
                         let cell_kind = match map_kind {
                             ResKind::ResourceMapPointsToU64 => ResKind::PointsToU64,
                             ResKind::ResourceMapPointsToRecord(ri) => ResKind::PointsToRecord(ri),
-                            _ => unreachable!(),
+                            ResKind::RawSpan
+                            | ResKind::PointsToU64
+                            | ResKind::PointsToRecord(_)
+                            | ResKind::OpenFile
+                            | ResKind::PosixWorld
+                            | ResKind::Uart
+                            | ResKind::SystemDealloc
+                            | ResKind::AllocatorState
+                            | ResKind::BlockLease
+                            | ResKind::LeasedPointsToU64
+                            | ResKind::FreeBlock
+                            | ResKind::FreeHeader => unreachable!(),
                         };
-                        let Val::View(map) = self.eval(&args[0]) else {
+                        let Val::View(map) = values[0].clone() else {
                             unreachable!("checked: resource map borrow")
                         };
-                        let Val::Int(key) = self.eval(&args[1]) else {
+                        let Val::Int(key) = values[1].clone() else {
                             unreachable!("checked: u64 key")
                         };
                         let goal = match map_kind {
@@ -5611,7 +8166,18 @@ impl<'a> Generator<'a> {
                             ResKind::ResourceMapPointsToRecord(_) => {
                                 format!("∃ cell, ({map}).entries {key} = some cell")
                             }
-                            _ => unreachable!(),
+                            ResKind::RawSpan
+                            | ResKind::PointsToU64
+                            | ResKind::PointsToRecord(_)
+                            | ResKind::OpenFile
+                            | ResKind::PosixWorld
+                            | ResKind::Uart
+                            | ResKind::SystemDealloc
+                            | ResKind::AllocatorState
+                            | ResKind::BlockLease
+                            | ResKind::LeasedPointsToU64
+                            | ResKind::FreeBlock
+                            | ResKind::FreeHeader => unreachable!(),
                         };
                         let ob = self.obligation(
                             &format!("{}.resource_map_take.{}", self.fname, slug(&key)),
@@ -5621,7 +8187,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let residual = self.hinted_sym("_resource_map", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), lean_res_view_ty(map_kind, self.records)));
@@ -5660,17 +8226,17 @@ impl<'a> Generator<'a> {
                         let Some(
                             map_kind @ (ResKind::ResourceMapPointsToU64
                             | ResKind::ResourceMapPointsToRecord(_)),
-                        ) = vc_resource_kind(&self.var_tys, &args[0])
+                        ) = sealed_resource_kind(&checked, 0)
                         else {
                             unreachable!("checked: resource-map borrow")
                         };
-                        let Val::View(map) = self.eval(&args[0]) else {
+                        let Val::View(map) = values[0].clone() else {
                             unreachable!("checked: resource map borrow")
                         };
-                        let Val::Int(key) = self.eval(&args[1]) else {
+                        let Val::Int(key) = values[1].clone() else {
                             unreachable!("checked: u64 key")
                         };
-                        let Val::View(cell) = self.eval(&args[2]) else {
+                        let Val::View(cell) = values[2].clone() else {
                             unreachable!("checked: points-to value")
                         };
                         let goal = format!("({map}).entries {key} = none");
@@ -5682,7 +8248,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let restored = self.hinted_sym("_resource_map", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), lean_res_view_ty(map_kind, self.records)));
@@ -5704,7 +8270,7 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     ResOp::AllocatorCreate => {
-                        let Val::View(root) = self.eval(&args[0]) else {
+                        let Val::View(root) = values[0].clone() else {
                             unreachable!("checked: raw span value")
                         };
                         let goal = format!("({root}).off = 0 ∧ 0 < ({root}).len");
@@ -5741,7 +8307,7 @@ impl<'a> Generator<'a> {
                         Val::View(state)
                     }
                     ResOp::AllocatorDestroy => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state value")
                         };
                         let goal = format!("Sable.AllocatorView.complete ({state})");
@@ -5780,10 +8346,10 @@ impl<'a> Generator<'a> {
                         Val::View(root)
                     }
                     ResOp::AllocatorTake => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state borrow")
                         };
-                        let Val::Int(key) = self.eval(&args[1]) else {
+                        let Val::Int(key) = values[1].clone() else {
                             unreachable!("checked: u64 key")
                         };
                         let goal = format!("Sable.AllocatorView.canTake ({state}) {key}");
@@ -5795,7 +8361,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5818,10 +8384,10 @@ impl<'a> Generator<'a> {
                         Val::View(lease)
                     }
                     ResOp::AllocatorPut => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state borrow")
                         };
-                        let Val::View(lease) = self.eval(&args[1]) else {
+                        let Val::View(lease) = values[1].clone() else {
                             unreachable!("checked: block lease value")
                         };
                         let goal = format!("Sable.AllocatorView.canPut ({state}) ({lease})");
@@ -5834,7 +8400,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5846,10 +8412,10 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     ResOp::AllocatorTakeFree => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state borrow")
                         };
-                        let Val::Int(key) = self.eval(&args[1]) else {
+                        let Val::Int(key) = values[1].clone() else {
                             unreachable!("checked: u64 key")
                         };
                         let goal = format!("Sable.AllocatorView.canTakeFree ({state}) {key}");
@@ -5861,7 +8427,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5892,10 +8458,10 @@ impl<'a> Generator<'a> {
                         Val::View(block)
                     }
                     ResOp::AllocatorPutFree => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state borrow")
                         };
-                        let Val::View(block) = self.eval(&args[1]) else {
+                        let Val::View(block) = values[1].clone() else {
                             unreachable!("checked: free block value")
                         };
                         let goal = format!("Sable.AllocatorView.canPutFree ({state}) ({block})");
@@ -5908,7 +8474,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5934,10 +8500,10 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     ResOp::AllocatorTakeHeader => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state borrow")
                         };
-                        let Val::Int(key) = self.eval(&args[1]) else {
+                        let Val::Int(key) = values[1].clone() else {
                             unreachable!("checked: u64 key")
                         };
                         let goal = format!("Sable.AllocatorView.canTakeHeader ({state}) {key}");
@@ -5949,7 +8515,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -5976,13 +8542,13 @@ impl<'a> Generator<'a> {
                         Val::View(header)
                     }
                     ResOp::AllocatorStepHeader => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state borrow")
                         };
-                        let Val::Int(limit) = self.eval(&args[1]) else {
+                        let Val::Int(limit) = values[1].clone() else {
                             unreachable!("checked: u64 limit")
                         };
-                        let Val::Int(key) = self.eval(&args[2]) else {
+                        let Val::Int(key) = values[2].clone() else {
                             unreachable!("checked: u64 key")
                         };
                         let goal = format!(
@@ -5998,7 +8564,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let residual = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((residual.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -6025,10 +8591,10 @@ impl<'a> Generator<'a> {
                         Val::View(header)
                     }
                     ResOp::AllocatorPutHeader => {
-                        let Val::View(state) = self.eval(&args[0]) else {
+                        let Val::View(state) = values[0].clone() else {
                             unreachable!("checked: allocator state borrow")
                         };
-                        let Val::View(header) = self.eval(&args[1]) else {
+                        let Val::View(header) = values[1].clone() else {
                             unreachable!("checked: free header value")
                         };
                         let goal = format!("Sable.AllocatorView.canPutHeader ({state}) ({header})");
@@ -6041,7 +8607,7 @@ impl<'a> Generator<'a> {
                         );
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let restored = self.hinted_sym("_allocator_view", Some(array.clone()));
                         self.binders
                             .push((restored.clone(), ResKind::AllocatorState.view_ty().into()));
@@ -6067,10 +8633,10 @@ impl<'a> Generator<'a> {
                         Val::Unit
                     }
                     ResOp::FreeBlockSplit => {
-                        let Val::View(block) = self.eval(&args[0]) else {
+                        let Val::View(block) = values[0].clone() else {
                             unreachable!("checked: free block borrow")
                         };
-                        let Val::Int(n) = self.eval(&args[1]) else {
+                        let Val::Int(n) = values[1].clone() else {
                             unreachable!("checked: u64 split")
                         };
                         let goal = format!("0 < {n} ∧ {n} < ({block}).span.len");
@@ -6088,7 +8654,7 @@ impl<'a> Generator<'a> {
                         ob.hyps.retain(|(name, _)| !name.ends_with("_owner"));
                         self.push_obligation(ob);
                         self.assume_fact(&goal);
-                        let array = sealed_borrow_root(&args[0], op.name());
+                        let array = sealed_borrow_root(&checked, 0);
                         let prefix = self.hinted_sym("_free", Some(array.clone()));
                         self.binders
                             .push((prefix.clone(), ResKind::FreeBlock.view_ty().into()));
@@ -6125,10 +8691,10 @@ impl<'a> Generator<'a> {
                         Val::View(suffix)
                     }
                     ResOp::FreeBlockJoin => {
-                        let Val::View(left) = self.eval(&args[0]) else {
+                        let Val::View(left) = values[0].clone() else {
                             unreachable!("checked: free block value")
                         };
-                        let Val::View(right) = self.eval(&args[1]) else {
+                        let Val::View(right) = values[1].clone() else {
                             unreachable!("checked: free block value")
                         };
                         let goal = format!("Sable.FreeBlockView.joinable ({left}) ({right})");
@@ -6158,7 +8724,7 @@ impl<'a> Generator<'a> {
                         Val::View(joined)
                     }
                     ResOp::FreeBlockLease => {
-                        let Val::View(block) = self.eval(&args[0]) else {
+                        let Val::View(block) = values[0].clone() else {
                             unreachable!("checked: free block value")
                         };
                         let lease = self.hinted_sym("_lease", hint);
@@ -6182,7 +8748,7 @@ impl<'a> Generator<'a> {
                         Val::View(lease)
                     }
                     ResOp::BlockLeaseFree => {
-                        let Val::View(lease) = self.eval(&args[0]) else {
+                        let Val::View(lease) = values[0].clone() else {
                             unreachable!("checked: block lease value")
                         };
                         let goal =
@@ -6223,14 +8789,30 @@ impl<'a> Generator<'a> {
                 }
                 let base = match self.env.get(array.as_str()) {
                     Some(Val::Obj(chain)) => Some(chain.clone()),
-                    _ => None,
+                    Some(
+                        Val::Int(_)
+                        | Val::Prop(_)
+                        | Val::Opt(_)
+                        | Val::Arr(_)
+                        | Val::Record(_)
+                        | Val::View(_)
+                        | Val::Ptr(_)
+                        | Val::Unit,
+                    )
+                    | None => None,
                 };
                 // A field borrow names the field's own place; whether
                 // that place is an object or an array is what the
                 // checker recorded on the expression (ADR 0020).
                 let place = |v: String| match &e.ty {
-                    Some(ty) if ty.as_array().is_some() => Val::Arr(v),
-                    _ => Val::Obj(v),
+                    Some(ty) => {
+                        if checked_array_payload(ty).is_some() {
+                            Val::Arr(v)
+                        } else {
+                            Val::Obj(v)
+                        }
+                    }
+                    None => Val::Obj(v),
                 };
                 match (base, field) {
                     // `&x.f` — the borrowed place is the field, not the
@@ -6241,7 +8823,17 @@ impl<'a> Generator<'a> {
                         // `&self.f` inside a member.
                         let selfv = match self.env.get("self") {
                             Some(Val::Obj(chain)) => chain.clone(),
-                            _ => "self".to_string(),
+                            Some(
+                                Val::Int(_)
+                                | Val::Prop(_)
+                                | Val::Opt(_)
+                                | Val::Arr(_)
+                                | Val::Record(_)
+                                | Val::View(_)
+                                | Val::Ptr(_)
+                                | Val::Unit,
+                            )
+                            | None => "self".to_string(),
                         };
                         place(project_field(&selfv, f))
                     }
@@ -6259,26 +8851,20 @@ impl<'a> Generator<'a> {
                 let h1 = self.fresh_hyp("h_lit");
                 self.hyps.push((h1, format!("({b}.len) = {}", elems.len())));
                 for (i, el) in elems.iter().enumerate() {
-                    let v = match (element.as_ref(), self.eval(el)) {
-                        (Ty::Bool, Val::Prop(prop)) => lean_bool_value(&prop),
-                        (Ty::Int(_) | Ty::Param(_), Val::Int(value)) => value,
-                        (Ty::Record(_), Val::Record(value)) => value,
-                        (payload, _) => {
-                            refuse_vc_type(format!(
-                                "internal.vcgen.lean_type_unsupported: array literal element \
+                    let v = checked_array_payload_value(element, self.eval(el, scope), |payload| {
+                        format!(
+                            "internal.vcgen.lean_type_unsupported: array literal element \
                                  `{}` has no proof value",
-                                payload.name()
-                            ));
-                            UNSUPPORTED_LEAN_VALUE.into()
-                        }
-                    };
+                            payload.name()
+                        )
+                    });
                     let h = self.fresh_hyp("h_lit");
                     self.hyps.push((h, format!("{b}.get {i} = {v}")));
                 }
                 Val::Arr(b)
             }
             ExprKind::Index { array, index, .. } => {
-                let Val::Int(i) = self.eval(index) else {
+                let Val::Int(i) = self.eval(index, scope) else {
                     unreachable!()
                 };
                 let arr = self.arr_str(array);
@@ -6309,7 +8895,15 @@ impl<'a> Generator<'a> {
                         self.assume_fact(&wf);
                         Val::Record(value)
                     }
-                    other => {
+                    other @ (Ty::Class(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit) => {
                         refuse_vc_type(format!(
                             "internal.vcgen.lean_type_unsupported: array element `{}` has no \
                              proof value",
@@ -6321,22 +8915,16 @@ impl<'a> Generator<'a> {
             }
             ExprKind::AllocArray { elem, len, init } => {
                 let hint = self.name_hint.take();
-                let Val::Int(n) = self.eval(len) else {
+                let Val::Int(n) = self.eval(len, scope) else {
                     unreachable!()
                 };
-                let v0 = match (elem.clone(), self.eval(init)) {
-                    (Ty::Bool, Val::Prop(prop)) => lean_bool_value(&prop),
-                    (Ty::Int(_) | Ty::Param(_), Val::Int(value)) => value,
-                    (Ty::Record(_), Val::Record(value)) => value,
-                    (payload, _) => {
-                        refuse_vc_type(format!(
-                            "internal.vcgen.lean_type_unsupported: array allocation initializer \
+                let v0 = checked_array_payload_value(elem, self.eval(init, scope), |payload| {
+                    format!(
+                        "internal.vcgen.lean_type_unsupported: array allocation initializer \
                              `{}` has no proof value",
-                            payload.name()
-                        ));
-                        UNSUPPORTED_LEAN_VALUE.into()
-                    }
-                };
+                        payload.name()
+                    )
+                });
                 // Allocation succeeds symbolically: failure is the named
                 // OOM trap (design §10), not a proof obligation.
                 let b = self.hinted_sym("_alloc", hint);
@@ -6389,7 +8977,19 @@ impl<'a> Generator<'a> {
                     Some(Ty::Int(_)) => Val::Int(projection),
                     Some(Ty::RawRecord(_)) => Val::Ptr(projection),
                     Some(Ty::OptionRaw(_)) => Val::Opt(projection),
-                    _ => unreachable!("checked: initial record field type"),
+                    Some(
+                        Ty::Bool
+                        | Ty::Param(_)
+                        | Ty::Class(_)
+                        | Ty::Record(_)
+                        | Ty::Array(_)
+                        | Ty::Option(_)
+                        | Ty::Res(_)
+                        | Ty::Raw(_)
+                        | Ty::Borrow(..)
+                        | Ty::Unit,
+                    )
+                    | None => unreachable!("checked: initial record field type"),
                 }
             }
             ExprKind::ClassFieldLen { obj, field } => {
@@ -6404,7 +9004,7 @@ impl<'a> Generator<'a> {
                 let Val::Obj(chain) = self.env[obj.as_str()].clone() else {
                     unreachable!("checked: class-typed receiver")
                 };
-                let Val::Int(i) = self.eval(index) else {
+                let Val::Int(i) = self.eval(index, scope) else {
                     unreachable!()
                 };
                 let arr = project_field(&chain, field);
@@ -6492,7 +9092,7 @@ impl<'a> Generator<'a> {
                 Val::Int(format!("({arr}.len)"))
             }
             ExprKind::SelfFieldIndex { field, index } => {
-                let Val::Int(i) = self.eval(index) else {
+                let Val::Int(i) = self.eval(index, scope) else {
                     unreachable!()
                 };
                 let arr = self.self_field_str(field);
@@ -6546,15 +9146,19 @@ impl<'a> Generator<'a> {
                 // the init's pres/posts exactly like fn-call array args.
                 let arg_vals: Vec<String> = args
                     .iter()
-                    .map(|a| match self.eval(a) {
-                        // Class args (by value or borrowed) substitute
-                        // as their symbolic structure value (ADR 0020).
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
-                        // Parenthesized as at a function call: dot-notation
-                        // in the init's clauses must bind the whole chain.
-                        Val::Opt(v) => format!("({v})"),
-                        Val::Prop(p) => lean_bool_value(&p),
-                        _ => unreachable!("checked: ctor args"),
+                    .map(|a| {
+                        match self.eval(a, scope) {
+                            // Class args (by value or borrowed) substitute
+                            // as their symbolic structure value (ADR 0020).
+                            Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) => v,
+                            // Parenthesized as at a function call: dot-notation
+                            // in the init's clauses must bind the whole chain.
+                            Val::Opt(v) => format!("({v})"),
+                            Val::Prop(p) => lean_bool_value(&p),
+                            Val::Record(_) | Val::Ptr(_) | Val::Unit => {
+                                unreachable!("checked: ctor args")
+                            }
+                        }
                     })
                     .collect();
                 let cd: &ClassDecl = self.class_map[class.as_str()];
@@ -6597,7 +9201,17 @@ impl<'a> Generator<'a> {
                     );
                     self.push_obligation(ob);
                 }
-                for (pname, fresh) in self.havoc_mut_borrow_args(&iparams, args) {
+                let (checked_call, symbolic_visit) = self.checked_call(
+                    CallTarget::Constructor {
+                        class: class.clone(),
+                        init: init.clone(),
+                    },
+                    e.span,
+                    &iparams,
+                    args,
+                    None,
+                );
+                for (pname, fresh) in self.havoc_mut_borrow_args(&checked_call, symbolic_visit) {
                     subst_map.insert(pname, fresh);
                 }
                 let cd: &ClassDecl = self.class_map[class.as_str()];
@@ -6642,9 +9256,16 @@ impl<'a> Generator<'a> {
                 let lean_record = lean_record_name(record);
                 let values: Vec<String> = args
                     .iter()
-                    .map(|arg| match self.eval(arg) {
+                    .map(|arg| match self.eval(arg, scope) {
                         Val::Int(v) | Val::Opt(v) | Val::Ptr(v) => format!("({v})"),
-                        _ => unreachable!("checked: raw-storable record field"),
+                        Val::Prop(_)
+                        | Val::Arr(_)
+                        | Val::Obj(_)
+                        | Val::Record(_)
+                        | Val::View(_)
+                        | Val::Unit => {
+                            unreachable!("checked: raw-storable record field")
+                        }
                     })
                     .collect();
                 let value = format!("({lean_record}.mk {})", values.join(" "));
@@ -6664,7 +9285,7 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .map(|a| {
-                        let Val::Int(v) = self.eval(a) else {
+                        let Val::Int(v) = self.eval(a, scope) else {
                             unreachable!("checked: int args")
                         };
                         v
@@ -6715,7 +9336,17 @@ impl<'a> Generator<'a> {
                             range,
                         ));
                     }
-                    _ => unreachable!("trait methods return integers for now"),
+                    Ty::Bool
+                    | Ty::Class(_)
+                    | Ty::Record(_)
+                    | Ty::Array(_)
+                    | Ty::Option(_)
+                    | Ty::OptionRaw(_)
+                    | Ty::Res(_)
+                    | Ty::Raw(_)
+                    | Ty::RawRecord(_)
+                    | Ty::Borrow(..)
+                    | Ty::Unit => unreachable!("trait methods return integers for now"),
                 }
                 for post in &m.posts {
                     let text = crate::mono::subst_clause_text(&post.text, &qual);
@@ -6732,23 +9363,33 @@ impl<'a> Generator<'a> {
                 Val::Int(ret_sym)
             }
             ExprKind::MethodCall {
-                recv, method, args, ..
+                recv,
+                recv_span,
+                method,
+                args,
+                ..
             } => {
                 let hint = self.name_hint.take();
                 let arg_vals: Vec<String> = args
                     .iter()
-                    .map(|a| match self.eval(a) {
-                        Val::Int(v) | Val::Arr(v) | Val::Obj(v) | Val::View(v) | Val::Ptr(v) => v,
-                        // Parenthesized as at a function call: dot-notation
-                        // in the callee's clauses must bind the whole chain.
-                        Val::Opt(v) => format!("({v})"),
-                        // Program booleans are propositions in symbolic
-                        // execution, while source parameters bind Lean Bool;
-                        // reify at the call boundary as at a function call.
-                        Val::Prop(p) => lean_bool_value(&p),
-                        _ => unreachable!(
-                            "checked: int/bool/option/array/class/resource/pointer args"
-                        ),
+                    .map(|a| {
+                        match self.eval(a, scope) {
+                            Val::Int(v)
+                            | Val::Arr(v)
+                            | Val::Obj(v)
+                            | Val::View(v)
+                            | Val::Ptr(v) => v,
+                            // Parenthesized as at a function call: dot-notation
+                            // in the callee's clauses must bind the whole chain.
+                            Val::Opt(v) => format!("({v})"),
+                            // Program booleans are propositions in symbolic
+                            // execution, while source parameters bind Lean Bool;
+                            // reify at the call boundary as at a function call.
+                            Val::Prop(p) => lean_bool_value(&p),
+                            Val::Record(_) | Val::Unit => unreachable!(
+                                "checked: int/bool/option/array/class/resource/pointer args"
+                            ),
+                        }
                     })
                     .collect();
                 let Some(ci) = self.var_tys.get(recv.as_str()).and_then(Ty::class_index) else {
@@ -6770,7 +9411,17 @@ impl<'a> Generator<'a> {
                     .expect("checked: method exists");
                 let cur = match self.env.get(recv.as_str()) {
                     Some(Val::Obj(s)) => s.clone(),
-                    _ => unreachable!("checked: class value"),
+                    Some(
+                        Val::Int(_)
+                        | Val::Prop(_)
+                        | Val::Opt(_)
+                        | Val::Arr(_)
+                        | Val::Record(_)
+                        | Val::View(_)
+                        | Val::Ptr(_)
+                        | Val::Unit,
+                    )
+                    | None => unreachable!("checked: class value"),
                 };
                 let mut entry_map = self.class_state_map(cd, &cur);
                 for (p, a) in m.f.params.iter().zip(arg_vals.iter()) {
@@ -6795,9 +9446,31 @@ impl<'a> Generator<'a> {
                     );
                     self.push_obligation(ob);
                 }
-                // Post-state: fresh for &mut self (invariant re-established),
-                // unchanged for &self.
-                let final_state = if m.self_kind == SelfKind::Mut {
+                let (checked_call, symbolic_visit) = self.checked_call(
+                    CallTarget::Method {
+                        class: cd.name.clone(),
+                        method: method.clone(),
+                    },
+                    e.span,
+                    &mparams,
+                    args,
+                    Some((
+                        cd.name.as_str(),
+                        Place::local(recv),
+                        if m.self_kind == SelfKind::Mut {
+                            Mutability::Mut
+                        } else {
+                            Mutability::Shared
+                        },
+                        *recv_span,
+                        Ty::Class(ci),
+                    )),
+                );
+                let receiver_effect = checked_call.receiver.as_ref().map(|r| r.transition.effect);
+                // The checker-authored receiver loan decides whether caller
+                // state changes; the method signature above is only the exact
+                // match that rejects a stale or forged handoff.
+                let final_state = if receiver_effect == Some(CallEffect::HavocUniqueBorrow) {
                     // Post-call state named after the receiver (`m_2`,
                     // `m_3`, ...) — stable and readable in discharges.
                     let b = self.hinted_sym("_obj", Some(recv.clone()));
@@ -6811,68 +9484,8 @@ impl<'a> Generator<'a> {
                 };
                 // Result symbol.
                 let ret_sym = self.hinted_sym("_r", hint);
-                match &m.f.ret {
-                    ty @ (Ty::Int(_) | Ty::Param(_)) => {
-                        self.binders.push((ret_sym.clone(), "Int".into()));
-                        let h = format!("h_{}_range", ret_sym.trim_start_matches('_'));
-                        self.hyps
-                            .push((h, self.r_prop(&ret_sym, adr0009_ty_int_model(ty.clone()))));
-                    }
-                    Ty::Option(element) => {
-                        self.binders
-                            .push((ret_sym.clone(), lean_option_ty(element, self.classes)));
-                    }
-                    Ty::Bool => {
-                        self.binders.push((ret_sym.clone(), "Prop".into()));
-                    }
-                    // A method returns a class or a resource on the same
-                    // terms a function does: a fresh state with its field
-                    // facts and invariant, or a fresh view. Ownership of
-                    // what came back is the checker's business and appears
-                    // nowhere here (ADR 0010, ADR 0024).
-                    Ty::Class(rci) => {
-                        let rcd = &self.classes[*rci];
-                        self.binders
-                            .push((ret_sym.clone(), lean_class_name(&rcd.name)));
-                        let rcd = rcd.clone();
-                        self.push_class_state_facts(&rcd, &ret_sym);
-                        self.push_invariant_hyps(&rcd, &ret_sym);
-                    }
-                    returned if returned.is_resource() => {
-                        let k = returned
-                            .res_kind()
-                            .expect("the arm's guard already matched this shape");
-                        self.binders
-                            .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
-                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym, self.records) {
-                            self.push_hyp_unique(h, prop);
-                        }
-                    }
-                    Ty::OptionRaw(_) => {
-                        self.binders
-                            .push((ret_sym.clone(), "Option Sable.RawPtr".into()));
-                    }
-                    Ty::Raw(_) | Ty::RawRecord(_) => {
-                        self.binders.push((ret_sym.clone(), "Sable.RawPtr".into()));
-                    }
-                    Ty::Unit => {}
-                    returned @ (Ty::Record(_) | Ty::Array(..) | Ty::Borrow(..) | Ty::Res(_)) => {
-                        // Spelled out so a new constructor is a compile error
-                        // here, and a return type with no fresh-state story
-                        // refuses rather than binding nothing (ADR 0074).
-                        // `Res` is caught by the resource guard above; a
-                        // method returning a record has no member signature
-                        // that admits it.
-                        refuse_vc_type(format!(
-                            "internal.vcgen.call_return_unsupported: `{}` has no \
-                             call-result state",
-                            returned.name()
-                        ));
-                        self.binders
-                            .push((ret_sym.clone(), UNSUPPORTED_LEAN_TY.into()));
-                    }
-                }
-                let fresh_args = self.havoc_mut_borrow_args(&mparams, args);
+                let ret_val = self.bind_call_result(&m.f.ret, &ret_sym, CallResultSite::Member);
+                let fresh_args = self.havoc_mut_borrow_args(&checked_call, symbolic_visit);
                 let cd = &self.classes[ci];
                 let m = cd
                     .methods
@@ -6923,23 +9536,11 @@ impl<'a> Generator<'a> {
                     let base = ret_sym.trim_start_matches('_').to_string();
                     self.push_option_value_facts(element, &base, &ret_sym);
                 }
-                match m.f.ret {
-                    Ty::Option(_) | Ty::OptionRaw(_) => Val::Opt(ret_sym),
-                    Ty::Unit => Val::Unit,
-                    Ty::Bool => Val::Prop(ret_sym),
-                    Ty::Class(_) => Val::Obj(ret_sym),
-                    ref returned if returned.is_resource() => Val::View(ret_sym),
-                    Ty::Raw(_) | Ty::RawRecord(_) => Val::Ptr(ret_sym),
-                    Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
-                    // A return shape with no value story latched a refusal
-                    // in the binder match above; the placeholder keeps the
-                    // walk total until generation fails on the latch.
-                    _ => Val::Int(ret_sym),
-                }
+                ret_val
             }
             ExprKind::Unary { op, operand } => match op {
                 UnOp::Neg => {
-                    let Val::Int(v) = self.eval(operand) else {
+                    let Val::Int(v) = self.eval(operand, scope) else {
                         unreachable!()
                     };
                     let value = format!("(-{v})");
@@ -6961,16 +9562,16 @@ impl<'a> Generator<'a> {
                     Val::Int(value)
                 }
                 UnOp::Not => {
-                    let p = self.eval_prop(operand);
+                    let p = self.eval_prop(operand, scope);
                     Val::Prop(format!("¬{p}"))
                 }
             },
             ExprKind::Binary { op, lhs, rhs, .. } => {
                 if op.is_arith() {
-                    let Val::Int(l) = self.eval(lhs) else {
+                    let Val::Int(l) = self.eval(lhs, scope) else {
                         unreachable!()
                     };
-                    let Val::Int(r) = self.eval(rhs) else {
+                    let Val::Int(r) = self.eval(rhs, scope) else {
                         unreachable!()
                     };
                     let lean_op = match op {
@@ -6979,7 +9580,14 @@ impl<'a> Generator<'a> {
                         BinOp::Mul => "*",
                         BinOp::Div => "/",
                         BinOp::Rem => "%",
-                        _ => unreachable!(),
+                        BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::And
+                        | BinOp::Or => unreachable!(),
                     };
                     let value = format!("({l} {lean_op} {r})");
                     let it = adr0009_ty_int_model(
@@ -7042,11 +9650,18 @@ impl<'a> Generator<'a> {
                                 }
                             }
                         }
-                        _ => unreachable!(),
+                        BinOp::Lt
+                        | BinOp::Le
+                        | BinOp::Gt
+                        | BinOp::Ge
+                        | BinOp::Eq
+                        | BinOp::Ne
+                        | BinOp::And
+                        | BinOp::Or => unreachable!(),
                     }
                     Val::Int(value)
                 } else {
-                    Val::Prop(self.eval_prop(e))
+                    Val::Prop(self.eval_prop_after_trap_lookup(e, scope))
                 }
             }
             ExprKind::Call { callee, args, .. } => {
@@ -7055,7 +9670,7 @@ impl<'a> Generator<'a> {
                 let arg_vals: Vec<String> = args
                     .iter()
                     .zip(&params)
-                    .map(|(a, parameter)| match self.eval(a) {
+                    .map(|(a, parameter)| match self.eval(a, scope) {
                         Val::Int(v)
                         | Val::Arr(v)
                         | Val::Obj(v)
@@ -7075,7 +9690,7 @@ impl<'a> Generator<'a> {
                         Val::Prop(_) => {
                             unreachable!("checked: a proposition argument has a Bool parameter")
                         }
-                        _ => unreachable!(
+                        Val::Unit => unreachable!(
                             "checked: int/bool/option/array/class/record/resource/pointer args"
                         ),
                     })
@@ -7135,99 +9750,20 @@ impl<'a> Generator<'a> {
                 // (ADR 0074): the callee may have mutated it arbitrarily
                 // within its posts, and omitting the havoc asserts those
                 // posts over the pre-call state.
-                for (pname, fresh) in self.havoc_mut_borrow_args(&params, args) {
+                let (checked_call, symbolic_visit) = self.checked_call(
+                    CallTarget::Function(callee.clone()),
+                    e.span,
+                    &params,
+                    args,
+                    None,
+                );
+                for (pname, fresh) in self.havoc_mut_borrow_args(&checked_call, symbolic_visit) {
                     subst_map.insert(pname, fresh);
                 }
                 let sig = &self.sigs[callee.as_str()];
 
                 let ret_sym = self.hinted_sym("_r", hint);
-                match &sig.ret {
-                    ty @ (Ty::Int(_) | Ty::Param(_)) => {
-                        self.binders.push((ret_sym.clone(), "Int".into()));
-                        self.hyps.push((
-                            format!("h_{}_range", ret_sym.trim_start_matches('_')),
-                            self.r_prop(&ret_sym, adr0009_ty_int_model(ty.clone())),
-                        ));
-                    }
-                    Ty::Option(element) => {
-                        self.binders
-                            .push((ret_sym.clone(), lean_option_ty(element, self.classes)));
-                    }
-                    Ty::Bool => {
-                        self.binders.push((ret_sym.clone(), "Prop".into()));
-                    }
-                    Ty::Class(ci) => {
-                        // A returned class: fresh state with field facts
-                        // and the invariant (the callee proved ret_inv;
-                        // ADR 0010).
-                        let cd = &self.classes[*ci];
-                        self.binders
-                            .push((ret_sym.clone(), lean_class_name(&cd.name)));
-                        self.push_class_state_facts(cd, &ret_sym);
-                        self.push_invariant_hyps(cd, &ret_sym);
-                    }
-                    Ty::Record(ri) => {
-                        let record = lean_record_name(&self.records[*ri].name);
-                        self.binders.push((ret_sym.clone(), record.clone()));
-                        // Like integer range facts, record well-formedness is
-                        // an implicit checked-type postcondition of the
-                        // verified callee, independent of its user posts.
-                        self.push_hyp_unique(
-                            format!("h_{}_wf", ret_sym.trim_start_matches('_')),
-                            format!("{record}.wf {ret_sym}"),
-                        );
-                    }
-                    // A returned resource: a fresh view binder. The
-                    // authority that came with it is the checker's
-                    // business, and appears nowhere here (ADR 0024).
-                    returned if returned.is_resource() => {
-                        let k = returned
-                            .res_kind()
-                            .expect("the arm's guard already matched this shape");
-                        self.binders
-                            .push((ret_sym.clone(), lean_res_view_ty(k, self.records)));
-                        for (h, prop) in view_wf_hyps(k, &ret_sym, &ret_sym, self.records) {
-                            self.push_hyp_unique(h, prop);
-                        }
-                    }
-                    // A returned pointer is an opaque `RawPtr`: what is
-                    // known about it is whatever the post says. The nullable
-                    // record pointer is the same value under an `Option`.
-                    Ty::Raw(_) | Ty::RawRecord(_) => {
-                        self.binders.push((ret_sym.clone(), "Sable.RawPtr".into()));
-                    }
-                    Ty::OptionRaw(_) => {
-                        self.binders
-                            .push((ret_sym.clone(), "Option Sable.RawPtr".into()));
-                    }
-                    // A returned array is storage the caller never named, so
-                    // its state is the fresh one every checked inhabitant
-                    // satisfies — the length bound and the payload's element
-                    // fact, through the one dispatch (ADR 0074). It is
-                    // deliberately `Bounded` and never `Eq`: a `&mut`
-                    // argument comes back with its length related to the
-                    // pre-call chain because it is the same storage, and a
-                    // return has no prior chain to relate to (ADR 0085).
-                    Ty::Array(..) => {
-                        let base = ret_sym.trim_start_matches('_').to_string();
-                        let ret_ty = sig.ret.clone();
-                        self.fresh_state_for(&ret_ty, &ret_sym, &base, LenFact::Bounded);
-                    }
-                    Ty::Unit => {}
-                    returned @ (Ty::Borrow(..) | Ty::Res(_)) => {
-                        // Spelled out so a new constructor is a compile error
-                        // here, and a return type with no fresh-state story
-                        // refuses rather than binding nothing (ADR 0074).
-                        // `Res` is caught by the resource guard above.
-                        refuse_vc_type(format!(
-                            "internal.vcgen.call_return_unsupported: `{}` has no \
-                             call-result state",
-                            returned.name()
-                        ));
-                        self.binders
-                            .push((ret_sym.clone(), UNSUPPORTED_LEAN_TY.into()));
-                    }
-                }
+                let ret_val = self.bind_call_result(&sig.ret, &ret_sym, CallResultSite::Function);
                 for post in callee_fn.posts.iter() {
                     let ret_ref = if sig.ret == Ty::Unit {
                         None
@@ -7254,30 +9790,27 @@ impl<'a> Generator<'a> {
                     let base = ret_sym.trim_start_matches('_').to_string();
                     self.push_option_value_facts(element, &base, &ret_sym);
                 }
-                match sig.ret {
-                    Ty::Option(_) | Ty::OptionRaw(_) => Val::Opt(ret_sym),
-                    Ty::Unit => Val::Unit,
-                    Ty::Bool => Val::Prop(ret_sym),
-                    Ty::Class(_) => Val::Obj(ret_sym),
-                    Ty::Record(_) => Val::Record(ret_sym),
-                    Ty::Array(_) => Val::Arr(ret_sym),
-                    ref returned if returned.is_resource() => Val::View(ret_sym),
-                    Ty::Raw(_) | Ty::RawRecord(_) => Val::Ptr(ret_sym),
-                    Ty::Int(_) | Ty::Param(_) => Val::Int(ret_sym),
-                    // A return shape with no value story latched a refusal
-                    // in the binder match above; the placeholder keeps the
-                    // walk total until generation fails on the latch.
-                    _ => Val::Int(ret_sym),
-                }
+                ret_val
             }
         }
     }
 
-    fn eval_prop(&mut self, e: &Expr) -> String {
+    fn eval_prop(&mut self, e: &Expr, scope: ScopeId) -> String {
+        if !self.consume_expression_trap_sites(scope, e) {
+            return "False".into();
+        }
+        self.eval_prop_after_trap_lookup(e, scope)
+    }
+
+    /// Proposition translation after the current expression's direct trap
+    /// edge has been consumed. The fallback invokes the expression translator
+    /// below that same seam so Boolean calls and projections do not consume
+    /// one source site twice.
+    fn eval_prop_after_trap_lookup(&mut self, e: &Expr, scope: ScopeId) -> String {
         match &e.kind {
             ExprKind::BoolLit(b) => if *b { "True" } else { "False" }.to_string(),
             ExprKind::Var(_) => {
-                let Val::Prop(p) = self.eval(e) else {
+                let Val::Prop(p) = self.eval_after_trap_lookup(e, scope) else {
                     unreachable!()
                 };
                 p
@@ -7285,12 +9818,12 @@ impl<'a> Generator<'a> {
             ExprKind::Unary {
                 op: UnOp::Not,
                 operand,
-            } => format!("¬{}", self.eval_prop(operand)),
+            } => format!("¬{}", self.eval_prop(operand, scope)),
             ExprKind::Binary { op, lhs, rhs, .. } if op.is_comparison() => {
-                let Val::Int(l) = self.eval(lhs) else {
+                let Val::Int(l) = self.eval(lhs, scope) else {
                     unreachable!()
                 };
-                let Val::Int(r) = self.eval(rhs) else {
+                let Val::Int(r) = self.eval(rhs, scope) else {
                     unreachable!()
                 };
                 let sym = match op {
@@ -7300,7 +9833,13 @@ impl<'a> Generator<'a> {
                     BinOp::Ge => "≥",
                     BinOp::Eq => "=",
                     BinOp::Ne => "≠",
-                    _ => unreachable!(),
+                    BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Rem
+                    | BinOp::And
+                    | BinOp::Or => unreachable!(),
                 };
                 format!("({l} {sym} {r})")
             }
@@ -7310,7 +9849,7 @@ impl<'a> Generator<'a> {
                 rhs,
                 ..
             } => {
-                let pl = self.eval_prop(lhs);
+                let pl = self.eval_prop(lhs, scope);
                 let guard = if *op == BinOp::And {
                     pl.clone()
                 } else {
@@ -7319,15 +9858,51 @@ impl<'a> Generator<'a> {
                 let snap = self.hyps.len();
                 let hname = format!("h_guard_{}", hslug(&guard));
                 self.hyps.push((hname, guard));
-                let pr = self.eval_prop(rhs);
+                let pr = self.eval_prop(rhs, scope);
                 self.hyps.truncate(snap);
                 let sym = if *op == BinOp::And { "∧" } else { "∨" };
                 format!("({pl} {sym} {pr})")
             }
             // Bool-typed calls (and anything else the checker typed Bool).
-            _ => match self.eval(e) {
+            ExprKind::IntLit(_)
+            | ExprKind::Unary { .. }
+            | ExprKind::Binary { .. }
+            | ExprKind::Call { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::Len { .. }
+            | ExprKind::RawOp { .. }
+            | ExprKind::DeviceOp { .. }
+            | ExprKind::ResOp { .. }
+            | ExprKind::Widen { .. }
+            | ExprKind::Narrow { .. }
+            | ExprKind::IsSome { .. }
+            | ExprKind::OptValue { .. }
+            | ExprKind::OptTake { .. }
+            | ExprKind::SomeE(_)
+            | ExprKind::NoneE
+            | ExprKind::ArrayLit(_)
+            | ExprKind::AllocArray { .. }
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::SelfFieldIndex { .. }
+            | ExprKind::CtorCall { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::ClassFieldIndex { .. }
+            | ExprKind::TraitCall { .. }
+            | ExprKind::MethodCall { .. }
+            | ExprKind::Borrow { .. }
+            | ExprKind::RecordLit { .. } => match self.eval_after_trap_lookup(e, scope) {
                 Val::Prop(p) => p,
-                _ => unreachable!("checked: bool-typed expression"),
+                Val::Int(_)
+                | Val::Opt(_)
+                | Val::Arr(_)
+                | Val::Obj(_)
+                | Val::Record(_)
+                | Val::View(_)
+                | Val::Ptr(_)
+                | Val::Unit => unreachable!("checked: bool-typed expression"),
             },
         }
     }
@@ -7362,7 +9937,15 @@ impl<'a> Generator<'a> {
                 Val::Prop(p) if p != name && p != &format!("({name} = true)") => {
                     Some((name.clone(), lean_bool_value(p)))
                 }
-                _ => None,
+                Val::Int(_)
+                | Val::Prop(_)
+                | Val::Opt(_)
+                | Val::Arr(_)
+                | Val::Obj(_)
+                | Val::Record(_)
+                | Val::View(_)
+                | Val::Ptr(_)
+                | Val::Unit => None,
             })
             .collect();
         substitute(text, &map, None)
@@ -7411,7 +9994,17 @@ impl<'a> Generator<'a> {
     fn self_chain(&self) -> String {
         match self.env.get("self") {
             Some(Val::Obj(s)) => s.clone(),
-            _ => unreachable!("checked: self in scope"),
+            Some(
+                Val::Int(_)
+                | Val::Prop(_)
+                | Val::Opt(_)
+                | Val::Arr(_)
+                | Val::Record(_)
+                | Val::View(_)
+                | Val::Ptr(_)
+                | Val::Unit,
+            )
+            | None => unreachable!("checked: self in scope"),
         }
     }
 
@@ -7420,7 +10013,17 @@ impl<'a> Generator<'a> {
         match self.cctx {
             Cctx::Init(_) => match self.env.get(&format!("self.{field}")) {
                 Some(Val::Arr(s)) => s.clone(),
-                _ => unreachable!("checked: field initialized"),
+                Some(
+                    Val::Int(_)
+                    | Val::Prop(_)
+                    | Val::Opt(_)
+                    | Val::Obj(_)
+                    | Val::Record(_)
+                    | Val::View(_)
+                    | Val::Ptr(_)
+                    | Val::Unit,
+                )
+                | None => unreachable!("checked: field initialized"),
             },
             Cctx::Method(..) | Cctx::Deinit(_) => project_field(&self.self_chain(), field),
             Cctx::None => unreachable!("checked: fields only in members"),
@@ -7431,7 +10034,17 @@ impl<'a> Generator<'a> {
     fn arr_str(&self, name: &str) -> String {
         match self.env.get(name) {
             Some(Val::Arr(s)) => s.clone(),
-            _ => unreachable!("checked: array in scope"),
+            Some(
+                Val::Int(_)
+                | Val::Prop(_)
+                | Val::Opt(_)
+                | Val::Obj(_)
+                | Val::Record(_)
+                | Val::View(_)
+                | Val::Ptr(_)
+                | Val::Unit,
+            )
+            | None => unreachable!("checked: array in scope"),
         }
     }
 
@@ -7439,7 +10052,17 @@ impl<'a> Generator<'a> {
     fn view_str(&self, name: &str) -> String {
         match self.env.get(name) {
             Some(Val::View(s)) => s.clone(),
-            _ => unreachable!("checked: resource in scope"),
+            Some(
+                Val::Int(_)
+                | Val::Prop(_)
+                | Val::Opt(_)
+                | Val::Arr(_)
+                | Val::Obj(_)
+                | Val::Record(_)
+                | Val::Ptr(_)
+                | Val::Unit,
+            )
+            | None => unreachable!("checked: resource in scope"),
         }
     }
 
@@ -7448,7 +10071,10 @@ impl<'a> Generator<'a> {
     fn state_str(&self, name: &str) -> String {
         match self.env.get(name) {
             Some(Val::Arr(s)) | Some(Val::Obj(s)) | Some(Val::View(s)) => s.clone(),
-            _ => unreachable!("checked: &mut param in scope"),
+            Some(
+                Val::Int(_) | Val::Prop(_) | Val::Opt(_) | Val::Record(_) | Val::Ptr(_) | Val::Unit,
+            )
+            | None => unreachable!("checked: &mut param in scope"),
         }
     }
 
@@ -7634,7 +10260,15 @@ impl<'a> Generator<'a> {
                 "∀ k, 0 ≤ k → k < {array}.len → {}.wf ({array}.get k)",
                 lean_record_name(&self.records[*ri].name)
             )),
-            other => {
+            other @ (Ty::Class(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit) => {
                 refuse_vc_type(format!(
                     "internal.vcgen.lean_type_unsupported: array payload `{}` has no \
                      element-range fact",
@@ -7677,6 +10311,35 @@ impl<'a> Generator<'a> {
             .push((format!("h_fact_{}", hslug(prop)), prop.to_string()));
     }
 
+    /// Preserve established user-facing obligation names unless two legal
+    /// member flavors share the same display spelling. Lean declaration
+    /// identities always carry the typed owner independently.
+    fn obligation_owner(&self) -> String {
+        let collides = match self.cctx {
+            Cctx::None => false,
+            Cctx::Init(class) => class
+                .methods
+                .iter()
+                .any(|method| method.f.name == self.f.name),
+            Cctx::Method(class, _) => class.inits.iter().any(|init| init.name == self.f.name),
+            Cctx::Deinit(class) => {
+                class.inits.iter().any(|init| init.name == "deinit")
+                    || class.methods.iter().any(|method| method.f.name == "deinit")
+            }
+        };
+        if !collides {
+            return self.fname.clone();
+        }
+        match &self.call_owner {
+            CallOwner::Function(_) => self.fname.clone(),
+            CallOwner::Constructor { class, init } => {
+                format!("{class}::{init}::constructor")
+            }
+            CallOwner::Method { class, method } => format!("{class}::{method}::method"),
+            CallOwner::Deinitializer { class } => format!("{class}::deinit::destructor"),
+        }
+    }
+
     fn obligation(
         &mut self,
         name: &str,
@@ -7684,9 +10347,15 @@ impl<'a> Generator<'a> {
         span: Span,
         goal: String,
     ) -> Obligation {
-        let unique = self.unique_name(name);
+        let owner = self.obligation_owner();
+        let semantic_name = match name.strip_prefix(&self.fname) {
+            Some(rest) if rest.is_empty() || rest.starts_with('.') => format!("{owner}{rest}"),
+            Some(_) | None => format!("{owner}.{name}"),
+        };
+        let unique = self.unique_name(&semantic_name);
+        let owner = self.call_owner.certificate_component();
         Obligation {
-            thm_name: format!("vc_{}", sanitize(&unique)),
+            thm_name: injective_lean_components("vc", &[owner.as_str(), unique.as_str()]),
             name: unique,
             kind_desc,
             span,
@@ -7730,197 +10399,15 @@ impl<'a> Generator<'a> {
     }
 }
 
-/// Whether a method call mutates its receiver. Answering this needs the
-/// class table, which not every caller of `collect_assigned` has; those
-/// that do not pass [`ANY_RECV_MUTATES`] and over-approximate.
-pub type MutRecv<'a> = &'a dyn std::ops::Fn(&str, &str) -> bool;
-
-/// Conservative resolver: every method call may mutate its receiver.
-pub const ANY_RECV_MUTATES: MutRecv<'static> = &|_, _| true;
-
-pub fn collect_assigned(
-    stmts: &[Stmt],
-    out: &mut std::collections::HashSet<String>,
-    mut_recv: MutRecv,
-) {
-    for s in stmts {
-        match s {
-            Stmt::Assign { name, value, .. } => {
-                out.insert(name.clone());
-                collect_mut_borrows(value, out, mut_recv);
-            }
-            Stmt::Store {
-                array,
-                index,
-                value,
-                ..
-            } => {
-                out.insert(array.clone());
-                collect_mut_borrows(index, out, mut_recv);
-                collect_mut_borrows(value, out, mut_recv);
-            }
-            Stmt::FieldAssign { value, .. } => {
-                out.insert("self".to_string());
-                collect_mut_borrows(value, out, mut_recv);
-            }
-            Stmt::FieldStore { index, value, .. } => {
-                out.insert("self".to_string());
-                collect_mut_borrows(index, out, mut_recv);
-                collect_mut_borrows(value, out, mut_recv);
-            }
-            Stmt::Assert(_) => {}
-            Stmt::ExprStmt(e) => {
-                collect_mut_borrows(e, out, mut_recv);
-            }
-            // The initializer of a declaration mutates just as much as
-            // the same call in statement position: `u64 t = c.bump();`
-            // and `var d = f(&mut b);` both write through their
-            // receiver/argument, and omitting them leaves the loop head
-            // asserting pre-loop facts about storage the body changed.
-            Stmt::Decl { init: Some(e), .. } | Stmt::VarDecl { init: e, .. } => {
-                collect_mut_borrows(e, out, mut_recv);
-            }
-            Stmt::Return { value: Some(e), .. } => {
-                collect_mut_borrows(e, out, mut_recv);
-            }
-            Stmt::If {
-                cond,
-                then_block,
-                else_block,
-            } => {
-                collect_mut_borrows(cond, out, mut_recv);
-                collect_assigned(then_block, out, mut_recv);
-                if let Some(eb) = else_block {
-                    collect_assigned(eb, out, mut_recv);
-                }
-            }
-            Stmt::While { cond, body, .. } => {
-                collect_mut_borrows(cond, out, mut_recv);
-                collect_assigned(body, out, mut_recv);
-            }
-            // `unsafe` is a vocabulary marker, not an effect barrier. An
-            // exposure is a nested scope, but writes through its mutable raw
-            // view change the exposed safe array at exit, and its body may
-            // also mutate unrelated outer state.
-            Stmt::Unsafe { body, .. } => collect_assigned(body, out, mut_recv),
-            Stmt::Expose {
-                array,
-                mutable,
-                body,
-                ..
-            } => {
-                if *mutable {
-                    out.insert(array.clone());
-                }
-                collect_assigned(body, out, mut_recv);
-            }
-            Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
-                collect_mut_borrows(size, out, mut_recv);
-            }
-            Stmt::SystemDealloc {
-                ptr, res, release, ..
-            } => {
-                collect_mut_borrows(ptr, out, mut_recv);
-                collect_mut_borrows(res, out, mut_recv);
-                collect_mut_borrows(release, out, mut_recv);
-            }
-            Stmt::Decl { init: None, .. } | Stmt::Return { value: None, .. } => {}
-        }
-    }
-}
-
-/// `&mut a` anywhere inside an expression means `a` may be mutated by a
-/// call — conservative marking for loop havoc. A `&mut self` method call
-/// marks its receiver for the same reason.
-fn collect_mut_borrows(e: &Expr, out: &mut std::collections::HashSet<String>, mut_recv: MutRecv) {
-    match &e.kind {
-        ExprKind::Borrow { array, mutable, .. } => {
-            if *mutable {
-                out.insert(array.clone());
-            }
-        }
-        ExprKind::Unary { operand, .. }
-        | ExprKind::Widen { arg: operand, .. }
-        | ExprKind::Narrow { arg: operand, .. }
-        | ExprKind::IsSome { operand }
-        | ExprKind::OptValue { operand } => collect_mut_borrows(operand, out, mut_recv),
-        ExprKind::OptTake { option, .. } => {
-            out.insert(option.clone());
-        }
-        ExprKind::TraitCall { args, .. } => {
-            for a in args {
-                collect_mut_borrows(a, out, mut_recv);
-            }
-        }
-        ExprKind::ClassFieldIndex { index, .. } => collect_mut_borrows(index, out, mut_recv),
-        ExprKind::SomeE(inner) => collect_mut_borrows(inner, out, mut_recv),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            collect_mut_borrows(lhs, out, mut_recv);
-            collect_mut_borrows(rhs, out, mut_recv);
-        }
-        ExprKind::MethodCall {
-            recv, method, args, ..
-        } => {
-            if mut_recv(recv, method) {
-                out.insert(recv.clone());
-            }
-            for a in args {
-                collect_mut_borrows(a, out, mut_recv);
-            }
-        }
-        ExprKind::Call { args, .. }
-        | ExprKind::CtorCall { args, .. }
-        | ExprKind::RecordLit { args, .. }
-        | ExprKind::RawOp { args, .. }
-        | ExprKind::ResOp { args, .. }
-        | ExprKind::DeviceOp { args, .. } => {
-            for a in args {
-                collect_mut_borrows(a, out, mut_recv);
-            }
-        }
-        ExprKind::AllocArray { len, init, .. } => {
-            collect_mut_borrows(len, out, mut_recv);
-            collect_mut_borrows(init, out, mut_recv);
-        }
-        ExprKind::Index { index, .. } | ExprKind::SelfFieldIndex { index, .. } => {
-            collect_mut_borrows(index, out, mut_recv)
-        }
-        ExprKind::ArrayLit(elems) => {
-            for el in elems {
-                collect_mut_borrows(el, out, mut_recv);
-            }
-        }
-        // Deliberately exhaustive: a new expression form must decide whether
-        // it contains an effectful subexpression instead of silently falling
-        // through and reopening loop-havoc unsoundness.
-        ExprKind::IntLit(_)
-        | ExprKind::BoolLit(_)
-        | ExprKind::Var(_)
-        | ExprKind::Len { .. }
-        | ExprKind::NoneE
-        | ExprKind::SelfField { .. }
-        | ExprKind::SelfFieldLen { .. }
-        | ExprKind::ClassField { .. }
-        | ExprKind::RecordField { .. }
-        | ExprKind::ClassFieldLen { .. } => {}
-    }
-}
-
 /// The well-formedness a resource view carries at every binding site.
 /// This is the shape of the *value*, not a claim about authority: a span
 /// has a nonnegative length its byte sequence covers.
-fn vc_resource_kind(var_tys: &HashMap<String, Ty>, e: &Expr) -> Option<ResKind> {
-    let name = match &e.kind {
-        ExprKind::Var(name) => Some(name.clone()),
-        ExprKind::SelfField { field } => Some(format!("self.{field}")),
-        ExprKind::Borrow { array, field, .. } => Some(
-            field
-                .as_ref()
-                .map_or_else(|| array.clone(), |f| format!("{array}.{f}")),
-        ),
-        _ => None,
-    }?;
-    var_tys.get(name.as_str())?.res_kind()
+fn sealed_resource_kind(operation: &CheckedSealedOperation, index: usize) -> Option<ResKind> {
+    let argument = operation.arguments.get(index)?;
+    match &argument.effect {
+        CallArgumentEffect::Loan(loan) => loan.referent.res_kind(),
+        CallArgumentEffect::Value(value) => value.value_ty.res_kind(),
+    }
 }
 
 fn view_wf_hyps(
@@ -8163,7 +10650,7 @@ fn project_field(state: &str, field: &str) -> String {
                     with_at = Some(i);
                     break;
                 }
-                _ => {}
+                _other_byte => {}
             }
         }
         let Some(w) = with_at else { break };
@@ -8227,6 +10714,36 @@ pub fn sanitize(name: &str) -> String {
         .collect()
 }
 
+/// Encode an arbitrary semantic identity as one injective Lean identifier.
+///
+/// Sanitizing punctuation is lossy (`a.b_c` and `a_b.c` collapse), which is
+/// unsafe for declarations subtracted across module artifacts. The byte
+/// length plus full UTF-8 hex payload makes distinct identities distinct;
+/// the version tag leaves room to change the representation deliberately.
+fn injective_lean_name(prefix: &str, identity: &str) -> String {
+    let payload = identity
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{prefix}_v1_{}_{payload}", identity.len())
+}
+
+/// Compose semantic fields without delimiter ambiguity before encoding them.
+fn injective_lean_components(prefix: &str, components: &[&str]) -> String {
+    let identity = components
+        .iter()
+        .map(|component| format!("{}:{component}", component.len()))
+        .collect::<String>();
+    injective_lean_name(prefix, &identity)
+}
+
+fn callable_lean_name(prefix: &str, owner: &CallOwner, role: &str, occurrence: usize) -> String {
+    let owner = owner.certificate_component();
+    let occurrence = occurrence.to_string();
+    injective_lean_components(prefix, &[owner.as_str(), role, occurrence.as_str()])
+}
+
 /// Short content-anchored slug for hypothesis names (design §6: names
 /// derive from clause content, never from positional counters, so
 /// discharge scripts survive unrelated edits). Lean allows shadowing,
@@ -8263,6 +10780,7 @@ pub fn slug(text: &str) -> String {
 mod type_domain_tests {
     use super::*;
     use crate::span::LineMap;
+    use crate::transition::CallTransition;
 
     /// A shape the preflight should have refused reaches a helper that has no
     /// error channel. The answer is a latched, named internal error and a
@@ -8389,11 +10907,20 @@ mod type_domain_tests {
         .expect("test source should parse")
     }
 
-    fn checked_program(source: &str) -> (Program, HashMap<String, FnSig>) {
+    fn checked_program(source: &str) -> (Program, CheckResult) {
         let mut program = parsed_program(source);
         crate::mono::monomorphize(&mut program).expect("test source should monomorphize");
         let checked = crate::check::check(&mut program).expect("test source should typecheck");
-        (program, checked.sigs)
+        (program, checked)
+    }
+
+    fn tampered_generation_error(source: &str, tamper: impl FnOnce(&mut CheckResult)) -> String {
+        let (program, mut checked) = checked_program(source);
+        tamper(&mut checked);
+        match generate(&program, &checked, source, Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("tampered checker ownership facts must fail closed"),
+        }
     }
 
     fn affine_bool_option() -> Ty {
@@ -8401,7 +10928,17 @@ mod type_domain_tests {
     }
 
     fn public_generate_error(program: &Program) -> String {
-        match generate(program, &HashMap::new(), "", Path::new(".")) {
+        if let Err(error) = validate_vc_type_domain(program) {
+            return error;
+        }
+        let checked = CheckResult {
+            sigs: HashMap::new(),
+            control: crate::control::ControlProgram::build(program)
+                .expect("the forged VC-domain fixture still has structural control"),
+            ownership: CheckedOwnershipPlan::default(),
+            unsafe_regions: 0,
+        };
+        match generate(program, &checked, "", Path::new(".")) {
             Err(error) => error,
             Ok(_) => panic!("synthetic invalid affine-option program reached VC generation"),
         }
@@ -8452,8 +10989,8 @@ fn affine_take(u64 n) {
     }
 }
 "#;
-        let (program, sigs) = checked_program(source);
-        let generated = generate(&program, &sigs, source, Path::new("."))
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
             .expect("checked affine-option locals must have VC semantics");
 
         let take = generated
@@ -8509,8 +11046,8 @@ fn affine_loop(u64 n) {
     }
 }
 "#;
-        let (program, sigs) = checked_program(source);
-        let generated = generate(&program, &sigs, source, Path::new("."))
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
             .expect("affine-option take must survive loop havoc");
         let take = generated
             .obligations
@@ -8526,25 +11063,23 @@ fn affine_loop(u64 n) {
             name.starts_with("h_inv_") && proposition.contains("pending.is_some")
         }));
 
-        let span = Span::new(0, 0);
-        let take_expr = Expr {
-            kind: ExprKind::OptTake {
-                option: "pending".into(),
-                option_span: span,
-            },
-            span,
-            ty: Some(Ty::array(Ty::Bool)),
+        let Stmt::While { kw_span, .. } = &program.fns[0].body[2] else {
+            panic!("fixture keeps the loop as its third statement")
         };
-        let statement = Stmt::Decl {
-            ty: Ty::array(Ty::Bool),
-            name: "flags".into(),
-            name_span: span,
-            init: Some(take_expr),
-            mutable: false,
+        let key = EffectSiteKey {
+            owner: CallOwner::Function("affine_loop".into()),
+            span: *kw_span,
         };
-        let mut assigned = HashSet::new();
-        collect_assigned(&[statement], &mut assigned, ANY_RECV_MUTATES);
-        assert!(assigned.contains("pending"));
+        let effects = checked
+            .ownership
+            .loop_effects(&key)
+            .expect("checker authors one exact loop mutation set");
+        assert!(effects.mutations.iter().any(|mutation| matches!(
+            mutation,
+            CheckedMutation::OptionTake { source, payload }
+                if source == &Place::local("pending")
+                    && payload == &Ty::array(Ty::Bool)
+        )));
     }
 
     #[test]
@@ -8612,6 +11147,441 @@ fn affine_loop(u64 n) {
             },
         ]);
         assert!(public_generate_error(&program).starts_with("vc.duplicate_local:"));
+    }
+
+    #[test]
+    fn exposure_return_rejection_comes_from_control_sealing_not_vc_resummary() {
+        let span = Span::new(0, 0);
+        let mut program = parsed_program("fn subject(&[u8] bytes) {}");
+        program.fns[0].body.push(Stmt::Expose {
+            kw_span: span,
+            array: "bytes".into(),
+            array_span: span,
+            mutable: false,
+            ptr: "ptr".into(),
+            ptr_span: span,
+            res: "mem".into(),
+            res_span: span,
+            body: vec![Stmt::If {
+                cond: Expr {
+                    kind: ExprKind::BoolLit(true),
+                    span,
+                    ty: Some(Ty::Bool),
+                },
+                then_block: vec![Stmt::Return { value: None, span }],
+                else_block: None,
+            }],
+        });
+
+        validate_vc_type_domain(&program)
+            .expect("VC type preflight no longer reconstructs exposure flow");
+        let error = crate::control::ControlProgram::build(&program)
+            .expect_err("control sealing rejects a return that bypasses reconstruction");
+        assert!(
+            error.message.contains("return inside an exposure"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn deleting_an_exposure_normal_path_after_checking_fails_closed() {
+        let source = r#"
+fn subject(u64 n) {
+    mut [u8] bytes = alloc_array<u8>(n, 0);
+    unsafe expose &mut bytes as (ptr, resource mem) {
+    }
+}
+"#;
+        let (mut program, checked) = checked_program(source);
+        let Stmt::Expose { body, .. } = &mut program.fns[0].body[1] else {
+            panic!("fixture has an exposure")
+        };
+        body.push(Stmt::Return {
+            value: None,
+            span: Span::new(0, 0),
+        });
+        let error = match generate(&program, &checked, source, Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("a forged exposure path cannot erase its checked normal phase"),
+        };
+        assert!(
+            error.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn checked_control_routes_remove_dead_names_from_later_clause_scopes() {
+        let source = r#"
+fn route_scope(&[u8] bytes, bool choose) {
+    u64 outer = 7;
+    if (choose) {
+        u64 then_local = 1;
+        mut [bool] flags = [true, false];
+    } else {
+        u64 else_local = 2;
+    }
+    /// assert outer = 7
+    unsafe expose &bytes as (ptr, resource mem) {
+        u64 exposure_local = 3;
+        unsafe {
+            u64 unsafe_local = 4;
+        }
+    }
+    /// assert outer = 7
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("every lexical continuation consumes its checked route");
+        let assertions: Vec<&ClauseWf> = generated
+            .clause_wfs
+            .iter()
+            .filter(|wf| wf.desc == "`assert` in `route_scope`")
+            .collect();
+        // Each source assertion is visited once per symbolic branch. Keep
+        // both visits visible, and group by source site rather than DFS order.
+        assert_eq!(assertions.len(), 4);
+        let mut by_site: HashMap<(usize, usize), Vec<&ClauseWf>> = HashMap::new();
+        for wf in &assertions {
+            by_site
+                .entry((wf.span.start, wf.span.end))
+                .or_default()
+                .push(*wf);
+        }
+        assert_eq!(by_site.len(), 2);
+        assert!(by_site.values().all(|visits| visits.len() == 2));
+
+        let names = |wf: &ClauseWf| {
+            wf.binders
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<HashSet<_>>()
+        };
+        for wf in &assertions {
+            let visible = names(wf);
+            for live in ["bytes", "choose", "outer"] {
+                assert!(visible.contains(live), "missing live binder `{live}`");
+            }
+            for dead in ["then_local", "else_local", "flags"] {
+                assert!(
+                    !visible.contains(dead),
+                    "dead branch binder `{dead}` escaped its route"
+                );
+            }
+        }
+
+        let post_exposure = by_site
+            .iter()
+            .max_by_key(|((start, _), _)| *start)
+            .expect("the later assertion follows the exposure")
+            .1;
+        for wf in post_exposure {
+            let visible = names(wf);
+            for dead in ["ptr", "mem", "exposure_local", "unsafe_local"] {
+                assert!(
+                    !visible.contains(dead),
+                    "dead exposure binder `{dead}` escaped its route"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn returning_symbolic_paths_restore_parent_types_and_old_state_for_siblings() {
+        let source = r#"
+fn route_return(&mut [bool] bits, bool stop) {
+    u64 outer = 7;
+    if (stop) {
+        return;
+    }
+    /// assert outer = 7
+}
+
+fn route_loop_return(&mut [bool] bits, bool stop) {
+    u64 outer = 7;
+    /// invariant true
+    /// variant 0
+    while (stop) {
+        u64 loop_local = 1;
+        return;
+    }
+    /// assert outer = 7
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("a returning path must not clear its sibling's symbolic maps");
+        for function in ["route_return", "route_loop_return"] {
+            let wf = generated
+                .clause_wfs
+                .iter()
+                .find(|wf| wf.desc == format!("`assert` in `{function}`"))
+                .expect("the post-control assertion has a WF declaration");
+            let names: HashSet<&str> = wf.binders.iter().map(|(name, _)| name.as_str()).collect();
+            for live in ["bits", "_old_bits", "outer", "stop"] {
+                assert!(names.contains(live), "{function} lost `{live}`");
+            }
+            assert!(!names.contains("loop_local"));
+        }
+    }
+
+    #[test]
+    fn retained_branch_loop_and_exposure_normal_edges_drive_generation() {
+        let source = r#"
+fn structural_edges(u64 limit, bool choose) {
+    mut [u8] bytes = alloc_array<u8>(limit, 0);
+    if (choose) {
+        u64 then_local = 1;
+        /// assert then_local = 1
+    } else {
+        u64 else_local = 2;
+        /// assert else_local = 2
+    }
+    mut u64 index = 0;
+    /// invariant index ≤ limit
+    /// variant limit - index
+    while (index < limit) {
+        index = index + 1;
+    }
+    unsafe expose &mut bytes as (pointer, resource memory) {
+        u64 exposure_local = 3;
+        /// assert exposure_local = 3
+    }
+    /// assert index = limit
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("all retained normal structural edges should generate");
+        assert!(generated.obligations.iter().any(|obligation| {
+            obligation
+                .name
+                .starts_with("structural_edges.inv_preserved")
+        }));
+        assert!(
+            generated
+                .obligations
+                .iter()
+                .any(|obligation| obligation.name == "structural_edges.expose.bytes.extent")
+        );
+        assert!(
+            generated
+                .obligations
+                .iter()
+                .any(|obligation| obligation.name == "structural_edges.expose.bytes.bytes")
+        );
+        let assertion_count = generated
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.name.starts_with("structural_edges.assert."))
+            .count();
+        assert_eq!(assertion_count, 6);
+    }
+
+    #[test]
+    fn checked_control_shape_refuses_deleted_else_and_moved_or_reshaped_returns() {
+        let else_source = r#"
+fn erased_else(bool flag) {
+    if (flag) {
+    } else {
+        /// assert false
+    }
+}
+"#;
+        let (mut else_program, else_checked) = checked_program(else_source);
+        let Stmt::If { else_block, .. } = &mut else_program.fns[0].body[0] else {
+            panic!("fixture has an if statement")
+        };
+        *else_block = None;
+        let deleted = match generate(&else_program, &else_checked, else_source, Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("deleting a checked else arm must fail closed"),
+        };
+        assert!(
+            deleted.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{deleted}"
+        );
+
+        let return_source = "fn moved_return(bool flag) { if (flag) {} return; }";
+        let (mut return_program, return_checked) = checked_program(return_source);
+        let return_statement = return_program.fns[0].body.pop().expect("checked return");
+        let Stmt::If { then_block, .. } = &mut return_program.fns[0].body[0] else {
+            panic!("fixture has an if statement")
+        };
+        then_block.push(return_statement);
+        let moved = match generate(
+            &return_program,
+            &return_checked,
+            return_source,
+            Path::new("."),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("moving a checked return into another scope must fail closed"),
+        };
+        assert!(
+            moved.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{moved}"
+        );
+
+        let shape_source = "fn reshaped_return() { return; }";
+        let (mut shape_program, shape_checked) = checked_program(shape_source);
+        let Stmt::Return { value, span } = &mut shape_program.fns[0].body[0] else {
+            panic!("fixture has a return statement")
+        };
+        *value = Some(Expr {
+            kind: ExprKind::IntLit(1),
+            span: *span,
+            ty: Some(Ty::Int(IntTy::U64)),
+        });
+        let reshaped = match generate(&shape_program, &shape_checked, shape_source, Path::new("."))
+        {
+            Err(error) => error,
+            Ok(_) => {
+                panic!("changing a checked unit return into a valued return must fail closed")
+            }
+        };
+        assert!(
+            reshaped.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{reshaped}"
+        );
+
+        let nested_source = "fn moved_if(bool first, bool second) { if (first) {} if (second) {} }";
+        let (mut nested_program, nested_checked) = checked_program(nested_source);
+        let moved_if = nested_program.fns[0].body.pop().expect("second checked if");
+        let Stmt::If { then_block, .. } = &mut nested_program.fns[0].body[0] else {
+            panic!("fixture starts with an if statement")
+        };
+        then_block.push(moved_if);
+        let nested = match generate(
+            &nested_program,
+            &nested_checked,
+            nested_source,
+            Path::new("."),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("moving a checked control subtree must fail closed"),
+        };
+        assert!(
+            nested.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{nested}"
+        );
+
+        let fallthrough_source = "fn erased_return() -> u64 { return 1; }";
+        let (mut fallthrough_program, fallthrough_checked) = checked_program(fallthrough_source);
+        fallthrough_program.fns[0].body.clear();
+        let fallthrough = match generate(
+            &fallthrough_program,
+            &fallthrough_checked,
+            fallthrough_source,
+            Path::new("."),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a non-unit checked return may not be erased"),
+        };
+        assert!(
+            fallthrough.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{fallthrough}"
+        );
+    }
+
+    #[test]
+    fn checked_trap_sites_cover_nested_normal_source_translation() {
+        let source = r#"
+fn trap_callee(u64 x) -> u64 {
+    return x;
+}
+
+/// pre i < values.len
+/// pre x < u64.max
+fn trap_source(&mut [u64] values, u64 i, u64 x) {
+    /// assert i < values.len
+    values[i] = trap_callee(x + 1);
+    [u64] scratch = alloc_array<u64>(1, x);
+    /// assert scratch.len = 1
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("nested statement/expression traps must consume the retained no-unwind plan");
+
+        assert!(
+            generated
+                .obligations
+                .iter()
+                .any(|obligation| obligation.name.starts_with("trap_source.assert."))
+        );
+        assert!(
+            generated
+                .obligations
+                .iter()
+                .any(|obligation| obligation.name.starts_with("trap_source.bounds."))
+        );
+        assert!(
+            generated
+                .obligations
+                .iter()
+                .any(|obligation| obligation.name.starts_with("trap_source.overflow."))
+        );
+        // Allocation failure and a callee trapping are operational-only
+        // edges. Their exact source sites are consumed by expression entry,
+        // while VC generation continues to reason about normal return only.
+    }
+
+    #[test]
+    fn checked_trap_shape_refuses_deleted_and_semantically_replaced_sites() {
+        let source = "fn trap_forge(u64 x) -> u64 { return x + 1; }";
+
+        let (mut deleted_program, deleted_checked) = checked_program(source);
+        let Stmt::Return {
+            value: Some(deleted),
+            ..
+        } = &mut deleted_program.fns[0].body[0]
+        else {
+            panic!("fixture returns the trapping expression")
+        };
+        let ExprKind::Binary { lhs, .. } = &deleted.kind else {
+            panic!("fixture return is an addition")
+        };
+        *deleted = (**lhs).clone();
+        let deleted_error =
+            match generate(&deleted_program, &deleted_checked, source, Path::new(".")) {
+                Err(error) => error,
+                Ok(_) => {
+                    panic!("deleting a checked trap site must fail before symbolic execution")
+                }
+            };
+        assert!(
+            deleted_error.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{deleted_error}"
+        );
+        assert!(deleted_error.contains("trap"), "{deleted_error}");
+
+        let (mut replaced_program, replaced_checked) = checked_program(source);
+        let Stmt::Return {
+            value: Some(replaced),
+            ..
+        } = &mut replaced_program.fns[0].body[0]
+        else {
+            panic!("fixture returns the trapping expression")
+        };
+        let ExprKind::Binary { op, .. } = &mut replaced.kind else {
+            panic!("fixture return is an addition")
+        };
+        *op = BinOp::Sub;
+        let replaced_error =
+            match generate(&replaced_program, &replaced_checked, source, Path::new(".")) {
+                Err(error) => error,
+                Ok(_) => {
+                    panic!("replacing one checked trap semantic with another must fail closed")
+                }
+            };
+        assert!(
+            replaced_error.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{replaced_error}"
+        );
+        assert!(replaced_error.contains("trap"), "{replaced_error}");
     }
 
     #[test]
@@ -9256,8 +12226,8 @@ fn bool_array_local(bool seed) -> bool {
     return bits[1];
 }
 "#;
-        let (program, sigs) = checked_program(source);
-        let generated = generate(&program, &sigs, source, std::path::Path::new("."))
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, std::path::Path::new("."))
             .expect("owned Boolean locals should stay inside the VC type domain");
 
         assert!(generated.obligations.iter().any(|obligation| {
@@ -9294,13 +12264,14 @@ fn bool_array_loop(u64 n, bool seed) {
     /// invariant bits.len = n
     /// variant n - i
     while (i < n) {
+        u64 loop_local = i;
         bits[i] = !bits[i];
         i = i + 1;
     }
 }
 "#;
-        let (program, sigs) = checked_program(source);
-        let generated = generate(&program, &sigs, source, std::path::Path::new("."))
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, std::path::Path::new("."))
             .expect("Boolean array loop havoc should remain in the concrete Bool model");
         let preservation = generated
             .obligations
@@ -9317,6 +12288,13 @@ fn bool_array_loop(u64 n, bool seed) {
         assert!(preservation.binders.iter().any(|(name, ty)| {
             name.starts_with("_old") && name.ends_with("_bits") && ty == "Sable.Seq Bool"
         }));
+        assert!(
+            preservation
+                .binders
+                .iter()
+                .all(|(name, _)| name != "loop_local"),
+            "loop-body locals must be cleared by the checked backedge route before preservation"
+        );
         assert!(preservation.hyps.iter().all(|(name, proposition)| {
             name != "h_bits_elems"
                 && !proposition.contains("≤ bits.get")
@@ -9351,6 +12329,7 @@ fn bool_array_loop(u64 n, bool seed) {
             records: Vec::new(),
             clause_wfs: Vec::new(),
             obligations: Vec::new(),
+            transition_certificates: Vec::new(),
             trust: TrustManifest::default(),
             machine: MachineManifest::default(),
         }
@@ -9363,16 +12342,30 @@ fn bool_array_loop(u64 n, bool seed) {
         let classes: Vec<ClassDecl> = Vec::new();
         let records: Vec<RecordDecl> = Vec::new();
         let sigs: HashMap<String, FnSig> = HashMap::new();
+        let ownership = CheckedOwnershipPlan::default();
         let fn_map: HashMap<&str, &Fn> = HashMap::new();
         let class_map: HashMap<&str, &ClassDecl> = HashMap::new();
         let mut out = empty_result();
         let mut generator = Generator {
             f: &f,
             fname: "probe".to_string(),
+            call_owner: CallOwner::Function("probe".to_string()),
             cctx: Cctx::None,
+            control: None,
             classes: &classes,
             records: &records,
             sigs: &sigs,
+            ownership: &ownership,
+            visited_checked_calls: HashSet::new(),
+            checked_call_visits: HashMap::new(),
+            visited_option_takes: HashSet::new(),
+            visited_exposures: HashSet::new(),
+            visited_sealed_operations: HashSet::new(),
+            visited_loops: HashSet::new(),
+            visited_value_transfers: HashSet::new(),
+            visited_assignments: HashSet::new(),
+            visited_field_assignments: HashSet::new(),
+            visited_temporary_drops: HashSet::new(),
             fn_map: &fn_map,
             class_map: &class_map,
             source: "",
@@ -9392,15 +12385,29 @@ fn bool_array_loop(u64 n, bool seed) {
         probe(&mut generator)
     }
 
-    fn borrow_expr(array: &str, field: Option<&str>) -> Expr {
-        Expr {
-            kind: ExprKind::Borrow {
-                array: array.to_string(),
-                field: field.map(str::to_string),
-                mutable: true,
+    fn checked_havoc_call(parameter: &str, referent: Ty, place: Place) -> CheckedCallTransition {
+        let parameter_ty = Ty::borrow(Mutability::Mut, referent.clone());
+        CheckedCallTransition {
+            key: CallSiteKey {
+                owner: CallOwner::Function("probe".to_string()),
+                span: Span::new(0, 0),
+                target: CallTarget::Function("callee".to_string()),
             },
-            span: Span::new(0, 0),
-            ty: None,
+            receiver: None,
+            arguments: vec![crate::transition::CallArgumentTransition {
+                parameter_index: 0,
+                parameter: parameter.to_string(),
+                parameter_ty,
+                argument_span: Span::new(0, 0),
+                effect: CallArgumentEffect::Loan(
+                    crate::transition::CallTransition::unique_borrow(
+                        place,
+                        referent,
+                        Span::new(0, 0),
+                    )
+                    .expect("test call-havoc shape is admitted"),
+                ),
+            }],
         }
     }
 
@@ -9408,15 +12415,47 @@ fn bool_array_loop(u64 n, bool seed) {
     fn sealed_ops_refuse_field_borrows_fail_closed() {
         let _ = take_vc_type_refusal();
 
+        let operation = |place: Option<Place>| CheckedSealedOperation {
+            key: EffectSiteKey {
+                owner: CallOwner::Function("probe".into()),
+                span: Span::new(0, 0),
+            },
+            target: CheckedSealedTarget::Resource(ResOp::SplitOff),
+            arguments: vec![CheckedSealedArgument {
+                index: 0,
+                argument_ty: Ty::borrow(Mutability::Mut, Ty::Res(ResKind::RawSpan)),
+                argument_span: Span::new(0, 0),
+                effect: match place {
+                    Some(place) => CallArgumentEffect::Loan(
+                        CallTransition::unique_borrow(
+                            place,
+                            Ty::Res(ResKind::RawSpan),
+                            Span::new(0, 0),
+                        )
+                        .expect("test sealed-loan shape is admitted"),
+                    ),
+                    None => CallArgumentEffect::Value(ValueTransfer {
+                        source: None,
+                        value_ty: Ty::Int(IntTy::U64),
+                        kind: ValueTransferKind::Copy,
+                        carried_obligation: false,
+                        branded: false,
+                        span: Span::new(0, 0),
+                    }),
+                },
+            }],
+            result_ty: Ty::Unit,
+        };
+
         // A whole-place borrow answers with its root name and no refusal.
-        let root = sealed_borrow_root(&borrow_expr("mem", None), "split_off");
+        let root = sealed_borrow_root(&operation(Some(Place::local("mem"))), 0);
         assert_eq!(root, "mem");
         assert!(take_vc_type_refusal().is_none());
 
         // A field borrow latches: the arm's write-back key would be the
         // whole object. The checker's `resource.field_borrow_op` refuses
         // the shape first; this is the arm's own fail-closed layer.
-        let refused = sealed_borrow_root(&borrow_expr("self", Some("mem")), "split_off");
+        let refused = sealed_borrow_root(&operation(Some(Place::field("self", "mem"))), 0);
         assert_eq!(refused, "_refused_split_off");
         let latched = take_vc_type_refusal().expect("the field borrow is latched");
         assert!(
@@ -9425,13 +12464,8 @@ fn bool_array_loop(u64 n, bool seed) {
         );
 
         // A non-borrow argument latches under its own name.
-        let not_a_borrow = Expr {
-            kind: ExprKind::IntLit(0),
-            span: Span::new(0, 0),
-            ty: None,
-        };
-        let refused = sealed_borrow_root(&not_a_borrow, "join");
-        assert_eq!(refused, "_refused_join");
+        let refused = sealed_borrow_root(&operation(None), 0);
+        assert_eq!(refused, "_refused_split_off");
         let latched = take_vc_type_refusal().expect("the shape is latched");
         assert!(
             latched.starts_with("internal.vcgen.sealed_borrow_shape:"),
@@ -9480,14 +12514,9 @@ fn bool_array_loop(u64 n, bool seed) {
             generator
                 .var_tys
                 .insert("xs".to_string(), Ty::array(Ty::Int(IntTy::U32)));
-            let params = vec![Param {
-                name: "m".to_string(),
-                ty: Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut),
-                span: Span::new(0, 0),
-                consumes: false,
-            }];
-            let args = vec![borrow_expr("xs", None)];
-            let fresh = generator.havoc_mut_borrow_args(&params, &args);
+            let checked =
+                checked_havoc_call("m", Ty::array(Ty::Int(IntTy::U32)), Place::local("xs"));
+            let fresh = generator.havoc_mut_borrow_args(&checked, 1);
             assert_eq!(fresh, vec![("m".to_string(), "_arr1".to_string())]);
             assert!(matches!(
                 generator.env.get("xs"),
@@ -9506,44 +12535,26 @@ fn bool_array_loop(u64 n, bool seed) {
                     .any(|(h, prop)| h == "h_xs_len" && prop == "(_arr1.len) = (xs.len)")
             );
             assert!(generator.hyps.iter().any(|(h, _)| h == "h_xs_elems"));
+            let certificate = generator
+                .out
+                .transition_certificates
+                .last()
+                .expect("a real array call havoc emits a certificate");
+            assert_eq!(certificate.transition.place.render(), "xs");
+            assert!(matches!(
+                certificate.kind,
+                crate::transition::CallHavocCertificateKind::Array { .. }
+            ));
         });
         assert!(take_vc_type_refusal().is_none());
-
-        // A unique-borrow parameter fed a non-borrow argument is latched,
-        // never silently skipped.
-        with_generator(|generator| {
-            let params = vec![Param {
-                name: "m".to_string(),
-                ty: Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut),
-                span: Span::new(0, 0),
-                consumes: false,
-            }];
-            let args = vec![Expr {
-                kind: ExprKind::IntLit(3),
-                span: Span::new(0, 0),
-                ty: None,
-            }];
-            let fresh = generator.havoc_mut_borrow_args(&params, &args);
-            assert!(fresh.is_empty());
-        });
-        let latched = take_vc_type_refusal().expect("the argument shape is latched");
-        assert!(
-            latched.starts_with("internal.vcgen.mut_borrow_arg_shape:"),
-            "{latched}"
-        );
 
         // A borrowed array place with no pre-call sequence state is
         // latched too: a length relation with nothing to be relative to is
         // not a fact.
         with_generator(|generator| {
-            let params = vec![Param {
-                name: "m".to_string(),
-                ty: Ty::array_ref(Ty::Int(IntTy::U32), Mutability::Mut),
-                span: Span::new(0, 0),
-                consumes: false,
-            }];
-            let args = vec![borrow_expr("xs", None)];
-            let _ = generator.havoc_mut_borrow_args(&params, &args);
+            let checked =
+                checked_havoc_call("m", Ty::array(Ty::Int(IntTy::U32)), Place::local("xs"));
+            let _ = generator.havoc_mut_borrow_args(&checked, 1);
         });
         let latched = take_vc_type_refusal().expect("the missing state is latched");
         assert!(
@@ -9553,21 +12564,1348 @@ fn bool_array_loop(u64 n, bool seed) {
     }
 
     #[test]
+    fn call_site_havoc_writes_back_the_shared_projected_place() {
+        // The checker and VCgen both decode this as `self.mem`. VCgen keeps
+        // the existing conservative object update, but it may not forget the
+        // projection and replace `self` with the returned resource view.
+        let _ = take_vc_type_refusal();
+        with_generator(|generator| {
+            generator
+                .env
+                .insert("self".to_string(), Val::Obj("before".to_string()));
+            let checked = checked_havoc_call(
+                "mem",
+                Ty::Res(ResKind::RawSpan),
+                Place::field("self", "mem"),
+            );
+
+            let fresh = generator.havoc_mut_borrow_args(&checked, 1);
+            assert_eq!(fresh.len(), 1);
+            assert_eq!(fresh[0].0, "mem");
+            assert!(matches!(
+                generator.env.get("self"),
+                Some(Val::Obj(state))
+                    if state.starts_with("{ before with mem := ") && state.ends_with(" }")
+            ));
+            let certificate = generator
+                .out
+                .transition_certificates
+                .last()
+                .expect("a projected resource call havoc emits a certificate");
+            assert_eq!(certificate.transition.place.render(), "self.mem");
+            assert_eq!(certificate.fresh, certificate.observed);
+            assert!(matches!(
+                certificate.kind,
+                crate::transition::CallHavocCertificateKind::Writeback
+            ));
+        });
+        assert!(take_vc_type_refusal().is_none());
+    }
+
+    #[test]
+    fn call_site_havoc_performs_only_checker_supplied_effects() {
+        let _ = take_vc_type_refusal();
+        with_generator(|generator| {
+            let checked = CheckedCallTransition {
+                key: CallSiteKey {
+                    owner: CallOwner::Function("probe".to_string()),
+                    span: Span::new(0, 0),
+                    target: CallTarget::Function("callee".to_string()),
+                },
+                receiver: None,
+                arguments: Vec::new(),
+            };
+            assert!(generator.havoc_mut_borrow_args(&checked, 1).is_empty());
+        });
+        assert!(take_vc_type_refusal().is_none());
+    }
+
+    fn checked_call_havoc_certificate(source: &str) -> (Program, CheckResult, VcResult) {
+        let (program, checked) = checked_program(source);
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let result = generate(&program, &checked, source, repo_root)
+            .expect("the checked call must produce symbolic state");
+        (program, checked, result)
+    }
+
+    const CALL_HAVOC_CERT_SOURCE: &str = r#"
+fn mutate(&mut [u64] values) {
+}
+
+pub fn certificate_subject(u64 n) {
+    mut [u64] values = alloc_array<u64>(n, 0);
+    mutate(&mut values);
+}
+"#;
+
+    const OPTION_HANDOFF_SOURCE: &str = r#"
+pub fn option_handoff(u64 n) {
+    mut option<[bool]> pending = some(alloc_array<bool>(n, false));
+    [bool] flags = pending.take;
+}
+"#;
+
+    const EXPOSURE_HANDOFF_SOURCE: &str = r#"
+pub fn exposure_handoff(u64 n) {
+    mut [u8] bytes = alloc_array<u8>(n, 0);
+    unsafe expose &mut bytes as (pointer, resource memory) {
+    }
+}
+"#;
+
+    const SEALED_HANDOFF_SOURCE: &str = r#"
+pub fn sealed_handoff(resource &mut RawSpan memory, u64 keep) -> resource RawSpan {
+    resource RawSpan tail = split_off(&mut memory, keep);
+    return tail;
+}
+"#;
+
+    const LOOP_HANDOFF_SOURCE: &str = r#"
+pub fn loop_handoff(u64 limit) {
+    mut u64 index = 0;
+    /// invariant index ≤ limit
+    /// variant limit - index
+    while (index < limit) {
+        index = index + 1;
+    }
+}
+"#;
+
+    const VALUE_TRANSFER_HANDOFF_SOURCE: &str = r#"
+pub fn value_transfer_handoff(u64 value) -> u64 {
+    u64 copy = value;
+    return copy;
+}
+"#;
+
+    const CLEANUP_ACTION_HANDOFF_SOURCE: &str = r#"
+class CleanupChild {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+}
+
+fn make_cleanup_child(u64 value) -> CleanupChild {
+    return CleanupChild::new(value);
+}
+
+class CleanupHolder {
+    CleanupChild child;
+    CleanupChild spare;
+
+    init new() {
+        self.child = CleanupChild::new(0);
+        self.spare = CleanupChild::new(0);
+    }
+
+    fn exercise(&mut self, bool choose) {
+        var mut local = make_cleanup_child(1);
+        if (choose) {
+        } else {
+        }
+        local = make_cleanup_child(2);
+        self.child = make_cleanup_child(3);
+        make_cleanup_child(4);
+    }
+}
+"#;
+
+    #[test]
+    fn cleanup_actions_and_linked_transfers_survive_symbolic_revisits() {
+        let (program, checked) = checked_program(CLEANUP_ACTION_HANDOFF_SOURCE);
+        let owner = CallOwner::Method {
+            class: "CleanupHolder".into(),
+            method: "exercise".into(),
+        };
+        let body = checked
+            .control
+            .body(&owner, Span::new(0, 0))
+            .expect("the method has one retained control body")
+            .plan();
+        assert_eq!(body.assignments().len(), 1);
+        assert_eq!(body.field_assignments().len(), 1);
+        assert_eq!(body.temporary_drops().len(), 1);
+        let action_keys = [
+            body.assignments()
+                .next()
+                .expect("local replacement action")
+                .transfer_key(),
+            body.field_assignments()
+                .next()
+                .expect("field replacement action")
+                .transfer_key(),
+            body.temporary_drops()
+                .next()
+                .expect("discarded class action")
+                .transfer_key(),
+        ];
+        for key in action_keys {
+            let transfer = checked
+                .ownership
+                .value_transfer(key)
+                .expect("every cleanup action links an exact checker transfer");
+            assert_eq!(transfer.kind, ValueTransferKind::Fresh);
+            assert_eq!(transfer.source, None);
+            assert_eq!(transfer.value_ty, Ty::Class(0));
+        }
+        generate(
+            &program,
+            &checked,
+            CLEANUP_ACTION_HANDOFF_SOURCE,
+            Path::new("."),
+        )
+        .expect("cleanup actions after a symbolic branch may be revisited without being consumed destructively");
+    }
+
+    #[test]
+    fn cleanup_action_finish_ledger_refuses_each_unvisited_action_kind() {
+        let (program, checked) = checked_program(CLEANUP_ACTION_HANDOFF_SOURCE);
+        let class = &program.classes[1];
+        let method = &class.methods[0];
+        let owner = CallOwner::Method {
+            class: class.name.clone(),
+            method: method.f.name.clone(),
+        };
+        let control = checked
+            .control
+            .body(&owner, method.f.span)
+            .expect("the method has one retained control body");
+        let fn_map: HashMap<&str, &Fn> = program
+            .fns
+            .iter()
+            .map(|function| (function.name.as_str(), function))
+            .collect();
+        let class_map: HashMap<&str, &ClassDecl> = program
+            .classes
+            .iter()
+            .map(|declaration| (declaration.name.as_str(), declaration))
+            .collect();
+        let mut out = empty_result();
+        let mut generator = Generator {
+            f: &method.f,
+            fname: format!("{}::{}", class.name, method.f.name),
+            call_owner: owner.clone(),
+            cctx: Cctx::Method(class, method.self_kind),
+            control: Some(control),
+            classes: &program.classes,
+            records: &program.records,
+            sigs: &checked.sigs,
+            ownership: &checked.ownership,
+            visited_checked_calls: checked
+                .ownership
+                .calls
+                .for_owner(&owner)
+                .map(|(key, _)| key.clone())
+                .collect(),
+            checked_call_visits: HashMap::new(),
+            visited_option_takes: HashSet::new(),
+            visited_exposures: HashSet::new(),
+            visited_sealed_operations: HashSet::new(),
+            visited_loops: HashSet::new(),
+            visited_value_transfers: checked
+                .ownership
+                .value_transfers_for_owner(&owner)
+                .map(|(key, _)| key.clone())
+                .collect(),
+            visited_assignments: HashSet::new(),
+            visited_field_assignments: HashSet::new(),
+            visited_temporary_drops: HashSet::new(),
+            fn_map: &fn_map,
+            class_map: &class_map,
+            source: CLEANUP_ACTION_HANDOFF_SOURCE,
+            binders: Vec::new(),
+            hyps: Vec::new(),
+            context: Vec::new(),
+            env: HashMap::new(),
+            var_tys: HashMap::new(),
+            entry_states: HashMap::new(),
+            fresh: 0,
+            tparams: Vec::new(),
+            trait_ctx: HashMap::new(),
+            name_hint: None,
+            name_counts: HashMap::new(),
+            out: &mut out,
+        };
+
+        generator.finish_checked_ownership();
+        let assignment = take_vc_type_refusal().expect("the local action is unvisited");
+        assert!(
+            assignment.starts_with("internal.vcgen.assignment_action_unvisited:"),
+            "{assignment}"
+        );
+        generator.visited_assignments.extend(
+            control
+                .plan()
+                .assignments()
+                .map(|action| (action.scope(), action.span())),
+        );
+
+        generator.finish_checked_ownership();
+        let field = take_vc_type_refusal().expect("the field action is unvisited");
+        assert!(
+            field.starts_with("internal.vcgen.field_assignment_action_unvisited:"),
+            "{field}"
+        );
+        generator.visited_field_assignments.extend(
+            control
+                .plan()
+                .field_assignments()
+                .map(|action| (action.scope(), action.span())),
+        );
+
+        generator.finish_checked_ownership();
+        let temporary = take_vc_type_refusal().expect("the temporary drop is unvisited");
+        assert!(
+            temporary.starts_with("internal.vcgen.temporary_drop_action_unvisited:"),
+            "{temporary}"
+        );
+        generator.visited_temporary_drops.extend(
+            control
+                .plan()
+                .temporary_drops()
+                .map(|action| (action.scope(), action.span())),
+        );
+
+        generator.finish_checked_ownership();
+        assert!(take_vc_type_refusal().is_none());
+    }
+
+    #[test]
+    fn cleanup_action_handoff_refuses_missing_and_mismatched_transfers() {
+        let owner = CallOwner::Method {
+            class: "CleanupHolder".into(),
+            method: "exercise".into(),
+        };
+        let missing = tampered_generation_error(CLEANUP_ACTION_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .value_transfers_for_owner(&owner)
+                .find(|(key, _)| key.sink == ValueTransferSink::DiscardTemporary)
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the discarded temporary transfer");
+            checked
+                .ownership
+                .remove_value_transfer(&key)
+                .expect("the adversarial test removes the exact linked transfer");
+        });
+        assert!(
+            missing.starts_with("internal.vcgen.value_transfer_missing:"),
+            "{missing}"
+        );
+
+        let local_missing = tampered_generation_error(CLEANUP_ACTION_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .value_transfers_for_owner(&owner)
+                .find(|(key, _)| {
+                    matches!(
+                        &key.sink,
+                        ValueTransferSink::Assignment(place)
+                            if place == &Place::local("local")
+                    )
+                })
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the local replacement transfer");
+            checked
+                .ownership
+                .remove_value_transfer(&key)
+                .expect("the adversarial test removes the local action's exact transfer");
+        });
+        assert!(
+            local_missing.starts_with("internal.vcgen.value_transfer_missing:"),
+            "{local_missing}"
+        );
+
+        let mismatch = tampered_generation_error(CLEANUP_ACTION_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .value_transfers_for_owner(&owner)
+                .find(|(key, _)| matches!(key.sink, ValueTransferSink::FieldAssignment(_)))
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the field replacement transfer");
+            checked
+                .ownership
+                .value_transfer_mut(&key)
+                .expect("the adversarial test mutates the linked transfer")
+                .value_ty = Ty::Bool;
+        });
+        assert!(
+            mismatch.starts_with("internal.vcgen.value_transfer_mismatch:"),
+            "{mismatch}"
+        );
+    }
+
+    #[test]
+    fn cleanup_action_shape_refuses_deletion_destination_type_and_span_forgery() {
+        let checked_error = |program: &Program, checked: &CheckResult| match generate(
+            program,
+            checked,
+            CLEANUP_ACTION_HANDOFF_SOURCE,
+            Path::new("."),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("a forged cleanup action site must fail closed"),
+        };
+
+        let (mut deleted_program, deleted_checked) = checked_program(CLEANUP_ACTION_HANDOFF_SOURCE);
+        deleted_program.classes[1].methods[0].f.body.pop();
+        let deleted = checked_error(&deleted_program, &deleted_checked);
+        assert!(
+            deleted.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{deleted}"
+        );
+
+        let (mut destination_program, destination_checked) =
+            checked_program(CLEANUP_ACTION_HANDOFF_SOURCE);
+        let Stmt::FieldAssign { field, .. } =
+            &mut destination_program.classes[1].methods[0].f.body[3]
+        else {
+            panic!("fixture has one field replacement")
+        };
+        *field = "spare".into();
+        let destination = checked_error(&destination_program, &destination_checked);
+        assert!(
+            destination.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{destination}"
+        );
+
+        let (mut type_program, type_checked) = checked_program(CLEANUP_ACTION_HANDOFF_SOURCE);
+        let Stmt::FieldAssign { value, .. } = &mut type_program.classes[1].methods[0].f.body[3]
+        else {
+            panic!("fixture has one field replacement")
+        };
+        value.ty = Some(Ty::Class(1));
+        let forged_type = checked_error(&type_program, &type_checked);
+        assert!(
+            forged_type.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{forged_type}"
+        );
+
+        let (mut span_program, span_checked) = checked_program(CLEANUP_ACTION_HANDOFF_SOURCE);
+        let Stmt::FieldAssign { field_span, .. } =
+            &mut span_program.classes[1].methods[0].f.body[3]
+        else {
+            panic!("fixture has one field replacement")
+        };
+        field_span.start += 1;
+        let forged_span = checked_error(&span_program, &span_checked);
+        assert!(
+            forged_span.starts_with("internal.vcgen.control_plan_shape_mismatch:"),
+            "{forged_span}"
+        );
+    }
+
+    #[test]
+    fn option_take_handoff_refuses_missing_mismatched_and_unvisited_records() {
+        let owner = CallOwner::Function("option_handoff".into());
+        let missing = tampered_generation_error(OPTION_HANDOFF_SOURCE, |checked| {
+            let (key, take) = checked
+                .ownership
+                .option_takes_for_owner(&owner)
+                .next()
+                .map(|(key, take)| (key.clone(), take.clone()))
+                .expect("the checker records the affine extraction");
+            assert_eq!(take.source, Place::local("pending"));
+            assert_eq!(take.payload, Ty::array(Ty::Bool));
+            checked
+                .ownership
+                .remove_option_take(&key)
+                .expect("the checked extraction is removable in this adversarial test");
+        });
+        assert!(
+            missing.starts_with("internal.vcgen.option_take_missing:"),
+            "{missing}"
+        );
+
+        let mismatch = tampered_generation_error(OPTION_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .option_takes_for_owner(&owner)
+                .next()
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the affine extraction");
+            checked
+                .ownership
+                .option_take_mut(&key)
+                .expect("the checked extraction remains present")
+                .source = Place::local("forged");
+        });
+        assert!(
+            mismatch.starts_with("internal.vcgen.option_take_mismatch:"),
+            "{mismatch}"
+        );
+
+        let unvisited = tampered_generation_error(OPTION_HANDOFF_SOURCE, |checked| {
+            checked
+                .ownership
+                .insert_option_take(CheckedOptionTake {
+                    key: EffectSiteKey {
+                        owner,
+                        span: Span::new(0, 0),
+                    },
+                    source: Place::local("pending"),
+                    source_span: Span::new(0, 0),
+                    payload: Ty::array(Ty::Bool),
+                })
+                .expect("the forged record has a distinct identity");
+        });
+        assert!(
+            unvisited.starts_with("internal.vcgen.option_take_unvisited:"),
+            "{unvisited}"
+        );
+    }
+
+    #[test]
+    fn exposure_handoff_refuses_missing_mismatched_and_unvisited_records() {
+        let owner = CallOwner::Function("exposure_handoff".into());
+        let missing = tampered_generation_error(EXPOSURE_HANDOFF_SOURCE, |checked| {
+            let (key, exposure) = checked
+                .ownership
+                .exposures_for_owner(&owner)
+                .next()
+                .map(|(key, exposure)| (key.clone(), exposure.clone()))
+                .expect("the checker records the exposure");
+            assert_eq!(exposure.owner_place, Place::local("bytes"));
+            assert_eq!(exposure.mutability, Mutability::Mut);
+            assert_eq!(exposure.pointer, "pointer");
+            assert_eq!(exposure.resource, "memory");
+            checked
+                .ownership
+                .remove_exposure(&key)
+                .expect("the checked exposure is removable in this adversarial test");
+        });
+        assert!(
+            missing.starts_with("internal.vcgen.exposure_missing:"),
+            "{missing}"
+        );
+
+        let mismatch = tampered_generation_error(EXPOSURE_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .exposures_for_owner(&owner)
+                .next()
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the exposure");
+            checked
+                .ownership
+                .exposure_mut(&key)
+                .expect("the checked exposure remains present")
+                .pointer = "forged".into();
+        });
+        assert!(
+            mismatch.starts_with("internal.vcgen.exposure_mismatch:"),
+            "{mismatch}"
+        );
+
+        let key_mismatch = tampered_generation_error(EXPOSURE_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .exposures_for_owner(&owner)
+                .next()
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the exposure");
+            checked
+                .ownership
+                .exposure_mut(&key)
+                .expect("the checked exposure remains present")
+                .key
+                .owner = CallOwner::Function("forged_owner".into());
+        });
+        assert!(
+            key_mismatch.starts_with("internal.vcgen.exposure_mismatch:"),
+            "{key_mismatch}"
+        );
+
+        let unvisited = tampered_generation_error(EXPOSURE_HANDOFF_SOURCE, |checked| {
+            checked
+                .ownership
+                .insert_exposure(CheckedExposure {
+                    key: EffectSiteKey {
+                        owner,
+                        span: Span::new(0, 0),
+                    },
+                    owner_place: Place::local("bytes"),
+                    owner_span: Span::new(0, 0),
+                    owner_ty: Ty::array(Ty::Int(IntTy::U8)),
+                    mutability: Mutability::Mut,
+                    pointer: "pointer".into(),
+                    pointer_span: Span::new(0, 0),
+                    resource: "memory".into(),
+                    resource_span: Span::new(0, 0),
+                })
+                .expect("the forged record has a distinct identity");
+        });
+        assert!(
+            unvisited.starts_with("internal.vcgen.exposure_unvisited:"),
+            "{unvisited}"
+        );
+    }
+
+    #[test]
+    fn sealed_handoff_refuses_missing_mismatched_and_unvisited_records() {
+        let owner = CallOwner::Function("sealed_handoff".into());
+        let missing = tampered_generation_error(SEALED_HANDOFF_SOURCE, |checked| {
+            let (key, operation) = checked
+                .ownership
+                .sealed_operations_for_owner(&owner)
+                .next()
+                .map(|(key, operation)| (key.clone(), operation.clone()))
+                .expect("the checker records the sealed operation");
+            assert_eq!(
+                operation.target,
+                CheckedSealedTarget::Resource(ResOp::SplitOff)
+            );
+            assert!(matches!(
+                &operation.arguments[0].effect,
+                CallArgumentEffect::Loan(loan)
+                    if loan.place == Place::local("memory")
+                        && loan.effect == CallEffect::HavocUniqueBorrow
+            ));
+            assert_eq!(operation.result_ty, Ty::Res(ResKind::RawSpan));
+            checked
+                .ownership
+                .remove_sealed_operation(&key)
+                .expect("the checked operation is removable in this adversarial test");
+        });
+        assert!(
+            missing.starts_with("internal.vcgen.sealed_transition_missing:"),
+            "{missing}"
+        );
+
+        let mismatch = tampered_generation_error(SEALED_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .sealed_operations_for_owner(&owner)
+                .next()
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the sealed operation");
+            checked
+                .ownership
+                .sealed_operation_mut(&key)
+                .expect("the checked operation remains present")
+                .target = CheckedSealedTarget::Resource(ResOp::Join);
+        });
+        assert!(
+            mismatch.starts_with("internal.vcgen.sealed_transition_mismatch:"),
+            "{mismatch}"
+        );
+
+        let unvisited = tampered_generation_error(SEALED_HANDOFF_SOURCE, |checked| {
+            checked
+                .ownership
+                .insert_sealed_operation(CheckedSealedOperation {
+                    key: EffectSiteKey {
+                        owner,
+                        span: Span::new(0, 0),
+                    },
+                    target: CheckedSealedTarget::Resource(ResOp::SplitOff),
+                    arguments: Vec::new(),
+                    result_ty: Ty::Unit,
+                })
+                .expect("the forged record has a distinct identity");
+        });
+        assert!(
+            unvisited.starts_with("internal.vcgen.sealed_transition_unvisited:"),
+            "{unvisited}"
+        );
+    }
+
+    #[test]
+    fn loop_handoff_refuses_missing_mismatched_and_unvisited_records() {
+        let owner = CallOwner::Function("loop_handoff".into());
+        let missing = tampered_generation_error(LOOP_HANDOFF_SOURCE, |checked| {
+            let (key, effects) = checked
+                .ownership
+                .loops_for_owner(&owner)
+                .next()
+                .map(|(key, effects)| (key.clone(), effects.clone()))
+                .expect("the checker records the loop effect");
+            assert!(effects.mutations.iter().any(|mutation| matches!(
+                mutation,
+                CheckedMutation::DirectWrite { place }
+                    if place == &Place::local("index")
+            )));
+            checked
+                .ownership
+                .remove_loop_effects(&key)
+                .expect("the checked loop is removable in this adversarial test");
+        });
+        assert!(
+            missing.starts_with("internal.vcgen.loop_effect_missing:"),
+            "{missing}"
+        );
+
+        let mismatch = tampered_generation_error(LOOP_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .loops_for_owner(&owner)
+                .next()
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the loop effect");
+            checked
+                .ownership
+                .loop_effects_mut(&key)
+                .expect("the checked loop remains present")
+                .condition_span = Span::new(0, 0);
+        });
+        assert!(
+            mismatch.starts_with("internal.vcgen.loop_effect_mismatch:"),
+            "{mismatch}"
+        );
+
+        let key_mismatch = tampered_generation_error(LOOP_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .loops_for_owner(&owner)
+                .next()
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the loop effect");
+            checked
+                .ownership
+                .loop_effects_mut(&key)
+                .expect("the checked loop remains present")
+                .key
+                .owner = CallOwner::Function("forged_owner".into());
+        });
+        assert!(
+            key_mismatch.starts_with("internal.vcgen.loop_effect_mismatch:"),
+            "{key_mismatch}"
+        );
+
+        let unvisited = tampered_generation_error(LOOP_HANDOFF_SOURCE, |checked| {
+            checked
+                .ownership
+                .insert_loop(CheckedLoopEffects {
+                    key: EffectSiteKey {
+                        owner,
+                        span: Span::new(0, 0),
+                    },
+                    condition_span: Span::new(0, 0),
+                    mutations: Vec::new(),
+                })
+                .expect("the forged record has a distinct identity");
+        });
+        assert!(
+            unvisited.starts_with("internal.vcgen.loop_effect_unvisited:"),
+            "{unvisited}"
+        );
+    }
+
+    #[test]
+    fn value_transfer_handoff_refuses_missing_mismatched_and_unvisited_records() {
+        let owner = CallOwner::Function("value_transfer_handoff".into());
+        let missing = tampered_generation_error(VALUE_TRANSFER_HANDOFF_SOURCE, |checked| {
+            let (key, transfer) = checked
+                .ownership
+                .value_transfers_for_owner(&owner)
+                .min_by_key(|(key, _)| (key.span.start, key.span.end))
+                .map(|(key, transfer)| (key.clone(), transfer.clone()))
+                .expect("the checker records the first value transfer");
+            assert_eq!(transfer.source, Some(Place::local("value")));
+            assert_eq!(transfer.kind, ValueTransferKind::Copy);
+            assert!(!transfer.carried_obligation);
+            assert!(!transfer.branded);
+            checked
+                .ownership
+                .remove_value_transfer(&key)
+                .expect("the checked transfer is removable in this adversarial test");
+        });
+        assert!(
+            missing.starts_with("internal.vcgen.value_transfer_missing:"),
+            "{missing}"
+        );
+
+        let mismatch = tampered_generation_error(VALUE_TRANSFER_HANDOFF_SOURCE, |checked| {
+            let key = checked
+                .ownership
+                .value_transfers_for_owner(&owner)
+                .min_by_key(|(key, _)| (key.span.start, key.span.end))
+                .map(|(key, _)| key.clone())
+                .expect("the checker records the first value transfer");
+            checked
+                .ownership
+                .value_transfer_mut(&key)
+                .expect("the checked transfer remains present")
+                .value_ty = Ty::Bool;
+        });
+        assert!(
+            mismatch.starts_with("internal.vcgen.value_transfer_mismatch:"),
+            "{mismatch}"
+        );
+
+        let unvisited = tampered_generation_error(VALUE_TRANSFER_HANDOFF_SOURCE, |checked| {
+            checked
+                .ownership
+                .insert_value_transfer(
+                    owner,
+                    crate::ownership::ValueTransferSink::Binding("forged".into()),
+                    ValueTransfer {
+                        source: None,
+                        value_ty: Ty::Unit,
+                        kind: ValueTransferKind::Copy,
+                        carried_obligation: false,
+                        branded: false,
+                        span: Span::new(0, 0),
+                    },
+                )
+                .expect("the forged record has a distinct identity");
+        });
+        assert!(
+            unvisited.starts_with("internal.vcgen.value_transfer_unvisited:"),
+            "{unvisited}"
+        );
+    }
+
+    #[test]
+    fn for_desugaring_uses_distinct_transfer_sinks_at_one_source_anchor() {
+        let source = r#"
+pub fn desugared_transfers(u64 limit) {
+    for (u64 index : range(limit)) {
+    }
+}
+"#;
+        let owner = CallOwner::Function("desugared_transfers".into());
+        let (program, checked) = checked_program(source);
+        let mut keys: Vec<_> = checked
+            .ownership
+            .value_transfers_for_owner(&owner)
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort_by_key(|key| (key.span.start, key.span.end, key.sink.render()));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].span, keys[1].span);
+        assert_ne!(keys[0].sink, keys[1].sink);
+        assert!(matches!(
+            (&keys[0].sink, &keys[1].sink),
+            (
+                crate::ownership::ValueTransferSink::Assignment(place),
+                crate::ownership::ValueTransferSink::Binding(binding)
+            ) if place == &Place::local("index") && binding == "index"
+        ));
+        generate(&program, &checked, source, Path::new("."))
+            .expect("both desugared transfer records have exact VC consumers");
+    }
+
+    #[test]
+    fn nested_calls_visit_checker_effects_in_evaluation_order() {
+        let source = r#"
+fn inner(&mut [u64] left) -> u64 {
+    return 0;
+}
+
+fn outer(u64 marker, &mut [u64] right) {
+}
+
+pub fn nested_subject(u64 n) {
+    mut [u64] left = alloc_array<u64>(n, 0);
+    mut [u64] right = alloc_array<u64>(n, 0);
+    outer(inner(&mut left), &mut right);
+}
+"#;
+        let (_, _, result) = checked_call_havoc_certificate(source);
+        let places: Vec<String> = result
+            .transition_certificates
+            .iter()
+            .map(|certificate| certificate.transition.place.render())
+            .collect();
+        assert_eq!(places, vec!["left".to_string(), "right".to_string()]);
+    }
+
+    #[test]
+    fn a_call_after_a_branch_reuses_checked_facts_and_emits_one_certificate_per_path() {
+        let source = r#"
+fn mutate(&mut [u64] values) {
+}
+
+pub fn branch_join(u64 n, bool choose) {
+    mut [u64] values = alloc_array<u64>(n, 0);
+    if (choose) {
+    } else {
+    }
+    mutate(&mut values);
+}
+"#;
+        let (_, checked, result) = checked_call_havoc_certificate(source);
+        assert_eq!(
+            checked
+                .ownership
+                .calls
+                .for_owner(&CallOwner::Function("branch_join".to_string()))
+                .count(),
+            1,
+            "the checker records one immutable fact for the one source call"
+        );
+
+        let certificates: Vec<&TransitionCertificate> = result
+            .transition_certificates
+            .iter()
+            .filter(|certificate| certificate.transition.place.render() == "values")
+            .collect();
+        assert_eq!(certificates.len(), 2);
+        assert!(certificates[0].name.contains(".visit.1."));
+        assert!(certificates[1].name.contains(".visit.2."));
+        assert_ne!(certificates[0].thm_name, certificates[1].thm_name);
+
+        let emitted = crate::lean::emit(
+            &result,
+            &[],
+            &HashSet::new(),
+            &[],
+            &crate::lean::EmittedNames::default(),
+        );
+        assert_eq!(emitted.names.certificates.len(), 2);
+        assert!(
+            certificates
+                .iter()
+                .all(|certificate| emitted.lean_source.contains(&certificate.thm_name))
+        );
+    }
+
+    #[test]
+    fn checker_handoff_preserves_a_destructor_field_place() {
+        let source = r#"
+fn touch(resource &mut RawSpan mem) {
+}
+
+pub class Holder {
+    resource RawSpan mem;
+
+    init hold(resource RawSpan initial) {
+        self.mem = initial;
+    }
+
+    deinit {
+        touch(&mut self.mem);
+    }
+}
+"#;
+        let (_, _, result) = checked_call_havoc_certificate(source);
+        let certificate = result
+            .transition_certificates
+            .iter()
+            .find(|certificate| certificate.transition.place.render() == "self.mem")
+            .expect("the checker-authored field place reaches the certificate");
+        assert!(matches!(
+            certificate.kind,
+            crate::transition::CallHavocCertificateKind::Writeback
+        ));
+    }
+
+    #[test]
+    fn retained_template_deinit_visits_checked_calls_and_emits_obligations() {
+        let source = r#"
+fn touch(resource &mut RawSpan mem) {
+}
+
+pub class GenericHolder<T> {
+    T value;
+    resource RawSpan mem;
+
+    init hold(T initial, resource RawSpan memory) {
+        self.value = initial;
+        self.mem = memory;
+    }
+
+    deinit {
+        touch(&mut self.mem);
+        /// assert #[label(nonnegative)] self.mem.len >= 0
+    }
+}
+"#;
+        let (program, checked) = checked_program(source);
+        assert_eq!(
+            checked
+                .ownership
+                .calls
+                .for_owner(&CallOwner::Deinitializer {
+                    class: "GenericHolder".to_string(),
+                })
+                .count(),
+            1,
+            "the checker records the retained template destructor call"
+        );
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let result = generate(&program, &checked, source, repo_root)
+            .expect("the retained template destructor must be symbolically generated");
+
+        assert!(
+            result
+                .obligations
+                .iter()
+                .any(|obligation| obligation.name == "GenericHolder::deinit.assert.nonnegative")
+        );
+        let certificate = result
+            .transition_certificates
+            .iter()
+            .find(|certificate| {
+                certificate.name.contains("deinitializer.GenericHolder")
+                    && certificate.transition.place.render() == "self.mem"
+            })
+            .expect("the template destructor visits its checker-authored field havoc");
+        assert!(matches!(
+            certificate.kind,
+            crate::transition::CallHavocCertificateKind::Writeback
+        ));
+    }
+
+    #[test]
+    fn constructor_and_method_calls_visit_checker_unique_borrow_effects() {
+        let source = r#"
+class Cell {
+    u64 value;
+
+    init zero() {
+        self.value = 0;
+    }
+
+    fn bump(&mut self) {
+        self.value = self.value + 1;
+    }
+}
+
+class Driver {
+    u64 runs;
+
+    init borrow(&mut Cell cell) {
+        cell.bump();
+        self.runs = 0;
+    }
+
+    fn touch(&self, &mut Cell cell) {
+        cell.bump();
+    }
+}
+
+pub fn member_call_subject() {
+    var mut cell = Cell::zero();
+    var driver = Driver::borrow(&mut cell);
+    driver.touch(&mut cell);
+}
+"#;
+        let (_, _, result) = checked_call_havoc_certificate(source);
+        let places: Vec<String> = result
+            .transition_certificates
+            .iter()
+            .map(|certificate| certificate.transition.place.render())
+            .collect();
+        assert_eq!(places, vec!["cell".to_string(), "cell".to_string()]);
+    }
+
+    #[test]
+    fn constructor_and_method_with_one_spelling_keep_distinct_typed_owners() {
+        let source = r#"
+fn noop() {
+}
+
+class Same {
+    u64 value;
+
+    init same() {
+        noop();
+        /// assert #[label(owner)] true
+        self.value = 0;
+    }
+
+    fn same(&self) {
+        noop();
+        /// assert #[label(owner)] true
+    }
+}
+
+pub fn same_member_subject() {
+    var value = Same::same();
+    value.same();
+}
+"#;
+        let (program, checked) = checked_program(source);
+        assert_eq!(
+            checked
+                .ownership
+                .calls
+                .for_owner(&CallOwner::Constructor {
+                    class: "Same".to_string(),
+                    init: "same".to_string(),
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            checked
+                .ownership
+                .calls
+                .for_owner(&CallOwner::Method {
+                    class: "Same".to_string(),
+                    method: "same".to_string(),
+                })
+                .count(),
+            1
+        );
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let result = generate(&program, &checked, source, repo_root)
+            .expect("typed member owners must partition calls and proof declarations");
+        let constructor = result
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name == "Same::same::constructor.assert.owner")
+            .expect("the constructor assertion has a typed identity");
+        let method = result
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name == "Same::same::method.assert.owner")
+            .expect("the method assertion has a typed identity");
+        assert_ne!(constructor.thm_name, method.thm_name);
+        assert_eq!(
+            result
+                .clause_wfs
+                .iter()
+                .map(|wf| wf.def_name.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            result.clause_wfs.len(),
+            "typed owner components keep every generated clause helper distinct"
+        );
+    }
+
+    #[test]
+    fn generated_theorem_identity_is_injective_over_raw_semantic_components() {
+        let projected = injective_lean_components(
+            "cert",
+            &["function.foo", "function.touch", "self.mem", "7:12", "0"],
+        );
+        let underscored = injective_lean_components(
+            "cert",
+            &["function.foo", "function.touch", "self_mem", "7:12", "0"],
+        );
+        assert_ne!(projected, underscored);
+
+        let dependency = injective_lean_components(
+            "cert",
+            &[
+                "function.foo",
+                "function.touch_dep",
+                "bar_call_havoc_baz",
+                "7:12",
+                "0",
+            ],
+        );
+        let root = injective_lean_components(
+            "cert",
+            &[
+                "function.foo_call_havoc_bar",
+                "function.touch_root",
+                "baz",
+                "7:12",
+                "0",
+            ],
+        );
+        assert_ne!(dependency, root);
+    }
+
+    #[test]
+    fn vcgen_refuses_a_missing_checked_call_record() {
+        let (program, mut checked) = checked_program(CALL_HAVOC_CERT_SOURCE);
+        checked.ownership.calls = crate::transition::CheckedCallTransitions::default();
+        let error = match generate(&program, &checked, CALL_HAVOC_CERT_SOURCE, Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("a unique-borrow call without its checker record must fail closed"),
+        };
+        assert!(
+            error.starts_with("internal.vcgen.call_transition_missing:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn vcgen_refuses_a_mismatched_checked_call_record() {
+        let (program, mut checked) = checked_program(CALL_HAVOC_CERT_SOURCE);
+        let key = checked
+            .ownership
+            .calls
+            .for_owner(&CallOwner::Function("certificate_subject".to_string()))
+            .next()
+            .map(|(key, _)| key.clone())
+            .expect("the subject has one checked call");
+        checked
+            .ownership
+            .calls
+            .get_mut(&key)
+            .expect("the checked call remains present")
+            .arguments[0]
+            .parameter = "forged".into();
+        let error = match generate(&program, &checked, CALL_HAVOC_CERT_SOURCE, Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("a parameter-mismatched checker record must fail closed"),
+        };
+        assert!(
+            error.starts_with("internal.vcgen.call_transition_mismatch:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn vcgen_refuses_a_checked_call_record_for_a_different_place() {
+        let (program, mut checked) = checked_program(CALL_HAVOC_CERT_SOURCE);
+        let key = checked
+            .ownership
+            .calls
+            .for_owner(&CallOwner::Function("certificate_subject".to_string()))
+            .next()
+            .map(|(key, _)| key.clone())
+            .expect("the subject has one checked call");
+        let CallArgumentEffect::Loan(loan) = &mut checked
+            .ownership
+            .calls
+            .get_mut(&key)
+            .expect("the checked call remains present")
+            .arguments[0]
+            .effect
+        else {
+            panic!("the source passes one unique borrow")
+        };
+        loan.place = Place::local("forged");
+        let error = match generate(&program, &checked, CALL_HAVOC_CERT_SOURCE, Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("a place-mismatched checker record must fail closed"),
+        };
+        assert!(
+            error.starts_with("internal.vcgen.call_transition_mismatch:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn vcgen_refuses_an_unvisited_checked_call_record() {
+        let (program, mut checked) = checked_program(CALL_HAVOC_CERT_SOURCE);
+        checked
+            .ownership
+            .calls
+            .insert(CheckedCallTransition {
+                key: CallSiteKey {
+                    owner: CallOwner::Function("certificate_subject".into()),
+                    span: Span::new(0, 0),
+                    target: CallTarget::Function("not_in_the_ast".into()),
+                },
+                receiver: None,
+                arguments: Vec::new(),
+            })
+            .expect("the forged extra key is distinct");
+        let error = match generate(&program, &checked, CALL_HAVOC_CERT_SOURCE, Path::new(".")) {
+            Err(error) => error,
+            Ok(_) => panic!("an extra checker record must fail closed"),
+        };
+        assert!(
+            error.starts_with("internal.vcgen.call_transition_unvisited:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn real_call_havoc_emits_a_non_skippable_transition_certificate() {
+        let (_, _, result) = checked_call_havoc_certificate(CALL_HAVOC_CERT_SOURCE);
+        assert_eq!(result.transition_certificates.len(), 1);
+        let certificate = &result.transition_certificates[0];
+        assert_eq!(certificate.transition.place.render(), "values");
+        assert!(matches!(certificate.transition.referent, Ty::Array(_)));
+        assert_eq!(certificate.fresh, certificate.observed);
+        assert!(matches!(
+            certificate.kind,
+            crate::transition::CallHavocCertificateKind::Array { .. }
+        ));
+
+        let attempted_skip = HashSet::from([certificate.name.clone()]);
+        let emitted = crate::lean::emit(
+            &result,
+            &[],
+            &attempted_skip,
+            &[],
+            &crate::lean::EmittedNames::default(),
+        );
+        assert!(emitted.lean_source.contains("Sable.ArrayCallHavoc"));
+        assert!(emitted.lean_source.contains("by exact ⟨rfl,"));
+        assert_eq!(emitted.names.certificates.len(), 1);
+        assert!(!emitted.names.thms.contains(&certificate.thm_name));
+    }
+
+    #[test]
+    fn tampered_real_call_havoc_certificate_is_rejected_by_lean() {
+        let (_, _, mut result) = checked_call_havoc_certificate(CALL_HAVOC_CERT_SOURCE);
+        let before = match &result.transition_certificates[0].kind {
+            crate::transition::CallHavocCertificateKind::Array { before, .. } => before.clone(),
+            crate::transition::CallHavocCertificateKind::Writeback => {
+                panic!("the source call lends an array")
+            }
+        };
+        // Adversarially restore the exact stale-state bug this certificate
+        // fences: the caller observes its pre-call sequence instead of the
+        // fresh sequence chosen for the callee's post-state.
+        result.transition_certificates[0].observed = before;
+        let emitted = crate::lean::emit(
+            &result,
+            &[],
+            &HashSet::new(),
+            &[],
+            &crate::lean::EmittedNames::default(),
+        );
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let environment = crate::lean::ProofEnvironment::capture(repo_root)
+            .expect("the repository proof environment must be capturable");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos();
+        let lean_file = std::env::temp_dir().join(format!(
+            "sable_tampered_transition_{}_{}.lean",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::write(&lean_file, &emitted.lean_source)
+            .expect("the tampered generated document must be writable");
+        let messages = crate::lean::run_lean(
+            repo_root,
+            &environment,
+            &lean_file,
+            None,
+            &emitted.lean_source,
+        )
+        .expect("Lean must run and report the rejected theorem");
+        let _ = std::fs::remove_file(&lean_file);
+        let modules = crate::modules::ModuleSet::single(
+            "transition_certificate.sable".into(),
+            CALL_HAVOC_CERT_SOURCE.into(),
+        );
+        let diagnostics = crate::lean::diagnose(&emitted, &result, &messages, &modules);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].name,
+            "internal.transition_certificate_rejected"
+        );
+    }
+
+    #[test]
     fn loop_havoc_refuses_untyped_and_stale_chained_names() {
         let _ = take_vc_type_refusal();
-        let cond = Expr {
-            kind: ExprKind::BoolLit(false),
-            span: Span::new(0, 0),
-            ty: None,
-        };
-        let assign_x = Stmt::Assign {
-            name: "x".to_string(),
-            name_span: Span::new(0, 0),
-            value: Expr {
-                kind: ExprKind::IntLit(1),
+        let effects = CheckedLoopEffects {
+            key: EffectSiteKey {
+                owner: CallOwner::Function("probe".into()),
                 span: Span::new(0, 0),
-                ty: None,
             },
+            condition_span: Span::new(0, 0),
+            mutations: vec![CheckedMutation::DirectWrite {
+                place: Place::local("x"),
+            }],
         };
 
         // An assigned name with a pre-loop env entry but no declared type
@@ -9576,7 +13914,7 @@ fn bool_array_loop(u64 n, bool seed) {
             generator
                 .env
                 .insert("x".to_string(), Val::Int("0".to_string()));
-            generator.havoc(&cond, std::slice::from_ref(&assign_x));
+            generator.havoc(&effects);
         });
         let latched = take_vc_type_refusal().expect("the untyped name is latched");
         assert!(
@@ -9597,7 +13935,7 @@ fn bool_array_loop(u64 n, bool seed) {
             generator
                 .env
                 .insert("b.f".to_string(), Val::Int("x".to_string()));
-            generator.havoc(&cond, std::slice::from_ref(&assign_x));
+            generator.havoc(&effects);
         });
         let latched = take_vc_type_refusal().expect("the dead chain is latched");
         assert!(
@@ -9614,10 +13952,31 @@ fn bool_array_loop(u64 n, bool seed) {
     #[test]
     fn a_call_return_with_no_state_story_latches_a_named_refusal() {
         let _ = take_vc_type_refusal();
-        let f = minimal_fn();
+        let mut f = minimal_fn();
         let mut callee = minimal_fn();
         callee.name = "g".to_string();
         callee.ret = Ty::borrow(Mutability::Shared, Ty::array(Ty::Int(IntTy::U64)));
+        let call = Expr {
+            kind: ExprKind::Call {
+                callee: "g".to_string(),
+                callee_span: Span::new(0, 0),
+                type_args: Vec::new(),
+                args: Vec::new(),
+            },
+            span: Span::new(0, 0),
+            ty: Some(Ty::borrow(
+                Mutability::Shared,
+                Ty::array(Ty::Int(IntTy::U64)),
+            )),
+        };
+        f.body.push(Stmt::ExprStmt(call.clone()));
+        let mut control_program = parsed_program("fn probe() {} fn g() {}");
+        control_program.fns = vec![f.clone(), callee.clone()];
+        let control_program = crate::control::ControlProgram::build(&control_program)
+            .expect("the forged call still has an exact control plan");
+        let control = control_program
+            .body(&CallOwner::Function("probe".into()), f.span)
+            .expect("the forged caller has one retained control body");
         let classes: Vec<ClassDecl> = Vec::new();
         let records: Vec<RecordDecl> = Vec::new();
         let mut sigs: HashMap<String, FnSig> = HashMap::new();
@@ -9631,14 +13990,40 @@ fn bool_array_loop(u64 n, bool seed) {
         let mut fn_map: HashMap<&str, &Fn> = HashMap::new();
         fn_map.insert("g", &callee);
         let class_map: HashMap<&str, &ClassDecl> = HashMap::new();
+        let mut ownership = CheckedOwnershipPlan::default();
+        ownership
+            .calls
+            .insert(CheckedCallTransition {
+                key: CallSiteKey {
+                    owner: CallOwner::Function("probe".to_string()),
+                    span: Span::new(0, 0),
+                    target: CallTarget::Function("g".to_string()),
+                },
+                receiver: None,
+                arguments: Vec::new(),
+            })
+            .expect("the synthetic call has one checked identity");
         let mut out = empty_result();
         let mut generator = Generator {
             f: &f,
             fname: "probe".to_string(),
+            call_owner: CallOwner::Function("probe".to_string()),
             cctx: Cctx::None,
+            control: Some(control),
             classes: &classes,
             records: &records,
             sigs: &sigs,
+            ownership: &ownership,
+            visited_checked_calls: HashSet::new(),
+            checked_call_visits: HashMap::new(),
+            visited_option_takes: HashSet::new(),
+            visited_exposures: HashSet::new(),
+            visited_sealed_operations: HashSet::new(),
+            visited_loops: HashSet::new(),
+            visited_value_transfers: HashSet::new(),
+            visited_assignments: HashSet::new(),
+            visited_field_assignments: HashSet::new(),
+            visited_temporary_drops: HashSet::new(),
             fn_map: &fn_map,
             class_map: &class_map,
             source: "",
@@ -9655,21 +14040,32 @@ fn bool_array_loop(u64 n, bool seed) {
             name_counts: HashMap::new(),
             out: &mut out,
         };
-        let call = Expr {
-            kind: ExprKind::Call {
-                callee: "g".to_string(),
-                callee_span: Span::new(0, 0),
-                type_args: Vec::new(),
-                args: Vec::new(),
-            },
-            span: Span::new(0, 0),
-            ty: Some(Ty::borrow(
-                Mutability::Shared,
-                Ty::array(Ty::Int(IntTy::U64)),
-            )),
-        };
-        generator.eval(&call);
+        generator.eval(&call, control.plan().body_scope());
         let latched = take_vc_type_refusal().expect("the return shape is latched");
+        assert!(
+            latched.starts_with("internal.vcgen.call_return_unsupported:"),
+            "{latched}"
+        );
+    }
+
+    #[test]
+    fn member_call_result_uses_the_shared_fail_closed_dispatch() {
+        let _ = take_vc_type_refusal();
+        with_generator(|generator| {
+            let value = generator.bind_call_result(
+                &Ty::array(Ty::Int(IntTy::U64)),
+                "result",
+                CallResultSite::Member,
+            );
+            assert!(matches!(value, Val::Int(ref placeholder) if placeholder == "result"));
+            assert!(
+                generator
+                    .binders
+                    .iter()
+                    .any(|(name, ty)| name == "result" && ty == UNSUPPORTED_LEAN_TY)
+            );
+        });
+        let latched = take_vc_type_refusal().expect("member array result is latched");
         assert!(
             latched.starts_with("internal.vcgen.call_return_unsupported:"),
             "{latched}"
@@ -9738,8 +14134,8 @@ fn loop_record(u64 count) -> u64 {
     return pair.left;
 }
 "#;
-        let (program, sigs) = checked_program(source);
-        let generated = generate(&program, &sigs, source, std::path::Path::new("."))
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, std::path::Path::new("."))
             .expect("record loop should stay inside the VC type domain");
         let preservation = generated
             .obligations

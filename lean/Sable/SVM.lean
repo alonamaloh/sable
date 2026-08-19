@@ -534,6 +534,15 @@ only at statement level — `x = f(args)`, or `f(args)` for a discarded
 result — so expressions stay pure and big-step. -/
 inductive Stmt where
   | assign (x : String) (e : Expr)
+  /-- End the lifetime of the listed lexical locals. The safe-array machine
+  has no observable destructor or allocator event, so dropping a safe value
+  is exactly removing its binding. Raw allocations remain in `RawHeap` and
+  are affected only by explicit raw operations. -/
+  | scopeExit (locals : List String)
+  /-- Move one local into compiler-only temporary storage in a single step.
+  The source disappears before the destination is installed, so an affine
+  owner is never represented by two live machine bindings. -/
+  | moveLocal (dst src : String)
   /-- `dst = src.take()` for an affine option. Unlike `optValue`, this is
   a statement-level, direct-local operation: a successful step installs
   `none` in `src` and the former payload in `dst` in one transition. The
@@ -548,6 +557,7 @@ inductive Stmt where
   | ite    (c : Expr) (thn els : List Stmt)
   | while  (c : Expr) (body : List Stmt)
   | ret    (e : Expr)
+  | retUnit
   | check  (name : String) (c : Expr)
   | call   (dst : Option String) (f : String) (args : List Arg)
   /-- `dst = alloc(size)` — a fresh root allocation of `size`
@@ -605,6 +615,18 @@ def Env.empty : Env := fun _ => none
 
 def Env.update (ρ : Env) (x : String) (v : Val) : Env :=
   fun y => if y = x then some v else ρ y
+
+/-- Remove one lexical binding. Undeclared and already-cleared names are
+cleared idempotently; source-name uniqueness is enforced by the checker. -/
+def Env.clear (ρ : Env) (x : String) : Env :=
+  fun y => if y = x then none else ρ y
+
+/-- Close a lexical scope in the normalized route's declared order. The
+result is independent of ordering, but retaining the route order makes the
+machine consume the compiler's explicit cleanup action unchanged. -/
+def Env.clearMany : Env → List String → Env
+  | ρ, [] => ρ
+  | ρ, x :: xs => (ρ.clear x).clearMany xs
 
 /-- Bind parameters to argument values (left-to-right, later shadows —
 duplicate parameter names are checker duty). -/
@@ -1111,6 +1133,27 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
   | assign_abort {ρ : Env} {x : String} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
       Step P cap (.run (.assign x e :: k) ρ σ μ) a.toConfig
+  | scopeExit {ρ : Env} {locals : List String} {k : List Stmt} {σ : List Frame}
+      {μ : RawHeap} :
+      Step P cap (.run (.scopeExit locals :: k) ρ σ μ)
+        (.run k (ρ.clearMany locals) σ μ)
+  | moveLocal_ok {ρ : Env} {dst src : String} {value : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ src) (hd : ρ dst = none) (hs : ρ src = some value) :
+      Step P cap (.run (.moveLocal dst src :: k) ρ σ μ)
+        (.run k ((ρ.clear src).update dst value) σ μ)
+  | moveLocal_undef_alias {ρ : Env} {dst src : String}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (heq : dst = src) :
+      Step P cap (.run (.moveLocal dst src :: k) ρ σ μ) .undef
+  | moveLocal_undef_dst {ρ : Env} {dst src : String} {value : Val}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ src) (hd : ρ dst = some value) :
+      Step P cap (.run (.moveLocal dst src :: k) ρ σ μ) .undef
+  | moveLocal_undef_src {ρ : Env} {dst src : String}
+      {k : List Stmt} {σ : List Frame} {μ : RawHeap}
+      (hne : dst ≠ src) (hd : ρ dst = none) (hs : ρ src = none) :
+      Step P cap (.run (.moveLocal dst src :: k) ρ σ μ) .undef
   -- Affine option extraction is atomic. The source is cleared before the
   -- destination is installed, and distinct names ensure the latter update
   -- cannot recreate the option owner. Destination freshness is deliberately
@@ -1263,6 +1306,11 @@ inductive Step (P : Prog) (cap : Int) : Config → Config → Prop where
   | ret_abort {ρ : Env} {e : Expr} {a : Abort} {k : List Stmt} {σ : List Frame} {μ : RawHeap}
       (h : Eval cap ρ e (.abort a)) :
       Step P cap (.run (.ret e :: k) ρ σ μ) a.toConfig
+  | retUnit_ok {ρ : Env} {k : List Stmt} {μ : RawHeap} :
+      Step P cap (.run (.retUnit :: k) ρ [] μ) (.done .unit)
+  | retUnit_pop {ρ : Env} {k : List Stmt} {fr : Frame} {σ : List Frame} {μ : RawHeap} :
+      Step P cap (.run (.retUnit :: k) ρ (fr :: σ) μ)
+        (.run fr.k ((fr.ρ.restore fr.loans ρ).bindDst fr.dst .unit) σ μ)
   -- raw allocation: fresh provenance, uninitialized bytes
   | alloc_ok {ρ : Env} {dst : String} {e : Expr} {n : Int}
       {k : List Stmt} {σ : List Frame} {μ : RawHeap}

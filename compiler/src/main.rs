@@ -12,10 +12,12 @@ Usage:
              [--entry <name>]        also emit a C-compatible main for <name>
              [-o <file>|-]           write atomically to <file> (default: stdout)
   sable test  <file.sable>           run test_* functions with dynamic contract checks
+  sable explain-type '<type>'        show parser positions and stage-gate coverage
   sable ... -M <dir>                 add a directory to the `use` module search path
   sable lsp                          run the language server on stdio
   sable daemon                       keep a warm Lean server for fast checks
                                      (socket: .sable-out/daemon.sock)
+  sable doctor                       check the local Sable toolchain and checkout
 ";
 
 fn main() -> ExitCode {
@@ -34,8 +36,10 @@ fn main() -> ExitCode {
             "check" if command.is_none() => command = Some("check"),
             "build" if command.is_none() => command = Some("build"),
             "test" if command.is_none() => command = Some("test"),
+            "explain-type" if command.is_none() => command = Some("explain-type"),
             "lsp" if command.is_none() => command = Some("lsp"),
             "daemon" if command.is_none() => command = Some("daemon"),
+            "doctor" if command.is_none() => command = Some("doctor"),
             // LSP clients conventionally append --stdio (vscode-languageclient
             // does, among others); stdio is our only transport, so accept it.
             "--stdio" if command == Some("lsp") => {}
@@ -105,6 +109,32 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    if command == Some("explain-type") {
+        if !opts.module_paths.is_empty() {
+            eprintln!(
+                "error: `-M` is not valid with `sable explain-type`; the command explains \
+                 closed built-in and resource type spellings\n{USAGE}"
+            );
+            return ExitCode::from(2);
+        }
+        let Some(spelling) = file.as_ref().and_then(|argument| argument.to_str()) else {
+            eprintln!("error: `sable explain-type` requires one type spelling\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        return match sable::explain_type(spelling) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(diagnostic) => {
+                let lines = sable::span::LineMap::new(spelling);
+                eprint!("{}", diagnostic.render("<type>", spelling, &lines));
+                eprintln!("  = diagnostic: {}", diagnostic.name);
+                ExitCode::from(2)
+            }
+        };
+    }
+
     if command == Some("daemon") {
         let cwd = match std::env::current_dir() {
             Ok(d) => d,
@@ -137,6 +167,43 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    if command == Some("doctor") {
+        if !opts.module_paths.is_empty() {
+            eprintln!("error: `-M` is not valid with `sable doctor`\n{USAGE}");
+            return ExitCode::from(2);
+        }
+        if file.is_some() {
+            eprintln!("error: `sable doctor` takes no file\n{USAGE}");
+            return ExitCode::from(2);
+        }
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                eprintln!("doctor error: cannot determine current directory: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let report = sable::doctor::inspect(&cwd);
+        println!("Sable doctor");
+        for check in &report.checks {
+            let status = match check.status {
+                sable::doctor::CheckStatus::Ok => "ok",
+                sable::doctor::CheckStatus::Warning => "warning",
+                sable::doctor::CheckStatus::Error => "error",
+            };
+            println!("  {status:7} {:14} {}", check.name, check.detail);
+        }
+        if !report.ready() {
+            println!("not ready: fix the required checks above");
+            return ExitCode::FAILURE;
+        }
+        if report.native_ready() {
+            println!("ready: verification and native execution prerequisites found");
+        } else {
+            println!("ready: verification prerequisites found; native execution unavailable");
+        }
+        return ExitCode::SUCCESS;
     }
     let (Some(command), Some(file)) = (command, file) else {
         eprint!("{USAGE}");

@@ -18,9 +18,11 @@
 //! proves is proven exactly once.
 
 use crate::Options;
+use crate::control::ControlProgram;
 use crate::diag::Diagnostic;
 use crate::lean::{self, Emitted, EmittedNames};
 use crate::modules::{self, ModuleSet};
+use crate::ownership::CheckedOwnershipPlan;
 use crate::span::Span;
 use crate::vcgen::{self, VcResult};
 use crate::{check, consts, mono};
@@ -146,6 +148,15 @@ pub fn from_portable(mods: &ModuleSet, pd: &PortableDiag) -> Diagnostic {
 /// every imported module's artifact ensured (verified) first.
 pub(crate) struct Prepared {
     pub(crate) program: crate::ast::Program,
+    /// Checker-sealed control/cleanup identities for this exact typed AST.
+    /// Downstream proof and execution consumers must look bodies up here;
+    /// rebuilding from source would break the verified-program provenance
+    /// boundary this carrier is meant to preserve.
+    pub(crate) control: ControlProgram,
+    /// Checker-authored move/loan/mutation facts for this exact typed AST.
+    /// VC generation consumes them immutably; retaining the same table keeps
+    /// later normalized-control consumers from reconstructing ownership.
+    pub(crate) ownership: CheckedOwnershipPlan,
     pub(crate) vc: VcResult,
     pub(crate) emitted: Emitted,
     /// Content-addressed artifact name for this module.
@@ -219,7 +230,7 @@ fn prepare_with_environment(
     };
     let vc = match vcgen::generate(
         &program,
-        &checked.sigs,
+        &checked,
         &mods.combined_source,
         &snapshot_repo_root,
     ) {
@@ -296,6 +307,7 @@ fn prepare_with_environment(
             .chain(&a.names.ghosts)
             .chain(&a.names.wfs)
             .chain(&a.names.thms)
+            .chain(&a.names.certificates)
         {
             if let Some(prev) = owner.insert(n, i) {
                 if prev != i {
@@ -322,33 +334,143 @@ fn prepare_with_environment(
         exclude.wfs.extend(a.names.wfs.iter().cloned());
         exclude.thms.extend(a.names.thms.iter().cloned());
         exclude
+            .certificates
+            .extend(a.names.certificates.iter().cloned());
+        exclude
             .obligations
             .extend(a.names.obligations.iter().cloned());
     }
+    let skip: std::collections::HashSet<String> = program
+        .defers
+        .iter()
+        .map(|d| d.name.clone())
+        .chain(program.assumes.iter().map(|a| a.name.clone()))
+        .collect();
 
-    // A ghost defined here under a name an import already declares
-    // would be silently *replaced* by the import under name
-    // subtraction — reject it like any cross-module collision.
+    // Name subtraction is an optimization, never authority to replace a root
+    // declaration with an imported one. Check every Lean declaration this
+    // artifact will emit before the emitter applies its category-specific
+    // exclusion sets. A declaration is root-emitted when its source belongs
+    // to the root *or* no dependency supplies its exact name in the same
+    // emission category. The second half is essential for importer-demanded
+    // generic instances: their cloned source spans still point into the
+    // dependency template while their concrete declarations belong to the
+    // importer artifact. Conversely, an
+    // exact same-category instance already emitted by a dependency remains
+    // imported and is not spuriously claimed here.
+    //
+    // The unified table catches cross-category collisions and two distinct
+    // root declarations that encode to the same Lean identifier.
     let own_path = &mods.modules[0].path;
-    for g in &vc.ghosts {
-        if mods.module_of(g.span.start).path == *own_path
-            && exclude.ghosts.contains(&lean::ghost_head_name(&g.text))
-        {
-            let d = Diagnostic {
+    let source_belongs_to_root = |span: Span| mods.module_of(span.start).path == *own_path;
+    let mut own_declarations: HashMap<String, (&'static str, Span)> = HashMap::new();
+    let mut register_declaration = |name: String,
+                                    kind: &'static str,
+                                    span: Span,
+                                    root_emitted: bool|
+     -> Option<Diagnostic> {
+        if !root_emitted {
+            return None;
+        }
+        if let Some(import_index) = owner.get(name.as_str()) {
+            return Some(Diagnostic {
                 name: "module.name_collision".into(),
                 title: format!(
-                    "ghost `{}` is also declared by an imported module",
-                    lean::ghost_head_name(&g.text)
+                    "generated Lean declaration `{name}` for this {kind} is also declared by an imported module"
                 ),
-                span: g.span,
+                span,
                 label: "second declaration here".into(),
                 notes: vec![(
                     "note".into(),
-                    "imports are a flat namespace; rename one of them".into(),
+                    format!(
+                        "imports use a flat Lean namespace; `{}` already owns `{name}`",
+                        dep_arts[*import_index].display
+                    ),
                 )],
-            };
-            return (mods, Err(vec![d]));
+            });
         }
+        if let Some((previous_kind, _)) = own_declarations.get(&name) {
+            return Some(Diagnostic {
+                    name: "module.name_collision".into(),
+                    title: format!(
+                        "generated Lean declaration `{name}` is shared by this {kind} and a root {previous_kind}"
+                    ),
+                    span,
+                    label: "second declaration here".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "generated declarations share one flat Lean namespace; rename one source declaration"
+                            .into(),
+                    )],
+                });
+        }
+        own_declarations.insert(name, (kind, span));
+        None
+    };
+
+    let mut collision = None;
+    for record in &vc.records {
+        let name = vcgen::lean_record_name(&record.name);
+        let root_emitted = source_belongs_to_root(record.span) || !exclude.classes.contains(&name);
+        collision = register_declaration(name, "record", record.span, root_emitted);
+        if collision.is_some() {
+            break;
+        }
+    }
+    for class in &vc.classes {
+        if collision.is_some() {
+            break;
+        }
+        let name = vcgen::lean_class_name(&class.name);
+        let root_emitted = source_belongs_to_root(class.span) || !exclude.classes.contains(&name);
+        collision = register_declaration(name, "class", class.span, root_emitted);
+    }
+    for ghost in &vc.ghosts {
+        if collision.is_some() {
+            break;
+        }
+        let name = lean::ghost_head_name(&ghost.text);
+        let root_emitted = source_belongs_to_root(ghost.span) || !exclude.ghosts.contains(&name);
+        collision = register_declaration(name, "ghost declaration", ghost.span, root_emitted);
+    }
+    for wf in &vc.clause_wfs {
+        if collision.is_some() {
+            break;
+        }
+        let root_emitted = source_belongs_to_root(wf.span) || !exclude.wfs.contains(&wf.def_name);
+        collision =
+            register_declaration(wf.def_name.clone(), "clause helper", wf.span, root_emitted);
+    }
+    for certificate in &vc.transition_certificates {
+        if collision.is_some() {
+            break;
+        }
+        let name = certificate.thm_name.clone();
+        let span = certificate.transition.span;
+        let root_emitted = source_belongs_to_root(span) || !exclude.certificates.contains(&name);
+        collision = register_declaration(name, "transition certificate", span, root_emitted);
+    }
+    for obligation in &vc.obligations {
+        if collision.is_some() {
+            break;
+        }
+        // Deferred/assumed obligations are not Lean declarations in this
+        // artifact or any dependency artifact; mirror the emitter's filter
+        // before inferring ownership from category subtraction.
+        if skip.contains(&obligation.name) {
+            continue;
+        }
+        let root_emitted =
+            source_belongs_to_root(obligation.span) || !exclude.thms.contains(&obligation.thm_name);
+        collision = register_declaration(
+            obligation.thm_name.clone(),
+            "verification theorem",
+            obligation.span,
+            root_emitted,
+        );
+    }
+    if let Some(diagnostic) = collision {
+        return (mods, Err(vec![diagnostic]));
     }
 
     // Escape hatches live in the module that owns the obligation: an
@@ -392,12 +514,6 @@ fn prepare_with_environment(
         }
     }
 
-    let skip: std::collections::HashSet<String> = program
-        .defers
-        .iter()
-        .map(|d| d.name.clone())
-        .chain(program.assumes.iter().map(|a| a.name.clone()))
-        .collect();
     let imports: Vec<String> = dep_arts.iter().map(|a| a.lean_name.clone()).collect();
     let emitted = lean::emit(&vc, &program.discharges, &skip, &imports, &exclude);
     let lean_name = artifact_name(path, &emitted.lean_source, &proof_fingerprint);
@@ -407,6 +523,8 @@ fn prepare_with_environment(
         mods,
         Ok(Prepared {
             program,
+            control: checked.control,
+            ownership: checked.ownership,
             vc,
             emitted,
             lean_name,
@@ -1215,7 +1333,8 @@ fn fnv64(seed: u64, bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{SourceSnapshot, artifact_name, root_generated_path};
+    use super::{SourceSnapshot, artifact_name, prepare, root_generated_path};
+    use crate::Options;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -1258,5 +1377,198 @@ mod tests {
             [Path::new("/B.sable"), Path::new("/C.sable")]
         );
         assert_eq!(b.edges, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn imported_certificate_name_cannot_suppress_a_distinct_root_certificate() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sable-certificate-identity-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temporary module directory is writable");
+        let dependency_path = directory.join("cert_dep.sable");
+        let root_path = directory.join("cert_root.sable");
+        std::fs::write(
+            &dependency_path,
+            r#"
+fn touch_dep(&mut [u64] values) {
+}
+
+pub fn foo(&mut [u64] bar_call_havoc_baz) {
+    touch_dep(&mut bar_call_havoc_baz);
+}
+"#,
+        )
+        .expect("dependency source is writable");
+        std::fs::write(
+            &root_path,
+            r#"
+use cert_dep;
+
+fn touch_root(&mut [u64] values) {
+}
+
+pub fn foo_call_havoc_bar(&mut [u64] baz) {
+    touch_root(&mut baz);
+}
+"#,
+        )
+        .expect("root source is writable");
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let options = Options {
+            emit_lean_only: true,
+            module_paths: vec![directory.clone()],
+        };
+        let (_, prepared) = prepare(&root_path, &options, repo_root);
+        let prepared = prepared.unwrap_or_else(|diagnostics| {
+            panic!("two-module certificate preparation failed: {diagnostics:#?}")
+        });
+        let dependency = prepared
+            .vc
+            .transition_certificates
+            .iter()
+            .find(|certificate| {
+                certificate
+                    .name
+                    .contains("function.foo.call_havoc.bar_call_havoc_baz")
+            })
+            .expect("the imported body still appears in the combined checked program");
+        let root = prepared
+            .vc
+            .transition_certificates
+            .iter()
+            .find(|certificate| {
+                certificate
+                    .name
+                    .contains("function.foo_call_havoc_bar.call_havoc.baz")
+            })
+            .expect("the root call emits its own certificate");
+
+        assert_ne!(dependency.thm_name, root.thm_name);
+        assert!(prepared.emitted.names.certificates.contains(&root.thm_name));
+        assert!(
+            !prepared
+                .emitted
+                .names
+                .certificates
+                .contains(&dependency.thm_name)
+        );
+        assert!(prepared.emitted.lean_source.contains(&root.name));
+        assert!(!prepared.emitted.lean_source.contains(&dependency.name));
+
+        // Pin the defense-in-depth branch itself: a root ghost is a distinct
+        // declaration category, so only the unified flat-namespace guard can
+        // reject it when it deliberately takes an imported certificate's
+        // exact Lean theorem name.
+        let collision_path = directory.join("cert_collision_root.sable");
+        std::fs::write(
+            &collision_path,
+            format!(
+                "use cert_dep;\n\n/// theorem {} : True := by\n///   trivial\n\nfn subject() {{\n}}\n",
+                dependency.thm_name
+            ),
+        )
+        .expect("collision root source is writable");
+        let (_, collision) = prepare(&collision_path, &options, repo_root);
+        let diagnostics = match collision {
+            Ok(_) => panic!("an imported certificate may not replace a root ghost"),
+            Err(diagnostics) => diagnostics,
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].name, "module.name_collision");
+        assert!(diagnostics[0].title.contains(&dependency.thm_name));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn importer_demanded_generic_class_cannot_collide_with_an_imported_ghost() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sable-instance-provenance-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temporary module directory is writable");
+        let dependency_path = directory.join("generic_dep.sable");
+        let root_path = directory.join("generic_root.sable");
+        let dependency_source = r#"
+pub class GuardBox<T> {
+    T value;
+
+    init make(T value) {
+        self.value = value;
+    }
+}
+"#;
+        std::fs::write(&dependency_path, dependency_source).expect("dependency source is writable");
+        std::fs::write(
+            &root_path,
+            r#"
+use generic_dep;
+
+pub fn demand_generic_instance() {
+    var value = GuardBox<u64>::make(1);
+}
+"#,
+        )
+        .expect("root source is writable");
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let options = Options {
+            emit_lean_only: true,
+            module_paths: vec![directory.clone()],
+        };
+
+        // Discover the generated Lean identity from an otherwise-valid
+        // build. `GuardBox_u64` retains the dependency template's source span,
+        // but only the importer demands and emits this concrete structure.
+        let (_, baseline) = prepare(&root_path, &options, repo_root);
+        let baseline = baseline.unwrap_or_else(|diagnostics| {
+            panic!("generic class preparation failed: {diagnostics:#?}")
+        });
+        let generated = baseline
+            .vc
+            .classes
+            .iter()
+            .find(|class| class.name == "GuardBox_u64")
+            .expect("the importer demands the concrete generic class");
+        let generated_lean_name = crate::vcgen::lean_class_name(&generated.name);
+        assert!(
+            baseline
+                .emitted
+                .names
+                .classes
+                .contains(&generated_lean_name)
+        );
+
+        std::fs::write(
+            &dependency_path,
+            format!(
+                "{dependency_source}\n/// theorem {generated_lean_name} : True := by\n///   trivial\n"
+            ),
+        )
+        .expect("dependency collision source is writable");
+        let (_, collision) = prepare(&root_path, &options, repo_root);
+        let diagnostics = match collision {
+            Ok(_) => panic!("an imported ghost may not replace an importer-owned generic class"),
+            Err(diagnostics) => diagnostics,
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].name, "module.name_collision");
+        assert!(diagnostics[0].title.contains(&generated_lean_name));
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

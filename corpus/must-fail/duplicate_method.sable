@@ -1,0 +1,20 @@
+// expect-error: type.duplicate_method
+
+class DuplicateMethod {
+    u64 value;
+
+    init make() {
+        self.value = 0;
+    }
+
+    fn read(&self) -> u64 {
+        return self.value;
+    }
+
+    fn read(&self) -> u64 {
+        return self.value;
+    }
+}
+
+fn subject() {
+}

@@ -1,0 +1,18 @@
+// expect-error: type.mutual_recursion
+// The nonrecursive method has the same display spelling as the initializer;
+// callable flavor must keep it from overwriting the recursive graph node.
+
+class RecursiveInitializer {
+    u64 value;
+
+    init same() {
+        var nested = RecursiveInitializer::same();
+        self.value = 0;
+    }
+
+    fn same(&self) {
+    }
+}
+
+fn subject() {
+}
