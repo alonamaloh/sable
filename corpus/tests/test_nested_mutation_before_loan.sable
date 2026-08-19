@@ -1,0 +1,19 @@
+// Dynamic oracle for the sound left-to-right ordering: the nested mutation in
+// the first argument completes before the later shared borrow is created.
+// The imported class-state contracts verify in Lean but are outside the
+// dynamic monitor's option-only `.value` fragment.
+// expect-skip: self.value = initial
+// expect-skip: self.value = 9
+// expect-skip: item.value = 9
+// expect-skip: result = self.value
+// expect-skip: result = item.value
+
+use nested_mutation_before_loan;
+
+/// pre actual = expected
+fn expect_eq(u64 actual, u64 expected) {
+}
+
+fn test_mutation_before_later_loan_observes_the_new_value() {
+    expect_eq(nested_mutation_before_loan(), 9);
+}

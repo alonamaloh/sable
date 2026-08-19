@@ -436,12 +436,14 @@ fn extern_parameter_abi_allowed(ty: &Ty) -> bool {
 }
 
 pub fn check(program: &mut Program) -> CResult<CheckResult> {
+    // Keep the profile-specific singleton-capability diagnosis ahead of the
+    // general integer-only trait-signature gate below.
+    check_uart_trait_methods(&program.traits)?;
     validate_declared_aggregate_payloads(program)?;
     let mut unsafe_regions = 0usize;
     let mut ownership = CheckedOwnershipPlan::default();
     let mut control_outlines = ControlOutlines::default();
     let traits_c: Vec<TraitDecl> = program.traits.clone();
-    check_uart_trait_methods(&traits_c)?;
     let mut sigs: HashMap<String, FnSig> = HashMap::new();
     for f in &program.fns {
         if sigs.contains_key(&f.name) {
@@ -4060,22 +4062,30 @@ pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
 /// The declared type of a trait-method parameter.
 ///
 /// An abstract trait call evaluates each argument as an integer proof
-/// value, so a parameter whose value is not one has no meaning at the
-/// call. An array is included in any binding mode: `&[T]` lifts to a
-/// `Sable.Seq T`, which is exactly what the abstract call cannot pass.
-/// A value option is included on the same terms: its proof value is
-/// `Option Int` / `Option Bool`, not an integer.
+/// value, so this is a positive gate: only integers and the retained type
+/// parameter that monomorphizes to an integer are admitted. Keeping the
+/// match exhaustive prevents a newly transportable ordinary-call shape
+/// from silently entering the narrower trait proof domain.
 pub(crate) fn trait_param_ty(ty: &Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "trait"));
     }
-    parameter_ty(ty, span)?;
-    if matches!(ty, Ty::Bool | Ty::Record(_) | Ty::Option(_)) || ty.as_array().is_some() {
-        return Err(Diagnostic {
+    match ty {
+        Ty::Int(_) | Ty::Param(_) => Ok(()),
+        Ty::Bool
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Slots(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => Err(Diagnostic {
             name: "type.trait_param_unsupported".into(),
-            title: "trait calls do not transport Boolean, POD-record, array, or option \
-                    parameters"
-                .into(),
+            title: "trait methods accept only integer proof-value parameters".into(),
             span,
             label: format!(
                 "`{}` is not supported in a trait method parameter",
@@ -4083,22 +4093,21 @@ pub(crate) fn trait_param_ty(ty: &Ty, span: Span) -> CResult<()> {
             ),
             notes: vec![(
                 "note".into(),
-                "ordinary functions may transport Boolean, POD-record, borrowed-array, and \
-                 value-option arguments, but a retained trait call substitutes integer \
-                 arguments into an abstract contract and has no model for these"
+                "ordinary functions transport more value, owner, pointer, and borrow shapes; \
+                 a retained trait call substitutes only integer arguments into its abstract \
+                 contract"
                     .into(),
             )],
-        });
+        }),
     }
-    Ok(())
 }
 
-/// The declared result type of a trait method.
+/// The declared result type of a trait method. This is the result-side half
+/// of the same positive integer proof-domain gate as `trait_param_ty`.
 pub(crate) fn trait_return_ty(ty: &Ty, method_name: &str, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "trait"));
     }
-    return_ty(ty, method_name, span)?;
     if matches!(ty, Ty::Option(_)) {
         return Err(Diagnostic {
             name: "type.trait_option_return".into(),
@@ -4113,13 +4122,21 @@ pub(crate) fn trait_return_ty(ty: &Ty, method_name: &str, span: Span) -> CResult
             )],
         });
     }
-    // An array joins the list for the reason `type.trait_param_unsupported`
-    // already gives about array parameters: an abstract trait call substitutes
-    // integer arguments into the trait's contract, and a sequence is not one.
-    if matches!(ty, Ty::Bool | Ty::Record(_)) || ty.as_array().is_some() {
-        return Err(Diagnostic {
+    match ty {
+        Ty::Int(_) | Ty::Param(_) => Ok(()),
+        Ty::Bool
+        | Ty::Class(_)
+        | Ty::Record(_)
+        | Ty::Array(_)
+        | Ty::Slots(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => Err(Diagnostic {
             name: "type.trait_return_unsupported".into(),
-            title: "trait calls do not return Boolean, POD-record, or array values".into(),
+            title: "trait methods return only integer proof values".into(),
             span,
             label: format!(
                 "`{}` is not supported as a trait method result",
@@ -4127,13 +4144,16 @@ pub(crate) fn trait_return_ty(ty: &Ty, method_name: &str, span: Span) -> CResult
             ),
             notes: vec![(
                 "note".into(),
-                "ordinary functions may return Boolean, POD-record, and array values, but \
-                 retained trait calls do not yet model those result kinds"
-                    .into(),
+                format!(
+                    "ordinary function `{method_name}` may return other supported values or \
+                     owners; a retained trait call has only an integer result in its abstract \
+                     contract"
+                )
+                .into(),
             )],
-        });
+        }),
+        Ty::Option(_) => unreachable!("value-option results were rejected above"),
     }
-    Ok(())
 }
 
 fn validate_declared_aggregate_payloads(program: &Program) -> CResult<()> {
@@ -6046,6 +6066,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 RawOp::HeaderSize | RawOp::HeaderNext => vec![raw.clone(), free_header_shared],
                 RawOp::HeaderClear => vec![raw.clone(), free_header_unique],
             };
+            let moved_before = ctx.moved.clone();
             let mut transfers = vec![None; args.len()];
             for (index, (arg, w)) in args.iter_mut().zip(&want).enumerate() {
                 require_explicit_borrow(ctx, arg, w.clone())?;
@@ -6093,6 +6114,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 CheckedSealedTarget::Raw(op),
                 args,
                 &transfers,
+                &moved_before,
                 result.clone(),
                 span,
             )?;
@@ -6133,6 +6155,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 DeviceOp::UartStatus => vec![uart],
                 DeviceOp::UartWrite => vec![Ty::Int(IntTy::U8), uart],
             };
+            let moved_before = ctx.moved.clone();
             for (arg, expected) in args.iter_mut().zip(want) {
                 require_explicit_borrow(ctx, arg, expected.clone())?;
                 check_expr(ctx, arg, Some(expected))?;
@@ -6146,6 +6169,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 CheckedSealedTarget::Device(op),
                 args,
                 &vec![None; args.len()],
+                &moved_before,
                 result.clone(),
                 span,
             )?;
@@ -6189,6 +6213,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            let moved_before = ctx.moved.clone();
             let mut transfers = vec![None; args.len()];
             let result = match op {
                 // `split_off(&mut whole, n)` — the prefix stays in the
@@ -6485,6 +6510,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 CheckedSealedTarget::Resource(op),
                 args,
                 &transfers,
+                &moved_before,
                 result.clone(),
                 span,
             )?;
@@ -7853,6 +7879,22 @@ fn record_call_transitions(
         receiver,
         arguments,
     };
+    let argument_loans: Vec<Option<CallTransition>> = call
+        .arguments
+        .iter()
+        .map(|argument| match &argument.effect {
+            CallArgumentEffect::Loan(loan) => Some(loan.clone()),
+            CallArgumentEffect::Value(_) => None,
+        })
+        .collect();
+    check_pending_loan_argument_mutations(
+        ctx,
+        &call.key.target.render(),
+        call.receiver.as_ref().map(|receiver| &receiver.transition),
+        args,
+        &argument_loans,
+        span,
+    )?;
     check_recorded_call_conflicts(ctx, moved_before, &call)?;
     ctx.ownership
         .calls
@@ -8199,6 +8241,7 @@ fn record_sealed_operation(
     target: CheckedSealedTarget,
     args: &[Expr],
     transfers: &[Option<ValueTransfer>],
+    moved_before: &HashSet<Place>,
     result_ty: Ty,
     span: Span,
 ) -> CResult<()> {
@@ -8335,7 +8378,15 @@ fn record_sealed_operation(
         });
     }
 
-    check_recorded_argument_conflicts(target.render(), &arguments)?;
+    let argument_loans: Vec<Option<CallTransition>> = arguments
+        .iter()
+        .map(|argument| match &argument.effect {
+            CallArgumentEffect::Loan(loan) => Some(loan.clone()),
+            CallArgumentEffect::Value(_) => None,
+        })
+        .collect();
+    check_pending_loan_argument_mutations(ctx, target.render(), None, args, &argument_loans, span)?;
+    check_recorded_argument_conflicts(ctx, moved_before, target.render(), &arguments)?;
     let operation = CheckedSealedOperation {
         key: EffectSiteKey {
             owner: ctx.call_owner.clone(),
@@ -8359,7 +8410,89 @@ fn record_sealed_operation(
         })
 }
 
+/// Keep a pending call loan's captured state stable across later arguments.
+///
+/// Sable evaluates arguments left-to-right. A borrow expression is therefore
+/// not a place recipe resolved only at callee entry: its place and entry state
+/// are captured at that argument position. The reservation becomes a callee
+/// loan only after argument evaluation completes, so a transient later read
+/// may finish first; a later mutation may not invalidate the captured state.
+/// The formal SVM makes this observable for unique array loans by reading the
+/// lending argument before entering the callee and writing its exit value
+/// back later. Letting a subsequent argument mutate the same place would make
+/// that copy-in/write-back semantics disagree with the interpreter's shared
+/// storage, native pointers, and VC snapshots.
+///
+/// Mutation discovery consumes the checker-authored ownership plan. In
+/// particular, a nested call contributes its recorded unique receiver or
+/// argument loan; this check does not rediscover mutability from call syntax.
+/// Every [`CheckedMutation`] variant denotes a write, extraction, or state
+/// reconstruction and therefore conflicts on overlap; none is filtered by its
+/// current source spelling. A mutation that completes in an earlier argument
+/// remains legal because no outer reservation has captured that state yet.
+fn check_pending_loan_argument_mutations(
+    ctx: &Ctx,
+    operation: &str,
+    receiver: Option<&CallTransition>,
+    arguments: &[Expr],
+    argument_loans: &[Option<CallTransition>],
+    span: Span,
+) -> CResult<()> {
+    if arguments.len() != argument_loans.len() {
+        return Err(Diagnostic {
+            name: "internal.check.call_evaluation_arity".into(),
+            title: format!(
+                "checked `{operation}` arguments and evaluation effects have different lengths"
+            ),
+            span,
+            label: "pending-loan stability requires one checked effect per argument".into(),
+            notes: vec![],
+        });
+    }
+
+    // A named method receiver is resolved before its explicit arguments in
+    // every executable backend, so its implicit loan is the first pending
+    // reservation whose captured state must stay stable.
+    let mut pending_loans: Vec<CallTransition> = receiver.into_iter().cloned().collect();
+    for (argument, loan) in arguments.iter().zip(argument_loans) {
+        let mut mutations = Vec::new();
+        collect_checked_expr_mutations(ctx, argument, &mut mutations)?;
+        for mutation in mutations {
+            if let Some(pending) = pending_loans
+                .iter()
+                .find(|pending| pending.place.overlaps(mutation.place()))
+            {
+                return Err(Diagnostic {
+                    name: "borrow.conflict".into(),
+                    title: format!(
+                        "borrow of `{}` overlaps a later mutation in `{operation}`",
+                        pending.place.render()
+                    ),
+                    span: argument.span,
+                    label: format!(
+                        "this argument mutates `{}` after the borrow was created",
+                        mutation.place().render()
+                    ),
+                    notes: vec![(
+                        "note".into(),
+                        "call arguments evaluate left-to-right; a borrow argument captures its \
+                         entry state before the callee begins, so later arguments must not \
+                         mutate the same place"
+                            .into(),
+                    )],
+                });
+            }
+        }
+        if let Some(loan) = loan {
+            pending_loans.push(loan.clone());
+        }
+    }
+    Ok(())
+}
+
 fn check_recorded_argument_conflicts(
+    ctx: &Ctx,
+    moved_before: &HashSet<Place>,
     operation: &str,
     arguments: &[CheckedSealedArgument],
 ) -> CResult<()> {
@@ -8424,6 +8557,32 @@ fn check_recorded_argument_conflicts(
                     loaned.render()
                 ),
                 notes: vec![],
+            });
+        }
+    }
+    for (loaned, _, loan_span) in loans {
+        if ctx
+            .moved
+            .difference(moved_before)
+            .any(|moved| loaned.overlaps(moved))
+        {
+            return Err(Diagnostic {
+                name: "borrow.moved_in_call".into(),
+                title: format!(
+                    "`{}` is lent and moved while evaluating `{operation}`",
+                    loaned.render()
+                ),
+                span: loan_span,
+                label: format!(
+                    "this borrow promises the caller keeps `{}`, which argument evaluation moves",
+                    loaned.render()
+                ),
+                notes: vec![(
+                    "note".into(),
+                    "a nested argument may return a fresh value while moving caller storage; \
+                     the move still invalidates an earlier pending sealed-operation loan"
+                        .into(),
+                )],
             });
         }
     }
@@ -10778,6 +10937,356 @@ fn bad() {
 "#,
         );
         assert_eq!(check_error(&mut program).name, "borrow.moved_in_call");
+    }
+
+    #[test]
+    fn later_nested_mutations_conflict_with_pending_call_state_in_every_call_shape() {
+        const PRELUDE: &str = r#"
+class TimingItem {
+    u64 value;
+
+    init new(u64 initial) {
+        self.value = initial;
+    }
+
+    fn set_nine(&mut self) {
+        self.value = 9;
+    }
+
+    fn receive(&self, u64 marker) {}
+}
+
+fn mutate(&mut TimingItem item) -> u64 {
+    item.set_nine();
+    return 0;
+}
+
+fn observe(&TimingItem item, u64 marker) {}
+
+class TimingTarget {
+    u64 marker;
+
+    init make(&TimingItem item, u64 marker) {
+        self.marker = marker;
+    }
+
+    init empty() {
+        self.marker = 0;
+    }
+
+    fn observe(&self, &TimingItem item, u64 marker) {}
+}
+"#;
+
+        let cases = [
+            // An explicit free-call loan captures state before the later
+            // nested call tries to mutate it.
+            r#"
+fn bad() {
+    var mut item = TimingItem::new(1);
+    observe(&item, mutate(&mut item));
+}
+"#,
+            // Constructors use the same argument-evaluation rule.
+            r#"
+fn bad() {
+    var mut item = TimingItem::new(1);
+    var target = TimingTarget::make(&item, mutate(&mut item));
+}
+"#,
+            // So do explicit arguments of a method on a disjoint receiver.
+            r#"
+fn bad() {
+    var target = TimingTarget::empty();
+    var mut item = TimingItem::new(1);
+    target.observe(&item, mutate(&mut item));
+}
+"#,
+            // A method's implicit receiver reservation captures state before
+            // every explicit argument, so it is subject to the same rule.
+            r#"
+fn bad() {
+    var mut item = TimingItem::new(1);
+    item.receive(mutate(&mut item));
+}
+"#,
+        ];
+
+        for source in cases {
+            let mut program = monomorphized_program(&format!("{PRELUDE}\n{source}"));
+            let error = check_error(&mut program);
+            assert_eq!(error.name, "borrow.conflict", "for:\n{source}");
+            assert!(error.title.contains("later mutation"));
+            assert!(
+                error
+                    .notes
+                    .iter()
+                    .any(|(_, note)| note.contains("left-to-right"))
+            );
+        }
+    }
+
+    #[test]
+    fn completed_nested_mutations_may_precede_a_later_call_reservation() {
+        let mut program = monomorphized_program(
+            r#"
+class TimingItem {
+    u64 value;
+
+    init new(u64 initial) {
+        self.value = initial;
+    }
+
+    fn set_nine(&mut self) {
+        self.value = 9;
+    }
+
+    fn receive(&self, u64 marker) {}
+}
+
+fn mutate(&mut TimingItem item) -> u64 {
+    item.set_nine();
+    return 0;
+}
+
+fn observe(u64 marker, &TimingItem item) {}
+
+class TimingTarget {
+    u64 marker;
+
+    init make(u64 marker, &TimingItem item) {
+        self.marker = marker;
+    }
+
+    init empty() {
+        self.marker = 0;
+    }
+
+    fn observe(&self, u64 marker, &TimingItem item) {}
+}
+
+fn good() {
+    var mut free_item = TimingItem::new(1);
+    observe(mutate(&mut free_item), &free_item);
+
+    var mut ctor_item = TimingItem::new(1);
+    var made = TimingTarget::make(mutate(&mut ctor_item), &ctor_item);
+
+    var target = TimingTarget::empty();
+    var mut method_item = TimingItem::new(1);
+    target.observe(mutate(&mut method_item), &method_item);
+
+    var receiver = TimingItem::new(1);
+    var mut disjoint = TimingItem::new(1);
+    receiver.receive(mutate(&mut disjoint));
+}
+"#,
+        );
+
+        check(&mut program).expect(
+            "a nested mutation that completes before a later reservation captures state is sound",
+        );
+    }
+
+    #[test]
+    fn pending_unique_reservations_allow_completed_reads_but_not_callee_aliases() {
+        let mut reads = monomorphized_program(
+            r#"
+fn nested_len(&[u64] values) -> u64 {
+    return values.len;
+}
+
+fn hold(&mut [u64] values, u64 nested, u64 direct) {}
+
+class ReadItem {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+
+    fn get(&self) -> u64 {
+        return self.value;
+    }
+
+    fn hold(&mut self, u64 nested, u64 direct) {}
+}
+
+fn read_item(&ReadItem item) -> u64 {
+    return item.get();
+}
+
+fn good() {
+    mut [u64] values = [1];
+    hold(&mut values, nested_len(&values), values.len);
+
+    var mut item = ReadItem::new(1);
+    item.hold(read_item(&item), item.get());
+}
+"#,
+        );
+        check(&mut reads).expect(
+            "transient nested shared reads and direct scalar reads finish before the callee",
+        );
+
+        let mut direct_alias = monomorphized_program(
+            r#"
+fn alias(&mut [u64] unique, &[u64] shared) {}
+
+fn bad() {
+    mut [u64] values = [1];
+    alias(&mut values, &values);
+}
+"#,
+        );
+        assert_eq!(check_error(&mut direct_alias).name, "borrow.conflict");
+    }
+
+    #[test]
+    fn sealed_operations_retain_the_same_pending_loan_stability_rule() {
+        let mut program = monomorphized_program(
+            r#"
+fn mutate_map(
+    resource &mut ResourceMap<u64, PointsTo<u64>> cells
+) -> u64 {
+    return 0;
+}
+
+fn bad(
+    resource &mut ResourceMap<u64, PointsTo<u64>> cells,
+    resource PointsTo<u64> cell
+) {
+    resource_map_put(&mut cells, mutate_map(&mut cells), cell);
+}
+"#,
+        );
+
+        let error = check_error(&mut program);
+        assert_eq!(error.name, "borrow.conflict");
+        assert!(error.title.contains("later mutation"));
+    }
+
+    #[test]
+    fn sealed_operations_reject_nested_moves_that_invalidate_pending_loans() {
+        let mut program = monomorphized_program(
+            r#"
+fn move_map(
+    resource ResourceMap<u64, PointsTo<u64>> cells
+) -> u64 {
+    return 0;
+}
+
+fn bad(resource PointsTo<u64> cell) {
+    mut resource ResourceMap<u64, PointsTo<u64>> cells = resource_map_empty();
+    resource_map_put(&mut cells, move_map(cells), cell);
+}
+"#,
+        );
+
+        let error = check_error(&mut program);
+        assert_eq!(error.name, "borrow.moved_in_call");
+        assert!(error.title.contains("resource_map_put"));
+        assert!(error.label.contains("argument evaluation moves"));
+    }
+
+    #[test]
+    fn sealed_operations_allow_completed_or_disjoint_effects_before_a_later_loan() {
+        let mut program = monomorphized_program(
+            r#"
+fn move_map_to_pointer(
+    raw<u8> pointer,
+    resource ResourceMap<u64, PointsTo<u64>> moved
+) -> raw<u8> {
+    return pointer;
+}
+
+fn good(
+    raw<u8> pointer,
+    resource &PointsTo<u64> cell,
+    resource ResourceMap<u64, PointsTo<u64>> moved
+) -> u64 {
+    unsafe {
+        return raw_cell_read_u64(move_map_to_pointer(pointer, moved), &cell);
+    }
+}
+
+fn poll(resource &mut Uart uart) -> u8 {
+    return 65;
+}
+
+fn good_uart(resource &mut Uart uart) {
+    unsafe {
+        uart_write(poll(&mut uart), &mut uart);
+    }
+}
+"#,
+        );
+
+        check(&mut program)
+            .expect("completed mutation and disjoint-move effects may precede a later sealed loan");
+    }
+
+    #[test]
+    fn retained_trait_signatures_admit_exactly_the_integer_proof_domain() {
+        let span = Span::new(10, 20);
+        for ty in [
+            Ty::Int(IntTy::U64),
+            Ty::Int(IntTy::TParam(0)),
+            Ty::Param(TypeParamId::from_legacy(0)),
+        ] {
+            trait_param_ty(&ty, span)
+                .unwrap_or_else(|_| panic!("`{}` is a trait proof value", ty.name()));
+            trait_return_ty(&ty, "proof_value", span)
+                .unwrap_or_else(|_| panic!("`{}` is a trait proof result", ty.name()));
+        }
+
+        for ty in [
+            Ty::Bool,
+            Ty::Class(0),
+            Ty::Record(0),
+            Ty::array(Ty::Int(IntTy::U64)),
+            Ty::slots(Ty::Int(IntTy::U64)),
+            Ty::OptionRaw(0),
+            Ty::Res(ResKind::RawSpan),
+            Ty::Raw(IntTy::U8),
+            Ty::RawRecord(0),
+            Ty::borrow(Mutability::Shared, Ty::Res(ResKind::RawSpan)),
+            Ty::Unit,
+        ] {
+            let parameter = trait_param_ty(&ty, span)
+                .expect_err(&format!("`{}` is not a trait proof value", ty.name()));
+            assert_eq!(parameter.name, "type.trait_param_unsupported");
+            assert_eq!(parameter.span, span);
+
+            let result = trait_return_ty(&ty, "closed", span)
+                .expect_err(&format!("`{}` is not a trait proof result", ty.name()));
+            assert_eq!(result.name, "type.trait_return_unsupported");
+            assert_eq!(result.span, span);
+        }
+
+        let value_option = Ty::option(Ty::Int(IntTy::U64));
+        assert_eq!(
+            trait_param_ty(&value_option, span)
+                .expect_err("an option is not an integer proof value")
+                .name,
+            "type.trait_param_unsupported"
+        );
+        assert_eq!(
+            trait_return_ty(&value_option, "closed", span)
+                .expect_err("an option is not an integer proof result")
+                .name,
+            "type.trait_option_return"
+        );
+
+        let affine_option = Ty::affine_array_option(Ty::Bool);
+        for refusal in [
+            trait_param_ty(&affine_option, span)
+                .expect_err("an affine option cannot enter a trait signature"),
+            trait_return_ty(&affine_option, "closed", span)
+                .expect_err("an affine option cannot leave a trait signature"),
+        ] {
+            assert_eq!(refusal.name, "type.affine_option_trait");
+        }
     }
 
     #[test]

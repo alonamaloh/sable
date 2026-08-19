@@ -1,0 +1,40 @@
+// A nested mutation in an earlier argument completes before the later borrow
+// is created. Left-to-right evaluation therefore gives the observer the
+// post-mutation state without overlapping two live loans.
+
+class OrderedItem {
+    u64 value;
+
+    /// post self.value = initial
+    init new(u64 initial) {
+        self.value = initial;
+    }
+
+    /// post self.value = 9
+    fn set_nine(&mut self) {
+        self.value = 9;
+    }
+
+    /// post result = self.value
+    fn get(&self) -> u64 {
+        return self.value;
+    }
+}
+
+/// post item.value = 9
+/// post result = 0
+fn ordered_mutate(&mut OrderedItem item) -> u64 {
+    item.set_nine();
+    return 0;
+}
+
+/// post result = item.value
+fn ordered_observe(u64 marker, &OrderedItem item) -> u64 {
+    return item.get();
+}
+
+/// post result = 9
+pub fn nested_mutation_before_loan() -> u64 {
+    var mut item = OrderedItem::new(1);
+    return ordered_observe(ordered_mutate(&mut item), &item);
+}

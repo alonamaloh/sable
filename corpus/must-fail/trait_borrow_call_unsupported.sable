@@ -1,0 +1,12 @@
+// expect-error: type.trait_param_unsupported
+// Retained trait proof reuse substitutes only integer values into an abstract
+// contract. The declaration gate rejects even a non-aliasing borrowed
+// interface, before a use can reach VC generation's integer-only call arm.
+
+trait ClosedSpanOps {
+    fn observe(resource &RawSpan item, u64 marker) -> u64;
+}
+
+fn closed_span_call<K: ClosedSpanOps>(resource &RawSpan item) -> u64 {
+    return K::observe(item, 0);
+}

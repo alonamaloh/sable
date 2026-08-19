@@ -1,0 +1,15 @@
+// expect-error: type.trait_param_unsupported
+// Class values have ordinary ownership semantics, but retained trait calls
+// substitute only integer proof values into abstract contracts.
+
+class TraitOwnedItem {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+}
+
+trait TraitOwnsClass {
+    fn inspect(TraitOwnedItem item) -> u64;
+}

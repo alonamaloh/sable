@@ -1,0 +1,7 @@
+// expect-error: type.trait_return_unsupported
+// Retained trait calls currently require an integer result; a procedure has
+// no result value for VC generation's abstract call binding.
+
+trait TraitProcedure {
+    fn clear(Self value);
+}

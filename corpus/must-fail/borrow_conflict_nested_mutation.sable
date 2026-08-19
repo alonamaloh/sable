@@ -1,0 +1,34 @@
+// expect-error: borrow.conflict
+// The first argument captures the shared loan's entry state. The second
+// argument's nested unique call may not mutate that owner before the outer
+// callee begins with the captured state.
+
+class NestedLoanItem {
+    u64 value;
+
+    init new(u64 initial) {
+        self.value = initial;
+    }
+
+    fn set_nine(&mut self) {
+        self.value = 9;
+    }
+
+    fn get(&self) -> u64 {
+        return self.value;
+    }
+}
+
+fn nested_loan_mutate(&mut NestedLoanItem item) -> u64 {
+    item.set_nine();
+    return 0;
+}
+
+fn nested_loan_observe(&NestedLoanItem item, u64 marker) -> u64 {
+    return item.get();
+}
+
+fn nested_loan_bad() -> u64 {
+    var mut item = NestedLoanItem::new(1);
+    return nested_loan_observe(&item, nested_loan_mutate(&mut item));
+}

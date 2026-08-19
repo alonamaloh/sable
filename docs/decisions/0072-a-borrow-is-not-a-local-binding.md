@@ -107,11 +107,31 @@ borrowed shapes newly *distinguished* from their owned form, which
 `every_distinguished_binding_mode_is_probed` demanded samples for — the audit
 widening itself, as its comment says it should.
 
+> **Clarified 2026-08-20.** “Written at a call” does not mean that a borrow is
+> a place recipe resolved only after every other argument has run. Arguments
+> evaluate left-to-right (ADR 0005), so `&x` records a pending callee loan and
+> captures its place and entry state at that argument position. Until the
+> callee begins, this reservation requires mutation stability rather than full
+> Rust-style inaccessibility: `f(&x, mutate(&mut x))` is `borrow.conflict`,
+> including when `mutate` is a nested function, constructor, or method call,
+> while a transient nested shared read may finish before the outer call starts.
+> `f(mutate(&mut x), &x)` is also admitted because the mutation completes
+> before the later reservation captures its state. An implicit method receiver
+> is the first reservation, before its explicit arguments. Direct overlapping
+> loan arguments remain conflicting because both would enter the same callee.
+> This is observable in ADR 0069's formal SVM: a lending argument's entry value
+> is read left-to-right and its exit value is written back later, so allowing an
+> intervening mutation would make that machine disagree with the interpreter's
+> shared storage and native pointers. ADR 0090's ephemeral plan records the
+> exact nested mutations used by this within-call check; it still introduces no
+> borrow state that survives a statement.
+
 ## What this does not do
 
-**It fences the hole; it does not build an aliasing model.** The checker still
-records no loan. `Place` has no root→owner relation, `contains`/`overlaps` is
-consulted only within one call's argument list, and there is no loan liveness.
+**It fences the hole; it does not build an aliasing model.** The checker records
+call-bound transitions, not a statement-spanning loan. `Place` has no
+root→owner relation, `contains`/`overlaps` is consulted only within one call's
+argument list, and there is no general loan liveness.
 What makes the tree sound today is that a borrow now exists only where the
 compiler already relates it to its owner: written at a call, bound to a
 parameter for the length of the call, with the argument-overlap rule (ADR

@@ -1,0 +1,16 @@
+// expect-error: type.trait_param_unsupported
+// This source retains the hazardous nested-call shape that exposed the wider
+// gap, but the positive integer-only trait signature gate now rejects the
+// borrowed interface before the call can reach VC generation.
+
+trait TemporalSpanOps {
+    fn observe(resource &RawSpan item, u64 marker) -> u64;
+}
+
+fn temporal_span_mutate(resource &mut RawSpan item) -> u64 {
+    return 0;
+}
+
+fn temporal_span_bad<K: TemporalSpanOps>(resource &mut RawSpan item) -> u64 {
+    return K::observe(&item, temporal_span_mutate(&mut item));
+}

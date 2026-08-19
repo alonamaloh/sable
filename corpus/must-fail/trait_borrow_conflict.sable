@@ -1,7 +1,6 @@
-// expect-error: borrow.conflict
-// A trait call obeys the same no-alias rule as an ordinary call: its
-// abstract contract cannot frame two arguments as distinct when one is a
-// mutable borrow of the very same resource view.
+// expect-error: type.trait_param_unsupported
+// Retained trait contracts have an integer-only proof domain. Reject the
+// borrowed signature itself, before any call-site alias question can arise.
 
 trait SpanOps {
     fn both(resource &mut RawSpan a, resource &RawSpan b) -> u64;

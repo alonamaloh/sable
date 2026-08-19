@@ -1,0 +1,7 @@
+// expect-error: type.trait_param_unsupported
+// Resource authority needs a state transition; the retained trait proof
+// domain has only integer arguments and results.
+
+trait TraitOwnsResource {
+    fn inspect(resource RawSpan item) -> u64;
+}

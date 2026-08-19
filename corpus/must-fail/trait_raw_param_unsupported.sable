@@ -1,0 +1,7 @@
+// expect-error: type.trait_param_unsupported
+// A raw pointer is not an integer proof value, even though ordinary unsafe
+// functions may transport it alongside separate authority.
+
+trait TraitTakesRaw {
+    fn inspect(raw<u8> pointer) -> u64;
+}

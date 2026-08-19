@@ -73,6 +73,29 @@ sealed operation looks up and applies its own record. Failed lookup uses only
 an inert placeholder after latching the refusal; it cannot reconstruct a
 proof-state ownership effect from syntax.
 
+A borrow argument nevertheless records its place and entry state at its own
+position, not at callee entry. This is a pending callee reservation, not a full
+Rust-style live loan during argument evaluation: a later read that completes
+before the callee begins remains legal, but the captured state must not change.
+The checker walks arguments in that same left-to-right order and projects every
+nested `CheckedMutation` from this plan. Once an explicit reservation (or an
+implicit method-receiver reservation) exists, every later overlapping checked
+mutation reachable from an argument expression is `borrow.conflict`; a mutation
+completed by an earlier argument remains legal. This temporal stability check
+is shared by free calls, constructors, methods, receivers, and sealed
+operations. Direct overlapping loan arguments remain a separate conflict
+because both loans would enter the same callee. Sealed operations also retain
+the checker's pre-argument moved-place snapshot: a later nested expression may
+return a fresh scalar while moving an owner, but the flow-sensitive move delta
+still conflicts with an earlier overlapping reservation as
+`borrow.moved_in_call`.
+Retained trait proof reuse has no ownership-effect consumer and remains
+scalar-only through a positive declaration gate: trait parameters and results
+admit only `Ty::Int` and the retained `Ty::Param` that must instantiate to an
+integer. Class, resource, pointer, borrow, aggregate, Boolean, and unit trait
+signature positions are rejected before a trait-call expression can reach VC
+generation, so `TraitCall` needs no parallel ownership-effect authority.
+
 The source-only mutation scan used to reject a `for` desugaring whose hidden
 bound/index would be modified now lives in the parser. It is a conservative
 parser restriction, not a proof-state effect authority. VCgen retains the
