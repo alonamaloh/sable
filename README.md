@@ -165,3 +165,6 @@ library. See
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the compiler works, and
   [`docs/decisions/`](docs/decisions/) for the reasoning behind each settled
   question.
+- [`docs/SOUNDNESS-INCIDENTS.md`](docs/SOUNDNESS-INCIDENTS.md) — the
+  evidence-qualified ledger of false proofs, accepted-invalid programs,
+  semantic divergences, fail-open ICEs, and pre-merge near misses.
