@@ -2007,10 +2007,12 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      expression CFG or a mechanized source-translation proof, and stages may
      still refuse shapes outside their admitted subsets.
 
-   - **G3 — slots and `Vec` (unblocked; next after closed C0):** make generic element storage
-     and movement real for the existing growable-vector benchmark; neither N0
-     nor the bignum ladder broadens the option ABI or authorizes generic owner
-     storage.
+   - **G3 — slots and `Vec` (in progress; ADR 0093):** make generic element
+     storage and movement real for the growable-vector benchmark through a
+     distinct occupancy-bearing `slots<T>` container, atomic `slot_take` and
+     `slot_put`, and independently verified class-owner specializations.
+     Ordinary `[T]` remains copy-element storage; Vec's owner-capable API does
+     not add a shared copying `get` or broaden the affine-option ABI.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
      key/value storage, probing, and its existing verified contracts.
 
