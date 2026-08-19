@@ -950,6 +950,24 @@ impl ValueDropAction {
             Ty::Array(element) => ValueDropRecipe::ReleaseArray {
                 element: element.as_ref().clone(),
             },
+            Ty::Slots(_) => {
+                return Err(PlanError {
+                    span,
+                    message: format!(
+                        "internal.control.slots_unsupported: `{}` has no sealed occupied-cell cleanup recipe",
+                        ty.name()
+                    ),
+                });
+            }
+            Ty::Option(payload) if payload.as_owned_slots().is_some() => {
+                return Err(PlanError {
+                    span,
+                    message: format!(
+                        "internal.control.slots_unsupported: owning option `{}` has no present-slot cleanup recipe",
+                        ty.name()
+                    ),
+                });
+            }
             Ty::Option(payload) if !payload.is_affine() => return Ok(None),
             Ty::Option(payload)
                 if payload.is_owned_array_of(&Ty::Bool)
@@ -4193,7 +4211,8 @@ impl BodyPlan {
             | ExprKind::TraitCall { args, .. }
             | ExprKind::MethodCall { args, .. }
             | ExprKind::RecordLit { args, .. }
-            | ExprKind::ArrayLit(args) => {
+            | ExprKind::ArrayLit(args)
+            | ExprKind::SlotOp { args, .. } => {
                 for argument in args {
                     self.inventory_expression(argument, scope, inventory)?;
                 }
@@ -5150,6 +5169,15 @@ fn checked_integer_ty(expression: &Expr, role: &str) -> Result<IntTy, PlanError>
 fn direct_expression_traps(expression: &Expr) -> Result<Vec<(Span, TrapSiteKind)>, PlanError> {
     let mut traps = Vec::new();
     match &expression.kind {
+        ExprKind::SlotOp { op, .. } => {
+            return Err(PlanError {
+                span: expression.span,
+                message: format!(
+                    "internal.control.slots_unsupported: `{}` has no retained trap-site plan",
+                    op.name()
+                ),
+            });
+        }
         ExprKind::Unary { op: UnOp::Neg, .. } => traps.push((
             expression.span,
             TrapSiteKind::NegOverflow(checked_integer_ty(expression, "negation")?),
@@ -5540,6 +5568,50 @@ mod tests {
 
     fn at(start: usize) -> Span {
         Span::new(start, start + 1)
+    }
+
+    #[test]
+    fn owner_slots_never_acquire_a_control_recipe_or_trap_plan() {
+        let slots = Ty::slots(Ty::Int(IntTy::U64));
+        let error = ValueDropAction::build(&slots, at(1))
+            .expect_err("owner slots have no occupied-cell cleanup recipe yet");
+        assert!(
+            error
+                .message
+                .starts_with("internal.control.slots_unsupported:"),
+            "{}",
+            error.message
+        );
+        let error = ValueDropAction::build(&Ty::option(slots.clone()), at(1))
+            .expect_err("an option over owner slots must stay on the owning cleanup path");
+        assert!(
+            error
+                .message
+                .starts_with("internal.control.slots_unsupported:"),
+            "{}",
+            error.message
+        );
+
+        let operation = Expr {
+            kind: ExprKind::SlotOp {
+                op: crate::ast::SlotOp::Alloc {
+                    elem: Ty::Int(IntTy::U64),
+                },
+                op_span: at(2),
+                args: vec![integer_expr(4, at(3))],
+            },
+            span: at(2),
+            ty: Some(slots),
+        };
+        let error = direct_expression_traps(&operation)
+            .expect_err("owner-slot operations have no retained trap plan yet");
+        assert!(
+            error
+                .message
+                .starts_with("internal.control.slots_unsupported:"),
+            "{}",
+            error.message
+        );
     }
 
     fn owned_decl(name: &str, span: Span) -> Stmt {

@@ -53,6 +53,7 @@ fn constructor(ty: &Ty) -> &'static str {
         Ty::Class(_) => "Class",
         Ty::Record(_) => "Record",
         Ty::Array(..) => "Array",
+        Ty::Slots(..) => "Slots",
         Ty::Option(_) => "Option",
         Ty::OptionRaw(_) => "OptionRaw",
         Ty::Res(_) => "Res",
@@ -71,6 +72,7 @@ const CONSTRUCTORS: &[&str] = &[
     "Class",
     "Record",
     "Array",
+    "Slots",
     "Option",
     "OptionRaw",
     "Res",
@@ -126,6 +128,57 @@ pub(crate) fn samples() -> Vec<(&'static str, Ty)> {
         ("&mut [bool]", Ty::array_ref(Ty::Bool, Mutability::Mut)),
         ("[record]", Ty::array(Ty::Record(0))),
         ("[type parameter]", Ty::array(Ty::Param(param()))),
+        ("slots<u64>", Ty::slots(Ty::Int(IntTy::U64))),
+        ("slots<class>", Ty::slots(Ty::Class(0))),
+        (
+            "&slots<class>",
+            Ty::borrow(Mutability::Shared, Ty::slots(Ty::Class(0))),
+        ),
+        (
+            "&mut slots<class>",
+            Ty::borrow(Mutability::Mut, Ty::slots(Ty::Class(0))),
+        ),
+        ("slots<record>", Ty::slots(Ty::Record(0))),
+        (
+            "&slots<record>",
+            Ty::borrow(Mutability::Shared, Ty::slots(Ty::Record(0))),
+        ),
+        (
+            "&mut slots<record>",
+            Ty::borrow(Mutability::Mut, Ty::slots(Ty::Record(0))),
+        ),
+        ("slots<type parameter>", Ty::slots(Ty::Param(param()))),
+        (
+            "&slots<type parameter>",
+            Ty::borrow(Mutability::Shared, Ty::slots(Ty::Param(param()))),
+        ),
+        (
+            "&mut slots<type parameter>",
+            Ty::borrow(Mutability::Mut, Ty::slots(Ty::Param(param()))),
+        ),
+        (
+            "option<slots<u64>>",
+            Ty::option(Ty::slots(Ty::Int(IntTy::U64))),
+        ),
+        (
+            "&option<slots<u64>>",
+            Ty::borrow(
+                Mutability::Shared,
+                Ty::option(Ty::slots(Ty::Int(IntTy::U64))),
+            ),
+        ),
+        (
+            "&mut option<slots<u64>>",
+            Ty::borrow(Mutability::Mut, Ty::option(Ty::slots(Ty::Int(IntTy::U64)))),
+        ),
+        (
+            "&slots<u64>",
+            Ty::borrow(Mutability::Shared, Ty::slots(Ty::Int(IntTy::U64))),
+        ),
+        (
+            "&mut slots<u64>",
+            Ty::borrow(Mutability::Mut, Ty::slots(Ty::Int(IntTy::U64))),
+        ),
         ("option<u64>", Ty::option(Ty::Int(IntTy::U64))),
         ("option<bool>", Ty::option(Ty::Bool)),
         ("option<record>", Ty::option(Ty::Record(0))),
@@ -1194,6 +1247,7 @@ fn every_checker_position_gate_has_a_column() {
             TyPos::RecordField => &["record field"],
             TyPos::ClassField => &["check class field"],
             TyPos::ArrayElement => &["check array payload"],
+            TyPos::SlotPayload => &[],
             TyPos::OptionPayload => &["check option payload", "check affine payload"],
             // Integer-narrowed positions: the admissibility table plus
             // `lower_int_ty` / `lower_raw_type` / `lower_res_kind` are the

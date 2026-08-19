@@ -584,6 +584,9 @@ pub(crate) fn validate_ty_payload(ty: Ty, context: &str) -> Result<(), String> {
 /// shape that reaches the machine without any gate seeing it.
 fn validate_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
+        Ty::Slots(_) => Err(format!(
+            "svm.slots_unsupported: {context} uses owner slots, which have no profile-machine representation yet"
+        )),
         Ty::Array(payload) => validate_array_payload(&payload, context),
         Ty::Option(payload) => validate_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
@@ -2336,6 +2339,12 @@ fn validate_call_signature(
 }
 
 fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String> {
+    if let ExprKind::SlotOp { op, .. } = &expr.kind {
+        return Err(format!(
+            "svm.slots_unsupported: `{}` has no profile-machine semantics yet",
+            op.name()
+        ));
+    }
     if let Some(ty) = &expr.ty {
         validate_ty_payload(ty.clone(), "expression annotation")?;
         if ty.is_owned_bool_array()
@@ -2358,6 +2367,9 @@ fn validate_expr_payloads(ctx: &LowerCtx<'_>, expr: &Expr) -> Result<(), String>
     }
 
     match &expr.kind {
+        ExprKind::SlotOp { .. } => {
+            unreachable!("slot operations are refused before cached annotation validation")
+        }
         ExprKind::Index { array, index, .. } => {
             validate_array_index(ctx, expr, array, index)?;
         }
@@ -4519,6 +4531,12 @@ fn lower_expr(ctx: &LowerCtx<'_>, e: &Expr) -> Result<String, String> {
     consume_expression_trap_sites(ctx, e)?;
     validate_expr_payloads(ctx, e)?;
     Ok(match &e.kind {
+        ExprKind::SlotOp { op, .. } => {
+            return Err(format!(
+                "svm.slots_unsupported: `{}` has no profile-machine lowering yet",
+                op.name()
+            ));
+        }
         ExprKind::IntLit(n) => {
             format!("(.intLit {} {})", lean_ty(expr_int_ty(e)?)?, int_lit(*n))
         }
@@ -4907,6 +4925,30 @@ fn classify_trap(msg: &str) -> String {
 mod tests {
     use super::*;
     use crate::span::Span;
+
+    #[test]
+    fn owner_slots_have_neither_an_svm_type_nor_operation_semantics() {
+        let error = validate_ty_payload(Ty::slots(Ty::Int(IntTy::U64)), "forged slot local")
+            .expect_err("owner slots have no profile-machine representation yet");
+        assert!(error.starts_with("svm.slots_unsupported:"), "{error}");
+
+        let program = empty_program();
+        let ctx = LowerCtx::bare(&program);
+        let operation = expr(
+            ExprKind::SlotOp {
+                op: SlotOp::Take,
+                op_span: Span::new(1, 2),
+                args: vec![expr(
+                    ExprKind::Var("hostile_operand".into()),
+                    Ty::Param(TypeParamId::from_legacy(0)),
+                )],
+            },
+            Ty::Param(TypeParamId::from_legacy(0)),
+        );
+        let error = validate_expr_payloads(&ctx, &operation)
+            .expect_err("the slot refusal wins over hostile cached types and operands");
+        assert!(error.starts_with("svm.slots_unsupported:"), "{error}");
+    }
 
     /// The wire format is compared against the machine's `Config.render`
     /// byte for byte, and every option payload is spelled by one helper, so

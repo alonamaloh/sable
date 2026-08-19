@@ -86,6 +86,7 @@ enum TypeShape {
     Record,
     Class,
     Array,
+    Slots,
     Option,
     Raw,
     Resource,
@@ -112,7 +113,8 @@ impl TypeShape {
             TypeShape::Param => TypeShape::Record,
             TypeShape::Record => TypeShape::Class,
             TypeShape::Class => TypeShape::Array,
-            TypeShape::Array => TypeShape::Option,
+            TypeShape::Array => TypeShape::Slots,
+            TypeShape::Slots => TypeShape::Option,
             TypeShape::Option => TypeShape::Raw,
             TypeShape::Raw => TypeShape::Resource,
             TypeShape::Resource => TypeShape::Borrow,
@@ -129,6 +131,7 @@ impl TypeShape {
             TypeShape::Record => "a record type",
             TypeShape::Class => "a class type",
             TypeShape::Array => "an array type `[T]`",
+            TypeShape::Slots => "an owner-slot type `slots<T>`",
             TypeShape::Option => "an option type `option<T>`",
             TypeShape::Raw => "a raw pointer type `raw<T>`",
             TypeShape::Resource => "a resource type",
@@ -145,6 +148,7 @@ impl TypeShape {
             TypeShape::Record => "a visible record",
             TypeShape::Class => "a visible class",
             TypeShape::Array => "`[T]`",
+            TypeShape::Slots => "`slots<T>`",
             TypeShape::Option => "`option<T>`",
             TypeShape::Raw => "`raw<T>`",
             TypeShape::Resource => "`resource K`",
@@ -162,6 +166,7 @@ impl TypeShape {
             TypeShape::Record => "Record",
             TypeShape::Class => "Class",
             TypeShape::Array => "Array",
+            TypeShape::Slots => "Slots",
             TypeShape::Option => "Option",
             TypeShape::Raw => "Raw",
             TypeShape::Resource => "Resource",
@@ -198,6 +203,7 @@ pub(crate) enum TyPos {
     RecordField,
     ClassField,
     ArrayElement,
+    SlotPayload,
     OptionPayload,
     ForIndex,
     Const,
@@ -238,7 +244,8 @@ impl TyPos {
             TyPos::Local => TyPos::RecordField,
             TyPos::RecordField => TyPos::ClassField,
             TyPos::ClassField => TyPos::ArrayElement,
-            TyPos::ArrayElement => TyPos::OptionPayload,
+            TyPos::ArrayElement => TyPos::SlotPayload,
+            TyPos::SlotPayload => TyPos::OptionPayload,
             TyPos::OptionPayload => TyPos::ForIndex,
             TyPos::ForIndex => TyPos::Const,
             TyPos::Const => TyPos::CastTarget,
@@ -260,6 +267,7 @@ impl TyPos {
             TyPos::RecordField => "record field",
             TyPos::ClassField => "class field",
             TyPos::ArrayElement => "array element",
+            TyPos::SlotPayload => "slot payload",
             TyPos::OptionPayload => "option payload",
             TyPos::ForIndex => "for index",
             TyPos::Const => "const",
@@ -301,6 +309,7 @@ impl TyPos {
             TyPos::RecordField => "type.record_field_unsupported",
             TyPos::ClassField => "type.class_field_unsupported",
             TyPos::ArrayElement => "type.array_payload_unsupported",
+            TyPos::SlotPayload => "type.slot_payload_unsupported",
             TyPos::OptionPayload => "type.option_payload_unsupported",
             TyPos::ForIndex => "type.for_index_unsupported",
             TyPos::Const => "type.const_unsupported",
@@ -322,6 +331,7 @@ impl TyPos {
             TyPos::RecordField => "a record field type",
             TyPos::ClassField => "a class field type",
             TyPos::ArrayElement => "an array element type",
+            TyPos::SlotPayload => "an owner-slot payload type",
             TyPos::OptionPayload => "an option payload type",
             TyPos::ForIndex => "a `for` index type",
             TyPos::Const => "a `const` type",
@@ -385,6 +395,9 @@ impl TyPos {
             (P::ArrayElement, _) => {
                 "an array element is stored, copied, and compared elementwise, so it \
                  needs a layout and a copy rule"
+            }
+            (P::SlotPayload, _) => {
+                "an owner slot moves one independently occupied value, so its payload needs an explicit ownership and destruction rule"
             }
             (P::OptionPayload, _) => {
                 "a copyable option payload is duplicated whenever the option is, so it \
@@ -1442,6 +1455,19 @@ impl<'a> Parser<'a> {
                     .expect("type_param_list enforces the type-parameter ceiling"),
             ));
         }
+        if name == "slots" {
+            if actual != 1 {
+                return Err(self.type_arity_error(
+                    name,
+                    1,
+                    actual,
+                    syntax.span,
+                    "parse.slots_type_arity",
+                ));
+            }
+            let payload = self.lower_generic_type(&args.as_ref().expect("one argument")[0])?;
+            return Ok(GenericTy::Slots(Box::new(payload)));
+        }
         if name == "option" {
             if actual != 1 {
                 return Err(self.type_arity_error(
@@ -1609,7 +1635,7 @@ impl<'a> Parser<'a> {
     /// only a complete list followed by `(` or `::` is a generic use.
     fn at_generic_args(&self) -> PResult<bool> {
         // Builtin angle-bracket forms have dedicated arms.
-        if matches!(self.peek(), Tok::Ident(n) if n == "widen" || n == "narrow" || n == "alloc_array")
+        if matches!(self.peek(), Tok::Ident(n) if n == "widen" || n == "narrow" || n == "alloc_array" || n == "alloc_slots")
         {
             return Ok(false);
         }
@@ -1723,6 +1749,7 @@ impl<'a> Parser<'a> {
                     | S::Param
                     | S::Record
                     | S::Array
+                    | S::Slots
                     | S::Option
                     | S::Raw
                     | S::Resource
@@ -1731,18 +1758,40 @@ impl<'a> Parser<'a> {
             // value spelling reaches it.
             P::RecordField => matches!(
                 shape,
-                S::Int | S::Bool | S::Param | S::Record | S::Class | S::Array | S::Option | S::Raw
+                S::Int
+                    | S::Bool
+                    | S::Param
+                    | S::Record
+                    | S::Class
+                    | S::Array
+                    | S::Slots
+                    | S::Option
+                    | S::Raw
             ),
             // A raw pointer or a record in a class field would need a field
             // layout and a copy rule that no downstream gate states, so this
             // one stays here.
             P::ClassField => matches!(
                 shape,
-                S::Int | S::Bool | S::Param | S::Class | S::Array | S::Option | S::Resource
+                S::Int
+                    | S::Bool
+                    | S::Param
+                    | S::Class
+                    | S::Array
+                    | S::Slots
+                    | S::Option
+                    | S::Resource
             ),
             // `Ty` holds exactly these; `type.array_payload_unsupported`
             // decides which of them the checker gives semantics to.
             P::ArrayElement => matches!(shape, S::Int | S::Bool | S::Param | S::Record),
+            // The first representation tranche spells exactly the payload
+            // domain needed by generic Vec instances over values and direct
+            // class owners. Nested containers remain closed until their
+            // recursive slot-cleanup semantics exist.
+            P::SlotPayload => {
+                matches!(shape, S::Int | S::Bool | S::Param | S::Record | S::Class)
+            }
             // The copyable payloads `Ty` holds, plus the two spellings whose
             // option is its own family: `option<[T]>`, which owns its payload,
             // and `option<raw<Record>>`, a nullable pointer that owns nothing.
@@ -1912,6 +1961,13 @@ impl<'a> Parser<'a> {
                 return Err(arity(1, "parse.raw_type_arity"));
             };
             return self.lower_raw_type(element);
+        }
+        if name == "slots" {
+            self.check_admits(TypeShape::Slots, pos, span)?;
+            let Some([payload]) = args else {
+                return Err(arity(1, "parse.slots_type_arity"));
+            };
+            return Ok(Ty::slots(self.lower_type(payload, TyPos::SlotPayload)?));
         }
         if name == "option" {
             self.check_admits(TypeShape::Option, pos, span)?;
@@ -3823,7 +3879,9 @@ impl<'a> Parser<'a> {
             // particular is erased at runtime, so a reader must not have to
             // infer it from a callee's signature (ADR 0024).
             Tok::KwResource | Tok::KwRaw | Tok::LBracket => self.local_decl_stmt(),
-            Tok::Ident(first) if first == "option" && self.peek2() == &Tok::Lt => {
+            Tok::Ident(first)
+                if matches!(first.as_str(), "option" | "slots") && self.peek2() == &Tok::Lt =>
+            {
                 self.local_decl_stmt()
             }
             Tok::Ident(first) if first == "self" && self.peek2() == &Tok::Dot => {
@@ -4520,6 +4578,74 @@ impl<'a> Parser<'a> {
                     ty: None,
                 })
             }
+            Tok::Ident(name) if SlotOp::from_name(&name).is_some() => {
+                let op = SlotOp::from_name(&name).expect("checked");
+                let op_span = self.bump().span;
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    loop {
+                        args.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                if args.len() != op.arity() {
+                    return Err(Diagnostic {
+                        name: "parse.slot_operation_arity".into(),
+                        title: format!("wrong number of arguments for `{}`", op.name()),
+                        span: op_span.join(close),
+                        label: format!("expected {}, found {}", op.arity(), args.len()),
+                        notes: vec![],
+                    });
+                }
+                Ok(Expr {
+                    kind: ExprKind::SlotOp { op, op_span, args },
+                    span: op_span.join(close),
+                    ty: None,
+                })
+            }
+            Tok::Ident(name) if name == "alloc_slots" => {
+                let op_span = self.bump().span;
+                self.expect(Tok::Lt)?;
+                let (elem, _) = self.ty(TyPos::SlotPayload)?;
+                self.expect(Tok::Gt)?;
+                self.expect(Tok::LParen)?;
+                let mut args = Vec::new();
+                if !self.at(&Tok::RParen) {
+                    loop {
+                        args.push(self.expr()?);
+                        if self.at(&Tok::Comma) {
+                            self.bump();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let close = self.expect(Tok::RParen)?.span;
+                if args.len() != 1 {
+                    return Err(Diagnostic {
+                        name: "parse.slot_operation_arity".into(),
+                        title: "wrong number of arguments for `alloc_slots`".into(),
+                        span: op_span.join(close),
+                        label: format!("expected 1, found {}", args.len()),
+                        notes: vec![],
+                    });
+                }
+                Ok(Expr {
+                    kind: ExprKind::SlotOp {
+                        op: SlotOp::Alloc { elem },
+                        op_span,
+                        args,
+                    },
+                    span: op_span.join(close),
+                    ty: None,
+                })
+            }
             Tok::Ident(name) if name == "alloc_array" => {
                 self.bump();
                 self.expect(Tok::Lt)?;
@@ -4840,7 +4966,7 @@ fn mk_bin(op: BinOp, op_span: Span, lhs: Expr, rhs: Expr) -> Expr {
 fn local_needs_initializer(ty: &Ty) -> bool {
     matches!(
         ty,
-        Ty::Array(..) | Ty::Option(_) | Ty::OptionRaw(_) | Ty::Res(_)
+        Ty::Array(..) | Ty::Slots(..) | Ty::Option(_) | Ty::OptionRaw(_) | Ty::Res(_)
     )
 }
 
@@ -4853,6 +4979,7 @@ fn is_reserved_name(name: &str) -> bool {
         "some",
         "none",
         "option",
+        "slots",
         "widen",
         "narrow",
         "theorem",
@@ -4883,6 +5010,9 @@ fn is_reserved_name(name: &str) -> bool {
         "False",
         "len",
         "alloc_array",
+        "alloc_slots",
+        "slot_take",
+        "slot_put",
         "split_off",
         "join",
         "open_file",
@@ -5043,7 +5173,8 @@ fn collect_for_expr_mutations(expression: &Expr, out: &mut std::collections::Has
         | ExprKind::RecordLit { args, .. }
         | ExprKind::RawOp { args, .. }
         | ExprKind::ResOp { args, .. }
-        | ExprKind::DeviceOp { args, .. } => {
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::SlotOp { args, .. } => {
             for argument in args {
                 collect_for_expr_mutations(argument, out);
             }
@@ -5094,7 +5225,8 @@ fn expr_vars(e: &Expr, out: &mut std::collections::HashSet<String>) {
         }
         ExprKind::ResOp { args, .. }
         | ExprKind::RawOp { args, .. }
-        | ExprKind::DeviceOp { args, .. } => {
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::SlotOp { args, .. } => {
             for a in args {
                 expr_vars(a, out);
             }
@@ -5799,6 +5931,96 @@ fn unsupported() -> option<Pair> {
     }
 
     #[test]
+    fn owner_slots_and_their_operations_have_distinct_parsed_nodes() {
+        let source = r#"
+class Pool {
+    slots<u64> cells;
+
+    init make() {
+        self.cells = alloc_slots<u64>(4);
+    }
+}
+
+fn surface() {
+    mut slots<u64> cells = alloc_slots<u64>(4);
+    var taken = slot_take(&mut cells, 0);
+    slot_put(&mut cells, 0, taken);
+    var count = cells.len;
+}
+"#;
+        let program = parse_source(source).unwrap();
+        assert_eq!(
+            program.classes[0].fields[0].ty,
+            Ty::slots(Ty::Int(IntTy::U64))
+        );
+        let function = &program.fns[0];
+
+        let Stmt::Decl {
+            ty,
+            init: Some(alloc),
+            mutable,
+            ..
+        } = &function.body[0]
+        else {
+            panic!("expected explicit owner-slot declaration");
+        };
+        assert!(*mutable);
+        assert_eq!(*ty, Ty::slots(Ty::Int(IntTy::U64)));
+        assert!(matches!(
+            &alloc.kind,
+            ExprKind::SlotOp {
+                op: SlotOp::Alloc { elem: Ty::Int(IntTy::U64) },
+                args,
+                ..
+            } if args.len() == 1
+        ));
+
+        let Stmt::VarDecl { init: take, .. } = &function.body[1] else {
+            panic!("expected inferred take binding");
+        };
+        assert!(matches!(
+            &take.kind,
+            ExprKind::SlotOp { op: SlotOp::Take, args, .. }
+                if args.len() == 2 && matches!(&args[0].kind, ExprKind::Borrow { mutable: true, .. })
+        ));
+
+        let Stmt::ExprStmt(put) = &function.body[2] else {
+            panic!("expected put statement");
+        };
+        assert!(matches!(
+            &put.kind,
+            ExprKind::SlotOp { op: SlotOp::Put, args, .. } if args.len() == 3
+        ));
+
+        let Stmt::VarDecl { init: len, .. } = &function.body[3] else {
+            panic!("expected inferred length observation");
+        };
+        assert!(matches!(&len.kind, ExprKind::Len { array } if array == "cells"));
+    }
+
+    #[test]
+    fn owner_slot_syntax_is_fail_closed_by_position_and_arity() {
+        let payload =
+            parse_source("fn bad() { slots<[u64]> cells = alloc_slots<u64>(1); }\n").unwrap_err();
+        assert_eq!(payload.name, "type.slot_payload_unsupported");
+
+        let returned =
+            parse_source("fn bad() -> slots<u64> { return alloc_slots<u64>(1); }\n").unwrap_err();
+        assert_eq!(returned.name, "type.return_unsupported");
+
+        for source in [
+            "fn bad() { var x = alloc_slots<u64>(); }\n",
+            "fn bad() { var x = slot_take(0); }\n",
+            "fn bad() { slot_put(0, 1); }\n",
+        ] {
+            assert_eq!(
+                parse_source(source).unwrap_err().name,
+                "parse.slot_operation_arity"
+            );
+        }
+    }
+
+    #[test]
     fn type_parameter_ceiling_accepts_256_and_rejects_the_257th_name() {
         let names = type_parameter_names(MAX_TYPE_PARAMS);
         let last = format!("T{}", MAX_TYPE_PARAMS - 1);
@@ -5868,7 +6090,8 @@ mod type_position_tests {
                 TyPos::Local => TyPos::RecordField,
                 TyPos::RecordField => TyPos::ClassField,
                 TyPos::ClassField => TyPos::ArrayElement,
-                TyPos::ArrayElement => TyPos::OptionPayload,
+                TyPos::ArrayElement => TyPos::SlotPayload,
+                TyPos::SlotPayload => TyPos::OptionPayload,
                 TyPos::OptionPayload => TyPos::ForIndex,
                 TyPos::ForIndex => TyPos::Const,
                 TyPos::Const => TyPos::CastTarget,
@@ -5948,6 +6171,7 @@ mod type_position_tests {
                     | TyPos::RecordField
                     | TyPos::ClassField
                     | TyPos::ArrayElement
+                    | TyPos::SlotPayload
                     | TyPos::OptionPayload
                     | TyPos::ForIndex => true,
                 };

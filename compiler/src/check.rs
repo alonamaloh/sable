@@ -275,6 +275,7 @@ fn check_extern_signature(f: &Fn) -> CResult<()> {
             | Ty::Param(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -397,6 +398,7 @@ fn extern_parameter_abi_allowed(ty: &Ty) -> bool {
             | Ty::Class(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Raw(_)
@@ -417,6 +419,7 @@ fn extern_parameter_abi_allowed(ty: &Ty) -> bool {
         | Ty::Class(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Unit => false,
@@ -2231,6 +2234,7 @@ fn check_block(
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -2432,6 +2436,7 @@ fn check_block(
                             | Ty::Param(_)
                             | Ty::Record(_)
                             | Ty::Array(_)
+                            | Ty::Slots(_)
                             | Ty::Option(_)
                             | Ty::OptionRaw(_)
                             | Ty::Res(_)
@@ -2455,6 +2460,7 @@ fn check_block(
                                 | Ty::Param(_)
                                 | Ty::Record(_)
                                 | Ty::Array(_)
+                                | Ty::Slots(_)
                                 | Ty::Option(_)
                                 | Ty::OptionRaw(_)
                                 | Ty::Res(_)
@@ -2476,6 +2482,7 @@ fn check_block(
                     | ExprKind::RawOp { .. }
                     | ExprKind::DeviceOp { .. }
                     | ExprKind::ResOp { .. }
+                    | ExprKind::SlotOp { .. }
                     | ExprKind::Widen { .. }
                     | ExprKind::Narrow { .. }
                     | ExprKind::IsSome { .. }
@@ -2513,6 +2520,7 @@ fn check_block(
                             | Ty::Param(_)
                             | Ty::Record(_)
                             | Ty::Array(_)
+                            | Ty::Slots(_)
                             | Ty::Option(_)
                             | Ty::OptionRaw(_)
                             | Ty::Res(_)
@@ -2532,6 +2540,7 @@ fn check_block(
                     | ExprKind::RawOp { .. }
                     | ExprKind::DeviceOp { .. }
                     | ExprKind::ResOp { .. }
+                    | ExprKind::SlotOp { .. }
                     | ExprKind::Widen { .. }
                     | ExprKind::Narrow { .. }
                     | ExprKind::IsSome { .. }
@@ -3005,6 +3014,7 @@ fn check_block(
                                     | Ty::Class(_)
                                     | Ty::Record(_)
                                     | Ty::Array(_)
+                                    | Ty::Slots(_)
                                     | Ty::Option(_)
                                     | Ty::OptionRaw(_)
                                     | Ty::Res(_)
@@ -3038,6 +3048,7 @@ fn check_block(
                         | ExprKind::RawOp { .. }
                         | ExprKind::DeviceOp { .. }
                         | ExprKind::ResOp { .. }
+                        | ExprKind::SlotOp { .. }
                         | ExprKind::Widen { .. }
                         | ExprKind::Narrow { .. }
                         | ExprKind::IsSome { .. }
@@ -3247,6 +3258,7 @@ fn resource_arg_kind(ctx: &Ctx, e: &Expr) -> Option<ResKind> {
         | ExprKind::RawOp { .. }
         | ExprKind::DeviceOp { .. }
         | ExprKind::ResOp { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::Widen { .. }
         | ExprKind::Narrow { .. }
         | ExprKind::IsSome { .. }
@@ -3460,6 +3472,7 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
 /// the whole chain itself.
 fn validate_container_payloads(ty: Ty, span: Span) -> CResult<()> {
     match ty {
+        Ty::Slots(_) => Err(slots_unsupported(span, "declared type")),
         Ty::Array(payload) => validate_array_payload(&payload, span),
         Ty::Option(payload) => option_payload_ty(*payload, span).map(|_| ()),
         // A borrow holds no payload of its own; `validate_aggregate_ty` is
@@ -3475,6 +3488,23 @@ fn validate_container_payloads(ty: Ty, span: Span) -> CResult<()> {
         | Ty::Raw(_)
         | Ty::RawRecord(_)
         | Ty::Unit => Ok(()),
+    }
+}
+
+fn slots_unsupported(span: Span, role: impl AsRef<str>) -> Diagnostic {
+    Diagnostic {
+        name: "type.slots_unsupported".into(),
+        title: "owner slots are representation-only".into(),
+        span,
+        label: format!(
+            "{} uses `slots<T>`, whose runtime and proof semantics are not admitted yet",
+            role.as_ref()
+        ),
+        notes: vec![(
+            "note".into(),
+            "this tranche preserves the distinct affine owner shape without treating it as an array"
+                .into(),
+        )],
     }
 }
 
@@ -3534,6 +3564,7 @@ fn borrow_referent_ty(borrowed: &Ty, referent: &Ty, span: Span) -> CResult<()> {
         | Ty::Bool
         | Ty::Param(_)
         | Ty::Record(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Raw(_)
@@ -3650,6 +3681,7 @@ pub(crate) fn member_param_ty(ty: &Ty, span: Span, allow_shared_arrays: bool) ->
             | Ty::Class(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -3664,6 +3696,7 @@ pub(crate) fn member_param_ty(ty: &Ty, span: Span, allow_shared_arrays: bool) ->
         | Ty::Class(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
         | Ty::Raw(_)
@@ -3741,6 +3774,7 @@ pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
             | Ty::Class(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -4052,6 +4086,7 @@ fn checked_array_binding(ty: &Ty) -> Option<(&Ty, BindingMode)> {
             | Ty::Param(_)
             | Ty::Class(_)
             | Ty::Record(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -4067,6 +4102,7 @@ fn checked_array_binding(ty: &Ty) -> Option<(&Ty, BindingMode)> {
             | Ty::Param(_)
             | Ty::Class(_)
             | Ty::Record(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -4080,6 +4116,7 @@ fn checked_array_binding(ty: &Ty) -> Option<(&Ty, BindingMode)> {
         | Ty::Param(_)
         | Ty::Class(_)
         | Ty::Record(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -4101,6 +4138,7 @@ fn checked_class_borrow(ty: &Ty) -> Option<(usize, Mutability)> {
             | Ty::Param(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -4116,6 +4154,7 @@ fn checked_class_borrow(ty: &Ty) -> Option<(usize, Mutability)> {
             | Ty::Param(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -4130,6 +4169,7 @@ fn checked_class_borrow(ty: &Ty) -> Option<(usize, Mutability)> {
         | Ty::Class(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -4150,6 +4190,7 @@ fn checked_class_index(ty: &Ty) -> Option<usize> {
         | Ty::Param(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -4217,6 +4258,7 @@ fn check_affine_option_initializer(
         | ExprKind::RawOp { .. }
         | ExprKind::DeviceOp { .. }
         | ExprKind::ResOp { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::Widen { .. }
         | ExprKind::Narrow { .. }
         | ExprKind::IsSome { .. }
@@ -4350,6 +4392,14 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
 }
 
 fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
+    if !matches!(&e.kind, ExprKind::SlotOp { .. }) {
+        if let Some(Ty::Slots(_)) = expected.as_ref() {
+            return Err(slots_unsupported(e.span, "expression context"));
+        }
+        if let Some(Ty::Slots(_)) = e.ty.as_ref() {
+            return Err(slots_unsupported(e.span, "expression annotation"));
+        }
+    }
     // Every rule below this point may duplicate the value it produces, so an
     // option whose present case owns is refused here rather than reaching one
     // of them. The owning family has its own entry points
@@ -4386,6 +4436,19 @@ fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
 fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
     let span = e.span;
     let ty = match &mut e.kind {
+        ExprKind::SlotOp { op, .. } => {
+            return Err(Diagnostic {
+                name: "slots.operation_unsupported".into(),
+                title: format!("`{}` has no admitted semantics yet", op.name()),
+                span,
+                label: "owner-slot operations are parsed but remain sealed".into(),
+                notes: vec![(
+                    "note".into(),
+                    "allocation, extraction, and replacement require the occupied-cell proof and cleanup model"
+                        .into(),
+                )],
+            });
+        }
         ExprKind::IntLit(n) => {
             let t = match expected {
                 Some(
@@ -4407,6 +4470,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -4472,6 +4536,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             "affine options cannot be copied, passed, returned, or hidden inside a temporary expression".into(),
                         )],
                     });
+                }
+                if matches!(v.ty, Ty::Slots(_)) {
+                    return Err(slots_unsupported(span, "owner-slot value"));
                 }
                 if ctx.is_moved(&Place::local(name)) {
                     return Err(moved_out(ctx, &Place::local(name), span, "read"));
@@ -4599,6 +4666,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             array_span,
             index,
         } => {
+            if ctx
+                .vars
+                .get(array.as_str())
+                .is_some_and(|binding| binding.ty.as_slots().is_some())
+            {
+                return Err(slots_unsupported(*array_span, "slot indexing"));
+            }
             let elem = array_elem_ty(ctx, array, *array_span)?;
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
             validate_array_payload(&elem, *array_span)?;
@@ -4619,6 +4693,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     field: "len".to_string(),
                 };
                 return check_expr(ctx, e, expected);
+            }
+            if ctx
+                .vars
+                .get(array.as_str())
+                .is_some_and(|binding| binding.ty.as_slots().is_some())
+            {
+                return Err(slots_unsupported(span, "slot `.len` observation"));
             }
             array_elem_ty(ctx, array, span)?;
             Ty::Int(IntTy::U64)
@@ -4645,6 +4726,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -4732,6 +4814,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -4779,6 +4862,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | ExprKind::RawOp { .. }
                 | ExprKind::DeviceOp { .. }
                 | ExprKind::ResOp { .. }
+                | ExprKind::SlotOp { .. }
                 | ExprKind::Widen { .. }
                 | ExprKind::Narrow { .. }
                 | ExprKind::IsSome { .. }
@@ -4814,6 +4898,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Res(_)
                     | Ty::Raw(_)
                     | Ty::RawRecord(_)
@@ -4859,6 +4944,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | Ty::Class(_)
                 | Ty::Record(_)
                 | Ty::Array(_)
+                | Ty::Slots(_)
                 | Ty::Res(_)
                 | Ty::Raw(_)
                 | Ty::RawRecord(_)
@@ -4919,6 +5005,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         notes: vec![],
                     });
                 }
+                Ty::Slots(_) => {
+                    return Err(slots_unsupported(span, "slot field read"));
+                }
                 other @ (Ty::Bool
                 | Ty::Class(_)
                 | Ty::Record(_)
@@ -4972,7 +5061,8 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 });
             };
             let meta = &ctx.record_metas[ri];
-            meta.fields
+            let field_ty = meta
+                .fields
                 .iter()
                 .find(|(name, _)| name == field)
                 .map(|(_, ty)| ty.clone())
@@ -4982,7 +5072,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     span,
                     label: "unknown record field".into(),
                     notes: vec![],
-                })?
+                })?;
+            if matches!(field_ty, Ty::Slots(_)) {
+                return Err(slots_unsupported(span, "slot record-field read"));
+            }
+            field_ty
         }
         ExprKind::ClassFieldLen { obj, field } => {
             let ci = class_of(ctx, obj, span)?;
@@ -4998,6 +5092,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             };
             match field_ty {
                 Ty::Array(..) => Ty::Int(IntTy::U64),
+                Ty::Slots(_) => {
+                    return Err(slots_unsupported(span, "slot `.len` observation"));
+                }
                 Ty::Int(_)
                 | Ty::Bool
                 | Ty::Param(_)
@@ -5039,6 +5136,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             };
             let elem = match field_ty {
                 Ty::Array(element) => element.clone(),
+                Ty::Slots(_) => {
+                    return Err(slots_unsupported(span, "slot indexing"));
+                }
                 Ty::Int(_)
                 | Ty::Bool
                 | Ty::Param(_)
@@ -5108,6 +5208,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -5122,6 +5223,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     }
                     Ty::Int(IntTy::TParam(0)) => Ty::Param(TypeParamId::from_legacy(pidx)),
                     Ty::Array(payload) => Ty::array(remap_payload(*payload)),
+                    Ty::Slots(payload) => Ty::slots(remap_payload(*payload)),
                     Ty::Option(payload) => Ty::Option(Box::new(remap_payload(*payload))),
                     // A borrow's referent is remapped in place: `&[<T>]` is
                     // the same remap `[<T>]` gets, one marker further out.
@@ -5129,6 +5231,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         mutability,
                         match *referent {
                             Ty::Array(payload) => Ty::array(remap_payload(*payload)),
+                            Ty::Slots(payload) => Ty::slots(remap_payload(*payload)),
                             other @ (Ty::Int(_)
                             | Ty::Bool
                             | Ty::Param(_)
@@ -5677,6 +5780,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         | Ty::Class(_)
                         | Ty::Record(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Option(_)
                         | Ty::OptionRaw(_)
                         | Ty::Raw(_)
@@ -5788,6 +5892,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
+            if matches!(fty, Ty::Slots(_)) {
+                return Err(slots_unsupported(span, "slot self-field read"));
+            }
             if ctx.in_init {
                 ctx.require_field_init(field, span)?;
             }
@@ -5795,6 +5902,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::SelfFieldLen { field } => {
             let fty = ctx.self_field_ty(field, span, false)?;
+            if matches!(fty, Ty::Slots(_)) {
+                return Err(slots_unsupported(span, "slot `.len` observation"));
+            }
             if !matches!(fty, Ty::Array(..)) {
                 return Err(Diagnostic {
                     name: "type.not_an_array".into(),
@@ -5811,6 +5921,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::SelfFieldIndex { field, index } => {
             let fty = ctx.self_field_ty(field, span, false)?;
+            if matches!(fty, Ty::Slots(_)) {
+                return Err(slots_unsupported(span, "slot indexing"));
+            }
             let Ty::Array(elem) = fty else {
                 return Err(Diagnostic {
                     name: "type.not_an_array".into(),
@@ -6006,6 +6119,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | Ty::Borrow(..) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
+                Ty::Slots(_) => {
+                    return Err(slots_unsupported(span, "method return type"));
+                }
                 Ty::Int(_) | Ty::Bool | Ty::Param(_) | Ty::Option(_) | Ty::Unit => false,
             };
             let moved_before = ctx.moved.clone();
@@ -6062,6 +6178,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | Ty::Param(_)
                 | Ty::Class(_)
                 | Ty::Record(_)
+                | Ty::Slots(_)
                 | Ty::Option(_)
                 | Ty::OptionRaw(_)
                 | Ty::Res(_)
@@ -6206,6 +6323,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     // An owned array field is a place too: `&x.limbs`
                     // borrows the array itself, shared.
                     Ty::Array(elem) => Ok(Ty::borrow(Mutability::Shared, Ty::Array(elem.clone()))),
+                    Ty::Slots(_) => Err(slots_unsupported(span, "slot-field borrow")),
                     Ty::Int(_)
                     | Ty::Bool
                     | Ty::Param(_)
@@ -6242,6 +6360,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             | Ty::Class(_)
                             | Ty::Record(_)
                             | Ty::Array(_)
+                            | Ty::Slots(_)
                             | Ty::Option(_)
                             | Ty::OptionRaw(_)
                             | Ty::Raw(_)
@@ -6257,6 +6376,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                             | Ty::Class(_)
                             | Ty::Record(_)
                             | Ty::Array(_)
+                            | Ty::Slots(_)
                             | Ty::Option(_)
                             | Ty::OptionRaw(_)
                             | Ty::Raw(_)
@@ -6270,6 +6390,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         | Ty::Class(_)
                         | Ty::Record(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Option(_)
                         | Ty::OptionRaw(_)
                         | Ty::Raw(_)
@@ -6358,6 +6479,13 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     return Ok(borrowed_ty);
                 }
             }
+            if ctx
+                .vars
+                .get(array.as_str())
+                .is_some_and(|binding| binding.ty.as_slots().is_some())
+            {
+                return Err(slots_unsupported(span, "slot borrow"));
+            }
             let elem = array_elem_ty(ctx, array, span)?;
             let src_mut = match ctx.vars.get(array.as_str()).map(|v| v.ty.clone()) {
                 Some(ty) => match checked_array_binding(&ty) {
@@ -6412,6 +6540,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | Ty::Class(_)
                 | Ty::Record(_)
                 | Ty::Array(_)
+                | Ty::Slots(_)
                 | Ty::Res(_)
                 | Ty::Raw(_)
                 | Ty::RawRecord(_)
@@ -6438,6 +6567,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | Ty::Class(_)
                 | Ty::Record(_)
                 | Ty::Array(_)
+                | Ty::Slots(_)
                 | Ty::Res(_)
                 | Ty::Raw(_)
                 | Ty::RawRecord(_)
@@ -6475,6 +6605,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -6524,6 +6655,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | ExprKind::RawOp { .. }
                 | ExprKind::DeviceOp { .. }
                 | ExprKind::ResOp { .. }
+                | ExprKind::SlotOp { .. }
                 | ExprKind::Widen { .. }
                 | ExprKind::Narrow { .. }
                 | ExprKind::IsSome { .. }
@@ -6657,6 +6789,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         | Ty::Class(_)
                         | Ty::Record(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Option(_)
                         | Ty::OptionRaw(_)
                         | Ty::Res(_)
@@ -6770,6 +6903,9 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 | Ty::Borrow(..) => true,
                 Ty::Class(ci) => class_holds_storage(ctx.class_metas, ci, 0),
                 Ty::Record(ri) => record_holds_storage(ctx.record_metas, ri),
+                Ty::Slots(_) => {
+                    return Err(slots_unsupported(span, "function return type"));
+                }
                 Ty::Int(_) | Ty::Bool | Ty::Param(_) | Ty::Option(_) | Ty::Unit => false,
             };
             let moved_before = ctx.moved.clone();
@@ -6857,6 +6993,7 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
                         | Ty::Raw(_)
                         | Ty::RawRecord(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Option(_)
                         | Ty::OptionRaw(_)
                         | Ty::Borrow(..)
@@ -6871,6 +7008,7 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
                         | Ty::Raw(_)
                         | Ty::RawRecord(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Option(_)
                         | Ty::OptionRaw(_)
                         | Ty::Borrow(..)
@@ -6884,6 +7022,7 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
                     | Ty::Raw(_)
                     | Ty::RawRecord(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -6919,6 +7058,7 @@ fn borrow_place(ctx: &Ctx, arg: &Expr) -> Option<(Place, bool)> {
             | ExprKind::RawOp { .. }
             | ExprKind::ResOp { .. }
             | ExprKind::DeviceOp { .. }
+            | ExprKind::SlotOp { .. }
             | ExprKind::Borrow { .. }
             | ExprKind::RecordField { .. }
             | ExprKind::RecordLit { .. } => None,
@@ -7007,6 +7147,7 @@ fn record_call_transitions(
             | Ty::Class(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -7201,6 +7342,15 @@ fn collect_checked_expr_mutations(
     out: &mut Vec<CheckedMutation>,
 ) -> CResult<()> {
     match &expression.kind {
+        ExprKind::SlotOp { op, .. } => {
+            return Err(Diagnostic {
+                name: "slots.operation_unsupported".into(),
+                title: format!("`{}` has no checked loop effect", op.name()),
+                span: expression.span,
+                label: "owner-slot operations remain sealed".into(),
+                notes: vec![],
+            });
+        }
         ExprKind::Call { args, .. }
         | ExprKind::CtorCall { args, .. }
         | ExprKind::MethodCall { args, .. } => {
@@ -7435,6 +7585,7 @@ fn record_sealed_operation(
             | Ty::Class(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -7761,6 +7912,7 @@ fn check_borrow_conflicts(
 /// forwarded bare; unique access is visibly reborrowed with `&mut`.
 fn check_user_call_argument(ctx: &mut Ctx, arg: &mut Expr, parameter_ty: &Ty) -> CResult<()> {
     match parameter_ty {
+        Ty::Slots(_) => Err(slots_unsupported(arg.span, "call parameter")),
         borrowed_array @ Ty::Borrow(mutability, referent)
             if matches!(referent.as_ref(), Ty::Array(_)) =>
         {
@@ -7855,6 +8007,7 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
                 | Ty::Param(_)
                 | Ty::Record(_)
                 | Ty::Array(_)
+                | Ty::Slots(_)
                 | Ty::Option(_)
                 | Ty::OptionRaw(_)
                 | Ty::Raw(_)
@@ -7869,6 +8022,7 @@ fn require_explicit_borrow(ctx: &Ctx, arg: &Expr, pty: Ty) -> CResult<()> {
         | Ty::Class(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -8424,6 +8578,7 @@ fn class_holds_storage(metas: &[ClassMeta], ci: usize, depth: usize) -> bool {
         // above; a borrow is not a field type, but storage-conservative if
         // one ever appears.
         Ty::Int(_) | Ty::Bool | Ty::Param(_) | Ty::Array(_) | Ty::Option(_) | Ty::Unit => false,
+        Ty::Slots(_) => true,
         Ty::Res(_) | Ty::Borrow(..) => true,
     })
 }
@@ -8445,7 +8600,8 @@ fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
         }
         ExprKind::RawOp { args, .. }
         | ExprKind::ResOp { args, .. }
-        | ExprKind::DeviceOp { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::SlotOp { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
         ExprKind::SomeE(inner)
         | ExprKind::OptValue { operand: inner }
         | ExprKind::IsSome { operand: inner } => brand_of(ctx, inner),
@@ -8508,6 +8664,7 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
         | ExprKind::RawOp { .. }
         | ExprKind::DeviceOp { .. }
         | ExprKind::ResOp { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::Widen { .. }
         | ExprKind::Narrow { .. }
         | ExprKind::IsSome { .. }
@@ -8549,6 +8706,7 @@ fn reject_brand_escape(ctx: &Ctx, e: &Expr, how: &str, span: Span) -> CResult<()
         | ExprKind::RawOp { .. }
         | ExprKind::DeviceOp { .. }
         | ExprKind::ResOp { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::Widen { .. }
         | ExprKind::Narrow { .. }
         | ExprKind::IsSome { .. }
@@ -8770,6 +8928,7 @@ fn int_of(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>, op_span: Span) -> C
         | Ty::Class(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -8806,6 +8965,7 @@ fn is_literal_only(e: &Expr) -> bool {
         | ExprKind::RawOp { .. }
         | ExprKind::DeviceOp { .. }
         | ExprKind::ResOp { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::Widen { .. }
         | ExprKind::Narrow { .. }
         | ExprKind::IsSome { .. }

@@ -167,7 +167,8 @@ fn subst_expr(e: &mut Expr, values: &HashMap<String, i128>) {
         }
         ExprKind::ResOp { args, .. }
         | ExprKind::RawOp { args, .. }
-        | ExprKind::DeviceOp { args, .. } => {
+        | ExprKind::DeviceOp { args, .. }
+        | ExprKind::SlotOp { args, .. } => {
             for a in args {
                 subst_expr(a, values);
             }

@@ -352,7 +352,7 @@ pub(crate) fn walk_ty(
         }
         // A borrow names whatever its referent names, so the traversal
         // recurses through it exactly as it does through a container.
-        Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
+        Ty::Array(element) | Ty::Slots(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
             walk_ty(element, span, externs, record_externs, refs)
         }
         Ty::Int(_) | Ty::Param(_) | Ty::Bool | Ty::Raw(_) | Ty::Unit => {}
@@ -365,7 +365,7 @@ pub(crate) fn walk_ty(
 /// text) sees the whole DAG. Enforced on the per-module parses, before
 /// the flat merge erases ownership.
 fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
-    use crate::ast::{Expr, ExprKind, GenericTy, RawOp, Stmt, TypeArg};
+    use crate::ast::{Expr, ExprKind, GenericTy, RawOp, SlotOp, Stmt, TypeArg};
 
     // Each legal source namespace gets its own global index. Runtime items
     // deliberately share one table; traits and constants do not participate
@@ -478,7 +478,9 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
                         walk_type(argument, span, refs);
                     }
                 }
-                GenericTy::Array(element) | GenericTy::Option(element) => {
+                GenericTy::Array(element)
+                | GenericTy::Slots(element)
+                | GenericTy::Option(element) => {
                     walk_type(element, span, refs);
                 }
                 GenericTy::Int(_) | GenericTy::Param(_) | GenericTy::Bool => {}
@@ -532,6 +534,14 @@ fn enforce_visibility(loading: &Loading) -> Result<(), Diagnostic> {
             ExprKind::ResOp { args, .. } | ExprKind::DeviceOp { args, .. } => {
                 for a in args {
                     walk_expr(a, refs, const_names, externs, record_externs);
+                }
+            }
+            ExprKind::SlotOp { op, args, .. } => {
+                if let SlotOp::Alloc { elem } = op {
+                    walk_ty(elem, e.span, externs, record_externs, refs);
+                }
+                for argument in args {
+                    walk_expr(argument, refs, const_names, externs, record_externs);
                 }
             }
             ExprKind::RawOp { op, op_span, args } => {

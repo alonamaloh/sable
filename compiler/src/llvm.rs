@@ -2852,6 +2852,7 @@ fn collect_argument_borrow_places(
         | ExprKind::RawOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
         | ExprKind::ResOp { args, .. }
+        | ExprKind::SlotOp { args, .. }
         | ExprKind::TraitCall { args, .. }
         | ExprKind::CtorCall { args, .. }
         | ExprKind::RecordLit { args, .. }
@@ -2992,6 +2993,12 @@ fn validate_expr(
     root_span_end: usize,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
+    if let ExprKind::SlotOp { op, .. } = &expression.kind {
+        return Err(vec![slots_unsupported(
+            expression.span,
+            format!("operation `{}`", op.name()),
+        )]);
+    }
     if let ExprKind::IsSome { operand } = &expression.kind {
         if operand.ty.as_ref().is_some_and(Ty::is_affine_option) {
             return validate_affine_option_is_some(expression, operand, locals);
@@ -3621,6 +3628,7 @@ pub(crate) fn require_runtime_type(
     role: &str,
 ) -> Result<(), Vec<BackendError>> {
     match ty {
+        Ty::Slots(_) => Err(vec![slots_unsupported(span, role)]),
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool | Ty::Unit => Ok(()),
         Ty::Option(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
@@ -3644,6 +3652,7 @@ pub(crate) fn require_local_value(
     role: &str,
 ) -> Result<(), Vec<BackendError>> {
     match ty {
+        Ty::Slots(_) => Err(vec![slots_unsupported(span, role)]),
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
         Ty::Option(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
@@ -3669,6 +3678,7 @@ pub(crate) fn require_parameter_value(
     role: &str,
 ) -> Result<(), Vec<BackendError>> {
     match ty {
+        Ty::Slots(_) => Err(vec![slots_unsupported(span, role)]),
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
         // A Boolean option crosses the call as the internal
@@ -7642,6 +7652,7 @@ fn collect_calls_expr(expression: &Expr, calls: &mut Vec<(String, Span)>) {
         ExprKind::RawOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
         | ExprKind::ResOp { args, .. }
+        | ExprKind::SlotOp { args, .. }
         | ExprKind::CtorCall { args, .. }
         | ExprKind::TraitCall { args, .. }
         | ExprKind::MethodCall { args, .. }
@@ -7740,6 +7751,7 @@ fn collect_method_calls_expr(expression: &Expr, methods: &mut Vec<(String, Strin
         | ExprKind::RawOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
         | ExprKind::ResOp { args, .. }
+        | ExprKind::SlotOp { args, .. }
         | ExprKind::CtorCall { args, .. }
         | ExprKind::TraitCall { args, .. }
         | ExprKind::RecordLit { args, .. }
@@ -7862,6 +7874,7 @@ fn collect_constructors_expr(
         | ExprKind::RawOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
         | ExprKind::ResOp { args, .. }
+        | ExprKind::SlotOp { args, .. }
         | ExprKind::TraitCall { args, .. }
         | ExprKind::MethodCall { args, .. }
         | ExprKind::RecordLit { args, .. }
@@ -7910,6 +7923,15 @@ fn unsupported(span: Span, detail: impl Into<String>) -> BackendError {
         "construct is outside the current LLVM backend subset",
         span,
         detail,
+    )
+}
+
+fn slots_unsupported(span: Span, role: impl AsRef<str>) -> BackendError {
+    diag(
+        "backend.slots_unsupported",
+        "owner slots have no LLVM representation yet",
+        span,
+        format!("{} cannot cross the native backend boundary", role.as_ref()),
     )
 }
 
@@ -7980,6 +8002,28 @@ mod tests {
         StorageLayout, Ty, TypeArg,
     };
     use crate::scan::{Clause, ClauseKind};
+
+    #[test]
+    fn owner_slot_operations_stop_at_the_native_backend_boundary() {
+        let operation = expression(
+            ExprKind::SlotOp {
+                op: crate::ast::SlotOp::Alloc {
+                    elem: Ty::Int(IntTy::U64),
+                },
+                op_span: Span::new(0, 1),
+                args: Vec::new(),
+            },
+            Ty::slots(Ty::Int(IntTy::U64)),
+        );
+        let errors = validate_expr(
+            &program(Vec::new()),
+            &operation,
+            1,
+            &ValidationLocals::new(),
+        )
+        .expect_err("owner slots have no native representation or operation semantics yet");
+        assert_eq!(errors[0].name, "backend.slots_unsupported");
+    }
 
     fn expression(kind: ExprKind, ty: Ty) -> Expr {
         Expr {

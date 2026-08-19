@@ -1,0 +1,7 @@
+// expect-error: slots.operation_unsupported
+// Parsing an operation is not semantic admission: even without a declared
+// slots-typed binding, the checker closes the operation by its own name.
+
+fn operation_only() {
+    var cells = alloc_slots<u64>(4);
+}

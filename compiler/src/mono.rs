@@ -508,9 +508,10 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, representation),
             Ty::Int(integer) => legacy_integer(integer, arity, span, representation, false),
-            Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
-                value(*element, arity, span, representation)
-            }
+            Ty::Array(element)
+            | Ty::Slots(element)
+            | Ty::Option(element)
+            | Ty::Borrow(_, element) => value(*element, arity, span, representation),
             Ty::Raw(integer) => legacy_integer(integer, arity, span, representation, true),
             Ty::Bool
             | Ty::Class(_)
@@ -527,6 +528,7 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
             Ty::Param(parameter_) => validate_parameter(parameter_, arity, span, "type"),
             Ty::Int(integer) => legacy_integer(integer, arity, span, "value type", false),
             Ty::Array(element) => value(*element, arity, span, "array element type"),
+            Ty::Slots(element) => value(*element, arity, span, "slot payload type"),
             Ty::Option(element) => value(*element, arity, span, "option payload type"),
             // A borrow is checked as whatever it names, so `&[T]` reports the
             // array element position the reader wrote.
@@ -565,6 +567,20 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
                 )?;
                 expression(len, arity)?;
                 expression(init, arity)
+            }
+            ExprKind::SlotOp { op, args, .. } => {
+                if let SlotOp::Alloc { elem } = op {
+                    value(
+                        elem.clone(),
+                        arity,
+                        expr.span,
+                        "slot allocation payload type",
+                    )?;
+                }
+                for argument in args {
+                    expression(argument, arity)?;
+                }
+                Ok(())
             }
             ExprKind::Unary { operand, .. }
             | ExprKind::IsSome { operand }
@@ -799,6 +815,7 @@ fn validate_type_args(program: &Program, class_args: &ClassArgEnv) -> MResult<()
             | ExprKind::RawOp { args, .. }
             | ExprKind::ResOp { args, .. }
             | ExprKind::DeviceOp { args, .. }
+            | ExprKind::SlotOp { args, .. }
             | ExprKind::ArrayLit(args)
             | ExprKind::RecordLit { args, .. } => {
                 for arg in args {
@@ -966,9 +983,10 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
         match ty {
             Ty::Param(parameter) => Err(escaped(span, parameter, representation)),
             Ty::Int(integer_ty) => integer(integer_ty, span, representation),
-            Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
-                value(*element, span, representation)
-            }
+            Ty::Array(element)
+            | Ty::Slots(element)
+            | Ty::Option(element)
+            | Ty::Borrow(_, element) => value(*element, span, representation),
             Ty::Raw(integer_ty) => integer(integer_ty, span, representation),
             Ty::Bool
             | Ty::Class(_)
@@ -985,6 +1003,7 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
             Ty::Param(parameter) => Err(escaped(span, parameter, "type")),
             Ty::Int(integer_ty) => integer(integer_ty, span, "integer type"),
             Ty::Array(element) => value(*element, span, "array element type"),
+            Ty::Slots(element) => value(*element, span, "slot payload type"),
             Ty::Option(element) => value(*element, span, "option payload type"),
             Ty::Borrow(_, referent) => checked_ty(*referent, span),
             Ty::Raw(integer_ty) => integer(integer_ty, span, "raw-pointer element type"),
@@ -1055,6 +1074,15 @@ fn validate_concrete_output(program: &Program) -> MResult<()> {
                 value(elem.clone(), expr.span, "array allocation element type")?;
                 expression(len)?;
                 expression(init)
+            }
+            ExprKind::SlotOp { op, args, .. } => {
+                if let SlotOp::Alloc { elem } = op {
+                    value(elem.clone(), expr.span, "slot allocation payload type")?;
+                }
+                for argument in args {
+                    expression(argument)?;
+                }
+                Ok(())
             }
             ExprKind::IntLit(_)
             | ExprKind::BoolLit(_)
@@ -1351,9 +1379,11 @@ impl ClassArgEnv {
                 Err(unknown_class_arg(span, name))
             }
             GenericTy::Class { name, .. } => Err(nested_generic_class_arg(span, name)),
-            GenericTy::Bool | GenericTy::Record(_) | GenericTy::Array(_) | GenericTy::Option(_) => {
-                Err(unsupported_type_arg(span, GenericTyError::NotV1Integer))
-            }
+            GenericTy::Bool
+            | GenericTy::Record(_)
+            | GenericTy::Array(_)
+            | GenericTy::Slots(_)
+            | GenericTy::Option(_) => Err(unsupported_type_arg(span, GenericTyError::NotV1Integer)),
         }
     }
 }
@@ -1660,6 +1690,7 @@ fn prepare_expr(e: &mut Expr, bound_params: &HashSet<String>) {
         | ExprKind::RawOp { args, .. }
         | ExprKind::ResOp { args, .. }
         | ExprKind::DeviceOp { args, .. }
+        | ExprKind::SlotOp { args, .. }
         | ExprKind::ArrayLit(args)
         | ExprKind::RecordLit { args, .. } => {
             for a in args.iter_mut() {
@@ -2222,7 +2253,8 @@ impl Mono {
             }
             ExprKind::RawOp { args, .. }
             | ExprKind::ResOp { args, .. }
-            | ExprKind::DeviceOp { args, .. } => {
+            | ExprKind::DeviceOp { args, .. }
+            | ExprKind::SlotOp { args, .. } => {
                 for a in args.iter_mut() {
                     self.rewrite_expr(a, depth)?;
                 }
@@ -2331,7 +2363,7 @@ pub(crate) fn subst_ty(t: &mut Ty, args: &[ConcreteArg], span: Span) -> MResult<
     match t {
         Ty::Param(parameter) => *t = type_argument(args, parameter.index(), span)?.lowered_ty(),
         Ty::Int(integer) => subst_intty(integer, args, span)?,
-        Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
+        Ty::Array(element) | Ty::Slots(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
             subst_ty(element, args, span)?
         }
         // A `raw<...>` element type is a width, and its parameter spelling is
@@ -2450,6 +2482,21 @@ fn subst_expr(e: &mut Expr, args: &[ConcreteArg], bound_calls: &BoundCalls) -> M
             subst_ty(elem, args, span)?;
             subst_expr(len, args, bound_calls)?;
             subst_expr(init, args, bound_calls)?;
+        }
+        ExprKind::SlotOp {
+            op: SlotOp::Alloc { elem },
+            args: operands,
+            ..
+        } => {
+            subst_ty(elem, args, span)?;
+            for operand in operands.iter_mut() {
+                subst_expr(operand, args, bound_calls)?;
+            }
+        }
+        ExprKind::SlotOp { args: operands, .. } => {
+            for operand in operands.iter_mut() {
+                subst_expr(operand, args, bound_calls)?;
+            }
         }
         ExprKind::CtorCall {
             class,

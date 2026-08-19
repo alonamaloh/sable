@@ -470,6 +470,9 @@ pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
 fn validate_interp_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
         Ty::Array(payload) => validate_interp_array_payload(&payload, context),
+        Ty::Slots(_) => Err(format!(
+            "interp.slots_unsupported: {context} uses owner slots, which have no interpreter value or lifecycle semantics yet"
+        )),
         Ty::Option(payload) => validate_interp_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "interp.type_parameter_unsupported: {context} contains an unresolved type parameter"
@@ -852,6 +855,12 @@ fn validate_affine_option_initializer(
 }
 
 fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String> {
+    if let ExprKind::SlotOp { op, .. } = &expr.kind {
+        return Err(format!(
+            "interp.slots_unsupported: `{}` has no interpreter semantics yet",
+            op.name()
+        ));
+    }
     if let Some(ty) = &expr.ty {
         validate_interp_ty(ty.clone(), "expression annotation")?;
     }
@@ -882,6 +891,9 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
     }
 
     match &expr.kind {
+        ExprKind::SlotOp { .. } => {
+            unreachable!("slot operations are refused before cached annotation validation")
+        }
         ExprKind::Index { array, index, .. } => {
             let array_ty = interp_local_ty(locals, array).ok_or_else(|| {
                 format!("interp.unknown_local: index names unknown array `{array}`")
@@ -2578,6 +2590,7 @@ impl<'a> Interp<'a> {
     /// ownership source, and they are the roots of the checker's `Place`.
     fn source_place(e: &Expr) -> Option<RtPlace> {
         match &e.kind {
+            ExprKind::SlotOp { .. } => None,
             ExprKind::Var(n) => Some(RtPlace::Local(n.clone())),
             ExprKind::SelfField { field } => Some(RtPlace::SelfField(field.clone())),
             _ => None,
@@ -3912,6 +3925,14 @@ impl<'a> Interp<'a> {
         self.burn(e.span)?;
         traps.consume_expression(e)?;
         match &e.kind {
+            ExprKind::SlotOp { op, .. } => Err(Trap {
+                undef: true,
+                message: format!(
+                    "interp.slots_unsupported: `{}` has no interpreter semantics yet",
+                    op.name()
+                ),
+                span: e.span,
+            }),
             ExprKind::IntLit(n) => Ok(RtVal::Int(*n)),
             ExprKind::BoolLit(b) => Ok(RtVal::Bool(*b)),
             ExprKind::Var(name) => match frame.vars.get(name.as_str()) {
@@ -5133,6 +5154,28 @@ mod payload_guard_tests {
     use super::*;
     use crate::scan::{Clause, ClauseKind};
     use crate::span::Span;
+
+    #[test]
+    fn owner_slots_have_neither_an_interpreter_type_nor_operation_semantics() {
+        let error = validate_interp_ty(Ty::slots(Ty::Int(IntTy::U64)), "forged slot local")
+            .expect_err("owner slots have no runtime representation yet");
+        assert!(error.starts_with("interp.slots_unsupported:"), "{error}");
+
+        let operation = expr(
+            ExprKind::SlotOp {
+                op: SlotOp::Put,
+                op_span: Span::new(1, 2),
+                args: vec![expr(
+                    ExprKind::Var("hostile_operand".into()),
+                    Some(Ty::Param(TypeParamId::from_legacy(0))),
+                )],
+            },
+            Some(Ty::Param(TypeParamId::from_legacy(0))),
+        );
+        let error = validate_interp_expr(&operation, &HashMap::new())
+            .expect_err("the slot refusal wins over hostile cached types and operands");
+        assert!(error.starts_with("interp.slots_unsupported:"), "{error}");
+    }
 
     /// The tag beside the elements is what every later read, store, and
     /// comparison trusts, so building an array whose values do not inhabit it

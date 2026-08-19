@@ -174,6 +174,7 @@ fn collect_uart_dependencies(program: &Program) -> (bool, Vec<String>) {
             }
             ExprKind::Call { args, .. }
             | ExprKind::RawOp { args, .. }
+            | ExprKind::SlotOp { args, .. }
             | ExprKind::CtorCall { args, .. }
             | ExprKind::RecordLit { args, .. }
             | ExprKind::TraitCall { args, .. }
@@ -411,6 +412,7 @@ fn adr0009_ty_int_model(ty: Ty) -> IntTy {
         | Ty::Class(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -441,6 +443,7 @@ fn lean_array_ty(element: &Ty, records: &[RecordDecl]) -> String {
         Ty::Record(ri) => format!("Sable.Seq {}", lean_record_name(&records[*ri].name)),
         Ty::Class(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -482,6 +485,7 @@ fn lean_option_ty(element: &Ty, classes: &[ClassDecl]) -> String {
         }
         Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
         | Ty::Raw(_)
@@ -592,6 +596,9 @@ pub(crate) fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result
 /// proof preflight never looked at.
 fn validate_vc_container_payloads(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
     match ty {
+        Ty::Slots(_) => Err(format!(
+            "internal.vcgen.slots_unsupported: owner slots have no proof representation in {context}"
+        )),
         Ty::Param(_) if !allow_param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {context}"
         )),
@@ -986,6 +993,7 @@ fn validate_vc_scalar_operator(
         | ExprKind::RawOp { .. }
         | ExprKind::DeviceOp { .. }
         | ExprKind::ResOp { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::IsSome { .. }
         | ExprKind::OptValue { .. }
         | ExprKind::OptTake { .. }
@@ -1037,6 +1045,7 @@ fn validate_vc_option_operator(
                 | Ty::Class(_)
                 | Ty::Record(_)
                 | Ty::Array(_)
+                | Ty::Slots(_)
                 | Ty::Res(_)
                 | Ty::Raw(_)
                 | Ty::RawRecord(_)
@@ -1063,6 +1072,7 @@ fn validate_vc_option_operator(
                 | Ty::Class(_)
                 | Ty::Record(_)
                 | Ty::Array(_)
+                | Ty::Slots(_)
                 | Ty::Res(_)
                 | Ty::Raw(_)
                 | Ty::RawRecord(_)
@@ -1114,6 +1124,7 @@ fn validate_vc_option_operator(
         | ExprKind::RawOp { .. }
         | ExprKind::DeviceOp { .. }
         | ExprKind::ResOp { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::Widen { .. }
         | ExprKind::Narrow { .. }
         | ExprKind::OptTake { .. }
@@ -1143,6 +1154,12 @@ fn validate_vc_expr(
     context: &str,
     locals: &HashMap<String, Ty>,
 ) -> Result<(), String> {
+    if let ExprKind::SlotOp { op, .. } = &expr.kind {
+        return Err(format!(
+            "internal.vcgen.slots_unsupported: `{}` has no proof semantics in {context}",
+            op.name()
+        ));
+    }
     if let Some(ty) = &expr.ty {
         let position = if matches!(expr.kind, ExprKind::Borrow { .. }) {
             VcTypePosition::Borrow
@@ -1175,6 +1192,7 @@ fn validate_vc_expr(
                 | ExprKind::RawOp { .. }
                 | ExprKind::DeviceOp { .. }
                 | ExprKind::ResOp { .. }
+                | ExprKind::SlotOp { .. }
                 | ExprKind::Widen { .. }
                 | ExprKind::Narrow { .. }
                 | ExprKind::IsSome { .. }
@@ -1202,6 +1220,10 @@ fn validate_vc_expr(
         }
     }
     match &expr.kind {
+        ExprKind::SlotOp { op, .. } => Err(format!(
+            "internal.vcgen.slots_unsupported: `{}` has no proof semantics in {context}",
+            op.name()
+        )),
         ExprKind::Unary { operand, .. }
         | ExprKind::Widen { arg: operand, .. }
         | ExprKind::Narrow { arg: operand, .. } => {
@@ -1817,6 +1839,7 @@ fn validate_vc_block_with_mutability(
                             | Ty::Class(_)
                             | Ty::Record(_)
                             | Ty::Array(_)
+                            | Ty::Slots(_)
                             | Ty::Option(_)
                             | Ty::OptionRaw(_)
                             | Ty::Res(_)
@@ -2106,6 +2129,12 @@ fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> Strin
         Ty::Int(_) | Ty::Param(_) => "Int".into(),
         Ty::Bool => "Bool".into(),
         Ty::Array(element) => lean_array_ty(element, records),
+        Ty::Slots(_) => {
+            refuse_vc_type(
+                "internal.vcgen.slots_unsupported: owner-slot field has no Lean type".into(),
+            );
+            UNSUPPORTED_LEAN_TY.into()
+        }
         // A class-valued field is a nested structure (ADR 0020).
         Ty::Class(ci) => lean_class_name(&classes[*ci].name),
         Ty::Record(ri) => lean_record_name(&records[*ri].name),
@@ -2129,6 +2158,7 @@ fn lean_record_field_layout(ty: Ty) -> String {
         | Ty::Class(_)
         | Ty::Record(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::Res(_)
         | Ty::Raw(_)
@@ -2230,6 +2260,12 @@ fn emit_extern_clause_wfs(
             }
             Ty::Array(element) => {
                 binders.push((p.name.clone(), lean_array_ty(element, &program.records)))
+            }
+            Ty::Slots(_) => {
+                refuse_vc_type(
+                    "internal.vcgen.slots_unsupported: extern owner-slot binder has no Lean type"
+                        .into(),
+                );
             }
             Ty::Class(ci) => {
                 binders.push((p.name.clone(), lean_class_name(&program.classes[*ci].name)))
@@ -2347,6 +2383,7 @@ pub(crate) fn generate(
                             | Ty::Class(_)
                             | Ty::Record(_)
                             | Ty::Array(_)
+                            | Ty::Slots(_)
                             | Ty::Option(_)
                             | Ty::OptionRaw(_)
                             | Ty::Res(_)
@@ -2898,6 +2935,7 @@ fn checked_array_payload(ty: &Ty) -> Option<&Ty> {
                 | Ty::Param(_)
                 | Ty::Class(_)
                 | Ty::Record(_)
+                | Ty::Slots(_)
                 | Ty::Option(_)
                 | Ty::OptionRaw(_)
                 | Ty::Res(_)
@@ -2912,6 +2950,7 @@ fn checked_array_payload(ty: &Ty) -> Option<&Ty> {
         | Ty::Param(_)
         | Ty::Class(_)
         | Ty::Record(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -2969,6 +3008,7 @@ fn checked_array_payload_value(
         },
         Ty::Class(_)
         | Ty::Array(_)
+        | Ty::Slots(_)
         | Ty::Option(_)
         | Ty::OptionRaw(_)
         | Ty::Res(_)
@@ -2989,6 +3029,7 @@ fn refused_expression_value(expression: &Expr) -> Val {
         Some(Ty::Bool) => Val::Prop("False".into()),
         Some(Ty::Option(_) | Ty::OptionRaw(_)) => Val::Opt(UNSUPPORTED_LEAN_VALUE.into()),
         Some(Ty::Array(_)) => Val::Arr(UNSUPPORTED_LEAN_VALUE.into()),
+        Some(Ty::Slots(_)) => Val::Unit,
         Some(Ty::Class(_)) => Val::Obj(UNSUPPORTED_LEAN_VALUE.into()),
         Some(Ty::Record(_)) => Val::Record(UNSUPPORTED_LEAN_VALUE.into()),
         Some(Ty::Res(_)) => Val::View(UNSUPPORTED_LEAN_VALUE.into()),
@@ -3191,6 +3232,12 @@ impl<'a> Generator<'a> {
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             Some(Ty::Array(element)) => lean_array_ty(element, self.records),
+            Some(Ty::Slots(_)) => {
+                refuse_vc_type(
+                    "internal.vcgen.slots_unsupported: owner-slot binder has no Lean type".into(),
+                );
+                UNSUPPORTED_LEAN_TY.into()
+            }
             Some(Ty::Unit) | Some(Ty::Borrow(..)) | None => {
                 unreachable!("checked: value has a Lean binder type")
             }
@@ -3218,6 +3265,13 @@ impl<'a> Generator<'a> {
                 Ty::Int(_) | Ty::Param(_) => Some((name.clone(), "Int".to_string())),
                 Ty::Bool => Some((name.clone(), "Bool".to_string())),
                 Ty::Array(element) => Some((name.clone(), lean_array_ty(element, self.records))),
+                Ty::Slots(_) => {
+                    refuse_vc_type(
+                        "internal.vcgen.slots_unsupported: owner-slot scope binding has no Lean type"
+                            .into(),
+                    );
+                    None
+                }
                 Ty::Class(ci) => Some((name.clone(), lean_class_name(&self.classes[*ci].name))),
                 Ty::Record(ri) => Some((name.clone(), lean_record_name(&self.records[*ri].name))),
                 // A resource binds its *view*; the authority it names is
@@ -3279,6 +3333,7 @@ impl<'a> Generator<'a> {
             | Ty::Class(_)
             | Ty::Record(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
             | Ty::Raw(_)
@@ -3349,6 +3404,12 @@ impl<'a> Generator<'a> {
                             self.r_prop(&format!("(({binder}.{}).value)", fld.name), *it),
                         );
                     }
+                }
+                Ty::Slots(_) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.slots_unsupported: slot field `{}` has no class-state facts",
+                        fld.name
+                    ));
                 }
                 // No representability fact exists for the rest: `Bool` is
                 // its own complete domain and a raw pointer is
@@ -3529,6 +3590,12 @@ impl<'a> Generator<'a> {
                 }
                 Val::Arr(binder.to_string())
             }
+            Ty::Slots(_) => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slots_unsupported: owner slots have no fresh symbolic state (for `{base}`)"
+                ));
+                Val::Unit
+            }
             Ty::Unit => {
                 refuse_vc_type(format!(
                     "internal.vcgen.fresh_state_unsupported: `()` has no fresh symbolic \
@@ -3619,6 +3686,12 @@ impl<'a> Generator<'a> {
                 Val::Ptr(binder.to_string())
             }
             Ty::Unit => Val::Unit,
+            Ty::Slots(_) => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slots_unsupported: owner slots have no call-result state (for `{base}`)"
+                ));
+                Val::Unit
+            }
             returned @ (Ty::Record(_) | Ty::Array(_) | Ty::Borrow(..)) => {
                 // Records/arrays arrive here only at a member boundary; a
                 // borrow has no result-state story at either boundary. The
@@ -3763,6 +3836,11 @@ impl<'a> Generator<'a> {
                         ))
                     } else {
                         match (&parameter.ty, &actual.effect) {
+                            (Ty::Slots(_), CallArgumentEffect::Loan(_))
+                            | (Ty::Slots(_), CallArgumentEffect::Value(_)) => Some(format!(
+                                "internal.vcgen.slots_unsupported: parameter `{}` has no checked call transition",
+                                parameter.name
+                            )),
                             (Ty::Borrow(mutability, referent), CallArgumentEffect::Loan(loan)) => {
                                 let expected_place = BorrowedPlace::from_expr(argument)
                                     .map(BorrowedPlace::into_place)
@@ -4067,6 +4145,10 @@ impl<'a> Generator<'a> {
                         Some(format!("argument {index} has a different checked span"))
                     } else {
                         match (&expected_ty, &actual.effect) {
+                            (Ty::Slots(_), CallArgumentEffect::Loan(_))
+                            | (Ty::Slots(_), CallArgumentEffect::Value(_)) => Some(format!(
+                                "internal.vcgen.slots_unsupported: sealed argument {index} has no transition"
+                            )),
                             (Ty::Borrow(mutability, referent), CallArgumentEffect::Loan(loan)) => {
                                 let expected_place = BorrowedPlace::from_expr(argument)
                                     .map(BorrowedPlace::into_place);
@@ -5062,6 +5144,12 @@ impl<'a> Generator<'a> {
                 }
                 Ty::Class(_) => (self.hinted_sym("_obj", Some(hint)), LenFact::Skip),
                 Ty::Res(_) => (self.hinted_sym("_view", Some(hint)), LenFact::Skip),
+                Ty::Slots(_) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.slots_unsupported: mutable slot loan `{hint}` has no symbolic write-back"
+                    ));
+                    (self.hinted_sym("_slots", Some(hint)), LenFact::Skip)
+                }
                 Ty::Int(_)
                 | Ty::Bool
                 | Ty::Param(_)
@@ -5310,6 +5398,12 @@ impl<'a> Generator<'a> {
             // `[T]` already share — binding mode never reached this type
             // (ADR 0067), and returning the owner is what ADR 0085 opened.
             Ty::Array(element) => lean_array_ty(element, self.records),
+            Ty::Slots(_) => {
+                refuse_vc_type(
+                    "internal.vcgen.slots_unsupported: owner-slot return has no Lean type".into(),
+                );
+                UNSUPPORTED_LEAN_TY.into()
+            }
             Ty::Borrow(..) => {
                 unreachable!("checked: borrowed values are not return types")
             }
@@ -6776,6 +6870,13 @@ impl<'a> Generator<'a> {
     /// only when source evaluation reaches it.
     fn eval_after_trap_lookup(&mut self, e: &Expr, scope: ScopeId) -> Val {
         match &e.kind {
+            ExprKind::SlotOp { op, .. } => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slots_unsupported: `{}` has no symbolic semantics",
+                    op.name()
+                ));
+                Val::Unit
+            }
             ExprKind::IntLit(n) => {
                 let v = if *n < 0 {
                     format!("({n})")
@@ -6837,6 +6938,7 @@ impl<'a> Generator<'a> {
                     // named refusal, never a misbranded Int (ADR 0074).
                     Some(
                         Ty::Array(..)
+                        | Ty::Slots(..)
                         | Ty::Class(_)
                         | Ty::Record(_)
                         | Ty::Res(_)
@@ -6917,6 +7019,7 @@ impl<'a> Generator<'a> {
                     | Ty::Bool
                     | Ty::Param(_)
                     | Ty::Record(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -6990,6 +7093,7 @@ impl<'a> Generator<'a> {
                         | Ty::Class(_)
                         | Ty::Record(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Res(_)
                         | Ty::Raw(_)
                         | Ty::RawRecord(_)
@@ -8911,6 +9015,7 @@ impl<'a> Generator<'a> {
                     }
                     other @ (Ty::Class(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -8966,6 +9071,7 @@ impl<'a> Generator<'a> {
                         | Ty::Class(_)
                         | Ty::Record(_)
                         | Ty::Array(..)
+                        | Ty::Slots(..)
                         | Ty::Option(_)
                         | Ty::OptionRaw(_)
                         | Ty::Raw(_)
@@ -8997,6 +9103,7 @@ impl<'a> Generator<'a> {
                         | Ty::Class(_)
                         | Ty::Record(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Option(_)
                         | Ty::Res(_)
                         | Ty::Raw(_)
@@ -9047,6 +9154,7 @@ impl<'a> Generator<'a> {
                     Some(
                         Ty::Class(_)
                         | Ty::Array(_)
+                        | Ty::Slots(_)
                         | Ty::Option(_)
                         | Ty::OptionRaw(_)
                         | Ty::Res(_)
@@ -9089,7 +9197,13 @@ impl<'a> Generator<'a> {
                         Some(Ty::Option(_)) => Val::Opt(projected),
                         // A field type with no symbolic projection is a
                         // named refusal, never a bare Int (ADR 0074).
-                        Some(Ty::Record(_) | Ty::OptionRaw(_) | Ty::Borrow(..) | Ty::Unit)
+                        Some(
+                            Ty::Slots(_)
+                            | Ty::Record(_)
+                            | Ty::OptionRaw(_)
+                            | Ty::Borrow(..)
+                            | Ty::Unit,
+                        )
                         | None => {
                             refuse_vc_type(format!(
                                 "internal.vcgen.field_state_unsupported: `self.{field}` \
@@ -9136,6 +9250,7 @@ impl<'a> Generator<'a> {
                     }
                     Ty::Class(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -9354,6 +9469,7 @@ impl<'a> Generator<'a> {
                     | Ty::Class(_)
                     | Ty::Record(_)
                     | Ty::Array(_)
+                    | Ty::Slots(_)
                     | Ty::Option(_)
                     | Ty::OptionRaw(_)
                     | Ty::Res(_)
@@ -9822,6 +9938,13 @@ impl<'a> Generator<'a> {
     /// one source site twice.
     fn eval_prop_after_trap_lookup(&mut self, e: &Expr, scope: ScopeId) -> String {
         match &e.kind {
+            ExprKind::SlotOp { op, .. } => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slots_unsupported: `{}` has no proposition semantics",
+                    op.name()
+                ));
+                "False".into()
+            }
             ExprKind::BoolLit(b) => if *b { "True" } else { "False" }.to_string(),
             ExprKind::Var(_) => {
                 let Val::Prop(p) = self.eval_after_trap_lookup(e, scope) else {
@@ -10127,6 +10250,12 @@ impl<'a> Generator<'a> {
                         out.push((entry.clone(), lean_ty));
                     }
                 }
+                Ty::Slots(_) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.slots_unsupported: parameter `{}` has no clause binder",
+                        p.name
+                    ));
+                }
                 Ty::Raw(_) | Ty::RawRecord(_) => out.push((p.name.clone(), "Sable.RawPtr".into())),
                 Ty::OptionRaw(_) => out.push((p.name.clone(), "Option Sable.RawPtr".into())),
                 Ty::Res(k) => {
@@ -10276,6 +10405,7 @@ impl<'a> Generator<'a> {
             )),
             other @ (Ty::Class(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -10795,6 +10925,33 @@ mod type_domain_tests {
     use super::*;
     use crate::span::LineMap;
     use crate::transition::CallTransition;
+
+    #[test]
+    fn owner_slots_have_neither_a_vc_type_nor_operation_semantics() {
+        let slots = Ty::slots(Ty::Int(IntTy::U64));
+        let error = validate_vc_ty(slots.clone(), false, "forged slot local")
+            .expect_err("owner slots have no Lean representation yet");
+        assert!(
+            error.starts_with("internal.vcgen.slots_unsupported:"),
+            "{error}"
+        );
+
+        let operation = Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Take,
+                op_span: Span::new(1, 2),
+                args: Vec::new(),
+            },
+            span: Span::new(1, 2),
+            ty: Some(Ty::Unit),
+        };
+        let error = validate_vc_expr(&operation, false, "forged slot operation", &HashMap::new())
+            .expect_err("owner-slot operations have no proof semantics yet");
+        assert!(
+            error.starts_with("internal.vcgen.slots_unsupported:"),
+            "{error}"
+        );
+    }
 
     /// A shape the preflight should have refused reaches a helper that has no
     /// error channel. The answer is a latched, named internal error and a

@@ -20,7 +20,7 @@ fn reports_parser_positions_and_all_four_evidence_profiles() {
     for expected in [
         "type: option<[bool]>",
         "normalized: option<[bool]>",
-        "parser type positions — 6/15 lowerings accepted",
+        "parser type positions — 6/16 lowerings accepted",
         "parser lowering is not full parse→consts→mono→check language admission",
         "parser-accepted: param, return, local, record field, class field, option payload",
         "type.borrow_param_unsupported",

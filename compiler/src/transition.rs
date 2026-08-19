@@ -206,6 +206,13 @@ impl CallTransition {
             Mutability::Shared => CallEffect::SharedLoan,
             Mutability::Mut => CallEffect::HavocUniqueBorrow,
         };
+        if matches!(referent, Ty::Slots(_)) {
+            return Err(format!(
+                "internal.call_transition.slots_unsupported: call loan for `{}` has owner-slot referent `{}`",
+                place.render(),
+                referent.name()
+            ));
+        }
         match &referent {
             Ty::Array(_) | Ty::Class(_) | Ty::Res(_) => Ok(Self {
                 place,
@@ -221,6 +228,7 @@ impl CallTransition {
             | Ty::RawRecord(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
+            | Ty::Slots(_)
             | Ty::Borrow(..)
             | Ty::Unit => Err(format!(
                 "internal.call_transition_unsupported: call loan for `{}` has \
@@ -336,6 +344,12 @@ impl TransitionCertificate {
                 }
                 CallHavocCertificateKind::Writeback
             }
+            Ty::Slots(_) => {
+                return Err(format!(
+                    "internal.transition_certificate.slots_unsupported: call havoc for `{place}` has owner-slot referent `{}`",
+                    transition.referent.name()
+                ));
+            }
             Ty::Int(_)
             | Ty::Bool
             | Ty::Param(_)
@@ -404,6 +418,47 @@ mod tests {
         let error = CallTransition::unique_borrow(Place::local("flag"), Ty::Bool, Span::new(0, 0))
             .expect_err("Boolean places are outside the admitted call-havoc slice");
         assert!(error.starts_with("internal.call_transition_unsupported:"));
+    }
+
+    #[test]
+    fn owner_slots_never_acquire_call_transition_or_certificate_semantics() {
+        let slots = Ty::slots(Ty::Int(IntTy::U64));
+        let error = CallTransition::borrow(
+            Place::local("cells"),
+            Mutability::Mut,
+            slots.clone(),
+            Span::new(0, 1),
+        )
+        .expect_err("owner-slot borrows have no checked call-transition semantics yet");
+        assert!(
+            error.starts_with("internal.call_transition.slots_unsupported:"),
+            "{error}"
+        );
+
+        // Forge the transition directly so the certificate gate is pinned
+        // independently of the earlier checker-to-VC handoff refusal.
+        let transition = CallTransition {
+            place: Place::local("cells"),
+            referent: slots,
+            effect: CallEffect::HavocUniqueBorrow,
+            span: Span::new(0, 1),
+        };
+        let error = TransitionCertificate::call_havoc(
+            "transition.subject.call_havoc.cells".into(),
+            "cert_transition_subject_call_havoc_cells".into(),
+            transition,
+            "_slots1".into(),
+            "_slots1".into(),
+            None,
+            None,
+            vec![("_slots1".into(), "Unsupported".into())],
+            Vec::new(),
+        )
+        .expect_err("owner slots have no transition-certificate semantics yet");
+        assert!(
+            error.starts_with("internal.transition_certificate.slots_unsupported:"),
+            "{error}"
+        );
     }
 
     #[test]

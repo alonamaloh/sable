@@ -167,6 +167,7 @@ pub enum GenericTy {
     Bool,
     Record(String),
     Array(Box<GenericTy>),
+    Slots(Box<GenericTy>),
     Option(Box<GenericTy>),
     Class {
         name: String,
@@ -293,6 +294,7 @@ impl GenericTy {
             GenericTy::Bool => Ok(GenericTy::Bool),
             GenericTy::Record(name) => Ok(GenericTy::Record(name.clone())),
             GenericTy::Array(element) => Ok(GenericTy::Array(Box::new(element.substitute(args)?))),
+            GenericTy::Slots(element) => Ok(GenericTy::Slots(Box::new(element.substitute(args)?))),
             GenericTy::Option(element) => {
                 Ok(GenericTy::Option(Box::new(element.substitute(args)?)))
             }
@@ -316,7 +318,9 @@ impl GenericTy {
         match self {
             GenericTy::Int(IntTy::TParam(_)) | GenericTy::Param(_) => false,
             GenericTy::Int(_) | GenericTy::Bool | GenericTy::Record(_) => true,
-            GenericTy::Array(element) | GenericTy::Option(element) => element.is_concrete(),
+            GenericTy::Array(element) | GenericTy::Slots(element) | GenericTy::Option(element) => {
+                element.is_concrete()
+            }
             GenericTy::Class { args, .. } => args.iter().all(GenericTy::is_concrete),
         }
     }
@@ -326,7 +330,7 @@ impl GenericTy {
     pub fn structural_depth(&self) -> usize {
         match self {
             GenericTy::Int(_) | GenericTy::Param(_) | GenericTy::Bool | GenericTy::Record(_) => 1,
-            GenericTy::Array(element) | GenericTy::Option(element) => {
+            GenericTy::Array(element) | GenericTy::Slots(element) | GenericTy::Option(element) => {
                 1 + element.structural_depth()
             }
             GenericTy::Class { args, .. } => {
@@ -347,7 +351,7 @@ impl GenericTy {
     fn visit_nominals_with(&self, visit: &mut impl FnMut(NominalKind, &str)) {
         match self {
             GenericTy::Record(name) => visit(NominalKind::Record, name),
-            GenericTy::Array(element) | GenericTy::Option(element) => {
+            GenericTy::Array(element) | GenericTy::Slots(element) | GenericTy::Option(element) => {
                 element.visit_nominals_with(visit)
             }
             GenericTy::Class { name, args } => {
@@ -391,6 +395,11 @@ impl GenericTy {
             GenericTy::Array(element) => {
                 let child = element.concrete_key()?;
                 out.push('A');
+                push_length_prefixed(out, child.as_str());
+            }
+            GenericTy::Slots(element) => {
+                let child = element.concrete_key()?;
+                out.push('S');
                 push_length_prefixed(out, child.as_str());
             }
             GenericTy::Option(element) => {
@@ -449,12 +458,16 @@ pub enum Ty {
     ///
     /// A bare type owns. `&[T]` and `&mut [T]` are `Ty::Borrow` over this.
     Array(Box<Ty>),
+    /// `slots<T>` — an owned fixed-length container of independently
+    /// occupied cells. Unlike `[T]`, allocation does not repeat a payload and
+    /// ordinary indexing is never an owner access path (ADR 0093).
+    Slots(Box<Ty>),
     /// `option<T>`. The payload is a full type for the same reason an array
     /// element is, so whether the option owns its present case is read off
-    /// the payload (`is_affine`) rather than encoded by the constructor. The
-    /// one payload shape that owns and is admitted anywhere is an owned
-    /// array; `as_affine_option_payload` is the question every rule that must
-    /// route the owning case away from a copy rule asks.
+    /// the payload (`is_affine`) rather than encoded by the constructor.
+    /// `as_affine_option_payload` recognizes every structurally owning case
+    /// (array, slots, or class); each semantic gate then admits its deliberate
+    /// subset or refuses the new owner by name.
     Option(Box<Ty>),
     /// `option<raw<R>>` for an explicitly laid-out record. This is an
     /// abstract nullable pointer value, not a byte representation.
@@ -995,6 +1008,11 @@ impl Ty {
         Ty::Array(Box::new(element))
     }
 
+    /// `slots<element>` — an owned occupancy-bearing slot container.
+    pub fn slots(element: Ty) -> Ty {
+        Ty::Slots(Box::new(element))
+    }
+
     /// `&referent` / `&mut referent`.
     pub fn borrow(mutability: Mutability, referent: Ty) -> Ty {
         Ty::Borrow(mutability, Box::new(referent))
@@ -1089,6 +1107,25 @@ impl Ty {
         }
     }
 
+    /// The payload and binding mode of an owner-slot container.
+    ///
+    /// Deliberately separate from [`Ty::as_array`]: sharing a descriptor or a
+    /// length operation does not give slots copy-index semantics.
+    pub fn as_slots(&self) -> Option<(&Ty, BindingMode)> {
+        match self.referent() {
+            Ty::Slots(payload) => Some((payload, self.binding_mode())),
+            _ => None,
+        }
+    }
+
+    /// The payload of an owned slots value, ignoring borrowed ones.
+    pub fn as_owned_slots(&self) -> Option<&Ty> {
+        match self {
+            Ty::Slots(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
     /// The element type and mutability of a *borrowed* array `&[T]`/`&mut [T]`.
     pub fn as_array_borrow(&self) -> Option<(&Ty, Mutability)> {
         match self {
@@ -1149,19 +1186,19 @@ impl Ty {
     /// payload type, not its element.
     ///
     /// This is the single question every rule asks when it has to route the
-    /// owning case away from a rule that would copy it. The owning family is
-    /// the shapes the ownership rules — move, take, destruction — are
-    /// written for: an option over an owned array, and an option over a
-    /// class, whose present case additionally carries a destructor. The
-    /// class arm matches the owned constructor directly — never through a
-    /// referent — so an option over a class *borrow* stays out of the
-    /// family (a borrow owns nothing).
+    /// owning case away from a rule that would copy it. The structural family
+    /// includes options over owned arrays, owner slots, and classes; it does
+    /// not claim that every downstream ownership gate already implements
+    /// every member. The class and slots arms match the owned constructor
+    /// directly — never through a referent — so options over their *borrows*
+    /// stay out of the family (a borrow owns nothing).
     ///
     /// A gate, not a traversal: one level, no recursion.
     pub fn as_affine_option_payload(&self) -> Option<&Ty> {
         match self {
             Ty::Option(payload)
                 if payload.as_owned_array().is_some()
+                    || payload.as_owned_slots().is_some()
                     || matches!(payload.as_ref(), Ty::Class(_)) =>
             {
                 Some(payload)
@@ -1203,6 +1240,7 @@ impl Ty {
             Ty::Record(_) => PayloadFamily::Record,
             Ty::Class(_)
             | Ty::Array(_)
+            | Ty::Slots(_)
             | Ty::Option(_)
             | Ty::OptionRaw(_)
             | Ty::Res(_)
@@ -1260,7 +1298,7 @@ impl Ty {
     /// reuse, and is independently checked under the affine arm below.
     pub fn is_affine(&self) -> bool {
         match self {
-            Ty::Class(_) | Ty::Res(_) | Ty::Array(_) => true,
+            Ty::Class(_) | Ty::Res(_) | Ty::Array(_) | Ty::Slots(_) => true,
             // An option owns exactly when its present case does.
             Ty::Option(payload) => payload.is_affine(),
             // Terminal, and deliberately *not* `referent.is_affine()`. A
@@ -1316,6 +1354,7 @@ impl Ty {
             Ty::Int(IntTy::TParam(_)) | Ty::Param(_) => false,
             Ty::Raw(IntTy::TParam(_)) => false,
             Ty::Array(element) => element.is_concrete(),
+            Ty::Slots(payload) => payload.is_concrete(),
             Ty::Option(payload) => payload.is_concrete(),
             Ty::Borrow(_, referent) => referent.is_concrete(),
             Ty::Int(_)
@@ -1340,6 +1379,7 @@ impl Ty {
     pub fn structural_depth(&self) -> usize {
         1 + match self {
             Ty::Array(element) => element.structural_depth(),
+            Ty::Slots(payload) => payload.structural_depth(),
             Ty::Option(payload) => payload.structural_depth(),
             Ty::Borrow(_, referent) => referent.structural_depth(),
             Ty::Int(_)
@@ -1372,6 +1412,7 @@ impl Ty {
             Ty::Bool => "bool".to_string(),
             Ty::Param(parameter) => format!("<T{}>", parameter.index()),
             Ty::Array(t) => format!("[{}]", t.name()),
+            Ty::Slots(t) => format!("slots<{}>", t.name()),
             Ty::Class(_) => "class".to_string(),
             Ty::Record(_) => "record".to_string(),
             Ty::Raw(t) => format!("raw<{}>", t.name()),
@@ -1457,6 +1498,46 @@ pub enum UnOp {
     Not,
 }
 
+/// The sealed owner-slot operations (ADR 0093).
+///
+/// Allocation carries its source element type because there is no ordinary
+/// function declaration whose signature could recover it after parsing.
+/// Take and put recover the payload from their explicitly borrowed container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotOp {
+    Alloc { elem: Ty },
+    Take,
+    Put,
+}
+
+impl SlotOp {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SlotOp::Alloc { .. } => "alloc_slots",
+            SlotOp::Take => "slot_take",
+            SlotOp::Put => "slot_put",
+        }
+    }
+
+    pub fn arity(&self) -> usize {
+        match self {
+            SlotOp::Alloc { .. } => 1,
+            SlotOp::Take => 2,
+            SlotOp::Put => 3,
+        }
+    }
+
+    /// The non-generic spellings. `alloc_slots<T>` is parsed by its own arm
+    /// so its element type cannot be lost in an untyped argument vector.
+    pub fn from_name(name: &str) -> Option<SlotOp> {
+        match name {
+            "slot_take" => Some(SlotOp::Take),
+            "slot_put" => Some(SlotOp::Put),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ExprKind {
     IntLit(i128),
@@ -1507,6 +1588,14 @@ pub enum ExprKind {
     /// `join(a, b)`. Its contract is generated, not written (ADR 0024).
     ResOp {
         op: ResOp,
+        op_span: Span,
+        args: Vec<Expr>,
+    },
+    /// `alloc_slots<T>(len)`, `slot_take(&mut place, i)`, and
+    /// `slot_put(&mut place, i, value)`. These are sealed operations rather
+    /// than calls: no source declaration may shadow their ownership rules.
+    SlotOp {
+        op: SlotOp,
         op_span: Span,
         args: Vec<Expr>,
     },
@@ -2171,9 +2260,12 @@ mod generic_ty_tests {
             if let Some(payload) = ty.as_option() {
                 return owns(payload);
             }
-            // What is left owns when it names a class, a resource, or an
-            // array: `class`, `resource K`, `[T]`.
-            spelled == "class" || spelled.starts_with("resource ") || spelled.starts_with('[')
+            // What is left owns when it names a class, a resource, an array,
+            // or owner slots: `class`, `resource K`, `[T]`, `slots<T>`.
+            spelled == "class"
+                || spelled.starts_with("resource ")
+                || spelled.starts_with('[')
+                || spelled.starts_with("slots<")
         }
         for (_, ty) in crate::shape_admission::samples() {
             assert_eq!(
@@ -2195,10 +2287,11 @@ mod generic_ty_tests {
     /// duplicate an owner with no diagnostic — which is the failure this
     /// whole partition exists to prevent.
     ///
-    /// The two are not complements: `option<class>` owns and is in neither
-    /// family, because the copyable gate refuses it. That is why the owning
-    /// family is read as "the payload is an owned array" rather than as "the
-    /// payload is affine".
+    /// The two are not complements: `option<class>` and
+    /// `option<slots<T>>` join the structural owning family even when a
+    /// particular semantic gate refuses them. That is why the owning family
+    /// is read from explicit owner constructors rather than from a stage's
+    /// current allow-list.
     #[test]
     fn no_owning_option_is_admitted_by_the_copyable_option_gate() {
         let mut owning = 0;
@@ -2278,8 +2371,8 @@ mod generic_ty_tests {
         assert_eq!(affine.name(), "option<[<T7>]>");
         assert!(Ty::affine_array_option(Ty::Bool).is_concrete());
 
-        // An owning option is one constructor over an owned array, and the
-        // owning family is read back off that payload.
+        // An owning option is one constructor over an owner, and the
+        // structural owning family is read back off that payload.
         let owning = Ty::affine_array_option(Ty::Bool);
         assert_eq!(owning, Ty::option(Ty::array(Ty::Bool)));
         assert!(owning.is_affine());
@@ -2297,8 +2390,8 @@ mod generic_ty_tests {
         // A borrowed array payload is representable and does not join the
         // owning family: a borrow owns nothing.
         assert!(!Ty::option(Ty::array_ref(Ty::Bool, Mutability::Shared)).is_affine_option());
-        // Neither does an option over another owner the ownership rules are
-        // not written for; the copyable-option gate refuses it by name.
+        // A class joins the structural owning family even where a later
+        // ownership gate has no semantic rule for that exact position.
         assert!(Ty::option(Ty::Class(0)).is_affine_option());
         assert!(Ty::option(Ty::Class(0)).is_affine());
 
@@ -2315,6 +2408,22 @@ mod generic_ty_tests {
             Ty::array(Ty::array(Ty::Int(IntTy::U64))).structural_depth(),
             3
         );
+
+        let slots = Ty::slots(Ty::Param(parameter));
+        assert_eq!(slots.name(), "slots<<T7>>");
+        assert_eq!(slots.as_owned_slots(), Some(&Ty::Param(parameter)));
+        assert_eq!(
+            slots.as_slots(),
+            Some((&Ty::Param(parameter), BindingMode::Owned))
+        );
+        assert!(slots.is_affine());
+        assert!(!slots.is_concrete());
+        assert_eq!(slots.structural_depth(), 2);
+        assert_eq!(
+            Ty::option(slots.clone()).as_affine_option_payload(),
+            Some(&slots)
+        );
+        assert!(!Ty::borrow(Mutability::Shared, slots).is_affine());
     }
 
     #[test]
@@ -2373,6 +2482,7 @@ mod generic_ty_tests {
             GenericTy::Bool,
             GenericTy::Record("Node".into()),
             GenericTy::Array(Box::new(GenericTy::Int(IntTy::I32))),
+            GenericTy::Slots(Box::new(GenericTy::Int(IntTy::I32))),
             GenericTy::Option(Box::new(GenericTy::Int(IntTy::I32))),
             GenericTy::Class {
                 name: "Box".into(),
@@ -2422,6 +2532,14 @@ mod generic_ty_tests {
                 .substitute(&[GenericTy::Bool])
                 .unwrap(),
             GenericTy::Bool
+        );
+
+        let slots = GenericTy::Slots(Box::new(parameter(0)));
+        assert_eq!(
+            slots
+                .substitute(&[GenericTy::Record("Cell".into())])
+                .unwrap(),
+            GenericTy::Slots(Box::new(GenericTy::Record("Cell".into())))
         );
     }
 
@@ -2495,6 +2613,7 @@ mod generic_ty_tests {
     fn canonical_keys_are_length_prefixed_and_injective() {
         let integer = GenericTy::Int(IntTy::I32);
         let array = GenericTy::Array(Box::new(integer.clone()));
+        let slots = GenericTy::Slots(Box::new(integer.clone()));
         let record = GenericTy::Record("Node".into());
         let option_record = GenericTy::Option(Box::new(record.clone()));
         let class = GenericTy::Class {
@@ -2504,6 +2623,7 @@ mod generic_ty_tests {
 
         assert_eq!(integer.concrete_key().unwrap().as_str(), "I3_i32");
         assert_eq!(array.concrete_key().unwrap().as_str(), "A6_I3_i32");
+        assert_eq!(slots.concrete_key().unwrap().as_str(), "S6_I3_i32");
         assert_eq!(record.concrete_key().unwrap().as_str(), "R4_Node");
         assert_eq!(option_record.concrete_key().unwrap().as_str(), "O7_R4_Node");
         assert_eq!(
@@ -2517,6 +2637,12 @@ mod generic_ty_tests {
         assert_ne!(
             array_of_option.concrete_key().unwrap(),
             option_of_array.concrete_key().unwrap()
+        );
+        assert_ne!(
+            slots.concrete_key().unwrap(),
+            GenericTy::Array(Box::new(integer.clone()))
+                .concrete_key()
+                .unwrap()
         );
         assert_ne!(
             GenericTy::Record("X".into()).concrete_key().unwrap(),

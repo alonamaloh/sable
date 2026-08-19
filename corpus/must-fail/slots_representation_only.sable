@@ -1,0 +1,7 @@
+// expect-error: type.slots_unsupported
+// G3 first gives owner slots an honest affine representation.  A declaration
+// remains sealed until cleanup, runtime, and proof semantics are admitted.
+
+fn representation_only() {
+    slots<u64> cells = alloc_slots<u64>(4);
+}

@@ -124,6 +124,13 @@ const TYPES: &[Probe] = &[
         feed: "",
     },
     Probe {
+        name: "slots<u64>",
+        spelling: "slots<u64>",
+        values: &["alloc_slots<u64>(2)"],
+        decls: "",
+        feed: "",
+    },
+    Probe {
         name: "option<u64>",
         spelling: "option<u64>",
         values: &["none", "some(7)"],
@@ -204,6 +211,7 @@ const CONTEXTS: &[Context] = &[
     ("record field", ctx_record_field),
     ("class field", ctx_class_field),
     ("array element", ctx_array_element),
+    ("slot payload", ctx_slot_payload),
     ("option payload", ctx_option_payload),
     ("generic arg", ctx_generic_arg),
     ("for index", ctx_for_index),
@@ -295,6 +303,13 @@ fn ctx_array_element(p: &Probe) -> Vec<String> {
             p.decls, p.feed
         )
     })
+}
+
+fn ctx_slot_payload(p: &Probe) -> Vec<String> {
+    vec![format!(
+        "{}\nfn probe() -> u64 {{\n    slots<{}> xs = alloc_slots<{}>(1);\n    return 0;\n}}\n",
+        p.decls, p.spelling, p.spelling
+    )]
 }
 
 fn ctx_option_payload(p: &Probe) -> Vec<String> {
@@ -753,6 +768,7 @@ fn every_spellable_type_shape_is_probed() {
             "Record" => ShapeWitness::Rows(&["record"]),
             "Class" => ShapeWitness::Rows(&["class"]),
             "Array" => ShapeWitness::Rows(&["[u64]", "[bool]", "[record]"]),
+            "Slots" => ShapeWitness::Rows(&["slots<u64>"]),
             "Option" => ShapeWitness::Rows(&["option<u64>", "option<bool>", "option<[bool]>"]),
             "Raw" => ShapeWitness::Rows(&["raw<u8>"]),
             // A borrow is a binding-mode wrapper (ADR 0067), so it is
@@ -820,6 +836,7 @@ fn every_type_position_is_probed() {
             "record field" => &["record field"],
             "class field" => &["class field"],
             "array element" => &["array element"],
+            "slot payload" => &["slot payload"],
             "option payload" => &["option payload"],
             "for index" => &["for index"],
             "const" => &["const"],

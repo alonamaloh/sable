@@ -2017,16 +2017,20 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      expression CFG or a mechanized source-translation proof, and stages may
      still refuse shapes outside their admitted subsets.
 
-   - **G3 — slots and `Vec` (in progress; ADR 0093):** the first compiler
-     tranche is complete: direct ordinary classes are generic arguments,
-     class identities resolve after template extraction, owner-containing
-     instances use injective structural names and `ProofReuse::None`, and
-     nested generic-class arguments fail closed. Next, make generic element
-     storage and movement real for the growable-vector benchmark through a
-     distinct occupancy-bearing `slots<T>` container, atomic `slot_take` and
-     `slot_put`, and independently verified class-owner specializations.
-     Ordinary `[T]` remains copy-element storage; Vec's owner-capable API does
-     not add a shared copying `get` or broaden the affine-option ABI.
+   - **G3 — slots and `Vec` (in progress; ADR 0093):** two compiler tranches
+     are complete. Direct ordinary classes are generic arguments, with final
+     identities, injective structural names, no integer proof reuse for owner
+     instances, and nested generic-class arguments still closed. The compiler
+     now also retains a distinct affine `slots<T>` / `GenericTy::Slots`
+     representation, parses `alloc_slots`, `slot_take`, `slot_put`, and
+     structural `.len`, and closes every checker, control, proof, interpreter,
+     SVM, transition, and native boundary with stable diagnostics. This is
+     representation, not execution: no slot operation, cleanup recipe, ABI,
+     parameter, return, proof model, or runtime value is admitted yet. Next,
+     seal checker-owned slot actions and implement recursive cleanup plus VC
+     and interpreter semantics. Ordinary `[T]` remains copy-element storage;
+     Vec's owner-capable API does not add a shared copying `get` or broaden the
+     affine-option ABI.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
      key/value storage, probing, and its existing verified contracts.
 
