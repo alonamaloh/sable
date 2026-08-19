@@ -1338,6 +1338,31 @@ fn svm_boolean_slot_rows_pin_local_representation_and_closed_call_abi() {
     }
 }
 
+/// The native phase-one slot representation is deliberately local-only.
+/// Owning Boolean slots have an LLVM value type for direct local storage, but
+/// the general runtime/return and parameter ABI gates remain closed.
+#[test]
+fn llvm_boolean_slot_row_pins_local_representation_and_closed_call_abi() {
+    fn gate(ty: &Ty, name: &str) -> String {
+        let index = GATES
+            .iter()
+            .position(|candidate| candidate.name == name)
+            .expect("the named LLVM gate is a matrix column");
+        answers(ty, "Boolean slot ratchet")[index].render()
+    }
+
+    let owned = Ty::slots(Ty::Bool);
+    assert_eq!(gate(&owned, "llvm local"), "yes");
+    assert_eq!(
+        gate(&owned, "llvm runtime type"),
+        "`backend.slots_unsupported`"
+    );
+    assert_eq!(
+        gate(&owned, "llvm parameter"),
+        "`backend.slots_unsupported`"
+    );
+}
+
 /// Every binding mode a stage answers differently for is a sample.
 ///
 /// Binding mode is decided separately from what a type names, so a shape that

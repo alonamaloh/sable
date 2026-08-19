@@ -79,6 +79,11 @@ const CASES: &[Case] = &[
         entry: "bool_array_borrows_entry",
     },
     Case {
+        label: "bool-owner-slots",
+        source: "slots_bool.sable",
+        entry: "slots_bool_entry",
+    },
+    Case {
         label: "bignum-native",
         source: "../verifies/bignum_native.sable",
         entry: "bignum_native_entry",
@@ -137,6 +142,56 @@ fn run_verified_llvm_differential() {
 
     let temp = temp_dir("diff");
     let hosted_runtime = repo_root().join("runtime/hosted/sable_rt_v1.c");
+    let counted_runtime = temp.join("counted_owned_storage_runtime.c");
+    fs::write(
+        &counted_runtime,
+        r#"
+#include <stdint.h>
+#include <stdlib.h>
+
+static uint64_t live_allocations = 0;
+static uint64_t total_allocations = 0;
+static uint64_t total_frees = 0;
+
+static void require_balanced_storage(void) {
+    if (live_allocations != 0 || total_allocations != 2 || total_frees != 2) {
+        _Exit(253);
+    }
+}
+
+__attribute__((constructor))
+static void install_balance_check(void) {
+    if (atexit(require_balanced_storage) != 0) {
+        _Exit(251);
+    }
+}
+
+void *__sable_rt_array_alloc_v1(uint64_t bytes) {
+    if (bytes > SIZE_MAX) {
+        return NULL;
+    }
+    void *storage = malloc((size_t)bytes);
+    if (storage != NULL) {
+        live_allocations += 1;
+        total_allocations += 1;
+    }
+    return storage;
+}
+
+void __sable_rt_array_free_v1(void *storage) {
+    if (storage == NULL) {
+        return;
+    }
+    if (live_allocations == 0) {
+        _Exit(252);
+    }
+    live_allocations -= 1;
+    total_frees += 1;
+    free(storage);
+}
+"#,
+    )
+    .expect("write counted owned-storage differential runtime");
     for case in CASES {
         let source = repo_root().join("corpus/llvm-diff").join(case.source);
         eprintln!("llvm-diff {}: verify", case.label);
@@ -179,6 +234,11 @@ fn run_verified_llvm_differential() {
 
         let ir_path = temp.join(format!("{}.ll", case.label));
         fs::write(&ir_path, ir).expect("write emitted differential IR");
+        let runtime = if case.label == "bool-owner-slots" {
+            &counted_runtime
+        } else {
+            &hosted_runtime
+        };
         for optimization in ["-O0", "-O2"] {
             eprintln!("llvm-diff {}: clang {optimization}", case.label);
             let executable = temp.join(format!("{}-{}", case.label, &optimization[1..]));
@@ -186,7 +246,7 @@ fn run_verified_llvm_differential() {
                 .args([optimization, "-x", "ir"])
                 .arg(&ir_path)
                 .args(["-x", "c"])
-                .arg(&hosted_runtime)
+                .arg(runtime)
                 .arg("-o")
                 .arg(&executable)
                 .output()

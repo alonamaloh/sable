@@ -1,7 +1,7 @@
 //! Strict textual LLVM IR lowering for the verified scalar, Boolean-option,
-//! bounded POD-record, owned-local Boolean-array, local `u32`-array, and
-//! fixed-owner class core with internal borrows, returns, and named moves
-//! (ADRs 0058--0059).
+//! bounded POD-record, owned-local Boolean-array, local `u32`-array, direct
+//! local Boolean owner-slot, and fixed-owner class core with internal borrows,
+//! returns, and named moves (ADRs 0058--0059).
 //!
 //! The backend lowers scalar storage, calls, comparisons, and structured
 //! control flow.  A construct is either lowered with its Sable meaning or
@@ -11,12 +11,12 @@
 use crate::VerifiedProgram;
 use crate::ast::{
     BinOp, BindingMode, ClassDecl, Expr, ExprKind, Fn, IntTy, Mutability, Program, RecordDecl,
-    SelfKind, Stmt, Ty, UnOp,
+    SelfKind, SlotOp, Stmt, Ty, UnOp,
 };
 use crate::control::{
     AssignmentAction, AssignmentStaging, BlockId, BodyPlan, ClassDropAction, ClassDropPhase,
-    ClassDropPlan, ControlProgram, DropId, ExitRoute, PlanError, ScopeId, StatementPlanKind,
-    TrapSite, ValueDropRecipe,
+    ClassDropPlan, ControlProgram, DropId, ExitRoute, PlanError, ScopeId, SlotAction,
+    SlotActionKind, StatementPlanKind, TrapSite, ValueDropRecipe,
 };
 use crate::diag::Diagnostic;
 use crate::place::Place;
@@ -902,6 +902,7 @@ struct ValidationLocals {
     scopes: Vec<HashMap<String, ValidationLocal>>,
     declared: HashSet<String>,
     moved_classes: HashSet<String>,
+    moved_slots: HashSet<String>,
 }
 
 impl ValidationLocals {
@@ -910,6 +911,7 @@ impl ValidationLocals {
             scopes: vec![HashMap::new()],
             declared: HashSet::new(),
             moved_classes: HashSet::new(),
+            moved_slots: HashSet::new(),
         }
     }
 
@@ -930,6 +932,7 @@ impl ValidationLocals {
             .expect("validation has a function scope")
             .insert(name.clone(), local);
         self.moved_classes.remove(&name);
+        self.moved_slots.remove(&name);
         Ok(())
     }
 
@@ -949,6 +952,7 @@ impl ValidationLocals {
         let removed = self.scopes.pop().expect("validated lexical scope");
         for name in removed.keys() {
             self.moved_classes.remove(name);
+            self.moved_slots.remove(name);
         }
     }
 
@@ -971,6 +975,27 @@ impl ValidationLocals {
 
     fn mark_class_moved(&mut self, name: &str) {
         self.moved_classes.insert(name.to_owned());
+    }
+
+    fn require_live_slots(
+        &self,
+        name: &str,
+        span: Span,
+        role: &str,
+    ) -> Result<(), Vec<BackendError>> {
+        if self.moved_slots.contains(name) {
+            return Err(vec![diag(
+                "backend.slots_moved",
+                "owner-slot value was already moved",
+                span,
+                format!("{role} uses moved-from owner-slot local `{name}`"),
+            )]);
+        }
+        Ok(())
+    }
+
+    fn mark_slots_moved(&mut self, name: &str) {
+        self.moved_slots.insert(name.to_owned());
     }
 }
 
@@ -1219,7 +1244,23 @@ fn validate_block(
                 init,
                 mutable,
             } => {
-                if ty.is_affine_option() {
+                if matches!(ty, Ty::Slots(_)) {
+                    if !is_owned_bool_slots(ty) {
+                        return Err(vec![slots_unsupported(
+                            *name_span,
+                            format!("local `{name}` with type `{}`", ty.name()),
+                        )]);
+                    }
+                    let Some(value) = init else {
+                        return Err(vec![diag(
+                            "backend.slots_initializer",
+                            "native owner-slot local has no initializer",
+                            *name_span,
+                            format!("`{name}` must receive an allocation or whole-owner move"),
+                        )]);
+                    };
+                    validate_bool_slots_initializer(program, value, root_span_end, locals, name)?;
+                } else if ty.is_affine_option() {
                     validate_affine_bool_option_decl(
                         program,
                         name,
@@ -1306,6 +1347,24 @@ fn validate_block(
                         "inferred local is missing its checked type",
                     )]);
                 };
+                if matches!(ty, Ty::Slots(_)) {
+                    if !is_owned_bool_slots(ty) {
+                        return Err(vec![slots_unsupported(
+                            *name_span,
+                            format!("inferred local `{name}` with type `{}`", ty.name()),
+                        )]);
+                    }
+                    validate_bool_slots_initializer(program, init, root_span_end, locals, name)?;
+                    locals.insert(
+                        name.clone(),
+                        ValidationLocal {
+                            ty: ty.clone(),
+                            mutable: *mutable,
+                        },
+                        *name_span,
+                    )?;
+                    continue;
+                }
                 if let Ty::Class(class) = ty {
                     validate_fixed_class_initializer(program, *class, init, root_span_end, locals)?;
                     locals.insert(
@@ -1380,6 +1439,17 @@ fn validate_block(
                         *name_span,
                         format!("assignment targets immutable local `{name}`"),
                     )]);
+                }
+                if matches!(local.ty, Ty::Slots(_)) {
+                    if !is_owned_bool_slots(&local.ty) {
+                        return Err(vec![slots_unsupported(
+                            *name_span,
+                            format!("assignment to `{name}` with type `{}`", local.ty.name()),
+                        )]);
+                    }
+                    validate_bool_slots_initializer(program, value, root_span_end, locals, name)?;
+                    locals.moved_slots.remove(name);
+                    continue;
                 }
                 if is_owned_native_array(&local.ty) {
                     return Err(vec![unsupported(
@@ -1472,6 +1542,7 @@ fn validate_block(
                 validate_bool_expr(program, cond, "`if` condition", root_span_end, locals)?;
                 let base_initializer = initializer.as_deref().cloned();
                 let before_moved = locals.moved_classes.clone();
+                let before_moved_slots = locals.moved_slots.clone();
                 locals.push_scope();
                 let mut then_initializer = base_initializer.clone();
                 let then_returned = validate_block(
@@ -1487,29 +1558,36 @@ fn validate_block(
                 )?;
                 locals.pop_scope();
                 let then_moved = locals.moved_classes.clone();
+                let then_moved_slots = locals.moved_slots.clone();
                 locals.moved_classes = before_moved.clone();
+                locals.moved_slots = before_moved_slots.clone();
                 let mut else_initializer = base_initializer.clone();
-                let (else_returned, else_moved) = if let Some(else_block) = else_block {
-                    locals.push_scope();
-                    let else_returned = validate_block(
-                        program,
-                        else_block,
-                        root_span_end,
-                        locals,
-                        ret_ty.clone(),
-                        else_initializer.as_mut(),
-                        method,
-                        plan,
-                        branch_plan
-                            .as_ref()
-                            .and_then(|branch| branch.else_arm())
-                            .map(|arm| arm.block()),
-                    )?;
-                    locals.pop_scope();
-                    (else_returned, locals.moved_classes.clone())
-                } else {
-                    (false, before_moved.clone())
-                };
+                let (else_returned, else_moved, else_moved_slots) =
+                    if let Some(else_block) = else_block {
+                        locals.push_scope();
+                        let else_returned = validate_block(
+                            program,
+                            else_block,
+                            root_span_end,
+                            locals,
+                            ret_ty.clone(),
+                            else_initializer.as_mut(),
+                            method,
+                            plan,
+                            branch_plan
+                                .as_ref()
+                                .and_then(|branch| branch.else_arm())
+                                .map(|arm| arm.block()),
+                        )?;
+                        locals.pop_scope();
+                        (
+                            else_returned,
+                            locals.moved_classes.clone(),
+                            locals.moved_slots.clone(),
+                        )
+                    } else {
+                        (false, before_moved.clone(), before_moved_slots.clone())
+                    };
                 if then_initializer != else_initializer {
                     return Err(vec![unsupported(
                         cond.span,
@@ -1528,11 +1606,25 @@ fn validate_block(
                         "every reaching branch must leave the same class owners live",
                     )]);
                 }
+                if !then_returned && !else_returned && then_moved_slots != else_moved_slots {
+                    return Err(vec![diag(
+                        "backend.slots_branch_shape",
+                        "owner-slot state differs across branch paths",
+                        cond.span,
+                        "every reaching branch must leave the same owner-slot locals live",
+                    )]);
+                }
                 locals.moved_classes = match (then_returned, else_returned) {
                     (true, true) => before_moved,
                     (true, false) => else_moved,
                     (false, true) => then_moved,
                     (false, false) => then_moved,
+                };
+                locals.moved_slots = match (then_returned, else_returned) {
+                    (true, true) => before_moved_slots,
+                    (true, false) => else_moved_slots,
+                    (false, true) => then_moved_slots,
+                    (false, false) => then_moved_slots,
                 };
                 returned = then_returned && else_returned;
             }
@@ -1554,6 +1646,7 @@ fn validate_block(
                 validate_bool_expr(program, cond, "`while` condition", root_span_end, locals)?;
                 let before = initializer.as_deref().cloned();
                 let before_moved = locals.moved_classes.clone();
+                let before_moved_slots = locals.moved_slots.clone();
                 let mut body_initializer = before.clone();
                 locals.push_scope();
                 let body_returned = validate_block(
@@ -1582,7 +1675,16 @@ fn validate_block(
                         "every reaching iteration must restore the same live class owners",
                     )]);
                 }
+                if !body_returned && locals.moved_slots != before_moved_slots {
+                    return Err(vec![diag(
+                        "backend.slots_loop_shape",
+                        "owner-slot state changes across a loop backedge",
+                        cond.span,
+                        "every reaching iteration must restore the same live owner-slot locals",
+                    )]);
+                }
                 locals.moved_classes = before_moved;
+                locals.moved_slots = before_moved_slots;
             }
             Stmt::FieldAssign {
                 field,
@@ -1703,6 +1805,10 @@ fn is_owned_native_array(ty: &Ty) -> bool {
 /// An array the backend has a descriptor for, in any binding mode.
 fn is_native_array(ty: &Ty) -> bool {
     ty.is_bool_array() || is_u32_array(ty)
+}
+
+fn is_owned_bool_slots(ty: &Ty) -> bool {
+    matches!(ty, Ty::Slots(payload) if payload.as_ref() == &Ty::Bool)
 }
 
 fn require_fixed_class<'a>(
@@ -2987,17 +3093,193 @@ fn validate_native_method_call(
     require_expr_type(expression, Ty::Unit, "native method result")
 }
 
+fn validate_local_bool_slot_container(
+    argument: &Expr,
+    locals: &ValidationLocals,
+    operation: &str,
+) -> Result<String, Vec<BackendError>> {
+    let ExprKind::Borrow {
+        array,
+        field: None,
+        mutable: true,
+    } = &argument.kind
+    else {
+        return Err(vec![diag(
+            "backend.slot_container",
+            "native owner-slot operation requires a direct mutable local borrow",
+            argument.span,
+            format!("`{operation}` must borrow `&mut` from a local `slots<bool>` owner"),
+        )]);
+    };
+    let expected = Ty::borrow(Mutability::Mut, Ty::slots(Ty::Bool));
+    if argument.ty.as_ref() != Some(&expected) {
+        return Err(vec![diag(
+            "backend.slot_container",
+            "native owner-slot borrow has the wrong checked type",
+            argument.span,
+            format!(
+                "`{operation}` container is annotated `{}`, expected `{}`",
+                argument
+                    .ty
+                    .as_ref()
+                    .map_or_else(|| "<missing>".into(), Ty::name),
+                expected.name()
+            ),
+        )]);
+    }
+    let Some(local) = locals.get(array) else {
+        return Err(vec![diag(
+            "backend.slot_container",
+            "native owner-slot operation names an unknown local",
+            argument.span,
+            format!("`{operation}` names `{array}`"),
+        )]);
+    };
+    if local.ty != Ty::slots(Ty::Bool) || !local.mutable {
+        return Err(vec![diag(
+            "backend.slot_container",
+            "native owner-slot operation requires writable Boolean-slot storage",
+            argument.span,
+            format!("`{array}` has type `{}`", local.ty.name()),
+        )]);
+    }
+    locals.require_live_slots(array, argument.span, operation)?;
+    Ok(array.clone())
+}
+
+fn validate_bool_slot_operation(
+    program: &Program,
+    expression: &Expr,
+    root_span_end: usize,
+    locals: &ValidationLocals,
+) -> Result<(), Vec<BackendError>> {
+    let ExprKind::SlotOp { op, args, .. } = &expression.kind else {
+        unreachable!("slot-operation validation is called only for a slot operation")
+    };
+    match op {
+        SlotOp::Alloc { elem } => {
+            if elem != &Ty::Bool {
+                return Err(vec![slots_unsupported(
+                    expression.span,
+                    format!("`alloc_slots` payload `{}`", elem.name()),
+                )]);
+            }
+            if args.len() != 1 {
+                return Err(vec![diag(
+                    "internal.control_plan_invalid",
+                    "native slot allocation lost its checked arity",
+                    expression.span,
+                    format!("retained operation has {} argument(s)", args.len()),
+                )]);
+            }
+            require_expr_type(
+                expression,
+                Ty::slots(Ty::Bool),
+                "native Boolean-slot allocation",
+            )?;
+            validate_expr(program, &args[0], root_span_end, locals)?;
+            require_expr_type(
+                &args[0],
+                Ty::Int(IntTy::U64),
+                "native Boolean-slot allocation length",
+            )
+        }
+        SlotOp::Take => {
+            if args.len() != 2 {
+                return Err(vec![diag(
+                    "internal.control_plan_invalid",
+                    "native slot take lost its checked arity",
+                    expression.span,
+                    format!("retained operation has {} argument(s)", args.len()),
+                )]);
+            }
+            validate_local_bool_slot_container(&args[0], locals, "slot_take")?;
+            validate_expr(program, &args[1], root_span_end, locals)?;
+            require_expr_type(&args[1], Ty::Int(IntTy::U64), "native slot-take index")?;
+            require_expr_type(expression, Ty::Bool, "native slot-take result")
+        }
+        SlotOp::Put => {
+            if args.len() != 3 {
+                return Err(vec![diag(
+                    "internal.control_plan_invalid",
+                    "native slot put lost its checked arity",
+                    expression.span,
+                    format!("retained operation has {} argument(s)", args.len()),
+                )]);
+            }
+            validate_local_bool_slot_container(&args[0], locals, "slot_put")?;
+            validate_expr(program, &args[1], root_span_end, locals)?;
+            require_expr_type(&args[1], Ty::Int(IntTy::U64), "native slot-put index")?;
+            validate_expr(program, &args[2], root_span_end, locals)?;
+            require_expr_type(&args[2], Ty::Bool, "native slot-put value")?;
+            require_expr_type(expression, Ty::Unit, "native slot-put result")
+        }
+    }
+}
+
+fn validate_bool_slots_initializer(
+    program: &Program,
+    expression: &Expr,
+    root_span_end: usize,
+    locals: &mut ValidationLocals,
+    destination: &str,
+) -> Result<(), Vec<BackendError>> {
+    require_expr_type(
+        expression,
+        Ty::slots(Ty::Bool),
+        "native Boolean-slot owner initializer",
+    )?;
+    match &expression.kind {
+        ExprKind::SlotOp {
+            op: SlotOp::Alloc { .. },
+            ..
+        } => validate_bool_slot_operation(program, expression, root_span_end, locals),
+        ExprKind::Var(source) => {
+            let Some(local) = locals.get(source) else {
+                return Err(vec![diag(
+                    "backend.slots_owner_value_position",
+                    "native owner-slot move names an unknown local",
+                    expression.span,
+                    format!("initializer of `{destination}` names `{source}`"),
+                )]);
+            };
+            if local.ty != Ty::slots(Ty::Bool) {
+                return Err(vec![diag(
+                    "backend.slots_owner_value_position",
+                    "native owner-slot move has a mismatched source",
+                    expression.span,
+                    format!("`{source}` has type `{}`", local.ty.name()),
+                )]);
+            }
+            if source == destination {
+                return Err(vec![diag(
+                    "backend.slots_owner_value_position",
+                    "native owner-slot value cannot move into itself",
+                    expression.span,
+                    format!("assignment target and source are both `{source}`"),
+                )]);
+            }
+            locals.require_live_slots(source, expression.span, "whole-owner move")?;
+            locals.mark_slots_moved(source);
+            Ok(())
+        }
+        _ => Err(vec![diag(
+            "backend.slots_owner_value_position",
+            "owner slots are outside this native value position",
+            expression.span,
+            "a local `slots<bool>` owner may be created by `alloc_slots<bool>` or moved directly from another local",
+        )]),
+    }
+}
+
 fn validate_expr(
     program: &Program,
     expression: &Expr,
     root_span_end: usize,
     locals: &ValidationLocals,
 ) -> Result<(), Vec<BackendError>> {
-    if let ExprKind::SlotOp { op, .. } = &expression.kind {
-        return Err(vec![slots_unsupported(
-            expression.span,
-            format!("operation `{}`", op.name()),
-        )]);
+    if matches!(expression.kind, ExprKind::SlotOp { .. }) {
+        return validate_bool_slot_operation(program, expression, root_span_end, locals);
     }
     if let ExprKind::IsSome { operand } = &expression.kind {
         if operand.ty.as_ref().is_some_and(Ty::is_affine_option) {
@@ -3033,6 +3315,21 @@ fn validate_expr(
                 return Err(vec![unsupported(
                     expression.span,
                     format!("array local `{name}` cannot be transported as a value"),
+                )]);
+            }
+            if is_owned_bool_slots(&local.ty) {
+                locals.require_live_slots(name, expression.span, "owner-slot expression")?;
+                return Err(vec![diag(
+                    "backend.slots_owner_value_position",
+                    "owner slots are outside this native value position",
+                    expression.span,
+                    "a whole `slots<bool>` owner moves only into an explicit local declaration or local assignment",
+                )]);
+            }
+            if matches!(local.ty, Ty::Slots(_)) {
+                return Err(vec![slots_unsupported(
+                    expression.span,
+                    format!("owner-slot local `{name}`"),
                 )]);
             }
             if matches!(local.ty, Ty::Class(_)) {
@@ -3338,7 +3635,9 @@ fn validate_expr(
                     local.ty,
                 )]);
             }
-            if !is_native_array(&local.ty) {
+            if is_owned_bool_slots(&local.ty) {
+                locals.require_live_slots(array, expression.span, "owner-slot length")?;
+            } else if !is_native_array(&local.ty) {
                 return Err(vec![unsupported(
                     expression.span,
                     format!(
@@ -3652,6 +3951,7 @@ pub(crate) fn require_local_value(
     role: &str,
 ) -> Result<(), Vec<BackendError>> {
     match ty {
+        Ty::Slots(payload) if payload.as_ref() == &Ty::Bool => Ok(()),
         Ty::Slots(_) => Err(vec![slots_unsupported(span, role)]),
         Ty::Int(integer) if !matches!(integer, IntTy::TParam(_)) => Ok(()),
         Ty::Bool => Ok(()),
@@ -3772,6 +4072,10 @@ const TRAP_NARROW_RANGE: u32 = 7;
 const TRAP_OPTION_NONE: u32 = 8;
 const TRAP_ARRAY_OOM: u32 = 9;
 const TRAP_ARRAY_OOB: u32 = 10;
+const TRAP_SLOTS_OOM: u32 = 11;
+const TRAP_SLOTS_OOB: u32 = 12;
+const TRAP_SLOTS_EMPTY: u32 = 13;
+const TRAP_SLOTS_OCCUPIED: u32 = 14;
 
 /// Internal aggregate representation for an option over a non-integer payload.
 /// This is deliberately not a C ABI promise: byte fields make the layout
@@ -3792,6 +4096,17 @@ const LLVM_ARRAY_U32: &str = "%sable.array.u32";
 /// absent and one owns the nested array descriptor. This remains local-only;
 /// it is deliberately not a source or C ABI.
 const LLVM_AFFINE_OPTION_BOOL_ARRAY: &str = "%sable.option.array.bool";
+
+/// One independently occupied Boolean owner cell. The tag is canonical zero
+/// (empty) or one (occupied); the payload byte is read only after the occupied
+/// guard succeeds. This is not an option or an ordinary copy-array element.
+const LLVM_SLOT_BOOL_CELL: &str = "%sable.slot.bool";
+
+/// Local-only owner-slot descriptor. A null pointer with length zero is both
+/// a live zero-length allocation and the neutral state left by a whole-owner
+/// move. Static ownership prevents operations on the latter, while cleanup is
+/// intentionally null-safe.
+const LLVM_SLOTS_BOOL: &str = "%sable.slots.bool";
 
 /// Nominal identity is the checked program's record tag, the same identity
 /// carried by interpreter/SVM values. Numeric names are deterministic and
@@ -3876,6 +4191,7 @@ struct ModuleSupport {
     needs_array_bool: bool,
     needs_array_u32: bool,
     needs_affine_option_bool_array: bool,
+    needs_slots_bool: bool,
     classes: BTreeSet<usize>,
     records: BTreeSet<usize>,
 }
@@ -3907,6 +4223,11 @@ impl ModuleSupport {
     fn require_affine_option_bool_array(&mut self) {
         self.needs_affine_option_bool_array = true;
         self.require_array_bool();
+    }
+
+    fn require_slots_bool(&mut self) {
+        self.needs_slots_bool = true;
+        self.needs_trap = true;
     }
 
     fn require_class(&mut self, program: &Program, class: usize) {
@@ -3971,9 +4292,15 @@ impl ModuleSupport {
             out.push_str(LLVM_ARRAY_U32);
             out.push_str(" = type { ptr, i64 }\n\n");
         }
-        if self.needs_array_bool || self.needs_array_u32 {
+        if self.needs_slots_bool {
+            out.push_str(LLVM_SLOT_BOOL_CELL);
+            out.push_str(" = type { i8, i8 }\n");
+            out.push_str(LLVM_SLOTS_BOOL);
+            out.push_str(" = type { ptr, i64 }\n\n");
+        }
+        if self.needs_array_bool || self.needs_array_u32 || self.needs_slots_bool {
             out.push_str(
-                "; target runtime hooks for owned array storage; allocation size is bytes\n\
+                "; target runtime hooks for owned contiguous storage; allocation size is bytes\n\
                  declare ptr @__sable_rt_array_alloc_v1(i64)\n\
                  declare void @__sable_rt_array_free_v1(ptr)\n\n",
             );
@@ -4016,11 +4343,13 @@ impl ModuleSupport {
             out.push_str(
                 "; __sable_rt_trap_v1 kinds: 1 add, 2 sub, 3 mul, 4 neg, \
                  5 div/rem zero, 6 signed div overflow, 7 narrow range, \
-                 8 option value of none, 9 array OOM, 10 array index OOB\n\
+                 8 option value of none, 9 array OOM, 10 array index OOB, \
+                 11 slots OOM, 12 slots index OOB, 13 slots empty, \
+                 14 slots occupied\n\
                  ; type_info bytes: result/destination, lhs/source, rhs; \
                  type codes u8..u64,i8..i64 = 1..8\n\
                  ; array traps use type_info 0: OOM lhs=len/rhs=0; \
-                 OOB lhs=index/rhs=len\n\
+                 OOB lhs=index/rhs=len; slots traps use the same payload shape\n\
                  declare void @llvm.trap() cold noreturn nounwind\n\n\
                  define weak void @__sable_rt_trap_v1(i32 %kind, i32 %type_info, \
                  i64 %lhs_bits, i64 %rhs_bits) nounwind {\n\
@@ -4072,6 +4401,10 @@ struct FunctionEmitter<'a, 'support> {
     /// action decides which cleanup-bearing RHS must survive while the old
     /// destination is destroyed.
     assignment_staging_slots: HashMap<Place, String>,
+    /// Checker-owned `slot_put` value identities. Even a Boolean payload is
+    /// materialized here before either destination guard so the backend
+    /// consumes the exact retained staging place and preserves source order.
+    slot_put_staging_slots: HashMap<Place, String>,
     late_entry_allocas: Vec<String>,
     next_local: usize,
     next_temp: usize,
@@ -4150,6 +4483,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             method: None,
             locals: HashMap::new(),
             assignment_staging_slots: HashMap::new(),
+            slot_put_staging_slots: HashMap::new(),
             late_entry_allocas: Vec::new(),
             next_local: 0,
             next_temp: 0,
@@ -4309,8 +4643,10 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .control
             .assignments()
             .filter_map(|action| match (action.ty(), action.staging()) {
-                (Ty::Class(class), AssignmentStaging::Temporary(place)) => {
-                    Some(Ok((place.clone(), *class, action.span())))
+                (ty, AssignmentStaging::Temporary(place))
+                    if matches!(ty, Ty::Class(_)) || is_owned_bool_slots(ty) =>
+                {
+                    Some(Ok((place.clone(), ty.clone(), action.span())))
                 }
                 (_, AssignmentStaging::Direct) => None,
                 (ty, AssignmentStaging::Temporary(_)) => Some(Err(vec![diag(
@@ -4325,15 +4661,54 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 )])),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for (place, class, span) in assignment_staging {
+        for (place, ty, span) in assignment_staging {
+            let slot_ty = match ty {
+                Ty::Class(class) => llvm_class_ty(class),
+                ty if is_owned_bool_slots(&ty) => LLVM_SLOTS_BOOL.to_string(),
+                _ => unreachable!("assignment staging filter admitted this type"),
+            };
             let slot = self.new_slot();
-            self.instruction(format!("{slot} = alloca {}", llvm_class_ty(class)));
+            self.instruction(format!("{slot} = alloca {slot_ty}"));
             if self.assignment_staging_slots.insert(place, slot).is_some() {
                 return Err(vec![diag(
                     "internal.control_plan_invalid",
                     "duplicate LLVM assignment temporary",
                     span,
                     "one planned assignment temporary must identify one entry slot",
+                )]);
+            }
+        }
+        let slot_put_staging = self
+            .control
+            .slot_actions()
+            .filter_map(|action| match action.kind() {
+                SlotActionKind::Put { staging, .. } => {
+                    Some((staging.clone(), action.payload().clone(), action.span()))
+                }
+                SlotActionKind::Alloc { .. } | SlotActionKind::Take { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        for (place, payload, span) in slot_put_staging {
+            if !place.is_root() || payload != Ty::Bool {
+                return Err(vec![diag(
+                    "backend.slots_unsupported",
+                    "native slot-put staging is outside the Boolean-local subset",
+                    span,
+                    format!(
+                        "retained temporary `{}` stages payload `{}`",
+                        place.render(),
+                        payload.name()
+                    ),
+                )]);
+            }
+            let slot = self.new_slot();
+            self.instruction(format!("{slot} = alloca i1"));
+            if self.slot_put_staging_slots.insert(place, slot).is_some() {
+                return Err(vec![diag(
+                    "internal.control_plan_invalid",
+                    "duplicate LLVM slot-put staging temporary",
+                    span,
+                    "one retained slot-put value identity must identify one entry slot",
                 )]);
             }
         }
@@ -4443,6 +4818,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ty if is_affine_bool_option(&ty.clone()) => {
                 self.support.require_affine_option_bool_array()
             }
+            ref ty if is_owned_bool_slots(ty) => self.support.require_slots_bool(),
             Ty::Record(record) => self.support.require_record(record),
             ref named if named.class_index().is_some() => {
                 let class = named
@@ -4479,6 +4855,25 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             .statement_trap_sites(self.active_scope(), statement)
             .map_err(|error| vec![control_plan_backend_error(error)])?;
         self.consume_trap_sites(&sites, None)
+    }
+
+    /// Authenticate the complete checker-sealed slot transition before
+    /// emitting operand effects or allocation/mutation. The exact action also
+    /// owns the two direct terminal trap identities; child expressions
+    /// consume their own sites recursively when they are evaluated.
+    fn slot_action_preflight(&self, expression: &Expr) -> Result<SlotAction, Vec<BackendError>> {
+        let scope = self.active_scope();
+        let action = self
+            .control
+            .slot_action(scope, expression)
+            .map_err(|error| vec![control_plan_backend_error(error)])?
+            .clone();
+        let sites = self
+            .control
+            .slot_action_trap_sites(&action)
+            .map_err(|error| vec![control_plan_backend_error(error)])?;
+        self.consume_trap_sites(&sites, Some(scope))?;
+        Ok(action)
     }
 
     fn consume_trap_sites(
@@ -4694,6 +5089,44 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         )]);
                     }
                     let ty = action.ty().clone();
+                    if is_owned_bool_slots(&ty) {
+                        let (Some(_), AssignmentStaging::Temporary(staging)) =
+                            (action.previous(), action.staging())
+                        else {
+                            return Err(vec![diag(
+                                "internal.control_plan_invalid",
+                                "owner-slot assignment lacks its planned replacement phases",
+                                *name_span,
+                                "an owner-slot replacement must stage, release-if-live, then install",
+                            )]);
+                        };
+                        let Some(scratch) = self.assignment_staging_slots.get(staging).cloned()
+                        else {
+                            return Err(vec![diag(
+                                "internal.control_plan_invalid",
+                                "owner-slot assignment has no planned staging slot",
+                                *name_span,
+                                format!("missing temporary `{}`", staging.render()),
+                            )]);
+                        };
+                        let staged = self.emit_bool_slots_initializer(value)?;
+                        self.instruction(format!(
+                            "store {LLVM_SLOTS_BOOL} {}, ptr {scratch}",
+                            staged.operand.expect("owner-slot assignment value")
+                        ));
+                        self.emit_assignment_previous(&action)?;
+                        let installed = self.new_temp();
+                        self.instruction(format!(
+                            "{installed} = load {LLVM_SLOTS_BOOL}, ptr {scratch}"
+                        ));
+                        self.instruction(format!(
+                            "store {LLVM_SLOTS_BOOL} {installed}, ptr {slot}"
+                        ));
+                        self.instruction(format!(
+                            "store {LLVM_SLOTS_BOOL} zeroinitializer, ptr {scratch}"
+                        ));
+                        continue;
+                    }
                     if let Ty::Class(class) = ty {
                         let (Some(_), AssignmentStaging::Temporary(staging)) =
                             (action.previous(), action.staging())
@@ -5032,7 +5465,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                 self.arm_cleanup(name)?;
                 return Ok(());
             }
-            let value = if ty.is_owned_bool_array() {
+            let value = if is_owned_bool_slots(&ty) {
+                self.emit_bool_slots_initializer(init)?
+            } else if ty.is_owned_bool_array() {
                 self.emit_fresh_bool_array(init)?
             } else if is_owned_u32_array(ty.clone()) {
                 self.emit_fresh_u32_array(init)?
@@ -5780,6 +6215,357 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         }
     }
 
+    fn bool_slots_descriptor(&mut self, ptr: String, len: String) -> Value {
+        let with_ptr = self.new_temp();
+        self.instruction(format!(
+            "{with_ptr} = insertvalue {LLVM_SLOTS_BOOL} zeroinitializer, ptr {ptr}, 0"
+        ));
+        let descriptor = self.new_temp();
+        self.instruction(format!(
+            "{descriptor} = insertvalue {LLVM_SLOTS_BOOL} {with_ptr}, i64 {len}, 1"
+        ));
+        Value {
+            ty: Ty::slots(Ty::Bool),
+            operand: Some(descriptor),
+        }
+    }
+
+    fn emit_bool_slots_initializer(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Value, Vec<BackendError>> {
+        match &expression.kind {
+            ExprKind::SlotOp {
+                op: SlotOp::Alloc { .. },
+                ..
+            } => self.emit_expr(expression),
+            ExprKind::Var(source) => {
+                let Some(local) = self.locals.get(source) else {
+                    return Err(vec![diag(
+                        "internal.control_plan_invalid",
+                        "native owner-slot move source has no local storage",
+                        expression.span,
+                        format!("missing local `{source}`"),
+                    )]);
+                };
+                if !is_owned_bool_slots(&local.ty) {
+                    return Err(vec![slots_unsupported(
+                        expression.span,
+                        format!("whole-owner move from `{source}`"),
+                    )]);
+                }
+                let source_slot = local.slot.clone();
+                let descriptor = self.new_temp();
+                self.instruction(format!(
+                    "{descriptor} = load {LLVM_SLOTS_BOOL}, ptr {source_slot}"
+                ));
+                // The source retains its exact cleanup candidate. Neutralize
+                // its runtime storage immediately so that candidate is a
+                // no-op and the allocation has exactly one executable owner.
+                self.instruction(format!(
+                    "store {LLVM_SLOTS_BOOL} zeroinitializer, ptr {source_slot}"
+                ));
+                Ok(Value {
+                    ty: Ty::slots(Ty::Bool),
+                    operand: Some(descriptor),
+                })
+            }
+            _ => Err(vec![diag(
+                "internal.control_plan_invalid",
+                "native owner-slot initializer changed after validation",
+                expression.span,
+                "expected a retained allocation or direct local move",
+            )]),
+        }
+    }
+
+    fn emit_bool_slots_allocation(&mut self, len: &Expr) -> Result<Value, Vec<BackendError>> {
+        let len = self
+            .emit_expr(len)?
+            .operand
+            .expect("validated Boolean-slot allocation length");
+        let over_cap = self.new_temp();
+        self.instruction(format!("{over_cap} = icmp ugt i64 {len}, {ARRAY_CAPACITY}"));
+        self.emit_trap_branch(&over_cap, TRAP_SLOTS_OOM, 0, &len, "0");
+
+        let empty = self.new_temp();
+        self.instruction(format!("{empty} = icmp eq i64 {len}, 0"));
+        let zero_label = self.new_label("slots.bool.zero");
+        let alloc_label = self.new_label("slots.bool.alloc");
+        let merge_label = self.new_label("slots.bool.ready");
+        self.terminate(format!(
+            "br i1 {empty}, label %{zero_label}, label %{alloc_label}"
+        ));
+
+        self.start_block(zero_label.clone());
+        self.terminate(format!("br label %{merge_label}"));
+
+        self.start_block(alloc_label);
+        // The logical cap makes this multiplication exact in i64. A cell is
+        // two bytes because both fields are i8 and therefore have alignment 1.
+        let bytes = self.new_temp();
+        self.instruction(format!("{bytes} = mul i64 {len}, 2"));
+        let ptr = self.new_temp();
+        self.instruction(format!(
+            "{ptr} = call ptr @__sable_rt_array_alloc_v1(i64 {bytes})"
+        ));
+        let failed = self.new_temp();
+        self.instruction(format!("{failed} = icmp eq ptr {ptr}, null"));
+        self.emit_trap_branch(&failed, TRAP_SLOTS_OOM, 0, &len, "0");
+
+        let fill_predecessor = self.current_label().to_owned();
+        let fill_head = self.new_label("slots.bool.fill.head");
+        let fill_body = self.new_label("slots.bool.fill.body");
+        let fill_end = self.new_label("slots.bool.fill.end");
+        self.terminate(format!("br label %{fill_head}"));
+
+        self.start_block(fill_head.clone());
+        let index = self.new_temp();
+        let next = format!("%slots.bool.fill.next.{}", self.next_temp);
+        self.next_temp += 1;
+        self.instruction(format!(
+            "{index} = phi i64 [ 0, %{fill_predecessor} ], [ {next}, %{fill_body} ]"
+        ));
+        let more = self.new_temp();
+        self.instruction(format!("{more} = icmp ult i64 {index}, {len}"));
+        self.terminate(format!(
+            "br i1 {more}, label %{fill_body}, label %{fill_end}"
+        ));
+
+        self.start_block(fill_body.clone());
+        let cell = self.new_temp();
+        self.instruction(format!(
+            "{cell} = getelementptr {LLVM_SLOT_BOOL_CELL}, ptr {ptr}, i64 {index}"
+        ));
+        self.instruction(format!(
+            "store {LLVM_SLOT_BOOL_CELL} zeroinitializer, ptr {cell}, align 1"
+        ));
+        self.instruction(format!("{next} = add i64 {index}, 1"));
+        self.terminate(format!("br label %{fill_head}"));
+
+        self.start_block(fill_end.clone());
+        self.terminate(format!("br label %{merge_label}"));
+        self.start_block(merge_label);
+        let merged_ptr = self.new_temp();
+        self.instruction(format!(
+            "{merged_ptr} = phi ptr [ null, %{zero_label} ], [ {ptr}, %{fill_end} ]"
+        ));
+        Ok(self.bool_slots_descriptor(merged_ptr, len))
+    }
+
+    fn load_bool_slots_parts(&mut self, owner: &str) -> (String, String) {
+        let slot = self
+            .locals
+            .get(owner)
+            .expect("validated Boolean-slot local")
+            .slot
+            .clone();
+        self.load_bool_slots_parts_from_slot(&slot)
+    }
+
+    fn load_bool_slots_parts_from_slot(&mut self, slot: &str) -> (String, String) {
+        let descriptor = self.new_temp();
+        self.instruction(format!("{descriptor} = load {LLVM_SLOTS_BOOL}, ptr {slot}"));
+        let ptr = self.new_temp();
+        self.instruction(format!(
+            "{ptr} = extractvalue {LLVM_SLOTS_BOOL} {descriptor}, 0"
+        ));
+        let len = self.new_temp();
+        self.instruction(format!(
+            "{len} = extractvalue {LLVM_SLOTS_BOOL} {descriptor}, 1"
+        ));
+        (ptr, len)
+    }
+
+    fn emit_bool_slots_bounds_guard(&mut self, index: &str, len: &str) {
+        let outside = self.new_temp();
+        self.instruction(format!("{outside} = icmp uge i64 {index}, {len}"));
+        self.emit_trap_branch(&outside, TRAP_SLOTS_OOB, 0, index, len);
+    }
+
+    fn bool_slot_cell_parts(&mut self, ptr: &str, index: &str) -> (String, String) {
+        let cell = self.new_temp();
+        self.instruction(format!(
+            "{cell} = getelementptr {LLVM_SLOT_BOOL_CELL}, ptr {ptr}, i64 {index}"
+        ));
+        let tag = self.new_temp();
+        self.instruction(format!(
+            "{tag} = getelementptr {LLVM_SLOT_BOOL_CELL}, ptr {cell}, i32 0, i32 0"
+        ));
+        let payload = self.new_temp();
+        self.instruction(format!(
+            "{payload} = getelementptr {LLVM_SLOT_BOOL_CELL}, ptr {cell}, i32 0, i32 1"
+        ));
+        (tag, payload)
+    }
+
+    fn retained_bool_slot_owner(
+        &self,
+        action: &SlotAction,
+        argument: &Expr,
+        operation: &str,
+    ) -> Result<String, Vec<BackendError>> {
+        if action.payload() != &Ty::Bool {
+            return Err(vec![slots_unsupported(
+                action.span(),
+                format!(
+                    "retained `{operation}` payload `{}`",
+                    action.payload().name()
+                ),
+            )]);
+        }
+        let Some(place) = action.container() else {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: action.span(),
+                message: format!("retained `{operation}` action has no container"),
+            })]);
+        };
+        let ExprKind::Borrow {
+            array,
+            field: None,
+            mutable: true,
+        } = &argument.kind
+        else {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: argument.span,
+                message: format!(
+                    "retained `{operation}` container is not a direct mutable local borrow"
+                ),
+            })]);
+        };
+        if !place.is_root() || place.root() != array {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: action.span(),
+                message: format!(
+                    "retained `{operation}` container `{}` does not match local `{array}`",
+                    place.render()
+                ),
+            })]);
+        }
+        let Some(local) = self.locals.get(array) else {
+            return Err(vec![control_plan_backend_error(PlanError {
+                span: argument.span,
+                message: format!("retained `{operation}` local `{array}` has no LLVM slot"),
+            })]);
+        };
+        if !is_owned_bool_slots(&local.ty) {
+            return Err(vec![slots_unsupported(
+                argument.span,
+                format!("retained `{operation}` container `{array}`"),
+            )]);
+        }
+        Ok(array.clone())
+    }
+
+    fn emit_bool_slot_operation(
+        &mut self,
+        expression: &Expr,
+        action: &SlotAction,
+    ) -> Result<Value, Vec<BackendError>> {
+        let ExprKind::SlotOp { op, args, .. } = &expression.kind else {
+            unreachable!("slot lowering is called only for slot operations")
+        };
+        match (op, action.kind()) {
+            (SlotOp::Alloc { elem }, SlotActionKind::Alloc { .. }) => {
+                if elem != &Ty::Bool || action.payload() != &Ty::Bool || args.len() != 1 {
+                    return Err(vec![control_plan_backend_error(PlanError {
+                        span: action.span(),
+                        message:
+                            "native slot allocation disagrees with its retained Boolean action"
+                                .into(),
+                    })]);
+                }
+                self.emit_bool_slots_allocation(&args[0])
+            }
+            (SlotOp::Take, SlotActionKind::Take { .. }) => {
+                if args.len() != 2 || action.result_ty() != &Ty::Bool {
+                    return Err(vec![control_plan_backend_error(PlanError {
+                        span: action.span(),
+                        message: "native slot take disagrees with its retained result or arity"
+                            .into(),
+                    })]);
+                }
+                // The container expression is first in source order. Resolve
+                // and load its descriptor before evaluating the index.
+                let owner = self.retained_bool_slot_owner(action, &args[0], "slot_take")?;
+                let (ptr, len) = self.load_bool_slots_parts(&owner);
+                let index = self
+                    .emit_expr(&args[1])?
+                    .operand
+                    .expect("validated slot-take index");
+                self.emit_bool_slots_bounds_guard(&index, &len);
+                let (tag_ptr, payload_ptr) = self.bool_slot_cell_parts(&ptr, &index);
+                let tag = self.new_temp();
+                self.instruction(format!("{tag} = load i8, ptr {tag_ptr}, align 1"));
+                let empty = self.new_temp();
+                self.instruction(format!("{empty} = icmp eq i8 {tag}, 0"));
+                self.emit_trap_branch(&empty, TRAP_SLOTS_EMPTY, 0, &index, &len);
+                let payload = self.new_temp();
+                self.instruction(format!("{payload} = load i8, ptr {payload_ptr}, align 1"));
+                self.instruction(format!("store i8 0, ptr {tag_ptr}, align 1"));
+                let value = self.new_temp();
+                self.instruction(format!("{value} = trunc i8 {payload} to i1"));
+                Ok(Value {
+                    ty: Ty::Bool,
+                    operand: Some(value),
+                })
+            }
+            (SlotOp::Put, SlotActionKind::Put { staging, .. }) => {
+                if args.len() != 3 || action.result_ty() != &Ty::Unit || !staging.is_root() {
+                    return Err(vec![control_plan_backend_error(PlanError {
+                        span: action.span(),
+                        message: "native slot put disagrees with its retained result, arity, or staging identity"
+                            .into(),
+                    })]);
+                }
+                // Source order is container, index, incoming value. The value
+                // enters the exact plan-owned scratch slot before either
+                // bounds or occupancy is consulted.
+                let owner = self.retained_bool_slot_owner(action, &args[0], "slot_put")?;
+                let (ptr, len) = self.load_bool_slots_parts(&owner);
+                let index = self
+                    .emit_expr(&args[1])?
+                    .operand
+                    .expect("validated slot-put index");
+                let incoming = self
+                    .emit_expr(&args[2])?
+                    .operand
+                    .expect("validated slot-put value");
+                let Some(scratch) = self.slot_put_staging_slots.get(staging).cloned() else {
+                    return Err(vec![control_plan_backend_error(PlanError {
+                        span: action.span(),
+                        message: format!(
+                            "native slot put has no storage for retained temporary `{}`",
+                            staging.render()
+                        ),
+                    })]);
+                };
+                self.instruction(format!("store i1 {incoming}, ptr {scratch}"));
+                self.emit_bool_slots_bounds_guard(&index, &len);
+                let (tag_ptr, payload_ptr) = self.bool_slot_cell_parts(&ptr, &index);
+                let tag = self.new_temp();
+                self.instruction(format!("{tag} = load i8, ptr {tag_ptr}, align 1"));
+                let occupied = self.new_temp();
+                self.instruction(format!("{occupied} = icmp ne i8 {tag}, 0"));
+                self.emit_trap_branch(&occupied, TRAP_SLOTS_OCCUPIED, 0, &index, &len);
+                let staged = self.new_temp();
+                self.instruction(format!("{staged} = load i1, ptr {scratch}"));
+                let payload = self.new_temp();
+                self.instruction(format!("{payload} = zext i1 {staged} to i8"));
+                self.instruction(format!("store i8 {payload}, ptr {payload_ptr}, align 1"));
+                self.instruction(format!("store i8 1, ptr {tag_ptr}, align 1"));
+                Ok(Value {
+                    ty: Ty::Unit,
+                    operand: None,
+                })
+            }
+            _ => Err(vec![control_plan_backend_error(PlanError {
+                span: action.span(),
+                message: "native owner-slot syntax no longer matches its retained action".into(),
+            })]),
+        }
+    }
+
     fn emit_native_array_store(
         &mut self,
         array: &str,
@@ -6034,12 +6820,22 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ValueDropRecipe::ReleaseArray { element } if element == &Ty::Int(IntTy::U32) => {
                 self.emit_u32_array_drop(name)
             }
+            ValueDropRecipe::ReleaseSlots { payload, occupied }
+                if payload == &Ty::Bool
+                    && occupied.is_none()
+                    && is_owned_bool_slots(action.ty()) =>
+            {
+                self.emit_bool_slots_drop(name)
+            }
             ValueDropRecipe::ReleaseSlots { .. } => {
                 return Err(vec![diag(
                     "backend.slots_cleanup_unsupported",
-                    "LLVM cannot lower owner-slot cleanup",
+                    "LLVM cannot lower this owner-slot cleanup recipe",
                     span,
-                    format!("`{name}` has cleanup-bearing type `{}`", action.ty().name()),
+                    format!(
+                        "`{name}` has cleanup-bearing type `{}`; only scalar Boolean occupied cells are admitted",
+                        action.ty().name()
+                    ),
                 )]);
             }
             ValueDropRecipe::DropPresent(payload)
@@ -6090,6 +6886,77 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
         self.instruction(format!("call void @__sable_rt_array_free_v1(ptr {ptr})"));
         self.terminate(format!("br label %{done_label}"));
         self.start_block(done_label);
+    }
+
+    fn emit_bool_slots_drop(&mut self, owner: &str) {
+        let slot = self
+            .locals
+            .get(owner)
+            .expect("validated Boolean-slot cleanup local")
+            .slot
+            .clone();
+        let (ptr, len) = self.load_bool_slots_parts_from_slot(&slot);
+        let absent = self.new_temp();
+        self.instruction(format!("{absent} = icmp eq ptr {ptr}, null"));
+        let scan_start = self.new_label("slots.bool.drop.start");
+        let scan_head = self.new_label("slots.bool.drop.head");
+        let scan_body = self.new_label("slots.bool.drop.body");
+        let clear = self.new_label("slots.bool.drop.clear");
+        let latch = self.new_label("slots.bool.drop.latch");
+        let free = self.new_label("slots.bool.drop.free");
+        let done = self.new_label("slots.bool.drop.done");
+        self.terminate(format!(
+            "br i1 {absent}, label %{done}, label %{scan_start}"
+        ));
+
+        self.start_block(scan_start.clone());
+        self.terminate(format!("br label %{scan_head}"));
+
+        self.start_block(scan_head.clone());
+        let cursor = self.new_temp();
+        let next = format!("%slots.bool.drop.next.{}", self.next_temp);
+        self.next_temp += 1;
+        self.instruction(format!(
+            "{cursor} = phi i64 [ {len}, %{scan_start} ], [ {next}, %{latch} ]"
+        ));
+        let more = self.new_temp();
+        self.instruction(format!("{more} = icmp ugt i64 {cursor}, 0"));
+        self.terminate(format!("br i1 {more}, label %{scan_body}, label %{free}"));
+
+        self.start_block(scan_body);
+        self.instruction(format!("{next} = sub i64 {cursor}, 1"));
+        let cell = self.new_temp();
+        self.instruction(format!(
+            "{cell} = getelementptr {LLVM_SLOT_BOOL_CELL}, ptr {ptr}, i64 {next}"
+        ));
+        let tag_ptr = self.new_temp();
+        self.instruction(format!(
+            "{tag_ptr} = getelementptr {LLVM_SLOT_BOOL_CELL}, ptr {cell}, i32 0, i32 0"
+        ));
+        let tag = self.new_temp();
+        self.instruction(format!("{tag} = load i8, ptr {tag_ptr}, align 1"));
+        let occupied = self.new_temp();
+        self.instruction(format!("{occupied} = icmp ne i8 {tag}, 0"));
+        self.terminate(format!("br i1 {occupied}, label %{clear}, label %{latch}"));
+
+        self.start_block(clear);
+        // Neutralize before recursively destroying the payload. Boolean has
+        // no child action, but retaining this order makes the cell lifecycle
+        // identical to the recursive recipe and keeps later widening honest.
+        self.instruction(format!("store i8 0, ptr {tag_ptr}, align 1"));
+        self.terminate(format!("br label %{latch}"));
+
+        self.start_block(latch.clone());
+        self.terminate(format!("br label %{scan_head}"));
+
+        self.start_block(free);
+        self.instruction(format!("call void @__sable_rt_array_free_v1(ptr {ptr})"));
+        self.terminate(format!("br label %{done}"));
+
+        self.start_block(done);
+        self.instruction(format!(
+            "store {LLVM_SLOTS_BOOL} zeroinitializer, ptr {slot}"
+        ));
     }
 
     fn emit_fixed_class_drop(
@@ -6348,8 +7215,19 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     }
 
     fn emit_expr(&mut self, expression: &Expr) -> Result<Value, Vec<BackendError>> {
-        self.consume_expression_trap_sites(expression)?;
+        let slot_action = if matches!(expression.kind, ExprKind::SlotOp { .. }) {
+            Some(self.slot_action_preflight(expression)?)
+        } else {
+            self.consume_expression_trap_sites(expression)?;
+            None
+        };
         match &expression.kind {
+            ExprKind::SlotOp { .. } => self.emit_bool_slot_operation(
+                expression,
+                slot_action
+                    .as_ref()
+                    .expect("slot-operation preflight produced its exact action"),
+            ),
             ExprKind::IntLit(value) => Ok(Value {
                 ty: expression.ty.clone().expect("validated literal type"),
                 operand: Some(value.to_string()),
@@ -6416,7 +7294,9 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             }
             ExprKind::Len { array } => {
                 let ty = self.locals[array].ty.clone();
-                let (_, len) = if ty.is_bool_array() {
+                let (_, len) = if is_owned_bool_slots(&ty) {
+                    self.load_bool_slots_parts(array)
+                } else if ty.is_bool_array() {
                     self.load_bool_array_parts(array)
                 } else {
                     self.load_u32_array_parts(array)
@@ -7451,6 +8331,7 @@ pub(crate) fn llvm_ty(ty: Ty) -> Option<String> {
         ty if ty.is_bool_array() => LLVM_ARRAY_BOOL.into(),
         ty if is_u32_array(&ty.clone()) => LLVM_ARRAY_U32.into(),
         ty if is_affine_bool_option(&ty.clone()) => LLVM_AFFINE_OPTION_BOOL_ARRAY.into(),
+        ref ty if is_owned_bool_slots(ty) => LLVM_SLOTS_BOOL.into(),
         Ty::Class(class) => llvm_class_ty(class),
         // A class borrow is a pointer whichever way it is bound: the IR type
         // is blind to mutability, and only the mangled symbol distinguishes
@@ -7957,9 +8838,12 @@ fn unsupported(span: Span, detail: impl Into<String>) -> BackendError {
 fn slots_unsupported(span: Span, role: impl AsRef<str>) -> BackendError {
     diag(
         "backend.slots_unsupported",
-        "owner slots have no LLVM representation yet",
+        "owner slots are outside the native Boolean-local subset",
         span,
-        format!("{} cannot cross the native backend boundary", role.as_ref()),
+        format!(
+            "{}; LLVM lowering admits only direct local `slots<bool>` storage and keeps slot call ABIs, class/record fields, other payloads, and Vec/class transport closed",
+            role.as_ref()
+        ),
     )
 }
 
@@ -8032,7 +8916,7 @@ mod tests {
     use crate::scan::{Clause, ClauseKind};
 
     #[test]
-    fn owner_slot_operations_stop_at_the_native_backend_boundary() {
+    fn non_boolean_owner_slot_operations_stop_at_the_native_backend_boundary() {
         let operation = expression(
             ExprKind::SlotOp {
                 op: crate::ast::SlotOp::Alloc {
@@ -8049,7 +8933,7 @@ mod tests {
             1,
             &ValidationLocals::new(),
         )
-        .expect_err("owner slots have no native representation or operation semantics yet");
+        .expect_err("non-Boolean owner slots have no native representation or operation semantics");
         assert_eq!(errors[0].name, "backend.slots_unsupported");
     }
 
@@ -8059,6 +8943,303 @@ mod tests {
             span: Span::new(0, 1),
             ty: Some(ty),
         }
+    }
+
+    fn expression_at(kind: ExprKind, ty: Ty, start: usize) -> Expr {
+        Expr {
+            kind,
+            span: Span::new(start, start + 1),
+            ty: Some(ty),
+        }
+    }
+
+    fn bool_slots_alloc(start: usize, len: i128) -> Expr {
+        Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Alloc { elem: Ty::Bool },
+                op_span: Span::new(start, start + 1),
+                args: vec![expression_at(
+                    ExprKind::IntLit(len),
+                    Ty::Int(IntTy::U64),
+                    start + 1,
+                )],
+            },
+            span: Span::new(start, start + 3),
+            ty: Some(Ty::slots(Ty::Bool)),
+        }
+    }
+
+    fn bool_slots_borrow(name: &str, start: usize) -> Expr {
+        expression_at(
+            ExprKind::Borrow {
+                array: name.into(),
+                field: None,
+                mutable: true,
+            },
+            Ty::borrow(Mutability::Mut, Ty::slots(Ty::Bool)),
+            start,
+        )
+    }
+
+    fn bool_slots_put(name: &str, start: usize) -> Expr {
+        let index = Expr {
+            kind: ExprKind::Binary {
+                op: BinOp::Add,
+                op_span: Span::new(start + 2, start + 3),
+                lhs: Box::new(expression_at(
+                    ExprKind::IntLit(0),
+                    Ty::Int(IntTy::U64),
+                    start + 20,
+                )),
+                rhs: Box::new(expression_at(
+                    ExprKind::IntLit(0),
+                    Ty::Int(IntTy::U64),
+                    start + 21,
+                )),
+            },
+            span: Span::new(start + 2, start + 3),
+            ty: Some(Ty::Int(IntTy::U64)),
+        };
+        Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Put,
+                op_span: Span::new(start, start + 1),
+                args: vec![
+                    bool_slots_borrow(name, start + 1),
+                    index,
+                    expression_at(ExprKind::BoolLit(true), Ty::Bool, start + 3),
+                ],
+            },
+            span: Span::new(start, start + 4),
+            ty: Some(Ty::Unit),
+        }
+    }
+
+    fn bool_slots_take(name: &str, start: usize) -> Expr {
+        Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Take,
+                op_span: Span::new(start, start + 1),
+                args: vec![
+                    bool_slots_borrow(name, start + 1),
+                    expression_at(ExprKind::IntLit(0), Ty::Int(IntTy::U64), start + 2),
+                ],
+            },
+            span: Span::new(start, start + 3),
+            ty: Some(Ty::Bool),
+        }
+    }
+
+    fn bool_slots_native_function() -> Fn {
+        function(
+            "bool_slots_native",
+            Ty::Unit,
+            vec![
+                Stmt::Decl {
+                    ty: Ty::slots(Ty::Bool),
+                    name: "source".into(),
+                    name_span: Span::new(1, 2),
+                    init: Some(bool_slots_alloc(10, 2)),
+                    mutable: true,
+                },
+                Stmt::Decl {
+                    ty: Ty::slots(Ty::Bool),
+                    name: "other".into(),
+                    name_span: Span::new(5, 6),
+                    init: Some(bool_slots_alloc(20, 1)),
+                    mutable: true,
+                },
+                Stmt::ExprStmt(bool_slots_put("source", 30)),
+                Stmt::Decl {
+                    ty: Ty::slots(Ty::Bool),
+                    name: "moved".into(),
+                    name_span: Span::new(2, 3),
+                    init: Some(expression_at(
+                        ExprKind::Var("source".into()),
+                        Ty::slots(Ty::Bool),
+                        40,
+                    )),
+                    mutable: true,
+                },
+                Stmt::Decl {
+                    ty: Ty::Bool,
+                    name: "answer".into(),
+                    name_span: Span::new(3, 4),
+                    init: Some(bool_slots_take("moved", 50)),
+                    mutable: false,
+                },
+                Stmt::Decl {
+                    ty: Ty::slots(Ty::Bool),
+                    name: "empty".into(),
+                    name_span: Span::new(4, 5),
+                    init: Some(bool_slots_alloc(60, 0)),
+                    mutable: false,
+                },
+            ],
+        )
+    }
+
+    #[test]
+    fn boolean_owner_slots_lower_distinct_cells_exact_staging_moves_and_reverse_cleanup() {
+        let source = program(vec![bool_slots_native_function()]);
+        let control = ControlProgram::build(&source).expect("exact Boolean-slot control plan");
+        let ir = emit_program_with_control(&source, &control, 100, &EmitOptions::default())
+            .expect("direct local Boolean owner slots lower natively");
+
+        assert!(ir.contains("%sable.slot.bool = type { i8, i8 }"), "{ir}");
+        assert!(ir.contains("%sable.slots.bool = type { ptr, i64 }"), "{ir}");
+        assert!(!ir.contains("%sable.array.bool = type"), "{ir}");
+        assert!(!ir.contains("%sable.option.bool = type"), "{ir}");
+        assert!(ir.contains("mul i64") && ir.contains(", 2"), "{ir}");
+        assert!(ir.contains("alloca i1"), "{ir}");
+        assert!(
+            ir.contains(".slots.bool.zero") && ir.contains(".slots.bool.alloc"),
+            "{ir}"
+        );
+
+        let container = ir
+            .find("load %sable.slots.bool")
+            .expect("slot_put first evaluates its owner descriptor");
+        let index = ir
+            .find("call { i64, i1 } @llvm.uadd.with.overflow.i64")
+            .expect("slot_put then evaluates its checked index");
+        let staged = ir[index..]
+            .find("store i1 1, ptr")
+            .map(|offset| index + offset)
+            .expect("slot_put stages the incoming value");
+        let bounds = ir[staged..]
+            .find(&format!("i32 {TRAP_SLOTS_OOB}"))
+            .map(|offset| staged + offset)
+            .expect("slot_put retains its bounds trap after staging");
+        assert!(
+            container < index && index < staged && staged < bounds,
+            "{ir}"
+        );
+
+        let fail_site = |kind: u32| format!("call void @__sable_rt_fail_v1(i32 {kind},");
+        let oom_sites = ir
+            .match_indices(&fail_site(TRAP_SLOTS_OOM))
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        assert!(oom_sites.len() >= 2, "{ir}");
+        let allocation = ir
+            .find("call ptr @__sable_rt_array_alloc_v1")
+            .expect("non-empty slots use the audited allocation hook");
+        assert!(
+            oom_sites[0] < allocation && allocation < oom_sites[1],
+            "{ir}"
+        );
+
+        let oob_sites = ir
+            .match_indices(&fail_site(TRAP_SLOTS_OOB))
+            .map(|(offset, _)| offset)
+            .collect::<Vec<_>>();
+        assert_eq!(oob_sites.len(), 2, "{ir}");
+        let occupied = ir
+            .find(&fail_site(TRAP_SLOTS_OCCUPIED))
+            .expect("slot_put retains its occupied-cell trap");
+        let empty = ir
+            .find(&fail_site(TRAP_SLOTS_EMPTY))
+            .expect("slot_take retains its empty-cell trap");
+        assert!(
+            staged < oob_sites[0]
+                && oob_sites[0] < occupied
+                && occupied < oob_sites[1]
+                && oob_sites[1] < empty,
+            "{ir}"
+        );
+
+        let move_load = ir
+            .find("load %sable.slots.bool")
+            .expect("whole-owner move loads the descriptor");
+        let move_neutral = ir[move_load..]
+            .find("store %sable.slots.bool zeroinitializer")
+            .map(|offset| move_load + offset)
+            .expect("whole-owner move neutralizes its source");
+        assert!(move_load < move_neutral, "{ir}");
+
+        assert!(ir.contains("slots.bool.drop.head"), "{ir}");
+        assert!(ir.contains("slots.bool.drop.next"), "{ir}");
+        assert!(ir.contains("sub i64"), "{ir}");
+        assert!(ir.contains("call void @__sable_rt_array_free_v1"), "{ir}");
+    }
+
+    #[test]
+    fn boolean_owner_slots_reject_retargeted_actions_nested_traps_and_abi_transport() {
+        let source = program(vec![bool_slots_native_function()]);
+        let control = ControlProgram::build(&source).expect("exact Boolean-slot control plan");
+
+        let mut retargeted = source.clone();
+        let Stmt::ExprStmt(put) = &mut retargeted.fns[0].body[2] else {
+            unreachable!()
+        };
+        let ExprKind::SlotOp { args, .. } = &mut put.kind else {
+            unreachable!()
+        };
+        let ExprKind::Borrow { array, .. } = &mut args[0].kind else {
+            unreachable!()
+        };
+        *array = "other".into();
+        let error = emit_program_with_control(&retargeted, &control, 100, &EmitOptions::default())
+            .expect_err("a sealed slot action cannot be retargeted");
+        assert_eq!(error[0].name, "internal.control_plan_invalid");
+
+        let mut changed_trap = source.clone();
+        let Stmt::ExprStmt(put) = &mut changed_trap.fns[0].body[2] else {
+            unreachable!()
+        };
+        let ExprKind::SlotOp { args, .. } = &mut put.kind else {
+            unreachable!()
+        };
+        let ExprKind::Binary { op, .. } = &mut args[1].kind else {
+            unreachable!()
+        };
+        *op = BinOp::Sub;
+        let error =
+            emit_program_with_control(&changed_trap, &control, 100, &EmitOptions::default())
+                .expect_err("a nested trap identity cannot change after slot planning");
+        assert_eq!(error[0].name, "internal.control_plan_invalid");
+        assert!(error[0].label.contains("SubOverflow"), "{:?}", error[0]);
+
+        let mut changed_cleanup = source.clone();
+        let Stmt::Decl { ty, init, .. } = &mut changed_cleanup.fns[0].body[0] else {
+            unreachable!()
+        };
+        *ty = Ty::slots(Ty::Int(IntTy::U64));
+        let Some(init) = init else { unreachable!() };
+        let ExprKind::SlotOp {
+            op: SlotOp::Alloc { elem },
+            ..
+        } = &mut init.kind
+        else {
+            unreachable!()
+        };
+        *elem = Ty::Int(IntTy::U64);
+        init.ty = Some(Ty::slots(Ty::Int(IntTy::U64)));
+        let error =
+            emit_program_with_control(&changed_cleanup, &control, 100, &EmitOptions::default())
+                .expect_err("a retained Boolean-slot cleanup cannot be reused for another payload");
+        assert_eq!(error[0].name, "internal.control_plan_invalid");
+
+        let slot_ty = Ty::slots(Ty::Bool);
+        let error = require_parameter_value(
+            &program(Vec::new()),
+            1,
+            slot_ty.clone(),
+            Span::new(80, 81),
+            "forged slot parameter",
+        )
+        .expect_err("Boolean slots have no native call ABI");
+        assert_eq!(error[0].name, "backend.slots_unsupported");
+        let error = require_runtime_type(
+            &program(Vec::new()),
+            1,
+            slot_ty,
+            Span::new(81, 82),
+            "forged slot return",
+        )
+        .expect_err("Boolean slots have no native return ABI");
+        assert_eq!(error[0].name, "backend.slots_unsupported");
     }
 
     fn function(name: &str, ret: Ty, body: Vec<Stmt>) -> Fn {

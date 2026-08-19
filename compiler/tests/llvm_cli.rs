@@ -209,6 +209,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 328_965, // i8 | (i8 << 8) | (i8 << 16)
             lhs_bits: 127,
             rhs_bits: 1,
+            storage_counts: None,
         },
         TrapCase {
             label: "subtract overflow",
@@ -217,6 +218,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 65_793, // u8 | (u8 << 8) | (u8 << 16)
             lhs_bits: 0,
             rhs_bits: 1,
+            storage_counts: None,
         },
         TrapCase {
             label: "multiply overflow",
@@ -227,6 +229,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 394_758, // i16 | (i16 << 8) | (i16 << 16)
             lhs_bits: 32_767,
             rhs_bits: 2,
+            storage_counts: None,
         },
         TrapCase {
             label: "negation overflow",
@@ -237,6 +240,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 2_056, // i64 | (i64 << 8), with no rhs type
             lhs_bits: 9_223_372_036_854_775_808,
             rhs_bits: 0,
+            storage_counts: None,
         },
         TrapCase {
             label: "division by zero",
@@ -245,6 +249,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 460_551, // i32 | (i32 << 8) | (i32 << 16)
             lhs_bits: 7,
             rhs_bits: 0,
+            storage_counts: None,
         },
         TrapCase {
             label: "signed division overflow",
@@ -254,6 +259,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             // Signed values are exposed as zero-extended source-width bits.
             lhs_bits: 2_147_483_648,
             rhs_bits: 4_294_967_295,
+            storage_counts: None,
         },
         TrapCase {
             label: "narrow range",
@@ -262,6 +268,7 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 1_797, // destination i8 | (source i32 << 8)
             lhs_bits: 300,
             rhs_bits: 0,
+            storage_counts: None,
         },
         TrapCase {
             label: "option value of none",
@@ -272,9 +279,98 @@ fn versioned_trap_hook_observes_raw_payloads_and_cannot_suppress_failure() {
             type_info: 0,
             lhs_bits: 0,
             rhs_bits: 0,
+            storage_counts: None,
         },
     ];
     assert_clang_traps("trap-abi", &ir, &cases);
+}
+
+#[test]
+fn boolean_owner_slot_traps_keep_exact_payloads_and_skip_unwinding() {
+    let source = repo_root().join("corpus/llvm-diff/slots_bool.sable");
+    let output = build_command()
+        .args(["build", "--emit-llvm", "-o", "-"])
+        .arg(&source)
+        .output()
+        .expect("run the Sable Boolean owner-slot LLVM build command");
+    assert!(
+        output.status.success(),
+        "LLVM Boolean owner-slot build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ir = String::from_utf8(output.stdout).expect("LLVM IR is UTF-8");
+    let report = String::from_utf8(output.stderr).expect("verification report is UTF-8");
+    assert!(report.contains("status: fully verified"));
+    assert!(!ir.contains("define i32 @main("));
+
+    // Each function is verified under a scalar precondition. This test-only
+    // entry violates that precondition to execute the otherwise unreachable
+    // native guard while keeping slots local to the Sable function.
+    let ir = format!(
+        "{ir}\n\
+         define i32 @main(i32 %argc, ptr %argv) {{\n\
+         entry:\n\
+           switch i32 %argc, label %unexpected [\n\
+             i32 2, label %capacity\n\
+             i32 3, label %bounds\n\
+             i32 4, label %empty\n\
+             i32 5, label %occupied\n\
+           ]\n\
+         capacity:\n\
+           %capacity_result = call i64 @__sable_v0_f_25_slots_bool_capacity_guard__p_u64__r_u64(i64 50000001)\n\
+           ret i32 0\n\
+         bounds:\n\
+           %bounds_result = call i1 @__sable_v0_f_23_slots_bool_bounds_guard__p_u64__r_b(i64 1)\n\
+           ret i32 0\n\
+         empty:\n\
+           %empty_result = call i1 @__sable_v0_f_22_slots_bool_empty_guard__p_b__r_b(i1 0)\n\
+           ret i32 0\n\
+         occupied:\n\
+           %occupied_result = call i1 @__sable_v0_f_25_slots_bool_occupied_guard__p_b__r_b(i1 1)\n\
+           ret i32 0\n\
+         unexpected:\n\
+           ret i32 99\n\
+         }}\n"
+    );
+    let cases = [
+        TrapCase {
+            label: "slot allocation capacity",
+            arguments: &["capacity"],
+            kind: 11,
+            type_info: 0,
+            lhs_bits: 50_000_001,
+            rhs_bits: 0,
+            storage_counts: Some((0, 0)),
+        },
+        TrapCase {
+            label: "slot index out of bounds",
+            arguments: &["bounds", "guard"],
+            kind: 12,
+            type_info: 0,
+            lhs_bits: 1,
+            rhs_bits: 1,
+            storage_counts: Some((1, 0)),
+        },
+        TrapCase {
+            label: "slot take of empty cell",
+            arguments: &["empty", "cell", "guard"],
+            kind: 13,
+            type_info: 0,
+            lhs_bits: 0,
+            rhs_bits: 1,
+            storage_counts: Some((1, 0)),
+        },
+        TrapCase {
+            label: "slot put into occupied cell",
+            arguments: &["occupied", "cell", "put", "guard"],
+            kind: 14,
+            type_info: 0,
+            lhs_bits: 0,
+            rhs_bits: 1,
+            storage_counts: Some((1, 0)),
+        },
+    ];
+    assert_clang_traps("bool-owner-slots-traps", &ir, &cases);
 }
 
 #[test]
@@ -742,6 +838,7 @@ struct TrapCase {
     type_info: u32,
     lhs_bits: u64,
     rhs_bits: u64,
+    storage_counts: Option<(u64, u64)>,
 }
 
 fn assert_clang_traps(label: &str, ir: &str, cases: &[TrapCase]) {
@@ -762,6 +859,28 @@ fn assert_clang_traps(label: &str, ir: &str, cases: &[TrapCase]) {
         br#"#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+static uint64_t storage_allocations = 0;
+static uint64_t storage_frees = 0;
+
+void *__sable_rt_array_alloc_v1(uint64_t bytes) {
+    if (bytes > SIZE_MAX) {
+        return NULL;
+    }
+    void *storage = malloc((size_t)bytes);
+    if (storage != NULL) {
+        storage_allocations += 1;
+    }
+    return storage;
+}
+
+void __sable_rt_array_free_v1(void *storage) {
+    if (storage != NULL) {
+        storage_frees += 1;
+    }
+    free(storage);
+}
 
 void __sable_rt_trap_v1(
     int32_t kind,
@@ -772,11 +891,14 @@ void __sable_rt_trap_v1(
     fprintf(
         stderr,
         "SABLE_TRAP_V1 kind=%" PRId32 " type_info=%" PRIu32
-        " lhs=%" PRIu64 " rhs=%" PRIu64 "\n",
+        " lhs=%" PRIu64 " rhs=%" PRIu64
+        " storage_allocs=%" PRIu64 " storage_frees=%" PRIu64 "\n",
         kind,
         (uint32_t)type_info,
         lhs_bits,
-        rhs_bits
+        rhs_bits,
+        storage_allocations,
+        storage_frees
     );
     fflush(stderr);
 }
@@ -822,6 +944,16 @@ void __sable_rt_trap_v1(
                 case.label,
                 output.status
             );
+            if let Some((allocations, frees)) = case.storage_counts {
+                let expected_storage =
+                    format!("storage_allocs={allocations} storage_frees={frees}");
+                assert!(
+                    stderr.contains(&expected_storage),
+                    "wrong {} {optimization} cleanup route (status {}):\n{stderr}",
+                    case.label,
+                    output.status
+                );
+            }
         }
     }
     fs::remove_dir_all(&temp).expect("remove isolated LLVM trap test directory");

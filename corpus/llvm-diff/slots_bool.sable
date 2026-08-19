@@ -1,0 +1,65 @@
+// Native differential for direct local Boolean owner slots. The call ABI,
+// class/record fields, other payloads, and Vec transport remain closed.
+
+fn slots_bool_entry() -> i32 {
+    mut slots<bool> first = alloc_slots<bool>(3);
+    bool incoming = true;
+    slot_put(&mut first, 1, incoming);
+
+    // Move the descriptor as one owner. The source retains only its neutral,
+    // null-safe cleanup state; no occupied cell is copied.
+    mut slots<bool> moved = first;
+    bool restored = slot_take(&mut moved, 1);
+
+    // Replacement evaluates and stages the new owner before releasing the
+    // old allocation, then installs the sole moved descriptor.
+    mut slots<bool> replacement = alloc_slots<bool>(1);
+    slot_put(&mut replacement, 0, false);
+    replacement = moved;
+    slot_put(&mut replacement, 2, true);
+    bool final_value = slot_take(&mut replacement, 2);
+
+    slots<bool> empty = alloc_slots<bool>(0);
+    if (restored) {
+        if (final_value) {
+            if (empty.len == 0) {
+                return 42;
+            }
+        }
+    }
+    return 1;
+}
+
+// The following verified guards are called with contract-violating scalar
+// inputs only by the native trap-ABI harness. Their local slots never cross a
+// call boundary.
+fn slots_bool_capacity_guard(u64 length) -> u64 {
+    slots<bool> cells = alloc_slots<bool>(length);
+    return cells.len;
+}
+
+/// pre index = 0
+fn slots_bool_bounds_guard(u64 index) -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    slot_put(&mut cells, 0, true);
+    return slot_take(&mut cells, index);
+}
+
+/// pre occupied = true
+fn slots_bool_empty_guard(bool occupied) -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    if (occupied) {
+        slot_put(&mut cells, 0, true);
+    }
+    return slot_take(&mut cells, 0);
+}
+
+/// pre already_full = false
+fn slots_bool_occupied_guard(bool already_full) -> bool {
+    mut slots<bool> cells = alloc_slots<bool>(1);
+    if (already_full) {
+        slot_put(&mut cells, 0, false);
+    }
+    slot_put(&mut cells, 0, true);
+    return slot_take(&mut cells, 0);
+}
