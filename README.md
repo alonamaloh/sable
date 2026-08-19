@@ -168,3 +168,6 @@ library. See
 - [`docs/SOUNDNESS-INCIDENTS.md`](docs/SOUNDNESS-INCIDENTS.md) — the
   evidence-qualified ledger of false proofs, accepted-invalid programs,
   semantic divergences, fail-open ICEs, and pre-merge near misses.
+- [`docs/ADVERSARIAL-REVIEW.md`](docs/ADVERSARIAL-REVIEW.md) — an evidence-first
+  guide for external breakage attempts, exact reproducer commands, and honest
+  reporting of proof/runtime findings.
