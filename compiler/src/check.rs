@@ -155,7 +155,8 @@ struct Ctx<'a> {
 /// param).
 fn class_of(ctx: &Ctx, name: &str, span: Span) -> CResult<usize> {
     reject_view_read(ctx, name, span)?;
-    ctx.vars
+    let class = ctx
+        .vars
         .get(name)
         .and_then(|v| v.ty.class_index())
         .ok_or_else(|| Diagnostic {
@@ -164,7 +165,12 @@ fn class_of(ctx: &Ctx, name: &str, span: Span) -> CResult<usize> {
             span,
             label: "field access needs a class-typed receiver".into(),
             notes: vec![],
-        })
+        })?;
+    let receiver = Place::local(name);
+    if ctx.is_moved(&receiver) {
+        return Err(moved_out(ctx, &receiver, span, "field receiver"));
+    }
+    Ok(class)
 }
 
 fn tbounds_of(params: &[String], bounds: &[Option<String>]) -> HashMap<String, (String, u8)> {
@@ -6683,6 +6689,20 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     });
                 }
             };
+            // A method call is an implicit borrow of its receiver. Resolve
+            // that borrow through the same place-state table as an explicit
+            // `&item`: looking the type up in `vars` is not enough, because a
+            // move deliberately leaves the declaration there while killing
+            // the value it used to contain.
+            let receiver_place = Place::local(recv);
+            if ctx.is_moved(&receiver_place) {
+                return Err(moved_out(
+                    ctx,
+                    &receiver_place,
+                    *recv_span,
+                    "method receiver",
+                ));
+            }
             let Some((_, params, ret, self_kind)) = ctx.class_metas[ci]
                 .methods
                 .iter()
@@ -6772,7 +6792,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 args,
                 &transfers,
                 Some((
-                    Place::local(recv),
+                    receiver_place,
                     ctx.class_metas[ci].name.clone(),
                     if self_kind == SelfKind::Mut {
                         Mutability::Mut
@@ -7736,6 +7756,15 @@ fn record_call_transitions(
                         notes: vec![],
                     });
                 };
+                // Argument checking normally rejects this first. Keep the
+                // complete checker-authored call record independently honest,
+                // including direct `&self.field` places and bare re-borrows:
+                // no loan may start from a place that was already dead when
+                // this call began. Moves performed by later arguments are
+                // intentionally handled below as `borrow.moved_in_call`.
+                if place_is_moved(moved_before, &place) {
+                    return Err(moved_out(ctx, &place, argument.span, "borrow"));
+                }
                 let actual = if actual_mutable {
                     Mutability::Mut
                 } else {
@@ -7792,6 +7821,15 @@ fn record_call_transitions(
         });
     }
 
+    if let Some((place, _, _, receiver_span, _)) = &receiver {
+        // Method receivers use this same authority boundary as explicit call
+        // arguments. The early receiver rule gives the source diagnostic;
+        // this check prevents a forged or future caller from retaining an
+        // impossible receiver transition in the ownership plan.
+        if place_is_moved(moved_before, place) {
+            return Err(moved_out(ctx, place, *receiver_span, "method receiver"));
+        }
+    }
     let receiver = receiver
         .map(|(place, class, mutability, receiver_span, referent)| {
             CallTransition::borrow(place, mutability, referent, receiver_span)
@@ -9161,7 +9199,7 @@ impl<'a> Ctx<'a> {
     /// A place is dead if it, or anything containing it, has been moved
     /// out: moving `o` kills `o.inner` too.
     fn is_moved(&self, p: &Place) -> bool {
-        self.moved.iter().any(|m| m.contains(p))
+        place_is_moved(&self.moved, p)
     }
 
     /// Type of `self.field` for a *use*: reading it, or writing through
@@ -9484,6 +9522,16 @@ fn moved_out(ctx: &Ctx, p: &Place, span: Span, how: &str) -> Diagnostic {
                 .into(),
         )],
     }
+}
+
+/// Query one snapshot of the checker's move state.
+///
+/// Call admission keeps the state from before argument evaluation so it can
+/// distinguish a loan that was dead on entry (`*.use_after_move`) from a live
+/// loan moved by another argument in the same call (`borrow.moved_in_call`).
+/// Both queries use the same containment rule as ordinary expression reads.
+fn place_is_moved(moved: &HashSet<Place>, place: &Place) -> bool {
+    moved.iter().any(|moved_place| moved_place.contains(place))
 }
 
 /// While an exposure body is open, its owner has no readable or writable
@@ -10730,6 +10778,207 @@ fn bad() {
 "#,
         );
         assert_eq!(check_error(&mut program).name, "borrow.moved_in_call");
+    }
+
+    #[test]
+    fn moved_class_method_receivers_are_rejected_as_place_uses() {
+        let mut program = monomorphized_program(
+            r#"
+class Item {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+
+    fn get(&self) -> u64 {
+        return self.value;
+    }
+}
+
+fn consume(Item item) {}
+
+fn bad() -> u64 {
+    var item = Item::new(7);
+    consume(item);
+    return item.get();
+}
+"#,
+        );
+
+        let error = check_error(&mut program);
+        assert_eq!(error.name, "class.use_after_move");
+        assert!(error.title.contains("item"));
+
+        let mut field_receiver = monomorphized_program(
+            r#"
+class Item {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+}
+
+fn consume(Item item) {}
+
+fn bad() -> u64 {
+    var item = Item::new(7);
+    consume(item);
+    return item.value;
+}
+"#,
+        );
+        assert_eq!(
+            check_error(&mut field_receiver).name,
+            "class.use_after_move"
+        );
+
+        let mut moved_during_call = monomorphized_program(
+            r#"
+class Item {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+
+    fn absorb(&self, Item other) {}
+}
+
+fn bad() {
+    var item = Item::new(7);
+    item.absorb(item);
+}
+"#,
+        );
+        assert_eq!(
+            check_error(&mut moved_during_call).name,
+            "borrow.moved_in_call"
+        );
+    }
+
+    #[test]
+    fn ordinary_free_constructor_and_method_calls_retain_live_places() {
+        let mut program = monomorphized_program(
+            r#"
+class Item {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+
+    fn get(&self) -> u64 {
+        return self.value;
+    }
+}
+
+fn read(&Item item) -> u64 {
+    return item.get();
+}
+
+class Holder {
+    Item item;
+
+    init wrap(Item item) {
+        self.item = item;
+    }
+
+    fn read(&self) -> u64 {
+        return read(&self.item);
+    }
+}
+
+fn exercise() -> u64 {
+    var item = Item::new(7);
+    var holder = Holder::wrap(item);
+    return holder.read();
+}
+"#,
+        );
+
+        let checked = check(&mut program).expect("ordinary live call places should be admitted");
+
+        let read_owner = CallOwner::Function("read".into());
+        let read_calls: Vec<_> = checked.ownership.calls.for_owner(&read_owner).collect();
+        assert_eq!(read_calls.len(), 1);
+        let (_, item_get) = read_calls[0];
+        assert_eq!(
+            item_get.key.target,
+            CallTarget::Method {
+                class: "Item".into(),
+                method: "get".into(),
+            }
+        );
+        assert_eq!(
+            item_get
+                .receiver
+                .as_ref()
+                .expect("method call has an implicit loan")
+                .transition
+                .place,
+            Place::local("item")
+        );
+
+        let holder_read_owner = CallOwner::Method {
+            class: "Holder".into(),
+            method: "read".into(),
+        };
+        let holder_read_calls: Vec<_> = checked
+            .ownership
+            .calls
+            .for_owner(&holder_read_owner)
+            .collect();
+        assert_eq!(holder_read_calls.len(), 1);
+        let (_, field_read) = holder_read_calls[0];
+        assert_eq!(field_read.key.target, CallTarget::Function("read".into()));
+        let CallArgumentEffect::Loan(field_loan) = &field_read.arguments[0].effect else {
+            panic!("the free call should retain its direct field loan");
+        };
+        assert_eq!(field_loan.place, Place::field("self", "item"));
+
+        let exercise_owner = CallOwner::Function("exercise".into());
+        let exercise_calls: Vec<_> = checked
+            .ownership
+            .calls
+            .for_owner(&exercise_owner)
+            .map(|(_, call)| call)
+            .collect();
+        assert_eq!(exercise_calls.len(), 3);
+        assert!(exercise_calls.iter().any(|call| {
+            call.key.target
+                == CallTarget::Constructor {
+                    class: "Item".into(),
+                    init: "new".into(),
+                }
+        }));
+        assert!(exercise_calls.iter().any(|call| {
+            call.key.target
+                == CallTarget::Constructor {
+                    class: "Holder".into(),
+                    init: "wrap".into(),
+                }
+        }));
+        let holder_method = exercise_calls
+            .iter()
+            .find(|call| {
+                call.key.target
+                    == CallTarget::Method {
+                        class: "Holder".into(),
+                        method: "read".into(),
+                    }
+            })
+            .expect("ordinary method call record");
+        assert_eq!(
+            holder_method
+                .receiver
+                .as_ref()
+                .expect("method call has an implicit loan")
+                .transition
+                .place,
+            Place::local("holder")
+        );
     }
 
     #[test]

@@ -82,5 +82,7 @@ demonstrated one level up. Where nothing new was needed at all:
 
 `corpus/verifies/class_fields.sable` (nested field, move-in, field
 borrow, method through a borrowed field — 15 obligations),
-`corpus/must-fail/use_after_move.sable` (`class.use_after_move`), and
+`corpus/must-fail/use_after_move.sable` and
+`corpus/must-fail/method_receiver_after_move.sable`
+(`class.use_after_move`, including an implicit method-receiver loan), and
 dynamic coverage in `corpus/tests/test_class_values.sable`.

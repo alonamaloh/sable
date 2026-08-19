@@ -1,0 +1,24 @@
+// expect-error: class.use_after_move
+// A method call borrows its receiver. Once a by-value call has moved the
+// owner away, that implicit receiver loan cannot recreate a usable name.
+
+class Item {
+    u64 value;
+
+    init new(u64 value) {
+        self.value = value;
+    }
+
+    /// post result = self.value
+    fn get(&self) -> u64 {
+        return self.value;
+    }
+}
+
+fn consume(Item item) {}
+
+fn bad() -> u64 {
+    var item = Item::new(7);
+    consume(item);
+    return item.get();
+}
