@@ -1,0 +1,276 @@
+pub class OwnerToken {
+    u64 token;
+
+    /// invariant token ≤ 100
+
+    /// pre value ≤ 100
+    init new(u64 value) {
+        self.token = value;
+    }
+
+    /// post result = self.token
+    fn get(&self) -> u64 {
+        return self.token;
+    }
+}
+
+pub class OwnerVec<T> {
+    slots<T> buf;
+    u64 len;
+
+    /// invariant len ≤ buf.len
+    /// invariant buf.len > 0
+    /// invariant ∀ k, 0 ≤ k → k < buf.len → (buf.get k ≠ none ↔ k < len)
+
+    /// pre cap > 0
+    /// post self.len = 0
+    /// post self.buf.len = cap
+    init with_capacity(u64 cap) {
+        self.buf = alloc_slots<T>(cap);
+        self.len = 0;
+    }
+
+    /// pre self.len < u64.max
+    /// post self.len = old self.len + 1
+    /// post self.buf.get (old self.len) = some x
+    /// post ∀ k, 0 ≤ k → k < old self.len → self.buf.get k = (old self).buf.get k
+    fn push(&mut self, T x) {
+        if (self.len == self.buf.len) {
+            u64 next_cap = self.buf.len + 1;
+            mut slots<T> next_buf = alloc_slots<T>(next_cap);
+            mut slots<T> previous_buf = self.buf;
+            u64 count = self.len;
+            mut u64 i = 0;
+            /// invariant i ≤ count
+            /// invariant count = self.len
+            /// invariant previous_buf.len + 1 = next_buf.len
+            /// invariant ∀ k, 0 ≤ k → k < previous_buf.len → (previous_buf.get k ≠ none ↔ i ≤ k ∧ k < count)
+            /// invariant ∀ k, 0 ≤ k → k < next_buf.len → (next_buf.get k ≠ none ↔ k < i)
+            /// invariant ∀ k, 0 ≤ k → k < i → next_buf.get k = (old self).buf.get k
+            /// invariant ∀ k, i ≤ k → k < count → previous_buf.get k = (old self).buf.get k
+            /// variant count - i
+            while (i < count) {
+                T moved = slot_take(&mut previous_buf, i);
+                slot_put(&mut next_buf, i, moved);
+                i = i + 1;
+            }
+            self.buf = next_buf;
+        }
+        slot_put(&mut self.buf, self.len, x);
+        self.len = self.len + 1;
+    }
+
+    /// pre self.len > 0
+    /// post self.len = old self.len - 1
+    /// post (old self).buf.get self.len = some result
+    /// post ∀ k, 0 ≤ k → k < self.len → self.buf.get k = (old self).buf.get k
+    fn pop(&mut self) -> T {
+        self.len = self.len - 1;
+        return slot_take(&mut self.buf, self.len);
+    }
+
+    /// pre i < self.len
+    /// post self.len = old self.len
+    /// post self.buf.get i = some x
+    /// post (old self).buf.get i = some result
+    /// post ∀ k, 0 ≤ k → k < self.buf.len → k ≠ i → self.buf.get k = (old self).buf.get k
+    fn replace(&mut self, u64 i, T x) -> T {
+        T previous = slot_take(&mut self.buf, i);
+        slot_put(&mut self.buf, i, x);
+        return previous;
+    }
+}
+
+pub fn demo_owner_vec() -> u64 {
+    var mut values = OwnerVec<OwnerToken>::with_capacity(2);
+    var first = OwnerToken::new(7);
+    values.push(first);
+    var second = OwnerToken::new(9);
+    var previous = values.replace(0, second);
+    var current = values.pop();
+    return previous.get() + current.get();
+}
+
+/// pre actual = expected
+fn expect_eq(u64 actual, u64 expected) {
+}
+
+fn test_owner_vec() {
+    expect_eq(demo_owner_vec(), 16);
+}
+
+/// discharge OwnerVec::push.inv_preserved.k_0_k_k_i_next_buf_get_k_old_self_buf_ge by
+///   intro k hk0 hk
+///   simp only [Sable.Seq.get_set]
+///   by_cases hki : k = i
+///   · subst k
+///     rw [if_pos rfl]
+///     have hsource := h_inv_k_i_k_k_count_previous_b i (by omega) (by omega)
+///     rw [h_sable_slot_put_value_1850_1883_3_0_staged, ← hsource, h_moved_taken]
+///   · rw [if_neg hki]
+///     exact h_inv_k_0_k_k_i_next_buf_get_k k hk0 (by omega)
+
+/// discharge OwnerVec::push.inv_preserved.k_i_k_k_count_previous_buf_get_k_old_sel by
+///   intro k hik hkcount
+///   simp only [Sable.Seq.get_set]
+///   rw [if_neg (by omega)]
+///   exact h_inv_k_i_k_k_count_previous_b k (by omega) hkcount
+
+/// discharge OwnerVec::push.post.k_0_k_k_old_self_len_self_buf_get_k_old by
+///   intro k hk0 hk
+///   simp only [Sable.Seq.get_set]
+///   rw [if_neg (by omega)]
+///   have hieq : i = _old_self.len := by omega
+///   apply h_inv_k_0_k_k_i_next_buf_get_k k hk0
+///   omega
+
+/// discharge SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::push.inv_preserved.k_0_k_k_i_next_buf_get_k_old_self_buf_ge by
+///   intro k hk0 hk
+///   simp only [Sable.Seq.get_set]
+///   by_cases hki : k = i
+///   · subst k
+///     rw [if_pos rfl]
+///     have hsource := h_inv_k_i_k_k_count_previous_b i (by omega) (by omega)
+///     rw [h_sable_slot_put_value_1850_1883_3_0_staged, ← hsource, h_moved_taken]
+///   · rw [if_neg hki]
+///     exact h_inv_k_0_k_k_i_next_buf_get_k k hk0 (by omega)
+
+/// discharge SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::push.inv_preserved.k_i_k_k_count_previous_buf_get_k_old_sel by
+///   intro k hik hkcount
+///   simp only [Sable.Seq.get_set]
+///   rw [if_neg (by omega)]
+///   exact h_inv_k_i_k_k_count_previous_b k (by omega) hkcount
+
+/// discharge SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::push.post.k_0_k_k_old_self_len_self_buf_get_k_old by
+///   intro k hk0 hk
+///   simp only [Sable.Seq.get_set]
+///   rw [if_neg (by omega)]
+///   have hieq : i = _old_self.len := by omega
+///   apply h_inv_k_0_k_k_i_next_buf_get_k k hk0
+///   omega
+
+/// discharge OwnerVec::push.inv_exit.k_0_k_k_buf_len_buf_get_k_none_k_len by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = _old_self.len
+///   · subst k
+///     simp
+///     omega
+///   · rw [if_neg hki]
+///     have hprev := h_inv_k_0_k_k_next_buf_len_nex k hk0 hkbuf
+///     have hieq : i = _old_self.len := by omega
+///     rw [hieq] at hprev
+///     constructor
+///     · intro hocc
+///       have hlt := hprev.mp hocc
+///       omega
+///     · intro hlt
+///       apply hprev.mpr
+///       omega
+
+/// discharge OwnerVec::push.inv_preserved.k_0_k_k_next_buf_len_next_buf_get_k_none by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = i
+///   · subst k
+///     simp
+///     omega
+///   · rw [if_neg hki]
+///     have hprev := h_inv_k_0_k_k_next_buf_len_nex k hk0 hkbuf
+///     constructor
+///     · intro hocc
+///       have hlt := hprev.mp hocc
+///       omega
+///     · intro hlt
+///       apply hprev.mpr
+///       omega
+
+/// discharge OwnerVec::push.inv_exit.k_0_k_k_buf_len_buf_get_k_none_k_len.2 by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = _old_self.len
+///   · subst k
+///     simp
+///     omega
+///   · rw [if_neg hki]
+///     have hprev := h_cinv_k_0_k_k_buf_len_buf_get k hk0 hkbuf
+///     constructor
+///     · intro hocc
+///       have hlt := hprev.mp hocc
+///       omega
+///     · intro hlt
+///       apply hprev.mpr
+///       omega
+
+/// discharge OwnerVec::replace.inv_exit.k_0_k_k_buf_len_buf_get_k_none_k_len by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = i
+///   · subst k
+///     simp
+///     omega
+///   · simp only [if_neg hki]
+///     exact h_cinv_k_0_k_k_buf_len_buf_get k hk0 hkbuf
+
+/// discharge SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::push.inv_exit.k_0_k_k_buf_len_buf_get_k_none_k_len by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = _old_self.len
+///   · subst k
+///     simp
+///     omega
+///   · rw [if_neg hki]
+///     have hprev := h_inv_k_0_k_k_next_buf_len_nex k hk0 hkbuf
+///     have hieq : i = _old_self.len := by omega
+///     rw [hieq] at hprev
+///     constructor
+///     · intro hocc
+///       have hlt := hprev.mp hocc
+///       omega
+///     · intro hlt
+///       apply hprev.mpr
+///       omega
+
+/// discharge SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::push.inv_preserved.k_0_k_k_next_buf_len_next_buf_get_k_none by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = i
+///   · subst k
+///     simp
+///     omega
+///   · rw [if_neg hki]
+///     have hprev := h_inv_k_0_k_k_next_buf_len_nex k hk0 hkbuf
+///     constructor
+///     · intro hocc
+///       have hlt := hprev.mp hocc
+///       omega
+///     · intro hlt
+///       apply hprev.mpr
+///       omega
+
+/// discharge SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::push.inv_exit.k_0_k_k_buf_len_buf_get_k_none_k_len.2 by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = _old_self.len
+///   · subst k
+///     simp
+///     omega
+///   · rw [if_neg hki]
+///     have hprev := h_cinv_k_0_k_k_buf_len_buf_get k hk0 hkbuf
+///     constructor
+///     · intro hocc
+///       have hlt := hprev.mp hocc
+///       omega
+///     · intro hlt
+///       apply hprev.mpr
+///       omega
+
+/// discharge SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::replace.inv_exit.k_0_k_k_buf_len_buf_get_k_none_k_len by
+///   intro k hk0 hkbuf
+///   simp only [Sable.Seq.len_set, Sable.Seq.get_set] at hkbuf ⊢
+///   by_cases hki : k = i
+///   · subst k
+///     simp
+///     omega
+///   · simp only [if_neg hki]
+///     exact h_cinv_k_0_k_k_buf_len_buf_get k hk0 hkbuf

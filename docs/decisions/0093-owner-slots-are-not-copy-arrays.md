@@ -134,6 +134,18 @@ The implementation is split into green, fail-closed commits:
 5. add formal SVM slot transitions and the native slots ABI, then require
    interpreter/Lean-SVM and Clang `-O0`/`-O2` differential evidence.
 
+Steps 1–4 are complete. The first source vertical slice is
+`corpus/verifies/owner_vec.sable`: generic `OwnerVec<T>` plus the concrete
+`OwnerVec<OwnerToken>` specialization close 147/147 obligations with 14 local
+discharges. Its dynamic corpus exercises repeated +1 growth, LIFO pop,
+replacement, value preservation, and exact-once recursive cleanup. Negative
+corpus pins move-only push, the absence of shared slot indexing, and the
+empty-pop precondition. Step 5 is partially complete: the formal SVM has
+generic local-slot rules and an owned-array witness, while the Rust source
+bridge admits only direct local `slots<bool>` with scalar cleanup. Class,
+member, Vec, and destructor translation, every slots call ABI, and native
+lowering remain pending and fail closed.
+
 Each admission change requires positive, must-fail, dynamic-trap, and forged
 checked-AST tests. Required lifecycle cases include growth, push source death,
 pop return, replace, reverse destruction, moved-cell suppression, early return,

@@ -1212,8 +1212,15 @@ foreign, or cross-module array ABI.
   this exact `flip_sign` closure, mutable borrows of other classes, discarded
   class results, field moves, additional or generic class shapes, nonempty
   destructors, array whole-value transport, and every public, extern, or
-  cross-module class ABI stay closed. Generic owner slots and `Vec` remain a
-  separate later design.
+  cross-module class ABI stay closed. Generic owner slots and `Vec` were a
+  separate later design at N5. ADR 0093 now admits only the verified and
+  interpreted `OwnerVec<T>` vertical slice: direct concrete class arguments,
+  occupancy-bearing `slots<T>`, allocate-before-move +1 growth, `push(T)`,
+  preconditioned `pop() -> T`, and `replace(index, T) -> T`. The formal SVM
+  separately admits generic local-slot rules and a direct local `slots<bool>`
+  source bridge. Class/Vec SVM translation, native lowering, direct slots call
+  ABI, shared owner indexing, and wider generic-owner shapes remain fail
+  closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across

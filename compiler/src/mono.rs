@@ -3647,6 +3647,34 @@ fn root() {
     }
 
     #[test]
+    fn owner_vec_specialized_for_an_owner_has_no_proof_reuse() {
+        let program = parse_and_monomorphize(
+            r#"
+class OwnerToken {}
+
+class OwnerVec<T> {
+    slots<T> cells;
+
+    init empty() {
+        self.cells = alloc_slots<T>(0);
+    }
+}
+
+fn root() {
+    var values = OwnerVec<OwnerToken>::empty();
+}
+"#,
+        );
+
+        let owner_vec = program
+            .classes
+            .iter()
+            .find(|class| class.name.starts_with("SableMono_c_8_OwnerVec_"))
+            .expect("concrete OwnerVec<OwnerToken> specialization");
+        assert!(matches!(owner_vec.proof_reuse, ProofReuse::None));
+    }
+
+    #[test]
     fn any_owner_argument_disables_reuse_while_all_integer_names_stay_legacy() {
         let program = parse_and_monomorphize(
             r#"

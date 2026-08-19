@@ -1,0 +1,12 @@
+// expect-error: slots.index_unsupported
+// The slots model exposes occupancy to specifications, not an executable
+// shared read that could copy an owner out of the backing storage.
+
+use owner_vec;
+
+fn owner_vec_has_no_shared_index() {
+    var mut values = OwnerVec<OwnerToken>::with_capacity(1);
+    var item = OwnerToken::new(7);
+    values.push(item);
+    var copied = values.buf[0];
+}

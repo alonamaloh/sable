@@ -1,0 +1,32 @@
+// expect-test-failure: pre of `owner_vec_require_zero` violated
+// The passing DropOnce test catches duplicate destruction. This companion
+// catches missing destruction: an occupied Vec cell must run its payload's
+// deinitializer during recursive slot cleanup.
+
+use owner_vec;
+
+/// pre value = 0
+fn owner_vec_require_zero(u64 value) {
+}
+
+class OwnerVecLoud {
+    u64 armed;
+
+    /// invariant armed = 1
+
+    init new() {
+        self.armed = 1;
+    }
+
+    deinit {
+        owner_vec_require_zero(self.armed);
+    }
+}
+
+fn test_owner_vec_cleanup_runs_deinit() {
+    var mut values = OwnerVec<OwnerVecLoud>::with_capacity(1);
+    var first = OwnerVecLoud::new();
+    values.push(first);
+    var second = OwnerVecLoud::new();
+    values.push(second);
+}

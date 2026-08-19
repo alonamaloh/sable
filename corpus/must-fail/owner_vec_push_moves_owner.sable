@@ -1,0 +1,12 @@
+// expect-error: class.use_after_move
+// `push` receives its payload by value. The caller's owner dies at the call;
+// retaining a second usable name would duplicate the occupied slot payload.
+
+use owner_vec;
+
+fn owner_vec_push_moves_owner() {
+    var mut values = OwnerVec<OwnerToken>::with_capacity(1);
+    var item = OwnerToken::new(7);
+    values.push(item);
+    var duplicate = item;
+}

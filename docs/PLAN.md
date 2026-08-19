@@ -52,8 +52,13 @@ closed. **G3's first semantic spine is now in place:** direct ordinary classes
 may be generic arguments without integer proof reuse, and `slots<T>` has one
 checker-authored ownership/control plan plus a distinct `Seq (Option T)` VC
 model for allocation, take, put, cleanup, and loop havoc. The interpreter now
-executes the same retained actions and recursive reverse cleanup. Formal SVM,
-native lowering, and the `Vec` movement API remain in progress.
+executes the same retained actions and recursive reverse cleanup. The first
+owner-safe `OwnerVec<T>` vertical slice is verified and interpreted with
+allocate-before-move growth, `push(T)`, preconditioned `pop() -> T`, and
+`replace(index, T) -> T`. The formal SVM now defines generic local-slot
+transitions, with a source bridge only for direct local `slots<bool>`.
+Class/Vec SVM translation, native lowering, and every slots call ABI remain in
+progress.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -2019,10 +2024,11 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      expression CFG or a mechanized source-translation proof, and stages may
      still refuse shapes outside their admitted subsets.
 
-   - **G3 — slots and `Vec` (in progress; ADR 0093):** three compiler tranches
-     are complete. Direct ordinary classes are generic arguments, with final
-     identities, injective structural names, no integer proof reuse for owner
-     instances, and nested generic-class arguments still closed. The compiler
+   - **G3 — slots and `Vec` (in progress; ADR 0093):** the first source, VC,
+     and interpreter vertical slice is complete. Direct ordinary classes are
+     generic arguments with final identities, injective structural names, and
+     no integer proof reuse for owner instances; nested generic-class arguments
+     remain closed. The compiler
      now also retains a distinct affine `slots<T>` / `GenericTy::Slots`
      representation and parses `alloc_slots`, `slot_take`, `slot_put`, and
      structural `.len`. The checker authors exact slot transitions, transfers,
@@ -2035,12 +2041,22 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      whole owners without cloning, snapshots them only into detached monitor
      data, and destroys occupied cells in descending order after neutralizing
      each cell. Early-return, loop, replacement, OOM, empty/occupied/OOB, and
-     terminal no-unwind lifecycle cases are pinned. SVM, transition
-     certificates/call ABI, and native lowering remain fail-closed with stable
-     diagnostics. Next, land the first verified and interpreted owner-safe
-     `Vec` specialization. Ordinary `[T]` remains copy-element storage; Vec's
-     owner-capable API does not add a shared copying `get` or broaden the
-     affine-option ABI.
+     terminal no-unwind lifecycle cases are pinned. The formal SVM defines
+     generic local-slot values and atomic allocation/take/put transitions; its
+     Rust bridge and differential corpus admit only direct local `slots<bool>`
+     with scalar cleanup. Class members, owner payloads, Vec/destructor
+     translation, transition certificates/call ABI, and native lowering remain
+     fail-closed with stable diagnostics. `corpus/verifies/owner_vec.sable` now
+     closes the generic `OwnerVec<T>` source and the independently checked
+     `OwnerToken` specialization at 147/147 obligations with 14 local
+     discharges. Its +1
+     growth path allocates before moving, and its contracts pin occupancy and
+     value preservation across `push`, preconditioned `pop`, and `replace`.
+     Runtime corpus covers repeated growth, LIFO pop, replacement, preserved
+     values, and exact-once recursive cleanup; negative corpus pins owner moves,
+     forbidden shared indexing, and empty-pop monitoring. Ordinary `[T]`
+     remains copy-element storage; this slice adds no shared copying `get`,
+     affine-option ABI, capacity doubling, or nested generic owner argument.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
      key/value storage, probing, and its existing verified contracts.
 

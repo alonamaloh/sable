@@ -1,0 +1,77 @@
+// Dynamic coverage for the first move-only Vec surface. Capacity grows by one
+// on every full push so a small test exercises several allocate-before-move
+// transitions rather than only the no-growth path.
+
+use owner_vec;
+
+class DropOnce {
+    u64 token;
+    u64 armed;
+
+    /// invariant token ≤ 100
+    /// invariant armed = 1
+
+    /// pre value ≤ 100
+    init new(u64 value) {
+        self.token = value;
+        self.armed = 1;
+    }
+
+    /// post result = self.token
+    fn get(&self) -> u64 {
+        return self.token;
+    }
+
+    // A duplicate destruction re-checks the invariant after `armed` becomes
+    // zero, so every passing path below detects duplicate owner cleanup.
+    deinit {
+        self.armed = 0;
+    }
+}
+
+/// pre actual = expected
+fn owner_vec_expect(u64 actual, u64 expected) {
+}
+
+fn test_owner_vec_repeated_growth_replace_and_preservation() {
+    var mut values = OwnerVec<DropOnce>::with_capacity(1);
+    var one = DropOnce::new(1);
+    values.push(one);
+    var two = DropOnce::new(2);
+    values.push(two);
+    var three = DropOnce::new(3);
+    values.push(three);
+    var four = DropOnce::new(4);
+    values.push(four);
+    var five = DropOnce::new(5);
+    values.push(five);
+
+    var ninety = DropOnce::new(90);
+    var displaced = values.replace(2, ninety);
+    owner_vec_expect(displaced.get(), 3);
+
+    var last = values.pop();
+    owner_vec_expect(last.get(), 5);
+    var before_last = values.pop();
+    owner_vec_expect(before_last.get(), 4);
+
+    // The preserved prefix [1, 2, 90] remains in `values` and is destroyed
+    // exactly once by its owner-slot cleanup at function exit.
+}
+
+fn test_owner_vec_lifo_pop() {
+    var mut values = OwnerVec<OwnerToken>::with_capacity(1);
+    var ten = OwnerToken::new(10);
+    values.push(ten);
+    var twenty = OwnerToken::new(20);
+    values.push(twenty);
+    var thirty = OwnerToken::new(30);
+    values.push(thirty);
+
+    var top = values.pop();
+    owner_vec_expect(top.get(), 30);
+    var middle = values.pop();
+    owner_vec_expect(middle.get(), 20);
+    var bottom = values.pop();
+    owner_vec_expect(bottom.get(), 10);
+}

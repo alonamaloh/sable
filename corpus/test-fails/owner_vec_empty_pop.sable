@@ -1,0 +1,10 @@
+// expect-test-failure: pre of `SableMono_c_8_OwnerVec_1_16_C10_OwnerToken0__::pop` violated
+// The common owner API returns `T` directly, so emptiness is a caller
+// obligation rather than an affine-option result.
+
+use owner_vec;
+
+fn test_owner_vec_empty_pop_contract() {
+    var mut values = OwnerVec<OwnerToken>::with_capacity(1);
+    var missing = values.pop();
+}
