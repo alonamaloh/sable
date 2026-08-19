@@ -1,0 +1,431 @@
+{
+  "schema_version": 1,
+  "mutants": [
+    {
+      "id": "checker.moved_method_receiver_guards_omitted",
+      "family": "checker",
+      "description": "Let a method receiver pass both early and transition-level moved-place guards.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "            if ctx.is_moved(&receiver_place) {\n",
+          "after": "            if false && ctx.is_moved(&receiver_place) {\n"
+        },
+        {
+          "file": "compiler/src/check.rs",
+          "before": "        if place_is_moved(moved_before, place) {\n            return Err(moved_out(ctx, place, *receiver_span, \"method receiver\"));\n",
+          "after": "        if false && place_is_moved(moved_before, place) {\n            return Err(moved_out(ctx, place, *receiver_span, \"method receiver\"));\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/method_receiver_after_move.sable",
+          "expect": "failed",
+          "baseline_contains": "error: `item` has been moved out"
+        }
+      ]
+    },
+    {
+      "id": "checker.recorded_borrow_mutability_erased",
+      "family": "checker",
+      "description": "Treat recorded unique receiver and argument loans as shared during conflict checking.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "            receiver.transition.effect == crate::transition::CallEffect::HavocUniqueBorrow,\n            receiver.transition.span,\n",
+          "after": "            false,\n            receiver.transition.span,\n"
+        },
+        {
+          "file": "compiler/src/check.rs",
+          "before": "    for argument in &call.arguments {\n        if let CallArgumentEffect::Loan(loan) = &argument.effect {\n            loans.push((\n                &loan.place,\n                loan.effect == crate::transition::CallEffect::HavocUniqueBorrow,\n                loan.span,\n",
+          "after": "    for argument in &call.arguments {\n        if let CallArgumentEffect::Loan(loan) = &argument.effect {\n            loans.push((\n                &loan.place,\n                false,\n                loan.span,\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/borrow_conflict.sable",
+          "expect": "failed",
+          "baseline_contains": "error: conflicting borrows of `x` in one call"
+        },
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/class_mut_borrow_conflict.sable",
+          "expect": "failed",
+          "baseline_contains": "error: conflicting borrows of `c` in one call"
+        },
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/borrow_conflict_field.sable",
+          "module_paths": ["corpus/must-fail/mods"],
+          "expect": "failed",
+          "baseline_contains": "error: conflicting borrows of `o` in one call"
+        }
+      ]
+    },
+    {
+      "id": "checker.recorded_move_loan_checks_omitted",
+      "family": "checker",
+      "description": "Skip recorded direct and nested move-versus-loan conflict scans.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "    for argument in &call.arguments {\n        let CallArgumentEffect::Value(value) = &argument.effect else {\n",
+          "after": "    for argument in call.arguments.iter().take(0) {\n        let CallArgumentEffect::Value(value) = &argument.effect else {\n"
+        },
+        {
+          "file": "compiler/src/check.rs",
+          "before": "    for (loaned, _, loan_span) in loans {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is both lent and handed over in one call\",\n",
+          "after": "    for (loaned, _, loan_span) in loans.into_iter().take(0) {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is both lent and handed over in one call\",\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/borrow_moved_in_call_nested.sable",
+          "expect": "failed",
+          "baseline_contains": "error: `a` is both lent and handed over in one call"
+        },
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/borrow_moved_in_call.sable",
+          "expect": "failed",
+          "baseline_contains": "error: `a` is both lent and handed over in one call"
+        }
+      ]
+    },
+    {
+      "id": "checker.trait_integer_param_gate_omitted",
+      "family": "checker",
+      "description": "Admit raw-pointer parameters into the retained trait call's integer-only proof domain.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "pub(crate) fn trait_param_ty(ty: &Ty, span: Span) -> CResult<()> {\n    if ty.is_affine_option() {\n",
+          "after": "pub(crate) fn trait_param_ty(ty: &Ty, span: Span) -> CResult<()> {\n    if matches!(ty, Ty::Raw(_)) {\n        return Ok(());\n    }\n    if ty.is_affine_option() {\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/trait_raw_param_unsupported.sable",
+          "expect": "failed",
+          "baseline_contains": "error: trait methods accept only integer proof-value parameters"
+        }
+      ]
+    },
+    {
+      "id": "checker.pending_reservation_mutation_check_omitted",
+      "family": "checker",
+      "description": "Ignore mutations performed by later arguments after an earlier call loan has captured its entry state.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "        for mutation in mutations {\n",
+          "after": "        for mutation in mutations.into_iter().take(0) {\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/borrow_conflict_nested_mutation.sable",
+          "expect": "failed",
+          "baseline_contains": "error: borrow of `item` overlaps a later mutation"
+        }
+      ]
+    },
+    {
+      "id": "checker.sealed_nested_move_check_omitted",
+      "family": "checker",
+      "description": "Ignore moves performed by nested sealed-operation arguments that invalidate an earlier pending loan.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "    for (loaned, _, loan_span) in loans {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is lent and moved while evaluating `{operation}`\",\n",
+          "after": "    for (loaned, _, loan_span) in loans.into_iter().take(0) {\n        if ctx\n            .moved\n            .difference(moved_before)\n            .any(|moved| loaned.overlaps(moved))\n        {\n            return Err(Diagnostic {\n                name: \"borrow.moved_in_call\".into(),\n                title: format!(\n                    \"`{}` is lent and moved while evaluating `{operation}`\",\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/borrow_moved_in_sealed_nested.sable",
+          "expect": "failed",
+          "baseline_contains": "error: `cells` is lent and moved while evaluating `resource_map_put`"
+        }
+      ]
+    },
+    {
+      "id": "checker.must_consume_overwrite_guard_omitted",
+      "family": "checker",
+      "description": "Treat overwriting an outstanding must-consume obligation as harmless.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "    let holds = ctx.vars.get(name.as_str()).is_some_and(|v| v.obligation);\n    if !holds {\n",
+          "after": "    let holds = ctx.vars.get(name.as_str()).is_some_and(|v| v.obligation);\n    if true || !holds {\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/must_consume_overwritten.sable",
+          "expect": "failed",
+          "baseline_contains": "error: assigning to `t` abandons its authority"
+        }
+      ]
+    },
+    {
+      "id": "checker.loop_condition_effects_omitted",
+      "family": "checker",
+      "description": "Exclude effectful loop conditions from the checker-authored mutation summary.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "    collect_checked_expr_mutations(ctx, condition, &mut mutations)?;\n",
+          "after": "    if false { collect_checked_expr_mutations(ctx, condition, &mut mutations)?; }\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/loop_condition_mutation_stale.sable",
+          "expect": "failed",
+          "baseline_contains": "loop_condition_mutation_stale.post.result_one"
+        }
+      ]
+    },
+    {
+      "id": "checker.loop_unsafe_body_effects_omitted",
+      "family": "checker",
+      "description": "Treat an unsafe block as an effect barrier during loop mutation discovery.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "            Stmt::Unsafe { body, .. } => collect_checked_stmt_mutations(ctx, body, out)?,\n",
+          "after": "            Stmt::Unsafe { .. } => {}\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/loop_nested_unsafe_stale.sable",
+          "expect": "failed",
+          "baseline_contains": "loop_nested_unsafe_stale.post.result_false"
+        }
+      ]
+    },
+    {
+      "id": "checker.loop_field_write_effect_omitted",
+      "family": "checker",
+      "description": "Forget that a field assignment mutates self inside a loop.",
+      "edits": [
+        {
+          "file": "compiler/src/check.rs",
+          "before": "            Stmt::FieldAssign { value, .. } => {\n                out.push(CheckedMutation::DirectWrite {\n                    place: Place::local(\"self\"),\n                });\n                collect_checked_expr_mutations(ctx, value, out)?;\n            }\n",
+          "after": "            Stmt::FieldAssign { value, .. } => {\n                collect_checked_expr_mutations(ctx, value, out)?;\n            }\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/loop_bool_field_stale.sable",
+          "expect": "failed",
+          "baseline_contains": "FlagLoop::make.post"
+        }
+      ]
+    },
+    {
+      "id": "control.assignment_destination_check_omitted",
+      "family": "control",
+      "description": "Allow an assignment action to be reused for a different destination.",
+      "edits": [
+        {
+          "file": "compiler/src/control.rs",
+          "before": "        if action.destination() != destination {\n",
+          "after": "        if false && action.destination() != destination {\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "control::tests::assignment_action_keys_and_destinations_fail_closed"
+        }
+      ]
+    },
+    {
+      "id": "control.exposure_owner_check_omitted",
+      "family": "control",
+      "description": "Stop reconciling an exposure rebuild with its retained owner place.",
+      "edits": [
+        {
+          "file": "compiler/src/control.rs",
+          "before": "                    || rebuild.owner() != &owner\n",
+          "after": "                    || false\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "control::tests::callable_reconciliation_rejects_changed_exposure_source_identity"
+        }
+      ]
+    },
+    {
+      "id": "control.class_drop_phase_check_omitted",
+      "family": "control",
+      "description": "Stop checking the retained class-drop phase sequence during reconciliation.",
+      "edits": [
+        {
+          "file": "compiler/src/control.rs",
+          "before": "            || self.phases != current.phases\n",
+          "after": "            || false\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "control::tests::concrete_class_drop_plan_seals_exact_identity_order_and_no_unwind"
+        }
+      ]
+    },
+    {
+      "id": "vc.call_havoc_omitted",
+      "family": "vc",
+      "description": "Skip checker-recorded unique-borrow havoc for explicit call arguments; receiver handling remains intact.",
+      "edits": [
+        {
+          "file": "compiler/src/vcgen.rs",
+          "before": "        let mut out = Vec::new();\n        for argument in &checked_call.arguments {\n",
+          "after": "        let mut out = Vec::new();\n        for argument in checked_call.arguments.iter().take(0) {\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/stale_state_after_call.sable",
+          "expect": "failed",
+          "baseline_contains": "caller.post"
+        }
+      ]
+    },
+    {
+      "id": "vc.projected_havoc_replaces_owner",
+      "family": "vc",
+      "description": "Write a projected borrowed field's fresh state over its entire owning object.",
+      "edits": [
+        {
+          "file": "compiler/src/vcgen.rs",
+          "before": "                        Val::Obj(format!(\"{{ {base} with {f} := {vs} }}\")),\n",
+          "after": "                        fresh,\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "cargo-test",
+          "test": "vcgen::type_domain_tests::call_site_havoc_writes_back_the_shared_projected_place"
+        }
+      ]
+    },
+    {
+      "id": "vc.free_call_preconditions_omitted",
+      "family": "vc",
+      "description": "Generate no proof obligations for ordinary function call preconditions.",
+      "edits": [
+        {
+          "file": "compiler/src/vcgen.rs",
+          "before": "                for pre in &callee_fn.pres {\n",
+          "after": "                for pre in callee_fn.pres.iter().take(0) {\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/utf8_surrogate_pre.sable",
+          "expect": "failed",
+          "baseline_contains": "demo.call_pre.encode_utf8"
+        }
+      ]
+    },
+    {
+      "id": "vc.method_call_preconditions_omitted",
+      "family": "vc",
+      "description": "Generate no proof obligations for concrete method call preconditions.",
+      "edits": [
+        {
+          "file": "compiler/src/vcgen.rs",
+          "before": "                for pre in &m.f.pres {\n",
+          "after": "                for pre in m.f.pres.iter().take(0) {\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/bump_arena_exhausted.sable",
+          "expect": "failed",
+          "baseline_contains": "exhausted.call_pre.BumpArena_alloc_u64.space.3"
+        }
+      ]
+    },
+    {
+      "id": "vc.array_index_bounds_obligation_omitted",
+      "family": "vc",
+      "description": "Assume array index bounds without emitting the corresponding obligation.",
+      "edits": [
+        {
+          "file": "compiler/src/vcgen.rs",
+          "before": "                let arr = self.arr_str(array);\n                let goal = format!(\"0 ≤ {i} ∧ {i} < ({arr}.len)\");\n                let ob = self.obligation(\n                    &format!(\"{}.bounds.{}\", self.fname, slug(self.src(e.span))),\n                    format!(\"index `{}` must be within bounds\", self.src_short(e.span)),\n                    e.span,\n                    goal.clone(),\n                );\n                self.push_obligation(ob);\n                self.assume_fact(&goal);\n",
+          "after": "                let arr = self.arr_str(array);\n                let goal = format!(\"0 ≤ {i} ∧ {i} < ({arr}.len)\");\n                let ob = self.obligation(\n                    &format!(\"{}.bounds.{}\", self.fname, slug(self.src(e.span))),\n                    format!(\"index `{}` must be within bounds\", self.src_short(e.span)),\n                    e.span,\n                    goal.clone(),\n                );\n                drop(ob);\n                self.assume_fact(&goal);\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/bounds.sable",
+          "expect": "failed",
+          "baseline_contains": "first.bounds"
+        }
+      ]
+    },
+    {
+      "id": "vc.arithmetic_overflow_obligation_omitted",
+      "family": "vc",
+      "description": "Assume add/subtract/multiply range safety without emitting the obligation.",
+      "edits": [
+        {
+          "file": "compiler/src/vcgen.rs",
+          "before": "                        BinOp::Add | BinOp::Sub | BinOp::Mul => {\n                            let goal = self.r_prop(&value, it);\n                            let ob = self.obligation(\n                                &format!(\"{}.overflow.{}\", self.fname, slug(self.src(e.span))),\n                                format!(\n                                    \"result of `{}` must fit in `{}`\",\n                                    self.src_short(e.span),\n                                    it.name()\n                                ),\n                                e.span,\n                                goal.clone(),\n                            );\n                            self.push_obligation(ob);\n                            self.assume_fact(&goal);\n",
+          "after": "                        BinOp::Add | BinOp::Sub | BinOp::Mul => {\n                            let goal = self.r_prop(&value, it);\n                            let ob = self.obligation(\n                                &format!(\"{}.overflow.{}\", self.fname, slug(self.src(e.span))),\n                                format!(\n                                    \"result of `{}` must fit in `{}`\",\n                                    self.src_short(e.span),\n                                    it.name()\n                                ),\n                                e.span,\n                                goal.clone(),\n                            );\n                            drop(ob);\n                            self.assume_fact(&goal);\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/overflow_design_doc.sable",
+          "expect": "failed",
+          "baseline_contains": "div_round_up.overflow.a_b"
+        }
+      ]
+    },
+    {
+      "id": "vc.divisor_nonzero_obligation_omitted",
+      "family": "vc",
+      "description": "Assume a nonzero divisor without emitting the division-safety obligation.",
+      "edits": [
+        {
+          "file": "compiler/src/vcgen.rs",
+          "before": "                        BinOp::Div | BinOp::Rem => {\n                            let goal = format!(\"{r} ≠ 0\");\n                            let ob = self.obligation(\n                                &format!(\"{}.div_zero.{}\", self.fname, slug(self.src(e.span))),\n                                format!(\"divisor `{}` must be nonzero\", self.src_short(rhs.span)),\n                                rhs.span,\n                                goal.clone(),\n                            );\n                            self.push_obligation(ob);\n                            self.assume_fact(&goal);\n",
+          "after": "                        BinOp::Div | BinOp::Rem => {\n                            let goal = format!(\"{r} ≠ 0\");\n                            let ob = self.obligation(\n                                &format!(\"{}.div_zero.{}\", self.fname, slug(self.src(e.span))),\n                                format!(\"divisor `{}` must be nonzero\", self.src_short(rhs.span)),\n                                rhs.span,\n                                goal.clone(),\n                            );\n                            drop(ob);\n                            self.assume_fact(&goal);\n"
+        }
+      ],
+      "oracles": [
+        {
+          "kind": "source",
+          "path": "corpus/must-fail/div_zero.sable",
+          "expect": "failed",
+          "baseline_contains": "half.div_zero"
+        }
+      ]
+    }
+  ]
+}
