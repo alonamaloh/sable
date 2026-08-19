@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "revision": "64502531afd538fda2dc83ac85e03e19bab77ef0",
+  "manifest_sha256": "ddf7664a390f7a16a5280d8c1ed941812a80c1275279a0731fcae482796660bd",
+  "started_at": "2026-08-19T23:25:35.416872+00:00",
+  "finished_at": "2026-08-19T23:28:31.697233+00:00",
+  "workers": 2,
+  "duration_seconds": 176.283,
+  "summary": {
+    "semantic-kill": 16,
+    "structural-kill": 4,
+    "conservative-kill": 0,
+    "compile-invalid": 0,
+    "crash": 0,
+    "timeout": 0,
+    "equivalent-or-survivor": 0,
+    "harness-error": 0
+  },
+  "results": [
+    { "id": "checker.moved_method_receiver_guards_omitted", "classification": "semantic-kill" },
+    { "id": "checker.recorded_borrow_mutability_erased", "classification": "semantic-kill" },
+    { "id": "checker.recorded_move_loan_checks_omitted", "classification": "semantic-kill" },
+    { "id": "checker.trait_integer_param_gate_omitted", "classification": "semantic-kill" },
+    { "id": "checker.pending_reservation_mutation_check_omitted", "classification": "semantic-kill" },
+    { "id": "checker.sealed_nested_move_check_omitted", "classification": "semantic-kill" },
+    { "id": "checker.must_consume_overwrite_guard_omitted", "classification": "semantic-kill" },
+    { "id": "checker.loop_condition_effects_omitted", "classification": "semantic-kill" },
+    { "id": "checker.loop_unsafe_body_effects_omitted", "classification": "semantic-kill" },
+    { "id": "checker.loop_field_write_effect_omitted", "classification": "semantic-kill" },
+    { "id": "control.assignment_destination_check_omitted", "classification": "structural-kill" },
+    { "id": "control.exposure_owner_check_omitted", "classification": "structural-kill" },
+    { "id": "control.class_drop_phase_check_omitted", "classification": "structural-kill" },
+    { "id": "vc.call_havoc_omitted", "classification": "semantic-kill" },
+    { "id": "vc.projected_havoc_replaces_owner", "classification": "structural-kill" },
+    { "id": "vc.free_call_preconditions_omitted", "classification": "semantic-kill" },
+    { "id": "vc.method_call_preconditions_omitted", "classification": "semantic-kill" },
+    { "id": "vc.array_index_bounds_obligation_omitted", "classification": "semantic-kill" },
+    { "id": "vc.arithmetic_overflow_obligation_omitted", "classification": "semantic-kill" },
+    { "id": "vc.divisor_nonzero_obligation_omitted", "classification": "semantic-kill" }
+  ]
+}

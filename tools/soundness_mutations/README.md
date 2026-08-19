@@ -104,3 +104,14 @@ then either add an independent witness, refine the mutation so it isolates one
 authority boundary, or document the redundant defense. Timing varies with the
 Rust cache and Lean toolchain, so this harness should not double as a
 performance benchmark.
+
+## Recorded baselines
+
+[`baselines/6450253.json`](./baselines/6450253.json) records the first complete
+run against the commit that introduced this harness. Its manifest hash binds
+the result to the exact 20 mutations: 16 were semantic kills and four were
+structural kills, with no survivors, invalid mutants, crashes, timeouts, or
+harness errors. This is evidence that the selected witnesses detect those
+specific edits; it is not a whole-compiler mutation score or a soundness
+percentage. The elapsed time is retained for audit context only and is not a
+performance measurement.
