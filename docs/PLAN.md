@@ -56,9 +56,13 @@ executes the same retained actions and recursive reverse cleanup. The first
 owner-safe `OwnerVec<T>` vertical slice is verified and interpreted with
 allocate-before-move growth, `push(T)`, preconditioned `pop() -> T`, and
 `replace(index, T) -> T`. The formal SVM now defines generic local-slot
-transitions, with a source bridge only for direct local `slots<bool>`.
-Class/Vec SVM translation, native lowering, and every slots call ABI remain in
-progress.
+transitions, with a source bridge only for direct local `slots<bool>`. LLVM now
+lowers that same direct-local Boolean subset: distinct occupancy/payload cells,
+allocation, length, take/put staging and traps, whole-owner local moves, reverse
+cleanup, and one backing free, with interpreter/Clang `-O0`/`-O2` evidence.
+Local/direct-field take and put also emit non-skippable Lean write-back
+certificates. Class/Vec SVM and native translation, non-Boolean native slots,
+fields, and every slots call ABI remain in progress.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -1990,6 +1994,25 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      pre-call state and requires Lean to reject it as
      `internal.transition_certificate_rejected`.
 
+     Local `slot_take` and `slot_put` now add fixed, non-skippable write-back
+     certificates after exact `CheckedSlotTransition` / `SlotAction`
+     cross-validation. The observed post-state is read back from the live
+     symbolic environment after local or direct-`self` field installation.
+     Lean checks only the exact structural take removal or put installation:
+     `observed = before.set i none` and
+     `observed = before.set i (some staged)`. Bounds, occupied/empty guards,
+     and payload-invariant checks remain ordinary obligations. Taken-owner and
+     incoming-to-staged equalities are trusted generator-authored symbolic
+     facts in ordinary VC contexts; Rust also remains trusted for snapshot,
+     index, and staged-term provenance. Branch revisits receive
+     injective visit identities; independently tampering the pre-state,
+     observation, index, or staged term so the structural equality breaks is
+     rejected as `internal.slot_transition_certificate_rejected`. Coordinated,
+     relation-preserving substitution remains inside the trusted Rust
+     provenance boundary rather than being a claim of this certificate.
+     Artifact root ownership and flat-namespace collision checks include these
+     theorems. Allocation, cleanup, and slots across the call ABI remain closed.
+
      Callable flavor now also keys recursion analysis and generated VC/clause
      identities. Same-spelled constructors and methods remain distinct;
      duplicate members within one flavor are rejected. Transition-certificate
@@ -2008,9 +2031,10 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      borrowed arrays retain their explicit call-site syntax gate.
 
      The Lean certificate remains deliberately bounded to explicit
-     unique-borrow call write-back and the array length fact inside the emitted
-     symbolic state; it does not establish complete source translation. ADR
-     0090 separately closes criterion 2 at the trusted checker-to-VC boundary:
+     unique-borrow call write-back, the array length fact, and local
+     take/put owner-slot write-back inside the emitted symbolic state; it does
+     not establish complete source translation. ADR 0090 separately closes
+     criterion 2 at the trusted checker-to-VC boundary:
      moves, mandatory-consumption state, loans, receivers, option takes, sealed
      operations, exposures, and loop mutations have one checker-authored plan
      with exact fail-closed VC consumers.
@@ -2044,9 +2068,19 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      terminal no-unwind lifecycle cases are pinned. The formal SVM defines
      generic local-slot values and atomic allocation/take/put transitions; its
      Rust bridge and differential corpus admit only direct local `slots<bool>`
-     with scalar cleanup. Class members, owner payloads, Vec/destructor
-     translation, transition certificates/call ABI, and native lowering remain
-     fail-closed with stable diagnostics. `corpus/verifies/owner_vec.sable` now
+     with scalar cleanup. Local/direct-field take and put now have
+     non-skippable Lean write-back certificates; allocation, cleanup, and slots
+     call ABI certification remain closed. LLVM admits the matching direct-local
+     `slots<bool>` owner only: `%sable.slot.bool = { i8 occupancy, i8 payload }`
+     cells behind a distinct `{ ptr, i64 }` descriptor, zero length, `.len`,
+     `slot_take`, source-ordered staged `slot_put`, whole-owner local declaration
+     and replacement moves, reverse occupancy cleanup, and one backing free.
+     Exact retained actions and terminal traps are consumed; Clang `-O0`/`-O2`
+     comparisons pin results, OOM/OOB/empty/occupied payloads, and allocation/
+     free balance. Non-Boolean payloads, fields, parameters, returns, borrowed
+     slots ABI, nested/option transport, class/record payloads, and OwnerVec
+     native support remain fail-closed with stable diagnostics.
+     `corpus/verifies/owner_vec.sable` now
      closes the generic `OwnerVec<T>` source and the independently checked
      `OwnerToken` specialization at 147/147 obligations with 14 local
      discharges. Its +1

@@ -93,6 +93,21 @@ user-written Vec invariant.
 The proof-level sequence may be copied as mathematical state. That does not
 authorize copying the executable slots value or any present runtime payload.
 
+Successful local or direct-`self` field take/put transitions also emit fixed,
+non-skippable Lean certificates after the checker-authored
+`CheckedSlotTransition` and retained `SlotAction` agree exactly. VC generation
+records the pre-state, index, and staged put term, performs `write_slot_place`,
+then reads the observed state back from the live environment.
+`SlotTakeWriteback` checks only `observed = before.set i none`;
+`SlotPutWriteback` checks only
+`observed = before.set i (some staged)`. Bounds, occupied/empty guards, and
+payload-invariant checks remain ordinary obligations. Taken-owner and
+incoming-to-staged equalities are trusted generator-authored symbolic facts in
+ordinary VC contexts rather than certificate fields; Rust also remains trusted
+for snapshot, index, and staged-term provenance. Branch revisits receive
+distinct symbolic-visit identities. Allocation and cleanup do not emit these
+certificates, and this does not admit slots to any call ABI.
+
 ### Generic instantiation and proof reuse
 
 Monomorphization admits a non-generic concrete class as a type argument only
@@ -131,20 +146,31 @@ The implementation is split into green, fail-closed commits:
    take/put/lifecycle semantics;
 4. admit concrete class generic arguments without integer proof reuse and add
    the owner-safe Vec verification/runtime corpus;
-5. add formal SVM slot transitions and the native slots ABI, then require
-   interpreter/Lean-SVM and Clang `-O0`/`-O2` differential evidence.
+5. add formal SVM slot transitions and the bounded direct-local Boolean native
+   layout, then require interpreter/Lean-SVM and Clang `-O0`/`-O2`
+   differential evidence;
+6. add kernel-checked local take/put write-back certificates without widening
+   allocation, cleanup, or call-ABI certification.
 
-Steps 1–4 are complete. The first source vertical slice is
+Steps 1–6 are complete for their stated bounded slices. The first source vertical slice is
 `corpus/verifies/owner_vec.sable`: generic `OwnerVec<T>` plus the concrete
 `OwnerVec<OwnerToken>` specialization close 147/147 obligations with 14 local
 discharges. Its dynamic corpus exercises repeated +1 growth, LIFO pop,
 replacement, value preservation, and exact-once recursive cleanup. Negative
 corpus pins move-only push, the absence of shared slot indexing, and the
-empty-pop precondition. Step 5 is partially complete: the formal SVM has
-generic local-slot rules and an owned-array witness, while the Rust source
-bridge admits only direct local `slots<bool>` with scalar cleanup. Class,
-member, Vec, and destructor translation, every slots call ABI, and native
-lowering remain pending and fail closed.
+empty-pop precondition. The formal SVM has generic local-slot rules and an
+owned-array witness, while the Rust source bridge admits only direct local
+`slots<bool>` with scalar cleanup. LLVM admits precisely that direct-local
+Boolean owner: `%sable.slot.bool = { i8 occupancy, i8 payload }` cells behind a
+distinct `%sable.slots.bool = { ptr, i64 }` descriptor, including zero length,
+`.len`, exact source-ordered take/put staging, whole-owner moves between local
+declarations or replacements, reverse occupancy cleanup, and one free of the
+backing allocation. Terminal no-unwind traps distinguish OOM, OOB, empty take,
+and occupied put with exact payloads. Interpreter/Clang `-O0`/`-O2` comparison,
+trap probes, retained-plan tampering, and counted allocation/free balance pin
+the slice. Non-Boolean payloads, fields, parameters, returns, borrowed slots
+ABI, nested/option transport, class/record payloads, OwnerVec native support,
+and every other slots call ABI remain pending and fail closed.
 
 Each admission change requires positive, must-fail, dynamic-trap, and forged
 checked-AST tests. Required lifecycle cases include growth, push source death,

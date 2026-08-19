@@ -357,9 +357,10 @@ pub fn emit(
         names.certificates.insert(certificate.thm_name.clone());
         let first = e.line + 1;
         e.push(&format!(
-            "/-- `{}` — kernel-checked call-havoc transition for `{}` -/",
+            "/-- `{}` — kernel-checked {} transition for `{}` -/",
             certificate.name,
-            doc_safe(&certificate.transition.place.render())
+            certificate.description(),
+            doc_safe(&certificate.place().render())
         ));
         e.push(&format!(
             "theorem {} {}",
@@ -1192,16 +1193,14 @@ pub fn diagnose(
             Some(MapTarget::Certificate(i)) => {
                 let certificate = &vc.transition_certificates[*i];
                 diags.push(Diagnostic {
-                    name: "internal.transition_certificate_rejected".into(),
+                    name: certificate.rejection_diagnostic_name().into(),
                     title: format!(
-                        "Lean rejected call-havoc transition certificate `{}`",
+                        "Lean rejected {} transition certificate `{}`",
+                        certificate.description(),
                         certificate.name
                     ),
-                    span: certificate.transition.span,
-                    label: format!(
-                        "fresh symbolic state was not certified at `{}`",
-                        certificate.transition.place.render()
-                    ),
+                    span: certificate.span(),
+                    label: certificate.rejection_label(),
                     notes: vec![
                         (
                             "certificate".into(),

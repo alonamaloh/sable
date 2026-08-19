@@ -1218,9 +1218,13 @@ foreign, or cross-module array ABI.
   occupancy-bearing `slots<T>`, allocate-before-move +1 growth, `push(T)`,
   preconditioned `pop() -> T`, and `replace(index, T) -> T`. The formal SVM
   separately admits generic local-slot rules and a direct local `slots<bool>`
-  source bridge. Class/Vec SVM translation, native lowering, direct slots call
-  ABI, shared owner indexing, and wider generic-owner shapes remain fail
-  closed.
+  source bridge. LLVM admits the same direct-local Boolean slice with a
+  distinct occupancy/payload-cell layout, source-ordered take/put, whole-owner
+  local moves, reverse cleanup, and `-O0`/`-O2` differential and trap/balance
+  evidence. Local/direct-field take and put have non-skippable Lean write-back
+  certificates. Class/Vec SVM and native translation, non-Boolean slots,
+  fields, direct slots call ABI, shared owner indexing, and wider generic-owner
+  shapes remain fail closed.
 - **Module visibility follows the referenced namespace.** The loader keeps one
   flat runtime namespace for functions, classes, and records, and distinct
   trait and constant namespaces. Restrictive `use m::{...}` filters names across
@@ -1284,17 +1288,37 @@ foreign, or cross-module array ABI.
   cannot be deferred, assumed, or user-discharged, and map a Lean failure to
   `internal.transition_certificate_rejected` at the call argument.
 
+  Local `slot_take` and `slot_put` now use the same non-skippable artifact
+  channel without pretending to be calls. After exact cross-validation of the
+  checker-authored `CheckedSlotTransition` and retained `SlotAction`, VCgen
+  snapshots the pre-state, index, and staged put term, performs the atomic
+  `write_slot_place`, and then reads the actual local or direct `self` field
+  back from the symbolic environment. Lean requires only the structural
+  `SlotTakeWriteback` equality (observed = before.set i none) or
+  `SlotPutWriteback` equality (observed = before.set i (some staged)). The
+  bounds, occupied/empty guards, and payload-invariant checks remain ordinary
+  obligations. Taken-owner and incoming-to-staged equalities are trusted
+  generator-authored symbolic facts in ordinary VC contexts; Rust also remains
+  trusted for snapshot, index, and staged-term provenance. Each
+  symbolic branch revisit has its own deterministic visit identity. Rejection
+  maps to `internal.slot_transition_certificate_rejected`; allocation,
+  cleanup, and every slots call-ABI shape remain explicitly outside this
+  certificate slice.
+
   The same typed callable identity keys the checker's recursion graph. An
   initializer and method may share a source spelling without overwriting each
   other's edges; duplicates within either member flavor are rejected as
   `type.duplicate_init` or `type.duplicate_method`, and member cycles report
   `type.mutual_recursion` at the member declaration.
 
-  Certificate theorem identifiers encode typed owner, resolved target, raw
-  structural `Place`, body-relative call span, parameter index, and deterministic
-  symbolic-visit ordinal as length-framed UTF-8 bytes. A branch continuation may
-  therefore revisit one immutable checked site while every path still receives
-  a distinct havoc certificate. Artifact preparation rejects any declaration
+  Call-certificate theorem identifiers encode typed owner, resolved target,
+  raw structural `Place`, body-relative call span, parameter index, and
+  deterministic symbolic-visit ordinal as length-framed UTF-8 bytes. Slot
+  certificates encode their distinct transition flavor, typed owner,
+  operation, raw place, body-relative operation span, and visit ordinal in the
+  same injective form. A branch continuation may therefore revisit one
+  immutable checked site while every path still receives a distinct
+  certificate. Artifact preparation rejects any declaration
   emitted by the root artifact whose Lean name is already imported, across
   declaration categories, before name subtraction can suppress it. Root
   emission ownership follows source ownership or absence from the exact
@@ -1320,14 +1344,14 @@ foreign, or cross-module array ABI.
   scalar-only and therefore have no owning effect to hand off. C0 criterion 2 is
   closed for this admitted checker-to-VC boundary.
 
-  The certificate validates fresh-state write-back and the array length fact
-  *within the emitted symbolic state*. It does not prove that mutation
-  discovery found every call, that source expressions were translated
+  These certificates validate selected call-havoc and local slot write-backs
+  *within the emitted symbolic state*. They do not prove that mutation
+  discovery found every effect, that source expressions were translated
   completely, that every fresh-state fact is justified, or that loop havoc,
-  moves, cleanup, and traps share a validated transition system. The Rust
-  checker and generator remain trusted for those boundaries; this is the
-  first bounded path toward translation validation, not general translation
-  validation.
+  general moves, cleanup, calls carrying slots, and traps share a validated
+  transition system. The Rust checker and generator remain trusted for those
+  boundaries; this is a bounded path toward translation validation, not
+  general translation validation.
 
   `compiler/src/control.rs::ControlOutline` is now the total pre-check
   structural authority (ADR 0092). It assigns blocks, lexical scopes,

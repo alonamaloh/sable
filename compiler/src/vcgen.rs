@@ -2696,6 +2696,7 @@ pub(crate) fn generate(
             ownership: &checked.ownership,
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
+            checked_slot_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
             visited_slot_transitions: HashSet::new(),
             visited_slot_actions: HashSet::new(),
@@ -2807,6 +2808,7 @@ pub(crate) fn generate(
             ownership: &checked.ownership,
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
+            checked_slot_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
             visited_slot_transitions: HashSet::new(),
             visited_slot_actions: HashSet::new(),
@@ -2929,6 +2931,7 @@ pub(crate) fn generate(
                 ownership: &checked.ownership,
                 visited_checked_calls: HashSet::new(),
                 checked_call_visits: HashMap::new(),
+                checked_slot_visits: HashMap::new(),
                 visited_option_takes: HashSet::new(),
                 visited_slot_transitions: HashSet::new(),
                 visited_slot_actions: HashSet::new(),
@@ -3302,6 +3305,10 @@ struct Generator<'a> {
     /// performs a distinct havoc and therefore receives a distinct fixed
     /// transition certificate.
     checked_call_visits: HashMap<CallSiteKey, usize>,
+    /// Deterministic DFS visit ordinal for each checked owner-slot operation.
+    /// A branch join can revisit one immutable source transition, and every
+    /// resulting write-back receives an injective certificate identity.
+    checked_slot_visits: HashMap<EffectSiteKey, usize>,
     /// Checker-authored non-call ownership effects reached by at least one
     /// symbolic path. Like calls, the records are immutable and may be
     /// revisited after a path split; this set proves per-body coverage.
@@ -4286,7 +4293,7 @@ impl<'a> Generator<'a> {
         &mut self,
         scope: ScopeId,
         expression: &Expr,
-    ) -> Option<(CheckedSlotTransition, SlotAction)> {
+    ) -> Option<(CheckedSlotTransition, SlotAction, usize)> {
         let ExprKind::SlotOp { op, op_span, args } = &expression.kind else {
             unreachable!("slot transition lookup is called only for slot operations")
         };
@@ -4389,9 +4396,7 @@ impl<'a> Generator<'a> {
         }
 
         let action = {
-            let Some(plan) = self.control_plan() else {
-                return None;
-            };
+            let plan = self.control_plan()?;
             let action = match plan.slot_action(scope, expression) {
                 Ok(action) => action.clone(),
                 Err(error) => {
@@ -4499,9 +4504,11 @@ impl<'a> Generator<'a> {
             ));
             return None;
         }
-        self.visited_slot_transitions.insert(key);
+        self.visited_slot_transitions.insert(key.clone());
         self.visited_slot_actions.insert((scope, expression.span));
-        Some((transition, action))
+        let visit = self.checked_slot_visits.entry(key).or_default();
+        *visit += 1;
+        Some((transition, action, *visit))
     }
 
     /// Validate the checker-authored exposure boundary before opening its
@@ -7642,6 +7649,57 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Give every symbolic visit to one immutable slot transition a distinct,
+    /// typed theorem identity. Body-relative spans mirror call-havoc
+    /// certificates while the explicit flavor component keeps the namespaces
+    /// disjoint even when source names contain punctuation resembling one of
+    /// the readable separators.
+    fn slot_transition_certificate_names(
+        &mut self,
+        transition: &CheckedSlotTransition,
+        operation: &str,
+        place: &Place,
+        symbolic_visit: usize,
+    ) -> Option<(String, String)> {
+        let Some(site_start) = transition.key.span.start.checked_sub(self.f.span.start) else {
+            refuse_vc_type(format!(
+                "internal.slot_transition_certificate_identity: `{operation}` span {}..{} precedes its {} body",
+                transition.key.span.start,
+                transition.key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        };
+        let Some(site_end) = transition.key.span.end.checked_sub(self.f.span.start) else {
+            refuse_vc_type(format!(
+                "internal.slot_transition_certificate_identity: `{operation}` span {}..{} precedes its {} body",
+                transition.key.span.start,
+                transition.key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        };
+        let owner = self.call_owner.certificate_component();
+        let raw_place = place.render();
+        let occurrence = format!("{site_start}:{site_end}");
+        let visit = symbolic_visit.to_string();
+        let name = format!(
+            "transition.{owner}.{operation}.{raw_place}.site.{site_start}-{site_end}.visit.{symbolic_visit}"
+        );
+        let thm_name = injective_lean_components(
+            "cert",
+            &[
+                "slot_transition",
+                owner.as_str(),
+                operation,
+                raw_place.as_str(),
+                occurrence.as_str(),
+                visit.as_str(),
+            ],
+        );
+        Some((name, thm_name))
+    }
+
     fn slot_payload_term(&mut self, payload: &Ty, value: Val) -> Option<String> {
         match (payload, value) {
             (Ty::Bool, Val::Prop(prop)) => Some(lean_bool_value(&prop)),
@@ -7697,7 +7755,8 @@ impl<'a> Generator<'a> {
     fn eval_after_trap_lookup(&mut self, e: &Expr, scope: ScopeId) -> Val {
         match &e.kind {
             ExprKind::SlotOp { op, args, .. } => {
-                let Some((transition, action)) = self.checked_slot_transition_action(scope, e)
+                let Some((transition, action, symbolic_visit)) =
+                    self.checked_slot_transition_action(scope, e)
                 else {
                     return refused_expression_value(e);
                 };
@@ -7739,10 +7798,11 @@ impl<'a> Generator<'a> {
                         Val::Slots(slots)
                     }
                     SlotOp::Take => {
-                        let CheckedSlotTransitionKind::Take { container, .. } = transition.kind
+                        let CheckedSlotTransitionKind::Take { container, .. } = &transition.kind
                         else {
                             unreachable!("slot take transition was exactly cross-validated")
                         };
+                        let container = container.clone();
                         let SlotActionKind::Take { .. } = action.kind() else {
                             unreachable!("slot take action was exactly cross-validated")
                         };
@@ -7793,6 +7853,36 @@ impl<'a> Generator<'a> {
                         if !self.write_slot_place(&container, updated.clone()) {
                             return refused_expression_value(e);
                         }
+                        // Read the checked place back from the live environment.
+                        // Reusing `updated` here would certify construction of a
+                        // term, not that local/field write-back installed it.
+                        let Some(observed) = self.slot_place_str(&container) else {
+                            return refused_expression_value(e);
+                        };
+                        let Some((name, thm_name)) = self.slot_transition_certificate_names(
+                            &transition,
+                            "slot_take",
+                            &container,
+                            symbolic_visit,
+                        ) else {
+                            return refused_expression_value(e);
+                        };
+                        match TransitionCertificate::slot_take(
+                            name,
+                            thm_name,
+                            transition,
+                            action,
+                            before,
+                            observed,
+                            index,
+                            self.binders.clone(),
+                        ) {
+                            Ok(certificate) => self.out.transition_certificates.push(certificate),
+                            Err(message) => {
+                                refuse_vc_type(message);
+                                return refused_expression_value(e);
+                            }
+                        }
                         self.push_slot_payload_facts(
                             &payload,
                             &format!("{}_take", container.binder_hint()),
@@ -7801,10 +7891,11 @@ impl<'a> Generator<'a> {
                         value
                     }
                     SlotOp::Put => {
-                        let CheckedSlotTransitionKind::Put { container, .. } = transition.kind
+                        let CheckedSlotTransitionKind::Put { container, .. } = &transition.kind
                         else {
                             unreachable!("slot put transition was exactly cross-validated")
                         };
+                        let container = container.clone();
                         let SlotActionKind::Put {
                             value_transfer,
                             staging,
@@ -7886,6 +7977,36 @@ impl<'a> Generator<'a> {
                         let updated = format!("({before}.set {index} (some ({staging_name})))");
                         if !self.write_slot_place(&container, updated.clone()) {
                             return refused_expression_value(e);
+                        }
+                        // The observed term comes from the environment after
+                        // write-back, including direct `self` field projection.
+                        let Some(observed) = self.slot_place_str(&container) else {
+                            return refused_expression_value(e);
+                        };
+                        let Some((name, thm_name)) = self.slot_transition_certificate_names(
+                            &transition,
+                            "slot_put",
+                            &container,
+                            symbolic_visit,
+                        ) else {
+                            return refused_expression_value(e);
+                        };
+                        match TransitionCertificate::slot_put(
+                            name,
+                            thm_name,
+                            transition,
+                            action,
+                            before,
+                            observed,
+                            index,
+                            staging_name,
+                            self.binders.clone(),
+                        ) {
+                            Ok(certificate) => self.out.transition_certificates.push(certificate),
+                            Err(message) => {
+                                refuse_vc_type(message);
+                                return refused_expression_value(e);
+                            }
                         }
                         self.push_slot_payload_facts(
                             &payload,
@@ -12245,6 +12366,453 @@ fn slot_roundtrip(u64 value) -> u64 {
                 .iter()
                 .all(|(_, ty)| ty != "Sable.Seq Int" || !obligation.name.contains("slot_"))
         }));
+
+        assert_eq!(
+            generated.transition_certificates.len(),
+            2,
+            "allocation has no certificate; put and take each have one"
+        );
+        for certificate in &generated.transition_certificates {
+            assert!(
+                certificate.hyps.is_empty(),
+                "slot writeback certificates must not consume generator-authored semantic hypotheses"
+            );
+            match &certificate.kind {
+                crate::transition::TransitionCertificateKind::SlotTake {
+                    transition,
+                    action,
+                    ..
+                }
+                | crate::transition::TransitionCertificateKind::SlotPut {
+                    transition,
+                    action,
+                    ..
+                } => {
+                    assert_eq!(action.effect_key(), &transition.key);
+                    assert_eq!(action.span(), transition.key.span);
+                    assert_eq!(action.payload(), &transition.payload);
+                    assert_eq!(action.result_ty(), &transition.result_ty);
+                }
+                crate::transition::TransitionCertificateKind::CallHavoc { .. } => {
+                    panic!("the local roundtrip has no call-havoc transition")
+                }
+            }
+        }
+        let put = generated
+            .transition_certificates
+            .iter()
+            .find_map(|certificate| match &certificate.kind {
+                crate::transition::TransitionCertificateKind::SlotPut {
+                    before,
+                    observed,
+                    index,
+                    staged,
+                    ..
+                } => Some((certificate, before, observed, index, staged)),
+                crate::transition::TransitionCertificateKind::CallHavoc { .. }
+                | crate::transition::TransitionCertificateKind::SlotTake { .. } => None,
+            })
+            .expect("the local put emits its writeback certificate");
+        assert_eq!(
+            put.2,
+            &format!("({}.set {} (some ({})))", put.1, put.3, put.4),
+            "the local post-state is read back exactly"
+        );
+        assert_eq!(
+            put.0.lean_goal(),
+            format!(
+                "Sable.SlotPutWriteback ({}) ({}) ({}) ({})",
+                put.1, put.2, put.3, put.4
+            ),
+            "the fixed certificate states only the structural put writeback"
+        );
+        let take = generated
+            .transition_certificates
+            .iter()
+            .find_map(|certificate| match &certificate.kind {
+                crate::transition::TransitionCertificateKind::SlotTake {
+                    before,
+                    observed,
+                    index,
+                    ..
+                } => Some((certificate, before, observed, index)),
+                crate::transition::TransitionCertificateKind::CallHavoc { .. }
+                | crate::transition::TransitionCertificateKind::SlotPut { .. } => None,
+            })
+            .expect("the local take emits its writeback certificate");
+        assert_eq!(
+            take.2,
+            &format!("({}.set {} (none : Option Int))", take.1, take.3),
+            "the local post-state is read back exactly"
+        );
+        assert_eq!(
+            take.0.lean_goal(),
+            format!(
+                "Sable.SlotTakeWriteback ({}) ({}) ({})",
+                take.1, take.2, take.3
+            ),
+            "the fixed certificate states only the structural take writeback"
+        );
+        let returned = take
+            .0
+            .binders
+            .iter()
+            .map(|(name, _)| name)
+            .find(|name| name.as_str() == "taken")
+            .expect("the ordinary VC context retains the returned payload binder");
+        assert!(
+            !take.0.lean_goal().contains(returned),
+            "trusted generator-authored payload provenance stays outside the fixed writeback predicate"
+        );
+        assert!(
+            !put.0.lean_goal().contains("(incoming)"),
+            "trusted generator-authored incoming-to-staged provenance stays outside the fixed predicate"
+        );
+        // Coordinated substitution that preserves these equalities is
+        // deliberately a trusted-Rust provenance question, not a stronger
+        // source-semantics claim smuggled into this structural certificate.
+
+        let attempted_skip: HashSet<String> = generated
+            .transition_certificates
+            .iter()
+            .map(|certificate| certificate.name.clone())
+            .collect();
+        let emitted = crate::lean::emit(
+            &generated,
+            &[],
+            &attempted_skip,
+            &[],
+            &crate::lean::EmittedNames::default(),
+        );
+        assert!(emitted.lean_source.contains("Sable.SlotPutWriteback"));
+        assert!(emitted.lean_source.contains("Sable.SlotTakeWriteback"));
+        assert_eq!(emitted.names.certificates.len(), 2);
+    }
+
+    #[test]
+    fn slot_allocation_and_cleanup_emit_no_transition_certificate() {
+        let source = r#"
+class Payload {
+    u64 value;
+
+    init new() {
+        self.value = 1;
+    }
+}
+
+fn allocation_only() {
+    mut slots<Payload> cells = alloc_slots<Payload>(2);
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("slot allocation and lexical cleanup remain executable proof state");
+        assert!(
+            generated.transition_certificates.is_empty(),
+            "allocation and cleanup remain outside the writeback-certificate slice"
+        );
+    }
+
+    #[test]
+    fn slot_writeback_certificates_use_injective_symbolic_visit_identities() {
+        let source = r#"
+fn branch_slot(bool choose, u64 incoming) -> u64 {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    if (choose) {
+    } else {
+    }
+    slot_put(&mut cells, 0, incoming);
+    return slot_take(&mut cells, 0);
+}
+"#;
+        let (program, checked) = checked_program(source);
+        assert_eq!(
+            checked
+                .ownership
+                .slot_transitions_for_owner(&CallOwner::Function("branch_slot".into()))
+                .count(),
+            3,
+            "the checker retains one alloc, one put, and one take source transition"
+        );
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("branch revisits reuse immutable slot authorities");
+        let puts: Vec<&TransitionCertificate> = generated
+            .transition_certificates
+            .iter()
+            .filter(|certificate| {
+                matches!(
+                    &certificate.kind,
+                    crate::transition::TransitionCertificateKind::SlotPut { .. }
+                )
+            })
+            .collect();
+        let takes: Vec<&TransitionCertificate> = generated
+            .transition_certificates
+            .iter()
+            .filter(|certificate| {
+                matches!(
+                    &certificate.kind,
+                    crate::transition::TransitionCertificateKind::SlotTake { .. }
+                )
+            })
+            .collect();
+        assert_eq!(puts.len(), 2);
+        assert_eq!(takes.len(), 2);
+        for certificates in [puts, takes] {
+            assert!(certificates[0].name.contains(".visit.1"));
+            assert!(certificates[1].name.contains(".visit.2"));
+            assert_ne!(certificates[0].thm_name, certificates[1].thm_name);
+        }
+    }
+
+    #[test]
+    fn direct_self_slot_fields_are_read_back_after_initializer_and_method_writes() {
+        let source = r#"
+class SlotHolder {
+    slots<u64> cells;
+
+    init full(u64 incoming) {
+        self.cells = alloc_slots<u64>(1);
+        slot_put(&mut self.cells, 0, incoming);
+    }
+
+    fn drain(&mut self) -> u64 {
+        self.cells = alloc_slots<u64>(1);
+        slot_put(&mut self.cells, 0, 7);
+        return slot_take(&mut self.cells, 0);
+    }
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("direct self slot fields have bounded writeback semantics");
+        let initializer = generated
+            .transition_certificates
+            .iter()
+            .find(|certificate| {
+                matches!(
+                    &certificate.kind,
+                    crate::transition::TransitionCertificateKind::SlotPut { .. }
+                ) && certificate
+                    .name
+                    .contains("constructor.SlotHolder.full.slot_put")
+            })
+            .expect("initializer put emits a certificate");
+        assert_eq!(initializer.place().render(), "self.cells");
+        let method = generated
+            .transition_certificates
+            .iter()
+            .find(|certificate| {
+                matches!(
+                    &certificate.kind,
+                    crate::transition::TransitionCertificateKind::SlotTake { .. }
+                ) && certificate
+                    .name
+                    .contains("method.SlotHolder.drain.slot_take")
+            })
+            .expect("method take emits a certificate");
+        let crate::transition::TransitionCertificateKind::SlotTake {
+            before, observed, ..
+        } = &method.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(method.place().render(), "self.cells");
+        assert_eq!(
+            observed,
+            &format!("({before}.set 0 (none : Option Int))"),
+            "the direct-field environment readback resolves to the exact installed update"
+        );
+
+        let emitted = crate::lean::emit(
+            &generated,
+            &[],
+            &HashSet::new(),
+            &[],
+            &crate::lean::EmittedNames::default(),
+        );
+        assert!(emitted.lean_source.contains(&method.thm_name));
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let environment = crate::lean::ProofEnvironment::capture(repo_root)
+            .expect("the repository proof environment must be capturable");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos();
+        let lean_file = std::env::temp_dir().join(format!(
+            "sable_direct_self_slot_certificate_{}_{}.lean",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::write(&lean_file, &emitted.lean_source)
+            .expect("the direct-field generated document must be writable");
+        let messages = crate::lean::run_lean(
+            repo_root,
+            &environment,
+            &lean_file,
+            None,
+            &emitted.lean_source,
+        )
+        .expect("Lean must check the direct-field slot certificates");
+        let _ = std::fs::remove_file(&lean_file);
+        let modules = crate::modules::ModuleSet::single(
+            "direct_self_slot_certificate.sable".into(),
+            source.into(),
+        );
+        let diagnostics = crate::lean::diagnose(&emitted, &generated, &messages, &modules);
+        assert!(
+            diagnostics.is_empty(),
+            "direct-field certificates must pass the kernel: {diagnostics:#?}"
+        );
+    }
+
+    fn assert_tampered_slot_certificate_rejected_by_lean(
+        source: &str,
+        label: &str,
+        tamper: impl FnOnce(&mut [TransitionCertificate]),
+    ) {
+        let (program, checked) = checked_program(source);
+        let mut generated = generate(&program, &checked, source, Path::new("."))
+            .expect("the untampered slot subject generates certificates");
+        tamper(&mut generated.transition_certificates);
+        let emitted = crate::lean::emit(
+            &generated,
+            &[],
+            &HashSet::new(),
+            &[],
+            &crate::lean::EmittedNames::default(),
+        );
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let environment = crate::lean::ProofEnvironment::capture(repo_root)
+            .expect("the repository proof environment must be capturable");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos();
+        let lean_file = std::env::temp_dir().join(format!(
+            "sable_tampered_slot_{}_{}_{}.lean",
+            sanitize(label),
+            std::process::id(),
+            nonce
+        ));
+        std::fs::write(&lean_file, &emitted.lean_source)
+            .expect("the tampered generated document must be writable");
+        let messages = crate::lean::run_lean(
+            repo_root,
+            &environment,
+            &lean_file,
+            None,
+            &emitted.lean_source,
+        )
+        .expect("Lean must run and reject the tampered slot theorem");
+        let _ = std::fs::remove_file(&lean_file);
+        let modules = crate::modules::ModuleSet::single(
+            "slot_transition_certificate.sable".into(),
+            source.into(),
+        );
+        let diagnostics = crate::lean::diagnose(&emitted, &generated, &messages, &modules);
+        assert!(!diagnostics.is_empty(), "{label}: Lean accepted the tamper");
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.name == "internal.slot_transition_certificate_rejected"
+                    && diagnostic.title.contains("slot-")
+                    && diagnostic
+                        .label
+                        .contains("owner-slot write-back was not certified")
+            }),
+            "{label}: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn lean_rejects_tampered_owner_slot_prestate_observation_index_and_staged_term() {
+        let source = r#"
+fn certified_roundtrip(u64 incoming) -> u64 {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    slot_put(&mut cells, 0, incoming);
+    return slot_take(&mut cells, 0);
+}
+"#;
+        assert_tampered_slot_certificate_rejected_by_lean(
+            source,
+            "take_observed",
+            |certificates| {
+                let certificate = certificates
+                    .iter_mut()
+                    .find(|certificate| {
+                        matches!(
+                            &certificate.kind,
+                            crate::transition::TransitionCertificateKind::SlotTake { .. }
+                        )
+                    })
+                    .expect("take certificate exists");
+                let crate::transition::TransitionCertificateKind::SlotTake {
+                    before, observed, ..
+                } = &mut certificate.kind
+                else {
+                    unreachable!()
+                };
+                *observed = before.clone();
+            },
+        );
+        assert_tampered_slot_certificate_rejected_by_lean(source, "take_before", |certificates| {
+            let certificate = certificates
+                .iter_mut()
+                .find(|certificate| {
+                    matches!(
+                        &certificate.kind,
+                        crate::transition::TransitionCertificateKind::SlotTake { .. }
+                    )
+                })
+                .expect("take certificate exists");
+            let crate::transition::TransitionCertificateKind::SlotTake {
+                before, observed, ..
+            } = &mut certificate.kind
+            else {
+                unreachable!()
+            };
+            *before = observed.clone();
+        });
+        assert_tampered_slot_certificate_rejected_by_lean(source, "take_index", |certificates| {
+            let certificate = certificates
+                .iter_mut()
+                .find(|certificate| {
+                    matches!(
+                        &certificate.kind,
+                        crate::transition::TransitionCertificateKind::SlotTake { .. }
+                    )
+                })
+                .expect("take certificate exists");
+            let crate::transition::TransitionCertificateKind::SlotTake { index, .. } =
+                &mut certificate.kind
+            else {
+                unreachable!()
+            };
+            *index = "1".into();
+        });
+        assert_tampered_slot_certificate_rejected_by_lean(source, "put_staged", |certificates| {
+            let certificate = certificates
+                .iter_mut()
+                .find(|certificate| {
+                    matches!(
+                        &certificate.kind,
+                        crate::transition::TransitionCertificateKind::SlotPut { .. }
+                    )
+                })
+                .expect("put certificate exists");
+            let crate::transition::TransitionCertificateKind::SlotPut { staged, .. } =
+                &mut certificate.kind
+            else {
+                unreachable!()
+            };
+            *staged = "0".into();
+        });
     }
 
     #[test]
@@ -14136,6 +14704,7 @@ fn bool_array_loop(u64 n, bool seed) {
             ownership: &ownership,
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
+            checked_slot_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
             visited_slot_transitions: HashSet::new(),
             visited_slot_actions: HashSet::new(),
@@ -14320,10 +14889,13 @@ fn bool_array_loop(u64 n, bool seed) {
                 .transition_certificates
                 .last()
                 .expect("a real array call havoc emits a certificate");
-            assert_eq!(certificate.transition.place.render(), "xs");
+            assert_eq!(certificate.place().render(), "xs");
             assert!(matches!(
-                certificate.kind,
-                crate::transition::CallHavocCertificateKind::Array { .. }
+                &certificate.kind,
+                crate::transition::TransitionCertificateKind::CallHavoc {
+                    kind: crate::transition::CallHavocCertificateKind::Array { .. },
+                    ..
+                }
             ));
         });
         assert!(take_vc_type_refusal().is_none());
@@ -14372,11 +14944,15 @@ fn bool_array_loop(u64 n, bool seed) {
                 .transition_certificates
                 .last()
                 .expect("a projected resource call havoc emits a certificate");
-            assert_eq!(certificate.transition.place.render(), "self.mem");
-            assert_eq!(certificate.fresh, certificate.observed);
+            assert_eq!(certificate.place().render(), "self.mem");
             assert!(matches!(
-                certificate.kind,
-                crate::transition::CallHavocCertificateKind::Writeback
+                &certificate.kind,
+                crate::transition::TransitionCertificateKind::CallHavoc {
+                    fresh,
+                    observed,
+                    kind: crate::transition::CallHavocCertificateKind::Writeback,
+                    ..
+                } if fresh == observed
             ));
         });
         assert!(take_vc_type_refusal().is_none());
@@ -14582,6 +15158,7 @@ class CleanupHolder {
                 .map(|(key, _)| key.clone())
                 .collect(),
             checked_call_visits: HashMap::new(),
+            checked_slot_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
             visited_slot_transitions: HashSet::new(),
             visited_slot_actions: HashSet::new(),
@@ -15192,7 +15769,7 @@ pub fn nested_subject(u64 n) {
         let places: Vec<String> = result
             .transition_certificates
             .iter()
-            .map(|certificate| certificate.transition.place.render())
+            .map(|certificate| certificate.place().render())
             .collect();
         assert_eq!(places, vec!["left".to_string(), "right".to_string()]);
     }
@@ -15225,7 +15802,7 @@ pub fn branch_join(u64 n, bool choose) {
         let certificates: Vec<&TransitionCertificate> = result
             .transition_certificates
             .iter()
-            .filter(|certificate| certificate.transition.place.render() == "values")
+            .filter(|certificate| certificate.place().render() == "values")
             .collect();
         assert_eq!(certificates.len(), 2);
         assert!(certificates[0].name.contains(".visit.1."));
@@ -15269,11 +15846,14 @@ pub class Holder {
         let certificate = result
             .transition_certificates
             .iter()
-            .find(|certificate| certificate.transition.place.render() == "self.mem")
+            .find(|certificate| certificate.place().render() == "self.mem")
             .expect("the checker-authored field place reaches the certificate");
         assert!(matches!(
-            certificate.kind,
-            crate::transition::CallHavocCertificateKind::Writeback
+            &certificate.kind,
+            crate::transition::TransitionCertificateKind::CallHavoc {
+                kind: crate::transition::CallHavocCertificateKind::Writeback,
+                ..
+            }
         ));
     }
 
@@ -15328,12 +15908,15 @@ pub class GenericHolder<T> {
             .iter()
             .find(|certificate| {
                 certificate.name.contains("deinitializer.GenericHolder")
-                    && certificate.transition.place.render() == "self.mem"
+                    && certificate.place().render() == "self.mem"
             })
             .expect("the template destructor visits its checker-authored field havoc");
         assert!(matches!(
-            certificate.kind,
-            crate::transition::CallHavocCertificateKind::Writeback
+            &certificate.kind,
+            crate::transition::TransitionCertificateKind::CallHavoc {
+                kind: crate::transition::CallHavocCertificateKind::Writeback,
+                ..
+            }
         ));
     }
 
@@ -15375,7 +15958,7 @@ pub fn member_call_subject() {
         let places: Vec<String> = result
             .transition_certificates
             .iter()
-            .map(|certificate| certificate.transition.place.render())
+            .map(|certificate| certificate.place().render())
             .collect();
         assert_eq!(places, vec!["cell".to_string(), "cell".to_string()]);
     }
@@ -15596,12 +16179,18 @@ pub fn same_member_subject() {
         let (_, _, result) = checked_call_havoc_certificate(CALL_HAVOC_CERT_SOURCE);
         assert_eq!(result.transition_certificates.len(), 1);
         let certificate = &result.transition_certificates[0];
-        assert_eq!(certificate.transition.place.render(), "values");
-        assert!(matches!(certificate.transition.referent, Ty::Array(_)));
-        assert_eq!(certificate.fresh, certificate.observed);
+        assert_eq!(certificate.place().render(), "values");
         assert!(matches!(
-            certificate.kind,
-            crate::transition::CallHavocCertificateKind::Array { .. }
+            &certificate.kind,
+            crate::transition::TransitionCertificateKind::CallHavoc {
+                transition: crate::transition::CallTransition {
+                    referent: Ty::Array(_),
+                    ..
+                },
+                fresh,
+                observed,
+                kind: crate::transition::CallHavocCertificateKind::Array { .. },
+            } if fresh == observed
         ));
 
         let attempted_skip = HashSet::from([certificate.name.clone()]);
@@ -15622,15 +16211,30 @@ pub fn same_member_subject() {
     fn tampered_real_call_havoc_certificate_is_rejected_by_lean() {
         let (_, _, mut result) = checked_call_havoc_certificate(CALL_HAVOC_CERT_SOURCE);
         let before = match &result.transition_certificates[0].kind {
-            crate::transition::CallHavocCertificateKind::Array { before, .. } => before.clone(),
-            crate::transition::CallHavocCertificateKind::Writeback => {
+            crate::transition::TransitionCertificateKind::CallHavoc {
+                kind: crate::transition::CallHavocCertificateKind::Array { before, .. },
+                ..
+            } => before.clone(),
+            crate::transition::TransitionCertificateKind::CallHavoc {
+                kind: crate::transition::CallHavocCertificateKind::Writeback,
+                ..
+            } => {
                 panic!("the source call lends an array")
+            }
+            crate::transition::TransitionCertificateKind::SlotTake { .. }
+            | crate::transition::TransitionCertificateKind::SlotPut { .. } => {
+                panic!("the source has no owner-slot transition")
             }
         };
         // Adversarially restore the exact stale-state bug this certificate
         // fences: the caller observes its pre-call sequence instead of the
         // fresh sequence chosen for the callee's post-state.
-        result.transition_certificates[0].observed = before;
+        let crate::transition::TransitionCertificateKind::CallHavoc { observed, .. } =
+            &mut result.transition_certificates[0].kind
+        else {
+            panic!("the source emits one call-havoc certificate")
+        };
+        *observed = before;
         let emitted = crate::lean::emit(
             &result,
             &[],
@@ -15673,6 +16277,17 @@ pub fn same_member_subject() {
         assert_eq!(
             diagnostics[0].name,
             "internal.transition_certificate_rejected"
+        );
+        assert_eq!(
+            diagnostics[0].title,
+            format!(
+                "Lean rejected call-havoc transition certificate `{}`",
+                result.transition_certificates[0].name
+            )
+        );
+        assert_eq!(
+            diagnostics[0].label,
+            "fresh symbolic state was not certified at `values`"
         );
     }
 
@@ -15798,6 +16413,7 @@ pub fn same_member_subject() {
             ownership: &ownership,
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
+            checked_slot_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
             visited_slot_transitions: HashSet::new(),
             visited_slot_actions: HashSet::new(),

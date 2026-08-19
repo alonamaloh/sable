@@ -9,7 +9,8 @@
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use crate::ast::{Mutability, Ty};
-use crate::ownership::ValueTransfer;
+use crate::control::{SlotAction, SlotActionKind};
+use crate::ownership::{CheckedSlotTransition, CheckedSlotTransitionKind, ValueTransfer};
 use crate::place::Place;
 use crate::span::Span;
 use std::collections::HashMap;
@@ -252,23 +253,51 @@ pub(crate) enum CallHavocCertificateKind {
     Array { before: String, length_hyp: String },
 }
 
-/// Evidence emitted for one real `&mut` call argument.
+/// Exact semantic payload of one fixed-proof transition certificate.
 ///
-/// `fresh` is the binder introduced for the callee's post-call state, while
-/// `observed` is read back from the generator environment *after* place
-/// write-back.  Lean checks that those terms are definitionally equal.  For
-/// arrays it also checks that the exact hypothesis introduced by fresh-state
-/// construction relates the new sequence's length to the actual old one.
+/// Slot certificates retain the immutable checker transition and the exact
+/// control action that VC generation cross-validated before changing symbolic
+/// state. They are deliberately distinct from [`CallTransition`]: admitting a
+/// local `slot_take`/`slot_put` certificate does not admit owner slots to the
+/// call ABI, and allocation/cleanup still have no certificate semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TransitionCertificateKind {
+    CallHavoc {
+        transition: CallTransition,
+        fresh: String,
+        observed: String,
+        kind: CallHavocCertificateKind,
+    },
+    SlotTake {
+        transition: CheckedSlotTransition,
+        action: SlotAction,
+        before: String,
+        observed: String,
+        index: String,
+    },
+    SlotPut {
+        transition: CheckedSlotTransition,
+        action: SlotAction,
+        before: String,
+        observed: String,
+        index: String,
+        staged: String,
+    },
+}
+
+/// Evidence emitted for one selected symbolic transition.
+///
+/// Every term in the Lean predicate is copied from the live symbolic visit.
+/// In particular, `observed` is read back from the generator environment
+/// *after* place write-back; it is never the constructed update term reused as
+/// if a write had necessarily succeeded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransitionCertificate {
     pub(crate) name: String,
     pub(crate) thm_name: String,
-    pub(crate) transition: CallTransition,
-    pub(crate) fresh: String,
-    pub(crate) observed: String,
     pub(crate) binders: Vec<(String, String)>,
     pub(crate) hyps: Vec<(String, String)>,
-    pub(crate) kind: CallHavocCertificateKind,
+    pub(crate) kind: TransitionCertificateKind,
 }
 
 impl TransitionCertificate {
@@ -371,40 +400,311 @@ impl TransitionCertificate {
         Ok(Self {
             name,
             thm_name,
-            transition,
-            fresh,
-            observed,
             binders,
             hyps,
-            kind,
+            kind: TransitionCertificateKind::CallHavoc {
+                transition,
+                fresh,
+                observed,
+                kind,
+            },
         })
     }
 
-    pub(crate) fn lean_goal(&self) -> String {
-        match (self.transition.effect, &self.kind) {
-            (CallEffect::SharedLoan, _) => {
-                unreachable!("call_havoc rejects shared-loan certificates")
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn slot_take(
+        name: String,
+        thm_name: String,
+        transition: CheckedSlotTransition,
+        action: SlotAction,
+        before: String,
+        observed: String,
+        index: String,
+        binders: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        let place = validate_slot_transition_action(&transition, &action, SlotCertificateOp::Take)?;
+        require_slot_term(&before, &place, "pre-state")?;
+        require_slot_term(&observed, &place, "observed post-state")?;
+        require_slot_term(&index, &place, "index")?;
+        Ok(Self {
+            name,
+            thm_name,
+            binders,
+            hyps: Vec::new(),
+            kind: TransitionCertificateKind::SlotTake {
+                transition,
+                action,
+                before,
+                observed,
+                index,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn slot_put(
+        name: String,
+        thm_name: String,
+        transition: CheckedSlotTransition,
+        action: SlotAction,
+        before: String,
+        observed: String,
+        index: String,
+        staged: String,
+        binders: Vec<(String, String)>,
+    ) -> Result<Self, String> {
+        let place = validate_slot_transition_action(&transition, &action, SlotCertificateOp::Put)?;
+        require_slot_term(&before, &place, "pre-state")?;
+        require_slot_term(&observed, &place, "observed post-state")?;
+        require_slot_term(&index, &place, "index")?;
+        require_slot_term(&staged, &place, "staged payload")?;
+        require_slot_binder(&binders, &staged, &place, "staged payload")?;
+        Ok(Self {
+            name,
+            thm_name,
+            binders,
+            hyps: Vec::new(),
+            kind: TransitionCertificateKind::SlotPut {
+                transition,
+                action,
+                before,
+                observed,
+                index,
+                staged,
+            },
+        })
+    }
+
+    pub(crate) fn place(&self) -> &Place {
+        match &self.kind {
+            TransitionCertificateKind::CallHavoc { transition, .. } => &transition.place,
+            TransitionCertificateKind::SlotTake { transition, .. }
+            | TransitionCertificateKind::SlotPut { transition, .. } => transition
+                .container()
+                .expect("slot take/put certificates always retain a container"),
+        }
+    }
+
+    pub(crate) fn span(&self) -> Span {
+        match &self.kind {
+            TransitionCertificateKind::CallHavoc { transition, .. } => transition.span,
+            TransitionCertificateKind::SlotTake { transition, .. }
+            | TransitionCertificateKind::SlotPut { transition, .. } => transition.key.span,
+        }
+    }
+
+    pub(crate) fn description(&self) -> &'static str {
+        match &self.kind {
+            TransitionCertificateKind::CallHavoc { .. } => "call-havoc",
+            TransitionCertificateKind::SlotTake { .. } => "slot-take writeback",
+            TransitionCertificateKind::SlotPut { .. } => "slot-put writeback",
+        }
+    }
+
+    pub(crate) fn rejection_diagnostic_name(&self) -> &'static str {
+        match &self.kind {
+            TransitionCertificateKind::CallHavoc { .. } => {
+                "internal.transition_certificate_rejected"
             }
-            (CallEffect::HavocUniqueBorrow, CallHavocCertificateKind::Writeback) => format!(
-                "Sable.CallHavocWriteback ({}) ({})",
-                self.fresh, self.observed
+            TransitionCertificateKind::SlotTake { .. }
+            | TransitionCertificateKind::SlotPut { .. } => {
+                "internal.slot_transition_certificate_rejected"
+            }
+        }
+    }
+
+    pub(crate) fn rejection_label(&self) -> String {
+        match &self.kind {
+            TransitionCertificateKind::CallHavoc { .. } => format!(
+                "fresh symbolic state was not certified at `{}`",
+                self.place().render()
             ),
-            (CallEffect::HavocUniqueBorrow, CallHavocCertificateKind::Array { before, .. }) => {
-                format!(
-                    "Sable.ArrayCallHavoc ({before}) ({}) ({})",
-                    self.fresh, self.observed
-                )
-            }
+            TransitionCertificateKind::SlotTake { .. }
+            | TransitionCertificateKind::SlotPut { .. } => format!(
+                "owner-slot write-back was not certified at `{}`",
+                self.place().render()
+            ),
+        }
+    }
+
+    pub(crate) fn lean_goal(&self) -> String {
+        match &self.kind {
+            TransitionCertificateKind::CallHavoc {
+                transition,
+                fresh,
+                observed,
+                kind,
+            } => match (transition.effect, kind) {
+                (CallEffect::SharedLoan, _) => {
+                    unreachable!("call_havoc rejects shared-loan certificates")
+                }
+                (CallEffect::HavocUniqueBorrow, CallHavocCertificateKind::Writeback) => {
+                    format!("Sable.CallHavocWriteback ({fresh}) ({observed})")
+                }
+                (CallEffect::HavocUniqueBorrow, CallHavocCertificateKind::Array { before, .. }) => {
+                    format!("Sable.ArrayCallHavoc ({before}) ({fresh}) ({observed})")
+                }
+            },
+            TransitionCertificateKind::SlotTake {
+                before,
+                observed,
+                index,
+                ..
+            } => format!("Sable.SlotTakeWriteback ({before}) ({observed}) ({index})"),
+            TransitionCertificateKind::SlotPut {
+                before,
+                observed,
+                index,
+                staged,
+                ..
+            } => format!("Sable.SlotPutWriteback ({before}) ({observed}) ({index}) ({staged})"),
         }
     }
 
     pub(crate) fn lean_proof(&self) -> String {
         match &self.kind {
-            CallHavocCertificateKind::Writeback => "by exact ⟨rfl⟩".to_string(),
-            CallHavocCertificateKind::Array { length_hyp, .. } => {
-                format!("by exact ⟨rfl, {length_hyp}⟩")
-            }
+            TransitionCertificateKind::CallHavoc {
+                kind: CallHavocCertificateKind::Writeback,
+                ..
+            } => "by exact ⟨rfl⟩".to_string(),
+            TransitionCertificateKind::CallHavoc {
+                kind: CallHavocCertificateKind::Array { length_hyp, .. },
+                ..
+            } => format!("by exact ⟨rfl, {length_hyp}⟩"),
+            TransitionCertificateKind::SlotTake { .. }
+            | TransitionCertificateKind::SlotPut { .. } => "by exact ⟨rfl⟩".to_string(),
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotCertificateOp {
+    Take,
+    Put,
+}
+
+fn validate_slot_transition_action(
+    transition: &CheckedSlotTransition,
+    action: &SlotAction,
+    expected_op: SlotCertificateOp,
+) -> Result<Place, String> {
+    let Some(place) = transition.container().cloned() else {
+        return Err(
+            "internal.slot_transition_certificate_shape: slot allocation cannot produce a writeback certificate"
+                .into(),
+        );
+    };
+    let reject = |detail: &str| {
+        format!(
+            "internal.slot_transition_certificate_shape: checked owner-slot transition for `{}` {detail}",
+            place.render()
+        )
+    };
+    if action.span() != transition.key.span
+        || action.effect_key() != &transition.key
+        || action.op_span() != transition.op_span
+        || action.payload() != &transition.payload
+        || action.result_ty() != &transition.result_ty
+    {
+        return Err(reject("disagrees with its retained control action"));
+    }
+    let transition_op = match &transition.kind {
+        CheckedSlotTransitionKind::Alloc { .. } => None,
+        CheckedSlotTransitionKind::Take { .. } => Some(SlotCertificateOp::Take),
+        CheckedSlotTransitionKind::Put { .. } => Some(SlotCertificateOp::Put),
+    };
+    let action_op = match action.kind() {
+        SlotActionKind::Alloc { .. } => None,
+        SlotActionKind::Take { .. } => Some(SlotCertificateOp::Take),
+        SlotActionKind::Put { .. } => Some(SlotCertificateOp::Put),
+    };
+    if transition_op != Some(expected_op) || action_op != Some(expected_op) {
+        return Err(reject(
+            "has the wrong operation flavor for this certificate",
+        ));
+    }
+    let shape_matches = match (&transition.kind, action.kind()) {
+        (
+            CheckedSlotTransitionKind::Take {
+                container,
+                container_span,
+                index_span,
+                ..
+            },
+            SlotActionKind::Take {
+                container: action_container,
+                container_span: action_container_span,
+                index_span: action_index_span,
+            },
+        ) => {
+            container == action_container
+                && container_span == action_container_span
+                && index_span == action_index_span
+        }
+        (
+            CheckedSlotTransitionKind::Put {
+                container,
+                container_span,
+                index_span,
+                value_span,
+                value_transfer,
+                ..
+            },
+            SlotActionKind::Put {
+                container: action_container,
+                container_span: action_container_span,
+                index_span: action_index_span,
+                value_span: action_value_span,
+                value_transfer: action_transfer,
+                ..
+            },
+        ) => {
+            container == action_container
+                && container_span == action_container_span
+                && index_span == action_index_span
+                && value_span == action_value_span
+                && value_transfer == action_transfer
+        }
+        (CheckedSlotTransitionKind::Alloc { .. }, SlotActionKind::Alloc { .. })
+        | (CheckedSlotTransitionKind::Alloc { .. }, SlotActionKind::Take { .. })
+        | (CheckedSlotTransitionKind::Alloc { .. }, SlotActionKind::Put { .. })
+        | (CheckedSlotTransitionKind::Take { .. }, SlotActionKind::Alloc { .. })
+        | (CheckedSlotTransitionKind::Take { .. }, SlotActionKind::Put { .. })
+        | (CheckedSlotTransitionKind::Put { .. }, SlotActionKind::Alloc { .. })
+        | (CheckedSlotTransitionKind::Put { .. }, SlotActionKind::Take { .. }) => false,
+    };
+    if !shape_matches {
+        return Err(reject(
+            "disagrees on its exact place, spans, or move transfer",
+        ));
+    }
+    Ok(place)
+}
+
+fn require_slot_term(term: &str, place: &Place, role: &str) -> Result<(), String> {
+    if term.trim().is_empty() {
+        Err(format!(
+            "internal.slot_transition_certificate_missing_term: `{}` has no {role}",
+            place.render()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_slot_binder(
+    binders: &[(String, String)],
+    binder: &str,
+    place: &Place,
+    role: &str,
+) -> Result<(), String> {
+    if binders.iter().any(|(name, _)| name == binder) {
+        Ok(())
+    } else {
+        Err(format!(
+            "internal.slot_transition_certificate_missing_binder: `{}` cannot find {role} binder `{binder}`",
+            place.render()
+        ))
     }
 }
 
@@ -421,7 +721,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_slots_never_acquire_call_transition_or_certificate_semantics() {
+    fn owner_slots_never_acquire_call_havoc_transition_or_certificate_semantics() {
         let slots = Ty::slots(Ty::Int(IntTy::U64));
         let error = CallTransition::borrow(
             Place::local("cells"),
@@ -454,7 +754,7 @@ mod tests {
             vec![("_slots1".into(), "Unsupported".into())],
             Vec::new(),
         )
-        .expect_err("owner slots have no transition-certificate semantics yet");
+        .expect_err("owner slots have no call-havoc certificate semantics");
         assert!(
             error.starts_with("internal.transition_certificate.slots_unsupported:"),
             "{error}"

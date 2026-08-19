@@ -446,7 +446,7 @@ fn prepare_with_environment(
             break;
         }
         let name = certificate.thm_name.clone();
-        let span = certificate.transition.span;
+        let span = certificate.span();
         let root_emitted = source_belongs_to_root(span) || !exclude.certificates.contains(&name);
         collision = register_declaration(name, "transition certificate", span, root_emitted);
     }
@@ -1479,6 +1479,124 @@ pub fn foo_call_havoc_bar(&mut [u64] baz) {
         let (_, collision) = prepare(&collision_path, &options, repo_root);
         let diagnostics = match collision {
             Ok(_) => panic!("an imported certificate may not replace a root ghost"),
+            Err(diagnostics) => diagnostics,
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].name, "module.name_collision");
+        assert!(diagnostics[0].title.contains(&dependency.thm_name));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn imported_old_sanitize_colliding_slot_certificate_cannot_suppress_root_ownership() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "sable-slot-certificate-identity-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).expect("temporary module directory is writable");
+        let dependency_path = directory.join("slot_cert_dep.sable");
+        let root_path = directory.join("slot_cert_root.sable");
+        std::fs::write(
+            &dependency_path,
+            r#"
+pub fn foo(u64 incoming) -> u64 {
+    mut slots<u64> bar_slot_put_baz = alloc_slots<u64>(1);
+    slot_put(&mut bar_slot_put_baz, 0, incoming);
+    return slot_take(&mut bar_slot_put_baz, 0);
+}
+"#,
+        )
+        .expect("dependency source is writable");
+        std::fs::write(
+            &root_path,
+            r#"
+use slot_cert_dep;
+
+pub fn foo_slot_put_bar(u64 incoming) -> u64 {
+    mut slots<u64> baz = alloc_slots<u64>(1);
+    slot_put(&mut baz, 0, incoming             );
+    return slot_take(&mut baz, 0);
+}
+"#,
+        )
+        .expect("root source is writable");
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let options = Options {
+            emit_lean_only: true,
+            module_paths: vec![directory.clone()],
+        };
+        let (_, prepared) = prepare(&root_path, &options, repo_root);
+        let prepared = prepared.unwrap_or_else(|diagnostics| {
+            panic!("two-module slot certificate preparation failed: {diagnostics:#?}")
+        });
+        let dependency = prepared
+            .vc
+            .transition_certificates
+            .iter()
+            .find(|certificate| {
+                certificate
+                    .name
+                    .contains("function.foo.slot_put.bar_slot_put_baz")
+            })
+            .expect("the dependency put certificate remains in the combined VC result");
+        let root = prepared
+            .vc
+            .transition_certificates
+            .iter()
+            .find(|certificate| {
+                certificate
+                    .name
+                    .contains("function.foo_slot_put_bar.slot_put.baz")
+            })
+            .expect("the root put certificate remains in the combined VC result");
+        let legacy_sanitize = |name: &str| {
+            name.chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        };
+        assert_eq!(
+            legacy_sanitize(&dependency.name),
+            legacy_sanitize(&root.name),
+            "the fixture must collide under the old lossy declaration sanitizer"
+        );
+        assert_ne!(dependency.thm_name, root.thm_name);
+        assert!(prepared.emitted.names.certificates.contains(&root.thm_name));
+        assert!(
+            !prepared
+                .emitted
+                .names
+                .certificates
+                .contains(&dependency.thm_name)
+        );
+        assert!(prepared.emitted.lean_source.contains(&root.name));
+        assert!(!prepared.emitted.lean_source.contains(&dependency.name));
+
+        let collision_path = directory.join("slot_cert_collision_root.sable");
+        std::fs::write(
+            &collision_path,
+            format!(
+                "use slot_cert_dep;\n\n/// theorem {} : True := by\n///   trivial\n\nfn subject() {{\n}}\n",
+                dependency.thm_name
+            ),
+        )
+        .expect("collision root source is writable");
+        let (_, collision) = prepare(&collision_path, &options, repo_root);
+        let diagnostics = match collision {
+            Ok(_) => panic!("an imported slot certificate may not be replaced by a root ghost"),
             Err(diagnostics) => diagnostics,
         };
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
