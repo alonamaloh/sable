@@ -12,7 +12,8 @@ use crate::ast;
 use crate::ast::*;
 use crate::control::{
     AssignmentStaging, BlockId, BodyPlan, ClassDropPhase, ClassDropPlan, ControlProgram, DropId,
-    ExitRoute, PlanError, ScopeId, StatementPlanKind, TrapSite, ValueDropAction, ValueDropRecipe,
+    ExitRoute, PlanError, ScopeId, SlotAction, SlotActionKind, StatementPlanKind, TrapSite,
+    ValueDropAction, ValueDropRecipe,
 };
 use crate::place::Place;
 use crate::span::Span;
@@ -27,6 +28,11 @@ pub enum RtVal {
     Int(i128),
     Bool(bool),
     Arr(Rc<RefCell<RtArray>>),
+    /// Affine owner-slot storage. Cloning the surrounding [`RtVal`] is
+    /// forbidden: the `Rc` exists only so an operation-local unique borrow
+    /// and the owning place can name one allocation while the operation is
+    /// active. Whole-owner transfers remove the source place first.
+    Slots(Rc<RefCell<RtSlots>>),
     /// An ordinary option. The checked payload type is retained even for
     /// `none`, because the dynamic proof monitor must implement the typed
     /// `Option.value = getD default` model (`0` for integers, `false` for
@@ -72,6 +78,7 @@ impl Clone for RtVal {
             RtVal::Int(value) => RtVal::Int(*value),
             RtVal::Bool(value) => RtVal::Bool(*value),
             RtVal::Arr(array) => RtVal::Arr(array.clone()),
+            RtVal::Slots(_) => panic!("owner-slot runtime values cannot be cloned"),
             RtVal::Opt { payload, value } => RtVal::Opt {
                 payload: payload.clone(),
                 value: value.clone(),
@@ -106,6 +113,7 @@ impl RtVal {
             (RtVal::Int(_), Ty::Int(integer)) => !matches!(integer, IntTy::TParam(_)),
             (RtVal::Bool(_), Ty::Bool) => true,
             (RtVal::Record { record, .. }, Ty::Record(declared)) => record == declared,
+            (RtVal::Obj { class, .. }, Ty::Class(declared)) => class == declared,
             _ => false,
         }
     }
@@ -230,6 +238,106 @@ impl RtArray {
             .map(spec_of)
             .collect::<Option<Vec<_>>>()?;
         Some(SpecArray::new(self.payload.clone(), values))
+    }
+}
+
+/// Runtime representation of `slots<T>`.
+///
+/// Occupancy is part of the allocation rather than encoded as an ordinary
+/// program option. A cell is neutralized with `Option::take` before its
+/// payload is transferred or recursively destroyed. `live` makes accidental
+/// aliases fail closed after the retained release action has run.
+#[derive(Debug)]
+pub struct RtSlots {
+    payload: Ty,
+    cells: Vec<Option<RtVal>>,
+    live: bool,
+}
+
+impl RtSlots {
+    fn allocate(payload: Ty, len: usize, span: Span) -> IResult<RtSlots> {
+        let mut cells = Vec::new();
+        cells.try_reserve_exact(len).map_err(|_| Trap {
+            undef: false,
+            message: format!("OOM trap: alloc_slots of length {len}"),
+            span,
+        })?;
+        cells.resize_with(len, || None);
+        Ok(RtSlots {
+            payload,
+            cells,
+            live: true,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.cells.len()
+    }
+
+    fn payload(&self) -> &Ty {
+        &self.payload
+    }
+
+    fn require_live(&self, span: Span, what: &str) -> IResult<()> {
+        if self.live {
+            Ok(())
+        } else {
+            Err(Trap {
+                undef: true,
+                message: format!(
+                    "interp.slots_after_release: {what} names released owner-slot storage"
+                ),
+                span,
+            })
+        }
+    }
+
+    fn payload_mismatch(payload: &Ty, value: &RtVal, role: &str, span: Span) -> Trap {
+        Trap {
+            undef: true,
+            message: format!(
+                "interp.slot_payload_mismatch: {role} {value:?} does not inhabit the owner-slot payload `{}`",
+                payload.name()
+            ),
+            span,
+        }
+    }
+
+    fn validate_cells(&self, span: Span, what: &str) -> IResult<()> {
+        self.require_live(span, what)?;
+        for value in self.cells.iter().flatten() {
+            if !value.inhabits(&self.payload) {
+                return Err(Self::payload_mismatch(
+                    &self.payload,
+                    value,
+                    "occupied cell",
+                    span,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Detached proof snapshot: an array of ordinary specification options,
+    /// never a second executable owner-slot value.
+    fn to_spec(&self) -> Option<SpecArray> {
+        if !self.live {
+            return None;
+        }
+        let values = self
+            .cells
+            .iter()
+            .map(|cell| {
+                Some(SpecVal::Opt {
+                    payload: Some(self.payload.clone()),
+                    value: match cell {
+                        Some(value) => Some(Box::new(spec_of(value)?)),
+                        None => None,
+                    },
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(SpecArray::new(Ty::option(self.payload.clone()), values))
     }
 }
 
@@ -384,6 +492,11 @@ pub(crate) fn validate_interp_return_ty(ty: Ty, context: &str) -> Result<(), Str
             "interp.affine_option_position_unsupported: {context} is ownership-bearing; affine options are supported only as explicit locals"
         ));
     }
+    if matches!(ty.referent(), Ty::Slots(_)) {
+        return Err(format!(
+            "interp.slots_call_abi_unsupported: {context} uses owner slots; the interpreter executes slots only as locals and class fields"
+        ));
+    }
     validate_interp_ty(ty, context)
 }
 
@@ -396,6 +509,11 @@ fn validate_interp_param_ty(ty: Ty, context: &str) -> Result<(), String> {
     if ty.is_affine_option() {
         return Err(format!(
             "interp.affine_option_position_unsupported: {context} is ownership-bearing; `option<[bool]>` is supported only as an explicit local"
+        ));
+    }
+    if matches!(ty.referent(), Ty::Slots(_)) {
+        return Err(format!(
+            "interp.slots_call_abi_unsupported: {context} uses owner slots; the interpreter has no slots call ABI"
         ));
     }
     // An owner crossing here is what a move is (ADR 0085): the caller's place
@@ -415,6 +533,9 @@ pub(crate) fn validate_interp_class_field_ty(ty: Ty, context: &str) -> Result<()
     if ty.is_owned_array_of(&Ty::Bool) {
         return Ok(());
     }
+    if let Ty::Slots(payload) = &ty {
+        return validate_interp_slot_payload(payload, context);
+    }
     validate_interp_param_ty(ty, context)
 }
 
@@ -430,6 +551,11 @@ pub(crate) fn validate_interp_field_ty(ty: Ty, context: &str) -> Result<(), Stri
             "interp.option_position_unsupported: {context} is option-valued; \
              ordinary options are supported as parameters, returns, locals, \
              and class fields, not record fields"
+        ));
+    }
+    if matches!(ty, Ty::Slots(_)) {
+        return Err(format!(
+            "interp.slots_position_unsupported: {context} is owner-slot storage; slots are supported only as locals and class fields"
         ));
     }
     validate_interp_param_ty(ty, context)
@@ -470,9 +596,7 @@ pub(crate) fn validate_interp_ty(ty: Ty, context: &str) -> Result<(), String> {
 fn validate_interp_container_payloads(ty: Ty, context: &str) -> Result<(), String> {
     match ty {
         Ty::Array(payload) => validate_interp_array_payload(&payload, context),
-        Ty::Slots(_) => Err(format!(
-            "interp.slots_unsupported: {context} uses owner slots, which have no interpreter value or lifecycle semantics yet"
-        )),
+        Ty::Slots(payload) => validate_interp_slot_payload(&payload, context),
         Ty::Option(payload) => validate_interp_option_payload(&payload, context),
         Ty::Param(_) | Ty::Int(IntTy::TParam(_)) | Ty::Raw(IntTy::TParam(_)) => Err(format!(
             "interp.type_parameter_unsupported: {context} contains an unresolved type parameter"
@@ -487,6 +611,43 @@ fn validate_interp_container_payloads(ty: Ty, context: &str) -> Result<(), Strin
         | Ty::RawRecord(_)
         | Ty::Borrow(..)
         | Ty::Unit => Ok(()),
+    }
+}
+
+/// May the interpreter execute the payload of one occupancy-bearing slot
+/// allocation. This is deliberately separate from ordinary array payloads:
+/// class values move through these cells and are never cloned by `get`/`set`.
+pub(crate) fn validate_interp_slot_payload(payload: &Ty, context: &str) -> Result<(), String> {
+    match payload {
+        Ty::Int(
+            IntTy::U8
+            | IntTy::U16
+            | IntTy::U32
+            | IntTy::U64
+            | IntTy::I8
+            | IntTy::I16
+            | IntTy::I32
+            | IntTy::I64,
+        )
+        | Ty::Bool
+        | Ty::Record(_)
+        | Ty::Class(_) => Ok(()),
+        Ty::Param(_) | Ty::Int(IntTy::TParam(_)) => Err(format!(
+            "interp.type_parameter_unsupported: {context} has unresolved owner-slot payload `{}`",
+            payload.name()
+        )),
+        Ty::Array(_)
+        | Ty::Slots(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => Err(format!(
+            "interp.slot_payload_unsupported: {context} has owner-slot payload `{}`; the interpreter executes concrete integers, Boolean, records, and concrete classes",
+            payload.name()
+        )),
     }
 }
 
@@ -559,6 +720,10 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                         ));
                     };
                     validate_affine_option_initializer(init, ty, locals, name)?;
+                } else if matches!(ty, Ty::Slots(_)) && init.is_none() {
+                    return Err(format!(
+                        "interp.slot_initializer: owner-slot local `{name}` needs an allocation or whole-owner move"
+                    ));
                 } else if let Some(init) = init {
                     validate_interp_expr(init, locals)?;
                     validate_interp_sink(
@@ -598,6 +763,16 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
             }
             Stmt::ExprStmt(value) => {
                 validate_interp_expr(value, locals)?;
+                if value
+                    .ty
+                    .as_ref()
+                    .is_some_and(|ty| matches!(ty, Ty::Slots(_)))
+                {
+                    return Err(
+                        "interp.slots_owner_value_position: an owner-slot value cannot be discarded as an expression"
+                            .into(),
+                    );
+                }
                 reject_owned_bool_array_transport(value, locals, "expression statement")?;
             }
             Stmt::FieldAssign { value, .. } => {
@@ -645,6 +820,11 @@ fn validate_interp_stmts(stmts: &[Stmt], locals: &mut InterpLocals) -> Result<()
                 }
                 if let Some(ty) = ty {
                     validate_interp_ty(ty.clone(), &format!("inferred declaration `{name}`"))?;
+                    if matches!(ty, Ty::Slots(_)) {
+                        return Err(format!(
+                            "interp.slots_inferred_type: owner-slot local `{name}` must use an explicit declaration"
+                        ));
+                    }
                 }
                 validate_interp_expr(init, locals)?;
                 let inferred = ty.clone().or(init.ty.clone()).ok_or_else(|| {
@@ -855,14 +1035,27 @@ fn validate_affine_option_initializer(
 }
 
 fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String> {
-    if let ExprKind::SlotOp { op, .. } = &expr.kind {
-        return Err(format!(
-            "interp.slots_unsupported: `{}` has no interpreter semantics yet",
-            op.name()
-        ));
+    if matches!(expr.kind, ExprKind::SlotOp { .. }) {
+        return validate_interp_slot_operation(expr, locals);
     }
     if let Some(ty) = &expr.ty {
         validate_interp_ty(ty.clone(), "expression annotation")?;
+    }
+    // An owner-slot value may be produced only by `alloc_slots` (handled by
+    // the operation gate above) or transferred out of one of the two direct
+    // places the ownership/control plans can name. In particular, a named
+    // object's field access is a copying expression at runtime and must never
+    // reach `RtVal::clone` with affine slot storage.
+    if expr
+        .ty
+        .as_ref()
+        .is_some_and(|ty| matches!(ty, Ty::Slots(_)))
+        && !matches!(expr.kind, ExprKind::Var(_) | ExprKind::SelfField { .. })
+    {
+        return Err(
+            "interp.slots_owner_value_position: owner-slot values move only from locals or direct `self` fields"
+                .into(),
+        );
     }
     // The producers of an *owner* are enumerated, because an owner has to
     // come from somewhere the destruction rules know about. A borrowed
@@ -891,9 +1084,7 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
     }
 
     match &expr.kind {
-        ExprKind::SlotOp { .. } => {
-            unreachable!("slot operations are refused before cached annotation validation")
-        }
+        ExprKind::SlotOp { .. } => unreachable!("slot operations return through their own gate"),
         ExprKind::Index { array, index, .. } => {
             let array_ty = interp_local_ty(locals, array).ok_or_else(|| {
                 format!("interp.unknown_local: index names unknown array `{array}`")
@@ -1153,14 +1344,19 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                     ));
                 }
             }
+            if matches!(ty, Ty::Slots(_)) {
+                require_cached_type(expr, ty, "owner-slot move source")?;
+            }
         }
         ExprKind::Len { array } => {
-            if interp_local_ty(locals, array).is_none_or(|ty| ty.as_array().is_none()) {
+            if interp_local_ty(locals, array)
+                .is_none_or(|ty| ty.as_array().is_none() && ty.as_slots().is_none())
+            {
                 return Err(format!(
-                    "interp.unknown_local: length names unknown or non-array local `{array}`"
+                    "interp.unknown_local: length names unknown or non-container local `{array}`"
                 ));
             }
-            require_cached_type(expr, Ty::Int(IntTy::U64), "array length")?;
+            require_cached_type(expr, Ty::Int(IntTy::U64), "container length")?;
         }
         ExprKind::NoneE => {
             if expr.ty.as_ref().is_some_and(Ty::is_affine_option) {
@@ -1185,9 +1381,122 @@ fn validate_interp_expr(expr: &Expr, locals: &InterpLocals) -> Result<(), String
                     "interp.affine_option_position_unsupported: affine option `{array}` cannot be borrowed"
                 ));
             }
+            if interp_local_ty(locals, array).is_some_and(|ty| matches!(ty, Ty::Slots(_)))
+                || matches!(expr.ty.as_ref(), Some(Ty::Borrow(_, referent)) if matches!(referent.as_ref(), Ty::Slots(_)))
+            {
+                return Err(format!(
+                    "interp.slots_borrow_unsupported: owner-slot borrow `{array}` is valid only inside `slot_take` or `slot_put`"
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn validate_interp_slot_container(
+    argument: &Expr,
+    payload: &Ty,
+    locals: &InterpLocals,
+    operation: &str,
+) -> Result<(), String> {
+    let ExprKind::Borrow {
+        array,
+        field,
+        mutable,
+    } = &argument.kind
+    else {
+        return Err(format!(
+            "interp.slot_container: `{operation}` lost its explicit unique container borrow"
+        ));
+    };
+    if !*mutable {
+        return Err(format!(
+            "interp.slot_container: `{operation}` requires a unique owner-slot borrow"
+        ));
+    }
+    require_cached_type(
+        argument,
+        Ty::borrow(Mutability::Mut, Ty::slots(payload.clone())),
+        "slot container borrow",
+    )?;
+    match field {
+        None => {
+            let local = locals.get(array.as_str()).ok_or_else(|| {
+                format!(
+                    "interp.unknown_local: `{operation}` names unknown slot container `{array}`"
+                )
+            })?;
+            if local.ty != Ty::slots(payload.clone()) {
+                return Err(format!(
+                    "interp.slot_container: `{operation}` container `{array}` has type `{}`, expected `slots<{}>`",
+                    local.ty.name(),
+                    payload.name()
+                ));
+            }
+            if !local.mutable {
+                return Err(format!(
+                    "interp.slot_container: `{operation}` names immutable slot container `{array}`"
+                ));
+            }
+        }
+        Some(_) if array == "self" => {}
+        Some(field) => {
+            return Err(format!(
+                "interp.slot_container: `{operation}` cannot mutate non-self field `{array}.{field}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_interp_slot_operation(expr: &Expr, locals: &InterpLocals) -> Result<(), String> {
+    let ExprKind::SlotOp { op, args, .. } = &expr.kind else {
+        unreachable!("slot validation is called only for slot operations")
+    };
+    if args.len() != op.arity() {
+        return Err(format!(
+            "interp.slot_operation_arity: `{}` has {} argument(s), expected {}",
+            op.name(),
+            args.len(),
+            op.arity()
+        ));
+    }
+    match op {
+        SlotOp::Alloc { elem } => {
+            validate_interp_slot_payload(elem, "alloc_slots")?;
+            require_cached_type(expr, Ty::slots(elem.clone()), "alloc_slots result")?;
+            validate_interp_sink(Ty::Int(IntTy::U64), &args[0], locals, "alloc_slots length")
+        }
+        SlotOp::Take => {
+            let Some(Ty::Borrow(Mutability::Mut, referent)) = args[0].ty.as_ref() else {
+                return Err(
+                    "interp.slot_container: `slot_take` has no checked unique-borrow type".into(),
+                );
+            };
+            let Ty::Slots(payload) = referent.as_ref() else {
+                return Err("interp.slot_container: `slot_take` does not borrow `slots<T>`".into());
+            };
+            validate_interp_slot_payload(payload, "slot_take")?;
+            validate_interp_slot_container(&args[0], payload, locals, "slot_take")?;
+            validate_interp_sink(Ty::Int(IntTy::U64), &args[1], locals, "slot_take index")?;
+            require_cached_type(expr, payload.as_ref().clone(), "slot_take result")
+        }
+        SlotOp::Put => {
+            let Some(Ty::Borrow(Mutability::Mut, referent)) = args[0].ty.as_ref() else {
+                return Err(
+                    "interp.slot_container: `slot_put` has no checked unique-borrow type".into(),
+                );
+            };
+            let Ty::Slots(payload) = referent.as_ref() else {
+                return Err("interp.slot_container: `slot_put` does not borrow `slots<T>`".into());
+            };
+            validate_interp_slot_payload(payload, "slot_put")?;
+            validate_interp_slot_container(&args[0], payload, locals, "slot_put")?;
+            validate_interp_sink(Ty::Int(IntTy::U64), &args[1], locals, "slot_put index")?;
+            validate_interp_sink(payload.as_ref().clone(), &args[2], locals, "slot_put value")?;
+            require_cached_type(expr, Ty::Unit, "slot_put result")
+        }
+    }
 }
 
 /// The type of the value an option's present case holds.
@@ -1813,10 +2122,12 @@ impl RtPlace {
 
 struct Frame {
     vars: HashMap<String, RtVal>,
-    /// Entry-state scalar params (post clauses mean entry values for
-    /// by-value params) and entry snapshots of &mut state (`old a`,
-    /// `old self`).
-    entry_scalars: HashMap<String, RtVal>,
+    /// Detached entry-state values for by-value parameters. A postcondition
+    /// speaks about the argument value even after its runtime owner has moved;
+    /// storing `SpecVal` here is essential for classes whose fields include
+    /// affine slot storage, because an `RtVal::Obj` clone would alias the live
+    /// field map rather than snapshot it.
+    entry_values: HashMap<String, SpecVal>,
     olds: HashMap<String, SpecVal>,
     /// Member context: the class index and its field storage.
     self_ctx: Option<(usize, Rc<RefCell<HashMap<String, RtVal>>>)>,
@@ -2080,7 +2391,7 @@ impl<'a> Interp<'a> {
         let mut control = ExecutionControl::new(plan);
         let mut frame = Frame {
             vars: HashMap::new(),
-            entry_scalars: HashMap::new(),
+            entry_values: HashMap::new(),
             olds: HashMap::new(),
             self_ctx: None,
         };
@@ -2107,17 +2418,21 @@ impl<'a> Interp<'a> {
                 // An *owned* array parameter was handed over, so the callee
                 // may hand it on again and leave its place empty — and a
                 // contract still speaks about a moved-from parameter (ADR
-                // 0030). The entry copy is deep rather than the `Rc`,
-                // because an entry value is what it was at entry whatever
+                // 0030). The entry value is a detached specification
+                // snapshot, because it remains what it was at entry whatever
                 // becomes of the storage. A borrowed array keeps the
                 // established convention: clauses read current contents, and
                 // `old p` is the snapshot taken above.
                 (array @ RtVal::Arr(_), ty) if matches!(ty, Ty::Array(_)) => {
-                    frame.entry_scalars.insert(p.name.clone(), deep_copy(array));
+                    if let Some(snapshot) = spec_of(array) {
+                        frame.entry_values.insert(p.name.clone(), snapshot);
+                    }
                 }
                 (RtVal::Arr(_), _) => {}
                 _ => {
-                    frame.entry_scalars.insert(p.name.clone(), v.clone());
+                    if let Some(snapshot) = spec_of(&v) {
+                        frame.entry_values.insert(p.name.clone(), snapshot);
+                    }
                 }
             }
             frame.vars.insert(p.name.clone(), v);
@@ -2169,12 +2484,12 @@ impl<'a> Interp<'a> {
     ) -> IResult<()> {
         let mut vars: HashMap<String, SpecVal> = HashMap::new();
         for (name, v) in &frame.vars {
-            let val = if let Some(entry) = frame.entry_scalars.get(name) {
-                entry
+            let value = if let Some(entry) = frame.entry_values.get(name) {
+                Some(entry.clone())
             } else {
-                v
+                spec_of(v)
             };
-            if let Some(sv) = spec_of(val) {
+            if let Some(sv) = value {
                 vars.insert(name.clone(), sv);
             }
         }
@@ -2183,11 +2498,9 @@ impl<'a> Interp<'a> {
         // outlives the transfer of authority (ADR 0024): the post of an
         // `init` that stores its argument in a field still says what the
         // field got.
-        for (name, v) in &frame.entry_scalars {
+        for (name, v) in &frame.entry_values {
             if !frame.vars.contains_key(name) {
-                if let Some(sv) = spec_of(v) {
-                    vars.insert(name.clone(), sv);
-                }
+                vars.insert(name.clone(), v.clone());
             }
         }
         if let Some((class, fields)) = &frame.self_ctx {
@@ -2510,6 +2823,108 @@ impl<'a> Interp<'a> {
         }
     }
 
+    fn runtime_place(place: &Place, span: Span) -> IResult<RtPlace> {
+        if place.is_root() && place.root() != "self" {
+            return Ok(RtPlace::Local(place.root().to_owned()));
+        }
+        if place.root() == "self" {
+            if let Some(field) = place.direct_field() {
+                return Ok(RtPlace::SelfField(field.to_owned()));
+            }
+        }
+        Err(control_plan_trap(PlanError {
+            span,
+            message: format!(
+                "interpreter owner-slot action names unsupported place `{}`",
+                place.render()
+            ),
+        }))
+    }
+
+    /// Resolve the one allocation named by a retained slot action without
+    /// cloning the affine runtime value that owns it.
+    fn slot_storage(
+        &self,
+        place: &Place,
+        payload: &Ty,
+        frame: &Frame,
+        span: Span,
+    ) -> IResult<Rc<RefCell<RtSlots>>> {
+        let runtime = Self::runtime_place(place, span)?;
+        let storage = match &runtime {
+            RtPlace::Local(name) => match frame.vars.get(name.as_str()) {
+                Some(RtVal::Slots(slots)) => slots.clone(),
+                _ => {
+                    return Err(control_plan_trap(PlanError {
+                        span,
+                        message: format!(
+                            "owner-slot place `{}` is absent or has no slot allocation",
+                            place.render()
+                        ),
+                    }));
+                }
+            },
+            RtPlace::SelfField(field) => {
+                let (_, fields) = frame.self_ctx.as_ref().ok_or_else(|| {
+                    control_plan_trap(PlanError {
+                        span,
+                        message: "owner-slot field action has no active self object".into(),
+                    })
+                })?;
+                let fields = fields.borrow();
+                match fields.get(field.as_str()) {
+                    Some(RtVal::Slots(slots)) => slots.clone(),
+                    _ => {
+                        return Err(control_plan_trap(PlanError {
+                            span,
+                            message: format!(
+                                "owner-slot field `{}` is absent or has no slot allocation",
+                                place.render()
+                            ),
+                        }));
+                    }
+                }
+            }
+        };
+        {
+            let slots = storage.borrow();
+            slots.require_live(span, &place.render())?;
+            if slots.payload() != payload {
+                return Err(control_plan_trap(PlanError {
+                    span,
+                    message: format!(
+                        "owner-slot place `{}` has payload `{}`, not retained payload `{}`",
+                        place.render(),
+                        slots.payload().name(),
+                        payload.name()
+                    ),
+                }));
+            }
+            slots.validate_cells(span, &place.render())?;
+        }
+        Ok(storage)
+    }
+
+    /// Authenticate the complete retained owner-slot action and every direct
+    /// terminal trap route before fuel, operand effects, or runtime mutation.
+    fn slot_action_preflight(
+        &self,
+        expression: &Expr,
+        traps: TrapContext<'_>,
+    ) -> IResult<SlotAction> {
+        let action = traps
+            .plan
+            .slot_action(traps.scope, expression)
+            .map_err(control_plan_trap)?
+            .clone();
+        let sites = traps
+            .plan
+            .slot_action_trap_sites(&action)
+            .map_err(control_plan_trap)?;
+        consume_trap_sites(&sites, Some(traps.scope))?;
+        Ok(action)
+    }
+
     /// Take a value out of a place and destroy it: at scope exit, and
     /// wherever a place is overwritten. A place holding no value — moved
     /// away, or never initialized — has nothing to drop.
@@ -2518,6 +2933,7 @@ impl<'a> Interp<'a> {
         enum OwnedDrop {
             Object(usize, Rc<RefCell<HashMap<String, RtVal>>>),
             Plain,
+            Slots,
             None,
         }
 
@@ -2536,6 +2952,7 @@ impl<'a> Interp<'a> {
                     | RtVal::AffineOptBoolArray(_)
                     | RtVal::AffineOptClass { value: None, .. },
                 ) => OwnedDrop::Plain,
+                Some(RtVal::Slots(_)) => OwnedDrop::Slots,
                 _ => OwnedDrop::None,
             },
             RtPlace::SelfField(field) => match frame.self_ctx.as_ref().and_then(|(_, fields)| {
@@ -2553,6 +2970,7 @@ impl<'a> Interp<'a> {
                         | RtVal::AffineOptBoolArray(_)
                         | RtVal::AffineOptClass { value: None, .. },
                     ) => Some(OwnedDrop::Plain),
+                    Some(RtVal::Slots(_)) => Some(OwnedDrop::Slots),
                     _ => None,
                 }
             }) {
@@ -2579,6 +2997,11 @@ impl<'a> Interp<'a> {
                 self.take_place(place, frame);
                 Ok(())
             }
+            OwnedDrop::Slots => Err(control_plan_trap(PlanError {
+                span: Span::new(0, 0),
+                message: "test-only unplanned drop cannot classify owner-slot cleanup; use the retained lexical route"
+                    .into(),
+            })),
             OwnedDrop::None => Ok(()),
         }
     }
@@ -2613,8 +3036,42 @@ impl<'a> Interp<'a> {
         frame: &mut Frame,
         traps: TrapContext<'_>,
     ) -> IResult<RtVal> {
+        // A slots owner is never cloned even transiently. Authenticate the
+        // expression's direct trap identity, validate the runtime tag while
+        // it is still in place, then atomically remove the whole owner.
+        if matches!(e.ty, Some(Ty::Slots(_))) {
+            if let Some(place) = Self::source_place(e) {
+                traps.consume_expression(e)?;
+                self.burn(e.span)?;
+                let declared =
+                    e.ty.as_ref()
+                        .and_then(Ty::as_owned_slots)
+                        .expect("the guard matched owned slots");
+                let planned = match &place {
+                    RtPlace::Local(name) => Place::local(name),
+                    RtPlace::SelfField(field) => Place::field("self", field),
+                };
+                self.slot_storage(&planned, declared, frame, e.span)?;
+                let held = self.take_place(&place, frame).ok_or_else(|| {
+                    control_plan_trap(PlanError {
+                        span: e.span,
+                        message: format!(
+                            "whole owner-slot move reached absent source `{}`",
+                            planned.render()
+                        ),
+                    })
+                })?;
+                if matches!(held, RtVal::Slots(_)) {
+                    return Ok(held);
+                }
+                unreachable!("slot_storage authenticated the source runtime value")
+            }
+        }
         let v = self.eval(e, frame, traps)?;
-        if matches!(v, RtVal::Obj { .. } | RtVal::Arr(_) | RtVal::ResMap(_)) {
+        if matches!(
+            v,
+            RtVal::Obj { .. } | RtVal::Arr(_) | RtVal::Slots(_) | RtVal::ResMap(_)
+        ) {
             if let Some(place) = Self::source_place(e) {
                 self.take_place(&place, frame);
             }
@@ -2755,7 +3212,7 @@ impl<'a> Interp<'a> {
                     let mut control = ExecutionControl::new(plan);
                     let mut frame = Frame {
                         vars: HashMap::new(),
-                        entry_scalars: HashMap::new(),
+                        entry_values: HashMap::new(),
                         olds: HashMap::new(),
                         self_ctx: Some((class, fields.clone())),
                     };
@@ -2801,6 +3258,7 @@ impl<'a> Interp<'a> {
                         held,
                         RtVal::Obj { .. }
                             | RtVal::Arr(_)
+                            | RtVal::Slots(_)
                             | RtVal::AffineOptBoolArray(_)
                             | RtVal::AffineOptClass { .. }
                     ) {
@@ -2829,11 +3287,45 @@ impl<'a> Interp<'a> {
             .validate_value_drop_action(action, self.classes, use_span)
             .map_err(control_plan_trap)?;
         match (action.recipe(), held) {
+            (ValueDropRecipe::ReleaseSlots { payload, occupied }, RtVal::Slots(slots)) => {
+                {
+                    let runtime = slots.borrow();
+                    runtime.validate_cells(use_span, what)?;
+                    if runtime.payload() != payload {
+                        return Err(control_plan_trap(PlanError {
+                            span: use_span,
+                            message: format!(
+                                "runtime owner slots `{what}` have payload `{}`, not retained payload `{}`",
+                                runtime.payload().name(),
+                                payload.name()
+                            ),
+                        }));
+                    }
+                }
+                let len = slots.borrow().len();
+                for index in (0..len).rev() {
+                    // Neutralize before recursive destruction. If the child
+                    // traps, this exact owner is no longer reachable from its
+                    // cell and the remaining suffix is deliberately skipped.
+                    let present = slots.borrow_mut().cells[index].take();
+                    let Some(present) = present else {
+                        continue;
+                    };
+                    if let Some(occupied) = occupied {
+                        self.drop_runtime_value_with_action(
+                            present,
+                            occupied,
+                            &format!("{what}[{index}]"),
+                            use_span,
+                        )?;
+                    }
+                }
+                slots.borrow_mut().live = false;
+                Ok(())
+            }
             (ValueDropRecipe::ReleaseSlots { .. }, _) => Err(control_plan_trap(PlanError {
                 span: use_span,
-                message: format!(
-                    "internal.interp.slots_cleanup_unsupported: runtime cleanup for owner-slot value `{what}` is not admitted"
-                ),
+                message: format!("runtime value `{what}` does not hold its retained owner slots"),
             })),
             (ValueDropRecipe::DropClass(class_action), RtVal::Obj { class, fields })
                 if class == class_action.class() =>
@@ -2925,15 +3417,48 @@ impl<'a> Interp<'a> {
                 }));
             }
         }
-        let valid = match (action.recipe(), held) {
-            (ValueDropRecipe::ReleaseSlots { .. }, _) => {
+        if let (ValueDropRecipe::ReleaseSlots { payload, occupied }, RtVal::Slots(slots)) =
+            (action.recipe(), held)
+        {
+            let runtime = slots.borrow();
+            runtime.validate_cells(use_span, what)?;
+            if runtime.payload() != payload {
                 return Err(control_plan_trap(PlanError {
                     span: use_span,
                     message: format!(
-                        "internal.interp.slots_cleanup_unsupported: runtime validation for owner-slot value `{what}` is not admitted"
+                        "runtime owner slots `{what}` have payload `{}`, not retained payload `{}`",
+                        runtime.payload().name(),
+                        payload.name()
                     ),
                 }));
             }
+            for (index, present) in runtime.cells.iter().enumerate() {
+                let Some(present) = present else {
+                    continue;
+                };
+                match occupied {
+                    Some(occupied) => self.validate_runtime_value_for_action(
+                        present,
+                        occupied,
+                        &format!("{what}[{index}]"),
+                        use_span,
+                    )?,
+                    None if present.inhabits(payload) => {}
+                    None => {
+                        return Err(control_plan_trap(PlanError {
+                            span: use_span,
+                            message: format!(
+                                "runtime owner slots `{what}` contain a value outside retained payload `{}`",
+                                payload.name()
+                            ),
+                        }));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let valid = match (action.recipe(), held) {
+            (ValueDropRecipe::ReleaseSlots { .. }, _) => false,
             (ValueDropRecipe::DropClass(expected), RtVal::Obj { class, .. }) => {
                 *class == expected.class()
             }
@@ -3783,7 +4308,7 @@ impl<'a> Interp<'a> {
         let fields = Rc::new(RefCell::new(HashMap::new()));
         let mut frame = Frame {
             vars: HashMap::new(),
-            entry_scalars: HashMap::new(),
+            entry_values: HashMap::new(),
             olds: HashMap::new(),
             self_ctx: Some((ci, fields.clone())),
         };
@@ -3795,7 +4320,9 @@ impl<'a> Interp<'a> {
                     }
                 }
                 _ => {
-                    frame.entry_scalars.insert(p.name.clone(), v.clone());
+                    if let Some(snapshot) = spec_of(&v) {
+                        frame.entry_values.insert(p.name.clone(), snapshot);
+                    }
                 }
             }
             frame.vars.insert(p.name.clone(), v);
@@ -3857,21 +4384,18 @@ impl<'a> Interp<'a> {
         let mut control = ExecutionControl::new(plan);
         let mut frame = Frame {
             vars: HashMap::new(),
-            entry_scalars: HashMap::new(),
+            entry_values: HashMap::new(),
             olds: HashMap::new(),
             self_ctx: Some((ci, fields.clone())),
         };
         // Entry snapshot for `old self` (and post-checking of by-value
         // params).
+        // `spec_of` immediately detaches an immutable proof snapshot. This
+        // is essential for owner-slot fields: constructing a second runtime
+        // object graph would duplicate their executable authority.
         let entry_obj = RtVal::Obj {
             class: ci,
-            fields: Rc::new(RefCell::new(
-                fields
-                    .borrow()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), deep_copy(v)))
-                    .collect(),
-            )),
+            fields: fields.clone(),
         };
         if let Some(sv) = spec_of(&entry_obj) {
             frame.olds.insert("self".into(), sv);
@@ -3886,7 +4410,9 @@ impl<'a> Interp<'a> {
                     }
                 }
                 _ => {
-                    frame.entry_scalars.insert(p.name.clone(), v.clone());
+                    if let Some(snapshot) = spec_of(&v) {
+                        frame.entry_values.insert(p.name.clone(), snapshot);
+                    }
                 }
             }
             frame.vars.insert(p.name.clone(), v);
@@ -3936,22 +4462,144 @@ impl<'a> Interp<'a> {
     }
 
     fn eval(&mut self, e: &Expr, frame: &mut Frame, traps: TrapContext<'_>) -> IResult<RtVal> {
+        // Slot actions are control-authoritative ownership transitions. Their
+        // full action/trap preflight precedes even fuel consumption, matching
+        // statement replacement and exposure preflights. Other expressions
+        // keep the ordinary direct-trap lookup.
+        let slot_action = if matches!(e.kind, ExprKind::SlotOp { .. }) {
+            Some(self.slot_action_preflight(e, traps)?)
+        } else {
+            traps.consume_expression(e)?;
+            None
+        };
         self.burn(e.span)?;
-        traps.consume_expression(e)?;
         match &e.kind {
-            ExprKind::SlotOp { op, .. } => Err(Trap {
-                undef: true,
-                message: format!(
-                    "interp.slots_unsupported: `{}` has no interpreter semantics yet",
-                    op.name()
-                ),
-                span: e.span,
-            }),
+            ExprKind::SlotOp { op, args, .. } => {
+                let action = slot_action
+                    .as_ref()
+                    .expect("slot-operation preflight selected its retained action");
+                match (op, action.kind()) {
+                    (SlotOp::Alloc { .. }, SlotActionKind::Alloc { .. }) => {
+                        let n = self.eval_int(&args[0], frame, traps)?;
+                        // Capacity is the first retained failure phase. The
+                        // fallible reservation inside `allocate` is the
+                        // second, allocator-failure phase.
+                        if n < 0 || n > 50_000_000 {
+                            return Err(Trap {
+                                undef: false,
+                                message: format!("OOM trap: alloc_slots of length {n}"),
+                                span: e.span,
+                            });
+                        }
+                        let slots =
+                            RtSlots::allocate(action.payload().clone(), n as usize, e.span)?;
+                        Ok(RtVal::Slots(Rc::new(RefCell::new(slots))))
+                    }
+                    (
+                        SlotOp::Take,
+                        SlotActionKind::Take {
+                            container,
+                            index_span,
+                            ..
+                        },
+                    ) => {
+                        // The explicit borrow has no executable value. The
+                        // retained Place is its authority; source order then
+                        // evaluates the index before either guard.
+                        let slots =
+                            self.slot_storage(container, action.payload(), frame, action.span())?;
+                        let index = self.eval_int(&args[1], frame, traps)?;
+                        let mut slots = slots.borrow_mut();
+                        let len = slots.len() as i128;
+                        if index < 0 || index >= len {
+                            return Err(Trap {
+                                undef: false,
+                                message: format!(
+                                    "slot_take index out of bounds: index {index}, length {len}"
+                                ),
+                                span: *index_span,
+                            });
+                        }
+                        let cell = &mut slots.cells[index as usize];
+                        cell.take().ok_or_else(|| Trap {
+                            undef: false,
+                            message: format!("slot_take: cell {index} is empty"),
+                            span: e.span,
+                        })
+                    }
+                    (
+                        SlotOp::Put,
+                        SlotActionKind::Put {
+                            container,
+                            index_span,
+                            staging,
+                            ..
+                        },
+                    ) => {
+                        if !staging.is_root() {
+                            return Err(control_plan_trap(PlanError {
+                                span: action.span(),
+                                message: "slot-put staging action is not a compiler-owned local"
+                                    .into(),
+                            }));
+                        }
+                        // Source order is container, index, incoming value.
+                        // The incoming value is moved into the retained
+                        // staging identity before either runtime guard. A
+                        // guard trap is terminal and performs no unwinding;
+                        // the destination allocation remains untouched.
+                        let slots =
+                            self.slot_storage(container, action.payload(), frame, action.span())?;
+                        let index = self.eval_int(&args[1], frame, traps)?;
+                        let incoming = self.eval_moved(&args[2], frame, traps)?;
+                        if !incoming.inhabits(action.payload()) {
+                            return Err(RtSlots::payload_mismatch(
+                                action.payload(),
+                                &incoming,
+                                "staged slot_put value",
+                                args[2].span,
+                            ));
+                        }
+                        let mut slots = slots.borrow_mut();
+                        let len = slots.len() as i128;
+                        if index < 0 || index >= len {
+                            return Err(Trap {
+                                undef: false,
+                                message: format!(
+                                    "slot_put index out of bounds: index {index}, length {len}"
+                                ),
+                                span: *index_span,
+                            });
+                        }
+                        let cell = &mut slots.cells[index as usize];
+                        if cell.is_some() {
+                            return Err(Trap {
+                                undef: false,
+                                message: format!("slot_put: cell {index} is already occupied"),
+                                span: e.span,
+                            });
+                        }
+                        *cell = Some(incoming);
+                        Ok(RtVal::Unit)
+                    }
+                    (SlotOp::Alloc { .. }, SlotActionKind::Take { .. })
+                    | (SlotOp::Alloc { .. }, SlotActionKind::Put { .. })
+                    | (SlotOp::Take, SlotActionKind::Alloc { .. })
+                    | (SlotOp::Take, SlotActionKind::Put { .. })
+                    | (SlotOp::Put, SlotActionKind::Alloc { .. })
+                    | (SlotOp::Put, SlotActionKind::Take { .. }) => {
+                        unreachable!("slot_action exact lookup rejects an operation mismatch")
+                    }
+                }
+            }
             ExprKind::IntLit(n) => Ok(RtVal::Int(*n)),
             ExprKind::BoolLit(b) => Ok(RtVal::Bool(*b)),
             ExprKind::Var(name) => match frame.vars.get(name.as_str()) {
                 Some(RtVal::AffineOptBoolArray(_)) => {
                     unreachable!("checked: affine option places are observed or taken directly")
+                }
+                Some(RtVal::Slots(_)) => {
+                    unreachable!("checked: owner slots move through eval_moved without cloning")
                 }
                 Some(value) => Ok(value.clone()),
                 None => unreachable!("checked: initialized local"),
@@ -4562,12 +5210,15 @@ impl<'a> Interp<'a> {
                 }
             }
 
-            ExprKind::Len { array } => {
-                let RtVal::Arr(a) = &frame.vars[array.as_str()] else {
-                    unreachable!()
-                };
-                Ok(RtVal::Int(a.borrow().len() as i128))
-            }
+            ExprKind::Len { array } => match &frame.vars[array.as_str()] {
+                RtVal::Arr(a) => Ok(RtVal::Int(a.borrow().len() as i128)),
+                RtVal::Slots(slots) => {
+                    let slots = slots.borrow();
+                    slots.require_live(e.span, array)?;
+                    Ok(RtVal::Int(slots.len() as i128))
+                }
+                _ => unreachable!("checked: array or owner-slot length"),
+            },
             ExprKind::Index { array, index, .. } => {
                 let idx = self.eval_int(index, frame, traps)?;
                 let RtVal::Arr(a) = &frame.vars[array.as_str()] else {
@@ -4659,11 +5310,16 @@ impl<'a> Interp<'a> {
                 let RtVal::Obj { fields, .. } = frame.vars[obj.as_str()].clone() else {
                     unreachable!("checked: class receiver")
                 };
-                let RtVal::Arr(a) = fields.borrow()[field.as_str()].clone() else {
-                    unreachable!("checked: array field")
-                };
-                let n = a.borrow().len() as i128;
-                Ok(RtVal::Int(n))
+                let fields = fields.borrow();
+                match fields.get(field.as_str()) {
+                    Some(RtVal::Arr(array)) => Ok(RtVal::Int(array.borrow().len() as i128)),
+                    Some(RtVal::Slots(slots)) => {
+                        let slots = slots.borrow();
+                        slots.require_live(e.span, &format!("{obj}.{field}"))?;
+                        Ok(RtVal::Int(slots.len() as i128))
+                    }
+                    _ => unreachable!("checked: array or owner-slot field"),
+                }
             }
             ExprKind::ClassFieldIndex {
                 obj, field, index, ..
@@ -4809,21 +5465,27 @@ impl<'a> Interp<'a> {
             }
             ExprKind::SelfField { field } => {
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
-                let v = fields
-                    .borrow()
-                    .get(field.as_str())
-                    .cloned()
-                    .expect("checked: field initialized");
-                Ok(v)
+                let fields = fields.borrow();
+                match fields.get(field.as_str()) {
+                    Some(RtVal::Slots(_)) => {
+                        unreachable!("checked: owner-slot fields move through eval_moved")
+                    }
+                    Some(value) => Ok(value.clone()),
+                    None => unreachable!("checked: field initialized"),
+                }
             }
             ExprKind::SelfFieldLen { field } => {
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
-                let arr = match fields.borrow().get(field.as_str()) {
-                    Some(RtVal::Arr(a)) => a.clone(),
-                    _ => unreachable!("checked: array field"),
-                };
-                let n = arr.borrow().len() as i128;
-                Ok(RtVal::Int(n))
+                let fields = fields.borrow();
+                match fields.get(field.as_str()) {
+                    Some(RtVal::Arr(array)) => Ok(RtVal::Int(array.borrow().len() as i128)),
+                    Some(RtVal::Slots(slots)) => {
+                        let slots = slots.borrow();
+                        slots.require_live(e.span, &format!("self.{field}"))?;
+                        Ok(RtVal::Int(slots.len() as i128))
+                    }
+                    _ => unreachable!("checked: array or owner-slot field"),
+                }
             }
             ExprKind::SelfFieldIndex { field, index } => {
                 let idx = self.eval_int(index, frame, traps)?;
@@ -5023,9 +5685,13 @@ impl<'a> Interp<'a> {
     }
 }
 
+#[cfg(test)]
 fn deep_copy(v: &RtVal) -> RtVal {
     match v {
         RtVal::Arr(a) => RtVal::Arr(Rc::new(RefCell::new(a.borrow().clone()))),
+        RtVal::Slots(_) => {
+            unreachable!("owner slots use detached specification snapshots, never runtime copies")
+        }
         RtVal::AffineOptBoolArray(_) => {
             unreachable!("affine options are never copied into snapshots or borrowed values")
         }
@@ -5059,6 +5725,7 @@ fn spec_of(v: &RtVal) -> Option<SpecVal> {
         RtVal::Int(n) => SpecVal::Int(*n),
         RtVal::Bool(b) => SpecVal::Bool(*b),
         RtVal::Arr(a) => SpecVal::Arr(a.borrow().to_spec()?),
+        RtVal::Slots(slots) => SpecVal::Arr(slots.borrow().to_spec()?),
         RtVal::Opt { payload, value } => SpecVal::Opt {
             payload: Some(payload.clone()),
             value: match value {
@@ -5170,10 +5837,22 @@ mod payload_guard_tests {
     use crate::span::Span;
 
     #[test]
-    fn owner_slots_have_neither_an_interpreter_type_nor_operation_semantics() {
-        let error = validate_interp_ty(Ty::slots(Ty::Int(IntTy::U64)), "forged slot local")
-            .expect_err("owner slots have no runtime representation yet");
-        assert!(error.starts_with("interp.slots_unsupported:"), "{error}");
+    fn owner_slots_have_runtime_semantics_but_keep_the_call_abi_and_malformed_ops_closed() {
+        let slots = Ty::slots(Ty::Int(IntTy::U64));
+        validate_interp_ty(slots.clone(), "owner-slot local")
+            .expect("owner-slot locals have an interpreter representation");
+        let error = validate_interp_param_ty(slots.clone(), "forged parameter")
+            .expect_err("owner slots have no interpreter call ABI");
+        assert!(
+            error.starts_with("interp.slots_call_abi_unsupported:"),
+            "{error}"
+        );
+        let error = validate_interp_return_ty(slots, "forged return")
+            .expect_err("owner slots have no interpreter return ABI");
+        assert!(
+            error.starts_with("interp.slots_call_abi_unsupported:"),
+            "{error}"
+        );
 
         let operation = expr(
             ExprKind::SlotOp {
@@ -5187,8 +5866,29 @@ mod payload_guard_tests {
             Some(Ty::Param(TypeParamId::from_legacy(0))),
         );
         let error = validate_interp_expr(&operation, &HashMap::new())
-            .expect_err("the slot refusal wins over hostile cached types and operands");
-        assert!(error.starts_with("interp.slots_unsupported:"), "{error}");
+            .expect_err("malformed slot arity wins over hostile cached types and operands");
+        assert!(error.starts_with("interp.slot_operation_arity:"), "{error}");
+
+        let named_field = expr(
+            ExprKind::ClassField {
+                obj: "owner".into(),
+                obj_span: Span::new(3, 4),
+                field: "cells".into(),
+            },
+            Some(Ty::slots(Ty::Int(IntTy::U64))),
+        );
+        let error = validate_interp_expr(&named_field, &HashMap::new())
+            .expect_err("a named-object field cannot copy an owner-slot value");
+        assert!(
+            error.starts_with("interp.slots_owner_value_position:"),
+            "{error}"
+        );
+
+        let untyped_source = expr(ExprKind::Var("cells".into()), None);
+        let locals = HashMap::from([("cells".into(), local(Ty::slots(Ty::Int(IntTy::U64))))]);
+        let error = validate_interp_expr(&untyped_source, &locals)
+            .expect_err("an affine source needs the cached type that selects move evaluation");
+        assert!(error.starts_with("interp.expression_type:"), "{error}");
     }
 
     /// The tag beside the elements is what every later read, store, and
@@ -5218,6 +5918,99 @@ mod payload_guard_tests {
             .expect("Boolean values inhabit a Boolean payload");
         assert!(array.set(0, RtVal::Int(0), span).is_err());
         assert!(array.set(0, RtVal::Bool(false), span).is_ok());
+    }
+
+    #[test]
+    fn owner_slot_monitor_snapshots_are_arrays_of_options_not_runtime_copies() {
+        let span = Span::new(0, 0);
+        let mut slots =
+            RtSlots::allocate(Ty::Int(IntTy::U64), 2, span).expect("small owner-slot allocation");
+        slots.cells[1] = Some(RtVal::Int(7));
+        let runtime = RtVal::Slots(Rc::new(RefCell::new(slots)));
+        assert_eq!(
+            spec_of(&runtime),
+            Some(SpecVal::Arr(SpecArray::new(
+                Ty::option(Ty::Int(IntTy::U64)),
+                vec![
+                    SpecVal::Opt {
+                        payload: Some(Ty::Int(IntTy::U64)),
+                        value: None,
+                    },
+                    SpecVal::Opt {
+                        payload: Some(Ty::Int(IntTy::U64)),
+                        value: Some(Box::new(SpecVal::Int(7))),
+                    },
+                ],
+            )))
+        );
+        let RtVal::Slots(slots) = runtime else {
+            unreachable!()
+        };
+        assert!(matches!(slots.borrow().cells[1], Some(RtVal::Int(7))));
+    }
+
+    #[test]
+    fn slot_action_mismatch_fails_before_fuel_or_allocation() {
+        let op_span = Span::new(10, 11);
+        let value_span = Span::new(12, 13);
+        let expression_span = Span::new(10, 14);
+        let slots_ty = Ty::slots(Ty::Int(IntTy::U64));
+        let original = Expr {
+            kind: ExprKind::SlotOp {
+                op: SlotOp::Alloc {
+                    elem: Ty::Int(IntTy::U64),
+                },
+                op_span,
+                args: vec![Expr {
+                    kind: ExprKind::IntLit(1),
+                    span: value_span,
+                    ty: Some(Ty::Int(IntTy::U64)),
+                }],
+            },
+            span: expression_span,
+            ty: Some(slots_ty.clone()),
+        };
+        let body = [Stmt::Decl {
+            ty: slots_ty,
+            name: "cells".into(),
+            name_span: Span::new(20, 21),
+            init: Some(original.clone()),
+            mutable: false,
+        }];
+        let plan = BodyPlan::build(
+            CallOwner::Function("__slot_action_tamper".into()),
+            Span::new(30, 31),
+            &[],
+            &body,
+        )
+        .expect("original allocation has one exact retained action");
+        let mut tampered = original;
+        let ExprKind::SlotOp { op, .. } = &mut tampered.kind else {
+            unreachable!()
+        };
+        *op = SlotOp::Alloc { elem: Ty::Bool };
+
+        with_empty_interpreter(|interpreter| {
+            let fuel = interpreter.fuel;
+            let error = interpreter
+                .eval_moved(
+                    &tampered,
+                    &mut frame_with(HashMap::new()),
+                    TrapContext::new(&plan, plan.body_scope()),
+                )
+                .expect_err("a post-check payload substitution must fail closed");
+            assert!(error.undef);
+            assert!(
+                error.message.contains("checked slot allocation result")
+                    || error.message.contains("slot action no longer matches"),
+                "{}",
+                error.message
+            );
+            assert_eq!(
+                interpreter.fuel, fuel,
+                "slot action preflight precedes executable effects"
+            );
+        });
     }
 
     fn empty_program() -> Program {
@@ -5588,7 +6381,7 @@ mod payload_guard_tests {
                 .expect_err("affine named receiver must fail closed");
             assert!(
                 error.starts_with("interp.affine_option_position_unsupported:")
-                    || error.contains("unknown or non-array local"),
+                    || error.contains("unknown or non-container local"),
                 "{error}"
             );
         }
@@ -5712,7 +6505,7 @@ mod payload_guard_tests {
     fn frame_with(vars: HashMap<String, RtVal>) -> Frame {
         Frame {
             vars,
-            entry_scalars: HashMap::new(),
+            entry_values: HashMap::new(),
             olds: HashMap::new(),
             self_ctx: None,
         }

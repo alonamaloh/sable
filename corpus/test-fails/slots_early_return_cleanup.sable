@@ -1,0 +1,33 @@
+// expect-test-failure: pre of `require_zero` violated
+// An explicit return consumes the retained lexical route, including occupied
+// owner-slot cells.
+
+/// pre value = 0
+fn require_zero(u64 value) {
+}
+
+class ReturnLoud {
+    u64 armed;
+
+    /// invariant armed = 1
+
+    /// post self.armed = 1
+    init new() {
+        self.armed = 1;
+    }
+
+    deinit {
+        require_zero(self.armed);
+    }
+}
+
+fn exits_early() -> u64 {
+    mut slots<ReturnLoud> cells = alloc_slots<ReturnLoud>(1);
+    var value = ReturnLoud::new();
+    slot_put(&mut cells, 0, value);
+    return 1;
+}
+
+fn test_slot_early_return_runs_cleanup() {
+    u64 ignored = exits_early();
+}

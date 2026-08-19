@@ -4831,6 +4831,10 @@ fn render_rt_val(program: &Program, value: &RtVal) -> String {
         RtVal::Int(n) => format!("int {n}"),
         RtVal::Bool(b) => format!("bool {b}"),
         RtVal::Arr(a) => format!("arr [{}]", render_elements(program, &a.borrow())),
+        // Owner slots remain outside the formal SVM admission gate. This arm
+        // is only the differential harness's fail-closed description if a
+        // forged caller hands it an interpreter-only value.
+        RtVal::Slots(_) => "unclassified owner-slot value".into(),
         RtVal::Ptr(a, o) => format!("ptr {a}+{o}"),
         RtVal::Opt { value: None, .. } => "opt none".into(),
         RtVal::Opt {

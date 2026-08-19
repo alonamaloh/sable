@@ -1,0 +1,7 @@
+// expect-test-failure: slot_take: cell 0 is empty
+// Empty take traps after bounds and leaves the destination cell empty.
+
+fn test_slot_take_empty() {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    u64 value = slot_take(&mut cells, 0);
+}

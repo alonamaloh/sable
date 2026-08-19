@@ -1,0 +1,6 @@
+// expect-test-failure: OOM trap: alloc_slots
+// Capacity failure happens before an allocation or any payload movement.
+
+fn test_slot_allocation_oom() {
+    slots<u64> cells = alloc_slots<u64>(50000001);
+}

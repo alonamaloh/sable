@@ -1,0 +1,34 @@
+// expect-test-failure: pre of `require_zero` violated
+// The loop backedge consumes the body scope's occupied slot owner before a
+// second iteration can begin.
+
+/// pre value = 0
+fn require_zero(u64 value) {
+}
+
+class LoopLoud {
+    u64 armed;
+
+    /// invariant armed = 1
+
+    /// post self.armed = 1
+    init new() {
+        self.armed = 1;
+    }
+
+    deinit {
+        require_zero(self.armed);
+    }
+}
+
+fn test_slot_loop_backedge_runs_cleanup() {
+    mut u64 i = 0;
+    /// invariant i <= 2
+    /// variant 2 - i
+    while (i < 2) {
+        mut slots<LoopLoud> cells = alloc_slots<LoopLoud>(1);
+        var value = LoopLoud::new();
+        slot_put(&mut cells, 0, value);
+        i = i + 1;
+    }
+}

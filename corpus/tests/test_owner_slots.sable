@@ -1,0 +1,136 @@
+// Dynamic lifecycle coverage for ADR 0093 owner-slot storage. These tests
+// exercise the interpreter-only tranche; the SVM and native ABI remain
+// deliberately closed until their own rollout step.
+
+class SlotOnce {
+    u64 armed;
+
+    /// invariant armed = 1
+
+    /// post self.armed = 1
+    init new() {
+        self.armed = 1;
+    }
+
+    // A duplicate drop would re-check the invariant after this mutation and
+    // fail, so passing paths below also cover exact-once destruction.
+    deinit {
+        self.armed = 0;
+    }
+}
+
+class SlotOwner {
+    slots<SlotOnce> cells;
+
+    init empty() {
+        slots<SlotOnce> fresh = alloc_slots<SlotOnce>(2);
+        self.cells = fresh;
+    }
+
+    fn put_one(&mut self) {
+        var value = SlotOnce::new();
+        slot_put(&mut self.cells, 0, value);
+    }
+
+    fn replace_storage(&mut self) {
+        self.cells = alloc_slots<SlotOnce>(3);
+    }
+
+    /// post result = self.cells.len
+    fn capacity(&self) -> u64 {
+        return self.cells.len;
+    }
+}
+
+class SnapshotSlots {
+    slots<u64> cells;
+
+    init full() {
+        self.cells = alloc_slots<u64>(1);
+        slot_put(&mut self.cells, 0, 7);
+    }
+
+    fn drain(&mut self) -> u64 {
+        return slot_take(&mut self.cells, 0);
+    }
+}
+
+// A by-value class parameter remains its detached entry value in the post,
+// even after its executable owner moves onward and its slots are mutated.
+/// post b.cells.len = 1
+/// post b.cells.get 0 = some 7
+fn consume_slot_snapshot(SnapshotSlots b) -> u64 {
+    var mut moved = b;
+    return moved.drain();
+}
+
+fn test_slot_scalar_roundtrip_and_whole_owner_move() {
+    mut slots<u64> first = alloc_slots<u64>(2);
+    /// assert first.len = 2
+    slot_put(&mut first, 1, 41);
+
+    // The allocation moves as a whole. `first` is dead and no executable
+    // copy of its occupied payload exists.
+    /// assert first.get 0 = none
+    /// assert first.get 1 = some 41
+    mut slots<u64> second = first;
+    u64 value = slot_take(&mut second, 1);
+    /// assert value = 41
+    /// assert second.get 1 = none
+    slot_put(&mut second, 0, value + 1);
+    u64 answer = slot_take(&mut second, 0);
+    /// assert answer = 42
+}
+
+fn test_slot_class_roundtrip_suppresses_the_moved_cell_drop() {
+    mut slots<SlotOnce> cells = alloc_slots<SlotOnce>(1);
+    var value = SlotOnce::new();
+    slot_put(&mut cells, 0, value);
+    var restored = slot_take(&mut cells, 0);
+    // `cells` later sees an empty cell; only `restored` destroys the class.
+}
+
+fn test_slot_class_parameter_snapshot_is_detached() {
+    var value = SnapshotSlots::full();
+    u64 observed = consume_slot_snapshot(value);
+    /// assert observed = 7
+}
+
+fn slot_early_return_cleanup(bool fast) -> u64 {
+    mut slots<SlotOnce> cells = alloc_slots<SlotOnce>(1);
+    var value = SlotOnce::new();
+    slot_put(&mut cells, 0, value);
+    if (fast) {
+        return 7;
+    }
+    return 8;
+}
+
+fn test_slot_early_return_routes() {
+    u64 fast = slot_early_return_cleanup(true);
+    /// assert fast = 7
+    u64 slow = slot_early_return_cleanup(false);
+    /// assert slow = 8
+}
+
+fn test_slot_loop_cleanup() {
+    mut u64 i = 0;
+    /// invariant i <= 3
+    /// variant 3 - i
+    while (i < 3) {
+        mut slots<SlotOnce> cells = alloc_slots<SlotOnce>(1);
+        var value = SlotOnce::new();
+        slot_put(&mut cells, 0, value);
+        i = i + 1;
+    }
+    /// assert i = 3
+}
+
+fn test_slot_field_len_and_replacement() {
+    var mut owner = SlotOwner::empty();
+    owner.put_one();
+    /// assert owner.cells.len = 2
+    owner.replace_storage();
+    u64 capacity = owner.capacity();
+    /// assert capacity = 3
+}

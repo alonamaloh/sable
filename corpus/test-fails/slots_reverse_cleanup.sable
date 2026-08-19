@@ -1,0 +1,41 @@
+// expect-test-failure: pre of `fail_high` violated
+// Occupied cells are neutralized and destroyed in descending index order.
+// The high cell traps first; terminal no-unwind cleanup skips the low suffix.
+
+/// pre value = 0
+fn fail_low(u64 value) {
+}
+
+/// pre value = 0
+fn fail_high(u64 value) {
+}
+
+class OrderedSlotDrop {
+    u64 rank;
+
+    /// invariant 1 <= rank
+    /// invariant rank <= 2
+
+    /// pre 1 <= rank
+    /// pre rank <= 2
+    /// post self.rank = rank
+    init new(u64 rank) {
+        self.rank = rank;
+    }
+
+    deinit {
+        if (self.rank == 2) {
+            fail_high(self.rank);
+        } else {
+            fail_low(self.rank);
+        }
+    }
+}
+
+fn test_slot_reverse_cleanup() {
+    mut slots<OrderedSlotDrop> cells = alloc_slots<OrderedSlotDrop>(2);
+    var low = OrderedSlotDrop::new(1);
+    slot_put(&mut cells, 0, low);
+    var high = OrderedSlotDrop::new(2);
+    slot_put(&mut cells, 1, high);
+}

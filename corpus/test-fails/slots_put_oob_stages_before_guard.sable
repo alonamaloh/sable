@@ -1,0 +1,29 @@
+// expect-test-failure: slot_put index out of bounds
+// The class source moves into staging before the bounds guard, while the
+// owner-slot allocation remains unchanged and the terminal trap unwinds
+// neither value.
+
+/// pre value = 0
+fn require_zero(u64 value) {
+}
+
+class SlotLoud {
+    u64 armed;
+
+    /// invariant armed = 1
+
+    /// post self.armed = 1
+    init new() {
+        self.armed = 1;
+    }
+
+    deinit {
+        require_zero(self.armed);
+    }
+}
+
+fn test_slot_put_oob_stages_before_guard() {
+    mut slots<SlotLoud> cells = alloc_slots<SlotLoud>(1);
+    var incoming = SlotLoud::new();
+    slot_put(&mut cells, 4, incoming);
+}

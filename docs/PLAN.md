@@ -51,8 +51,9 @@ and terminal class-drop recipes across those consumers. All six C0 criteria are
 closed. **G3's first semantic spine is now in place:** direct ordinary classes
 may be generic arguments without integer proof reuse, and `slots<T>` has one
 checker-authored ownership/control plan plus a distinct `Seq (Option T)` VC
-model for allocation, take, put, cleanup, and loop havoc. Interpreter, formal
-SVM, native lowering, and the `Vec` movement API remain in progress.
+model for allocation, take, put, cleanup, and loop havoc. The interpreter now
+executes the same retained actions and recursive reverse cleanup. Formal SVM,
+native lowering, and the `Vec` movement API remain in progress.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -2029,10 +2030,15 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      control plan seals staging, traps, recursive reverse cleanup, and exact
      action identity. VC generation consumes that handoff as a distinct
      `Seq (Option T)` state, including empty allocation, occupancy guards,
-     class-invariant transport, and whole-container loop havoc. Interpreter,
-     SVM, transition certificates/call ABI, and native lowering remain
-     fail-closed with stable diagnostics. Next, implement the interpreter and
-     lifecycle corpus. Ordinary `[T]` remains copy-element storage; Vec's
+     class-invariant transport, and whole-container loop havoc. The interpreter
+     consumes the retained actions as payload-tagged optional cells, moves
+     whole owners without cloning, snapshots them only into detached monitor
+     data, and destroys occupied cells in descending order after neutralizing
+     each cell. Early-return, loop, replacement, OOM, empty/occupied/OOB, and
+     terminal no-unwind lifecycle cases are pinned. SVM, transition
+     certificates/call ABI, and native lowering remain fail-closed with stable
+     diagnostics. Next, land the first verified and interpreted owner-safe
+     `Vec` specialization. Ordinary `[T]` remains copy-element storage; Vec's
      owner-capable API does not add a shared copying `get` or broaden the
      affine-option ABI.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with

@@ -1,0 +1,31 @@
+// expect-test-failure: slot_put: cell 0 is already occupied
+// The incoming owner is staged before the occupancy guard. The guard is a
+// terminal no-unwind edge, so neither staged nor resident payload runs its
+// deliberately failing deinitializer and the occupancy trap wins.
+
+/// pre value = 0
+fn require_zero(u64 value) {
+}
+
+class SlotLoud {
+    u64 armed;
+
+    /// invariant armed = 1
+
+    /// post self.armed = 1
+    init new() {
+        self.armed = 1;
+    }
+
+    deinit {
+        require_zero(self.armed);
+    }
+}
+
+fn test_slot_put_occupied_has_no_unwind() {
+    mut slots<SlotLoud> cells = alloc_slots<SlotLoud>(1);
+    var resident = SlotLoud::new();
+    slot_put(&mut cells, 0, resident);
+    var incoming = SlotLoud::new();
+    slot_put(&mut cells, 0, incoming);
+}

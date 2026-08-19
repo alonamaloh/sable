@@ -1,0 +1,42 @@
+// expect-test-failure: pre of `require_zero` violated
+// Field replacement evaluates the fresh allocation, destroys the old
+// occupied slot allocation, and installs only if that retained cleanup
+// completes. A failing payload deinitializer takes the no-unwind edge.
+
+/// pre value = 0
+fn require_zero(u64 value) {
+}
+
+class ReplaceLoud {
+    u64 armed;
+
+    /// invariant armed = 1
+
+    /// post self.armed = 1
+    init new() {
+        self.armed = 1;
+    }
+
+    deinit {
+        require_zero(self.armed);
+    }
+}
+
+class ReplaceSlots {
+    slots<ReplaceLoud> cells;
+
+    init full() {
+        self.cells = alloc_slots<ReplaceLoud>(1);
+        var value = ReplaceLoud::new();
+        slot_put(&mut self.cells, 0, value);
+    }
+
+    fn reset(&mut self) {
+        self.cells = alloc_slots<ReplaceLoud>(2);
+    }
+}
+
+fn test_slot_field_replacement_runs_old_cleanup() {
+    var mut owner = ReplaceSlots::full();
+    owner.reset();
+}
