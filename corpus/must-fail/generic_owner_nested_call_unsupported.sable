@@ -1,0 +1,25 @@
+// expect-error: mono.generic_to_generic_call_unsupported
+// Retained ADR 0009 templates cannot transport another template's abstract
+// contract yet.  The owner widening must fail here instead of leaving `<T>`
+// for the checker or accidentally reusing the outer integer-model proof.
+
+pub class NestedCallOwner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+fn inner<T>(T value) -> T {
+    return value;
+}
+
+fn outer<T>(T value) -> T {
+    return inner<T>(value);
+}
+
+pub fn instantiate_nested_call() -> NestedCallOwner {
+    var owner = NestedCallOwner::make(1);
+    return outer<NestedCallOwner>(owner);
+}

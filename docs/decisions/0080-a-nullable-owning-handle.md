@@ -81,5 +81,6 @@ twins (both loud-destructor directions, both empty-take traps, and
 trap-beats-deinit), three new fences (inference, wrap-of-take, static
 presence), and the repurposed `option_payload_class.sable` pinning
 declaration-site mutability. Generic templates cannot manufacture
-`option<class>` (type arguments are integers only) — a verified
-non-interaction.
+`option<class>`: the template position gate refuses an affine option parameter,
+and an owner specialization is independently rechecked rather than inheriting
+the integer-model proof — a verified non-interaction.

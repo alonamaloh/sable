@@ -4,10 +4,12 @@
 //! declarations are fully concrete afterward; retained ADR 0009 templates
 //! deliberately keep explicit type parameters for checker/VCgen modeling.
 //!
-//! Instances are mangled `Vec_i32`; spans point into the generic source,
-//! so diagnostics land on the template with the instance visible in the
-//! declaration name. `T` is substituted even inside proof-clause text
-//! (bare, not parenthesized, so `T.max` becomes `i32.max`).
+//! All-integer instances retain the legacy `Vec_i32` spelling. Instances with
+//! a concrete class owner use an injective, length-framed structural name;
+//! spans still point into the generic source, so diagnostics land on the
+//! template with the instance visible in its declaration name. `T` is
+//! substituted even inside proof-clause text (bare, not parenthesized, so
+//! `T.max` becomes `i32.max`).
 
 use crate::ast::*;
 use crate::diag::Diagnostic;
@@ -22,7 +24,8 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
     preflight_source_names(program)?;
     reject_input_proof_reuse(program)?;
     validate_declaration_type_params(program)?;
-    validate_v1_type_args(program)?;
+    let class_args = ClassArgEnv::from_program(program)?;
+    validate_type_args(program, &class_args)?;
     let mut fn_templates: HashMap<String, Fn> = HashMap::new();
     let mut class_templates: HashMap<String, ClassDecl> = HashMap::new();
 
@@ -185,7 +188,7 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
                 });
             };
             // The trait signature, with Self := the concrete type.
-            let args = [im.for_ty];
+            let args = [ConcreteArg::Int(im.for_ty)];
             let mut want_params = tm.params.clone();
             for p in &mut want_params {
                 subst_ty(&mut p.ty, &args, p.span)?;
@@ -279,6 +282,8 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
         }
     }
 
+    class_args.validate_extracted_classes(&program.classes)?;
+
     let emitted_names = seed_emitted_names(program)?;
     let mut ctx = Mono {
         fn_templates,
@@ -290,6 +295,7 @@ pub fn monomorphize(program: &mut Program) -> MResult<()> {
         new_classes: Vec::new(),
         traits,
         impls,
+        class_args,
     };
 
     // Roots: rewrite use sites in the non-generic declarations.
@@ -731,42 +737,61 @@ fn validate_declaration_type_params(program: &Program) -> MResult<()> {
     Ok(())
 }
 
-/// G0 stores recursive use-site types before current monomorphization can
-/// implement them. Validate the whole input before mutating it so even a
-/// dormant or unreachable template fails closed with the type argument's own
-/// span. Parameters remain valid here; concrete-use checks happen when a
-/// request is made.
-fn validate_v1_type_args(program: &Program) -> MResult<()> {
-    fn validate_args(args: &[TypeArg], arity: usize) -> MResult<()> {
+/// Validate the admitted direct type-argument domain before mutating the
+/// program, so even dormant or unreachable templates fail closed at the
+/// argument's own span. A direct parameter is first range-checked for a precise
+/// diagnostic; the enclosing generic-to-generic call is then refused because
+/// retained templates do not transport other template contracts. Concrete
+/// root arguments are integers or ordinary (non-generic) classes.
+fn validate_type_args(program: &Program, class_args: &ClassArgEnv) -> MResult<()> {
+    fn validate_args(args: &[TypeArg], arity: usize, class_args: &ClassArgEnv) -> MResult<()> {
         for arg in args {
-            let ty = arg
-                .ty
-                .try_to_v1_int()
-                .map_err(|error| unsupported_type_arg(arg.span, error))?;
-            if let IntTy::TParam(index) = ty {
-                let parameter = TypeParamId::from_legacy(index);
+            if let GenericTy::Param(parameter) = &arg.ty {
                 if parameter.index() >= arity {
                     return Err(unsupported_type_arg(
                         arg.span,
-                        GenericTyError::TypeParameterOutOfBounds { parameter, arity },
+                        GenericTyError::TypeParameterOutOfBounds {
+                            parameter: *parameter,
+                            arity,
+                        },
                     ));
                 }
+            } else {
+                class_args.resolve(&arg.ty, arg.span)?;
             }
         }
         Ok(())
     }
 
-    fn expression(expr: &Expr, arity: usize) -> MResult<()> {
+    fn expression(expr: &Expr, arity: usize, class_args: &ClassArgEnv) -> MResult<()> {
         match &expr.kind {
             ExprKind::Call {
-                type_args, args, ..
-            }
-            | ExprKind::CtorCall {
-                type_args, args, ..
+                callee,
+                callee_span,
+                type_args,
+                args,
             } => {
-                validate_args(type_args, arity)?;
+                validate_args(type_args, arity, class_args)?;
+                if arity > 0 && !type_args.is_empty() {
+                    return Err(generic_to_generic_call(*callee_span, "function", callee));
+                }
                 for arg in args {
-                    expression(arg, arity)?;
+                    expression(arg, arity, class_args)?;
+                }
+            }
+            ExprKind::CtorCall {
+                class,
+                class_span,
+                type_args,
+                args,
+                ..
+            } => {
+                validate_args(type_args, arity, class_args)?;
+                if arity > 0 && !type_args.is_empty() {
+                    return Err(generic_to_generic_call(*class_span, "class", class));
+                }
+                for arg in args {
+                    expression(arg, arity, class_args)?;
                 }
             }
             ExprKind::MethodCall { args, .. }
@@ -777,7 +802,7 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
             | ExprKind::ArrayLit(args)
             | ExprKind::RecordLit { args, .. } => {
                 for arg in args {
-                    expression(arg, arity)?;
+                    expression(arg, arity, class_args)?;
                 }
             }
             ExprKind::Unary { operand, .. }
@@ -785,17 +810,17 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
             | ExprKind::OptValue { operand }
             | ExprKind::SomeE(operand)
             | ExprKind::Widen { arg: operand, .. }
-            | ExprKind::Narrow { arg: operand, .. } => expression(operand, arity)?,
+            | ExprKind::Narrow { arg: operand, .. } => expression(operand, arity, class_args)?,
             ExprKind::Binary { lhs, rhs, .. } => {
-                expression(lhs, arity)?;
-                expression(rhs, arity)?;
+                expression(lhs, arity, class_args)?;
+                expression(rhs, arity, class_args)?;
             }
             ExprKind::Index { index, .. }
             | ExprKind::SelfFieldIndex { index, .. }
-            | ExprKind::ClassFieldIndex { index, .. } => expression(index, arity)?,
+            | ExprKind::ClassFieldIndex { index, .. } => expression(index, arity, class_args)?,
             ExprKind::AllocArray { len, init, .. } => {
-                expression(len, arity)?;
-                expression(init, arity)?;
+                expression(len, arity, class_args)?;
+                expression(init, arity, class_args)?;
             }
             ExprKind::IntLit(_)
             | ExprKind::BoolLit(_)
@@ -813,7 +838,7 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
         Ok(())
     }
 
-    fn statements(stmts: &[Stmt], arity: usize) -> MResult<()> {
+    fn statements(stmts: &[Stmt], arity: usize, class_args: &ClassArgEnv) -> MResult<()> {
         for statement in stmts {
             match statement {
                 Stmt::Decl {
@@ -827,34 +852,36 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
                 | Stmt::SystemAlloc { size: value, .. }
                 | Stmt::Return {
                     value: Some(value), ..
-                } => expression(value, arity)?,
+                } => expression(value, arity, class_args)?,
                 Stmt::SystemDealloc {
                     ptr, res, release, ..
                 } => {
-                    expression(ptr, arity)?;
-                    expression(res, arity)?;
-                    expression(release, arity)?;
+                    expression(ptr, arity, class_args)?;
+                    expression(res, arity, class_args)?;
+                    expression(release, arity, class_args)?;
                 }
                 Stmt::Store { index, value, .. } | Stmt::FieldStore { index, value, .. } => {
-                    expression(index, arity)?;
-                    expression(value, arity)?;
+                    expression(index, arity, class_args)?;
+                    expression(value, arity, class_args)?;
                 }
                 Stmt::If {
                     cond,
                     then_block,
                     else_block,
                 } => {
-                    expression(cond, arity)?;
-                    statements(then_block, arity)?;
+                    expression(cond, arity, class_args)?;
+                    statements(then_block, arity, class_args)?;
                     if let Some(else_block) = else_block {
-                        statements(else_block, arity)?;
+                        statements(else_block, arity, class_args)?;
                     }
                 }
                 Stmt::While { cond, body, .. } => {
-                    expression(cond, arity)?;
-                    statements(body, arity)?;
+                    expression(cond, arity, class_args)?;
+                    statements(body, arity, class_args)?;
                 }
-                Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => statements(body, arity)?,
+                Stmt::Unsafe { body, .. } | Stmt::Expose { body, .. } => {
+                    statements(body, arity, class_args)?
+                }
                 Stmt::Decl { init: None, .. }
                 | Stmt::Return { value: None, .. }
                 | Stmt::Assert(_) => {}
@@ -863,38 +890,38 @@ fn validate_v1_type_args(program: &Program) -> MResult<()> {
         Ok(())
     }
 
-    fn function(function: &Fn, arity: usize) -> MResult<()> {
-        statements(&function.body, arity)
+    fn function(function: &Fn, arity: usize, class_args: &ClassArgEnv) -> MResult<()> {
+        statements(&function.body, arity, class_args)
     }
 
-    fn class(class: &ClassDecl) -> MResult<()> {
+    fn class(class: &ClassDecl, class_args: &ClassArgEnv) -> MResult<()> {
         let arity = class.type_params.len();
         for init in &class.inits {
-            function(init, arity)?;
+            function(init, arity, class_args)?;
         }
         for method in &class.methods {
-            function(&method.f, arity)?;
+            function(&method.f, arity, class_args)?;
         }
         if let Some(deinit) = &class.deinit {
-            statements(deinit, arity)?;
+            statements(deinit, arity, class_args)?;
         }
         Ok(())
     }
 
     for function_ in program.fns.iter().chain(&program.fn_templates) {
-        function(function_, function_.type_params.len())?;
+        function(function_, function_.type_params.len(), class_args)?;
     }
     for class_ in program.classes.iter().chain(&program.class_templates) {
-        class(class_)?;
+        class(class_, class_args)?;
     }
     for trait_ in &program.traits {
         for method in &trait_.methods {
-            function(method, 1)?;
+            function(method, 1, class_args)?;
         }
     }
     for impl_ in &program.impls {
         for function_ in &impl_.fns {
-            function(function_, 0)?;
+            function(function_, 0, class_args)?;
         }
     }
     Ok(())
@@ -1164,6 +1191,171 @@ impl TemplateKind {
             TemplateKind::Class => "class",
         }
     }
+
+    fn tag(self) -> char {
+        match self {
+            TemplateKind::Function => 'f',
+            TemplateKind::Class => 'c',
+        }
+    }
+}
+
+/// The concrete, already-resolved arguments monomorphization may substitute.
+///
+/// The nominal identity stays name-based in `ConcreteArgs::keys`; the class
+/// index here is only the checked `Ty` payload used after module merge and
+/// generic-template extraction have fixed the ordinary-class order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConcreteArg {
+    Int(IntTy),
+    Class { name: String, index: usize },
+}
+
+impl ConcreteArg {
+    fn lowered_ty(&self) -> Ty {
+        match self {
+            ConcreteArg::Int(integer) => Ty::Int(*integer),
+            ConcreteArg::Class { index, .. } => Ty::Class(*index),
+        }
+    }
+
+    fn generic_ty(&self) -> GenericTy {
+        match self {
+            ConcreteArg::Int(integer) => GenericTy::Int(*integer),
+            ConcreteArg::Class { name, .. } => GenericTy::Class {
+                name: name.clone(),
+                args: Box::new([]),
+            },
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        match self {
+            ConcreteArg::Int(integer) => integer.name(),
+            ConcreteArg::Class { name, .. } => name,
+        }
+    }
+
+    fn as_int(&self) -> Option<IntTy> {
+        match self {
+            ConcreteArg::Int(integer) => Some(*integer),
+            ConcreteArg::Class { .. } => None,
+        }
+    }
+}
+
+/// The resolved substitution values plus the source-structural identity used
+/// for deduplication and non-integer emitted names. Keeping the channels
+/// distinct ensures module-order class indices never leak into identity.
+#[derive(Debug, Clone)]
+struct ConcreteArgs {
+    values: Vec<ConcreteArg>,
+    keys: Box<[CanonicalTypeKey]>,
+}
+
+impl ConcreteArgs {
+    fn all_ints(&self) -> Option<Vec<IntTy>> {
+        self.values.iter().map(ConcreteArg::as_int).collect()
+    }
+}
+
+/// Names that may occur as a direct concrete class type argument.
+///
+/// Ordinary indices are computed by filtering the source class sequence in
+/// place. That is exactly the sequence left after template extraction, even
+/// when generic and ordinary declarations were interleaved in the source.
+#[derive(Debug, Clone)]
+struct ClassArgEnv {
+    ordinary: HashMap<String, usize>,
+    generic: HashSet<String>,
+}
+
+impl ClassArgEnv {
+    fn from_program(program: &Program) -> MResult<ClassArgEnv> {
+        let mut ordinary = HashMap::new();
+        let mut generic = HashSet::new();
+        let mut next_index = 0usize;
+
+        for class in &program.classes {
+            if class.type_params.is_empty() {
+                ordinary.insert(class.name.clone(), next_index);
+                next_index += 1;
+            } else {
+                generic.insert(class.name.clone());
+            }
+        }
+        for class in &program.class_templates {
+            if class.type_params.is_empty() {
+                return Err(Diagnostic {
+                    name: "internal.mono.empty_class_template".into(),
+                    title: "a retained class template has no type parameters".into(),
+                    span: class.name_span,
+                    label: "ordinary classes belong in `Program::classes`".into(),
+                    notes: vec![],
+                });
+            }
+            generic.insert(class.name.clone());
+        }
+
+        Ok(ClassArgEnv { ordinary, generic })
+    }
+
+    fn validate_extracted_classes(&self, classes: &[ClassDecl]) -> MResult<()> {
+        for (index, class) in classes.iter().enumerate() {
+            if self.ordinary.get(&class.name) != Some(&index) {
+                return Err(Diagnostic {
+                    name: "internal.mono.class_arg_index".into(),
+                    title: "ordinary class indices changed during template extraction".into(),
+                    span: class.name_span,
+                    label: format!(
+                        "class `{}` is at index {index}, inconsistent with preflight resolution",
+                        class.name
+                    ),
+                    notes: vec![],
+                });
+            }
+        }
+        if classes.len() != self.ordinary.len() {
+            return Err(Diagnostic {
+                name: "internal.mono.class_arg_index".into(),
+                title: "ordinary class indices changed during template extraction".into(),
+                span: Span::new(0, 0),
+                label: "the extracted ordinary-class set differs from preflight resolution".into(),
+                notes: vec![],
+            });
+        }
+        Ok(())
+    }
+
+    fn resolve(&self, ty: &GenericTy, span: Span) -> MResult<ConcreteArg> {
+        match ty {
+            GenericTy::Int(IntTy::TParam(index)) => Err(unsupported_type_arg(
+                span,
+                GenericTyError::NonCanonicalLegacyParameter(TypeParamId::from_legacy(*index)),
+            )),
+            GenericTy::Int(integer) => Ok(ConcreteArg::Int(*integer)),
+            GenericTy::Param(parameter) => Err(unsupported_type_arg(
+                span,
+                GenericTyError::UnsubstitutedTypeParameter(*parameter),
+            )),
+            GenericTy::Class { name, args } if args.is_empty() => {
+                if let Some(index) = self.ordinary.get(name) {
+                    return Ok(ConcreteArg::Class {
+                        name: name.clone(),
+                        index: *index,
+                    });
+                }
+                if self.generic.contains(name) {
+                    return Err(nested_generic_class_arg(span, name));
+                }
+                Err(unknown_class_arg(span, name))
+            }
+            GenericTy::Class { name, .. } => Err(nested_generic_class_arg(span, name)),
+            GenericTy::Bool | GenericTy::Record(_) | GenericTy::Array(_) | GenericTy::Option(_) => {
+                Err(unsupported_type_arg(span, GenericTyError::NotV1Integer))
+            }
+        }
+    }
 }
 
 /// Exact identity of an instance. The legacy emitted spelling is deliberately
@@ -1177,7 +1369,7 @@ struct InstanceKey {
 }
 
 impl InstanceKey {
-    fn from_args(kind: TemplateKind, template: &str, args: &ConcreteV1Args) -> InstanceKey {
+    fn from_args(kind: TemplateKind, template: &str, args: &ConcreteArgs) -> InstanceKey {
         InstanceKey {
             kind,
             template: template.to_string(),
@@ -1266,7 +1458,7 @@ fn seed_emitted_names(program: &Program) -> MResult<BTreeMap<String, EmittedName
 struct Request {
     key: InstanceKey,
     emitted_name: String,
-    args: Vec<IntTy>,
+    args: Vec<ConcreteArg>,
     span: Span,
     depth: usize,
 }
@@ -1283,6 +1475,7 @@ struct Mono {
     traits: HashMap<String, TraitDecl>,
     /// (trait name, concrete type name) → impl info.
     impls: HashMap<(String, String), ImplInfo>,
+    class_args: ClassArgEnv,
 }
 
 /// What monomorphization needs to resolve `K::m` through an impl.
@@ -1524,10 +1717,41 @@ pub fn mangle(template: &str, args: &[IntTy]) -> String {
     out
 }
 
+/// Injective emitted spelling for an instance outside the legacy all-integer
+/// domain. Every variable component is byte-length framed; the kind and arity
+/// are explicit, so parsing the identifier recovers the complete structural
+/// instance identity without consulting program-relative nominal indices.
+fn structural_mangle(key: &InstanceKey) -> String {
+    fn push_framed(out: &mut String, value: &str) {
+        out.push_str(&value.len().to_string());
+        out.push('_');
+        out.push_str(value);
+        out.push('_');
+    }
+
+    let mut out = String::from("SableMono_");
+    out.push(key.kind.tag());
+    out.push('_');
+    push_framed(&mut out, &key.template);
+    out.push_str(&key.args.len().to_string());
+    out.push('_');
+    for argument in key.args.iter() {
+        push_framed(&mut out, argument.as_str());
+    }
+    out
+}
+
+fn emitted_instance_name(key: &InstanceKey, args: &ConcreteArgs) -> String {
+    match args.all_ints() {
+        Some(integer_args) => mangle(&key.template, &integer_args),
+        None => structural_mangle(key),
+    }
+}
+
 fn unsupported_type_arg(span: Span, error: GenericTyError) -> Diagnostic {
     let reason = match error {
         GenericTyError::NotV1Integer => {
-            "this recursive type shape is outside the current integer-only generic domain"
+            "this recursive type shape is outside the current direct integer-or-class generic domain"
         }
         GenericTyError::UnsubstitutedTypeParameter(_) => {
             "an unsubstituted type parameter reached a concrete instantiation"
@@ -1543,63 +1767,89 @@ fn unsupported_type_arg(span: Span, error: GenericTyError) -> Diagnostic {
         name: "mono.type_arg_unsupported".into(),
         title: "this generic type argument is not supported yet".into(),
         span,
-        label: "instantiation accepts only `u8`..`u64` and `i8`..`i64`".into(),
+        label: "instantiation accepts integers and non-generic concrete classes".into(),
         notes: vec![(
             "note".into(),
             format!(
-                "{reason}; the argument representation is recursive so that Boolean, aggregate, \
-                 and nominal arguments can be enabled without changing instance identity"
+                "{reason}; Boolean, record, array, option, and nested generic-class arguments \
+                 remain closed until their own semantic tranches"
             ),
         )],
     }
 }
 
-/// The current substitution payload plus the future-proof structural keys
-/// taken directly from the recursive source types. Keeping both here prevents
-/// instance identity from being accidentally reconstructed from the temporary
-/// integer-only v1 lowering.
-struct ConcreteV1Args {
-    values: Vec<IntTy>,
-    keys: Box<[CanonicalTypeKey]>,
+fn nested_generic_class_arg(span: Span, name: &str) -> Diagnostic {
+    Diagnostic {
+        name: "mono.nested_generic_class_arg_unsupported".into(),
+        title: format!("generic class `{name}` cannot be a type argument yet"),
+        span,
+        label: "use a non-generic concrete class as the owner argument".into(),
+        notes: vec![(
+            "note".into(),
+            "nested generic classes need fixed-point instance discovery and deterministic \
+             generated-class index assignment before checked types can name them"
+                .into(),
+        )],
+    }
 }
 
-/// Borrow recursive use-site arguments at the current integer-only mono
-/// boundary. The AST arguments remain intact until request validation and
-/// emitted-name reservation both succeed.
-fn concrete_v1_type_args(type_args: &[TypeArg]) -> MResult<ConcreteV1Args> {
+fn unknown_class_arg(span: Span, name: &str) -> Diagnostic {
+    Diagnostic {
+        name: "mono.unknown_class_type_arg".into(),
+        title: format!("generic type argument names unknown class `{name}`"),
+        span,
+        label: "the nominal type is not an ordinary class in this program".into(),
+        notes: vec![],
+    }
+}
+
+fn generic_to_generic_call(span: Span, kind: &str, name: &str) -> Diagnostic {
+    Diagnostic {
+        name: "mono.generic_to_generic_call_unsupported".into(),
+        title: format!("generic declaration cannot instantiate {kind} `{name}` yet"),
+        span,
+        label: "generic-to-generic calls remain outside the retained template model".into(),
+        notes: vec![(
+            "note".into(),
+            "move this nested instantiation into an ordinary declaration; retained ADR 0009 \
+             templates do not yet transport another template's abstract contract"
+                .into(),
+        )],
+    }
+}
+
+/// Resolve recursive use-site arguments at the current direct
+/// integer-or-ordinary-class boundary. The AST arguments remain intact until
+/// request validation and emitted-name reservation both succeed.
+fn concrete_type_args(type_args: &[TypeArg], class_args: &ClassArgEnv) -> MResult<ConcreteArgs> {
     let mut values = Vec::with_capacity(type_args.len());
     let mut keys = Vec::with_capacity(type_args.len());
     for TypeArg { ty, span } in type_args {
-        values.push(
-            ty.try_to_concrete_v1_int()
-                .map_err(|error| unsupported_type_arg(*span, error))?,
-        );
+        values.push(class_args.resolve(ty, *span)?);
         keys.push(
             ty.concrete_key()
                 .map_err(|error| unsupported_type_arg(*span, error))?,
         );
     }
-    Ok(ConcreteV1Args {
+    Ok(ConcreteArgs {
         values,
         keys: keys.into_boxed_slice(),
     })
 }
 
-fn require_concrete_v1_type_args(type_args: &[TypeArg]) -> MResult<()> {
+fn require_concrete_type_args(type_args: &[TypeArg], class_args: &ClassArgEnv) -> MResult<()> {
     for arg in type_args {
-        arg.ty
-            .try_to_concrete_v1_int()
-            .map_err(|error| unsupported_type_arg(arg.span, error))?;
+        class_args.resolve(&arg.ty, arg.span)?;
     }
     Ok(())
 }
 
-fn substitute_type_args(type_args: &mut [TypeArg], args: &[IntTy]) -> MResult<()> {
-    let substitutions: Vec<GenericTy> = args
-        .iter()
-        .copied()
-        .map(GenericTy::from_legacy_int)
-        .collect();
+fn substitute_type_args(type_args: &mut [TypeArg], args: &[ConcreteArg]) -> MResult<()> {
+    // The source gate currently makes this a no-op: retained templates reject
+    // every generic-to-generic call before extraction. Keep the structural
+    // substitution beside `subst_expr` so reopening that boundary cannot
+    // accidentally regress recursive argument traversal.
+    let substitutions: Vec<GenericTy> = args.iter().map(ConcreteArg::generic_ty).collect();
     for arg in type_args {
         arg.ty = arg
             .ty
@@ -1614,19 +1864,10 @@ impl Mono {
         &mut self,
         kind: TemplateKind,
         template: &str,
-        args: &ConcreteV1Args,
+        args: &ConcreteArgs,
         span: Span,
         depth: usize,
     ) -> MResult<String> {
-        if let Some(index) = args.values.iter().find_map(|arg| match arg {
-            IntTy::TParam(index) => Some(*index),
-            _ => None,
-        }) {
-            return Err(unsupported_type_arg(
-                span,
-                GenericTyError::UnsubstitutedTypeParameter(TypeParamId::from_legacy(index)),
-            ));
-        }
         let (expected, bounds) = match kind {
             TemplateKind::Function => {
                 let template = self
@@ -1657,15 +1898,17 @@ impl Mono {
         }
         for (bound, arg) in bounds.iter().zip(&args.values) {
             if let Some(b) = bound {
-                if !self
-                    .impls
-                    .contains_key(&(b.clone(), arg.name().to_string()))
-                {
+                let argument_name = arg.display_name();
+                let satisfies = arg.as_int().is_some()
+                    && self
+                        .impls
+                        .contains_key(&(b.clone(), argument_name.to_string()));
+                if !satisfies {
                     return Err(Diagnostic {
                         name: "mono.unsatisfied_bound".into(),
-                        title: format!("`{}` does not implement `{b}`", arg.name()),
+                        title: format!("`{argument_name}` does not implement `{b}`"),
                         span,
-                        label: format!("the bound requires `impl {b} for {}`", arg.name()),
+                        label: format!("the bound requires `impl {b} for {argument_name}`"),
                         notes: vec![],
                     });
                 }
@@ -1685,7 +1928,7 @@ impl Mono {
             });
         }
 
-        let emitted_name = mangle(template, &args.values);
+        let emitted_name = emitted_instance_name(&key, args);
         if let Some(owner) = self.emitted_names.get(&emitted_name) {
             let occupied_by = match owner {
                 EmittedNameOwner::Source(source_kind) => source_kind.description().to_string(),
@@ -1729,7 +1972,7 @@ impl Mono {
     }
 
     fn instantiate(&mut self, req: Request) -> MResult<()> {
-        let proof_reuse = adr0009_int_model_reuse(&req.key.template, &req.args, req.span)?;
+        let proof_reuse = adr0009_int_model_reuse(&req.key.template, &req.args);
         if req.key.kind == TemplateKind::Class {
             let template = self.class_templates[&req.key.template].clone();
             let mut c = template;
@@ -1779,7 +2022,7 @@ impl Mono {
         &self,
         param_names: &[String],
         bounds: &[Option<String>],
-        args: &[IntTy],
+        args: &[ConcreteArg],
     ) -> (
         HashMap<String, String>,
         HashMap<String, (String, HashSet<String>)>,
@@ -1787,9 +2030,9 @@ impl Mono {
         let mut text_map: HashMap<String, String> = HashMap::new();
         let mut bound_calls: HashMap<String, (String, HashSet<String>)> = HashMap::new();
         for (i, p) in param_names.iter().enumerate() {
-            text_map.insert(p.clone(), args[i].name().to_string());
+            text_map.insert(p.clone(), args[i].display_name().to_string());
             if let Some(b) = bounds.get(i).and_then(|b| b.as_ref()) {
-                let info = &self.impls[&(b.clone(), args[i].name().to_string())];
+                let info = &self.impls[&(b.clone(), args[i].display_name().to_string())];
                 for (spname, mangled) in &info.specs {
                     text_map.insert(format!("{p}::{spname}"), mangled.clone());
                 }
@@ -1804,7 +2047,7 @@ impl Mono {
     fn subst_fn(
         &mut self,
         f: &mut Fn,
-        args: &[IntTy],
+        args: &[ConcreteArg],
         text_map: &HashMap<String, String>,
         bound_calls: &HashMap<String, (String, HashSet<String>)>,
         depth: usize,
@@ -1893,7 +2136,7 @@ impl Mono {
                 type_args,
                 args,
             } => {
-                require_concrete_v1_type_args(type_args)?;
+                require_concrete_type_args(type_args, &self.class_args)?;
                 if self.fn_templates.contains_key(callee.as_str()) {
                     if type_args.is_empty() {
                         return Err(Diagnostic {
@@ -1906,7 +2149,7 @@ impl Mono {
                             notes: vec![],
                         });
                     }
-                    let targs = concrete_v1_type_args(type_args)?;
+                    let targs = concrete_type_args(type_args, &self.class_args)?;
                     let emitted = self.request(
                         TemplateKind::Function,
                         &callee.clone(),
@@ -1936,7 +2179,7 @@ impl Mono {
                 args,
                 ..
             } => {
-                require_concrete_v1_type_args(type_args)?;
+                require_concrete_type_args(type_args, &self.class_args)?;
                 if self.class_templates.contains_key(class.as_str()) {
                     if type_args.is_empty() {
                         return Err(Diagnostic {
@@ -1949,7 +2192,7 @@ impl Mono {
                             notes: vec![],
                         });
                     }
-                    let targs = concrete_v1_type_args(type_args)?;
+                    let targs = concrete_type_args(type_args, &self.class_args)?;
                     let emitted = self.request(
                         TemplateKind::Class,
                         &class.clone(),
@@ -2019,28 +2262,23 @@ impl Mono {
     }
 }
 
-fn adr0009_int_model_reuse(template: &str, args: &[IntTy], span: Span) -> MResult<ProofReuse> {
-    if let Some(index) = args.iter().find_map(|argument| match argument {
-        IntTy::TParam(index) => Some(*index),
-        _ => None,
-    }) {
-        return Err(unsupported_type_arg(
-            span,
-            GenericTyError::UnsubstitutedTypeParameter(TypeParamId::from_legacy(index)),
-        ));
+fn adr0009_int_model_reuse(template: &str, args: &[ConcreteArg]) -> ProofReuse {
+    if args.iter().all(|argument| argument.as_int().is_some()) {
+        ProofReuse::adr0009_int_model(template.to_string())
+    } else {
+        ProofReuse::None
     }
-    Ok(ProofReuse::adr0009_int_model(template.to_string()))
 }
 
 /// The argument bound to a declaration's type parameter.
 ///
-/// `validate_v1_type_args` checks arity before any substitution runs, so an
+/// `validate_type_args` checks arity before any substitution runs, so an
 /// index outside the list means the checked AST disagrees with the request
 /// that produced it. That is an internal inconsistency, and it gets a named,
 /// spanned diagnostic: an index panic is never an acceptable answer, however
 /// unreachable it is believed to be.
-fn type_argument(args: &[IntTy], index: usize, span: Span) -> MResult<IntTy> {
-    args.get(index).copied().ok_or_else(|| Diagnostic {
+fn type_argument(args: &[ConcreteArg], index: usize, span: Span) -> MResult<&ConcreteArg> {
+    args.get(index).ok_or_else(|| Diagnostic {
         name: "internal.mono.type_arg_arity".into(),
         title: "a type parameter has no argument to substitute".into(),
         span,
@@ -2055,23 +2293,43 @@ fn type_argument(args: &[IntTy], index: usize, span: Span) -> MResult<IntTy> {
     })
 }
 
-fn subst_intty(t: &mut IntTy, args: &[IntTy], span: Span) -> MResult<()> {
+fn noninteger_in_integer_position(span: Span, argument: &ConcreteArg) -> Diagnostic {
+    Diagnostic {
+        name: "mono.type_arg_position_unsupported".into(),
+        title: format!(
+            "class type argument `{}` cannot occupy an integer-only position",
+            argument.display_name()
+        ),
+        span,
+        label: "this occurrence requires a concrete integer width".into(),
+        notes: vec![(
+            "note".into(),
+            "class owners may replace declaration value types, but not conversion targets or \
+             raw-pointer widths"
+                .into(),
+        )],
+    }
+}
+
+fn subst_intty(t: &mut IntTy, args: &[ConcreteArg], span: Span) -> MResult<()> {
     if let IntTy::TParam(i) = t {
-        *t = type_argument(args, *i as usize, span)?;
+        let argument = type_argument(args, *i as usize, span)?;
+        *t = argument
+            .as_int()
+            .ok_or_else(|| noninteger_in_integer_position(span, argument))?;
     }
     Ok(())
 }
 
 /// Replace every type parameter in a checked type by its argument.
 ///
-/// A traversal: one function for the whole grammar, recursing into every
-/// payload. The argument vector stays `&[IntTy]` — the type-argument domain
-/// is concrete integers (ADR 0009), and widening it here would delete the
-/// refusal that keeps non-integer arguments closed. It is a separate axis
-/// from what a container may hold.
-pub(crate) fn subst_ty(t: &mut Ty, args: &[IntTy], span: Span) -> MResult<()> {
+/// A traversal over the whole checked grammar. A declaration parameter may
+/// become an integer or an already-resolved ordinary class. Integer-only
+/// compatibility positions still call `subst_intty` and reject a class
+/// argument rather than laundering it through an integer representation.
+pub(crate) fn subst_ty(t: &mut Ty, args: &[ConcreteArg], span: Span) -> MResult<()> {
     match t {
-        Ty::Param(parameter) => *t = Ty::Int(type_argument(args, parameter.index(), span)?),
+        Ty::Param(parameter) => *t = type_argument(args, parameter.index(), span)?.lowered_ty(),
         Ty::Int(integer) => subst_intty(integer, args, span)?,
         Ty::Array(element) | Ty::Option(element) | Ty::Borrow(_, element) => {
             subst_ty(element, args, span)?
@@ -2094,7 +2352,7 @@ type BoundCalls = HashMap<String, (String, HashSet<String>)>;
 
 fn subst_stmts(
     stmts: &mut [Stmt],
-    args: &[IntTy],
+    args: &[ConcreteArg],
     text_map: &HashMap<String, String>,
     bound_calls: &BoundCalls,
 ) -> MResult<()> {
@@ -2178,7 +2436,7 @@ fn subst_stmts(
     Ok(())
 }
 
-fn subst_expr(e: &mut Expr, args: &[IntTy], bound_calls: &BoundCalls) -> MResult<()> {
+fn subst_expr(e: &mut Expr, args: &[ConcreteArg], bound_calls: &BoundCalls) -> MResult<()> {
     let span = e.span;
     if let Some(ty) = &mut e.ty {
         subst_ty(ty, args, span)?;
@@ -2331,7 +2589,7 @@ mod tests {
     use super::*;
     use crate::span::LineMap;
 
-    /// `validate_v1_type_args` checks arity before substitution runs, so this
+    /// `validate_type_args` checks arity before substitution runs, so this
     /// cannot be reached from a source program. It is still a named, spanned
     /// diagnostic rather than an index panic: "never a panic" is a property
     /// of the compiler, not of the paths someone has thought about.
@@ -2340,26 +2598,25 @@ mod tests {
         let parameter = TypeParamId::new(3).expect("index 3 is within the parameter ceiling");
         let span = Span::new(7, 11);
         let mut ty = Ty::array(Ty::Param(parameter));
-        let diagnostic = subst_ty(&mut ty, &[IntTy::U32], span)
+        let diagnostic = subst_ty(&mut ty, &[ConcreteArg::Int(IntTy::U32)], span)
             .expect_err("parameter #3 has no argument in a one-argument instantiation");
         assert_eq!(diagnostic.name, "internal.mono.type_arg_arity");
         assert_eq!(diagnostic.span, span);
 
         let mut legacy = Ty::option(Ty::Int(IntTy::TParam(3)));
         assert_eq!(
-            subst_ty(&mut legacy, &[IntTy::U32], span)
+            subst_ty(&mut legacy, &[ConcreteArg::Int(IntTy::U32)], span)
                 .expect_err("the legacy parameter spelling is checked too")
                 .name,
             "internal.mono.type_arg_arity"
         );
     }
 
-    /// Substitution cannot deepen a checked type, because the argument domain
-    /// is concrete integers (ADR 0009): a parameter is a leaf and so is the
-    /// integer that replaces it. That is what makes the parser's depth bound
-    /// hold on the substituted type too, without a second check after
-    /// expansion. Widening the argument domain breaks this and needs the
-    /// bound re-imposed on `Ty::structural_depth`.
+    /// Substitution cannot deepen a checked type in the direct integer/class
+    /// domain: a parameter is a leaf and so are `Ty::Int` and `Ty::Class`.
+    /// That keeps the parser's depth bound valid without a second check after
+    /// expansion. Admitting a recursive argument shape would break this and
+    /// require re-imposing the bound on `Ty::structural_depth`.
     #[test]
     fn substitution_never_deepens_a_checked_type() {
         let parameter = TypeParamId::new(0).expect("index 0 is within the parameter ceiling");
@@ -2372,8 +2629,12 @@ mod tests {
             Ty::array(Ty::array(Ty::Param(parameter))),
         ] {
             let mut substituted = original.clone();
-            subst_ty(&mut substituted, &[IntTy::U32], Span::new(0, 0))
-                .expect("one argument covers a single-parameter declaration");
+            subst_ty(
+                &mut substituted,
+                &[ConcreteArg::Int(IntTy::U32)],
+                Span::new(0, 0),
+            )
+            .expect("one argument covers a single-parameter declaration");
             assert_eq!(
                 substituted.structural_depth(),
                 original.structural_depth(),
@@ -2696,29 +2957,36 @@ fn duplicate<T>(T value) -> T {
     }
 
     #[test]
-    fn concrete_v1_arguments_keep_keys_from_recursive_source_types() {
+    fn concrete_arguments_keep_keys_from_recursive_source_types() {
         let source_type = GenericTy::Int(IntTy::I32);
         let source_key = source_type.concrete_key().unwrap();
-        let args = concrete_v1_type_args(&[TypeArg {
-            ty: source_type,
-            span: Span::new(7, 10),
-        }])
+        let class_args = ClassArgEnv {
+            ordinary: HashMap::new(),
+            generic: HashSet::new(),
+        };
+        let args = concrete_type_args(
+            &[TypeArg {
+                ty: source_type,
+                span: Span::new(7, 10),
+            }],
+            &class_args,
+        )
         .unwrap();
 
-        assert_eq!(args.values, vec![IntTy::I32]);
+        assert_eq!(args.values, vec![ConcreteArg::Int(IntTy::I32)]);
         assert_eq!(args.keys.as_ref(), &[source_key]);
 
         // Instance identity consumes the structural-key channel, not the
         // temporary v1 substitution values. Keep this deliberately mismatched
         // construction as a wiring regression for the recursive-type rollout.
         let bool_key = GenericTy::Bool.concrete_key().unwrap();
-        let mismatched = ConcreteV1Args {
-            values: vec![IntTy::I32],
+        let mismatched = ConcreteArgs {
+            values: vec![ConcreteArg::Int(IntTy::I32)],
             keys: vec![bool_key.clone()].into_boxed_slice(),
         };
         let key = InstanceKey::from_args(TemplateKind::Function, "identity", &mismatched);
         assert_eq!(key.args.as_ref(), &[bool_key]);
-        assert_eq!(mangle("identity", &mismatched.values), "identity_i32");
+        assert_eq!(emitted_instance_name(&key, &mismatched), "identity_i32");
     }
 
     #[test]
@@ -2806,7 +3074,7 @@ fn record_root() -> Pair {
     }
 
     #[test]
-    fn substitutes_and_rewrites_generic_uses_in_class_deinits() {
+    fn substitutes_class_deinits_and_rewrites_ordinary_deinit_uses() {
         let program = parse_and_monomorphize(
             r#"
 fn identity<T>(T value) -> T {
@@ -2834,7 +3102,7 @@ class Generic<T> {
 
     deinit {
         /// assert T.max = T.max
-        T copy = identity<T>(self.value);
+        T copy = self.value;
     }
 }
 
@@ -2874,21 +3142,19 @@ fn class_roots() {
         assert_eq!(clause.text, "u64.max = u64.max");
         let Stmt::Decl {
             ty,
-            init: Some(generic_call),
+            init: Some(generic_value),
             ..
         } = &generic_deinit[1]
         else {
             panic!("expected the generic deinit declaration");
         };
         assert_eq!(*ty, Ty::Int(IntTy::U64));
-        let (callee, type_args) = call_name(generic_call);
-        assert_eq!(callee, "identity_u64");
-        assert!(type_args.is_empty());
+        assert!(matches!(generic_value.kind, ExprKind::SelfField { .. }));
         assert!(program.fns.iter().any(|f| f.name == "identity_u64"));
     }
 
     #[test]
-    fn rejects_dormant_noninteger_type_arguments_at_the_v1_boundary() {
+    fn rejects_dormant_boolean_type_arguments_at_the_direct_boundary() {
         let mut program = parse_program(
             r#"
 fn identity<T>(T value) -> T {
@@ -2921,7 +3187,11 @@ fn root() -> u8 {
         let error = monomorphize(&mut program).expect_err("bool is outside G0's enabled domain");
         assert_eq!(error.name, "mono.type_arg_unsupported");
         assert_eq!(error.span, span);
-        assert!(error.label.contains("only `u8`..`u64`"));
+        assert!(
+            error
+                .label
+                .contains("integers and non-generic concrete classes")
+        );
     }
 
     #[test]
@@ -3239,5 +3509,289 @@ fn root(i32 value) -> i32 {
             .expect_err("affine-option payload parameters must not escape");
         assert_eq!(error.name, "mono.unsubstituted_type_param");
         assert!(error.label.contains("option payload type"));
+    }
+
+    #[test]
+    fn ordinary_class_arguments_resolve_after_template_extraction_without_proof_reuse() {
+        let program = parse_and_monomorphize(
+            r#"
+class EarlierTemplate<T> {}
+
+class Owner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+fn relay<T>(T value) -> T {
+    return value;
+}
+
+fn root() -> Owner {
+    var owner = Owner::make(7);
+    return relay<Owner>(owner);
+}
+"#,
+        );
+
+        assert_eq!(program.classes[0].name, "Owner");
+        let instance = program
+            .fns
+            .iter()
+            .find(|function| function.name.starts_with("SableMono_f_5_relay_"))
+            .expect("owner relay instance");
+        assert_eq!(instance.params[0].ty, Ty::Class(0));
+        assert_eq!(instance.ret, Ty::Class(0));
+        assert!(instance.proof_reuse.is_none());
+
+        let root = program
+            .fns
+            .iter()
+            .find(|function| function.name == "root")
+            .expect("root function");
+        let Stmt::Return {
+            value: Some(call), ..
+        } = &root.body[1]
+        else {
+            panic!("expected rewritten relay return");
+        };
+        let (callee, type_args) = call_name(call);
+        assert_eq!(callee, instance.name);
+        assert!(type_args.is_empty());
+    }
+
+    #[test]
+    fn generic_class_owner_fields_are_concrete_and_independently_checked() {
+        let program = parse_and_monomorphize(
+            r#"
+class Owner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+class Holder<T> {
+    T value;
+
+    init hold(T value) {
+        self.value = value;
+    }
+}
+
+fn root() {
+    var owner = Owner::make(7);
+    var holder = Holder<Owner>::hold(owner);
+}
+"#,
+        );
+
+        let holder = program
+            .classes
+            .iter()
+            .find(|class| class.name.starts_with("SableMono_c_6_Holder_"))
+            .expect("owner Holder instance");
+        assert_eq!(holder.fields[0].ty, Ty::Class(0));
+        assert_eq!(holder.inits[0].params[0].ty, Ty::Class(0));
+        assert!(holder.proof_reuse.is_none());
+    }
+
+    #[test]
+    fn any_owner_argument_disables_reuse_while_all_integer_names_stay_legacy() {
+        let program = parse_and_monomorphize(
+            r#"
+class Owner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+fn first<T, U>(T value, U ignored) -> T {
+    return value;
+}
+
+fn root() -> i32 {
+    i32 legacy = first<i32, u8>(3, 4);
+    var owner = Owner::make(5);
+    return first<i32, Owner>(legacy, owner);
+}
+"#,
+        );
+
+        let legacy = program
+            .fns
+            .iter()
+            .find(|function| function.name == "first_i32_u8")
+            .expect("legacy integer instance");
+        assert!(matches!(legacy.proof_reuse, ProofReuse::Adr0009IntModel(_)));
+
+        let owner = program
+            .fns
+            .iter()
+            .find(|function| function.name.starts_with("SableMono_f_5_first_"))
+            .expect("mixed owner instance");
+        assert_eq!(owner.params[0].ty, Ty::Int(IntTy::I32));
+        assert_eq!(owner.params[1].ty, Ty::Class(0));
+        assert!(owner.proof_reuse.is_none());
+    }
+
+    #[test]
+    fn generic_to_generic_owner_propagation_fails_before_template_retention() {
+        let source = r#"
+class Owner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+fn inner<T>(T value) -> T {
+    return value;
+}
+
+fn outer<T>(T value) -> T {
+    return inner<T>(value);
+}
+
+fn root() -> Owner {
+    var owner = Owner::make(7);
+    return outer<Owner>(owner);
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "mono.generic_to_generic_call_unsupported");
+        assert_eq!(error.span.start, source.rfind("inner<T>").unwrap());
+    }
+
+    #[test]
+    fn structural_owner_names_are_injective_and_index_independent() {
+        fn class_args(names: &[(&str, usize)]) -> ConcreteArgs {
+            let values: Vec<ConcreteArg> = names
+                .iter()
+                .map(|(name, index)| ConcreteArg::Class {
+                    name: (*name).into(),
+                    index: *index,
+                })
+                .collect();
+            let keys = values
+                .iter()
+                .map(ConcreteArg::generic_ty)
+                .map(|ty| ty.concrete_key().expect("concrete class key"))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            ConcreteArgs { values, keys }
+        }
+
+        let left = class_args(&[("A_B", 0), ("C", 1)]);
+        let right = class_args(&[("A", 0), ("B_C", 1)]);
+        let reindexed = class_args(&[("A_B", 41), ("C", 99)]);
+        let left_key = InstanceKey::from_args(TemplateKind::Function, "pair", &left);
+        let right_key = InstanceKey::from_args(TemplateKind::Function, "pair", &right);
+        let reindexed_key = InstanceKey::from_args(TemplateKind::Function, "pair", &reindexed);
+
+        assert_ne!(structural_mangle(&left_key), structural_mangle(&right_key));
+        assert_eq!(
+            structural_mangle(&left_key),
+            structural_mangle(&reindexed_key)
+        );
+        assert!(structural_mangle(&left_key).starts_with("SableMono_f_4_pair_2_"));
+    }
+
+    #[test]
+    fn nested_generic_class_arguments_are_refused_independent_of_queue_order() {
+        let source = r#"
+class Owner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+class Box<T> {
+    T value;
+
+    init hold(T value) {
+        self.value = value;
+    }
+}
+
+fn phantom<T>() -> u64 {
+    return 0;
+}
+
+fn root() -> u64 {
+    var owner = Owner::make(1);
+    var boxed = Box<Owner>::hold(owner);
+    return phantom<Box<Owner>>();
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "mono.nested_generic_class_arg_unsupported");
+        assert_eq!(error.span.start, source.rfind("Box<Owner>").unwrap());
+    }
+
+    #[test]
+    fn class_arguments_fail_at_integer_only_template_occurrences() {
+        let source = r#"
+class Owner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+fn convert<T>(u8 value) -> T {
+    return widen<T>(value);
+}
+
+fn root() -> Owner {
+    return convert<Owner>(7);
+}
+"#;
+        let error = monomorphization_error(source);
+        assert_eq!(error.name, "mono.type_arg_position_unsupported");
+        assert!(error.title.contains("`Owner`"));
+        assert_eq!(error.span.start, source.find("widen<T>").unwrap());
+    }
+
+    #[test]
+    fn unknown_synthetic_class_arguments_fail_without_indexing() {
+        let mut program = parse_program(
+            r#"
+fn identity<T>(T value) -> T {
+    return value;
+}
+
+fn root() -> i32 {
+    return identity<i32>(7);
+}
+"#,
+        );
+        let Stmt::Return {
+            value: Some(expression),
+            ..
+        } = &mut program.fns[1].body[0]
+        else {
+            panic!("expected root return");
+        };
+        let ExprKind::Call { type_args, .. } = &mut expression.kind else {
+            panic!("expected identity call");
+        };
+        type_args[0].ty = GenericTy::Class {
+            name: "Missing".into(),
+            args: Box::new([]),
+        };
+
+        let error = monomorphize(&mut program).expect_err("unknown class has no checked index");
+        assert_eq!(error.name, "mono.unknown_class_type_arg");
+        assert!(error.title.contains("`Missing`"));
     }
 }

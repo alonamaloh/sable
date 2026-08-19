@@ -16,9 +16,9 @@ pub enum IntTy {
     I64,
     /// Legacy integer-expression representation of a type parameter in
     /// `widen<T>` / `narrow<T>` and generic compatibility helpers. Declaration
-    /// positions use `Ty::Param` / `Ty::Param`, so a parameter is not
-    /// accidentally treated as an integer merely because v1 instances are
-    /// currently integer-only.
+    /// positions use `Ty::Param`, so a parameter is not accidentally treated
+    /// as an integer merely because retained ADR 0009 template proofs use the
+    /// integer model.
     TParam(u8),
 }
 
@@ -153,8 +153,8 @@ pub enum NominalKind {
 /// monomorphization.
 ///
 /// Call and constructor type-argument sites store this. It is an owned
-/// structural representation, wider than the integer arguments instantiation
-/// currently accepts. Nominal types are name-based
+/// structural representation, wider than the direct integer-or-ordinary-class
+/// leaves monomorphization currently accepts. Nominal types are name-based
 /// because module-local class indices are not stable until merging and
 /// monomorphization have finished.
 ///
@@ -194,7 +194,8 @@ impl TypeArg {
 /// Failures from checked generic-type conversion, substitution, and keying.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenericTyError {
-    /// The shape cannot be represented by the integer-only v1 AST surface.
+    /// The shape cannot be represented by the legacy integer conversion or
+    /// admitted as a direct monomorphization leaf.
     NotV1Integer,
     /// A parameter survived where a concrete monomorphization key or integer
     /// was required.
@@ -1253,10 +1254,10 @@ impl Ty {
     /// its payload does, and a borrow never owns its referent (ADRs 0010,
     /// 0023).
     ///
-    /// `Param` is copyable because the type-argument domain is concrete
-    /// integers (ADR 0009). `type_arguments_are_copyable` pins that coupling,
-    /// so widening the domain fails a test rather than silently classifying
-    /// an owner as copyable.
+    /// `Param` is copyable in a retained template because that template is
+    /// checked against ADR 0009's integer model. A concrete class-owner
+    /// instance contains `Ty::Class`, not `Param`, receives no integer proof
+    /// reuse, and is independently checked under the affine arm below.
     pub fn is_affine(&self) -> bool {
         match self {
             Ty::Class(_) | Ty::Res(_) | Ty::Array(_) => true,
@@ -1789,8 +1790,8 @@ pub struct Param {
 /// proof instead of generating its own obligations.
 ///
 /// Naming the ADR 0009 integer model in the variant makes the proof domain
-/// explicit: future bool/record instances cannot silently inherit a theorem
-/// proved only for integer-valued templates.
+/// explicit: a class-owner instance, or any future bool/record instance,
+/// cannot silently inherit a theorem proved only for integer-valued templates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProofReuse {
     None,
@@ -2242,11 +2243,11 @@ mod generic_ty_tests {
         assert!(Ty::RawRecord(0).storage_layout().is_some());
     }
 
-    /// The argument domain is concrete integers, which is what makes a
-    /// retained template parameter provably copyable. Widening the domain
-    /// fails here rather than silently classifying an owner as copyable.
+    /// A retained template parameter is the ADR 0009 integer proof model, not
+    /// a claim that every concrete instantiation is copyable. Owner instances
+    /// contain the concrete class type and are independently checked.
     #[test]
-    fn type_arguments_are_copyable() {
+    fn retained_integer_model_params_and_concrete_owners_have_distinct_affinity() {
         for width in [
             IntTy::U8,
             IntTy::U16,
@@ -2261,6 +2262,7 @@ mod generic_ty_tests {
         }
         let parameter = TypeParamId::from_legacy(0);
         assert!(!Ty::Param(parameter).is_affine());
+        assert!(Ty::Class(0).is_affine());
     }
 
     #[test]

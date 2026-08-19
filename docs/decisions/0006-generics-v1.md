@@ -11,9 +11,9 @@ the compiler strategy.
    `swap_elems<u8>(&mut a, i, j)`. No inference in v1 — honest and
    unambiguous; inference is sugar that can come later without semantic
    change.
-2. **Parameter domain v1**: the eight integer types. (`bool`, class-typed
-   parameters, and nested instantiations come later; class fields still
-   cannot be class-typed, so `Vec<Vec<T>>` is out of range anyway.)
+2. **Parameter domain**: the eight integer types and, since the first G3
+   owner tranche, direct ordinary (non-generic) classes. `bool`, records,
+   arrays, options, and nested generic-class instances remain closed.
 3. **Strategy: parse → expand → everything else.** A monomorphization
    pass clones each generic declaration once per distinct instantiation
    reachable from non-generic roots, substituting the parameter
@@ -21,13 +21,14 @@ the compiler strategy.
    (so `T.max` in a contract becomes `i32.max`). The checker, VCgen,
    Lean emission, interpreter, and LSP see only ordinary declarations;
    the Lean encoding needs nothing new.
-4. **Naming**: instances are mangled `Vec_i32` (Lean structure names,
-   theorem prefixes); diagnostics and obligation names display the
-   pretty form `Vec<i32>::push`. Spans point into the generic source.
-5. **Proof cost**: each instance is verified independently. Accepted for
-   v1 (automation is cheap; instances differ in range facts anyway).
-   Proving once and instantiating — a per-instance `∀`-quantified
-   metatheorem — is future work tied to the metatheory track.
+4. **Naming**: all-integer instances retain the legacy `Vec_i32` spelling.
+   Any instance containing a class owner uses an injective, length-framed
+   structural spelling which contains no program-relative class index.
+   Diagnostics retain source spans in the generic declaration.
+5. **Proof cost and provenance**: ADR 0009 permits proof reuse only when every
+   argument is an integer covered by `Sable.IntModel`. Any instance containing
+   a class owner receives `ProofReuse::None` and is checked and verified
+   independently after substitution.
 6. **Law-carrying trait bounds are deferred to the hash-map benchmark**
    (`T: Hashable` with hash-respects-equality), exactly as the goals doc
    schedules: Vec needs no bounds, so v1 ships without them rather than
@@ -35,9 +36,9 @@ the compiler strategy.
 
 ## G0 recursive-type foundation (2026-08-12)
 
-ADR 0006's semantic domain remains the eight integer types, but the compiler no
-longer represents that temporary limit as a flat type-argument string. G0 makes
-the widening path explicit and fail closed:
+At the G0 checkpoint, ADR 0006's semantic domain remained the eight integer
+types, but the compiler no longer represented that temporary limit as a flat
+type-argument string. G0 made the widening path explicit and fail closed:
 
 - `GenericTy` and opaque `CanonicalTypeKey` values recurse over integers,
   `bool`, type parameters, records, classes with arguments, arrays, and options.
@@ -54,10 +55,9 @@ the widening path explicit and fail closed:
   original recursive canonical arguments. Its emitted spelling remains a
   presentation detail; ambiguous legacy spellings and collisions with source,
   template, or impl-lowered names are deterministic errors.
-- The semantic gate is unchanged. Any argument that is not a concrete v1
-  integer (after parameter substitution) is rejected as
-  `mono.type_arg_unsupported` before checked types are built. Boolean/POD
-  checking, verification, execution, and lowering belong to G1.
+- At that checkpoint the semantic gate was unchanged: every argument that was
+  not a concrete integer failed before checked types were built. The G3
+  amendment below opens exactly direct ordinary classes.
 
 G0 also closes deterministic pre-monomorphization failure paths: duplicate
 traits, duplicate impl spec definitions, and duplicate impl methods diagnose the
@@ -69,3 +69,22 @@ The closure gate was the complete low-concurrency suite, not only focused parser
 tests: 82/82 library tests; all 368 verifier, rejection, dynamic, and
 dynamic-failure corpus subjects in 424.42s; LLVM CLI 6/6; the retained verified
 program matching the interpreter and Clang at `-O0`/`-O2`; and SVM 69/69.
+
+## G3 amendment: concrete class-owner arguments (2026-08-19)
+
+Monomorphization now resolves a direct ordinary class name against the final
+ordinary-class order and substitutes `Ty::Class(index)` into the generated
+instance. A generated generic class is not itself an admissible argument:
+nested generic-class owners remain a named, pre-mutation refusal until
+fixed-point instance discovery can assign their class identities
+deterministically.
+
+This widens code specialization, not ADR 0009's abstract proof model. The
+retained template is still checked over integer `Ty::Param` values. An
+all-integer request keeps its legacy emitted name and integer-model proof reuse
+byte for byte; a request containing any class owner uses the structural name,
+receives `ProofReuse::None`, and is independently checked and verified with the
+concrete affine class type. Boolean, record, array, option, and nested
+generic-class arguments remain closed. Retained templates also continue to
+reject generic-to-generic calls by name; this tranche does not add abstract
+contract transport between templates.

@@ -284,3 +284,19 @@ Clang; the exact `VerifiedProgram`↔Clang differential passed 1/1 over five
 subjects at `-O0` and `-O2`; and the exact Rust↔Lean SVM differential passed
 86/86. `free_list_return_random`, grind-budget, LSP, and doc-tests were green.
 This closes G1.5 without widening concepts.
+
+## G3 amendment: owner specialization is not integer-model proof reuse (2026-08-19)
+
+The concrete monomorphization domain now includes a direct ordinary,
+non-generic class. ADR 0009's proof domain does not: retained templates remain
+checked against `Sable.IntModel`, and `Ty::Param` remains the non-affine
+integer-model placeholder only inside that retained check.
+
+Proof reuse is therefore an all-arguments rule. Monomorphization may construct
+`ProofReuse::Adr0009IntModel` only when every concrete argument is an integer.
+If any argument is a class owner, substitution produces the final affine
+`Ty::Class(index)`, the generated declaration receives `ProofReuse::None`, and
+the checker and VC generator process that declaration independently. A
+template-level success can never authorize copying, moving, or dropping the
+owner specialization. Nested generic-class arguments remain outside this
+amendment.

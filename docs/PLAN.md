@@ -26,7 +26,8 @@ the formal SVM as a lending argument (ADR 0069), and G1.10 lowers one natively
 as a lent descriptor (ADR 0070).
 G2.0–G2.2 close affine-option representation, local semantics,
 and atomic formal-machine take; G2.3 closes the exact local LLVM lowering. No
-array, affine-option, or record ABI, and no generic-class widening, is claimed.
+array, affine-option, or record ABI is claimed; nested generic-class arguments
+remain closed.
 N0's exact local `[u32]` LLVM storage and internal borrowed-array call slice is
 closed as the native `Nat` foundation. N1a closes the fixed-owner class slice
 needed by the real imported `Nat::from_prefix` and `cmp`. N1b closes internal
@@ -47,7 +48,10 @@ control outline drives the checker and is sealed into the retained structured
 plan consumed by VC, SVM, interpreter, and LLVM. Exact local/field replacement
 and discarded-class-temporary actions link checker transfers, staging, cleanup,
 and terminal class-drop recipes across those consumers. All six C0 criteria are
-closed; G3 may begin.
+closed. **G3's first compiler tranche is complete:** a direct ordinary class may
+be a generic argument; any such owner instance is independently checked with
+`ProofReuse::None`, while all-integer instances retain their legacy names and
+ADR 0009 proof reuse. Owner slots and the `Vec` movement API remain in progress.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -130,7 +134,7 @@ Remaining M6 items: Base64 (nothing new technically after hex); `partial fn`; `n
 
 ### M7 — generics v1 and `Vec<T>` *(complete, 2026-08-09)*
 
-**Generics** per ADR 0006: explicit instantiation only (`Vec<i32>::with_capacity(4)`, `id<u8>(x)`), parameters range over the eight integer types, and a monomorphization pass (`compiler/src/mono.rs`) expands every instantiation between parse and typecheck — no downstream stage (checker, VCgen, interpreter, spec evaluator) ever sees a type variable. Clause text substitutes parameters bare, so `T.max` becomes `i32.max` and the existing clause pipeline just works. Instances verify independently under mangled names (`Vec_i32`); the per-instance duplication of hand discharges is the accepted v1 cost. Diagnostics: `mono.missing_type_args`, `mono.arity`, `mono.not_generic`, plus recursion caps.
+**Generics** per ADR 0006 originally shipped with explicit instantiation only (`Vec<i32>::with_capacity(4)`, `id<u8>(x)`) and the eight integer types. A monomorphization pass (`compiler/src/mono.rs`) expands each reachable instance before ordinary checking — no executable or backend stage sees a type variable. Clause text substitutes parameters bare, so `T.max` becomes `i32.max`. ADR 0009 later made all-integer instances reuse the retained integer-model proof. The first G3 owner tranche now also admits a direct ordinary class: an owner-containing instance uses an injective structural name, receives no integer proof reuse, and is checked independently; nested generic classes remain closed. Diagnostics include `mono.missing_type_args`, `mono.arity`, `mono.not_generic`, owner-boundary refusals, and recursion caps.
 
 **`Vec<T>`** (`corpus/verifies/vec.sable`): growable vector with amortized-doubling `push` — capacity invariant `buf.len ≤ 2^62` makes the doubling overflow-free by construction; `push` carries the full frame post `∀ k < old self.len → self.buf.get k = (old self).buf.get k` across the reallocation-and-copy path. Two instances (`Vec<i32>`, `Vec<u8>`) verify at 151 obligations with 8 discharges (the copy-loop invariant and frame post, per growth path, per instance); dynamic tests exercise growth, set/pop, and both instances at zero skipped clauses.
 
@@ -139,7 +143,10 @@ Remaining M6 items: Base64 (nothing new technically after hex); `partial fn`; `n
 - Loop well-formedness definitions inside class methods lacked `self`/`_old_self` binders, breaking any invariant mentioning fields.
 - The runtime monitor's spec fragment gained `(old obj).field` projections and chained postfix (`(old self).buf.get k`), so `Vec`'s frame posts are *monitored*, not skipped — guarded by `test-fails/wrong_frame_dynamic`, which proves a violated frame post is caught rather than vacuously passed.
 
-Deferred to the hash map (next): law-carrying trait bounds (`T: Hashable` with equations the proofs can use), non-integer type arguments, template-level discharges instantiated by mono.
+Deferred from the original M7 result: law-carrying trait bounds (`T: Hashable`
+with equations the proofs can use), non-integer type arguments, and
+template-level discharges. The first two follow-on milestones landed bounds and
+integer proof reuse; G3 later opened only direct ordinary class arguments.
 
 ### M8 — traits v1 and the verified hash map *(complete, 2026-08-09)*
 
@@ -724,8 +731,10 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      4096 nodes per outer argument. Imported generic-class arities are retained
      separately from checked class indices. Duplicate type parameters and the
      256-parameter declaration ceiling still fail in the parser; every parsed
-     non-integer argument still fails at `mono.type_arg_unsupported` before a
-     checked type exists.
+     non-integer argument failed at `mono.type_arg_unsupported` before a
+     checked type existed at the G0 checkpoint. The current G3 exception is a
+     direct ordinary class; recursive aggregate and nested generic-class
+     arguments remain closed.
 
      Preparation, substitution, and generic-use traversal cover record literals,
      `some(...)`, class destructors, and member contracts and variants. Each
@@ -767,8 +776,9 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      `ProofReuse::Adr0009IntModel` capability with an opaque payload. Its fields
      are private and its constructor is crate-private, so external AST callers
      can inspect but cannot forge it. Mono rejects a caller-supplied marker and
-     authors it only for instances licensed by the existing concrete-integer
-     domain; VCgen recognizes only that exact variant. The preparation and
+     authors it only when every concrete argument is an integer; the wider G3
+     owner domain never receives it. VCgen recognizes only that exact variant.
+     The preparation and
      VC-generation entry points are crate-private as well. At that checkpoint,
      checker and VCgen rejected Boolean/POD aggregate semantics independently,
      the interpreter and SVM repeated the fail-closed guard, and module
@@ -2007,7 +2017,11 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      expression CFG or a mechanized source-translation proof, and stages may
      still refuse shapes outside their admitted subsets.
 
-   - **G3 — slots and `Vec` (in progress; ADR 0093):** make generic element
+   - **G3 — slots and `Vec` (in progress; ADR 0093):** the first compiler
+     tranche is complete: direct ordinary classes are generic arguments,
+     class identities resolve after template extraction, owner-containing
+     instances use injective structural names and `ProofReuse::None`, and
+     nested generic-class arguments fail closed. Next, make generic element
      storage and movement real for the growable-vector benchmark through a
      distinct occupancy-bearing `slots<T>` container, atomic `slot_take` and
      `slot_put`, and independently verified class-owner specializations.

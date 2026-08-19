@@ -1,0 +1,29 @@
+// Concrete, non-generic classes are valid owner arguments.  Both the function
+// and class instances below are checked with their affine `OwnerToken` shape;
+// they do not inherit the retained template's integer-model proof.
+
+pub class OwnerToken {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+fn relay<T>(T value) -> T {
+    return value;
+}
+
+pub class OwnerSlot<T> {
+    T value;
+
+    init hold(T value) {
+        self.value = value;
+    }
+}
+
+pub fn concrete_owner_arguments() {
+    var owner = OwnerToken::make(7);
+    var relayed = relay<OwnerToken>(owner);
+    var slot = OwnerSlot<OwnerToken>::hold(relayed);
+}

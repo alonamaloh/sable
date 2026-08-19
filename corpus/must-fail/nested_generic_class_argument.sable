@@ -1,0 +1,27 @@
+// expect-error: mono.nested_generic_class_arg_unsupported
+// A direct ordinary class is concrete.  A generic class instance remains a
+// separate boundary until nested class arguments have recursive proof rules.
+
+pub class NestedOwner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+pub class GenericBox<T> {
+    T value;
+
+    init hold(T value) {
+        self.value = value;
+    }
+}
+
+fn phantom<T>() -> u64 {
+    return 0;
+}
+
+pub fn nested_owner_argument_is_closed() -> u64 {
+    return phantom<GenericBox<NestedOwner>>();
+}

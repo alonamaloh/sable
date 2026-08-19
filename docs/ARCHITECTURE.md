@@ -398,17 +398,20 @@ foreign, or cross-module array ABI.
   its complete outer type. One bounded parser drives lookahead, use-site
   arguments, and every declared type: a recursive path is at most 64 nodes, any
   argument list at most 256 entries, and one type at most 4096 nodes. Imported
-  generic-class arities live in a table separate from checked class indices. None of that
-  widens v1 semantics: every non-integer shape reaches
-  `mono.type_arg_unsupported` before checked types are built. Preparation,
+  generic-class arities live in a table separate from checked class indices.
+  The first G3 widening admits exactly a direct ordinary class in addition to
+  integers: it resolves to the final checked class index, while Boolean,
+  record, array, option, nested generic-class, and generic-to-generic template
+  uses still fail before checked instances are built. Preparation,
   substitution, and generic-use walks cover record literals, `some(...)`, class
   destructors, and member contracts and variants. Each `InstanceKey` is the
   function/class kind, template base, and original recursive
   `CanonicalTypeKey` arguments, so only exact structural requests deduplicate.
-  The collision-free legacy emitted spelling is unchanged; an emitted-name
-  registry rejects ambiguous legacy spellings and collisions with source,
-  template, or impl-lowered names deterministically. Duplicate traits, impl
-  specs, and impl methods likewise diagnose the second source declaration.
+  All-integer requests retain the legacy emitted spelling. An owner request
+  uses an injective length-framed structural spelling with no class index; the
+  emitted-name registry rejects collisions with source, template, or
+  impl-lowered names deterministically. Duplicate traits, impl specs, and impl
+  methods likewise diagnose the second source declaration.
 - **Parameter identity and proof provenance are explicit before aggregate
   semantics widen.** G1.0 represents declaration parameters as
   `Ty::Param(TypeParamId)`. It no longer makes a parameter look
@@ -429,9 +432,11 @@ foreign, or cross-module array ABI.
   pre-populated capability and is its only pipeline author; the preparation and
   VC-generation entry points are likewise crate-private, so external callers
   cannot route a hand-built program around that check. VCgen skips instance
-  obligations only when the exact variant is present. This prevents a later
-  Boolean or record instance from silently inheriting a theorem proved over
-  `Sable.IntModel`. At this checkpoint the checker and VCgen independently
+  obligations only when the exact variant is present. Mono issues it only when
+  every argument is an integer; any class-owner instance receives
+  `ProofReuse::None` and is independently checked and verified. This also
+  prevents a future Boolean or record instance from silently inheriting a
+  theorem proved over `Sable.IntModel`. At the G1.0 checkpoint the checker and VCgen independently
   rejected non-integer aggregate payloads; the interpreter and SVM repeated the
   fail-closed guard at their own execution/lowering boundaries. Module
   visibility also descended into container payloads — `modules::walk_ty`

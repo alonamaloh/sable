@@ -123,30 +123,34 @@ interior mutability, and `Ty == Ty` is correct only if a global invariant
 holds — bought against a `Copy` removal that cost twelve hand-written lines.
 
 Parameterizing the grammar by its nominal representation (`TyOf<Name>`, with
-`Ty = TyOf<usize>` and `GenericTy = TyOf<String>`) is the more complete answer,
-and its diagnosis is right: the `Ty`/`GenericTy` split is a *phase* distinction,
-not a type distinction. Its payoff is the generic-argument cells, which this
-work deliberately does not go near. Deferred, with a trigger: adopt it when the
-type-argument domain widens past integers, or when nominal index assignment
-moves earlier in the pipeline.
+`Ty = TyOf<usize>` and `GenericTy = TyOf<String>`) remains the more complete
+answer, and its diagnosis is right: the `Ty`/`GenericTy` split is a *phase*
+distinction, not a type distinction. The first G3 widening did not require that
+refactor because both newly admitted forms are leaves after resolution: an
+integer becomes `Ty::Int`, and a direct ordinary class becomes
+`Ty::Class(index)`. Reconsider `TyOf<Name>` when recursive/nested type arguments
+are admitted or nominal index assignment moves earlier in the pipeline.
 
-### The substitution vector stays integer-only
+### The substitution vector admits only resolved leaves
 
-`mono::subst_ty(&mut Ty, &[IntTy], Span)` recurses into the new `Box<Ty>`
-payloads and nothing more. Widening it to `&[Ty]` would delete
-`GenericTyError::NotV1Integer`, which is what closes eight matrix cells through
-`mono.type_arg_unsupported`, and would then need a compensating whitelist in the
-same commit. The container-payload axis and the generic-argument axis are
-independent; the eight cells stay closed *by construction* rather than by test.
+`mono::subst_ty(&mut Ty, &[ConcreteArg], Span)` recurses through checked
+payloads, but each substitution value is either a concrete integer or an
+ordinary class name already resolved to its final checked index. A whitelist in
+`ClassArgEnv` preserves the independent generic-argument axis: Boolean, record,
+array, option, and nested generic-class arguments still fail before a checked
+type is built, and integer-only occurrences such as conversion widths reject a
+class argument by name.
 
-This is also what keeps `Ty::is_affine(Ty::Param(_)) == false` honest: the
-argument domain is concrete integers, so a retained template parameter is
-provably copyable. `type_arguments_are_copyable` pins that coupling, so widening
-the domain fails a test rather than silently classifying an owner as copyable.
-`mono::concrete_v1_type_args` is already the sole producer of both the
-substitution vector (`ConcreteV1Args::values`, a `Vec<IntTy>`) and the
-instance-key spelling the emitted name is mangled from, so widening the domain
-has one function to change rather than two that can drift apart.
+`Ty::is_affine(Ty::Param(_)) == false` now describes only the retained ADR 0009
+integer proof model. It is not a claim about every concrete argument. An owner
+instance substitutes `Ty::Class(index)`, receives `ProofReuse::None`, and is
+checked independently under the affine arm; the affinity regression pins that
+separation.
+`mono::concrete_type_args` is the sole producer of both the resolved
+substitution vector (`ConcreteArgs::values`) and the source-structural canonical
+keys used for instance identity. All-integer requests render from the integer
+values for byte-compatible legacy names; owner requests render from the keys,
+so program-relative class indices cannot leak into identity or spelling.
 
 ### Nominal indices stay program-relative
 
@@ -324,16 +328,17 @@ structural shape. `ResRef` does not fold into a borrow constructor:
 `resource &K` is spelled with the `resource` keyword and classified as its own
 shape, so folding it would make a shape function disagree with `Parser::admits`
 about the same spelling. `IntTy::TParam` and `Ty::Param` remain a duality,
-normalized on entry; it goes away when the argument domain widens.
+normalized on entry: the former is retained only in integer-only syntax
+positions, while declaration value types use the latter.
 
 **Depth after substitution.** The parser bounds a spelled type, and `name`,
 `is_affine`, `is_concrete`, and the traversals now recurse over a real tree.
 `GenericTy::structural_depth` is checked at the mono boundary. On the `Ty` side,
 `substitution_never_deepens_a_checked_type` pins that `subst_ty` preserves
-`Ty::structural_depth`, because a parameter is a leaf and so is the concrete
-integer that replaces it. No second bound after expansion is needed while the
-argument domain stays integers, and that test is what fails if it stops being
-true.
+`Ty::structural_depth`, because a parameter is a leaf and so are both admitted
+replacement forms, a concrete integer and a resolved ordinary class. No second
+bound after expansion is needed while arguments remain direct leaves; that test
+is what fails if a recursive argument shape is admitted without a new bound.
 
 **What no representation change buys.** `Place` is a root plus a field path with
 no index component, and affinity, initialization, brands, and `#[must_consume]`

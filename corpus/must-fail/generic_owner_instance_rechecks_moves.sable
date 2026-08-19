@@ -1,0 +1,21 @@
+// expect-error: class.use_after_move
+// The retained `T` template uses ADR 0009's non-affine integer proof model,
+// but an owner instance is checked independently after `T` becomes affine.
+
+pub class GenericMoveOwner {
+    u64 value;
+
+    init make(u64 value) {
+        self.value = value;
+    }
+}
+
+fn duplicate<T>(T value) -> T {
+    var moved = value;
+    return value;
+}
+
+pub fn instantiate_bad_move() -> GenericMoveOwner {
+    var owner = GenericMoveOwner::make(1);
+    return duplicate<GenericMoveOwner>(owner);
+}
