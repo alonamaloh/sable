@@ -8,12 +8,15 @@
 #![deny(clippy::wildcard_enum_match_arm)]
 
 use crate::ast::*;
-use crate::control::{BlockId, ControlOutline, ControlOutlines, ControlProgram, StatementPlanKind};
+use crate::control::{
+    BlockId, ControlOutline, ControlOutlines, ControlProgram, SlotActionKind, StatementPlanKind,
+};
 use crate::diag::Diagnostic;
 use crate::ownership::{
     CheckedExposure, CheckedLoopEffects, CheckedMutation, CheckedOptionTake, CheckedOwnershipPlan,
-    CheckedSealedArgument, CheckedSealedOperation, CheckedSealedTarget, EffectSiteKey,
-    ValueTransfer, ValueTransferKind, ValueTransferSink,
+    CheckedSealedArgument, CheckedSealedOperation, CheckedSealedTarget, CheckedSlotMutationKind,
+    CheckedSlotTransition, CheckedSlotTransitionKind, EffectSiteKey, ValueTransfer,
+    ValueTransferKey, ValueTransferKind, ValueTransferSink,
 };
 use crate::place::{BorrowedPlace, Place};
 use crate::span::Span;
@@ -1604,6 +1607,7 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         label: "the checked AST could not produce one exact control plan".into(),
         notes: vec![],
     })?;
+    reconcile_slot_control(&control, &ownership)?;
 
     Ok(CheckResult {
         sigs,
@@ -1611,6 +1615,140 @@ pub fn check(program: &mut Program) -> CResult<CheckResult> {
         ownership,
         unsafe_regions,
     })
+}
+
+fn reconcile_slot_control(
+    control: &ControlProgram,
+    ownership: &CheckedOwnershipPlan,
+) -> CResult<()> {
+    for body in control.iter() {
+        let owner = body.owner();
+        let plan = body.plan();
+        let mut visited = HashSet::new();
+        for action in plan.slot_actions() {
+            let Some(transition) = ownership.slot_transition(action.effect_key()) else {
+                return Err(Diagnostic {
+                    name: "internal.check.slot_control_transition_missing".into(),
+                    title: format!(
+                        "control slot action in {} has no checker ownership transition",
+                        owner.render()
+                    ),
+                    span: action.span(),
+                    label: "slot actions require one exact checker-authored ownership boundary"
+                        .into(),
+                    notes: vec![],
+                });
+            };
+            if !visited.insert(action.effect_key().clone()) {
+                return Err(Diagnostic {
+                    name: "internal.check.duplicate_slot_control_transition".into(),
+                    title: "two control actions reused one slot ownership transition".into(),
+                    span: action.span(),
+                    label: "owner and operation span must be injective".into(),
+                    notes: vec![],
+                });
+            }
+            let exact = transition.key == *action.effect_key()
+                && transition.op_span == action.op_span()
+                && transition.payload == *action.payload()
+                && transition.result_ty == *action.result_ty()
+                && match (&transition.kind, action.kind()) {
+                    (
+                        CheckedSlotTransitionKind::Alloc {
+                            length_ty,
+                            length_span,
+                        },
+                        SlotActionKind::Alloc {
+                            length_span: action_length,
+                        },
+                    ) => *length_ty == Ty::Int(IntTy::U64) && length_span == action_length,
+                    (
+                        CheckedSlotTransitionKind::Take {
+                            container,
+                            container_span,
+                            index_ty,
+                            index_span,
+                        },
+                        SlotActionKind::Take {
+                            container: action_container,
+                            container_span: action_container_span,
+                            index_span: action_index_span,
+                        },
+                    ) => {
+                        container == action_container
+                            && container_span == action_container_span
+                            && *index_ty == Ty::Int(IntTy::U64)
+                            && index_span == action_index_span
+                    }
+                    (
+                        CheckedSlotTransitionKind::Put {
+                            container,
+                            container_span,
+                            index_ty,
+                            index_span,
+                            value_span,
+                            value_transfer,
+                        },
+                        SlotActionKind::Put {
+                            container: action_container,
+                            container_span: action_container_span,
+                            index_span: action_index_span,
+                            value_span: action_value_span,
+                            value_transfer: action_transfer,
+                            ..
+                        },
+                    ) => {
+                        container == action_container
+                            && container_span == action_container_span
+                            && *index_ty == Ty::Int(IntTy::U64)
+                            && index_span == action_index_span
+                            && value_span == action_value_span
+                            && value_transfer == action_transfer
+                    }
+                    (
+                        CheckedSlotTransitionKind::Alloc { .. },
+                        SlotActionKind::Take { .. } | SlotActionKind::Put { .. },
+                    )
+                    | (
+                        CheckedSlotTransitionKind::Take { .. },
+                        SlotActionKind::Alloc { .. } | SlotActionKind::Put { .. },
+                    )
+                    | (
+                        CheckedSlotTransitionKind::Put { .. },
+                        SlotActionKind::Alloc { .. } | SlotActionKind::Take { .. },
+                    ) => false,
+                };
+            if !exact {
+                return Err(Diagnostic {
+                    name: "internal.check.slot_control_transition_mismatch".into(),
+                    title: "control and ownership disagree about a checked slot transition".into(),
+                    span: action.span(),
+                    label: "operation, place, types, spans, and transfer identity must all match"
+                        .into(),
+                    notes: vec![],
+                });
+            }
+        }
+        let owned_count = ownership.slot_transitions_for_owner(owner).count();
+        if visited.len() != owned_count {
+            let missing = ownership
+                .slot_transitions_for_owner(owner)
+                .find(|(key, _)| !visited.contains(*key))
+                .map(|(key, _)| key)
+                .expect("slot transition counts differ");
+            return Err(Diagnostic {
+                name: "internal.check.slot_control_action_missing".into(),
+                title: format!(
+                    "checker slot transition in {} has no retained control action",
+                    owner.render()
+                ),
+                span: missing.span,
+                label: "complete callable reconciliation visits every slot transition".into(),
+                notes: vec![],
+            });
+        }
+    }
+    Ok(())
 }
 
 fn control_outline_mismatch(span: Span, detail: &str) -> Diagnostic {
@@ -1660,6 +1798,7 @@ fn check_block(
                 init,
                 mutable,
             } => {
+                local_ty(ty, *name_span)?;
                 if let Some(payload) = ty.as_affine_option_payload() {
                     affine_option_payload(payload, *name_span)?;
                     if !*mutable {
@@ -1694,6 +1833,16 @@ fn check_block(
                         title: format!("Boolean array local `{name}` needs an initializer"),
                         span: *name_span,
                         label: "initialize it with a Boolean array literal or `alloc_array<bool>`"
+                            .into(),
+                        notes: vec![],
+                    });
+                }
+                if matches!(ty, Ty::Slots(_)) && init.is_none() {
+                    return Err(Diagnostic {
+                        name: "type.slot_initializer".into(),
+                        title: format!("owner-slot local `{name}` needs an initializer"),
+                        span: *name_span,
+                        label: "initialize it with `alloc_slots<T>(len)` or a whole-owner move"
                             .into(),
                         notes: vec![],
                     });
@@ -1772,7 +1921,12 @@ fn check_block(
                             return Err(option_take_position(e.span));
                         }
                     } else {
-                        check_expr(ctx, e, Some(ty.clone()))?;
+                        check_direct_slot_expr(
+                            ctx,
+                            e,
+                            Some(ty.clone()),
+                            DirectSlotPosition::ExplicitLocal,
+                        )?;
                     }
                     // A local initialized from branded storage is branded
                     // — but only if it *names* storage. A byte loaded out
@@ -1851,7 +2005,7 @@ fn check_block(
                         notes: vec![],
                     });
                 }
-                if matches!(ty, Ty::Class(_) | Ty::Res(_)) {
+                if matches!(ty, Ty::Class(_) | Ty::Res(_) | Ty::Slots(_)) {
                     // Reassignment of a class local is a move-in of an
                     // owned value; the old value is dropped, with its
                     // RAII invariant check. Check first: operator sugar
@@ -1859,7 +2013,7 @@ fn check_block(
                     // (ADR 0012). A resource local follows the same rule,
                     // and dropping the old token discards its authority
                     // rather than running anything (ADR 0024).
-                    check_expr(ctx, value, Some(ty))?;
+                    check_direct_slot_expr(ctx, value, Some(ty), DirectSlotPosition::Assignment)?;
                     // A bare name is a local-to-local move: the source
                     // place dies here (ADR 0020). Every other class-typed
                     // expression is a call or a construction — a fresh
@@ -1891,7 +2045,7 @@ fn check_block(
                             notes: vec![],
                         });
                     }
-                    check_expr(ctx, value, Some(ty))?;
+                    check_direct_slot_expr(ctx, value, Some(ty), DirectSlotPosition::Assignment)?;
                     transfer_and_record(
                         ctx,
                         value,
@@ -2254,7 +2408,12 @@ fn check_block(
                             });
                         }
                         Some(e) => {
-                            check_expr(ctx, e, Some(return_ty))?;
+                            check_direct_slot_expr(
+                                ctx,
+                                e,
+                                Some(return_ty),
+                                DirectSlotPosition::Return,
+                            )?;
                             // Returning a place consumes it: the value leaves
                             // with the caller, and a field returned this way is
                             // authority the object no longer has.
@@ -2283,7 +2442,7 @@ fn check_block(
                 )?;
             }
             Stmt::ExprStmt(e) => {
-                let ty = check_expr(ctx, e, None)?;
+                let ty = check_direct_slot_expr(ctx, e, None, DirectSlotPosition::Statement)?;
                 // A discarded class *result* is a temporary and is destroyed
                 // at the end of this statement. A place projection is not a
                 // temporary: if an internal AST producer supplied an
@@ -2374,6 +2533,20 @@ fn check_block(
                             notes: vec![],
                         });
                     }
+                    if matches!(cached, Ty::Slots(_)) {
+                        return Err(Diagnostic {
+                            name: "slots.inferred_type".into(),
+                            title: "an owner-slot binding cannot use inferred-local syntax".into(),
+                            span: *name_span,
+                            label: "write an explicit `slots<T>` declaration for slot allocation"
+                                .into(),
+                            notes: vec![(
+                                "note".into(),
+                                "a whole-owner move may be inferred only from the live source owner"
+                                    .into(),
+                            )],
+                        });
+                    }
                     validate_aggregate_ty(cached.clone(), *name_span)?;
                 }
                 let some_of_class_local = matches!(
@@ -2428,50 +2601,16 @@ fn check_block(
                 // be legal at all. `var x = self.f;` moves a field the
                 // same way.
                 let moved_from = match &init.kind {
-                    ExprKind::Var(src) => match ctx.vars.get(src.as_str()).map(|v| v.ty.clone()) {
-                        Some(Ty::Class(ci)) => Some(ci),
-                        Some(
-                            Ty::Int(_)
-                            | Ty::Bool
-                            | Ty::Param(_)
-                            | Ty::Record(_)
-                            | Ty::Array(_)
-                            | Ty::Slots(_)
-                            | Ty::Option(_)
-                            | Ty::OptionRaw(_)
-                            | Ty::Res(_)
-                            | Ty::Raw(_)
-                            | Ty::RawRecord(_)
-                            | Ty::Borrow(..)
-                            | Ty::Unit,
-                        )
-                        | None => None,
-                    },
-                    ExprKind::SelfField { field } => {
-                        match ctx
-                            .vars
-                            .get(format!("self.{field}").as_str())
-                            .map(|v| v.ty.clone())
-                        {
-                            Some(Ty::Class(ci)) => Some(ci),
-                            Some(
-                                Ty::Int(_)
-                                | Ty::Bool
-                                | Ty::Param(_)
-                                | Ty::Record(_)
-                                | Ty::Array(_)
-                                | Ty::Slots(_)
-                                | Ty::Option(_)
-                                | Ty::OptionRaw(_)
-                                | Ty::Res(_)
-                                | Ty::Raw(_)
-                                | Ty::RawRecord(_)
-                                | Ty::Borrow(..)
-                                | Ty::Unit,
-                            )
-                            | None => None,
-                        }
-                    }
+                    ExprKind::Var(src) => ctx
+                        .vars
+                        .get(src.as_str())
+                        .map(|v| v.ty.clone())
+                        .filter(|ty| matches!(ty, Ty::Class(_) | Ty::Slots(_))),
+                    ExprKind::SelfField { field } => ctx
+                        .vars
+                        .get(format!("self.{field}").as_str())
+                        .map(|v| v.ty.clone())
+                        .filter(|ty| matches!(ty, Ty::Class(_) | Ty::Slots(_))),
                     ExprKind::IntLit(_)
                     | ExprKind::BoolLit(_)
                     | ExprKind::Unary { .. }
@@ -2566,11 +2705,21 @@ fn check_block(
                     check_affine_option_take(ctx, init)?
                 } else {
                     match moved_from {
-                        Some(ci) => {
-                            check_expr(ctx, init, Some(Ty::Class(ci)))?;
-                            Ty::Class(ci)
+                        Some(owner_ty) => {
+                            check_direct_slot_expr(
+                                ctx,
+                                init,
+                                Some(owner_ty.clone()),
+                                DirectSlotPosition::InferredLocal,
+                            )?;
+                            owner_ty
                         }
-                        None => check_expr(ctx, init, None)?,
+                        None => check_direct_slot_expr(
+                            ctx,
+                            init,
+                            None,
+                            DirectSlotPosition::InferredLocal,
+                        )?,
                     }
                 };
                 local_ty(&t, init.span)?;
@@ -3080,7 +3229,12 @@ fn check_block(
                     }
                 }
                 if !checked {
-                    check_expr(ctx, value, Some(fty))?;
+                    check_direct_slot_expr(
+                        ctx,
+                        value,
+                        Some(fty.clone()),
+                        DirectSlotPosition::FieldAssignment,
+                    )?;
                 }
                 // A field is a sink like any other: it takes the value, so
                 // the source place dies. And a field outlives the exposure
@@ -3119,6 +3273,9 @@ fn check_block(
                 value,
             } => {
                 let fty = ctx.self_field_ty(field, *field_span, true)?;
+                if matches!(fty, Ty::Slots(_)) {
+                    return Err(slot_store_unsupported(*field_span));
+                }
                 let Ty::Array(elem) = fty else {
                     return Err(Diagnostic {
                         name: "type.not_an_array".into(),
@@ -3141,6 +3298,9 @@ fn check_block(
             } => {
                 reject_exposed_owner(ctx, array, *array_span)?;
                 let (elem, mutability, arr_mutable) = match ctx.vars.get(array.as_str()) {
+                    Some(v) if matches!(v.ty, Ty::Slots(_)) => {
+                        return Err(slot_store_unsupported(*array_span));
+                    }
                     Some(v) => match checked_array_binding(&v.ty) {
                         Some((element, mode)) => (element.clone(), mode, v.mutable),
                         None => {
@@ -3472,7 +3632,7 @@ fn affine_option_boundary(ty: Ty, span: Span, boundary: &str) -> Diagnostic {
 /// the whole chain itself.
 fn validate_container_payloads(ty: Ty, span: Span) -> CResult<()> {
     match ty {
-        Ty::Slots(_) => Err(slots_unsupported(span, "declared type")),
+        Ty::Slots(payload) => slot_payload_ty(&payload, span),
         Ty::Array(payload) => validate_array_payload(&payload, span),
         Ty::Option(payload) => option_payload_ty(*payload, span).map(|_| ()),
         // A borrow holds no payload of its own; `validate_aggregate_ty` is
@@ -3494,17 +3654,89 @@ fn validate_container_payloads(ty: Ty, span: Span) -> CResult<()> {
 fn slots_unsupported(span: Span, role: impl AsRef<str>) -> Diagnostic {
     Diagnostic {
         name: "type.slots_unsupported".into(),
-        title: "owner slots are representation-only".into(),
+        title: "owner slots are not admitted at this boundary".into(),
         span,
         label: format!(
-            "{} uses `slots<T>`, whose runtime and proof semantics are not admitted yet",
+            "{} uses `slots<T>` outside its sealed local/field operations",
             role.as_ref()
         ),
         notes: vec![(
             "note".into(),
-            "this tranche preserves the distinct affine owner shape without treating it as an array"
+            "owner slots are local or class-field storage; they do not cross calls, returns, ordinary borrows, or record layout"
                 .into(),
         )],
+    }
+}
+
+fn slot_index_unsupported(span: Span) -> Diagnostic {
+    Diagnostic {
+        name: "slots.index_unsupported".into(),
+        title: "owner-slot cells cannot be indexed directly".into(),
+        span,
+        label: "use `slot_take(&mut owner, index)` to extract an occupied cell".into(),
+        notes: vec![(
+            "note".into(),
+            "a direct read would erase whether the cell remains occupied".into(),
+        )],
+    }
+}
+
+fn slot_store_unsupported(span: Span) -> Diagnostic {
+    Diagnostic {
+        name: "slots.store_unsupported".into(),
+        title: "owner-slot cells cannot be assigned directly".into(),
+        span,
+        label: "use `slot_put(&mut owner, index, value)` as a statement".into(),
+        notes: vec![(
+            "note".into(),
+            "put checks that the destination cell is empty before installing its owner".into(),
+        )],
+    }
+}
+
+/// Payloads admitted by the first occupied-slot transition model. This is an
+/// allow-list independent of parser position so substituted generic instances
+/// and forged typed ASTs meet the same boundary.
+fn slot_payload_ty(payload: &Ty, span: Span) -> CResult<()> {
+    match payload {
+        Ty::Int(IntTy::TParam(_)) => Err(noncanonical_aggregate_payload(span)),
+        Ty::Int(
+            IntTy::U8
+            | IntTy::U16
+            | IntTy::U32
+            | IntTy::U64
+            | IntTy::I8
+            | IntTy::I16
+            | IntTy::I32
+            | IntTy::I64,
+        )
+        | Ty::Bool
+        | Ty::Param(_)
+        | Ty::Record(_)
+        | Ty::Class(_) => Ok(()),
+        Ty::Array(_)
+        | Ty::Slots(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => Err(Diagnostic {
+            name: "type.slot_payload_unsupported".into(),
+            title: format!(
+                "`{}` has no occupied-slot payload semantics",
+                payload.clone().name()
+            ),
+            span,
+            label: "expected an integer, `bool`, type parameter, POD record, or direct class"
+                .into(),
+            notes: vec![(
+                "note".into(),
+                "nested containers, resources, raw values, borrows, and unit remain outside the first slot cleanup model"
+                    .into(),
+            )],
+        }),
     }
 }
 
@@ -3627,6 +3859,9 @@ pub(crate) fn parameter_ty(ty: &Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "parameter"));
     }
+    if matches!(ty, Ty::Slots(_)) {
+        return Err(slots_unsupported(span, "parameter"));
+    }
     // Before the payload traversal: what a borrow may name is a question
     // about the borrow, and reporting an inner payload rule for `&record`
     // would name a rule the reader did not break.
@@ -3731,6 +3966,12 @@ pub(crate) fn return_ty(ty: &Ty, fn_name: &str, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "return"));
     }
+    if matches!(ty, Ty::Slots(_)) {
+        return Err(slots_unsupported(
+            span,
+            format!("return type of `{fn_name}`"),
+        ));
+    }
     validate_aggregate_ty(ty.clone(), span)?;
     // A returned borrow would name storage the callee's frame stops keeping,
     // which is the parser's `TyPos::Return` row and its name. Saying it here
@@ -3759,6 +4000,15 @@ pub(crate) fn return_ty(ty: &Ty, fn_name: &str, span: Span) -> CResult<()> {
 pub(crate) fn class_field_ty(ty: &Ty, span: Span) -> CResult<()> {
     if ty.is_affine_option() {
         return Err(affine_option_boundary(ty.clone(), span, "field"));
+    }
+    if matches!(ty, Ty::Borrow(_, referent) if matches!(referent.as_ref(), Ty::Slots(_))) {
+        return Err(Diagnostic {
+            name: "type.slot_owner_binding".into(),
+            title: "an owner-slot field must own its allocation".into(),
+            span,
+            label: "borrowed slot containers exist only for one `slot_take` or `slot_put`".into(),
+            notes: vec![],
+        });
     }
     validate_aggregate_ty(ty.clone(), span)?;
     // A copyable option with a concrete value payload is stored-field
@@ -4391,15 +4641,310 @@ fn check_affine_option_take(ctx: &mut Ctx, expression: &mut Expr) -> CResult<Ty>
     Ok(ty)
 }
 
-fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
-    if !matches!(&e.kind, ExprKind::SlotOp { .. }) {
-        if let Some(Ty::Slots(_)) = expected.as_ref() {
-            return Err(slots_unsupported(e.span, "expression context"));
-        }
-        if let Some(Ty::Slots(_)) = e.ty.as_ref() {
-            return Err(slots_unsupported(e.span, "expression annotation"));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectSlotPosition {
+    ExplicitLocal,
+    InferredLocal,
+    Assignment,
+    Return,
+    FieldAssignment,
+    Statement,
+}
+
+impl DirectSlotPosition {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ExplicitLocal => "an explicit local initializer",
+            Self::InferredLocal => "an inferred local initializer",
+            Self::Assignment => "a local assignment",
+            Self::Return => "a return value",
+            Self::FieldAssignment => "a `self` field assignment",
+            Self::Statement => "an expression statement",
         }
     }
+}
+
+/// Check a direct statement-level value boundary, admitting the deliberately
+/// small slot-operation surface without making slot operations ordinary nested
+/// expressions. Children of a slot operation go through `check_expr`, so a
+/// take cannot hide inside a put value, index, call argument, or other child.
+fn check_direct_slot_expr(
+    ctx: &mut Ctx,
+    expression: &mut Expr,
+    expected: Option<Ty>,
+    position: DirectSlotPosition,
+) -> CResult<Ty> {
+    let ty = if matches!(expression.kind, ExprKind::SlotOp { .. }) {
+        check_slot_operation(ctx, expression, position)?
+    } else {
+        check_expr(ctx, expression, expected.clone())?
+    };
+    if let Some(expected) = expected {
+        if ty != expected {
+            return Err(Diagnostic {
+                name: "type.mismatch".into(),
+                title: format!(
+                    "type mismatch: expected `{}`, found `{}`",
+                    expected.name(),
+                    ty.clone().name()
+                ),
+                span: expression.span,
+                label: format!("this has type `{}`", ty.name()),
+                notes: vec![],
+            });
+        }
+    }
+    Ok(ty)
+}
+
+fn slot_operation_position(op: &SlotOp, position: DirectSlotPosition, span: Span) -> CResult<()> {
+    let admitted = match op {
+        SlotOp::Alloc { .. } => matches!(
+            position,
+            DirectSlotPosition::ExplicitLocal | DirectSlotPosition::FieldAssignment
+        ),
+        SlotOp::Take => !matches!(position, DirectSlotPosition::Statement),
+        SlotOp::Put => position == DirectSlotPosition::Statement,
+    };
+    if admitted {
+        return Ok(());
+    }
+    Err(Diagnostic {
+        name: "slots.operation_position".into(),
+        title: format!("`{}` is not admitted as {}", op.name(), position.describe()),
+        span,
+        label: match op {
+            SlotOp::Alloc { .. } => {
+                "allocate directly into an explicit `slots<T>` local or `self` field"
+            }
+            SlotOp::Take => "move the result directly into a local/field or return it",
+            SlotOp::Put => "use `slot_put(...)` as a statement",
+        }
+        .into(),
+        notes: vec![(
+            "note".into(),
+            "direct positions give the retained control action one exact ownership sink".into(),
+        )],
+    })
+}
+
+fn slot_operation_arity(op: &SlotOp, args: &[Expr], span: Span) -> CResult<()> {
+    if args.len() == op.arity() {
+        return Ok(());
+    }
+    Err(Diagnostic {
+        name: "internal.check.slot_operation_arity".into(),
+        title: format!(
+            "checked `{}` has {} argument(s), expected {}",
+            op.name(),
+            args.len(),
+            op.arity()
+        ),
+        span,
+        label: "the sealed slot transition requires exact arity".into(),
+        notes: vec![],
+    })
+}
+
+/// Resolve the unique slot loan used only by `slot_take`/`slot_put`.
+///
+/// This is intentionally not part of ordinary `ExprKind::Borrow` checking.
+/// It admits `&mut local` and `&mut self.field`, and nothing else, so adding
+/// owner slots does not widen general mutable field borrows or call loans.
+fn resolve_slot_container(ctx: &mut Ctx, argument: &mut Expr) -> CResult<(Place, Ty)> {
+    let span = argument.span;
+    let ExprKind::Borrow {
+        array,
+        field,
+        mutable,
+    } = &argument.kind
+    else {
+        return Err(Diagnostic {
+            name: "slots.container_borrow".into(),
+            title: "slot operation needs an explicit unique container borrow".into(),
+            span,
+            label: "write `&mut slots_local` or `&mut self.slot_field`".into(),
+            notes: vec![],
+        });
+    };
+    if !*mutable {
+        return Err(Diagnostic {
+            name: "slots.container_mutability".into(),
+            title: "slot operation received a shared container borrow".into(),
+            span,
+            label: "taking or putting changes cell occupancy; write `&mut`".into(),
+            notes: vec![],
+        });
+    }
+
+    let (place, container_ty) = match field.as_deref() {
+        Some(field) if array == "self" => {
+            let ty = ctx.self_field_ty(field, span, true)?;
+            ctx.require_field_init(field, span)?;
+            (Place::field("self", field), ty)
+        }
+        Some(field) => {
+            return Err(Diagnostic {
+                name: "slots.container_place".into(),
+                title: format!("`{array}.{field}` is not an admitted slot-operation place"),
+                span,
+                label: "only a mutable local or the current receiver's direct field is admitted"
+                    .into(),
+                notes: vec![(
+                    "note".into(),
+                    "this operation-local exception does not authorize general mutable class-field borrows"
+                        .into(),
+                )],
+            });
+        }
+        None => {
+            reject_exposed_owner(ctx, array, span)?;
+            let place = Place::local(array);
+            if ctx.is_moved(&place) {
+                return Err(moved_out(ctx, &place, span, "borrow"));
+            }
+            let Some(binding) = ctx.vars.get(array.as_str()) else {
+                return Err(Diagnostic {
+                    name: "type.unknown_variable".into(),
+                    title: format!("unknown variable `{array}`"),
+                    span,
+                    label: "not declared".into(),
+                    notes: vec![],
+                });
+            };
+            if !binding.initialized {
+                return Err(Diagnostic {
+                    name: "type.uninitialized".into(),
+                    title: format!("`{array}` may be used before initialization"),
+                    span,
+                    label: "slot operations need a live container owner".into(),
+                    notes: vec![],
+                });
+            }
+            if !binding.mutable {
+                return Err(Diagnostic {
+                    name: "slots.container_mutability".into(),
+                    title: format!("slot container `{array}` is immutable"),
+                    span,
+                    label: "declare it `mut slots<...>` before taking or putting".into(),
+                    notes: vec![],
+                });
+            }
+            (place, binding.ty.clone())
+        }
+    };
+    let Ty::Slots(payload) = container_ty else {
+        return Err(Diagnostic {
+            name: "slots.container_type".into(),
+            title: format!("`{}` is not an owner-slot container", place.render()),
+            span,
+            label: format!("this has type `{}`", container_ty.name()),
+            notes: vec![],
+        });
+    };
+    slot_payload_ty(&payload, span)?;
+    let payload = *payload;
+    argument.ty = Some(Ty::borrow(Mutability::Mut, Ty::slots(payload.clone())));
+    Ok((place, payload))
+}
+
+fn check_slot_operation(
+    ctx: &mut Ctx,
+    expression: &mut Expr,
+    position: DirectSlotPosition,
+) -> CResult<Ty> {
+    let span = expression.span;
+    let ExprKind::SlotOp { op, op_span, args } = &mut expression.kind else {
+        unreachable!("slot checker is called only for a slot operation")
+    };
+    slot_operation_position(op, position, span)?;
+    slot_operation_arity(op, args, span)?;
+    let op = op.clone();
+    let op_span = *op_span;
+    let key = EffectSiteKey {
+        owner: ctx.call_owner.clone(),
+        span,
+    };
+    let (payload, result_ty, kind) = match op {
+        SlotOp::Alloc { elem } => {
+            slot_payload_ty(&elem, op_span)?;
+            check_expr(ctx, &mut args[0], Some(Ty::Int(IntTy::U64)))?;
+            (
+                elem.clone(),
+                Ty::slots(elem),
+                CheckedSlotTransitionKind::Alloc {
+                    length_ty: Ty::Int(IntTy::U64),
+                    length_span: args[0].span,
+                },
+            )
+        }
+        SlotOp::Take => {
+            let (container, payload) = resolve_slot_container(ctx, &mut args[0])?;
+            check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+            (
+                payload.clone(),
+                payload,
+                CheckedSlotTransitionKind::Take {
+                    container,
+                    container_span: args[0].span,
+                    index_ty: Ty::Int(IntTy::U64),
+                    index_span: args[1].span,
+                },
+            )
+        }
+        SlotOp::Put => {
+            let (container, payload) = resolve_slot_container(ctx, &mut args[0])?;
+            check_expr(ctx, &mut args[1], Some(Ty::Int(IntTy::U64)))?;
+            check_expr(ctx, &mut args[2], Some(payload.clone()))?;
+            let sink = ValueTransferSink::SlotPut(container.clone());
+            transfer_and_record(
+                ctx,
+                &args[2],
+                sink.clone(),
+                Some(("be stored in owner slots", args[2].span)),
+            )?;
+            let value_transfer = ValueTransferKey {
+                owner: ctx.call_owner.clone(),
+                span: args[2].span,
+                sink,
+            };
+            (
+                payload.clone(),
+                Ty::Unit,
+                CheckedSlotTransitionKind::Put {
+                    container,
+                    container_span: args[0].span,
+                    index_ty: Ty::Int(IntTy::U64),
+                    index_span: args[1].span,
+                    value_span: args[2].span,
+                    value_transfer,
+                },
+            )
+        }
+    };
+    expression.ty = Some(result_ty.clone());
+    ctx.ownership
+        .insert_slot_transition(CheckedSlotTransition {
+            key,
+            op_span,
+            payload,
+            result_ty: result_ty.clone(),
+            kind,
+        })
+        .map_err(|duplicate| Diagnostic {
+            name: "internal.check.duplicate_slot_transition".into(),
+            title: format!(
+                "duplicate slot-transition identity inside {}",
+                duplicate.owner.render()
+            ),
+            span: duplicate.span,
+            label: "owner and operation span must identify exactly one slot transition".into(),
+            notes: vec![],
+        })?;
+    Ok(result_ty)
+}
+
+fn check_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> {
     // Every rule below this point may duplicate the value it produces, so an
     // option whose present case owns is refused here rather than reaching one
     // of them. The owning family has its own entry points
@@ -4438,13 +4983,14 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
     let ty = match &mut e.kind {
         ExprKind::SlotOp { op, .. } => {
             return Err(Diagnostic {
-                name: "slots.operation_unsupported".into(),
-                title: format!("`{}` has no admitted semantics yet", op.name()),
+                name: "slots.operation_position".into(),
+                title: format!("`{}` is nested in an unsupported expression", op.name()),
                 span,
-                label: "owner-slot operations are parsed but remain sealed".into(),
+                label: "owner-slot operations require one direct statement-level ownership sink"
+                    .into(),
                 notes: vec![(
                     "note".into(),
-                    "allocation, extraction, and replacement require the occupied-cell proof and cleanup model"
+                    "allocate into an explicit slot local or `self` field, bind/assign/return a take directly, and use put as a statement"
                         .into(),
                 )],
             });
@@ -4537,11 +5083,36 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                         )],
                     });
                 }
-                if matches!(v.ty, Ty::Slots(_)) {
-                    return Err(slots_unsupported(span, "owner-slot value"));
-                }
                 if ctx.is_moved(&Place::local(name)) {
                     return Err(moved_out(ctx, &Place::local(name), span, "read"));
+                }
+                if let Ty::Slots(payload) = &v.ty {
+                    if !v.initialized {
+                        return Err(Diagnostic {
+                            name: "type.uninitialized".into(),
+                            title: format!("`{name}` may be moved before initialization"),
+                            span,
+                            label: "owner slots need a live allocation before a whole-owner move"
+                                .into(),
+                            notes: vec![],
+                        });
+                    }
+                    slot_payload_ty(payload, span)?;
+                    if matches!(&expected, Some(want) if *want == v.ty) {
+                        e.ty = Some(v.ty.clone());
+                        return Ok(v.ty.clone());
+                    }
+                    return Err(Diagnostic {
+                        name: "slots.owner_value_position".into(),
+                        title: format!("owner-slot local `{name}` used as an ordinary value"),
+                        span,
+                        label: "move the whole owner directly into a local or `self` field".into(),
+                        notes: vec![(
+                            "note".into(),
+                            "observe `.len`, or mutate occupancy with `slot_take` and `slot_put`"
+                                .into(),
+                        )],
+                    });
                 }
                 if let Ty::Res(got) = v.ty {
                     // Resources are affine: a bare name is a move, and
@@ -4671,7 +5242,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 .get(array.as_str())
                 .is_some_and(|binding| binding.ty.as_slots().is_some())
             {
-                return Err(slots_unsupported(*array_span, "slot indexing"));
+                return Err(slot_index_unsupported(*array_span));
             }
             let elem = array_elem_ty(ctx, array, *array_span)?;
             check_expr(ctx, index, Some(Ty::Int(IntTy::U64)))?;
@@ -4694,12 +5265,32 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                 };
                 return check_expr(ctx, e, expected);
             }
-            if ctx
+            if let Some(binding) = ctx
                 .vars
                 .get(array.as_str())
-                .is_some_and(|binding| binding.ty.as_slots().is_some())
+                .filter(|binding| binding.ty.as_owned_slots().is_some())
             {
-                return Err(slots_unsupported(span, "slot `.len` observation"));
+                reject_exposed_owner(ctx, array, span)?;
+                let place = Place::local(array);
+                if ctx.is_moved(&place) {
+                    return Err(moved_out(ctx, &place, span, "length observation"));
+                }
+                if !binding.initialized {
+                    return Err(Diagnostic {
+                        name: "type.uninitialized".into(),
+                        title: format!("owner-slot local `{array}` may be uninitialized"),
+                        span,
+                        label: "`.len` needs a live slot allocation".into(),
+                        notes: vec![],
+                    });
+                }
+                let payload = binding
+                    .ty
+                    .as_owned_slots()
+                    .expect("filtered to an owner-slot binding");
+                slot_payload_ty(payload, span)?;
+                e.ty = Some(Ty::Int(IntTy::U64));
+                return Ok(Ty::Int(IntTy::U64));
             }
             array_elem_ty(ctx, array, span)?;
             Ty::Int(IntTy::U64)
@@ -5092,8 +5683,27 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             };
             match field_ty {
                 Ty::Array(..) => Ty::Int(IntTy::U64),
-                Ty::Slots(_) => {
-                    return Err(slots_unsupported(span, "slot `.len` observation"));
+                Ty::Slots(payload) => {
+                    reject_exposed_owner(ctx, obj, span)?;
+                    let place = Place::local(obj);
+                    if ctx.is_moved(&place) {
+                        return Err(moved_out(ctx, &place, span, "field length observation"));
+                    }
+                    if !ctx
+                        .vars
+                        .get(obj.as_str())
+                        .is_some_and(|binding| binding.initialized)
+                    {
+                        return Err(Diagnostic {
+                            name: "type.uninitialized".into(),
+                            title: format!("class receiver `{obj}` may be uninitialized"),
+                            span,
+                            label: "slot-field `.len` needs a live receiver".into(),
+                            notes: vec![],
+                        });
+                    }
+                    slot_payload_ty(payload, span)?;
+                    Ty::Int(IntTy::U64)
                 }
                 Ty::Int(_)
                 | Ty::Bool
@@ -5137,7 +5747,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
             let elem = match field_ty {
                 Ty::Array(element) => element.clone(),
                 Ty::Slots(_) => {
-                    return Err(slots_unsupported(span, "slot indexing"));
+                    return Err(slot_index_unsupported(span));
                 }
                 Ty::Int(_)
                 | Ty::Bool
@@ -5892,8 +6502,23 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
                     notes: vec![],
                 });
             }
-            if matches!(fty, Ty::Slots(_)) {
-                return Err(slots_unsupported(span, "slot self-field read"));
+            if let Ty::Slots(payload) = &fty {
+                ctx.require_field_init(field, span)?;
+                slot_payload_ty(payload, span)?;
+                if matches!(&expected, Some(want) if *want == fty) {
+                    e.ty = Some(fty.clone());
+                    return Ok(fty);
+                }
+                return Err(Diagnostic {
+                    name: "slots.owner_value_position".into(),
+                    title: format!("owner-slot field `self.{field}` used as an ordinary value"),
+                    span,
+                    label: "move the whole owner directly into a local or replacement field".into(),
+                    notes: vec![(
+                        "note".into(),
+                        "ordinary field reads would copy an affine slot allocation".into(),
+                    )],
+                });
             }
             if ctx.in_init {
                 ctx.require_field_init(field, span)?;
@@ -5902,8 +6527,11 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         }
         ExprKind::SelfFieldLen { field } => {
             let fty = ctx.self_field_ty(field, span, false)?;
-            if matches!(fty, Ty::Slots(_)) {
-                return Err(slots_unsupported(span, "slot `.len` observation"));
+            if let Ty::Slots(payload) = &fty {
+                ctx.require_field_init(field, span)?;
+                slot_payload_ty(payload, span)?;
+                e.ty = Some(Ty::Int(IntTy::U64));
+                return Ok(Ty::Int(IntTy::U64));
             }
             if !matches!(fty, Ty::Array(..)) {
                 return Err(Diagnostic {
@@ -5922,7 +6550,7 @@ fn infer_expr(ctx: &mut Ctx, e: &mut Expr, expected: Option<Ty>) -> CResult<Ty> 
         ExprKind::SelfFieldIndex { field, index } => {
             let fty = ctx.self_field_ty(field, span, false)?;
             if matches!(fty, Ty::Slots(_)) {
-                return Err(slots_unsupported(span, "slot indexing"));
+                return Err(slot_index_unsupported(span));
             }
             let Ty::Array(elem) = fty else {
                 return Err(Diagnostic {
@@ -7342,14 +7970,56 @@ fn collect_checked_expr_mutations(
     out: &mut Vec<CheckedMutation>,
 ) -> CResult<()> {
     match &expression.kind {
-        ExprKind::SlotOp { op, .. } => {
-            return Err(Diagnostic {
-                name: "slots.operation_unsupported".into(),
-                title: format!("`{}` has no checked loop effect", op.name()),
+        ExprKind::SlotOp { op, args, .. } => {
+            for argument in args {
+                collect_checked_expr_mutations(ctx, argument, out)?;
+            }
+            let key = EffectSiteKey {
+                owner: ctx.call_owner.clone(),
                 span: expression.span,
-                label: "owner-slot operations remain sealed".into(),
-                notes: vec![],
-            });
+            };
+            let Some(transition) = ctx.ownership.slot_transition(&key) else {
+                return Err(Diagnostic {
+                    name: "internal.check.loop_slot_transition_missing".into(),
+                    title: "checked loop slot operation has no ownership transition".into(),
+                    span: expression.span,
+                    label: "loop effects require the checker-authored slot boundary".into(),
+                    notes: vec![],
+                });
+            };
+            match (op, &transition.kind) {
+                (SlotOp::Alloc { .. }, CheckedSlotTransitionKind::Alloc { .. }) => {}
+                (SlotOp::Take, CheckedSlotTransitionKind::Take { container, .. }) => {
+                    out.push(CheckedMutation::Slot {
+                        key,
+                        operation: CheckedSlotMutationKind::Take,
+                        container: container.clone(),
+                        payload: transition.payload.clone(),
+                    });
+                }
+                (SlotOp::Put, CheckedSlotTransitionKind::Put { container, .. }) => {
+                    out.push(CheckedMutation::Slot {
+                        key,
+                        operation: CheckedSlotMutationKind::Put,
+                        container: container.clone(),
+                        payload: transition.payload.clone(),
+                    });
+                }
+                (SlotOp::Alloc { .. }, CheckedSlotTransitionKind::Take { .. })
+                | (SlotOp::Alloc { .. }, CheckedSlotTransitionKind::Put { .. })
+                | (SlotOp::Take, CheckedSlotTransitionKind::Alloc { .. })
+                | (SlotOp::Take, CheckedSlotTransitionKind::Put { .. })
+                | (SlotOp::Put, CheckedSlotTransitionKind::Alloc { .. })
+                | (SlotOp::Put, CheckedSlotTransitionKind::Take { .. }) => {
+                    return Err(Diagnostic {
+                        name: "internal.check.loop_slot_transition_mismatch".into(),
+                        title: "slot syntax and checked ownership transition disagree".into(),
+                        span: expression.span,
+                        label: format!("`{}` must retain its exact checked operation", op.name()),
+                        notes: vec![],
+                    });
+                }
+            }
         }
         ExprKind::Call { args, .. }
         | ExprKind::CtorCall { args, .. }
@@ -8467,6 +9137,11 @@ impl<'a> Ctx<'a> {
         self.place_ty(p).is_some_and(|t| matches!(t, Ty::Array(_)))
     }
 
+    /// Whether this place owns an occupancy-tracked slot allocation.
+    fn is_slots_place(&self, p: &Place) -> bool {
+        self.place_ty(p).is_some_and(|t| matches!(t, Ty::Slots(_)))
+    }
+
     /// Which affine category a place belongs to, as the prefix its
     /// diagnostics carry. The consequence differs — a class you can
     /// rebuild, a resource is authority somebody else now holds, an array
@@ -8474,6 +9149,8 @@ impl<'a> Ctx<'a> {
     fn affine_kind(&self, p: &Place) -> &'static str {
         if self.is_resource_place(p) {
             "resource"
+        } else if self.is_slots_place(p) {
+            "slots"
         } else if self.is_array_place(p) {
             "array"
         } else {
@@ -8600,8 +9277,7 @@ fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
         }
         ExprKind::RawOp { args, .. }
         | ExprKind::ResOp { args, .. }
-        | ExprKind::DeviceOp { args, .. }
-        | ExprKind::SlotOp { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
+        | ExprKind::DeviceOp { args, .. } => args.iter().any(|a| brand_of(ctx, a)),
         ExprKind::SomeE(inner)
         | ExprKind::OptValue { operand: inner }
         | ExprKind::IsSome { operand: inner } => brand_of(ctx, inner),
@@ -8615,6 +9291,7 @@ fn brand_of(ctx: &Ctx, e: &Expr) -> bool {
         | ExprKind::Call { .. }
         | ExprKind::Index { .. }
         | ExprKind::Len { .. }
+        | ExprKind::SlotOp { .. }
         | ExprKind::Widen { .. }
         | ExprKind::Narrow { .. }
         | ExprKind::NoneE
@@ -8764,6 +9441,19 @@ fn moved_out(ctx: &Ctx, p: &Place, span: Span, how: &str) -> Diagnostic {
                 "note".into(),
                 "an owned array moves into its new place: both names would reach \
                  the same elements, and the logic treats them as separate values"
+                    .into(),
+            )],
+        };
+    }
+    if ctx.is_slots_place(p) {
+        return Diagnostic {
+            name: "slots.use_after_move".into(),
+            title: format!("`{}` has been moved out", p.render()),
+            span,
+            label,
+            notes: vec![(
+                "note".into(),
+                "owner slots move with their allocation and occupancy; the old place no longer names it"
                     .into(),
             )],
         };
@@ -10114,5 +10804,763 @@ trait Factory {
             Err(error) => error,
         };
         assert_eq!(error.name, "type.trait_return_unsupported");
+    }
+
+    #[test]
+    fn slot_transitions_actions_and_loop_mutations_share_exact_checked_identity() {
+        let mut program = monomorphized_program(
+            r#"
+fn cycle(u64 length) -> u64 {
+    mut slots<u64> cells = alloc_slots<u64>(length);
+    slot_put(&mut cells, 0, 7);
+    mut u64 i = 0;
+    var observed = cells.len;
+    /// invariant i <= 1
+    /// variant 1 - i
+    while (i < 1) {
+        var value = slot_take(&mut cells, i);
+        slot_put(&mut cells, i, value);
+        i = i + 1;
+    }
+    return slot_take(&mut cells, 0);
+}
+"#,
+        );
+        let checked = check(&mut program).expect("the checker admits the bounded slot surface");
+        let owner = CallOwner::Function("cycle".into());
+        let transitions: Vec<_> = checked
+            .ownership
+            .slot_transitions_for_owner(&owner)
+            .map(|(_, transition)| transition)
+            .collect();
+        assert_eq!(transitions.len(), 5);
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| matches!(
+                    transition.kind,
+                    CheckedSlotTransitionKind::Alloc { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| matches!(
+                    transition.kind,
+                    CheckedSlotTransitionKind::Take { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            transitions
+                .iter()
+                .filter(|transition| matches!(
+                    transition.kind,
+                    CheckedSlotTransitionKind::Put { .. }
+                ))
+                .count(),
+            2
+        );
+
+        let loop_effects = checked
+            .ownership
+            .loops_for_owner(&owner)
+            .next()
+            .expect("the loop has one checked effect record")
+            .1;
+        let slot_mutations: Vec<_> = loop_effects
+            .mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                CheckedMutation::Slot {
+                    operation,
+                    container,
+                    payload,
+                    ..
+                } => Some((*operation, container.clone(), payload.clone())),
+                CheckedMutation::DirectWrite { .. }
+                | CheckedMutation::UniqueLoan(_)
+                | CheckedMutation::OptionTake { .. }
+                | CheckedMutation::ExposureRebuild { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            slot_mutations,
+            vec![
+                (
+                    CheckedSlotMutationKind::Take,
+                    Place::local("cells"),
+                    Ty::Int(IntTy::U64),
+                ),
+                (
+                    CheckedSlotMutationKind::Put,
+                    Place::local("cells"),
+                    Ty::Int(IntTy::U64),
+                ),
+            ]
+        );
+
+        let body = checked
+            .control
+            .body(&owner, program.fns[0].span)
+            .expect("cycle has a retained control body");
+        let actions: Vec<_> = body.plan().slot_actions().collect();
+        assert_eq!(actions.len(), transitions.len());
+        for action in &actions {
+            assert_eq!(
+                body.plan()
+                    .slot_action_trap_sites(action)
+                    .expect("every action retains its exact trap identities")
+                    .len(),
+                2
+            );
+            assert_eq!(action.effect_key().owner, owner);
+            assert_eq!(action.payload(), &Ty::Int(IntTy::U64));
+            if let SlotActionKind::Put {
+                container,
+                value_transfer,
+                staging,
+                ..
+            } = action.kind()
+            {
+                assert_eq!(container, &Place::local("cells"));
+                assert!(staging.root().starts_with("$sable$slot_put_value$"));
+                let transfer = checked
+                    .ownership
+                    .value_transfer(value_transfer)
+                    .expect("put action links its checker-authored transfer");
+                assert_eq!(transfer.value_ty, Ty::Int(IntTy::U64));
+            }
+        }
+
+        let Stmt::VarDecl { init: len, .. } = &program.fns[0].body[3] else {
+            panic!("expected the checked `.len` binding");
+        };
+        assert_eq!(len.ty, Some(Ty::Int(IntTy::U64)));
+    }
+
+    #[test]
+    fn slot_owners_move_as_whole_locals_and_direct_self_fields() {
+        let mut program = monomorphized_program(
+            r#"
+class Pool {
+    slots<u64> cells;
+
+    init new(u64 length) {
+        self.cells = alloc_slots<u64>(length);
+    }
+
+    fn replace(&mut self, u64 length) -> u64 {
+        mut slots<u64> next = alloc_slots<u64>(length);
+        var previous = self.cells;
+        self.cells = next;
+        var installed = self.cells.len;
+        return installed;
+    }
+
+    fn roundtrip(&mut self, u64 value) -> u64 {
+        slot_put(&mut self.cells, 0, value);
+        return slot_take(&mut self.cells, 0);
+    }
+}
+
+fn local_move(u64 length) -> u64 {
+    mut slots<u64> first = alloc_slots<u64>(length);
+    var moved = first;
+    mut slots<u64> replacement = alloc_slots<u64>(length);
+    replacement = moved;
+    return replacement.len;
+}
+
+fn observe(Pool pool) -> u64 {
+    return pool.cells.len;
+}
+"#,
+        );
+        let checked =
+            check(&mut program).expect("whole slot owners move without copying their allocation");
+
+        let method = &program.classes[0].methods[0].f;
+        let Stmt::VarDecl {
+            init: moved, ty, ..
+        } = &method.body[1]
+        else {
+            panic!("expected inferred self-field move");
+        };
+        assert_eq!(ty.as_ref(), Some(&Ty::slots(Ty::Int(IntTy::U64))));
+        assert_eq!(moved.ty.as_ref(), ty.as_ref());
+        let Stmt::VarDecl { init: len, .. } = &method.body[3] else {
+            panic!("expected self-field length observation");
+        };
+        assert_eq!(len.ty, Some(Ty::Int(IntTy::U64)));
+
+        let roundtrip = CallOwner::Method {
+            class: "Pool".into(),
+            method: "roundtrip".into(),
+        };
+        let transitions: Vec<_> = checked
+            .ownership
+            .slot_transitions_for_owner(&roundtrip)
+            .map(|(_, transition)| transition)
+            .collect();
+        assert_eq!(transitions.len(), 2);
+        assert!(
+            transitions.iter().all(|transition| {
+                transition.container() == Some(&Place::field("self", "cells"))
+            })
+        );
+
+        let local_owner = CallOwner::Function("local_move".into());
+        let local_plan = checked
+            .control
+            .body(&local_owner, program.fns[0].span)
+            .expect("local_move has a retained control body")
+            .plan();
+        let replacement = local_plan
+            .assignments()
+            .find(|action| action.destination() == &Place::local("replacement"))
+            .expect("whole-slot reassignment has an exact replacement action");
+        assert!(replacement.previous().is_some());
+        assert!(matches!(
+            replacement.staging(),
+            crate::control::AssignmentStaging::Temporary(_)
+        ));
+        let Stmt::Return {
+            value: Some(class_len),
+            ..
+        } = &program.fns[1].body[0]
+        else {
+            panic!("expected arbitrary class-field length observation");
+        };
+        assert_eq!(class_len.ty, Some(Ty::Int(IntTy::U64)));
+    }
+
+    #[test]
+    fn slot_positions_mutability_and_direct_cell_access_fail_by_name() {
+        let cases = [
+            (
+                "fn bad() { var cells = alloc_slots<u64>(1); }",
+                "slots.operation_position",
+            ),
+            (
+                "fn bad() { mut slots<u64> cells = alloc_slots<u64>(1); cells = alloc_slots<u64>(1); }",
+                "slots.operation_position",
+            ),
+            (
+                "fn bad() { mut slots<u64> cells = alloc_slots<u64>(1); u64 value = slot_put(&mut cells, 0, 1); }",
+                "slots.operation_position",
+            ),
+            (
+                "fn bad() { mut slots<u64> cells = alloc_slots<u64>(1); slot_take(&mut cells, 0); }",
+                "slots.operation_position",
+            ),
+            (
+                "fn id(u64 value) -> u64 { return value; } fn bad() -> u64 { mut slots<u64> cells = alloc_slots<u64>(1); return id(slot_take(&mut cells, 0)); }",
+                "slots.operation_position",
+            ),
+            (
+                "fn bad() { slots<u64> cells = alloc_slots<u64>(1); var value = slot_take(&mut cells, 0); }",
+                "slots.container_mutability",
+            ),
+            (
+                "fn bad() { mut slots<u64> cells = alloc_slots<u64>(1); var value = cells[0]; }",
+                "slots.index_unsupported",
+            ),
+            (
+                "fn bad() { mut slots<u64> cells = alloc_slots<u64>(1); cells[0] = 1; }",
+                "slots.store_unsupported",
+            ),
+        ];
+        for (source, expected) in cases {
+            let mut program = monomorphized_program(source);
+            assert_eq!(check_error(&mut program).name, expected, "{source}");
+        }
+
+        let mut projected = monomorphized_program(
+            r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+}
+
+fn bad(Pool pool) -> u64 {
+    return slot_take(&mut pool.cells, 0);
+}
+"#,
+        );
+        assert_eq!(check_error(&mut projected).name, "slots.container_place");
+
+        let mut ordinary_borrow = monomorphized_program(
+            r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+    fn bad(&mut self) { var loan = &mut self.cells; }
+}
+"#,
+        );
+        assert_eq!(
+            check_error(&mut ordinary_borrow).name,
+            "class.mut_field_borrow"
+        );
+
+        let mut shared_self = monomorphized_program(
+            r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+    fn bad(&mut self) -> u64 { return slot_take(&self.cells, 0); }
+}
+"#,
+        );
+        assert_eq!(
+            check_error(&mut shared_self).name,
+            "slots.container_mutability"
+        );
+
+        let mut immutable_self = monomorphized_program(
+            r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+    fn bad(&self) { slot_put(&mut self.cells, 0, 1); }
+}
+"#,
+        );
+        assert_eq!(
+            check_error(&mut immutable_self).name,
+            "type.mutate_shared_self"
+        );
+
+        for (source, expected) in [
+            (
+                r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+    fn bad(&self) -> u64 { return self.cells[0]; }
+}
+"#,
+                "slots.index_unsupported",
+            ),
+            (
+                r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+    fn bad(&mut self) { self.cells[0] = 1; }
+}
+"#,
+                "slots.store_unsupported",
+            ),
+            (
+                r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+}
+fn bad(Pool pool) -> u64 { return pool.cells[0]; }
+"#,
+                "slots.index_unsupported",
+            ),
+            (
+                r#"
+fn bad() -> u64 {
+    mut slots<u64> first = alloc_slots<u64>(1);
+    var moved = first;
+    return first.len;
+}
+"#,
+                "slots.use_after_move",
+            ),
+            (
+                r#"
+class Pool {
+    slots<u64> cells;
+    init new() { self.cells = alloc_slots<u64>(1); }
+}
+fn bad(Pool pool) -> u64 {
+    var moved = pool;
+    return pool.cells.len;
+}
+"#,
+                "class.use_after_move",
+            ),
+        ] {
+            let mut program = monomorphized_program(source);
+            assert_eq!(check_error(&mut program).name, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn forged_slot_bindings_cannot_bypass_owned_form_and_initializer_gates() {
+        let borrowed_slots = Ty::borrow(Mutability::Mut, Ty::slots(Ty::Int(IntTy::U64)));
+
+        let mut local = monomorphized_program("fn bad() { u64 value; }");
+        let Stmt::Decl { ty, .. } = &mut local.fns[0].body[0] else {
+            panic!("expected explicit local");
+        };
+        *ty = borrowed_slots.clone();
+        assert_eq!(
+            check_error(&mut local).name,
+            "type.borrow_local_unsupported"
+        );
+
+        let mut uninitialized = monomorphized_program("fn bad() { u64 value; }");
+        let Stmt::Decl { ty, .. } = &mut uninitialized.fns[0].body[0] else {
+            panic!("expected explicit local");
+        };
+        *ty = Ty::slots(Ty::Int(IntTy::U64));
+        assert_eq!(
+            check_error(&mut uninitialized).name,
+            "type.slot_initializer"
+        );
+
+        let mut inferred = monomorphized_program("fn bad() { var value = true; }");
+        let Stmt::VarDecl { ty, .. } = &mut inferred.fns[0].body[0] else {
+            panic!("expected inferred local");
+        };
+        *ty = Some(Ty::slots(Ty::Int(IntTy::U64)));
+        assert_eq!(check_error(&mut inferred).name, "slots.inferred_type");
+
+        let mut field = monomorphized_program(
+            r#"
+class Owner {
+    u64 value;
+    init new() { self.value = 0; }
+}
+"#,
+        );
+        field.classes[0].fields[0].ty = borrowed_slots;
+        assert_eq!(check_error(&mut field).name, "type.slot_owner_binding");
+
+        let mut malformed =
+            monomorphized_program("fn bad() { mut slots<u64> cells = alloc_slots<u64>(1); }");
+        let Stmt::Decl {
+            init: Some(allocation),
+            ..
+        } = &mut malformed.fns[0].body[0]
+        else {
+            panic!("expected slot allocation");
+        };
+        let ExprKind::SlotOp { args, .. } = &mut allocation.kind else {
+            panic!("expected slot operation");
+        };
+        args.clear();
+        assert_eq!(
+            check_error(&mut malformed).name,
+            "internal.check.slot_operation_arity"
+        );
+    }
+
+    #[test]
+    fn slot_payload_admission_is_an_explicit_post_substitution_allow_list() {
+        for payload in [
+            Ty::Int(IntTy::U64),
+            Ty::Bool,
+            Ty::Param(TypeParamId::from_legacy(0)),
+            Ty::Record(0),
+            Ty::Class(0),
+        ] {
+            slot_payload_ty(&payload, Span::new(1, 2)).unwrap_or_else(|error| {
+                panic!("`{}` was refused: {}", payload.name(), error.title)
+            });
+        }
+        for payload in [
+            Ty::array(Ty::Bool),
+            Ty::slots(Ty::Bool),
+            Ty::option(Ty::Bool),
+            Ty::Res(ResKind::RawSpan),
+            Ty::Raw(IntTy::U8),
+            Ty::borrow(Mutability::Shared, Ty::Class(0)),
+            Ty::Unit,
+        ] {
+            assert_eq!(
+                slot_payload_ty(&payload, Span::new(1, 2))
+                    .expect_err("nested/authority slot payloads stay closed")
+                    .name,
+                "type.slot_payload_unsupported",
+                "{}",
+                payload.name()
+            );
+        }
+        assert_eq!(
+            slot_payload_ty(&Ty::Int(IntTy::TParam(0)), Span::new(1, 2))
+                .expect_err("legacy integer parameters are not aggregate payloads")
+                .name,
+            "type.aggregate_payload_noncanonical"
+        );
+        assert_eq!(
+            validate_aggregate_ty(Ty::option(Ty::slots(Ty::Int(IntTy::U64))), Span::new(1, 2),)
+                .expect_err("option<slots<T>> has no conditional-owner semantics")
+                .name,
+            "type.affine_option_unsupported"
+        );
+    }
+
+    #[test]
+    fn class_payload_put_moves_the_source_and_take_produces_a_fresh_owner() {
+        let mut program = monomorphized_program(
+            r#"
+class Item {
+    u64 value;
+    init new(u64 value) { self.value = value; }
+}
+
+fn subject() {
+    mut slots<Item> cells = alloc_slots<Item>(1);
+    var item = Item::new(7);
+    slot_put(&mut cells, 0, item);
+    var restored = slot_take(&mut cells, 0);
+}
+"#,
+        );
+        let checked = check(&mut program).expect("class payload slots have affine transitions");
+        let owner = CallOwner::Function("subject".into());
+        let put = checked
+            .ownership
+            .slot_transitions_for_owner(&owner)
+            .find_map(|(_, transition)| match &transition.kind {
+                CheckedSlotTransitionKind::Put { value_transfer, .. } => Some(value_transfer),
+                CheckedSlotTransitionKind::Alloc { .. }
+                | CheckedSlotTransitionKind::Take { .. } => None,
+            })
+            .expect("put transition");
+        let put_transfer = checked
+            .ownership
+            .value_transfer(put)
+            .expect("put transition links its transfer");
+        assert_eq!(put_transfer.kind, ValueTransferKind::Move);
+        assert_eq!(put_transfer.source, Some(Place::local("item")));
+        assert_eq!(put_transfer.value_ty, Ty::Class(0));
+        assert_eq!(put.sink, ValueTransferSink::SlotPut(Place::local("cells")));
+
+        let take_span = checked
+            .ownership
+            .slot_transitions_for_owner(&owner)
+            .find_map(|(key, transition)| {
+                matches!(transition.kind, CheckedSlotTransitionKind::Take { .. })
+                    .then_some(key.span)
+            })
+            .expect("take transition");
+        let take_binding = ValueTransferKey {
+            owner: owner.clone(),
+            span: take_span,
+            sink: ValueTransferSink::Binding("restored".into()),
+        };
+        let take_transfer = checked
+            .ownership
+            .value_transfer(&take_binding)
+            .expect("the direct take binding has a transfer");
+        assert_eq!(take_transfer.kind, ValueTransferKind::Fresh);
+        assert_eq!(take_transfer.source, None);
+        assert_eq!(take_transfer.value_ty, Ty::Class(0));
+
+        let drop = checked
+            .control
+            .body(&owner, program.fns[0].span)
+            .expect("subject control body")
+            .plan()
+            .candidate_for_place(&Place::local("cells"))
+            .expect("slot owner has a drop candidate");
+        assert!(matches!(
+            drop.drop_action().recipe(),
+            crate::control::ValueDropRecipe::ReleaseSlots {
+                payload: Ty::Class(0),
+                occupied: Some(occupied),
+            } if matches!(occupied.recipe(), crate::control::ValueDropRecipe::DropClass(class) if class.class() == 0)
+        ));
+
+        let mut reuse = monomorphized_program(
+            r#"
+class Item {
+    u64 value;
+    init new(u64 value) { self.value = value; }
+}
+fn bad() {
+    mut slots<Item> cells = alloc_slots<Item>(1);
+    var item = Item::new(7);
+    slot_put(&mut cells, 0, item);
+    var duplicate = item;
+}
+"#,
+        );
+        assert_eq!(check_error(&mut reuse).name, "class.use_after_move");
+    }
+
+    #[test]
+    fn branded_record_payload_cannot_escape_into_owner_slots() {
+        let mut program = monomorphized_program(
+            r#"
+record Cell #[layout(size := 8, align := 8)] {
+    #[offset(0)] u64 value;
+}
+
+fn bad(&mut [u8] bytes) {
+    mut slots<Cell> cells = alloc_slots<Cell>(1);
+    unsafe expose &mut bytes as (pointer, resource memory) {
+        raw<Cell> typed = raw_cast<Cell>(pointer);
+        mut resource PointsTo<Cell> cell = raw_into_cell<Cell>(typed, memory);
+        raw_cell_init<Cell>(typed, Cell(7), &mut cell);
+        Cell observed = raw_cell_read<Cell>(typed, &cell);
+        slot_put(&mut cells, 0, observed);
+    }
+}
+"#,
+        );
+        assert_eq!(check_error(&mut program).name, "expose.brand_escapes");
+    }
+
+    #[test]
+    fn whole_slot_moves_change_loop_shape_but_loop_local_alloc_does_not_mutate_a_container() {
+        let mut moved = monomorphized_program(
+            r#"
+fn bad() {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    mut u64 i = 0;
+    /// invariant i <= 1
+    /// variant 1 - i
+    while (i < 1) {
+        var taken_owner = cells;
+        i = i + 1;
+    }
+}
+"#,
+        );
+        assert_eq!(check_error(&mut moved).name, "slots.loop_shape");
+
+        let mut allocated = monomorphized_program(
+            r#"
+fn ok() {
+    mut u64 i = 0;
+    /// invariant i <= 1
+    /// variant 1 - i
+    while (i < 1) {
+        slots<u64> temporary = alloc_slots<u64>(1);
+        i = i + 1;
+    }
+}
+"#,
+        );
+        let checked = check(&mut allocated).expect("loop-local slot allocation is owner creation");
+        let effects = checked
+            .ownership
+            .loops_for_owner(&CallOwner::Function("ok".into()))
+            .next()
+            .expect("loop effects")
+            .1;
+        assert!(
+            effects
+                .mutations
+                .iter()
+                .all(|mutation| !matches!(mutation, CheckedMutation::Slot { .. }))
+        );
+    }
+
+    #[test]
+    fn slot_control_handoff_refuses_missing_mismatched_and_respanned_records() {
+        let source = r#"
+fn subject() {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    slot_put(&mut cells, 0, 7);
+}
+"#;
+        let mut missing_program = monomorphized_program(source);
+        let mut missing = check(&mut missing_program).expect("baseline checks");
+        let owner = CallOwner::Function("subject".into());
+        let key = missing
+            .ownership
+            .slot_transitions_for_owner(&owner)
+            .find(|(_, transition)| {
+                matches!(transition.kind, CheckedSlotTransitionKind::Put { .. })
+            })
+            .map(|(key, _)| key.clone())
+            .expect("put transition");
+        missing.ownership.remove_slot_transition(&key);
+        assert_eq!(
+            reconcile_slot_control(&missing.control, &missing.ownership)
+                .expect_err("a missing ownership transition must fail")
+                .name,
+            "internal.check.slot_control_transition_missing"
+        );
+
+        let mut mismatch_program = monomorphized_program(source);
+        let mut mismatch = check(&mut mismatch_program).expect("baseline checks");
+        let key = mismatch
+            .ownership
+            .slot_transitions_for_owner(&owner)
+            .next()
+            .map(|(key, _)| key.clone())
+            .expect("slot transition");
+        mismatch
+            .ownership
+            .slot_transition_mut(&key)
+            .expect("mutable transition")
+            .payload = Ty::Bool;
+        assert_eq!(
+            reconcile_slot_control(&mismatch.control, &mismatch.ownership)
+                .expect_err("a mismatched ownership transition must fail")
+                .name,
+            "internal.check.slot_control_transition_mismatch"
+        );
+        let transition = mismatch
+            .ownership
+            .slot_transition_mut(&key)
+            .expect("mutable transition");
+        transition.payload = match &transition.result_ty {
+            Ty::Slots(payload) => payload.as_ref().clone(),
+            Ty::Int(_) => Ty::Int(IntTy::U64),
+            Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => Ty::Int(IntTy::U64),
+        };
+        transition.key.span = Span::new(key.span.start + 1, key.span.end + 1);
+        assert_eq!(
+            reconcile_slot_control(&mismatch.control, &mismatch.ownership)
+                .expect_err("a mismatched embedded transition key must fail")
+                .name,
+            "internal.check.slot_control_transition_mismatch"
+        );
+
+        let checked_body = mismatch
+            .control
+            .body(&owner, mismatch_program.fns[0].span)
+            .expect("retained subject body");
+        let put = checked_body
+            .plan()
+            .slot_actions()
+            .find(|action| matches!(action.kind(), SlotActionKind::Put { .. }))
+            .expect("put action");
+        let Stmt::ExprStmt(expression) = &mut mismatch_program.fns[0].body[1] else {
+            panic!("expected put statement");
+        };
+        expression.span = Span::new(expression.span.start + 1, expression.span.end + 1);
+        assert!(
+            checked_body
+                .plan()
+                .slot_action(put.scope(), expression)
+                .is_err()
+        );
+        assert!(
+            checked_body
+                .validate_callable(
+                    mismatch_program.fns[0].span,
+                    &mismatch_program.fns[0].params,
+                    &mismatch_program.fns[0].body,
+                )
+                .is_err()
+        );
     }
 }

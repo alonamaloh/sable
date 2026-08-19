@@ -2829,6 +2829,12 @@ impl<'a> Interp<'a> {
             .validate_value_drop_action(action, self.classes, use_span)
             .map_err(control_plan_trap)?;
         match (action.recipe(), held) {
+            (ValueDropRecipe::ReleaseSlots { .. }, _) => Err(control_plan_trap(PlanError {
+                span: use_span,
+                message: format!(
+                    "internal.interp.slots_cleanup_unsupported: runtime cleanup for owner-slot value `{what}` is not admitted"
+                ),
+            })),
             (ValueDropRecipe::DropClass(class_action), RtVal::Obj { class, fields })
                 if class == class_action.class() =>
             {
@@ -2920,6 +2926,14 @@ impl<'a> Interp<'a> {
             }
         }
         let valid = match (action.recipe(), held) {
+            (ValueDropRecipe::ReleaseSlots { .. }, _) => {
+                return Err(control_plan_trap(PlanError {
+                    span: use_span,
+                    message: format!(
+                        "internal.interp.slots_cleanup_unsupported: runtime validation for owner-slot value `{what}` is not admitted"
+                    ),
+                }));
+            }
             (ValueDropRecipe::DropClass(expected), RtVal::Obj { class, .. }) => {
                 *class == expected.class()
             }

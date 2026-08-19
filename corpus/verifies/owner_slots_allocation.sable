@@ -1,0 +1,6 @@
+// Owner slots have an affine local representation and a retained recursive
+// cleanup plan. Runtime and native lowering remain separate subset gates.
+
+fn owner_slots_allocation() {
+    slots<u64> cells = alloc_slots<u64>(4);
+}

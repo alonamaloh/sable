@@ -1,0 +1,7 @@
+// expect-error: slots.operation_position
+// Allocation requires an explicit owner sink so the checker and retained
+// control plan agree on one exact ownership transition.
+
+fn inferred_allocation() {
+    var cells = alloc_slots<u64>(4);
+}

@@ -17,20 +17,20 @@ The `init param` / `method param` pairs read the same way.
 
 | type | local | return | param | param & | param &mut | record field | class field | array element | slot payload | option payload | generic arg | for index | const | cast target | trait-impl target | raw element | resource extent | resource map key | init param | init param & | method param | method param & |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `u64` | yes | yes | yes | never | not yet | yes | yes | yes | not yet | yes | yes | yes | yes | yes | yes | not yet | yes | yes | yes | never | yes | never |
-| `bool` | yes | yes | yes | never | not yet | not yet | yes | yes | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
+| `u64` | yes | yes | yes | never | not yet | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | not yet | yes | yes | yes | never | yes | never |
+| `bool` | yes | yes | yes | never | not yet | not yet | yes | yes | yes | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `[u64]` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
 | `[bool]` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
 | `[record]` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | not yet | not yet | never | not yet | never | not yet | not yet | not yet | never | not yet | yes | not yet | not yet |
-| `slots<u64>` | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet |
+| `slots<u64>` | yes | not yet | not yet | not yet | not yet | not yet | yes | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet | not yet |
 | `option<u64>` | yes | yes | yes | never | not yet | not yet | yes | not yet | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
 | `option<bool>` | yes | yes | yes | never | not yet | not yet | yes | not yet | not yet | yes | not yet | never | not yet | never | not yet | not yet | not yet | not yet | yes | never | yes | never |
-| `record` | yes | yes | yes | never | not yet | not yet | not yet | yes | not yet | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
+| `record` | yes | yes | yes | never | not yet | not yet | not yet | yes | yes | not yet | not yet | never | not yet | never | not yet | yes | yes | not yet | not yet | never | not yet | never |
 | `option<[bool]>` | yes | not yet | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | never | not yet | not yet | not yet | not yet |
-| `class` | yes | yes | yes | yes | yes | never | yes | not yet | not yet | yes | yes | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
+| `class` | yes | yes | yes | yes | yes | never | yes | not yet | yes | yes | yes | never | never | never | not yet | not yet | not yet | never | yes | yes | yes | yes |
 | `raw<u8>` | yes | yes | yes | never | not yet | not yet | not yet | not yet | not yet | not yet | not yet | never | never | never | not yet | not yet | not yet | not yet | not yet | never | not yet | never |
 
-Open cells: 82 of 213 intended; 51 never open by design.
+Open cells: 88 of 213 intended; 51 never open by design.
 
 ## Cells that never open
 
@@ -58,14 +58,12 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 |---|---|---|
 | `u64` | param & | `type.borrow_param_unsupported` |
 | `u64` | param &mut | `type.borrow_param_unsupported` |
-| `u64` | slot payload | `type.slots_unsupported` |
 | `u64` | raw element | `raw.element_type` |
 | `u64` | init param & | `type.borrow_param_unsupported` |
 | `u64` | method param & | `type.borrow_param_unsupported` |
 | `bool` | param & | `type.borrow_param_unsupported` |
 | `bool` | param &mut | `type.borrow_param_unsupported` |
 | `bool` | record field | `record.field_type` |
-| `bool` | slot payload | `type.slots_unsupported` |
 | `bool` | generic arg | `mono.type_arg_unsupported` |
 | `bool` | for index | `type.for_index_unsupported` |
 | `bool` | const | `type.const_unsupported` |
@@ -120,13 +118,11 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `[record]` | init param | `type.member_param` |
 | `[record]` | method param | `type.member_param` |
 | `[record]` | method param & | `type.member_param` |
-| `slots<u64>` | local | `slots.operation_unsupported` |
 | `slots<u64>` | return | `type.return_unsupported` |
 | `slots<u64>` | param | `type.param_unsupported` |
 | `slots<u64>` | param & | `type.borrow_param_unsupported` |
 | `slots<u64>` | param &mut | `type.borrow_param_unsupported` |
-| `slots<u64>` | record field | `type.slots_unsupported` |
-| `slots<u64>` | class field | `type.slots_unsupported` |
+| `slots<u64>` | record field | `record.field_type` |
 | `slots<u64>` | array element | `type.array_payload_unsupported` |
 | `slots<u64>` | slot payload | `type.slot_payload_unsupported` |
 | `slots<u64>` | option payload | `type.option_payload_unsupported` |
@@ -176,7 +172,6 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `record` | param &mut | `type.borrow_param_unsupported` |
 | `record` | record field | `record.field_type` |
 | `record` | class field | `type.class_field_unsupported` |
-| `record` | slot payload | `type.slots_unsupported` |
 | `record` | option payload | `type.option_payload_unsupported` |
 | `record` | generic arg | `mono.type_arg_unsupported` |
 | `record` | for index | `type.for_index_unsupported` |
@@ -211,7 +206,6 @@ Reversing one of these is deleting its `NEVER` entry in `compiler/tests/type_mat
 | `option<[bool]>` | method param & | `type.borrow_param_unsupported` |
 | `class` | record field | `record.field_type` |
 | `class` | array element | `type.array_payload_unsupported` |
-| `class` | slot payload | `type.slots_unsupported` |
 | `class` | for index | `type.for_index_unsupported` |
 | `class` | const | `type.const_unsupported` |
 | `class` | cast target | `type.cast_target_unsupported` |

@@ -49,6 +49,7 @@ pub(crate) enum ValueTransferSink {
     SystemDeallocResource,
     SystemDeallocRelease,
     OptionPayload,
+    SlotPut(Place),
 }
 
 impl ValueTransferSink {
@@ -62,6 +63,7 @@ impl ValueTransferSink {
             Self::SystemDeallocResource => "system_dealloc.resource".into(),
             Self::SystemDeallocRelease => "system_dealloc.release".into(),
             Self::OptionPayload => "option.payload".into(),
+            Self::SlotPut(place) => format!("slot_put.{}", place.render()),
         }
     }
 }
@@ -85,6 +87,54 @@ pub(crate) struct CheckedOptionTake {
     pub(crate) source: Place,
     pub(crate) source_span: Span,
     pub(crate) payload: Ty,
+}
+
+/// The exact semantic flavor of one admitted owner-slot transition.
+///
+/// The source AST keeps the surface [`crate::ast::SlotOp`]. This enum keeps
+/// the checker's resolved boundary: allocation has no container place, while
+/// take and put mutate one exact owner. Put additionally links the value move
+/// recorded at the same boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CheckedSlotTransitionKind {
+    Alloc {
+        length_ty: Ty,
+        length_span: Span,
+    },
+    Take {
+        container: Place,
+        container_span: Span,
+        index_ty: Ty,
+        index_span: Span,
+    },
+    Put {
+        container: Place,
+        container_span: Span,
+        index_ty: Ty,
+        index_span: Span,
+        value_span: Span,
+        value_transfer: ValueTransferKey,
+    },
+}
+
+/// Checker-authored owner-slot transition for one exact source operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedSlotTransition {
+    pub(crate) key: EffectSiteKey,
+    pub(crate) op_span: Span,
+    pub(crate) payload: Ty,
+    pub(crate) result_ty: Ty,
+    pub(crate) kind: CheckedSlotTransitionKind,
+}
+
+impl CheckedSlotTransition {
+    pub(crate) fn container(&self) -> Option<&Place> {
+        match &self.kind {
+            CheckedSlotTransitionKind::Alloc { .. } => None,
+            CheckedSlotTransitionKind::Take { container, .. }
+            | CheckedSlotTransitionKind::Put { container, .. } => Some(container),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,10 +192,29 @@ pub(crate) struct CheckedSealedOperation {
 /// places for havoc and may consume the richer payload later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CheckedMutation {
-    DirectWrite { place: Place },
+    DirectWrite {
+        place: Place,
+    },
     UniqueLoan(crate::transition::CallTransition),
-    OptionTake { source: Place, payload: Ty },
-    ExposureRebuild { owner_place: Place },
+    OptionTake {
+        source: Place,
+        payload: Ty,
+    },
+    Slot {
+        key: EffectSiteKey,
+        operation: CheckedSlotMutationKind,
+        container: Place,
+        payload: Ty,
+    },
+    ExposureRebuild {
+        owner_place: Place,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckedSlotMutationKind {
+    Take,
+    Put,
 }
 
 impl CheckedMutation {
@@ -154,6 +223,7 @@ impl CheckedMutation {
             Self::DirectWrite { place } => place,
             Self::UniqueLoan(transition) => &transition.place,
             Self::OptionTake { source, .. } => source,
+            Self::Slot { container, .. } => container,
             Self::ExposureRebuild { owner_place } => owner_place,
         }
     }
@@ -171,6 +241,7 @@ pub(crate) struct CheckedLoopEffects {
 pub(crate) struct CheckedOwnershipPlan {
     pub(crate) calls: CheckedCallTransitions,
     option_takes: HashMap<EffectSiteKey, CheckedOptionTake>,
+    slot_transitions: HashMap<EffectSiteKey, CheckedSlotTransition>,
     exposures: HashMap<EffectSiteKey, CheckedExposure>,
     sealed_operations: HashMap<EffectSiteKey, CheckedSealedOperation>,
     loops: HashMap<EffectSiteKey, CheckedLoopEffects>,
@@ -194,6 +265,30 @@ impl CheckedOwnershipPlan {
         owner: &CallOwner,
     ) -> impl Iterator<Item = (&EffectSiteKey, &CheckedOptionTake)> {
         self.option_takes
+            .iter()
+            .filter(move |(key, _)| &key.owner == owner)
+    }
+
+    pub(crate) fn insert_slot_transition(
+        &mut self,
+        transition: CheckedSlotTransition,
+    ) -> Result<(), EffectSiteKey> {
+        insert_exact(
+            &mut self.slot_transitions,
+            transition.key.clone(),
+            transition,
+        )
+    }
+
+    pub(crate) fn slot_transition(&self, key: &EffectSiteKey) -> Option<&CheckedSlotTransition> {
+        self.slot_transitions.get(key)
+    }
+
+    pub(crate) fn slot_transitions_for_owner(
+        &self,
+        owner: &CallOwner,
+    ) -> impl Iterator<Item = (&EffectSiteKey, &CheckedSlotTransition)> {
+        self.slot_transitions
             .iter()
             .filter(move |(key, _)| &key.owner == owner)
     }
@@ -297,6 +392,22 @@ impl CheckedOwnershipPlan {
     }
 
     #[cfg(test)]
+    pub(crate) fn slot_transition_mut(
+        &mut self,
+        key: &EffectSiteKey,
+    ) -> Option<&mut CheckedSlotTransition> {
+        self.slot_transitions.get_mut(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_slot_transition(
+        &mut self,
+        key: &EffectSiteKey,
+    ) -> Option<CheckedSlotTransition> {
+        self.slot_transitions.remove(key)
+    }
+
+    #[cfg(test)]
     pub(crate) fn exposure_mut(&mut self, key: &EffectSiteKey) -> Option<&mut CheckedExposure> {
         self.exposures.get_mut(key)
     }
@@ -395,6 +506,24 @@ mod tests {
         assert_eq!(
             plan.insert_option_take(option_take)
                 .expect_err("duplicate option-take identities fail closed"),
+            key()
+        );
+
+        let slot_transition = CheckedSlotTransition {
+            key: key(),
+            op_span: Span::new(10, 15),
+            payload: Ty::Int(crate::ast::IntTy::U64),
+            result_ty: Ty::slots(Ty::Int(crate::ast::IntTy::U64)),
+            kind: CheckedSlotTransitionKind::Alloc {
+                length_ty: Ty::Int(crate::ast::IntTy::U64),
+                length_span: Span::new(16, 17),
+            },
+        };
+        plan.insert_slot_transition(slot_transition.clone())
+            .expect("the first slot-transition identity is unique");
+        assert_eq!(
+            plan.insert_slot_transition(slot_transition)
+                .expect_err("duplicate slot-transition identities fail closed"),
             key()
         );
 

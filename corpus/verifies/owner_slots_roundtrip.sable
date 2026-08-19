@@ -1,0 +1,10 @@
+// The proof model tracks each cell as Option<T>: allocation starts empty,
+// put establishes presence, and take atomically restores emptiness.
+
+/// post #[label(roundtrip)] result = value
+fn owner_slots_roundtrip(u64 value) -> u64 {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    slot_put(&mut cells, 0, value);
+    u64 restored = slot_take(&mut cells, 0);
+    return restored;
+}

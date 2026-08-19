@@ -1,0 +1,19 @@
+class SlotItem {
+    u64 value;
+
+    /// invariant value <= 10
+
+    /// pre value <= 10
+    init new(u64 value) {
+        self.value = value;
+    }
+}
+
+/// pre value <= 10
+fn owner_slots_class_roundtrip(u64 value) -> SlotItem {
+    mut slots<SlotItem> cells = alloc_slots<SlotItem>(1);
+    var item = SlotItem::new(value);
+    slot_put(&mut cells, 0, item);
+    var restored = slot_take(&mut cells, 0);
+    return restored;
+}

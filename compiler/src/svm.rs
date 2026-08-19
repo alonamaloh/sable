@@ -2801,6 +2801,9 @@ fn validate_checked_value_drop_action(
     fn validate_class_leaves(action: &ValueDropAction, role: &str) -> Result<(), String> {
         match action.recipe() {
             ValueDropRecipe::ReleaseArray { .. } => Ok(()),
+            ValueDropRecipe::ReleaseSlots { .. } => Err(format!(
+                "svm.slots_cleanup_unsupported: retained {role} owner-slot cleanup is outside the SVM core subset"
+            )),
             ValueDropRecipe::DropPresent(payload) => validate_class_leaves(payload, role),
             ValueDropRecipe::DropClass(class) => {
                 let route = class.terminal_trap_route();

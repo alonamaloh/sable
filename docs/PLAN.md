@@ -48,10 +48,11 @@ control outline drives the checker and is sealed into the retained structured
 plan consumed by VC, SVM, interpreter, and LLVM. Exact local/field replacement
 and discarded-class-temporary actions link checker transfers, staging, cleanup,
 and terminal class-drop recipes across those consumers. All six C0 criteria are
-closed. **G3's first compiler tranche is complete:** a direct ordinary class may
-be a generic argument; any such owner instance is independently checked with
-`ProofReuse::None`, while all-integer instances retain their legacy names and
-ADR 0009 proof reuse. Owner slots and the `Vec` movement API remain in progress.
+closed. **G3's first semantic spine is now in place:** direct ordinary classes
+may be generic arguments without integer proof reuse, and `slots<T>` has one
+checker-authored ownership/control plan plus a distinct `Seq (Option T)` VC
+model for allocation, take, put, cleanup, and loop havoc. Interpreter, formal
+SVM, native lowering, and the `Vec` movement API remain in progress.
 
 Standing decisions (see `decisions/`): compiler in Rust; Lean is the elaborator and checker of record for the proof language from day 1 (no interim SMT dialect); error-message quality and early LSP are priorities because LLMs write most Sable code; repo private until there is something to show.
 
@@ -2017,19 +2018,22 @@ C0 is the explicit consolidation gate before the later G3/G4 feature work:
      expression CFG or a mechanized source-translation proof, and stages may
      still refuse shapes outside their admitted subsets.
 
-   - **G3 — slots and `Vec` (in progress; ADR 0093):** two compiler tranches
+   - **G3 — slots and `Vec` (in progress; ADR 0093):** three compiler tranches
      are complete. Direct ordinary classes are generic arguments, with final
      identities, injective structural names, no integer proof reuse for owner
      instances, and nested generic-class arguments still closed. The compiler
      now also retains a distinct affine `slots<T>` / `GenericTy::Slots`
-     representation, parses `alloc_slots`, `slot_take`, `slot_put`, and
-     structural `.len`, and closes every checker, control, proof, interpreter,
-     SVM, transition, and native boundary with stable diagnostics. This is
-     representation, not execution: no slot operation, cleanup recipe, ABI,
-     parameter, return, proof model, or runtime value is admitted yet. Next,
-     seal checker-owned slot actions and implement recursive cleanup plus VC
-     and interpreter semantics. Ordinary `[T]` remains copy-element storage;
-     Vec's owner-capable API does not add a shared copying `get` or broaden the
+     representation and parses `alloc_slots`, `slot_take`, `slot_put`, and
+     structural `.len`. The checker authors exact slot transitions, transfers,
+     loop mutations, and operation-local direct-`self` loans; the retained
+     control plan seals staging, traps, recursive reverse cleanup, and exact
+     action identity. VC generation consumes that handoff as a distinct
+     `Seq (Option T)` state, including empty allocation, occupancy guards,
+     class-invariant transport, and whole-container loop havoc. Interpreter,
+     SVM, transition certificates/call ABI, and native lowering remain
+     fail-closed with stable diagnostics. Next, implement the interpreter and
+     lifecycle corpus. Ordinary `[T]` remains copy-element storage; Vec's
+     owner-capable API does not add a shared copying `get` or broaden the
      affine-option ABI.
    - **G4 — `HashMap`:** exercise the completed generic aggregate stack with
      key/value storage, probing, and its existing verified contracts.

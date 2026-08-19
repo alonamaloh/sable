@@ -12,10 +12,10 @@
 
 use crate::ast::{
     BinOp, ClassDecl, Expr, ExprKind, IntTy, Mutability, Param, Program, RawOp, ResKind, ResOp,
-    Stmt, Ty, UnOp,
+    SlotOp, Stmt, Ty, UnOp,
 };
 use crate::ownership::{EffectSiteKey, ValueTransferKey, ValueTransferSink};
-use crate::place::Place;
+use crate::place::{BorrowedPlace, Place};
 use crate::scan::{Clause, ClauseKind};
 use crate::span::Span;
 use crate::transition::CallOwner;
@@ -843,6 +843,7 @@ pub(crate) enum CompilerTempKind {
     ReturnValue,
     AssignmentValue,
     FieldAssignmentValue,
+    SlotPutValue,
     DiscardedClassValue,
     ExposureLoan,
     ExposureIndex,
@@ -929,7 +930,16 @@ pub(crate) struct ValueDropAction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ValueDropRecipe {
-    ReleaseArray { element: Ty },
+    ReleaseArray {
+        element: Ty,
+    },
+    /// Destroy each dynamically occupied cell in descending index order,
+    /// neutralizing it before recursively applying `occupied`, then release
+    /// the allocation. `None` means the payload itself needs no destruction.
+    ReleaseSlots {
+        payload: Ty,
+        occupied: Option<Box<ValueDropAction>>,
+    },
     DropClass(ClassDropAction),
     DropPresent(Box<ValueDropAction>),
 }
@@ -950,14 +960,37 @@ impl ValueDropAction {
             Ty::Array(element) => ValueDropRecipe::ReleaseArray {
                 element: element.as_ref().clone(),
             },
-            Ty::Slots(_) => {
-                return Err(PlanError {
-                    span,
-                    message: format!(
-                        "internal.control.slots_unsupported: `{}` has no sealed occupied-cell cleanup recipe",
-                        ty.name()
-                    ),
-                });
+            Ty::Slots(payload) => {
+                match payload.as_ref() {
+                    Ty::Int(
+                        IntTy::U8
+                        | IntTy::U16
+                        | IntTy::U32
+                        | IntTy::U64
+                        | IntTy::I8
+                        | IntTy::I16
+                        | IntTy::I32
+                        | IntTy::I64,
+                    )
+                    | Ty::Bool
+                    | Ty::Param(_)
+                    | Ty::Record(_)
+                    | Ty::Class(_) => {}
+                    _ => {
+                        return Err(PlanError {
+                            span,
+                            message: format!(
+                                "internal.control.slot_payload_unsupported: `{}` is outside the sealed occupied-cell cleanup family",
+                                payload.name()
+                            ),
+                        });
+                    }
+                }
+                let occupied = Self::build(payload, span)?.map(Box::new);
+                ValueDropRecipe::ReleaseSlots {
+                    payload: payload.as_ref().clone(),
+                    occupied,
+                }
             }
             Ty::Option(payload) if payload.as_owned_slots().is_some() => {
                 return Err(PlanError {
@@ -1082,6 +1115,90 @@ pub(crate) struct TemporaryDropAction {
     drop_action: ValueDropAction,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SlotActionKey {
+    scope: ScopeId,
+    span: Span,
+}
+
+/// Exact checked shape of one owner-slot operation.
+///
+/// A put's `staging` is not optional: consumers evaluate the incoming value
+/// into that place before consulting the bounds/occupancy trap sites, then
+/// install it only after both guards succeed. The retained transfer key binds
+/// that staged value to the checker's affine move record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SlotActionKind {
+    Alloc {
+        length_span: Span,
+    },
+    Take {
+        container: Place,
+        container_span: Span,
+        index_span: Span,
+    },
+    Put {
+        container: Place,
+        container_span: Span,
+        index_span: Span,
+        value_span: Span,
+        value_transfer: ValueTransferKey,
+        staging: Place,
+    },
+}
+
+/// Retained control action for one exact checker-admitted slot transition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlotAction {
+    scope: ScopeId,
+    span: Span,
+    effect_key: EffectSiteKey,
+    op_span: Span,
+    payload: Ty,
+    result_ty: Ty,
+    kind: SlotActionKind,
+    trap_keys: Vec<TrapSiteKey>,
+}
+
+impl SlotAction {
+    pub(crate) const fn scope(&self) -> ScopeId {
+        self.scope
+    }
+
+    pub(crate) const fn span(&self) -> Span {
+        self.span
+    }
+
+    pub(crate) fn effect_key(&self) -> &EffectSiteKey {
+        &self.effect_key
+    }
+
+    pub(crate) const fn op_span(&self) -> Span {
+        self.op_span
+    }
+
+    pub(crate) fn payload(&self) -> &Ty {
+        &self.payload
+    }
+
+    pub(crate) fn result_ty(&self) -> &Ty {
+        &self.result_ty
+    }
+
+    pub(crate) fn kind(&self) -> &SlotActionKind {
+        &self.kind
+    }
+
+    pub(crate) fn container(&self) -> Option<&Place> {
+        match &self.kind {
+            SlotActionKind::Alloc { .. } => None,
+            SlotActionKind::Take { container, .. } | SlotActionKind::Put { container, .. } => {
+                Some(container)
+            }
+        }
+    }
+}
+
 /// The two distinct failure edges of a native owned-array allocation.
 ///
 /// A requested logical length above the language cap is different from a
@@ -1121,6 +1238,26 @@ enum TrapSiteKind {
     ArrayAllocation {
         element: Ty,
         phase: AllocationTrapPhase,
+    },
+    SlotAllocation {
+        payload: Ty,
+        phase: AllocationTrapPhase,
+    },
+    SlotTakeBounds {
+        container: Place,
+        payload: Ty,
+    },
+    SlotTakeEmpty {
+        container: Place,
+        payload: Ty,
+    },
+    SlotPutBounds {
+        container: Place,
+        payload: Ty,
+    },
+    SlotPutOccupied {
+        container: Place,
+        payload: Ty,
     },
     ArrayIndex {
         array: String,
@@ -1856,6 +1993,7 @@ struct BodyInventory {
     assignments: HashSet<AssignmentKey>,
     field_assignments: HashSet<FieldAssignmentKey>,
     temporary_drops: HashSet<TemporaryDropKey>,
+    slot_actions: HashSet<SlotActionKey>,
     returns: HashSet<(Span, ScopeId)>,
     compiler_temps: HashSet<CompilerTempKey>,
     traps: Vec<TrapSiteKey>,
@@ -1924,6 +2062,8 @@ pub(crate) struct BodyPlan {
     field_assignment_ids: HashMap<FieldAssignmentKey, usize>,
     temporary_drops: Vec<TemporaryDropAction>,
     temporary_drop_ids: HashMap<TemporaryDropKey, usize>,
+    slot_actions: Vec<SlotAction>,
+    slot_action_ids: HashMap<SlotActionKey, usize>,
     return_sites: HashSet<(Span, ScopeId)>,
     trap_sites: Vec<TrapSite>,
     trap_site_ids: HashMap<TrapSiteKey, usize>,
@@ -2000,6 +2140,8 @@ impl BodyPlan {
                 field_assignment_ids: HashMap::new(),
                 temporary_drops: Vec::new(),
                 temporary_drop_ids: HashMap::new(),
+                slot_actions: Vec::new(),
+                slot_action_ids: HashMap::new(),
                 return_sites: HashSet::new(),
                 trap_sites: Vec::new(),
                 trap_site_ids: HashMap::new(),
@@ -2021,6 +2163,7 @@ impl BodyPlan {
             )?;
         }
         builder.walk_block(body, outline.body_scope())?;
+        builder.walk_slot_actions_block(body, outline.body_scope())?;
         let mut plan = builder.plan;
         plan.seal_structural_edges(outline, body, outline.body_block())?;
         plan.seal_trap_sites(body)?;
@@ -2537,6 +2680,7 @@ impl BodyPlan {
             }
         }
         self.inventory_block(body, self.body_scope, &mut inventory)?;
+        self.inventory_slot_actions_block(body, self.body_scope, &mut inventory)?;
 
         if inventory.scopes.len() != self.scopes.len() {
             let missing = self
@@ -2668,6 +2812,18 @@ impl BodyPlan {
                 span: missing.span,
                 message: "checked body no longer contains its planned discarded class temporary"
                     .into(),
+            });
+        }
+        if inventory.slot_actions.len() != self.slot_actions.len() {
+            let missing = self
+                .slot_action_ids
+                .iter()
+                .find(|(key, _)| !inventory.slot_actions.contains(key))
+                .map(|(key, _)| *key)
+                .expect("slot-action counts differ");
+            return Err(PlanError {
+                span: missing.span,
+                message: "checked body no longer contains its planned slot action".into(),
             });
         }
         if inventory.returns.len() != self.return_sites.len() {
@@ -3651,6 +3807,105 @@ impl BodyPlan {
         self.field_assignments.iter()
     }
 
+    /// Resolve and fully reconcile one retained owner-slot operation.
+    pub(crate) fn slot_action(
+        &self,
+        scope: ScopeId,
+        expression: &Expr,
+    ) -> Result<&SlotAction, PlanError> {
+        let key = SlotActionKey {
+            scope,
+            span: expression.span,
+        };
+        let Some(index) = self.slot_action_ids.get(&key) else {
+            return Err(PlanError {
+                span: expression.span,
+                message: "control plan has no slot action at this span in the active lexical scope"
+                    .into(),
+            });
+        };
+        let action = self.slot_actions.get(*index).ok_or_else(|| PlanError {
+            span: expression.span,
+            message: "slot-action index no longer resolves to a retained action".into(),
+        })?;
+        let checked = checked_slot_expression(expression)?;
+        let expected_kind = match checked.kind {
+            CheckedSlotExpressionKind::Alloc { length_span } => {
+                SlotActionKind::Alloc { length_span }
+            }
+            CheckedSlotExpressionKind::Take {
+                container,
+                container_span,
+                index_span,
+            } => SlotActionKind::Take {
+                container,
+                container_span,
+                index_span,
+            },
+            CheckedSlotExpressionKind::Put {
+                container,
+                container_span,
+                index_span,
+                value_span,
+            } => SlotActionKind::Put {
+                value_transfer: ValueTransferKey {
+                    owner: self.owner.clone(),
+                    span: value_span,
+                    sink: ValueTransferSink::SlotPut(container.clone()),
+                },
+                staging: self
+                    .compiler_temp(scope, expression.span, CompilerTempKind::SlotPutValue)?
+                    .clone(),
+                container,
+                container_span,
+                index_span,
+                value_span,
+            },
+        };
+        let expected_traps: Vec<TrapSiteKey> = direct_expression_traps(expression)?
+            .into_iter()
+            .map(|(span, kind)| TrapSiteKey { scope, span, kind })
+            .collect();
+        let expected_effect = EffectSiteKey {
+            owner: self.owner.clone(),
+            span: expression.span,
+        };
+        if action.scope != scope
+            || action.span != expression.span
+            || action.effect_key != expected_effect
+            || action.op_span != checked.op_span
+            || action.payload != checked.payload
+            || action.result_ty != checked.result_ty
+            || action.kind != expected_kind
+            || action.trap_keys != expected_traps
+        {
+            return Err(PlanError {
+                span: expression.span,
+                message: "slot action no longer matches its checked operation, transfer, staging, or trap identities"
+                    .into(),
+            });
+        }
+        for trap in &action.trap_keys {
+            self.trap_site(trap.scope, trap.span, trap.kind.clone())?;
+        }
+        Ok(action)
+    }
+
+    pub(crate) fn slot_action_trap_sites(
+        &self,
+        action: &SlotAction,
+    ) -> Result<Vec<&TrapSite>, PlanError> {
+        action
+            .trap_keys
+            .iter()
+            .map(|key| self.trap_site(key.scope, key.span, key.kind.clone()))
+            .collect()
+    }
+
+    pub(crate) fn slot_actions(&self) -> impl ExactSizeIterator<Item = &SlotAction> {
+        self.slot_actions.iter()
+    }
+
     /// Resolve a discarded fresh class value and its statement-end drop.
     pub(crate) fn temporary_drop(
         &self,
@@ -4179,6 +4434,294 @@ impl BodyPlan {
         Ok(())
     }
 
+    fn inventory_slot_action(
+        &self,
+        expression: &Expr,
+        scope: ScopeId,
+        position: SlotExpressionPosition,
+        inventory: &mut BodyInventory,
+    ) -> Result<(), PlanError> {
+        let ExprKind::SlotOp { op, args, .. } = &expression.kind else {
+            return self.inventory_slot_actions_expression(
+                expression,
+                scope,
+                SlotExpressionPosition::Nested,
+                inventory,
+            );
+        };
+        validate_slot_expression_position(op, position, expression.span)?;
+        let key = SlotActionKey {
+            scope,
+            span: expression.span,
+        };
+        if !inventory.slot_actions.insert(key) {
+            return Err(PlanError {
+                span: expression.span,
+                message: "two slot operations reuse one checked structural identity".into(),
+            });
+        }
+        let action = self.slot_action(scope, expression)?;
+        if let SlotActionKind::Put { staging, .. } = action.kind() {
+            let expected = self.inventory_compiler_temp(
+                scope,
+                expression.span,
+                CompilerTempKind::SlotPutValue,
+                false,
+                inventory,
+            )?;
+            if staging != &expected {
+                return Err(PlanError {
+                    span: expression.span,
+                    message: "slot-put staging no longer matches its exact compiler temporary"
+                        .into(),
+                });
+            }
+        }
+        for argument in args {
+            self.inventory_slot_actions_expression(
+                argument,
+                scope,
+                SlotExpressionPosition::Nested,
+                inventory,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn inventory_slot_actions_expression(
+        &self,
+        expression: &Expr,
+        scope: ScopeId,
+        position: SlotExpressionPosition,
+        inventory: &mut BodyInventory,
+    ) -> Result<(), PlanError> {
+        if matches!(expression.kind, ExprKind::SlotOp { .. }) {
+            return self.inventory_slot_action(expression, scope, position, inventory);
+        }
+        match &expression.kind {
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Widen { arg: operand, .. }
+            | ExprKind::Narrow { arg: operand, .. }
+            | ExprKind::IsSome { operand }
+            | ExprKind::OptValue { operand }
+            | ExprKind::SomeE(operand) => self.inventory_slot_actions_expression(
+                operand,
+                scope,
+                SlotExpressionPosition::Nested,
+                inventory,
+            )?,
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.inventory_slot_actions_expression(
+                    lhs,
+                    scope,
+                    SlotExpressionPosition::Nested,
+                    inventory,
+                )?;
+                self.inventory_slot_actions_expression(
+                    rhs,
+                    scope,
+                    SlotExpressionPosition::Nested,
+                    inventory,
+                )?;
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::RawOp { args, .. }
+            | ExprKind::DeviceOp { args, .. }
+            | ExprKind::ResOp { args, .. }
+            | ExprKind::CtorCall { args, .. }
+            | ExprKind::TraitCall { args, .. }
+            | ExprKind::MethodCall { args, .. }
+            | ExprKind::RecordLit { args, .. }
+            | ExprKind::ArrayLit(args) => {
+                for argument in args {
+                    self.inventory_slot_actions_expression(
+                        argument,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                        inventory,
+                    )?;
+                }
+            }
+            ExprKind::Index { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. } => self.inventory_slot_actions_expression(
+                index,
+                scope,
+                SlotExpressionPosition::Nested,
+                inventory,
+            )?,
+            ExprKind::AllocArray { len, init, .. } => {
+                self.inventory_slot_actions_expression(
+                    len,
+                    scope,
+                    SlotExpressionPosition::Nested,
+                    inventory,
+                )?;
+                self.inventory_slot_actions_expression(
+                    init,
+                    scope,
+                    SlotExpressionPosition::Nested,
+                    inventory,
+                )?;
+            }
+            ExprKind::SlotOp { .. } => unreachable!("slot operations return above"),
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Var(_)
+            | ExprKind::Len { .. }
+            | ExprKind::OptTake { .. }
+            | ExprKind::NoneE
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::Borrow { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn inventory_slot_actions_block(
+        &self,
+        statements: &[Stmt],
+        scope: ScopeId,
+        inventory: &mut BodyInventory,
+    ) -> Result<(), PlanError> {
+        for statement in statements {
+            match statement {
+                Stmt::Decl { init, .. } => {
+                    if let Some(init) = init {
+                        self.inventory_slot_action(
+                            init,
+                            scope,
+                            SlotExpressionPosition::ExplicitLocal,
+                            inventory,
+                        )?;
+                    }
+                }
+                Stmt::VarDecl { init, .. } => self.inventory_slot_action(
+                    init,
+                    scope,
+                    SlotExpressionPosition::InferredLocal,
+                    inventory,
+                )?,
+                Stmt::Assign { value, .. } => self.inventory_slot_action(
+                    value,
+                    scope,
+                    SlotExpressionPosition::Assignment,
+                    inventory,
+                )?,
+                Stmt::Return { value, .. } => {
+                    if let Some(value) = value {
+                        self.inventory_slot_action(
+                            value,
+                            scope,
+                            SlotExpressionPosition::Return,
+                            inventory,
+                        )?;
+                    }
+                }
+                Stmt::ExprStmt(expression) => self.inventory_slot_action(
+                    expression,
+                    scope,
+                    SlotExpressionPosition::Statement,
+                    inventory,
+                )?,
+                Stmt::FieldAssign { value, .. } => self.inventory_slot_action(
+                    value,
+                    scope,
+                    SlotExpressionPosition::FieldAssignment,
+                    inventory,
+                )?,
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    self.inventory_slot_actions_expression(
+                        cond,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                        inventory,
+                    )?;
+                    let then_scope = self.checked_child_scope(
+                        ScopeKind::BranchArm(BranchArm::Then),
+                        cond.span,
+                        scope,
+                    )?;
+                    self.inventory_slot_actions_block(then_block, then_scope, inventory)?;
+                    if let Some(else_block) = else_block {
+                        let else_scope = self.checked_child_scope(
+                            ScopeKind::BranchArm(BranchArm::Else),
+                            cond.span,
+                            scope,
+                        )?;
+                        self.inventory_slot_actions_block(else_block, else_scope, inventory)?;
+                    }
+                }
+                Stmt::While {
+                    cond,
+                    kw_span,
+                    body,
+                    ..
+                } => {
+                    self.inventory_slot_actions_expression(
+                        cond,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                        inventory,
+                    )?;
+                    let body_scope =
+                        self.checked_child_scope(ScopeKind::LoopBody, *kw_span, scope)?;
+                    self.inventory_slot_actions_block(body, body_scope, inventory)?;
+                }
+                Stmt::Unsafe { body, .. } => {
+                    self.inventory_slot_actions_block(body, scope, inventory)?;
+                }
+                Stmt::Expose { kw_span, body, .. } => {
+                    let exposure =
+                        self.checked_child_scope(ScopeKind::Exposure, *kw_span, scope)?;
+                    self.inventory_slot_actions_block(body, exposure, inventory)?;
+                }
+                Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                    self.inventory_slot_actions_expression(
+                        index,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                        inventory,
+                    )?;
+                    self.inventory_slot_actions_expression(
+                        value,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                        inventory,
+                    )?;
+                }
+                Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => self
+                    .inventory_slot_actions_expression(
+                        size,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                        inventory,
+                    )?,
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
+                    for expression in [ptr, res, release] {
+                        self.inventory_slot_actions_expression(
+                            expression,
+                            scope,
+                            SlotExpressionPosition::Nested,
+                            inventory,
+                        )?;
+                    }
+                }
+                Stmt::Assert(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     fn inventory_expression(
         &self,
         expression: &Expr,
@@ -4540,6 +5083,12 @@ impl ControlProgram {
         }
         match action.recipe() {
             ValueDropRecipe::ReleaseArray { .. } => Ok(()),
+            ValueDropRecipe::ReleaseSlots { occupied, .. } => {
+                if let Some(occupied) = occupied {
+                    self.validate_value_drop_action(occupied, classes, use_span)?;
+                }
+                Ok(())
+            }
             ValueDropRecipe::DropClass(class) => {
                 self.class_drop_for_action(class, classes, use_span)?;
                 Ok(())
@@ -4916,6 +5465,260 @@ impl PlanBuilder {
         Ok(())
     }
 
+    fn slot_action(
+        &mut self,
+        scope: ScopeId,
+        expression: &Expr,
+        position: SlotExpressionPosition,
+    ) -> Result<(), PlanError> {
+        let ExprKind::SlotOp { op, args, .. } = &expression.kind else {
+            return self.walk_slot_actions_expression(
+                expression,
+                scope,
+                SlotExpressionPosition::Nested,
+            );
+        };
+        validate_slot_expression_position(op, position, expression.span)?;
+        let checked = checked_slot_expression(expression)?;
+        let key = SlotActionKey {
+            scope,
+            span: expression.span,
+        };
+        if self.plan.slot_action_ids.contains_key(&key) {
+            return Err(PlanError {
+                span: expression.span,
+                message:
+                    "duplicate slot-operation span in one lexical scope has no stable control identity"
+                        .into(),
+            });
+        }
+        let kind = match checked.kind {
+            CheckedSlotExpressionKind::Alloc { length_span } => {
+                SlotActionKind::Alloc { length_span }
+            }
+            CheckedSlotExpressionKind::Take {
+                container,
+                container_span,
+                index_span,
+            } => SlotActionKind::Take {
+                container,
+                container_span,
+                index_span,
+            },
+            CheckedSlotExpressionKind::Put {
+                container,
+                container_span,
+                index_span,
+                value_span,
+            } => {
+                let staging = self.compiler_temp(
+                    scope,
+                    expression.span,
+                    CompilerTempKind::SlotPutValue,
+                    false,
+                )?;
+                SlotActionKind::Put {
+                    value_transfer: ValueTransferKey {
+                        owner: self.plan.owner.clone(),
+                        span: value_span,
+                        sink: ValueTransferSink::SlotPut(container.clone()),
+                    },
+                    staging,
+                    container,
+                    container_span,
+                    index_span,
+                    value_span,
+                }
+            }
+        };
+        let trap_keys = direct_expression_traps(expression)?
+            .into_iter()
+            .map(|(span, kind)| TrapSiteKey { scope, span, kind })
+            .collect();
+        let action = SlotAction {
+            scope,
+            span: expression.span,
+            effect_key: EffectSiteKey {
+                owner: self.plan.owner.clone(),
+                span: expression.span,
+            },
+            op_span: checked.op_span,
+            payload: checked.payload,
+            result_ty: checked.result_ty,
+            kind,
+            trap_keys,
+        };
+        let index = self.plan.slot_actions.len();
+        self.plan.slot_actions.push(action);
+        self.plan.slot_action_ids.insert(key, index);
+        for argument in args {
+            self.walk_slot_actions_expression(argument, scope, SlotExpressionPosition::Nested)?;
+        }
+        Ok(())
+    }
+
+    fn walk_slot_actions_expression(
+        &mut self,
+        expression: &Expr,
+        scope: ScopeId,
+        position: SlotExpressionPosition,
+    ) -> Result<(), PlanError> {
+        if matches!(expression.kind, ExprKind::SlotOp { .. }) {
+            return self.slot_action(scope, expression, position);
+        }
+        match &expression.kind {
+            ExprKind::Unary { operand, .. }
+            | ExprKind::Widen { arg: operand, .. }
+            | ExprKind::Narrow { arg: operand, .. }
+            | ExprKind::IsSome { operand }
+            | ExprKind::OptValue { operand }
+            | ExprKind::SomeE(operand) => {
+                self.walk_slot_actions_expression(operand, scope, SlotExpressionPosition::Nested)?
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.walk_slot_actions_expression(lhs, scope, SlotExpressionPosition::Nested)?;
+                self.walk_slot_actions_expression(rhs, scope, SlotExpressionPosition::Nested)?;
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::RawOp { args, .. }
+            | ExprKind::DeviceOp { args, .. }
+            | ExprKind::ResOp { args, .. }
+            | ExprKind::CtorCall { args, .. }
+            | ExprKind::TraitCall { args, .. }
+            | ExprKind::MethodCall { args, .. }
+            | ExprKind::RecordLit { args, .. }
+            | ExprKind::ArrayLit(args) => {
+                for argument in args {
+                    self.walk_slot_actions_expression(
+                        argument,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                    )?;
+                }
+            }
+            ExprKind::Index { index, .. }
+            | ExprKind::SelfFieldIndex { index, .. }
+            | ExprKind::ClassFieldIndex { index, .. } => {
+                self.walk_slot_actions_expression(index, scope, SlotExpressionPosition::Nested)?
+            }
+            ExprKind::AllocArray { len, init, .. } => {
+                self.walk_slot_actions_expression(len, scope, SlotExpressionPosition::Nested)?;
+                self.walk_slot_actions_expression(init, scope, SlotExpressionPosition::Nested)?;
+            }
+            ExprKind::SlotOp { .. } => unreachable!("slot operations return above"),
+            ExprKind::IntLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::Var(_)
+            | ExprKind::Len { .. }
+            | ExprKind::OptTake { .. }
+            | ExprKind::NoneE
+            | ExprKind::SelfField { .. }
+            | ExprKind::SelfFieldLen { .. }
+            | ExprKind::ClassField { .. }
+            | ExprKind::RecordField { .. }
+            | ExprKind::ClassFieldLen { .. }
+            | ExprKind::Borrow { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn walk_slot_actions_block(
+        &mut self,
+        statements: &[Stmt],
+        scope: ScopeId,
+    ) -> Result<(), PlanError> {
+        for statement in statements {
+            match statement {
+                Stmt::Decl { init, .. } => {
+                    if let Some(init) = init {
+                        self.slot_action(scope, init, SlotExpressionPosition::ExplicitLocal)?;
+                    }
+                }
+                Stmt::VarDecl { init, .. } => {
+                    self.slot_action(scope, init, SlotExpressionPosition::InferredLocal)?;
+                }
+                Stmt::Assign { value, .. } => {
+                    self.slot_action(scope, value, SlotExpressionPosition::Assignment)?;
+                }
+                Stmt::Return { value, .. } => {
+                    if let Some(value) = value {
+                        self.slot_action(scope, value, SlotExpressionPosition::Return)?;
+                    }
+                }
+                Stmt::ExprStmt(expression) => {
+                    self.slot_action(scope, expression, SlotExpressionPosition::Statement)?;
+                }
+                Stmt::FieldAssign { value, .. } => {
+                    self.slot_action(scope, value, SlotExpressionPosition::FieldAssignment)?;
+                }
+                Stmt::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    self.walk_slot_actions_expression(cond, scope, SlotExpressionPosition::Nested)?;
+                    let then_scope = self.outlined_scope(
+                        ScopeKind::BranchArm(BranchArm::Then),
+                        cond.span,
+                        scope,
+                    )?;
+                    self.walk_slot_actions_block(then_block, then_scope)?;
+                    if let Some(else_block) = else_block {
+                        let else_scope = self.outlined_scope(
+                            ScopeKind::BranchArm(BranchArm::Else),
+                            cond.span,
+                            scope,
+                        )?;
+                        self.walk_slot_actions_block(else_block, else_scope)?;
+                    }
+                }
+                Stmt::While {
+                    cond,
+                    kw_span,
+                    body,
+                    ..
+                } => {
+                    self.walk_slot_actions_expression(cond, scope, SlotExpressionPosition::Nested)?;
+                    let body_scope = self.outlined_scope(ScopeKind::LoopBody, *kw_span, scope)?;
+                    self.walk_slot_actions_block(body, body_scope)?;
+                }
+                Stmt::Unsafe { body, .. } => self.walk_slot_actions_block(body, scope)?,
+                Stmt::Expose { kw_span, body, .. } => {
+                    let exposure = self.outlined_scope(ScopeKind::Exposure, *kw_span, scope)?;
+                    self.walk_slot_actions_block(body, exposure)?;
+                }
+                Stmt::FieldStore { index, value, .. } | Stmt::Store { index, value, .. } => {
+                    self.walk_slot_actions_expression(
+                        index,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                    )?;
+                    self.walk_slot_actions_expression(
+                        value,
+                        scope,
+                        SlotExpressionPosition::Nested,
+                    )?;
+                }
+                Stmt::StaticAlloc { size, .. } | Stmt::SystemAlloc { size, .. } => {
+                    self.walk_slot_actions_expression(size, scope, SlotExpressionPosition::Nested)?;
+                }
+                Stmt::SystemDealloc {
+                    ptr, res, release, ..
+                } => {
+                    for expression in [ptr, res, release] {
+                        self.walk_slot_actions_expression(
+                            expression,
+                            scope,
+                            SlotExpressionPosition::Nested,
+                        )?;
+                    }
+                }
+                Stmt::Assert(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     fn compiler_temp(
         &mut self,
         scope: ScopeId,
@@ -4938,6 +5741,7 @@ impl PlanBuilder {
             CompilerTempKind::ReturnValue => "return",
             CompilerTempKind::AssignmentValue => "assignment",
             CompilerTempKind::FieldAssignmentValue => "field_assignment",
+            CompilerTempKind::SlotPutValue => "slot_put_value",
             CompilerTempKind::DiscardedClassValue => "discarded_class",
             CompilerTempKind::ExposureLoan => "exposure_loan",
             CompilerTempKind::ExposureIndex => "exposure_index",
@@ -4949,6 +5753,7 @@ impl PlanBuilder {
             CompilerTempKind::ReturnValue
             | CompilerTempKind::AssignmentValue
             | CompilerTempKind::FieldAssignmentValue
+            | CompilerTempKind::SlotPutValue
             | CompilerTempKind::DiscardedClassValue
             | CompilerTempKind::ExposureLoan
             | CompilerTempKind::ExposureIndex
@@ -5166,17 +5971,297 @@ fn checked_integer_ty(expression: &Expr, role: &str) -> Result<IntTy, PlanError>
 /// checker's bounded infallible source in the interpreter. Their operational
 /// trap-bearing counterparts below are allocation expressions, explicit
 /// system deallocation, and exposure close.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CheckedSlotExpressionKind {
+    Alloc {
+        length_span: Span,
+    },
+    Take {
+        container: Place,
+        container_span: Span,
+        index_span: Span,
+    },
+    Put {
+        container: Place,
+        container_span: Span,
+        index_span: Span,
+        value_span: Span,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckedSlotExpression {
+    op_span: Span,
+    payload: Ty,
+    result_ty: Ty,
+    kind: CheckedSlotExpressionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotExpressionPosition {
+    ExplicitLocal,
+    InferredLocal,
+    Assignment,
+    Return,
+    FieldAssignment,
+    Statement,
+    Nested,
+}
+
+fn validate_slot_expression_position(
+    op: &SlotOp,
+    position: SlotExpressionPosition,
+    span: Span,
+) -> Result<(), PlanError> {
+    let admitted = match op {
+        SlotOp::Alloc { .. } => matches!(
+            position,
+            SlotExpressionPosition::ExplicitLocal | SlotExpressionPosition::FieldAssignment
+        ),
+        SlotOp::Take => !matches!(
+            position,
+            SlotExpressionPosition::Statement | SlotExpressionPosition::Nested
+        ),
+        SlotOp::Put => position == SlotExpressionPosition::Statement,
+    };
+    if admitted {
+        return Ok(());
+    }
+    Err(PlanError {
+        span,
+        message: format!(
+            "checked `{}` moved outside its admitted direct ownership position",
+            op.name()
+        ),
+    })
+}
+
+fn checked_slot_payload(payload: &Ty, span: Span) -> Result<(), PlanError> {
+    if matches!(
+        payload,
+        Ty::Int(
+            IntTy::U8
+                | IntTy::U16
+                | IntTy::U32
+                | IntTy::U64
+                | IntTy::I8
+                | IntTy::I16
+                | IntTy::I32
+                | IntTy::I64
+        ) | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Record(_)
+            | Ty::Class(_)
+    ) {
+        return Ok(());
+    }
+    Err(PlanError {
+        span,
+        message: format!(
+            "internal.control.slot_payload_unsupported: `{}` is outside the checked slot payload family",
+            payload.name()
+        ),
+    })
+}
+
+fn checked_slot_container(argument: &Expr) -> Result<(Place, Ty), PlanError> {
+    let borrowed = BorrowedPlace::from_expr(argument).ok_or_else(|| PlanError {
+        span: argument.span,
+        message: "checked slot operation lost its explicit container borrow".into(),
+    })?;
+    if borrowed.mutability() != Mutability::Mut {
+        return Err(PlanError {
+            span: argument.span,
+            message: "checked slot operation no longer has a unique container borrow".into(),
+        });
+    }
+    let place = borrowed.into_place();
+    if !(place.is_root() || (place.root() == "self" && place.direct_field().is_some())) {
+        return Err(PlanError {
+            span: argument.span,
+            message: format!(
+                "checked slot operation names unsupported container place `{}`",
+                place.render()
+            ),
+        });
+    }
+    let borrow_ty = checked_expression_ty(argument, "slot container borrow")?;
+    let Ty::Borrow(Mutability::Mut, referent) = borrow_ty else {
+        return Err(PlanError {
+            span: argument.span,
+            message: "checked slot container has no unique-borrow type".into(),
+        });
+    };
+    let Ty::Slots(payload) = referent.as_ref() else {
+        return Err(PlanError {
+            span: argument.span,
+            message: "checked slot container borrow no longer refers to `slots<T>`".into(),
+        });
+    };
+    checked_slot_payload(payload, argument.span)?;
+    Ok((place, payload.as_ref().clone()))
+}
+
+fn checked_slot_expression(expression: &Expr) -> Result<CheckedSlotExpression, PlanError> {
+    let ExprKind::SlotOp { op, op_span, args } = &expression.kind else {
+        return Err(PlanError {
+            span: expression.span,
+            message: "slot action lookup received a non-slot expression".into(),
+        });
+    };
+    if args.len() != op.arity() {
+        return Err(PlanError {
+            span: expression.span,
+            message: format!(
+                "checked `{}` has {} argument(s), expected {}",
+                op.name(),
+                args.len(),
+                op.arity()
+            ),
+        });
+    }
+    let result_ty = checked_expression_ty(expression, "slot operation result")?;
+    let (payload, kind) = match op {
+        SlotOp::Alloc { elem } => {
+            checked_slot_payload(elem, *op_span)?;
+            if checked_expression_ty(&args[0], "slot allocation length")? != Ty::Int(IntTy::U64) {
+                return Err(PlanError {
+                    span: args[0].span,
+                    message: "checked slot allocation length is not `u64`".into(),
+                });
+            }
+            if result_ty != Ty::slots(elem.clone()) {
+                return Err(PlanError {
+                    span: expression.span,
+                    message: "checked slot allocation result no longer matches its payload".into(),
+                });
+            }
+            (
+                elem.clone(),
+                CheckedSlotExpressionKind::Alloc {
+                    length_span: args[0].span,
+                },
+            )
+        }
+        SlotOp::Take => {
+            let (container, payload) = checked_slot_container(&args[0])?;
+            if checked_expression_ty(&args[1], "slot take index")? != Ty::Int(IntTy::U64) {
+                return Err(PlanError {
+                    span: args[1].span,
+                    message: "checked slot-take index is not `u64`".into(),
+                });
+            }
+            if result_ty != payload {
+                return Err(PlanError {
+                    span: expression.span,
+                    message: "checked slot-take result no longer matches its container payload"
+                        .into(),
+                });
+            }
+            (
+                payload,
+                CheckedSlotExpressionKind::Take {
+                    container,
+                    container_span: args[0].span,
+                    index_span: args[1].span,
+                },
+            )
+        }
+        SlotOp::Put => {
+            let (container, payload) = checked_slot_container(&args[0])?;
+            if checked_expression_ty(&args[1], "slot put index")? != Ty::Int(IntTy::U64) {
+                return Err(PlanError {
+                    span: args[1].span,
+                    message: "checked slot-put index is not `u64`".into(),
+                });
+            }
+            if checked_expression_ty(&args[2], "slot put value")? != payload {
+                return Err(PlanError {
+                    span: args[2].span,
+                    message: "checked slot-put value no longer matches its container payload"
+                        .into(),
+                });
+            }
+            if result_ty != Ty::Unit {
+                return Err(PlanError {
+                    span: expression.span,
+                    message: "checked slot-put result is not unit".into(),
+                });
+            }
+            (
+                payload,
+                CheckedSlotExpressionKind::Put {
+                    container,
+                    container_span: args[0].span,
+                    index_span: args[1].span,
+                    value_span: args[2].span,
+                },
+            )
+        }
+    };
+    Ok(CheckedSlotExpression {
+        op_span: *op_span,
+        payload,
+        result_ty,
+        kind,
+    })
+}
+
 fn direct_expression_traps(expression: &Expr) -> Result<Vec<(Span, TrapSiteKind)>, PlanError> {
     let mut traps = Vec::new();
     match &expression.kind {
-        ExprKind::SlotOp { op, .. } => {
-            return Err(PlanError {
-                span: expression.span,
-                message: format!(
-                    "internal.control.slots_unsupported: `{}` has no retained trap-site plan",
-                    op.name()
-                ),
-            });
+        ExprKind::SlotOp { .. } => {
+            let checked = checked_slot_expression(expression)?;
+            match checked.kind {
+                CheckedSlotExpressionKind::Alloc { .. } => {
+                    traps.push((
+                        expression.span,
+                        TrapSiteKind::SlotAllocation {
+                            payload: checked.payload.clone(),
+                            phase: AllocationTrapPhase::Capacity,
+                        },
+                    ));
+                    traps.push((
+                        expression.span,
+                        TrapSiteKind::SlotAllocation {
+                            payload: checked.payload,
+                            phase: AllocationTrapPhase::Allocator,
+                        },
+                    ));
+                }
+                CheckedSlotExpressionKind::Take { container, .. } => {
+                    traps.push((
+                        expression.span,
+                        TrapSiteKind::SlotTakeBounds {
+                            container: container.clone(),
+                            payload: checked.payload.clone(),
+                        },
+                    ));
+                    traps.push((
+                        expression.span,
+                        TrapSiteKind::SlotTakeEmpty {
+                            container,
+                            payload: checked.payload,
+                        },
+                    ));
+                }
+                CheckedSlotExpressionKind::Put { container, .. } => {
+                    traps.push((
+                        expression.span,
+                        TrapSiteKind::SlotPutBounds {
+                            container: container.clone(),
+                            payload: checked.payload.clone(),
+                        },
+                    ));
+                    traps.push((
+                        expression.span,
+                        TrapSiteKind::SlotPutOccupied {
+                            container,
+                            payload: checked.payload,
+                        },
+                    ));
+                }
+            }
         }
         ExprKind::Unary { op: UnOp::Neg, .. } => traps.push((
             expression.span,
@@ -5571,16 +6656,17 @@ mod tests {
     }
 
     #[test]
-    fn owner_slots_never_acquire_a_control_recipe_or_trap_plan() {
+    fn owner_slots_acquire_recursive_cleanup_and_exact_allocation_traps() {
         let slots = Ty::slots(Ty::Int(IntTy::U64));
-        let error = ValueDropAction::build(&slots, at(1))
-            .expect_err("owner slots have no occupied-cell cleanup recipe yet");
-        assert!(
-            error
-                .message
-                .starts_with("internal.control.slots_unsupported:"),
-            "{}",
-            error.message
+        let action = ValueDropAction::build(&slots, at(1))
+            .expect("owner slots have a checked cleanup recipe")
+            .expect("owner slots need cleanup");
+        assert_eq!(
+            action.recipe(),
+            &ValueDropRecipe::ReleaseSlots {
+                payload: Ty::Int(IntTy::U64),
+                occupied: None,
+            }
         );
         let error = ValueDropAction::build(&Ty::option(slots.clone()), at(1))
             .expect_err("an option over owner slots must stay on the owning cleanup path");
@@ -5598,20 +6684,32 @@ mod tests {
                     elem: Ty::Int(IntTy::U64),
                 },
                 op_span: at(2),
-                args: vec![integer_expr(4, at(3))],
+                args: vec![Expr {
+                    kind: ExprKind::IntLit(4),
+                    span: at(3),
+                    ty: Some(Ty::Int(IntTy::U64)),
+                }],
             },
             span: at(2),
             ty: Some(slots),
         };
-        let error = direct_expression_traps(&operation)
-            .expect_err("owner-slot operations have no retained trap plan yet");
-        assert!(
-            error
-                .message
-                .starts_with("internal.control.slots_unsupported:"),
-            "{}",
-            error.message
-        );
+        let traps = direct_expression_traps(&operation)
+            .expect("owner-slot allocation has exact capacity and allocator traps");
+        assert_eq!(traps.len(), 2);
+        assert!(matches!(
+            traps[0].1,
+            TrapSiteKind::SlotAllocation {
+                phase: AllocationTrapPhase::Capacity,
+                ..
+            }
+        ));
+        assert!(matches!(
+            traps[1].1,
+            TrapSiteKind::SlotAllocation {
+                phase: AllocationTrapPhase::Allocator,
+                ..
+            }
+        ));
     }
 
     fn owned_decl(name: &str, span: Span) -> Stmt {
@@ -6757,6 +7855,23 @@ mod tests {
             ValueDropRecipe::DropClass(action) if action.class() == 2
         ));
 
+        let slots_class_ty = Ty::slots(Ty::Class(2));
+        let slots_class = ValueDropAction::build(&slots_class_ty, span)
+            .unwrap()
+            .expect("occupied class cells retain recursive destruction");
+        let ValueDropRecipe::ReleaseSlots {
+            payload,
+            occupied: Some(occupied),
+        } = slots_class.recipe()
+        else {
+            panic!("class slots need an occupied-cell cleanup recipe")
+        };
+        assert_eq!(payload, &Ty::Class(2));
+        assert!(matches!(
+            occupied.recipe(),
+            ValueDropRecipe::DropClass(action) if action.class() == 2
+        ));
+
         for non_cleanup in [
             Ty::Bool,
             Ty::option(Ty::Bool),
@@ -6774,13 +7889,17 @@ mod tests {
             Ty::option(Ty::option(Ty::Class(2))),
             Ty::option(Ty::array(Ty::Int(IntTy::U64))),
             Ty::option(Ty::Res(crate::ast::ResKind::RawSpan)),
+            Ty::slots(Ty::Res(crate::ast::ResKind::RawSpan)),
+            Ty::slots(Ty::array(Ty::Bool)),
+            Ty::slots(Ty::Int(IntTy::TParam(0))),
         ] {
             let error = ValueDropAction::build(&unsupported, span)
                 .expect_err("unsealed owner nesting must fail before it acquires cleanup");
             assert_eq!(error.span, span);
             assert!(
                 error.message.contains("occupied-slot")
-                    || error.message.contains("one-level cleanup family"),
+                    || error.message.contains("one-level cleanup family")
+                    || error.message.contains("slot_payload_unsupported"),
                 "unexpected refusal for `{}`: {}",
                 unsupported.name(),
                 error.message

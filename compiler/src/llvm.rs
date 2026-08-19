@@ -4592,6 +4592,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         Some(ValueDropRecipe::DropClass(class_drop)) => {
                             Some(self.class_drop_for_action(class_drop, *field_span)?)
                         }
+                        Some(ValueDropRecipe::ReleaseSlots { .. }) => {
+                            return Err(vec![diag(
+                                "backend.slots_cleanup_unsupported",
+                                "LLVM cannot lower owner-slot field replacement cleanup",
+                                *field_span,
+                                "occupied-slot cleanup remains outside the native backend",
+                            )]);
+                        }
                         Some(ValueDropRecipe::ReleaseArray { .. })
                         | Some(ValueDropRecipe::DropPresent(_))
                         | None => None,
@@ -6026,6 +6034,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             ValueDropRecipe::ReleaseArray { element } if element == &Ty::Int(IntTy::U32) => {
                 self.emit_u32_array_drop(name)
             }
+            ValueDropRecipe::ReleaseSlots { .. } => {
+                return Err(vec![diag(
+                    "backend.slots_cleanup_unsupported",
+                    "LLVM cannot lower owner-slot cleanup",
+                    span,
+                    format!("`{name}` has cleanup-bearing type `{}`", action.ty().name()),
+                )]);
+            }
             ValueDropRecipe::DropPresent(payload)
                 if matches!(
                     payload.recipe(),
@@ -6229,6 +6245,18 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         }
                         Some(ValueDropRecipe::DropClass(child)) => {
                             self.emit_fixed_class_drop_from_slot(&field_slot, child.class())?;
+                        }
+                        Some(ValueDropRecipe::ReleaseSlots { .. }) => {
+                            return Err(vec![diag(
+                                "backend.slots_cleanup_unsupported",
+                                "LLVM cannot lower owner-slot class-field cleanup",
+                                field.span(),
+                                format!(
+                                    "field `{}` has cleanup-bearing type `{}`",
+                                    field.name(),
+                                    field.ty().name()
+                                ),
+                            )]);
                         }
                         None if matches!(field.ty(), Ty::Int(_)) => {}
                         Some(ValueDropRecipe::ReleaseArray { .. })

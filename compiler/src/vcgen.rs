@@ -25,13 +25,14 @@ use crate::ast::*;
 use crate::check::{CheckResult, FnSig};
 use crate::control::{
     AssignmentAction, AssignmentStaging, BodyPlan, CompilerTempKind, ControlBody, ExitKind,
-    ExitRoute, FieldAssignmentAction, ReturnRoutes, ScopeId, TemporaryDropAction, TrapSite,
-    ValueDropRecipe,
+    ExitRoute, FieldAssignmentAction, ReturnRoutes, ScopeId, SlotAction, SlotActionKind,
+    TemporaryDropAction, TrapSite, ValueDropRecipe,
 };
 use crate::ownership::{
     CheckedExposure, CheckedLoopEffects, CheckedMutation, CheckedOptionTake, CheckedOwnershipPlan,
-    CheckedSealedArgument, CheckedSealedOperation, CheckedSealedTarget, EffectSiteKey,
-    ValueTransfer, ValueTransferKey, ValueTransferKind, ValueTransferSink,
+    CheckedSealedArgument, CheckedSealedOperation, CheckedSealedTarget, CheckedSlotMutationKind,
+    CheckedSlotTransition, CheckedSlotTransitionKind, EffectSiteKey, ValueTransfer,
+    ValueTransferKey, ValueTransferKind, ValueTransferSink,
 };
 use crate::place::{BorrowedPlace, Place};
 use crate::scan::Clause;
@@ -461,6 +462,45 @@ fn lean_array_ty(element: &Ty, records: &[RecordDecl]) -> String {
     }
 }
 
+/// Lean value type carried by one occupied owner-slot cell. This is a
+/// separate allow-list from ordinary arrays and copyable source options:
+/// `slots<T>` has move/occupancy semantics even when `T` itself is copyable.
+fn lean_slot_payload_ty(payload: &Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> String {
+    match payload {
+        Ty::Bool => "Bool".into(),
+        Ty::Int(_) | Ty::Param(_) => {
+            let _ = adr0009_int_model(payload);
+            "Int".into()
+        }
+        Ty::Record(record) => lean_record_name(&records[*record].name),
+        Ty::Class(class) => lean_class_name(&classes[*class].name),
+        Ty::Array(_)
+        | Ty::Slots(_)
+        | Ty::Option(_)
+        | Ty::OptionRaw(_)
+        | Ty::Res(_)
+        | Ty::Raw(_)
+        | Ty::RawRecord(_)
+        | Ty::Borrow(..)
+        | Ty::Unit => {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_payload_unsupported: `{}` has no occupied-slot Lean value type",
+                payload.name()
+            ));
+            UNSUPPORTED_LEAN_TY.into()
+        }
+    }
+}
+
+/// Proof state for `slots<T>` is an occupancy sequence, never an ordinary
+/// `Seq T`: an empty cell is `none`, and a present payload is `some value`.
+fn lean_slots_ty(payload: &Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> String {
+    format!(
+        "Sable.Seq (Option {})",
+        lean_slot_payload_ty(payload, classes, records)
+    )
+}
+
 /// The Lean type of an option with this payload. An allow-list, for the same
 /// reason `lean_array_ty` is: a payload needs a Lean type whose proof rules
 /// were written for it, whether or not it owns.
@@ -512,6 +552,7 @@ fn lean_bool_value(prop: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VcAggregateKind {
     Array,
+    Slots,
     Option,
 }
 
@@ -523,6 +564,7 @@ impl VcAggregateKind {
     fn container(self) -> &'static str {
         match self {
             VcAggregateKind::Array => "array",
+            VcAggregateKind::Slots => "owner-slot",
             VcAggregateKind::Option => "option",
         }
     }
@@ -542,6 +584,30 @@ pub(crate) fn validate_vc_payload_ty(
     context: &str,
 ) -> Result<(), String> {
     let container = aggregate.container();
+    if aggregate == VcAggregateKind::Slots {
+        return match ty {
+            Ty::Int(IntTy::TParam(_)) => Err(format!(
+                "internal.vcgen.type_error: non-canonical legacy parameter in {container} payload in {context}"
+            )),
+            Ty::Int(_) | Ty::Bool | Ty::Record(_) | Ty::Class(_) => Ok(()),
+            Ty::Param(_) if allow_param => Ok(()),
+            Ty::Param(_) => Err(format!(
+                "internal.vcgen.type_error: type parameter escaped monomorphization in {container} payload in {context}"
+            )),
+            Ty::Array(_)
+            | Ty::Slots(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => Err(format!(
+                "internal.vcgen.slot_payload_unsupported: {container} payload `{}` has no proof semantics in {context}",
+                ty.name()
+            )),
+        };
+    }
     match ty.payload_family() {
         PayloadFamily::Noncanonical => Err(format!(
             "internal.vcgen.type_error: non-canonical legacy parameter in {container} payload in {context}"
@@ -596,9 +662,9 @@ pub(crate) fn validate_vc_ty(ty: Ty, allow_param: bool, context: &str) -> Result
 /// proof preflight never looked at.
 fn validate_vc_container_payloads(ty: Ty, allow_param: bool, context: &str) -> Result<(), String> {
     match ty {
-        Ty::Slots(_) => Err(format!(
-            "internal.vcgen.slots_unsupported: owner slots have no proof representation in {context}"
-        )),
+        Ty::Slots(element) => {
+            validate_vc_payload_ty(&element, allow_param, VcAggregateKind::Slots, context)
+        }
         Ty::Param(_) if !allow_param => Err(format!(
             "internal.vcgen.type_error: type parameter escaped monomorphization in {context}"
         )),
@@ -661,6 +727,58 @@ pub(crate) fn validate_vc_type_position(
         return Err(format!(
             "internal.vcgen.type_error: a borrow is a parameter binding mode, not a local \
              binding, in {context}"
+        ));
+    }
+
+    // Owner slots stay local/class-field storage. Their unique borrow exists
+    // only as the first argument of a sealed slot operation and is validated
+    // again by that operation's exact checker/control handoff.
+    if matches!(ty.referent(), Ty::Slots(_)) {
+        let admitted = match &ty {
+            Ty::Slots(_) => match position {
+                VcTypePosition::Expression | VcTypePosition::Local | VcTypePosition::ClassField => {
+                    true
+                }
+                VcTypePosition::Parameter
+                | VcTypePosition::TraitParameter
+                | VcTypePosition::Return
+                | VcTypePosition::TraitReturn
+                | VcTypePosition::RecordField
+                | VcTypePosition::Borrow => false,
+            },
+            Ty::Borrow(Mutability::Mut, referent) if matches!(referent.as_ref(), Ty::Slots(_)) => {
+                match position {
+                    VcTypePosition::Borrow => true,
+                    VcTypePosition::Expression
+                    | VcTypePosition::Local
+                    | VcTypePosition::Parameter
+                    | VcTypePosition::TraitParameter
+                    | VcTypePosition::Return
+                    | VcTypePosition::TraitReturn
+                    | VcTypePosition::ClassField
+                    | VcTypePosition::RecordField => false,
+                }
+            }
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Class(_)
+            | Ty::Record(_)
+            | Ty::Array(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => false,
+        };
+        if admitted {
+            return Ok(());
+        }
+        return Err(format!(
+            "vc.slots_position: `{}` is owner-slot local/class-field storage and is not supported in this position in {context}",
+            ty.name()
         ));
     }
 
@@ -1148,18 +1266,93 @@ fn validate_vc_option_operator(
     Ok(())
 }
 
+fn validate_vc_slot_operation(
+    expression: &Expr,
+    allow_param: bool,
+    context: &str,
+    locals: &HashMap<String, Ty>,
+) -> Result<(), String> {
+    let ExprKind::SlotOp { op, args, .. } = &expression.kind else {
+        unreachable!("slot validator is called only for slot operations")
+    };
+    if args.len() != op.arity() {
+        return Err(format!(
+            "internal.vcgen.slot_transition_shape: `{}` has {} argument(s), expected {} in {context}",
+            op.name(),
+            args.len(),
+            op.arity()
+        ));
+    }
+    match op {
+        SlotOp::Alloc { elem } => {
+            validate_vc_payload_ty(elem, allow_param, VcAggregateKind::Slots, context)?;
+            validate_vc_expr(&args[0], allow_param, context, locals)?;
+            require_vc_expr_ty(
+                &args[0],
+                Ty::Int(IntTy::U64),
+                locals,
+                "slot-allocation length",
+                context,
+            )?;
+            if expression.ty != Some(Ty::slots(elem.clone())) {
+                return Err(format!(
+                    "internal.vcgen.slot_transition_shape: `alloc_slots` result disagrees with its payload in {context}"
+                ));
+            }
+        }
+        SlotOp::Take | SlotOp::Put => {
+            validate_vc_expr(&args[0], allow_param, context, locals)?;
+            let container_ty = vc_semantic_expr_ty(&args[0], locals, context)?;
+            let Ty::Borrow(Mutability::Mut, referent) = container_ty else {
+                return Err(format!(
+                    "internal.vcgen.slot_transition_shape: `{}` container is not a unique borrow in {context}",
+                    op.name()
+                ));
+            };
+            let Ty::Slots(payload) = referent.as_ref() else {
+                return Err(format!(
+                    "internal.vcgen.slot_transition_shape: `{}` container does not refer to owner slots in {context}",
+                    op.name()
+                ));
+            };
+            validate_vc_payload_ty(payload, allow_param, VcAggregateKind::Slots, context)?;
+            validate_vc_expr(&args[1], allow_param, context, locals)?;
+            require_vc_expr_ty(&args[1], Ty::Int(IntTy::U64), locals, "slot index", context)?;
+            match op {
+                SlotOp::Take if expression.ty.as_ref() == Some(payload.as_ref()) => {}
+                SlotOp::Put => {
+                    validate_vc_expr(&args[2], allow_param, context, locals)?;
+                    require_vc_expr_ty(
+                        &args[2],
+                        payload.as_ref().clone(),
+                        locals,
+                        "slot-put value",
+                        context,
+                    )?;
+                    if expression.ty != Some(Ty::Unit) {
+                        return Err(format!(
+                            "internal.vcgen.slot_transition_shape: `slot_put` result is not unit in {context}"
+                        ));
+                    }
+                }
+                SlotOp::Take => {
+                    return Err(format!(
+                        "internal.vcgen.slot_transition_shape: `slot_take` result disagrees with its payload in {context}"
+                    ));
+                }
+                SlotOp::Alloc { .. } => unreachable!(),
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_vc_expr(
     expr: &Expr,
     allow_param: bool,
     context: &str,
     locals: &HashMap<String, Ty>,
 ) -> Result<(), String> {
-    if let ExprKind::SlotOp { op, .. } = &expr.kind {
-        return Err(format!(
-            "internal.vcgen.slots_unsupported: `{}` has no proof semantics in {context}",
-            op.name()
-        ));
-    }
     if let Some(ty) = &expr.ty {
         let position = if matches!(expr.kind, ExprKind::Borrow { .. }) {
             VcTypePosition::Borrow
@@ -1220,10 +1413,7 @@ fn validate_vc_expr(
         }
     }
     match &expr.kind {
-        ExprKind::SlotOp { op, .. } => Err(format!(
-            "internal.vcgen.slots_unsupported: `{}` has no proof semantics in {context}",
-            op.name()
-        )),
+        ExprKind::SlotOp { .. } => validate_vc_slot_operation(expr, allow_param, context, locals),
         ExprKind::Unary { operand, .. }
         | ExprKind::Widen { arg: operand, .. }
         | ExprKind::Narrow { arg: operand, .. } => {
@@ -1455,19 +1645,17 @@ fn validate_vc_expr(
             Ok(())
         }
         ExprKind::Len { array } => {
-            if locals.get(array).is_none_or(|ty| ty.as_array().is_none()) {
-                return Err(format!(
-                    "internal.vcgen.type_error: length source `{array}` is not an active array in {context}"
-                ));
-            }
             if locals
                 .get(array)
-                .as_ref()
-                .is_some_and(|ty| ty.is_array_of(&Ty::Bool))
-                && expr.ty != Some(Ty::Int(IntTy::U64))
+                .is_none_or(|ty| ty.as_array().is_none() && ty.as_slots().is_none())
             {
                 return Err(format!(
-                    "internal.vcgen.type_error: Boolean array length has a non-u64 result in {context}"
+                    "internal.vcgen.type_error: length source `{array}` is not an active array or owner-slot container in {context}"
+                ));
+            }
+            if expr.ty != Some(Ty::Int(IntTy::U64)) {
+                return Err(format!(
+                    "internal.vcgen.type_error: sequence length has a non-u64 result in {context}"
                 ));
             }
             Ok(())
@@ -1532,6 +1720,11 @@ fn validate_vc_block_with_mutability(
                 if *ty == Ty::array(Ty::Bool) && init.is_none() {
                     return Err(format!(
                         "internal.vcgen.type_error: owned Boolean array local `{name}` must be initialized in {context}"
+                    ));
+                }
+                if matches!(ty, Ty::Slots(_)) && init.is_none() {
+                    return Err(format!(
+                        "vc.slots_initializer: owner-slot local `{name}` must be initialized in {context}"
                     ));
                 }
                 if ty.is_affine_option() && init.is_none() {
@@ -2129,12 +2322,7 @@ fn lean_field_ty(ty: Ty, classes: &[ClassDecl], records: &[RecordDecl]) -> Strin
         Ty::Int(_) | Ty::Param(_) => "Int".into(),
         Ty::Bool => "Bool".into(),
         Ty::Array(element) => lean_array_ty(element, records),
-        Ty::Slots(_) => {
-            refuse_vc_type(
-                "internal.vcgen.slots_unsupported: owner-slot field has no Lean type".into(),
-            );
-            UNSUPPORTED_LEAN_TY.into()
-        }
+        Ty::Slots(payload) => lean_slots_ty(payload, classes, records),
         // A class-valued field is a nested structure (ADR 0020).
         Ty::Class(ci) => lean_class_name(&classes[*ci].name),
         Ty::Record(ri) => lean_record_name(&records[*ri].name),
@@ -2509,6 +2697,8 @@ pub(crate) fn generate(
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
+            visited_slot_transitions: HashSet::new(),
+            visited_slot_actions: HashSet::new(),
             visited_exposures: HashSet::new(),
             visited_sealed_operations: HashSet::new(),
             visited_loops: HashSet::new(),
@@ -2618,6 +2808,8 @@ pub(crate) fn generate(
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
+            visited_slot_transitions: HashSet::new(),
+            visited_slot_actions: HashSet::new(),
             visited_exposures: HashSet::new(),
             visited_sealed_operations: HashSet::new(),
             visited_loops: HashSet::new(),
@@ -2738,6 +2930,8 @@ pub(crate) fn generate(
                 visited_checked_calls: HashSet::new(),
                 checked_call_visits: HashMap::new(),
                 visited_option_takes: HashSet::new(),
+                visited_slot_transitions: HashSet::new(),
+                visited_slot_actions: HashSet::new(),
                 visited_exposures: HashSet::new(),
                 visited_sealed_operations: HashSet::new(),
                 visited_loops: HashSet::new(),
@@ -2857,11 +3051,11 @@ pub(crate) fn generate(
     Ok(result)
 }
 
-/// The length relation a site supplies for a fresh array state. The facts
-/// every inhabitant of a type satisfies do not include one: what a fresh
-/// length equals depends on where the fresh state is made — a parameter's
-/// entry state is merely representable, while a havoc preserves the length
-/// of the state it replaces (stores are the only array mutation).
+/// The length relation a site supplies for a fresh sequence state. The facts
+/// every inhabitant of an array or owner-slot type satisfies do not include
+/// one: what a fresh length equals depends on where the fresh state is made.
+/// In particular, array stores and slot take/put preserve length, while a
+/// whole owner-slot replacement does not.
 enum LenFact {
     /// `0 ≤ len ∧ len ≤ u64.max` — a parameter's entry state.
     Bounded,
@@ -2889,6 +3083,9 @@ enum Val {
     Opt(String),
     /// Symbolic array value: entry binder or a `.set` chain over it.
     Arr(String),
+    /// Symbolic owner-slot value: a `Seq (Option payload)` binder or `.set`
+    /// chain. Kept distinct from arrays so no copy-index rule can consume it.
+    Slots(String),
     /// Symbolic class value: a binder or a `{ _ with f := v }` chain.
     Obj(String),
     /// Symbolic POD record value. It is structurally represented in Lean
@@ -2910,6 +3107,7 @@ impl Val {
             Val::Int(term)
             | Val::Opt(term)
             | Val::Arr(term)
+            | Val::Slots(term)
             | Val::Obj(term)
             | Val::Record(term)
             | Val::View(term)
@@ -2978,6 +3176,7 @@ fn checked_array_payload_value(
             Val::Int(_)
             | Val::Opt(_)
             | Val::Arr(_)
+            | Val::Slots(_)
             | Val::Obj(_)
             | Val::Record(_)
             | Val::View(_)
@@ -2989,6 +3188,7 @@ fn checked_array_payload_value(
             Val::Prop(_)
             | Val::Opt(_)
             | Val::Arr(_)
+            | Val::Slots(_)
             | Val::Obj(_)
             | Val::Record(_)
             | Val::View(_)
@@ -3001,6 +3201,7 @@ fn checked_array_payload_value(
             | Val::Prop(_)
             | Val::Opt(_)
             | Val::Arr(_)
+            | Val::Slots(_)
             | Val::Obj(_)
             | Val::View(_)
             | Val::Ptr(_)
@@ -3029,7 +3230,7 @@ fn refused_expression_value(expression: &Expr) -> Val {
         Some(Ty::Bool) => Val::Prop("False".into()),
         Some(Ty::Option(_) | Ty::OptionRaw(_)) => Val::Opt(UNSUPPORTED_LEAN_VALUE.into()),
         Some(Ty::Array(_)) => Val::Arr(UNSUPPORTED_LEAN_VALUE.into()),
-        Some(Ty::Slots(_)) => Val::Unit,
+        Some(Ty::Slots(_)) => Val::Slots(UNSUPPORTED_LEAN_VALUE.into()),
         Some(Ty::Class(_)) => Val::Obj(UNSUPPORTED_LEAN_VALUE.into()),
         Some(Ty::Record(_)) => Val::Record(UNSUPPORTED_LEAN_VALUE.into()),
         Some(Ty::Res(_)) => Val::View(UNSUPPORTED_LEAN_VALUE.into()),
@@ -3105,6 +3306,8 @@ struct Generator<'a> {
     /// symbolic path. Like calls, the records are immutable and may be
     /// revisited after a path split; this set proves per-body coverage.
     visited_option_takes: HashSet<EffectSiteKey>,
+    visited_slot_transitions: HashSet<EffectSiteKey>,
+    visited_slot_actions: HashSet<(ScopeId, Span)>,
     visited_exposures: HashSet<EffectSiteKey>,
     visited_sealed_operations: HashSet<EffectSiteKey>,
     visited_loops: HashSet<EffectSiteKey>,
@@ -3165,8 +3368,10 @@ impl<'a> Generator<'a> {
                 .iter()
                 .map(|fld| {
                     match self.env.get(&format!("self.{}", fld.name)) {
-                        Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s))
-                        | Some(Val::View(s)) | Some(Val::Ptr(s)) => format!("{s}"),
+                        Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Slots(s))
+                        | Some(Val::Obj(s)) | Some(Val::View(s)) | Some(Val::Ptr(s)) => {
+                            format!("{s}")
+                        }
                         Some(Val::Prop(p)) => lean_bool_value(p),
                         // Parenthesized so an option chain stays one
                         // constructor argument: `some (7)` spliced bare
@@ -3193,8 +3398,8 @@ impl<'a> Generator<'a> {
         map.insert("self".to_string(), literal.clone());
         for fld in &class.fields {
             match self.env.get(&format!("self.{}", fld.name)) {
-                Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Obj(s)) | Some(Val::View(s))
-                | Some(Val::Ptr(s)) => {
+                Some(Val::Int(s)) | Some(Val::Arr(s)) | Some(Val::Slots(s)) | Some(Val::Obj(s))
+                | Some(Val::View(s)) | Some(Val::Ptr(s)) => {
                     map.insert(fld.name.clone(), s.clone());
                 }
                 Some(Val::Prop(p)) => {
@@ -3232,12 +3437,7 @@ impl<'a> Generator<'a> {
             Some(Ty::Int(_)) | Some(Ty::Param(_)) => "Int".to_string(),
             Some(Ty::Bool) => "Bool".to_string(),
             Some(Ty::Array(element)) => lean_array_ty(element, self.records),
-            Some(Ty::Slots(_)) => {
-                refuse_vc_type(
-                    "internal.vcgen.slots_unsupported: owner-slot binder has no Lean type".into(),
-                );
-                UNSUPPORTED_LEAN_TY.into()
-            }
+            Some(Ty::Slots(payload)) => lean_slots_ty(payload, self.classes, self.records),
             Some(Ty::Unit) | Some(Ty::Borrow(..)) | None => {
                 unreachable!("checked: value has a Lean binder type")
             }
@@ -3265,13 +3465,10 @@ impl<'a> Generator<'a> {
                 Ty::Int(_) | Ty::Param(_) => Some((name.clone(), "Int".to_string())),
                 Ty::Bool => Some((name.clone(), "Bool".to_string())),
                 Ty::Array(element) => Some((name.clone(), lean_array_ty(element, self.records))),
-                Ty::Slots(_) => {
-                    refuse_vc_type(
-                        "internal.vcgen.slots_unsupported: owner-slot scope binding has no Lean type"
-                            .into(),
-                    );
-                    None
-                }
+                Ty::Slots(payload) => Some((
+                    name.clone(),
+                    lean_slots_ty(payload, self.classes, self.records),
+                )),
                 Ty::Class(ci) => Some((name.clone(), lean_class_name(&self.classes[*ci].name))),
                 Ty::Record(ri) => Some((name.clone(), lean_record_name(&self.records[*ri].name))),
                 // A resource binds its *view*; the authority it names is
@@ -3343,6 +3540,67 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Facts every present slot payload carries. They are stated under the
+    /// occupancy equation, so allocation establishes them vacuously, put
+    /// transports them from its staged value, and take may recover them for
+    /// the unique returned payload.
+    fn slot_payload_fact_props(&self, payload: &Ty, value: &str) -> Vec<(String, String)> {
+        match payload {
+            Ty::Bool => Vec::new(),
+            ty @ (Ty::Int(_) | Ty::Param(_)) => vec![(
+                "range".into(),
+                self.r_prop(value, adr0009_ty_int_model(ty.clone())),
+            )],
+            Ty::Record(record) => vec![(
+                "wf".into(),
+                format!(
+                    "{}.wf {value}",
+                    lean_record_name(&self.records[*record].name)
+                ),
+            )],
+            Ty::Class(class) => {
+                let declaration = &self.classes[*class];
+                let map = self.class_state_map(declaration, value);
+                declaration
+                    .invariants
+                    .iter()
+                    .map(|invariant| {
+                        (
+                            format!("inv_{}", chslug(invariant)),
+                            substitute(&invariant.text, &map, None),
+                        )
+                    })
+                    .collect()
+            }
+            Ty::Array(_)
+            | Ty::Slots(_)
+            | Ty::Option(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slot_payload_unsupported: `{}` has no present-cell fact",
+                    payload.name()
+                ));
+                Vec::new()
+            }
+        }
+    }
+
+    fn push_slot_payload_facts(&mut self, payload: &Ty, base: &str, slots: &str) {
+        for (suffix, fact) in self.slot_payload_fact_props(payload, "value") {
+            self.push_hyp_unique(
+                format!("h_{base}_present_{suffix}"),
+                format!(
+                    "∀ k, 0 ≤ k → k < ({slots}.len) → ∀ value, ({slots}.get k) = some value → ({fact})"
+                ),
+            );
+        }
+    }
+
     fn push_class_state_facts(&mut self, class: &ClassDecl, binder: &str) {
         // Deduped (`_2` suffixes) like class invariants: two borrowed
         // arguments of the same class must not shadow each other's facts
@@ -3406,10 +3664,15 @@ impl<'a> Generator<'a> {
                     }
                 }
                 Ty::Slots(_) => {
-                    refuse_vc_type(format!(
-                        "internal.vcgen.slots_unsupported: slot field `{}` has no class-state facts",
-                        fld.name
-                    ));
+                    let Ty::Slots(payload) = &fld.ty else {
+                        unreachable!()
+                    };
+                    let path = format!("({binder}.{})", fld.name);
+                    self.push_hyp_unique(
+                        format!("h_field_{}_len", fld.name),
+                        format!("0 ≤ {path}.len ∧ {path}.len ≤ u64.max"),
+                    );
+                    self.push_slot_payload_facts(payload, &format!("field_{}", fld.name), &path);
                 }
                 // No representability fact exists for the rest: `Bool` is
                 // its own complete domain and a raw pointer is
@@ -3590,11 +3853,24 @@ impl<'a> Generator<'a> {
                 }
                 Val::Arr(binder.to_string())
             }
-            Ty::Slots(_) => {
-                refuse_vc_type(format!(
-                    "internal.vcgen.slots_unsupported: owner slots have no fresh symbolic state (for `{base}`)"
+            Ty::Slots(payload) => {
+                self.binders.push((
+                    binder.to_string(),
+                    lean_slots_ty(payload, self.classes, self.records),
                 ));
-                Val::Unit
+                match len {
+                    LenFact::Bounded => self.push_hyp_unique(
+                        format!("h_{base}_len"),
+                        format!("0 ≤ {binder}.len ∧ {binder}.len ≤ u64.max"),
+                    ),
+                    LenFact::Eq(prior) => self.push_hyp_unique(
+                        format!("h_{base}_len"),
+                        format!("({binder}.len) = ({prior}.len)"),
+                    ),
+                    LenFact::Skip => {}
+                }
+                self.push_slot_payload_facts(payload, base, binder);
+                Val::Slots(binder.to_string())
             }
             Ty::Unit => {
                 refuse_vc_type(format!(
@@ -4002,6 +4278,232 @@ impl<'a> Generator<'a> {
         effect
     }
 
+    /// Resolve one owner-slot operation through both immutable authorities.
+    /// Nothing about the symbolic state may change until the typed AST, the
+    /// ownership transition, the control action, the put staging transfer,
+    /// and every direct trap route agree exactly.
+    fn checked_slot_transition_action(
+        &mut self,
+        scope: ScopeId,
+        expression: &Expr,
+    ) -> Option<(CheckedSlotTransition, SlotAction)> {
+        let ExprKind::SlotOp { op, op_span, args } = &expression.kind else {
+            unreachable!("slot transition lookup is called only for slot operations")
+        };
+        let key = EffectSiteKey {
+            owner: self.call_owner.clone(),
+            span: expression.span,
+        };
+        let result_ty = expression.ty.clone().unwrap_or(Ty::Unit);
+        let malformed = |detail: &str| {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_transition_shape: `{}` at {}..{} inside {} {detail}",
+                op.name(),
+                expression.span.start,
+                expression.span.end,
+                self.call_owner.render()
+            ));
+        };
+        if args.len() != op.arity() {
+            malformed("has a different arity than its sealed operation");
+            return None;
+        }
+
+        let (payload, expected_kind) = match op {
+            SlotOp::Alloc { elem } => (
+                elem.clone(),
+                CheckedSlotTransitionKind::Alloc {
+                    length_ty: args[0].ty.clone().unwrap_or(Ty::Unit),
+                    length_span: args[0].span,
+                },
+            ),
+            SlotOp::Take | SlotOp::Put => {
+                let Some(borrowed) = BorrowedPlace::from_expr(&args[0]) else {
+                    malformed("does not retain an explicit container borrow");
+                    return None;
+                };
+                if borrowed.mutability() != Mutability::Mut {
+                    malformed("does not retain a unique container borrow");
+                    return None;
+                }
+                let Some(Ty::Borrow(Mutability::Mut, referent)) = args[0].ty.as_ref() else {
+                    malformed("has no checked unique-borrow container type");
+                    return None;
+                };
+                let Ty::Slots(payload) = referent.as_ref() else {
+                    malformed("does not borrow owner-slot storage");
+                    return None;
+                };
+                let container = borrowed.into_place();
+                let index_ty = args[1].ty.clone().unwrap_or(Ty::Unit);
+                let kind = match op {
+                    SlotOp::Take => CheckedSlotTransitionKind::Take {
+                        container,
+                        container_span: args[0].span,
+                        index_ty,
+                        index_span: args[1].span,
+                    },
+                    SlotOp::Put => CheckedSlotTransitionKind::Put {
+                        value_transfer: ValueTransferKey {
+                            owner: self.call_owner.clone(),
+                            span: args[2].span,
+                            sink: ValueTransferSink::SlotPut(container.clone()),
+                        },
+                        container,
+                        container_span: args[0].span,
+                        index_ty,
+                        index_span: args[1].span,
+                        value_span: args[2].span,
+                    },
+                    SlotOp::Alloc { .. } => unreachable!(),
+                };
+                (payload.as_ref().clone(), kind)
+            }
+        };
+        let expected = CheckedSlotTransition {
+            key: key.clone(),
+            op_span: *op_span,
+            payload,
+            result_ty,
+            kind: expected_kind,
+        };
+        let Some(transition) = self.ownership.slot_transition(&key).cloned() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_transition_missing: no checked `{}` transition at {}..{} inside {}",
+                op.name(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        };
+        if transition != expected {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_transition_mismatch: checked `{}` transition at {}..{} inside {} disagrees with the typed operation",
+                op.name(),
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        }
+
+        let action = {
+            let Some(plan) = self.control_plan() else {
+                return None;
+            };
+            let action = match plan.slot_action(scope, expression) {
+                Ok(action) => action.clone(),
+                Err(error) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.slot_action_missing_or_mismatch: {} at {}..{} inside {}",
+                        error.message,
+                        error.span.start,
+                        error.span.end,
+                        self.call_owner.render()
+                    ));
+                    return None;
+                }
+            };
+            let sites = match plan.slot_action_trap_sites(&action) {
+                Ok(sites) => sites,
+                Err(error) => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.slot_action_trap_mismatch: {} at {}..{} inside {}",
+                        error.message,
+                        error.span.start,
+                        error.span.end,
+                        self.call_owner.render()
+                    ));
+                    return None;
+                }
+            };
+            if !self.consume_trap_sites(plan, &sites) {
+                return None;
+            }
+            action
+        };
+        let common_matches = action.scope() == scope
+            && action.span() == expression.span
+            && action.effect_key() == &transition.key
+            && action.op_span() == transition.op_span
+            && action.payload() == &transition.payload
+            && action.result_ty() == &transition.result_ty;
+        let shape_matches = match (&transition.kind, action.kind()) {
+            (
+                CheckedSlotTransitionKind::Alloc { length_span, .. },
+                SlotActionKind::Alloc {
+                    length_span: action_length,
+                },
+            ) => length_span == action_length,
+            (
+                CheckedSlotTransitionKind::Take {
+                    container,
+                    container_span,
+                    index_span,
+                    ..
+                },
+                SlotActionKind::Take {
+                    container: action_container,
+                    container_span: action_container_span,
+                    index_span: action_index_span,
+                },
+            ) => {
+                container == action_container
+                    && container_span == action_container_span
+                    && index_span == action_index_span
+            }
+            (
+                CheckedSlotTransitionKind::Put {
+                    container,
+                    container_span,
+                    index_span,
+                    value_span,
+                    value_transfer,
+                    ..
+                },
+                SlotActionKind::Put {
+                    container: action_container,
+                    container_span: action_container_span,
+                    index_span: action_index_span,
+                    value_span: action_value_span,
+                    value_transfer: action_transfer,
+                    staging,
+                },
+            ) => {
+                let expected_staging = self.control_plan().and_then(|plan| {
+                    plan.compiler_temp(scope, expression.span, CompilerTempKind::SlotPutValue)
+                        .ok()
+                });
+                container == action_container
+                    && container_span == action_container_span
+                    && index_span == action_index_span
+                    && value_span == action_value_span
+                    && value_transfer == action_transfer
+                    && expected_staging == Some(staging)
+            }
+            (CheckedSlotTransitionKind::Alloc { .. }, SlotActionKind::Take { .. })
+            | (CheckedSlotTransitionKind::Alloc { .. }, SlotActionKind::Put { .. })
+            | (CheckedSlotTransitionKind::Take { .. }, SlotActionKind::Alloc { .. })
+            | (CheckedSlotTransitionKind::Take { .. }, SlotActionKind::Put { .. })
+            | (CheckedSlotTransitionKind::Put { .. }, SlotActionKind::Alloc { .. })
+            | (CheckedSlotTransitionKind::Put { .. }, SlotActionKind::Take { .. }) => false,
+        };
+        if !common_matches || !shape_matches {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_action_transition_mismatch: retained `{}` action at {}..{} inside {} disagrees with its checked ownership transition",
+                op.name(),
+                expression.span.start,
+                expression.span.end,
+                self.call_owner.render()
+            ));
+            return None;
+        }
+        self.visited_slot_transitions.insert(key);
+        self.visited_slot_actions.insert((scope, expression.span));
+        Some((transition, action))
+    }
+
     /// Validate the checker-authored exposure boundary before opening its
     /// symbolic loan. Exact binder/type matching prevents a forged typed AST
     /// from redirecting the checker's ownership fact to different storage.
@@ -4262,6 +4764,63 @@ impl<'a> Generator<'a> {
             ));
             return None;
         };
+        for mutation in &effects.mutations {
+            let CheckedMutation::Slot {
+                key: slot_key,
+                operation,
+                container,
+                payload,
+            } = mutation
+            else {
+                continue;
+            };
+            let Some(transition) = self.ownership.slot_transition(slot_key) else {
+                refuse_vc_type(format!(
+                    "internal.vcgen.loop_slot_transition_missing: loop effect at {}..{} inside {} references no checked slot transition at {}..{}",
+                    key.span.start,
+                    key.span.end,
+                    self.call_owner.render(),
+                    slot_key.span.start,
+                    slot_key.span.end
+                ));
+                return None;
+            };
+            let kind_matches = match (operation, &transition.kind) {
+                (
+                    CheckedSlotMutationKind::Take,
+                    CheckedSlotTransitionKind::Take {
+                        container: checked_container,
+                        ..
+                    },
+                ) => checked_container == container && transition.result_ty == *payload,
+                (
+                    CheckedSlotMutationKind::Put,
+                    CheckedSlotTransitionKind::Put {
+                        container: checked_container,
+                        ..
+                    },
+                ) => checked_container == container && transition.result_ty == Ty::Unit,
+                (CheckedSlotMutationKind::Take, CheckedSlotTransitionKind::Alloc { .. })
+                | (CheckedSlotMutationKind::Take, CheckedSlotTransitionKind::Put { .. })
+                | (CheckedSlotMutationKind::Put, CheckedSlotTransitionKind::Alloc { .. })
+                | (CheckedSlotMutationKind::Put, CheckedSlotTransitionKind::Take { .. }) => false,
+            };
+            if slot_key.owner != self.call_owner
+                || transition.key != *slot_key
+                || transition.payload != *payload
+                || !kind_matches
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.loop_slot_transition_mismatch: loop effect at {}..{} inside {} disagrees with referenced slot transition at {}..{}",
+                    key.span.start,
+                    key.span.end,
+                    self.call_owner.render(),
+                    slot_key.span.start,
+                    slot_key.span.end
+                ));
+                return None;
+            }
+        }
         let mismatch = if effects.key != *key {
             Some("the stored record carries a different effect-site key")
         } else if effects.condition_span != condition_span {
@@ -4272,6 +4831,7 @@ impl<'a> Generator<'a> {
             }
             CheckedMutation::DirectWrite { .. }
             | CheckedMutation::OptionTake { .. }
+            | CheckedMutation::Slot { .. }
             | CheckedMutation::ExposureRebuild { .. } => false,
         }) {
             Some("the stored mutation set contains a non-unique loan")
@@ -4435,8 +4995,8 @@ impl<'a> Generator<'a> {
                 span: value.span,
                 sink: ValueTransferSink::FieldAssignment(destination.clone()),
             };
-            let cleanup_bearing =
-                matches!(value_ty, Ty::Class(_) | Ty::Array(_)) || value_ty.is_affine_option();
+            let cleanup_bearing = matches!(value_ty, Ty::Class(_) | Ty::Array(_) | Ty::Slots(_))
+                || value_ty.is_affine_option();
             let expected_staging = if cleanup_bearing {
                 let temporary = match plan.compiler_temp(
                     scope,
@@ -4466,7 +5026,9 @@ impl<'a> Generator<'a> {
             };
             let retained_class = action.drop_action().and_then(|drop| match drop.recipe() {
                 ValueDropRecipe::DropClass(class) => Some(class.class()),
-                ValueDropRecipe::ReleaseArray { .. } | ValueDropRecipe::DropPresent(_) => None,
+                ValueDropRecipe::ReleaseArray { .. }
+                | ValueDropRecipe::ReleaseSlots { .. }
+                | ValueDropRecipe::DropPresent(_) => None,
             });
             let bad_terminal = action
                 .drop_action()
@@ -4474,7 +5036,9 @@ impl<'a> Generator<'a> {
                     ValueDropRecipe::DropClass(class) => {
                         class.terminal_trap_route() != &plan.trap_route()
                     }
-                    ValueDropRecipe::ReleaseArray { .. } | ValueDropRecipe::DropPresent(_) => false,
+                    ValueDropRecipe::ReleaseArray { .. }
+                    | ValueDropRecipe::ReleaseSlots { .. }
+                    | ValueDropRecipe::DropPresent(_) => false,
                 });
             if action.scope() != scope
                 || action.span() != span
@@ -4563,7 +5127,9 @@ impl<'a> Generator<'a> {
             };
             let retained_class = match action.drop_action().recipe() {
                 ValueDropRecipe::DropClass(class) => Some(class),
-                ValueDropRecipe::ReleaseArray { .. } | ValueDropRecipe::DropPresent(_) => None,
+                ValueDropRecipe::ReleaseArray { .. }
+                | ValueDropRecipe::ReleaseSlots { .. }
+                | ValueDropRecipe::DropPresent(_) => None,
             };
             if action.scope() != scope
                 || action.span() != span
@@ -4705,6 +5271,19 @@ impl<'a> Generator<'a> {
         }
         if let Some((key, _)) = self
             .ownership
+            .slot_transitions_for_owner(&self.call_owner)
+            .filter(|(key, _)| !self.visited_slot_transitions.contains(*key))
+            .min_by_key(|(key, _)| (key.span.start, key.span.end))
+        {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_transition_unvisited: checked ownership transition at {}..{} inside {} was not visited",
+                key.span.start,
+                key.span.end,
+                self.call_owner.render()
+            ));
+        }
+        if let Some((key, _)) = self
+            .ownership
             .exposures_for_owner(&self.call_owner)
             .filter(|(key, _)| !self.visited_exposures.contains(*key))
             .min_by_key(|(key, _)| (key.span.start, key.span.end))
@@ -4761,6 +5340,22 @@ impl<'a> Generator<'a> {
         }
         if let Some(control) = self.control {
             let plan = control.plan();
+            if let Some(action) = plan
+                .slot_actions()
+                .filter(|action| {
+                    !self
+                        .visited_slot_actions
+                        .contains(&(action.scope(), action.span()))
+                })
+                .min_by_key(|action| (action.span().start, action.span().end))
+            {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slot_action_unvisited: retained slot action at {}..{} inside {} was not visited",
+                    action.span().start,
+                    action.span().end,
+                    self.call_owner.render()
+                ));
+            }
             if let Some(action) = plan
                 .assignments()
                 .filter(|action| {
@@ -5213,6 +5808,7 @@ impl<'a> Generator<'a> {
                         | Val::Prop(_)
                         | Val::Opt(_)
                         | Val::Arr(_)
+                        | Val::Slots(_)
                         | Val::Record(_)
                         | Val::View(_)
                         | Val::Ptr(_)
@@ -5601,6 +6197,7 @@ impl<'a> Generator<'a> {
                             | ExprKind::TraitCall { .. }
                             | ExprKind::DeviceOp { .. }
                             | ExprKind::AllocArray { .. }
+                            | ExprKind::SlotOp { .. }
                             | ExprKind::ArrayLit(_)
                     ) {
                         self.name_hint = Some(name.clone());
@@ -5636,6 +6233,7 @@ impl<'a> Generator<'a> {
                         | ExprKind::TraitCall { .. }
                         | ExprKind::DeviceOp { .. }
                         | ExprKind::AllocArray { .. }
+                        | ExprKind::SlotOp { .. }
                         | ExprKind::ArrayLit(_)
                 ) {
                     self.name_hint = Some(name.clone());
@@ -5692,7 +6290,9 @@ impl<'a> Generator<'a> {
                         // facts are its length and its element domain, both
                         // true of every state the callee could have left it
                         // in, and neither is a user invariant to re-establish.
-                        Val::Arr(chain) => format!("(result = {chain})"),
+                        Val::Arr(chain) | Val::Slots(chain) => {
+                            format!("(result = {chain})")
+                        }
                         // Returning a resource returns its authority; in
                         // the logic that is just its view. There is no
                         // `ret_inv` analogue — a view carries its own
@@ -6069,6 +6669,7 @@ impl<'a> Generator<'a> {
                         | ExprKind::CtorCall { .. }
                         | ExprKind::TraitCall { .. }
                         | ExprKind::AllocArray { .. }
+                        | ExprKind::SlotOp { .. }
                         | ExprKind::ArrayLit(_)
                 ) {
                     self.name_hint = Some(name.clone());
@@ -6116,6 +6717,7 @@ impl<'a> Generator<'a> {
                             // with the resource is nowhere here (ADR 0024).
                             Val::Int(s)
                             | Val::Arr(s)
+                            | Val::Slots(s)
                             | Val::Obj(s)
                             | Val::View(s)
                             | Val::Ptr(s) => s,
@@ -6154,6 +6756,7 @@ impl<'a> Generator<'a> {
                     Val::Int(v) | Val::Record(v) => v,
                     Val::Prop(p) => lean_bool_value(&p),
                     Val::Arr(_)
+                    | Val::Slots(_)
                     | Val::Obj(_)
                     | Val::View(_)
                     | Val::Ptr(_)
@@ -6572,6 +7175,28 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// A loop preserves one owner-slot container's length only when every
+    /// mutation that can overlap that exact place is a checked take or put
+    /// on that same place. Whole-owner writes can install a differently
+    /// sized allocation and therefore deliberately receive no length fact.
+    fn loop_preserves_slot_length(effects: &CheckedLoopEffects, container: &Place) -> bool {
+        effects
+            .mutations
+            .iter()
+            .filter(|mutation| mutation.place().overlaps(container))
+            .all(|mutation| {
+                matches!(
+                    mutation,
+                    CheckedMutation::Slot {
+                        container: mutated,
+                        operation:
+                            CheckedSlotMutationKind::Take | CheckedSlotMutationKind::Put,
+                        ..
+                    } if mutated == container
+                )
+            })
+    }
+
     /// Fresh source-named binders for everything the loop body assigns
     /// (plus locals whose symbolic value mentions a havocked variable,
     /// transitively). Hypotheses mentioning havocked names are dropped.
@@ -6592,6 +7217,7 @@ impl<'a> Generator<'a> {
                     Val::Int(s)
                     | Val::Opt(s)
                     | Val::Arr(s)
+                    | Val::Slots(s)
                     | Val::Obj(s)
                     | Val::Record(s)
                     | Val::View(s)
@@ -6706,10 +7332,10 @@ impl<'a> Generator<'a> {
                             };
                             self.fresh += 1;
                             let b = format!("_self{}_{}", self.fresh, fld.name);
-                            // Stores preserve length, so an array field
-                            // keeps its relation to the pre-loop chain when
-                            // that chain survives the havoc (rewritten to
-                            // the stale binder names).
+                            // Array stores preserve length. Owner-slot
+                            // take/put does too, but a whole-field write may
+                            // replace the allocation and must drop the
+                            // relation even when the old chain survives.
                             let len = match &prior_value {
                                 Val::Arr(chain) => {
                                     let prior = substitute(chain, &stale_map, None);
@@ -6720,6 +7346,21 @@ impl<'a> Generator<'a> {
                                         LenFact::Skip
                                     } else {
                                         LenFact::Eq(prior)
+                                    }
+                                }
+                                Val::Slots(chain) => {
+                                    let container = Place::field("self", &fld.name);
+                                    if !Self::loop_preserves_slot_length(effects, &container) {
+                                        LenFact::Skip
+                                    } else {
+                                        let prior = substitute(chain, &stale_map, None);
+                                        if havoc_set.iter().any(|h| {
+                                            !stale_map.contains_key(h) && mentions(&prior, h)
+                                        }) {
+                                            LenFact::Skip
+                                        } else {
+                                            LenFact::Eq(prior)
+                                        }
                                     }
                                 }
                                 Val::Int(_)
@@ -6762,6 +7403,7 @@ impl<'a> Generator<'a> {
                     Val::Prop(s) => (rewrite(s), Val::Prop(rewrite(s))),
                     Val::Opt(s) => (rewrite(s), Val::Opt(rewrite(s))),
                     Val::Arr(s) => (rewrite(s), Val::Arr(rewrite(s))),
+                    Val::Slots(s) => (rewrite(s), Val::Slots(rewrite(s))),
                     Val::Obj(s) => (rewrite(s), Val::Obj(rewrite(s))),
                     Val::Record(s) => (rewrite(s), Val::Record(rewrite(s))),
                     Val::View(s) => (rewrite(s), Val::View(rewrite(s))),
@@ -6802,13 +7444,13 @@ impl<'a> Generator<'a> {
             if ty.binding_mode() == BindingMode::Shared {
                 continue;
             }
-            // Stores are the only array mutation and preserve length, so a
-            // length fact is sound to assume at havoc. What it is equated
-            // to differs by binding mode: a `&mut` parameter has an
-            // entry-state binder, and an owned local has the pre-havoc
-            // `.set` chain instead (rewritten to the stale names — alloc
-            // binders carry the source name — and kept only when it does
-            // not itself mention a havocked body-local).
+            // Array stores and unique-loan calls preserve length. Slot
+            // take/put preserves length too, but a whole owner write does
+            // not. What a surviving relation is equated to differs by
+            // binding mode: a `&mut` parameter has an entry-state binder,
+            // and an owned local has the pre-havoc `.set` chain instead
+            // (rewritten to stale names and kept only when it does not
+            // itself mention a havocked body-local).
             let len = if ty.is_unique_borrow() {
                 // Only a parameter has an entry state, and only a
                 // parameter can be a unique borrow here: a borrow is not a
@@ -6839,6 +7481,22 @@ impl<'a> Generator<'a> {
                             LenFact::Eq(prior)
                         }
                     }
+                    Some(Val::Slots(s)) => {
+                        let container = Place::local(name);
+                        if !Self::loop_preserves_slot_length(effects, &container) {
+                            LenFact::Skip
+                        } else {
+                            let prior = substitute(s, &stale_map, None);
+                            if havoc_set
+                                .iter()
+                                .any(|h| !stale_map.contains_key(h) && mentions(&prior, h))
+                            {
+                                LenFact::Skip
+                            } else {
+                                LenFact::Eq(prior)
+                            }
+                        }
+                    }
                     Some(
                         Val::Int(_)
                         | Val::Prop(_)
@@ -6857,6 +7515,174 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// Read one checker-admitted owner-slot place. The surface language
+    /// currently permits only a mutable local root or a direct `self` field;
+    /// keeping that boundary explicit prevents VCgen from inventing general
+    /// object-field aliasing semantics.
+    fn slot_place_str(&mut self, place: &Place) -> Option<String> {
+        if place.is_root() {
+            return match self.env.get(place.root()) {
+                Some(Val::Slots(slots)) => Some(slots.clone()),
+                Some(_) | None => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.slot_place_state: checked slot place `{}` has no owner-slot state",
+                        place.render()
+                    ));
+                    None
+                }
+            };
+        }
+        if place.root() != "self" {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_place_shape: checked slot place `{}` is not a local root or direct `self` field",
+                place.render()
+            ));
+            return None;
+        }
+        let Some(field) = place.direct_field() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_place_shape: checked slot place `{}` has an unsupported projection",
+                place.render()
+            ));
+            return None;
+        };
+        match self.cctx {
+            Cctx::Init(_) => match self.env.get(&format!("self.{field}")) {
+                Some(Val::Slots(slots)) => Some(slots.clone()),
+                Some(_) | None => {
+                    refuse_vc_type(format!(
+                        "internal.vcgen.slot_place_state: checked slot field `self.{field}` is not initialized as owner-slot state"
+                    ));
+                    None
+                }
+            },
+            Cctx::Method(..) | Cctx::Deinit(_) => Some(project_field(&self.self_chain(), field)),
+            Cctx::None => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slot_place_shape: `self.{field}` appears outside a class member"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Consume the slot operation's explicit borrow expression while reading
+    /// state from the exact checker-authored place. In an initializer,
+    /// `self.field` lives in its own `self.field` environment entry until the
+    /// final class literal exists; generic borrow projection through `self`
+    /// would therefore observe a fictitious whole-object state.
+    fn checked_slot_place_state(
+        &mut self,
+        expression: &Expr,
+        place: &Place,
+        scope: ScopeId,
+    ) -> Option<String> {
+        if !self.consume_expression_trap_sites(scope, expression) {
+            return None;
+        }
+        let Some(borrowed) = BorrowedPlace::from_expr(expression) else {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_place_shape: `{}` is not retained as an explicit borrow",
+                place.render()
+            ));
+            return None;
+        };
+        if borrowed.mutability() != Mutability::Mut || borrowed.place() != place {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_place_state_mismatch: explicit borrow disagrees with checked slot place `{}`",
+                place.render()
+            ));
+            return None;
+        }
+        self.slot_place_str(place)
+    }
+
+    /// Atomically install a new owner-slot sequence at the exact checked
+    /// place. Callers construct the complete `.set` term before invoking
+    /// this helper, so no intermediate proof state can observe a taken value
+    /// still present or a put value staged but not installed.
+    fn write_slot_place(&mut self, place: &Place, slots: String) -> bool {
+        if place.is_root() {
+            self.env.insert(place.root().to_string(), Val::Slots(slots));
+            return true;
+        }
+        if place.root() != "self" {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_place_shape: checked slot write `{}` is not a local root or direct `self` field",
+                place.render()
+            ));
+            return false;
+        }
+        let Some(field) = place.direct_field() else {
+            refuse_vc_type(format!(
+                "internal.vcgen.slot_place_shape: checked slot write `{}` has an unsupported projection",
+                place.render()
+            ));
+            return false;
+        };
+        match self.cctx {
+            Cctx::Init(_) => {
+                self.env.insert(format!("self.{field}"), Val::Slots(slots));
+                true
+            }
+            Cctx::Method(..) | Cctx::Deinit(_) => {
+                let base = self.self_chain();
+                self.env.insert(
+                    "self".to_string(),
+                    Val::Obj(format!("{{ {base} with {field} := {slots} }}")),
+                );
+                true
+            }
+            Cctx::None => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slot_place_shape: `self.{field}` appears outside a class member"
+                ));
+                false
+            }
+        }
+    }
+
+    fn slot_payload_term(&mut self, payload: &Ty, value: Val) -> Option<String> {
+        match (payload, value) {
+            (Ty::Bool, Val::Prop(prop)) => Some(lean_bool_value(&prop)),
+            (Ty::Int(_) | Ty::Param(_), Val::Int(value)) => Some(value),
+            (Ty::Record(_), Val::Record(value)) => Some(value),
+            (Ty::Class(_), Val::Obj(value)) => Some(value),
+            (
+                Ty::Bool
+                | Ty::Int(_)
+                | Ty::Param(_)
+                | Ty::Record(_)
+                | Ty::Class(_)
+                | Ty::Array(_)
+                | Ty::Slots(_)
+                | Ty::Option(_)
+                | Ty::OptionRaw(_)
+                | Ty::Res(_)
+                | Ty::Raw(_)
+                | Ty::RawRecord(_)
+                | Ty::Borrow(..)
+                | Ty::Unit,
+                Val::Int(_)
+                | Val::Prop(_)
+                | Val::Opt(_)
+                | Val::Arr(_)
+                | Val::Slots(_)
+                | Val::Obj(_)
+                | Val::Record(_)
+                | Val::View(_)
+                | Val::Ptr(_)
+                | Val::Unit,
+            ) => {
+                refuse_vc_type(format!(
+                    "internal.vcgen.slot_payload_state: `{}` value has no matching symbolic slot payload",
+                    payload.name()
+                ));
+                None
+            }
+        }
+    }
+
     fn eval(&mut self, e: &Expr, scope: ScopeId) -> Val {
         if !self.consume_expression_trap_sites(scope, e) {
             return refused_expression_value(e);
@@ -6870,12 +7696,205 @@ impl<'a> Generator<'a> {
     /// only when source evaluation reaches it.
     fn eval_after_trap_lookup(&mut self, e: &Expr, scope: ScopeId) -> Val {
         match &e.kind {
-            ExprKind::SlotOp { op, .. } => {
-                refuse_vc_type(format!(
-                    "internal.vcgen.slots_unsupported: `{}` has no symbolic semantics",
-                    op.name()
-                ));
-                Val::Unit
+            ExprKind::SlotOp { op, args, .. } => {
+                let Some((transition, action)) = self.checked_slot_transition_action(scope, e)
+                else {
+                    return refused_expression_value(e);
+                };
+                let payload = transition.payload.clone();
+                let payload_lean = lean_slot_payload_ty(&payload, self.classes, self.records);
+                let site = slug(self.src(e.span));
+                match op {
+                    SlotOp::Alloc { .. } => {
+                        let CheckedSlotTransitionKind::Alloc { .. } = transition.kind else {
+                            unreachable!("slot allocation transition was exactly cross-validated")
+                        };
+                        let SlotActionKind::Alloc { .. } = action.kind() else {
+                            unreachable!("slot allocation action was exactly cross-validated")
+                        };
+                        let hint = self.name_hint.take();
+                        let Val::Int(length) = self.eval(&args[0], scope) else {
+                            unreachable!("checked: owner-slot allocation length is u64")
+                        };
+                        let slots = self.hinted_sym("_slots", hint);
+                        self.binders.push((
+                            slots.clone(),
+                            lean_slots_ty(&payload, self.classes, self.records),
+                        ));
+                        self.push_hyp_unique(
+                            format!("h_{}_len", slots.trim_start_matches('_')),
+                            format!("({slots}.len) = ({length})"),
+                        );
+                        self.push_hyp_unique(
+                            format!("h_{}_all_none", slots.trim_start_matches('_')),
+                            format!(
+                                "∀ k, 0 ≤ k → k < ({slots}.len) → ({slots}.get k) = (none : Option {payload_lean})"
+                            ),
+                        );
+                        self.push_slot_payload_facts(
+                            &payload,
+                            slots.trim_start_matches('_'),
+                            &slots,
+                        );
+                        Val::Slots(slots)
+                    }
+                    SlotOp::Take => {
+                        let CheckedSlotTransitionKind::Take { container, .. } = transition.kind
+                        else {
+                            unreachable!("slot take transition was exactly cross-validated")
+                        };
+                        let SlotActionKind::Take { .. } = action.kind() else {
+                            unreachable!("slot take action was exactly cross-validated")
+                        };
+                        let hint = self.name_hint.take();
+                        let Some(before) =
+                            self.checked_slot_place_state(&args[0], &container, scope)
+                        else {
+                            return refused_expression_value(e);
+                        };
+                        let Val::Int(index) = self.eval(&args[1], scope) else {
+                            unreachable!("checked: slot_take index is u64")
+                        };
+                        let bounds = format!("0 ≤ {index} ∧ {index} < ({before}.len)");
+                        let ob = self.obligation(
+                            &format!("{}.slot_take.bounds.{site}", self.fname),
+                            format!(
+                                "`slot_take` index must be in bounds for `{}`",
+                                container.render()
+                            ),
+                            args[1].span,
+                            bounds.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&bounds);
+                        let occupied =
+                            format!("({before}.get {index}) ≠ (none : Option {payload_lean})");
+                        let ob = self.obligation(
+                            &format!("{}.slot_take.occupied.{site}", self.fname),
+                            format!(
+                                "`slot_take` requires occupied storage in `{}`",
+                                container.render()
+                            ),
+                            e.span,
+                            occupied.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&occupied);
+
+                        let taken = self.hinted_sym("_slot_take", hint);
+                        let base = taken.trim_start_matches('_').to_string();
+                        let value = self.fresh_state_for(&payload, &taken, &base, LenFact::Skip);
+                        self.push_hyp_unique(
+                            format!("h_{base}_taken"),
+                            format!("({before}.get {index}) = some ({taken})"),
+                        );
+                        let updated =
+                            format!("({before}.set {index} (none : Option {payload_lean}))");
+                        if !self.write_slot_place(&container, updated.clone()) {
+                            return refused_expression_value(e);
+                        }
+                        self.push_slot_payload_facts(
+                            &payload,
+                            &format!("{}_take", container.binder_hint()),
+                            &updated,
+                        );
+                        value
+                    }
+                    SlotOp::Put => {
+                        let CheckedSlotTransitionKind::Put { container, .. } = transition.kind
+                        else {
+                            unreachable!("slot put transition was exactly cross-validated")
+                        };
+                        let SlotActionKind::Put {
+                            value_transfer,
+                            staging,
+                            ..
+                        } = action.kind().clone()
+                        else {
+                            unreachable!("slot put action was exactly cross-validated")
+                        };
+                        // Source order is container, index, then incoming
+                        // value. The value is still staged before either
+                        // guard, so a guard trap owns the staged payload via
+                        // the retained terminal route, but an index expression
+                        // may legally borrow that payload before the later
+                        // move consumes it.
+                        let Some(before) =
+                            self.checked_slot_place_state(&args[0], &container, scope)
+                        else {
+                            return refused_expression_value(e);
+                        };
+                        let Val::Int(index) = self.eval(&args[1], scope) else {
+                            unreachable!("checked: slot_put index is u64")
+                        };
+                        let evaluated = self.eval(&args[2], scope);
+                        let _transfer = self.checked_value_transfer_key(&args[2], &value_transfer);
+                        let Some(incoming) = self.slot_payload_term(&payload, evaluated) else {
+                            return refused_expression_value(e);
+                        };
+                        let staging_name = self.hinted_sym(
+                            "_slot_put_value",
+                            Some(format!("_{}", sanitize(&staging.binder_hint()))),
+                        );
+                        self.binders
+                            .push((staging_name.clone(), payload_lean.clone()));
+                        self.push_hyp_unique(
+                            format!("h_{}_staged", staging_name.trim_start_matches('_')),
+                            format!("{staging_name} = ({incoming})"),
+                        );
+
+                        let bounds = format!("0 ≤ {index} ∧ {index} < ({before}.len)");
+                        let ob = self.obligation(
+                            &format!("{}.slot_put.bounds.{site}", self.fname),
+                            format!(
+                                "`slot_put` index must be in bounds for `{}`",
+                                container.render()
+                            ),
+                            args[1].span,
+                            bounds.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&bounds);
+                        let empty =
+                            format!("({before}.get {index}) = (none : Option {payload_lean})");
+                        let ob = self.obligation(
+                            &format!("{}.slot_put.empty.{site}", self.fname),
+                            format!(
+                                "`slot_put` requires empty storage in `{}`",
+                                container.render()
+                            ),
+                            e.span,
+                            empty.clone(),
+                        );
+                        self.push_obligation(ob);
+                        self.assume_fact(&empty);
+
+                        // Integer/record facts and, critically, every class
+                        // invariant are proved for the exact staged value
+                        // before its `some` state is made visible.
+                        for (suffix, fact) in self.slot_payload_fact_props(&payload, &staging_name)
+                        {
+                            let ob = self.obligation(
+                                &format!("{}.slot_put.payload.{suffix}.{site}", self.fname),
+                                "staged slot payload must preserve its checked value facts".into(),
+                                args[2].span,
+                                fact.clone(),
+                            );
+                            self.push_obligation(ob);
+                            self.assume_fact(&fact);
+                        }
+                        let updated = format!("({before}.set {index} (some ({staging_name})))");
+                        if !self.write_slot_place(&container, updated.clone()) {
+                            return refused_expression_value(e);
+                        }
+                        self.push_slot_payload_facts(
+                            &payload,
+                            &format!("{}_put", container.binder_hint()),
+                            &updated,
+                        );
+                        Val::Unit
+                    }
+                }
             }
             ExprKind::IntLit(n) => {
                 let v = if *n < 0 {
@@ -6902,8 +7921,11 @@ impl<'a> Generator<'a> {
             ExprKind::BoolLit(b) => Val::Prop(if *b { "True".into() } else { "False".into() }),
             ExprKind::Var(name) => self.env.get(name).cloned().expect("checked: initialized"),
             ExprKind::Len { array } => {
-                let arr = self.arr_str(array);
-                Val::Int(format!("({arr}.len)"))
+                let container = match self.env.get(array) {
+                    Some(Val::Arr(array)) | Some(Val::Slots(array)) => array.clone(),
+                    Some(_) | None => unreachable!("checked: sequence container in scope"),
+                };
+                Val::Int(format!("({container}.len)"))
             }
             ExprKind::IsSome { operand } => {
                 let Val::Opt(o) = self.eval(operand, scope) else {
@@ -7071,7 +8093,7 @@ impl<'a> Generator<'a> {
                     // parenthesizes it below. A class payload's structure
                     // chain rides the same way.
                     Val::Opt(v) | Val::Obj(v) => v,
-                    Val::View(_) | Val::Record(_) | Val::Unit => {
+                    Val::Slots(_) | Val::View(_) | Val::Record(_) | Val::Unit => {
                         refuse_vc_type(format!(
                             "internal.vcgen.type_error: `some` payload has no symbolic \
                              value in {}",
@@ -8912,6 +9934,7 @@ impl<'a> Generator<'a> {
                         | Val::Prop(_)
                         | Val::Opt(_)
                         | Val::Arr(_)
+                        | Val::Slots(_)
                         | Val::Record(_)
                         | Val::View(_)
                         | Val::Ptr(_)
@@ -8926,6 +9949,8 @@ impl<'a> Generator<'a> {
                     Some(ty) => {
                         if checked_array_payload(ty).is_some() {
                             Val::Arr(v)
+                        } else if matches!(ty.referent(), Ty::Slots(_)) {
+                            Val::Slots(v)
                         } else {
                             Val::Obj(v)
                         }
@@ -8946,6 +9971,7 @@ impl<'a> Generator<'a> {
                                 | Val::Prop(_)
                                 | Val::Opt(_)
                                 | Val::Arr(_)
+                                | Val::Slots(_)
                                 | Val::Record(_)
                                 | Val::View(_)
                                 | Val::Ptr(_)
@@ -8954,6 +9980,11 @@ impl<'a> Generator<'a> {
                             | None => "self".to_string(),
                         };
                         place(project_field(&selfv, f))
+                    }
+                    (None, None)
+                        if matches!(e.ty.as_ref().map(Ty::referent), Some(Ty::Slots(_))) =>
+                    {
+                        Val::Slots(self.slots_str(array))
                     }
                     (None, None) => Val::Arr(self.arr_str(array)),
                 }
@@ -9189,6 +10220,7 @@ impl<'a> Generator<'a> {
                         Some(Ty::Class(_)) => Val::Obj(projected),
                         Some(Ty::Raw(_) | Ty::RawRecord(_)) => Val::Ptr(projected),
                         Some(Ty::Array(..)) => Val::Arr(projected),
+                        Some(Ty::Slots(..)) => Val::Slots(projected),
                         Some(Ty::Bool) => Val::Prop(format!("({projected} = true)")),
                         Some(Ty::Int(_) | Ty::Param(_)) => Val::Int(projected),
                         // A copyable option field projects as its chain,
@@ -9197,13 +10229,7 @@ impl<'a> Generator<'a> {
                         Some(Ty::Option(_)) => Val::Opt(projected),
                         // A field type with no symbolic projection is a
                         // named refusal, never a bare Int (ADR 0074).
-                        Some(
-                            Ty::Slots(_)
-                            | Ty::Record(_)
-                            | Ty::OptionRaw(_)
-                            | Ty::Borrow(..)
-                            | Ty::Unit,
-                        )
+                        Some(Ty::Record(_) | Ty::OptionRaw(_) | Ty::Borrow(..) | Ty::Unit)
                         | None => {
                             refuse_vc_type(format!(
                                 "internal.vcgen.field_state_unsupported: `self.{field}` \
@@ -9284,7 +10310,7 @@ impl<'a> Generator<'a> {
                             // in the init's clauses must bind the whole chain.
                             Val::Opt(v) => format!("({v})"),
                             Val::Prop(p) => lean_bool_value(&p),
-                            Val::Record(_) | Val::Ptr(_) | Val::Unit => {
+                            Val::Slots(_) | Val::Record(_) | Val::Ptr(_) | Val::Unit => {
                                 unreachable!("checked: ctor args")
                             }
                         }
@@ -9389,6 +10415,7 @@ impl<'a> Generator<'a> {
                         Val::Int(v) | Val::Opt(v) | Val::Ptr(v) => format!("({v})"),
                         Val::Prop(_)
                         | Val::Arr(_)
+                        | Val::Slots(_)
                         | Val::Obj(_)
                         | Val::Record(_)
                         | Val::View(_)
@@ -9516,7 +10543,7 @@ impl<'a> Generator<'a> {
                             // execution, while source parameters bind Lean Bool;
                             // reify at the call boundary as at a function call.
                             Val::Prop(p) => lean_bool_value(&p),
-                            Val::Record(_) | Val::Unit => unreachable!(
+                            Val::Slots(_) | Val::Record(_) | Val::Unit => unreachable!(
                                 "checked: int/bool/option/array/class/resource/pointer args"
                             ),
                         }
@@ -9546,6 +10573,7 @@ impl<'a> Generator<'a> {
                         | Val::Prop(_)
                         | Val::Opt(_)
                         | Val::Arr(_)
+                        | Val::Slots(_)
                         | Val::Record(_)
                         | Val::View(_)
                         | Val::Ptr(_)
@@ -9820,6 +10848,11 @@ impl<'a> Generator<'a> {
                         Val::Prop(_) => {
                             unreachable!("checked: a proposition argument has a Bool parameter")
                         }
+                        Val::Slots(_) => {
+                            unreachable!(
+                                "checked: owner-slot containers cannot cross call boundaries"
+                            )
+                        }
                         Val::Unit => unreachable!(
                             "checked: int/bool/option/array/class/record/resource/pointer args"
                         ),
@@ -10035,6 +11068,7 @@ impl<'a> Generator<'a> {
                 Val::Int(_)
                 | Val::Opt(_)
                 | Val::Arr(_)
+                | Val::Slots(_)
                 | Val::Obj(_)
                 | Val::Record(_)
                 | Val::View(_)
@@ -10056,6 +11090,7 @@ impl<'a> Generator<'a> {
                 Val::Int(s)
                 | Val::Opt(s)
                 | Val::Arr(s)
+                | Val::Slots(s)
                 | Val::Obj(s)
                 | Val::Record(s)
                 | Val::View(s)
@@ -10078,6 +11113,7 @@ impl<'a> Generator<'a> {
                 | Val::Prop(_)
                 | Val::Opt(_)
                 | Val::Arr(_)
+                | Val::Slots(_)
                 | Val::Obj(_)
                 | Val::Record(_)
                 | Val::View(_)
@@ -10136,6 +11172,7 @@ impl<'a> Generator<'a> {
                 | Val::Prop(_)
                 | Val::Opt(_)
                 | Val::Arr(_)
+                | Val::Slots(_)
                 | Val::Record(_)
                 | Val::View(_)
                 | Val::Ptr(_)
@@ -10145,11 +11182,11 @@ impl<'a> Generator<'a> {
         }
     }
 
-    /// Current symbolic expression for an array field of self.
+    /// Current symbolic expression for an array or owner-slot field of self.
     fn self_field_str(&self, field: &str) -> String {
         match self.cctx {
             Cctx::Init(_) => match self.env.get(&format!("self.{field}")) {
-                Some(Val::Arr(s)) => s.clone(),
+                Some(Val::Arr(s)) | Some(Val::Slots(s)) => s.clone(),
                 Some(
                     Val::Int(_)
                     | Val::Prop(_)
@@ -10175,6 +11212,7 @@ impl<'a> Generator<'a> {
                 Val::Int(_)
                 | Val::Prop(_)
                 | Val::Opt(_)
+                | Val::Slots(_)
                 | Val::Obj(_)
                 | Val::Record(_)
                 | Val::View(_)
@@ -10182,6 +11220,25 @@ impl<'a> Generator<'a> {
                 | Val::Unit,
             )
             | None => unreachable!("checked: array in scope"),
+        }
+    }
+
+    /// Current symbolic view of a resource in scope.
+    fn slots_str(&self, name: &str) -> String {
+        match self.env.get(name) {
+            Some(Val::Slots(s)) => s.clone(),
+            Some(
+                Val::Int(_)
+                | Val::Prop(_)
+                | Val::Opt(_)
+                | Val::Arr(_)
+                | Val::Obj(_)
+                | Val::Record(_)
+                | Val::View(_)
+                | Val::Ptr(_)
+                | Val::Unit,
+            )
+            | None => unreachable!("checked: owner-slot container in scope"),
         }
     }
 
@@ -10194,6 +11251,7 @@ impl<'a> Generator<'a> {
                 | Val::Prop(_)
                 | Val::Opt(_)
                 | Val::Arr(_)
+                | Val::Slots(_)
                 | Val::Obj(_)
                 | Val::Record(_)
                 | Val::Ptr(_)
@@ -10207,7 +11265,9 @@ impl<'a> Generator<'a> {
     /// class-state symbol.
     fn state_str(&self, name: &str) -> String {
         match self.env.get(name) {
-            Some(Val::Arr(s)) | Some(Val::Obj(s)) | Some(Val::View(s)) => s.clone(),
+            Some(Val::Arr(s)) | Some(Val::Slots(s)) | Some(Val::Obj(s)) | Some(Val::View(s)) => {
+                s.clone()
+            }
             Some(
                 Val::Int(_) | Val::Prop(_) | Val::Opt(_) | Val::Record(_) | Val::Ptr(_) | Val::Unit,
             )
@@ -10927,13 +11987,23 @@ mod type_domain_tests {
     use crate::transition::CallTransition;
 
     #[test]
-    fn owner_slots_have_neither_a_vc_type_nor_operation_semantics() {
+    fn owner_slots_have_a_distinct_local_vc_type_and_sealed_operation_gate() {
         let slots = Ty::slots(Ty::Int(IntTy::U64));
-        let error = validate_vc_ty(slots.clone(), false, "forged slot local")
-            .expect_err("owner slots have no Lean representation yet");
-        assert!(
-            error.starts_with("internal.vcgen.slots_unsupported:"),
-            "{error}"
+        validate_vc_ty(slots.clone(), false, "slot local")
+            .expect("owner slots have a proof representation");
+        validate_vc_type_position(slots.clone(), false, VcTypePosition::Local, "slot local")
+            .expect("owner slots are admitted as local storage");
+        let error = validate_vc_type_position(
+            slots.clone(),
+            false,
+            VcTypePosition::Parameter,
+            "slot parameter",
+        )
+        .expect_err("owner slots do not cross call boundaries");
+        assert!(error.starts_with("vc.slots_position:"), "{error}");
+        assert_eq!(
+            lean_slots_ty(&Ty::Int(IntTy::U64), &[], &[]),
+            "Sable.Seq (Option Int)"
         );
 
         let operation = Expr {
@@ -10946,9 +12016,9 @@ mod type_domain_tests {
             ty: Some(Ty::Unit),
         };
         let error = validate_vc_expr(&operation, false, "forged slot operation", &HashMap::new())
-            .expect_err("owner-slot operations have no proof semantics yet");
+            .expect_err("a sealed operation must retain its exact arity and types");
         assert!(
-            error.starts_with("internal.vcgen.slots_unsupported:"),
+            error.starts_with("internal.vcgen.slot_transition_shape:"),
             "{error}"
         );
     }
@@ -11113,6 +12183,543 @@ mod type_domain_tests {
             Err(error) => error,
             Ok(_) => panic!("synthetic invalid affine-option program reached VC generation"),
         }
+    }
+
+    #[test]
+    fn owner_slot_roundtrip_emits_occupancy_vcs_and_atomic_state_updates() {
+        let source = r#"
+fn slot_roundtrip(u64 value) -> u64 {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    slot_put(&mut cells, 0, value);
+    u64 taken = slot_take(&mut cells, 0);
+    return taken;
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("checked owner-slot operations must have VC semantics");
+
+        assert!(
+            generated
+                .obligations
+                .iter()
+                .flat_map(|obligation| &obligation.binders)
+                .any(|(_, ty)| ty == "Sable.Seq (Option Int)")
+        );
+        let put_bounds = generated
+            .obligations
+            .iter()
+            .find(|obligation| {
+                obligation
+                    .name
+                    .starts_with("slot_roundtrip.slot_put.bounds")
+            })
+            .expect("put emits its exact bounds obligation");
+        assert!(put_bounds.goal.contains(".len"));
+        assert!(put_bounds.hyps.iter().any(|(name, proposition)| {
+            name.contains("all_none") && proposition.contains("none : Option Int")
+        }));
+        let put_empty = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.starts_with("slot_roundtrip.slot_put.empty"))
+            .expect("put emits an empty-cell obligation");
+        assert!(put_empty.goal.contains("= (none : Option Int)"));
+
+        let take_occupied = generated
+            .obligations
+            .iter()
+            .find(|obligation| {
+                obligation
+                    .name
+                    .starts_with("slot_roundtrip.slot_take.occupied")
+            })
+            .expect("take emits an occupied-cell obligation");
+        assert!(take_occupied.goal.contains("≠ (none : Option Int)"));
+        assert!(take_occupied.hyps.iter().any(|(_, proposition)| {
+            proposition.contains(".set") && proposition.contains("some")
+        }));
+        assert!(generated.obligations.iter().all(|obligation| {
+            obligation
+                .binders
+                .iter()
+                .all(|(_, ty)| ty != "Sable.Seq Int" || !obligation.name.contains("slot_"))
+        }));
+    }
+
+    #[test]
+    fn class_slot_put_proves_the_staged_invariant_before_installation() {
+        let source = r#"
+class Item {
+    u64 value;
+
+    /// invariant value ≤ 10
+
+    /// pre value ≤ 10
+    init new(u64 value) {
+        self.value = value;
+    }
+}
+
+fn class_slot() {
+    mut slots<Item> cells = alloc_slots<Item>(1);
+    var item = Item::new(7);
+    slot_put(&mut cells, 0, item);
+    var restored = slot_take(&mut cells, 0);
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("class payload slots preserve the concrete invariant fact");
+        let invariant = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("slot_put.payload.inv_"))
+            .expect("put proves the staged concrete class invariant");
+        assert!(invariant.goal.contains("≤ 10"));
+        assert!(
+            invariant.binders.iter().any(|(name, ty)| {
+                name.contains("slot_put_value") && ty.contains("SableC_Item")
+            })
+        );
+        let take = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("slot_take.occupied"))
+            .expect("class take proves occupancy");
+        assert!(take.hyps.iter().any(|(name, proposition)| {
+            name.contains("present_inv") && proposition.contains("≤ 10")
+        }));
+    }
+
+    #[test]
+    fn slot_put_evaluates_a_borrowing_index_before_staging_and_moving_its_value() {
+        let source = r#"
+class Item {
+    u64 value;
+
+    /// invariant value = 7
+
+    init new() {
+        self.value = 7;
+    }
+}
+
+/// post result = 0
+fn index_of(&Item item) -> u64 {
+    return 0;
+}
+
+fn slot_put_order() {
+    mut slots<Item> cells = alloc_slots<Item>(1);
+    var item = Item::new();
+    slot_put(&mut cells, index_of(&item), item);
+    var restored = slot_take(&mut cells, 0);
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("the put index may borrow its payload before the later move");
+
+        let borrow_invariant = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("slot_put_order.borrow_inv.item"))
+            .expect("the index helper checks its shared class borrow");
+        assert!(
+            borrow_invariant
+                .binders
+                .iter()
+                .all(|(name, _)| { !name.contains("slot_put_value") })
+        );
+        assert!(borrow_invariant.hyps.iter().all(|(name, proposition)| {
+            !name.contains("staged") && !proposition.contains("slot_put_value")
+        }));
+
+        let bounds = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("slot_put_order.slot_put.bounds"))
+            .expect("the put emits bounds after staging");
+        let post_position = bounds
+            .hyps
+            .iter()
+            .position(|(name, _)| name.starts_with("h_index_of_post_"))
+            .expect("the index call postcondition is in scope");
+        let staged_position = bounds
+            .hyps
+            .iter()
+            .position(|(name, _)| name.contains("staged"))
+            .expect("the moved value is staged before the guard");
+        assert!(post_position < staged_position);
+        let result_position = bounds
+            .binders
+            .iter()
+            .position(|(name, ty)| name.starts_with("_r") && ty == "Int")
+            .expect("the index result is bound");
+        let staging_position = bounds
+            .binders
+            .iter()
+            .position(|(name, ty)| name.contains("slot_put_value") && ty.contains("SableC_Item"))
+            .expect("the payload staging binder is present");
+        assert!(result_position < staging_position);
+
+        let tampered = tampered_generation_error(source, |checked| {
+            let owner = CallOwner::Function("slot_put_order".into());
+            let key = checked
+                .ownership
+                .slot_transitions_for_owner(&owner)
+                .find(|(_, transition)| {
+                    matches!(transition.kind, CheckedSlotTransitionKind::Put { .. })
+                })
+                .expect("put transition")
+                .0
+                .clone();
+            let transition = checked
+                .ownership
+                .slot_transition_mut(&key)
+                .expect("mutable put transition");
+            let CheckedSlotTransitionKind::Put {
+                index_span,
+                value_transfer,
+                ..
+            } = &mut transition.kind
+            else {
+                unreachable!()
+            };
+            value_transfer.span = *index_span;
+        });
+        assert!(
+            tampered.starts_with("internal.vcgen.slot_transition_mismatch:"),
+            "{tampered}"
+        );
+    }
+
+    #[test]
+    fn initializer_slot_operations_read_the_exact_initialized_field_state() {
+        let source = r#"
+class InitializedPool {
+    slots<u64> cells;
+    u64 restored;
+
+    init new() {
+        self.cells = alloc_slots<u64>(1);
+        slot_put(&mut self.cells, 0, 7);
+        self.restored = slot_take(&mut self.cells, 0);
+    }
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("initializer slot operations use the initialized field entry directly");
+        assert_eq!(generated.classes[0].fields[0].1, "Sable.Seq (Option Int)");
+
+        let put_bounds = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("slot_put.bounds"))
+            .expect("the initializer put emits its bounds obligation");
+        assert!(put_bounds.goal.contains(".len"));
+        let take_occupied = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("slot_take.occupied"))
+            .expect("the initializer take emits its occupancy obligation");
+        assert!(take_occupied.goal.contains(".set"));
+        assert!(take_occupied.goal.contains("some"));
+    }
+
+    #[test]
+    fn direct_self_slot_fields_use_the_enclosing_class_state_chain() {
+        let source = r#"
+class Pool {
+    slots<u64> cells;
+
+    init new() {
+        self.cells = alloc_slots<u64>(1);
+    }
+
+    fn roundtrip(&mut self, u64 value) -> u64 {
+        slot_put(&mut self.cells, 0, value);
+        return slot_take(&mut self.cells, 0);
+    }
+
+    fn replace(&mut self) -> u64 {
+        var previous = self.cells;
+        mut slots<u64> next = alloc_slots<u64>(2);
+        self.cells = next;
+        return self.cells.len;
+    }
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("direct self slot fields have symbolic read/write semantics");
+        assert_eq!(generated.classes[0].fields[0].1, "Sable.Seq (Option Int)");
+        let occupied = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("slot_take.occupied"))
+            .expect("the field take emits occupancy");
+        assert!(occupied.goal.contains(".cells"));
+        assert!(occupied.goal.contains(".set"));
+        assert!(occupied.goal.contains("some"));
+    }
+
+    #[test]
+    fn slot_loop_effects_validate_the_transition_and_havoc_the_whole_container() {
+        let source = r#"
+fn slot_loop() {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    slot_put(&mut cells, 0, 7);
+    mut u64 i = 0;
+    /// invariant i ≤ 1
+    /// invariant cells.len = 1
+    /// variant 1 - i
+    while (i < 1) {
+        u64 value = slot_take(&mut cells, i);
+        slot_put(&mut cells, i, value);
+        i = i + 1;
+    }
+    u64 final_value = slot_take(&mut cells, 0);
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("slot loop mutations have exact checker-linked havoc semantics");
+        let loop_take = generated
+            .obligations
+            .iter()
+            .find(|obligation| {
+                obligation.name.contains("slot_take.occupied")
+                    && obligation
+                        .binders
+                        .iter()
+                        .any(|(name, ty)| name == "cells" && ty == "Sable.Seq (Option Int)")
+            })
+            .expect("the loop body take sees a fresh whole-container binder");
+        assert!(loop_take.hyps.iter().any(|(name, proposition)| {
+            name.starts_with("h_inv_") && proposition.contains("cells.len")
+        }));
+        assert!(loop_take.hyps.iter().any(|(name, proposition)| {
+            name.starts_with("h_cells_len")
+                && proposition.contains("cells.len")
+                && proposition.contains("_old")
+        }));
+
+        let error = tampered_generation_error(source, |checked| {
+            let owner = CallOwner::Function("slot_loop".into());
+            let key = checked
+                .ownership
+                .loops_for_owner(&owner)
+                .next()
+                .expect("loop effect")
+                .0
+                .clone();
+            let effect = checked
+                .ownership
+                .loop_effects_mut(&key)
+                .expect("mutable loop fixture");
+            let mutation = effect
+                .mutations
+                .iter_mut()
+                .find(|mutation| matches!(mutation, CheckedMutation::Slot { .. }))
+                .expect("slot mutation");
+            let CheckedMutation::Slot { payload, .. } = mutation else {
+                unreachable!()
+            };
+            *payload = Ty::Bool;
+        });
+        assert!(
+            error.starts_with("internal.vcgen.loop_slot_transition_mismatch:"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn slot_loop_whole_owner_writes_drop_local_and_init_field_length_facts() {
+        let source = r#"
+fn local_replacement() {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    mut u64 i = 0;
+    /// invariant i ≤ 1
+    /// variant 1 - i
+    while (i < 1) {
+        slots<u64> replacement = alloc_slots<u64>(2);
+        cells = replacement;
+        i = i + 1;
+    }
+    /// assert #[label(local_length_is_not_stable)] cells.len = 1
+}
+
+class FieldReplacement {
+    slots<u64> cells;
+
+    init new() {
+        self.cells = alloc_slots<u64>(1);
+        mut u64 i = 0;
+        /// invariant i ≤ 1
+        /// variant 1 - i
+        while (i < 1) {
+            slots<u64> replacement = alloc_slots<u64>(2);
+            self.cells = replacement;
+            i = i + 1;
+        }
+        /// assert #[label(field_length_is_not_stable)] self.cells.len = 1
+    }
+}
+"#;
+        let (program, checked) = checked_program(source);
+        let generated = generate(&program, &checked, source, Path::new("."))
+            .expect("whole owner writes havoc slots without a stale length equality");
+
+        let local_assertion = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("local_length_is_not_stable"))
+            .expect("the local false assertion remains an obligation");
+        assert!(
+            local_assertion
+                .hyps
+                .iter()
+                .all(|(name, _)| !name.starts_with("h_cells_len")),
+            "a whole-local write must not retain a fresh-to-stale slot length equality: {local_assertion:#?}"
+        );
+
+        let field_assertion = generated
+            .obligations
+            .iter()
+            .find(|obligation| obligation.name.contains("field_length_is_not_stable"))
+            .expect("the init-field false assertion remains an obligation");
+        assert!(
+            field_assertion
+                .hyps
+                .iter()
+                .all(|(name, _)| !name.starts_with("h_self_cells_len")),
+            "a whole-field write must not retain a fresh-to-stale slot length equality: {field_assertion:#?}"
+        );
+
+        let emitted = crate::lean::emit(
+            &generated,
+            &[],
+            &HashSet::new(),
+            &[],
+            &crate::lean::EmittedNames::default(),
+        );
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler crate has a repository parent");
+        let environment = crate::lean::ProofEnvironment::capture(repo_root)
+            .expect("the repository proof environment must be capturable");
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock follows the Unix epoch")
+            .as_nanos();
+        let lean_file = std::env::temp_dir().join(format!(
+            "sable_slot_length_havoc_{}_{}.lean",
+            std::process::id(),
+            nonce
+        ));
+        std::fs::write(&lean_file, &emitted.lean_source)
+            .expect("the owner-slot havoc document must be writable");
+        let messages = crate::lean::run_lean(
+            repo_root,
+            &environment,
+            &lean_file,
+            None,
+            &emitted.lean_source,
+        )
+        .expect("Lean must run and reject the two false length assertions");
+        let _ = std::fs::remove_file(&lean_file);
+        let modules =
+            crate::modules::ModuleSet::single("slot_length_havoc.sable".into(), source.into());
+        let diagnostics = crate::lean::diagnose(&emitted, &generated, &messages, &modules);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.name.contains("local_length_is_not_stable")),
+            "{diagnostics:#?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.name.contains("field_length_is_not_stable")),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn slot_transition_deletion_substitution_and_unvisited_insertion_fail_closed() {
+        let source = r#"
+fn slot_boundary(u64 value) {
+    mut slots<u64> cells = alloc_slots<u64>(1);
+    slot_put(&mut cells, 0, value);
+    u64 restored = slot_take(&mut cells, 0);
+}
+"#;
+        let deleted = tampered_generation_error(source, |checked| {
+            let owner = CallOwner::Function("slot_boundary".into());
+            let key = checked
+                .ownership
+                .slot_transitions_for_owner(&owner)
+                .find(|(_, transition)| {
+                    matches!(transition.kind, CheckedSlotTransitionKind::Put { .. })
+                })
+                .expect("put transition")
+                .0
+                .clone();
+            checked
+                .ownership
+                .remove_slot_transition(&key)
+                .expect("remove retained transition");
+        });
+        assert!(
+            deleted.starts_with("internal.vcgen.slot_transition_missing:"),
+            "{deleted}"
+        );
+
+        let substituted = tampered_generation_error(source, |checked| {
+            let owner = CallOwner::Function("slot_boundary".into());
+            let key = checked
+                .ownership
+                .slot_transitions_for_owner(&owner)
+                .find(|(_, transition)| {
+                    matches!(transition.kind, CheckedSlotTransitionKind::Take { .. })
+                })
+                .expect("take transition")
+                .0
+                .clone();
+            checked
+                .ownership
+                .slot_transition_mut(&key)
+                .expect("mutable retained transition")
+                .payload = Ty::Bool;
+        });
+        assert!(
+            substituted.starts_with("internal.vcgen.slot_transition_mismatch:"),
+            "{substituted}"
+        );
+
+        let unvisited = tampered_generation_error(source, |checked| {
+            let owner = CallOwner::Function("slot_boundary".into());
+            let mut transition = checked
+                .ownership
+                .slot_transitions_for_owner(&owner)
+                .next()
+                .expect("slot transition")
+                .1
+                .clone();
+            transition.key.span = Span::new(0, 0);
+            checked
+                .ownership
+                .insert_slot_transition(transition)
+                .expect("insert distinct forged transition");
+        });
+        assert!(
+            unvisited.starts_with("internal.vcgen.slot_transition_unvisited:"),
+            "{unvisited}"
+        );
     }
 
     #[test]
@@ -12530,6 +14137,8 @@ fn bool_array_loop(u64 n, bool seed) {
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
+            visited_slot_transitions: HashSet::new(),
+            visited_slot_actions: HashSet::new(),
             visited_exposures: HashSet::new(),
             visited_sealed_operations: HashSet::new(),
             visited_loops: HashSet::new(),
@@ -12974,6 +14583,8 @@ class CleanupHolder {
                 .collect(),
             checked_call_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
+            visited_slot_transitions: HashSet::new(),
+            visited_slot_actions: HashSet::new(),
             visited_exposures: HashSet::new(),
             visited_sealed_operations: HashSet::new(),
             visited_loops: HashSet::new(),
@@ -14188,6 +15799,8 @@ pub fn same_member_subject() {
             visited_checked_calls: HashSet::new(),
             checked_call_visits: HashMap::new(),
             visited_option_takes: HashSet::new(),
+            visited_slot_transitions: HashSet::new(),
+            visited_slot_actions: HashSet::new(),
             visited_exposures: HashSet::new(),
             visited_sealed_operations: HashSet::new(),
             visited_loops: HashSet::new(),
