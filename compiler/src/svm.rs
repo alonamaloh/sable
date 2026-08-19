@@ -16,8 +16,9 @@ use crate::ast::*;
 #[cfg(test)]
 use crate::control::summarize_block;
 use crate::control::{
-    AssignmentStaging, BlockKind, BodyPlan, BranchArm, BranchArmPlan, ClassDropAction,
-    CompilerTempKind, ControlProgram, ExitKind, ExitRoute, FlowSummary, ScopeId, TrapSite,
+    AssignmentStaging, BlockKind, BodyPlan, BranchArm, BranchArmPlan, CompilerTempKind,
+    ControlProgram, ExitKind, ExitRoute, FlowSummary, ScopeId, TrapSite, ValueDropAction,
+    ValueDropRecipe,
 };
 use crate::interp::{MmioEvent, ObservedRun, RtArray, RtVal};
 use crate::ownership::ValueTransferSink;
@@ -2767,13 +2768,13 @@ fn validate_checked_assignment_action(
     Ok(())
 }
 
-/// Link a statement-local class cleanup edge to the exact concrete class
-/// recipe retained by the same checked control table. The SVM does not lower
-/// class destruction yet, but that subset refusal is allowed only after the
-/// action has proved its canonical terminal no-unwind identity.
-fn validate_checked_class_drop_action(
+/// Reconcile one retained recursive cleanup action before the SVM applies its
+/// named subset boundary. Class leaves must still resolve to the concrete
+/// recipe and canonical terminal no-unwind route owned by the same checked
+/// control table; array and present-payload nodes cannot bypass that leaf.
+fn validate_checked_value_drop_action(
     ctx: &LowerCtx<'_>,
-    action: &ClassDropAction,
+    action: &ValueDropAction,
     span: crate::span::Span,
     role: &str,
 ) -> Result<(), String> {
@@ -2782,22 +2783,29 @@ fn validate_checked_class_drop_action(
             "internal.svm.control_plan: checked {role} lost its whole control table"
         ));
     };
-    let recipe = control
-        .class_drop_for_action(action, &ctx.program.classes, span)
+    control
+        .validate_value_drop_action(action, &ctx.program.classes, span)
         .map_err(control_plan_error)?;
-    let route = action.terminal_trap_route();
-    if recipe.class() != action.class()
-        || recipe.terminal_trap_route() != route
-        || route.kind() != ExitKind::Trap
-        || !route.scopes().is_empty()
-        || !route.clears().is_empty()
-        || !route.drops().is_empty()
-    {
-        return Err(format!(
-            "internal.svm.control_plan: retained {role} class cleanup is not its canonical terminal no-unwind recipe"
-        ));
+    fn validate_class_leaves(action: &ValueDropAction, role: &str) -> Result<(), String> {
+        match action.recipe() {
+            ValueDropRecipe::ReleaseArray { .. } => Ok(()),
+            ValueDropRecipe::DropPresent(payload) => validate_class_leaves(payload, role),
+            ValueDropRecipe::DropClass(class) => {
+                let route = class.terminal_trap_route();
+                if route.kind() != ExitKind::Trap
+                    || !route.scopes().is_empty()
+                    || !route.clears().is_empty()
+                    || !route.drops().is_empty()
+                {
+                    return Err(format!(
+                        "internal.svm.control_plan: retained {role} class cleanup is not its canonical terminal no-unwind recipe"
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
-    Ok(())
+    validate_class_leaves(action, role)
 }
 
 /// Consume the exact retained replacement/install sequence for
@@ -2858,51 +2866,14 @@ fn validate_checked_field_assignment_action(
             );
         }
     }
-    match (value_ty, action.class_drop()) {
-        (Ty::Class(class), Some(class_drop)) if *class == class_drop.class() => {
-            validate_checked_class_drop_action(ctx, class_drop, field_span, "field assignment")?;
-        }
-        (Ty::Class(_), Some(_)) | (Ty::Class(_), None) => {
+    if let Some(drop_action) = action.drop_action() {
+        if drop_action.ty() != value_ty {
             return Err(
-                "internal.svm.control_plan: retained class field assignment lost its exact class-drop action"
+                "internal.svm.control_plan: retained field cleanup action names a different type"
                     .into(),
             );
         }
-        (
-            Ty::Int(_)
-            | Ty::Bool
-            | Ty::Array(_)
-            | Ty::Option(_)
-            | Ty::Raw(_)
-            | Ty::Res(_)
-            | Ty::Borrow(..)
-            | Ty::Record(_)
-            | Ty::RawRecord(_)
-            | Ty::OptionRaw(_)
-            | Ty::Param(_)
-            | Ty::Unit,
-            None,
-        ) => {}
-        (
-            Ty::Int(_)
-            | Ty::Bool
-            | Ty::Array(_)
-            | Ty::Option(_)
-            | Ty::Raw(_)
-            | Ty::Res(_)
-            | Ty::Borrow(..)
-            | Ty::Record(_)
-            | Ty::RawRecord(_)
-            | Ty::OptionRaw(_)
-            | Ty::Param(_)
-            | Ty::Unit,
-            Some(_),
-        ) => {
-            return Err(
-                "internal.svm.control_plan: retained non-class field assignment acquired a class-drop action"
-                    .into(),
-            );
-        }
+        validate_checked_value_drop_action(ctx, drop_action, field_span, "field assignment")?;
     }
     Ok(())
 }
@@ -2954,15 +2925,21 @@ fn validate_checked_temporary_drop_action(
                 .into(),
         );
     };
-    if action.class_drop().class() != *class {
+    let ValueDropRecipe::DropClass(class_drop) = action.drop_action().recipe() else {
+        return Err(
+            "internal.svm.control_plan: retained discarded-class action lost its terminal class recipe"
+                .into(),
+        );
+    };
+    if class_drop.class() != *class {
         return Err(
             "internal.svm.control_plan: retained discarded-class action names the wrong class-drop recipe"
                 .into(),
         );
     }
-    validate_checked_class_drop_action(
+    validate_checked_value_drop_action(
         ctx,
-        action.class_drop(),
+        action.drop_action(),
         expression.span,
         "discarded class temporary",
     )

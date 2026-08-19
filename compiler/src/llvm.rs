@@ -16,7 +16,7 @@ use crate::ast::{
 use crate::control::{
     AssignmentAction, AssignmentStaging, BlockId, BodyPlan, ClassDropAction, ClassDropPhase,
     ClassDropPlan, ControlProgram, DropId, ExitRoute, PlanError, ScopeId, StatementPlanKind,
-    TrapSite,
+    TrapSite, ValueDropRecipe,
 };
 use crate::diag::Diagnostic;
 use crate::place::Place;
@@ -631,15 +631,15 @@ fn llvm_validation_plan<'a>(
     body.validate_callable(function.span, &function.params, &function.body)
         .map_err(|error| vec![control_plan_backend_error(error)])?;
     for action in body.plan().field_assignments() {
-        if let Some(class_drop) = action.class_drop() {
+        if let Some(drop_action) = action.drop_action() {
             control
-                .class_drop_for_action(class_drop, &program.classes, action.span())
+                .validate_value_drop_action(drop_action, &program.classes, action.span())
                 .map_err(|error| vec![control_plan_backend_error(error)])?;
         }
     }
     for action in body.plan().temporary_drops() {
         control
-            .class_drop_for_action(action.class_drop(), &program.classes, action.span())
+            .validate_value_drop_action(action.drop_action(), &program.classes, action.span())
             .map_err(|error| vec![control_plan_backend_error(error)])?;
     }
     validate_llvm_exposure_plan_tree(body.plan(), &function.body, body.plan().body_block().id())
@@ -4128,7 +4128,8 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                     .iter()
                     .enumerate()
                     .map(|(class, declaration)| ClassDropPlan::build(class, declaration))
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| vec![control_plan_backend_error(error)])?,
             ),
         };
         Ok(Self {
@@ -4577,10 +4578,14 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                                 .into(),
                         })]);
                     }
-                    let drop_plan = action
-                        .class_drop()
-                        .map(|class_drop| self.class_drop_for_action(class_drop, *field_span))
-                        .transpose()?;
+                    let drop_plan = match action.drop_action().map(|drop| drop.recipe()) {
+                        Some(ValueDropRecipe::DropClass(class_drop)) => {
+                            Some(self.class_drop_for_action(class_drop, *field_span)?)
+                        }
+                        Some(ValueDropRecipe::ReleaseArray { .. })
+                        | Some(ValueDropRecipe::DropPresent(_))
+                        | None => None,
+                    };
                     Some((action, drop_plan))
                 }
                 _ => None,
@@ -4592,8 +4597,15 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         .temporary_drop(scope, expression)
                         .map_err(|error| vec![control_plan_backend_error(error)])?
                         .clone();
-                    let drop_plan =
-                        self.class_drop_for_action(action.class_drop(), expression.span)?;
+                    let ValueDropRecipe::DropClass(class_drop) = action.drop_action().recipe()
+                    else {
+                        return Err(vec![control_plan_backend_error(PlanError {
+                            span: expression.span,
+                            message: "discarded class temporary lost its terminal class recipe"
+                                .into(),
+                        })]);
+                    };
+                    let drop_plan = self.class_drop_for_action(class_drop, expression.span)?;
                     Some((action, drop_plan))
                 }
                 _ => None,
@@ -5985,7 +5997,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
     fn emit_drop_candidate(&mut self, drop: DropId) -> Result<(), Vec<BackendError>> {
         let candidate = self.control.candidate(drop);
         let place = candidate.place().clone();
-        let ty = candidate.ty().clone();
+        let action = candidate.drop_action().clone();
         let span = candidate.span();
         if !place.is_root() {
             return Err(vec![diag(
@@ -5996,17 +6008,28 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
             )]);
         }
         let name = place.root();
-        match ty {
-            Ty::Class(class) => self.emit_fixed_class_drop(name, class)?,
-            ty if ty.is_owned_bool_array() => self.emit_bool_array_drop(name),
-            ty if is_owned_u32_array(ty.clone()) => self.emit_u32_array_drop(name),
-            ty if is_affine_bool_option(&ty) => self.emit_affine_bool_option_drop(name),
-            ty => {
+        match action.recipe() {
+            ValueDropRecipe::DropClass(class) => self.emit_fixed_class_drop(name, class.class())?,
+            ValueDropRecipe::ReleaseArray { element } if element == &Ty::Bool => {
+                self.emit_bool_array_drop(name)
+            }
+            ValueDropRecipe::ReleaseArray { element } if element == &Ty::Int(IntTy::U32) => {
+                self.emit_u32_array_drop(name)
+            }
+            ValueDropRecipe::DropPresent(payload)
+                if matches!(
+                    payload.recipe(),
+                    ValueDropRecipe::ReleaseArray { element } if element == &Ty::Bool
+                ) && is_affine_bool_option(action.ty()) =>
+            {
+                self.emit_affine_bool_option_drop(name)
+            }
+            ValueDropRecipe::ReleaseArray { .. } | ValueDropRecipe::DropPresent(_) => {
                 return Err(vec![diag(
                     "backend.control_plan_unsupported",
                     "LLVM cannot lower a planned cleanup candidate",
                     span,
-                    format!("`{name}` has cleanup-bearing type `{}`", ty.name()),
+                    format!("`{name}` has cleanup-bearing type `{}`", action.ty().name()),
                 )]);
             }
         }
@@ -6188,15 +6211,19 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                         )]);
                     }
                     let field_slot = self.emit_class_field_slot(class, slot, field.index());
-                    match field.ty().clone() {
-                        Ty::Array(element) if element.as_ref() == &Ty::Int(IntTy::U32) => {
+                    match field.drop_action().map(|action| action.recipe()) {
+                        Some(ValueDropRecipe::ReleaseArray { element })
+                            if element == &Ty::Int(IntTy::U32) =>
+                        {
                             self.emit_u32_array_drop_from_slot(&field_slot);
                         }
-                        Ty::Class(child) => {
-                            self.emit_fixed_class_drop_from_slot(&field_slot, child)?;
+                        Some(ValueDropRecipe::DropClass(child)) => {
+                            self.emit_fixed_class_drop_from_slot(&field_slot, child.class())?;
                         }
-                        Ty::Int(_) => {}
-                        other => {
+                        None if matches!(field.ty(), Ty::Int(_)) => {}
+                        Some(ValueDropRecipe::ReleaseArray { .. })
+                        | Some(ValueDropRecipe::DropPresent(_))
+                        | None => {
                             return Err(vec![diag(
                                 "backend.control_plan_unsupported",
                                 "LLVM cannot lower a planned class-field cleanup",
@@ -6204,7 +6231,7 @@ impl<'a, 'support> FunctionEmitter<'a, 'support> {
                                 format!(
                                     "field `{}` has unsupported cleanup type `{}`",
                                     field.name(),
-                                    other.name()
+                                    field.ty().name()
                                 ),
                             )]);
                         }

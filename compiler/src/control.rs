@@ -799,7 +799,7 @@ pub(crate) struct DropCandidate {
     id: DropId,
     scope: ScopeId,
     place: Place,
-    ty: Ty,
+    drop_action: ValueDropAction,
     span: Span,
 }
 
@@ -817,7 +817,11 @@ impl DropCandidate {
     }
 
     pub(crate) fn ty(&self) -> &Ty {
-        &self.ty
+        self.drop_action.ty()
+    }
+
+    pub(crate) fn drop_action(&self) -> &ValueDropAction {
+        &self.drop_action
     }
 
     pub(crate) const fn span(&self) -> Span {
@@ -908,6 +912,93 @@ pub(crate) struct ClassDropAction {
     terminal_trap: ExitRoute,
 }
 
+/// The exact recursive recipe for destroying one cleanup-bearing value.
+///
+/// This is deliberately narrower than [`Ty::is_affine`]. Resources carry an
+/// explicit must-consume authority and never acquire implicit destruction.
+/// Arrays currently release one total, initialized buffer whose elements are
+/// non-affine; admitting affine elements requires a separate occupied-slot
+/// model and is rejected here rather than silently compiling as a raw free.
+/// An owning option destroys only its dynamically present payload, using the
+/// payload's retained action rather than rediscovering that recipe at use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValueDropAction {
+    ty: Ty,
+    recipe: ValueDropRecipe,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ValueDropRecipe {
+    ReleaseArray { element: Ty },
+    DropClass(ClassDropAction),
+    DropPresent(Box<ValueDropAction>),
+}
+
+impl ValueDropAction {
+    fn build(ty: &Ty, span: Span) -> Result<Option<Self>, PlanError> {
+        let recipe = match ty {
+            Ty::Class(class) => ValueDropRecipe::DropClass(ClassDropAction::new(*class)),
+            Ty::Array(element) if element.is_affine() => {
+                return Err(PlanError {
+                    span,
+                    message: format!(
+                        "owned array `{}` has no sealed occupied-slot cleanup recipe",
+                        ty.name()
+                    ),
+                });
+            }
+            Ty::Array(element) => ValueDropRecipe::ReleaseArray {
+                element: element.as_ref().clone(),
+            },
+            Ty::Option(payload) if !payload.is_affine() => return Ok(None),
+            Ty::Option(payload)
+                if payload.is_owned_array_of(&Ty::Bool)
+                    || matches!(payload.as_ref(), Ty::Class(_)) =>
+            {
+                let payload_action = Self::build(payload, span)?.ok_or_else(|| PlanError {
+                    span,
+                    message: format!(
+                        "owning option `{}` lost its present-payload cleanup recipe",
+                        ty.name()
+                    ),
+                })?;
+                ValueDropRecipe::DropPresent(Box::new(payload_action))
+            }
+            Ty::Option(_) => {
+                return Err(PlanError {
+                    span,
+                    message: format!(
+                        "owning option `{}` is outside the sealed one-level cleanup family",
+                        ty.name()
+                    ),
+                });
+            }
+            Ty::Int(_)
+            | Ty::Bool
+            | Ty::Param(_)
+            | Ty::Record(_)
+            | Ty::OptionRaw(_)
+            | Ty::Res(_)
+            | Ty::Raw(_)
+            | Ty::RawRecord(_)
+            | Ty::Borrow(..)
+            | Ty::Unit => return Ok(None),
+        };
+        Ok(Some(Self {
+            ty: ty.clone(),
+            recipe,
+        }))
+    }
+
+    pub(crate) fn ty(&self) -> &Ty {
+        &self.ty
+    }
+
+    pub(crate) fn recipe(&self) -> &ValueDropRecipe {
+        &self.recipe
+    }
+}
+
 impl ClassDropAction {
     fn new(class: usize) -> Self {
         Self {
@@ -956,9 +1047,8 @@ pub(crate) struct FieldAssignmentAction {
     destination: Place,
     ty: Ty,
     transfer_key: ValueTransferKey,
-    drop_if_present: bool,
     staging: AssignmentStaging,
-    class_drop: Option<ClassDropAction>,
+    drop_action: Option<ValueDropAction>,
 }
 
 /// One discarded fresh class result and its mandatory statement-end drop.
@@ -969,10 +1059,9 @@ pub(crate) struct FieldAssignmentAction {
 pub(crate) struct TemporaryDropAction {
     scope: ScopeId,
     span: Span,
-    ty: Ty,
     transfer_key: ValueTransferKey,
     temporary: Place,
-    class_drop: ClassDropAction,
+    drop_action: ValueDropAction,
 }
 
 /// The two distinct failure edges of a native owned-array allocation.
@@ -1148,15 +1237,15 @@ impl FieldAssignmentAction {
     }
 
     pub(crate) const fn drop_if_present(&self) -> bool {
-        self.drop_if_present
+        self.drop_action.is_some()
     }
 
     pub(crate) fn staging(&self) -> &AssignmentStaging {
         &self.staging
     }
 
-    pub(crate) fn class_drop(&self) -> Option<&ClassDropAction> {
-        self.class_drop.as_ref()
+    pub(crate) fn drop_action(&self) -> Option<&ValueDropAction> {
+        self.drop_action.as_ref()
     }
 }
 
@@ -1170,7 +1259,7 @@ impl TemporaryDropAction {
     }
 
     pub(crate) fn ty(&self) -> &Ty {
-        &self.ty
+        self.drop_action.ty()
     }
 
     pub(crate) fn transfer_key(&self) -> &ValueTransferKey {
@@ -1181,8 +1270,8 @@ impl TemporaryDropAction {
         &self.temporary
     }
 
-    pub(crate) fn class_drop(&self) -> &ClassDropAction {
-        &self.class_drop
+    pub(crate) fn drop_action(&self) -> &ValueDropAction {
+        &self.drop_action
     }
 }
 
@@ -1536,6 +1625,7 @@ pub(crate) struct ClassDropField {
     index: usize,
     name: String,
     ty: Ty,
+    drop_action: Option<ValueDropAction>,
     span: Span,
     must_consume: bool,
 }
@@ -1551,6 +1641,10 @@ impl ClassDropField {
 
     pub(crate) fn ty(&self) -> &Ty {
         &self.ty
+    }
+
+    pub(crate) fn drop_action(&self) -> Option<&ValueDropAction> {
+        self.drop_action.as_ref()
     }
 
     pub(crate) const fn span(&self) -> Span {
@@ -1581,8 +1675,8 @@ struct ClassDropShape {
 }
 
 impl ClassDropShape {
-    fn from_declaration(declaration: &ClassDecl) -> Self {
-        Self {
+    fn from_declaration(declaration: &ClassDecl) -> Result<Self, PlanError> {
+        Ok(Self {
             name: declaration.name.clone(),
             name_span: declaration.name_span,
             declaration_span: declaration.span,
@@ -1595,16 +1689,19 @@ impl ClassDropShape {
                 .fields
                 .iter()
                 .enumerate()
-                .map(|(index, field)| ClassDropField {
-                    index,
-                    name: field.name.clone(),
-                    ty: field.ty.clone(),
-                    span: field.span,
-                    must_consume: field.must_consume,
+                .map(|(index, field)| {
+                    Ok(ClassDropField {
+                        index,
+                        name: field.name.clone(),
+                        ty: field.ty.clone(),
+                        drop_action: ValueDropAction::build(&field.ty, field.span)?,
+                        span: field.span,
+                        must_consume: field.must_consume,
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, PlanError>>()?,
             has_deinitializer: declaration.deinit.is_some(),
-        }
+        })
     }
 }
 
@@ -1624,8 +1721,8 @@ pub(crate) struct ClassDropPlan {
 }
 
 impl ClassDropPlan {
-    pub(crate) fn build(class: usize, declaration: &ClassDecl) -> Self {
-        let shape = ClassDropShape::from_declaration(declaration);
+    pub(crate) fn build(class: usize, declaration: &ClassDecl) -> Result<Self, PlanError> {
+        let shape = ClassDropShape::from_declaration(declaration)?;
         let mut phases = vec![ClassDropPhase::CheckInvariant];
         if shape.has_deinitializer {
             phases.push(ClassDropPhase::RunDeinitializer(CallOwner::Deinitializer {
@@ -1640,17 +1737,17 @@ impl ClassDropPlan {
                 .cloned()
                 .map(ClassDropPhase::DropField),
         );
-        Self {
+        Ok(Self {
             class,
             shape,
             phases,
             terminal_trap: ExitRoute::terminal_trap(),
-        }
+        })
     }
 
     pub(crate) fn validate(&self, class: usize, declaration: &ClassDecl) -> Result<(), PlanError> {
         self.validate_terminal_trap_route()?;
-        let current = Self::build(class, declaration);
+        let current = Self::build(class, declaration)?;
         if self.class != current.class
             || self.shape != current.shape
             || self.phases != current.phases
@@ -2474,7 +2571,8 @@ impl BodyPlan {
             let mut expected_drops = Vec::new();
             for binding in expected_bindings {
                 let candidate = self.candidate_for_place(&binding.place);
-                if has_runtime_cleanup(&binding.ty) {
+                let expected_action = ValueDropAction::build(&binding.ty, binding.span)?;
+                if let Some(expected_action) = expected_action {
                     let Some(candidate) = candidate else {
                         return Err(PlanError {
                             span: binding.span,
@@ -2485,7 +2583,7 @@ impl BodyPlan {
                         });
                     };
                     if candidate.scope() != scope
-                        || candidate.ty() != &binding.ty
+                        || candidate.drop_action() != &expected_action
                         || candidate.span() != binding.span
                     {
                         return Err(PlanError {
@@ -3495,12 +3593,13 @@ impl BodyPlan {
             span: value.span,
             sink: ValueTransferSink::FieldAssignment(destination.clone()),
         };
+        let expected_drop_action = ValueDropAction::build(&value_ty, span)?;
         if action.scope != scope
             || action.span != span
             || action.destination != *destination
             || action.ty != value_ty
             || action.transfer_key != transfer_key
-            || action.drop_if_present != has_runtime_cleanup(&value_ty)
+            || action.drop_action != expected_drop_action
         {
             return Err(PlanError {
                 span,
@@ -3510,7 +3609,7 @@ impl BodyPlan {
                 ),
             });
         }
-        let expected_staging = if has_runtime_cleanup(&value_ty) {
+        let expected_staging = if expected_drop_action.is_some() {
             AssignmentStaging::Temporary(
                 self.compiler_temp(scope, span, CompilerTempKind::FieldAssignmentValue)?
                     .clone(),
@@ -3524,24 +3623,6 @@ impl BodyPlan {
                 message: "field-assignment staging no longer matches its checked cleanup policy"
                     .into(),
             });
-        }
-        match (&value_ty, action.class_drop.as_ref()) {
-            (Ty::Class(class), Some(drop))
-                if drop.class == *class && drop.terminal_trap.is_terminal_trap() => {}
-            (Ty::Class(_), _) => {
-                return Err(PlanError {
-                    span,
-                    message: "class field assignment has no exact terminal class-drop action"
-                        .into(),
-                });
-            }
-            (_, None) => {}
-            (_, Some(_)) => {
-                return Err(PlanError {
-                    span,
-                    message: "non-class field assignment retained a stale class-drop action".into(),
-                });
-            }
         }
         Ok(action)
     }
@@ -3591,22 +3672,24 @@ impl BodyPlan {
             span,
             sink: ValueTransferSink::DiscardTemporary,
         };
-        match &ty {
-            Ty::Class(class)
+        let expected_drop_action = ValueDropAction::build(&ty, span)?;
+        match (&ty, expected_drop_action) {
+            (Ty::Class(_), Some(expected_drop_action))
                 if action.scope == scope
                     && action.span == span
-                    && action.ty == ty
+                    && action.drop_action == expected_drop_action
                     && action.transfer_key == transfer_key
-                    && action.temporary == *expected_temporary
-                    && action.class_drop.class == *class
-                    && action.class_drop.terminal_trap.is_terminal_trap() => Ok(action),
-            Ty::Class(_) => Err(PlanError {
+                    && action.temporary == *expected_temporary =>
+            {
+                Ok(action)
+            }
+            (Ty::Class(_), _) => Err(PlanError {
                 span,
                 message:
                     "discarded class temporary no longer matches its type, compiler temporary, or terminal drop action"
                         .into(),
             }),
-            _ => Err(PlanError {
+            (_, _) => Err(PlanError {
                 span,
                 message: "discarded temporary action no longer targets a class value".into(),
             }),
@@ -4332,7 +4415,7 @@ impl ControlProgram {
         for (class_index, class) in program.classes.iter().enumerate() {
             control
                 .class_drops
-                .push(ClassDropPlan::build(class_index, class));
+                .push(ClassDropPlan::build(class_index, class)?);
             control.insert_class(outlines, class)?;
         }
         for class in &program.class_templates {
@@ -4408,6 +4491,46 @@ impl ControlProgram {
         Ok(plan)
     }
 
+    /// Reconcile one recursive value-destruction action with both its exact
+    /// type shape and every concrete class recipe reachable through a
+    /// dynamically present payload. Array actions are release-only in the
+    /// current language: their element type is retained, and affine elements
+    /// fail during action construction before they can acquire raw-free
+    /// semantics by accident.
+    pub(crate) fn validate_value_drop_action(
+        &self,
+        action: &ValueDropAction,
+        classes: &[ClassDecl],
+        use_span: Span,
+    ) -> Result<(), PlanError> {
+        let expected = ValueDropAction::build(action.ty(), use_span)?.ok_or_else(|| PlanError {
+            span: use_span,
+            message: format!(
+                "non-cleanup type `{}` retained a value-drop action",
+                action.ty().name()
+            ),
+        })?;
+        if action != &expected {
+            return Err(PlanError {
+                span: use_span,
+                message: format!(
+                    "value-drop action for `{}` no longer matches its exact recursive recipe",
+                    action.ty().name()
+                ),
+            });
+        }
+        match action.recipe() {
+            ValueDropRecipe::ReleaseArray { .. } => Ok(()),
+            ValueDropRecipe::DropClass(class) => {
+                self.class_drop_for_action(class, classes, use_span)?;
+                Ok(())
+            }
+            ValueDropRecipe::DropPresent(payload) => {
+                self.validate_value_drop_action(payload, classes, use_span)
+            }
+        }
+    }
+
     pub(crate) fn class_drops(&self) -> &[ClassDropPlan] {
         &self.class_drops
     }
@@ -4425,14 +4548,30 @@ impl ControlProgram {
     }
 
     fn validate_cleanup_action_links(&self, classes: &[ClassDecl]) -> Result<(), PlanError> {
+        for plan in &self.class_drops {
+            for phase in plan.phases() {
+                if let ClassDropPhase::DropField(field) = phase {
+                    if let Some(drop_action) = field.drop_action() {
+                        self.validate_value_drop_action(drop_action, classes, field.span())?;
+                    }
+                }
+            }
+        }
         for body in &self.bodies {
+            for candidate in &body.plan().candidates {
+                self.validate_value_drop_action(
+                    candidate.drop_action(),
+                    classes,
+                    candidate.span(),
+                )?;
+            }
             for action in body.plan().field_assignments() {
-                if let Some(class_drop) = action.class_drop() {
-                    self.class_drop_for_action(class_drop, classes, action.span())?;
+                if let Some(drop_action) = action.drop_action() {
+                    self.validate_value_drop_action(drop_action, classes, action.span())?;
                 }
             }
             for action in body.plan().temporary_drops() {
-                self.class_drop_for_action(action.class_drop(), classes, action.span())?;
+                self.validate_value_drop_action(action.drop_action(), classes, action.span())?;
             }
         }
         Ok(())
@@ -4555,16 +4694,16 @@ impl PlanBuilder {
 
     fn declare(&mut self, scope: ScopeId, name: &str, ty: Ty, span: Span) -> Result<(), PlanError> {
         self.reserve(scope, name, ty.clone(), span)?;
-        if !has_runtime_cleanup(&ty) {
+        let Some(drop_action) = ValueDropAction::build(&ty, span)? else {
             return Ok(());
-        }
+        };
         let place = Place::local(name);
         let id = DropId(self.plan.candidates.len());
         let candidate = DropCandidate {
             id,
             scope,
             place: place.clone(),
-            ty,
+            drop_action,
             span,
         };
         self.plan.candidates.push(candidate);
@@ -4678,8 +4817,8 @@ impl PlanBuilder {
         }
         let destination = Place::field("self", field);
         let ty = checked_expression_ty(value, "field-assignment value")?;
-        let drop_if_present = has_runtime_cleanup(&ty);
-        let staging = if drop_if_present {
+        let drop_action = ValueDropAction::build(&ty, span)?;
+        let staging = if drop_action.is_some() {
             AssignmentStaging::Temporary(self.compiler_temp(
                 scope,
                 span,
@@ -4688,10 +4827,6 @@ impl PlanBuilder {
             )?)
         } else {
             AssignmentStaging::Direct
-        };
-        let class_drop = match ty {
-            Ty::Class(class) => Some(ClassDropAction::new(class)),
-            _ => None,
         };
         let transfer_key = ValueTransferKey {
             owner: self.plan.owner.clone(),
@@ -4705,9 +4840,8 @@ impl PlanBuilder {
             destination,
             ty,
             transfer_key,
-            drop_if_present,
             staging,
-            class_drop,
+            drop_action,
         });
         self.plan.field_assignment_ids.insert(key, index);
         Ok(())
@@ -4715,9 +4849,11 @@ impl PlanBuilder {
 
     fn temporary_drop(&mut self, scope: ScopeId, expression: &Expr) -> Result<(), PlanError> {
         let ty = checked_expression_ty(expression, "discarded class temporary")?;
-        let Ty::Class(class) = ty else {
+        let Ty::Class(_) = ty else {
             return Ok(());
         };
+        let drop_action = ValueDropAction::build(&ty, expression.span)?
+            .expect("class values always have a sealed drop action");
         if let Some(source) = Place::from_value_expr(expression) {
             return Err(PlanError {
                 span: expression.span,
@@ -4749,14 +4885,13 @@ impl PlanBuilder {
         self.plan.temporary_drops.push(TemporaryDropAction {
             scope,
             span: expression.span,
-            ty: Ty::Class(class),
             transfer_key: ValueTransferKey {
                 owner: self.plan.owner.clone(),
                 span: expression.span,
                 sink: ValueTransferSink::DiscardTemporary,
             },
             temporary,
-            class_drop: ClassDropAction::new(class),
+            drop_action,
         });
         self.plan.temporary_drop_ids.insert(key, index);
         Ok(())
@@ -5327,10 +5462,6 @@ fn direct_statement_traps(
         | Stmt::Expose { mutable: false, .. } => {}
     }
     Ok(traps)
-}
-
-fn has_runtime_cleanup(ty: &Ty) -> bool {
-    matches!(ty, Ty::Class(_) | Ty::Array(_)) || ty.is_affine_option()
 }
 
 #[cfg(test)]
@@ -6506,6 +6637,140 @@ mod tests {
     }
 
     #[test]
+    fn value_drop_actions_seal_only_current_recursive_cleanup_shapes() {
+        let span = at(390);
+
+        let class_ty = Ty::Class(2);
+        let class = ValueDropAction::build(&class_ty, span)
+            .unwrap()
+            .expect("class owns one concrete destruction recipe");
+        assert_eq!(class.ty(), &class_ty);
+        let ValueDropRecipe::DropClass(class_drop) = class.recipe() else {
+            panic!("class action must terminate in a class recipe")
+        };
+        assert_eq!(class_drop.class(), 2);
+        assert!(class_drop.terminal_trap_route().is_terminal_trap());
+
+        let array_ty = Ty::array(Ty::Bool);
+        let array = ValueDropAction::build(&array_ty, span)
+            .unwrap()
+            .expect("current arrays release one non-affine buffer");
+        assert!(matches!(
+            array.recipe(),
+            ValueDropRecipe::ReleaseArray { element: Ty::Bool }
+        ));
+
+        let option_array_ty = Ty::option(array_ty.clone());
+        let option_array = ValueDropAction::build(&option_array_ty, span)
+            .unwrap()
+            .expect("an admitted owning option seals its present payload");
+        let ValueDropRecipe::DropPresent(payload) = option_array.recipe() else {
+            panic!("owning option must retain a present-only recipe")
+        };
+        assert_eq!(payload.ty(), &array_ty);
+        assert!(matches!(
+            payload.recipe(),
+            ValueDropRecipe::ReleaseArray { element: Ty::Bool }
+        ));
+
+        let option_class_ty = Ty::option(Ty::Class(2));
+        let option_class = ValueDropAction::build(&option_class_ty, span)
+            .unwrap()
+            .expect("an admitted class option seals its present class recipe");
+        let ValueDropRecipe::DropPresent(payload) = option_class.recipe() else {
+            panic!("owning option must retain a present-only recipe")
+        };
+        assert!(matches!(
+            payload.recipe(),
+            ValueDropRecipe::DropClass(action) if action.class() == 2
+        ));
+
+        for non_cleanup in [
+            Ty::Bool,
+            Ty::option(Ty::Bool),
+            Ty::Res(crate::ast::ResKind::RawSpan),
+        ] {
+            assert!(
+                ValueDropAction::build(&non_cleanup, span)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        for unsupported in [
+            Ty::array(Ty::Class(2)),
+            Ty::option(Ty::option(Ty::Class(2))),
+            Ty::option(Ty::array(Ty::Int(IntTy::U64))),
+            Ty::option(Ty::Res(crate::ast::ResKind::RawSpan)),
+        ] {
+            let error = ValueDropAction::build(&unsupported, span)
+                .expect_err("unsealed owner nesting must fail before it acquires cleanup");
+            assert_eq!(error.span, span);
+            assert!(
+                error.message.contains("occupied-slot")
+                    || error.message.contains("one-level cleanup family"),
+                "unexpected refusal for `{}`: {}",
+                unsupported.name(),
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn class_drop_fields_carry_recursive_actions_but_resources_remain_must_consume() {
+        let mut owner = class("Owner", at(395), "owner");
+        owner.fields = vec![
+            Field {
+                name: "child".into(),
+                ty: Ty::Class(0),
+                span: at(396),
+                must_consume: false,
+            },
+            Field {
+                name: "bytes".into(),
+                ty: Ty::array(Ty::Bool),
+                span: at(397),
+                must_consume: false,
+            },
+            Field {
+                name: "authority".into(),
+                ty: Ty::Res(crate::ast::ResKind::RawSpan),
+                span: at(398),
+                must_consume: true,
+            },
+        ];
+        let plan = ClassDropPlan::build(1, &owner).expect("current field shapes seal");
+        let fields = plan
+            .phases()
+            .iter()
+            .filter_map(|phase| match phase {
+                ClassDropPhase::DropField(field) => Some(field),
+                ClassDropPhase::CheckInvariant | ClassDropPhase::RunDeinitializer(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fields.iter().map(|field| field.name()).collect::<Vec<_>>(),
+            ["authority", "bytes", "child"]
+        );
+        assert!(fields[0].must_consume());
+        assert!(fields[0].drop_action().is_none());
+        assert!(matches!(
+            fields[1].drop_action().map(ValueDropAction::recipe),
+            Some(ValueDropRecipe::ReleaseArray { element: Ty::Bool })
+        ));
+        assert!(matches!(
+            fields[2].drop_action().map(ValueDropAction::recipe),
+            Some(ValueDropRecipe::DropClass(action)) if action.class() == 0
+        ));
+
+        owner.fields[1].ty = Ty::array(Ty::Class(0));
+        let error = ClassDropPlan::build(1, &owner)
+            .expect_err("owner arrays need occupied-slot semantics before field cleanup");
+        assert_eq!(error.span, at(397));
+        assert!(error.message.contains("occupied-slot"));
+    }
+
+    #[test]
     fn concrete_class_drop_plan_seals_exact_identity_order_and_no_unwind() {
         let mut source = program();
         let mut concrete = class("Owner", at(400), "owner");
@@ -6576,6 +6841,32 @@ mod tests {
                 (0, "first", Ty::Int(IntTy::U64)),
             ]
         );
+        let ClassDropPhase::DropField(array_field) = &plan.phases()[2] else {
+            unreachable!()
+        };
+        assert!(matches!(
+            array_field.drop_action().map(ValueDropAction::recipe),
+            Some(ValueDropRecipe::ReleaseArray { element: Ty::Bool })
+        ));
+        for phase in &plan.phases()[3..] {
+            let ClassDropPhase::DropField(field) = phase else {
+                unreachable!()
+            };
+            assert!(field.drop_action().is_none());
+        }
+
+        let mut changed_field_action = plan.clone();
+        let ClassDropPhase::DropField(field) = &mut changed_field_action.phases[2] else {
+            unreachable!()
+        };
+        let Some(action) = &mut field.drop_action else {
+            unreachable!()
+        };
+        let ValueDropRecipe::ReleaseArray { element } = &mut action.recipe else {
+            unreachable!()
+        };
+        *element = Ty::Int(IntTy::U8);
+        assert!(changed_field_action.validate(0, &concrete).is_err());
 
         let mut reordered = concrete.clone();
         reordered.fields.swap(0, 1);
@@ -6638,14 +6929,14 @@ mod tests {
                     )
                     .unwrap()
         ));
-        assert_eq!(class_assignment.class_drop().unwrap().class(), 0);
-        assert!(
-            class_assignment
-                .class_drop()
-                .unwrap()
-                .terminal_trap_route()
-                .is_terminal_trap()
-        );
+        let Some(class_action) = class_assignment.drop_action() else {
+            unreachable!()
+        };
+        let ValueDropRecipe::DropClass(class_drop) = class_action.recipe() else {
+            unreachable!()
+        };
+        assert_eq!(class_drop.class(), 0);
+        assert!(class_drop.terminal_trap_route().is_terminal_trap());
 
         let scalar_assignment = plan
             .field_assignment(
@@ -6660,7 +6951,7 @@ mod tests {
             .expect("non-cleanup field installs use the same typed action");
         assert!(!scalar_assignment.drop_if_present());
         assert_eq!(scalar_assignment.staging(), &AssignmentStaging::Direct);
-        assert!(scalar_assignment.class_drop().is_none());
+        assert!(scalar_assignment.drop_action().is_none());
 
         let discarded = plan
             .temporary_drop(
@@ -6673,7 +6964,10 @@ mod tests {
             .expect("fresh class result has one statement-end drop action");
         assert_eq!(discarded.scope(), plan.body_scope());
         assert_eq!(discarded.ty(), &Ty::Class(0));
-        assert_eq!(discarded.class_drop().class(), 0);
+        assert!(matches!(
+            discarded.drop_action().recipe(),
+            ValueDropRecipe::DropClass(class) if class.class() == 0
+        ));
         assert_eq!(
             discarded.transfer_key(),
             &ValueTransferKey {
@@ -6750,7 +7044,12 @@ mod tests {
         forged_destination.field_assignments[0].destination = Place::field("self", "other");
         assert!(forged_destination.validate_body_shape(&body).is_err());
         let mut forged_class = plan.clone();
-        forged_class.temporary_drops[0].class_drop.class = 1;
+        let ValueDropRecipe::DropClass(class) =
+            &mut forged_class.temporary_drops[0].drop_action.recipe
+        else {
+            unreachable!("discarded class result retains a class recipe")
+        };
+        class.class = 1;
         assert!(forged_class.validate_body_shape(&body).is_err());
     }
 
@@ -6771,19 +7070,22 @@ mod tests {
             .body(&CallOwner::Function("cleanup_links".into()), at(200))
             .unwrap();
         let action = body.plan().temporary_drops().next().unwrap();
+        let ValueDropRecipe::DropClass(class_action) = action.drop_action().recipe() else {
+            unreachable!()
+        };
         let drop = control
-            .class_drop_for_action(action.class_drop(), &source.classes, action.span())
+            .class_drop_for_action(class_action, &source.classes, action.span())
             .expect("action links the exact concrete class recipe");
         assert_eq!(drop.class(), 0);
 
-        let mut wrong_class = action.class_drop().clone();
+        let mut wrong_class = class_action.clone();
         wrong_class.class = 1;
         assert!(
             control
                 .class_drop_for_action(&wrong_class, &source.classes, action.span())
                 .is_err()
         );
-        let mut unwind = action.class_drop().clone();
+        let mut unwind = class_action.clone();
         unwind.terminal_trap = ExitRoute {
             kind: ExitKind::Return,
             scopes: vec![body.plan().body_scope()],
@@ -6793,6 +7095,42 @@ mod tests {
         assert!(
             control
                 .class_drop_for_action(&unwind, &source.classes, action.span())
+                .is_err()
+        );
+
+        let option_ty = Ty::option(Ty::Class(0));
+        let option_action = ValueDropAction::build(&option_ty, action.span())
+            .unwrap()
+            .expect("class option has one recursive action");
+        control
+            .validate_value_drop_action(&option_action, &source.classes, action.span())
+            .expect("the exact nested class leaf resolves through the same table");
+
+        let mut wrong_payload_ty = option_action.clone();
+        let ValueDropRecipe::DropPresent(payload) = &mut wrong_payload_ty.recipe else {
+            unreachable!()
+        };
+        payload.ty = Ty::Class(1);
+        assert!(
+            control
+                .validate_value_drop_action(&wrong_payload_ty, &source.classes, action.span())
+                .is_err()
+        );
+
+        let mut wrong_array_element =
+            ValueDropAction::build(&Ty::option(Ty::array(Ty::Bool)), action.span())
+                .unwrap()
+                .unwrap();
+        let ValueDropRecipe::DropPresent(payload) = &mut wrong_array_element.recipe else {
+            unreachable!()
+        };
+        let ValueDropRecipe::ReleaseArray { element } = &mut payload.recipe else {
+            unreachable!()
+        };
+        *element = Ty::Int(IntTy::U8);
+        assert!(
+            control
+                .validate_value_drop_action(&wrong_array_element, &source.classes, action.span())
                 .is_err()
         );
     }

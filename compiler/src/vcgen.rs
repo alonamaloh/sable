@@ -26,6 +26,7 @@ use crate::check::{CheckResult, FnSig};
 use crate::control::{
     AssignmentAction, AssignmentStaging, BodyPlan, CompilerTempKind, ControlBody, ExitKind,
     ExitRoute, FieldAssignmentAction, ReturnRoutes, ScopeId, TemporaryDropAction, TrapSite,
+    ValueDropRecipe,
 };
 use crate::ownership::{
     CheckedExposure, CheckedLoopEffects, CheckedMutation, CheckedOptionTake, CheckedOwnershipPlan,
@@ -4381,10 +4382,18 @@ impl<'a> Generator<'a> {
             } else {
                 None
             };
-            let retained_class = action.class_drop().map(|drop| drop.class());
+            let retained_class = action.drop_action().and_then(|drop| match drop.recipe() {
+                ValueDropRecipe::DropClass(class) => Some(class.class()),
+                ValueDropRecipe::ReleaseArray { .. } | ValueDropRecipe::DropPresent(_) => None,
+            });
             let bad_terminal = action
-                .class_drop()
-                .is_some_and(|drop| drop.terminal_trap_route() != &plan.trap_route());
+                .drop_action()
+                .is_some_and(|drop| match drop.recipe() {
+                    ValueDropRecipe::DropClass(class) => {
+                        class.terminal_trap_route() != &plan.trap_route()
+                    }
+                    ValueDropRecipe::ReleaseArray { .. } | ValueDropRecipe::DropPresent(_) => false,
+                });
             if action.scope() != scope
                 || action.span() != span
                 || action.destination() != destination
@@ -4470,13 +4479,18 @@ impl<'a> Generator<'a> {
             } else {
                 None
             };
+            let retained_class = match action.drop_action().recipe() {
+                ValueDropRecipe::DropClass(class) => Some(class),
+                ValueDropRecipe::ReleaseArray { .. } | ValueDropRecipe::DropPresent(_) => None,
+            };
             if action.scope() != scope
                 || action.span() != span
                 || action.ty() != value_ty
                 || action.transfer_key() != &expected_key
                 || action.temporary() != expected_temporary
-                || Some(action.class_drop().class()) != expected_class
-                || action.class_drop().terminal_trap_route() != &plan.trap_route()
+                || retained_class.map(|class| class.class()) != expected_class
+                || retained_class
+                    .is_none_or(|class| class.terminal_trap_route() != &plan.trap_route())
             {
                 refuse_vc_type(format!(
                     "internal.vcgen.temporary_drop_action_mismatch: retained discarded value at {}..{} inside {} disagrees with its class type, transfer, compiler temporary, or terminal no-unwind action",

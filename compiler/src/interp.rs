@@ -12,7 +12,7 @@ use crate::ast;
 use crate::ast::*;
 use crate::control::{
     AssignmentStaging, BlockId, BodyPlan, ClassDropPhase, ClassDropPlan, ControlProgram, DropId,
-    ExitRoute, PlanError, ScopeId, StatementPlanKind, TrapSite,
+    ExitRoute, PlanError, ScopeId, StatementPlanKind, TrapSite, ValueDropAction, ValueDropRecipe,
 };
 use crate::place::Place;
 use crate::span::Span;
@@ -1790,6 +1790,7 @@ enum RtPlace {
 
 impl RtPlace {
     /// How the place is spelled in a diagnostic.
+    #[cfg(test)]
     fn name(&self) -> String {
         match self {
             RtPlace::Local(n) => n.clone(),
@@ -2408,7 +2409,12 @@ impl<'a> Interp<'a> {
                         span: candidate.span(),
                     });
                 }
-                Ok((*drop, candidate.place().root().to_owned()))
+                Ok((
+                    *drop,
+                    candidate.place().root().to_owned(),
+                    candidate.drop_action().clone(),
+                    candidate.span(),
+                ))
             })
             .collect::<IResult<Vec<_>>>()?;
         let clears = route
@@ -2433,8 +2439,10 @@ impl<'a> Interp<'a> {
         // Non-owning locals, moved-from owners, and erased proof bindings are
         // then cleared by the same normalized route rather than by
         // statement-specific cleanup code.
-        for (drop, name) in drops {
-            self.drop_place(&RtPlace::Local(name), frame)?;
+        for (drop, name, action, span) in drops {
+            if let Some(held) = self.take_place(&RtPlace::Local(name.clone()), frame) {
+                self.drop_runtime_value_with_action(held, &action, &name, span)?;
+            }
             control.reached.remove(&drop);
         }
         for name in clears {
@@ -2493,6 +2501,7 @@ impl<'a> Interp<'a> {
     /// Take a value out of a place and destroy it: at scope exit, and
     /// wherever a place is overwritten. A place holding no value — moved
     /// away, or never initialized — has nothing to drop.
+    #[cfg(test)]
     fn drop_place(&mut self, place: &RtPlace, frame: &mut Frame) -> IResult<()> {
         enum OwnedDrop {
             Object(usize, Rc<RefCell<HashMap<String, RtVal>>>),
@@ -2653,6 +2662,7 @@ impl<'a> Interp<'a> {
     /// A field the body moved out is *not* dropped again — dynamic presence
     /// stays in the runtime map — but invariant/deinitializer/field order and
     /// the terminal no-unwind policy come only from `ClassDropPlan`.
+    #[cfg(test)]
     fn drop_value(
         &mut self,
         class: usize,
@@ -2758,48 +2768,197 @@ impl<'a> Interp<'a> {
                     let Some(held) = held else {
                         continue;
                     };
-                    match (field.ty(), held) {
-                        (
-                            Ty::Class(expected),
-                            RtVal::Obj {
-                                class: actual,
-                                fields: child_fields,
-                            },
-                        ) if *expected == actual => {
-                            self.drop_value(
-                                actual,
-                                &child_fields,
-                                &format!("{what}.{}", field.name()),
-                            )?;
-                        }
-                        (Ty::Class(expected), _) => {
-                            return Err(control_plan_trap(PlanError {
-                                span: field.span(),
-                                message: format!(
-                                    "runtime field `{}` does not hold planned class index {expected}",
-                                    field.name()
-                                ),
-                            }));
-                        }
-                        (_, RtVal::Obj { class: actual, .. }) => {
-                            return Err(control_plan_trap(PlanError {
-                                span: field.span(),
-                                message: format!(
-                                    "runtime field `{}` unexpectedly holds class index {actual}",
-                                    field.name()
-                                ),
-                            }));
-                        }
-                        // Arrays and scalar/plain fields have no Sable
-                        // destructor. Removing their runtime value completes
-                        // the phase; host storage release is representation
-                        // cleanup, not a language-level unwind.
-                        (_, _) => {}
+                    if field.must_consume() {
+                        return Err(control_plan_trap(PlanError {
+                            span: field.span(),
+                            message: format!(
+                                "must-consume field `{}` remained live at class destruction",
+                                field.name()
+                            ),
+                        }));
+                    }
+                    if let Some(action) = field.drop_action() {
+                        self.drop_runtime_value_with_action(
+                            held,
+                            action,
+                            &format!("{what}.{}", field.name()),
+                            field.span(),
+                        )?;
+                    } else if matches!(
+                        held,
+                        RtVal::Obj { .. }
+                            | RtVal::Arr(_)
+                            | RtVal::AffineOptBoolArray(_)
+                            | RtVal::AffineOptClass { .. }
+                    ) {
+                        return Err(control_plan_trap(PlanError {
+                            span: field.span(),
+                            message: format!(
+                                "runtime field `{}` holds an owner without a retained drop action",
+                                field.name()
+                            ),
+                        }));
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    fn drop_runtime_value_with_action(
+        &mut self,
+        held: RtVal,
+        action: &ValueDropAction,
+        what: &str,
+        use_span: Span,
+    ) -> IResult<()> {
+        self.control
+            .validate_value_drop_action(action, self.classes, use_span)
+            .map_err(control_plan_trap)?;
+        match (action.recipe(), held) {
+            (ValueDropRecipe::DropClass(class_action), RtVal::Obj { class, fields })
+                if class == class_action.class() =>
+            {
+                let drop_plan = self
+                    .control
+                    .class_drop_for_action(class_action, self.classes, use_span)
+                    .map_err(control_plan_trap)?
+                    .clone();
+                self.drop_value_with_plan(class, &fields, what, &drop_plan, use_span)
+            }
+            (ValueDropRecipe::DropClass(class_action), _) => Err(control_plan_trap(PlanError {
+                span: use_span,
+                message: format!(
+                    "runtime value `{what}` does not hold retained class index {}",
+                    class_action.class()
+                ),
+            })),
+            (ValueDropRecipe::ReleaseArray { element }, RtVal::Arr(array)) => {
+                let actual = array.borrow().payload();
+                if &actual != element {
+                    return Err(control_plan_trap(PlanError {
+                        span: use_span,
+                        message: format!(
+                            "runtime array `{what}` has payload `{}`, not retained payload `{}`",
+                            actual.name(),
+                            element.name()
+                        ),
+                    }));
+                }
+                Ok(())
+            }
+            (ValueDropRecipe::ReleaseArray { .. }, _) => Err(control_plan_trap(PlanError {
+                span: use_span,
+                message: format!("runtime value `{what}` does not hold its retained array"),
+            })),
+            (ValueDropRecipe::DropPresent(_), RtVal::AffineOptBoolArray(None))
+            | (ValueDropRecipe::DropPresent(_), RtVal::AffineOptClass { value: None, .. }) => {
+                Ok(())
+            }
+            (ValueDropRecipe::DropPresent(payload), RtVal::AffineOptBoolArray(Some(array))) => self
+                .drop_runtime_value_with_action(
+                    RtVal::Arr(array),
+                    payload,
+                    &format!("{what}.value"),
+                    use_span,
+                ),
+            (
+                ValueDropRecipe::DropPresent(payload),
+                RtVal::AffineOptClass {
+                    class,
+                    value: Some(fields),
+                },
+            ) => self.drop_runtime_value_with_action(
+                RtVal::Obj { class, fields },
+                payload,
+                &format!("{what}.value"),
+                use_span,
+            ),
+            (ValueDropRecipe::DropPresent(_), _) => Err(control_plan_trap(PlanError {
+                span: use_span,
+                message: format!("runtime value `{what}` does not hold its retained owning option"),
+            })),
+        }
+    }
+
+    fn validate_runtime_value_for_action(
+        &self,
+        held: &RtVal,
+        action: &ValueDropAction,
+        what: &str,
+        use_span: Span,
+    ) -> IResult<()> {
+        self.control
+            .validate_value_drop_action(action, self.classes, use_span)
+            .map_err(control_plan_trap)?;
+        if let (ValueDropRecipe::ReleaseArray { element }, RtVal::Arr(array)) =
+            (action.recipe(), held)
+        {
+            let actual = array.borrow().payload();
+            if &actual != element {
+                return Err(control_plan_trap(PlanError {
+                    span: use_span,
+                    message: format!(
+                        "runtime array `{what}` has payload `{}`, not retained payload `{}`",
+                        actual.name(),
+                        element.name()
+                    ),
+                }));
+            }
+        }
+        let valid = match (action.recipe(), held) {
+            (ValueDropRecipe::DropClass(expected), RtVal::Obj { class, .. }) => {
+                *class == expected.class()
+            }
+            (ValueDropRecipe::ReleaseArray { element }, RtVal::Arr(array)) => {
+                array.borrow().payload() == *element
+            }
+            (ValueDropRecipe::DropPresent(payload), RtVal::AffineOptBoolArray(value)) => {
+                matches!(
+                    payload.recipe(),
+                    ValueDropRecipe::ReleaseArray { element } if element == &Ty::Bool
+                ) && value.as_ref().is_none_or(|array| {
+                    self.validate_runtime_value_for_action(
+                        &RtVal::Arr(array.clone()),
+                        payload,
+                        what,
+                        use_span,
+                    )
+                    .is_ok()
+                })
+            }
+            (ValueDropRecipe::DropPresent(payload), RtVal::AffineOptClass { class, value }) => {
+                matches!(
+                    payload.recipe(),
+                    ValueDropRecipe::DropClass(expected) if expected.class() == *class
+                ) && value.as_ref().is_none_or(|fields| {
+                    self.validate_runtime_value_for_action(
+                        &RtVal::Obj {
+                            class: *class,
+                            fields: fields.clone(),
+                        },
+                        payload,
+                        what,
+                        use_span,
+                    )
+                    .is_ok()
+                })
+            }
+            (ValueDropRecipe::DropClass(_), _)
+            | (ValueDropRecipe::ReleaseArray { .. }, _)
+            | (ValueDropRecipe::DropPresent(_), _) => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(control_plan_trap(PlanError {
+                span: use_span,
+                message: format!(
+                    "runtime value `{what}` does not match retained cleanup type `{}`",
+                    action.ty().name()
+                ),
+            }))
+        }
     }
 
     fn check_invariants_at(
@@ -2991,16 +3150,12 @@ impl<'a> Interp<'a> {
                         }));
                     }
                 }
-                let drop_plan = action
-                    .class_drop()
-                    .map(|drop| {
-                        self.control
-                            .class_drop_for_action(drop, self.classes, *field_span)
-                            .cloned()
-                    })
-                    .transpose()
-                    .map_err(control_plan_trap)?;
-                Some((action, drop_plan))
+                if let Some(drop_action) = action.drop_action() {
+                    self.control
+                        .validate_value_drop_action(drop_action, self.classes, *field_span)
+                        .map_err(control_plan_trap)?;
+                }
+                Some(action)
             }
             _ => None,
         };
@@ -3022,12 +3177,10 @@ impl<'a> Interp<'a> {
                                 .into(),
                     }));
                 }
-                let drop_plan = self
-                    .control
-                    .class_drop_for_action(action.class_drop(), self.classes, expression.span)
-                    .map_err(control_plan_trap)?
-                    .clone();
-                Some((action, drop_plan))
+                self.control
+                    .validate_value_drop_action(action.drop_action(), self.classes, expression.span)
+                    .map_err(control_plan_trap)?;
+                Some(action)
             }
             _ => None,
         };
@@ -3098,10 +3251,15 @@ impl<'a> Interp<'a> {
                             span: action.span(),
                         });
                     }
-                    self.drop_place(
-                        &RtPlace::Local(action.destination().root().to_owned()),
-                        frame,
-                    )?;
+                    let destination = RtPlace::Local(action.destination().root().to_owned());
+                    if let Some(held) = self.take_place(&destination, frame) {
+                        self.drop_runtime_value_with_action(
+                            held,
+                            candidate.drop_action(),
+                            &action.destination().render(),
+                            action.span(),
+                        )?;
+                    }
                 }
                 frame.vars.insert(action.destination().root().to_owned(), v);
                 Ok(Flow::Normal)
@@ -3315,31 +3473,11 @@ impl<'a> Interp<'a> {
             }
             Stmt::ExprStmt(e) => {
                 let v = self.eval(e, frame, traps)?;
-                if let Some((action, drop_plan)) = planned_temporary_drop {
-                    let Ty::Class(expected) = action.ty() else {
-                        unreachable!("temporary_drop exact-lookup admits only a class")
-                    };
-                    let RtVal::Obj { class, fields } = v else {
-                        return Err(control_plan_trap(PlanError {
-                            span: action.span(),
-                            message: format!(
-                                "discarded class temporary does not hold retained class index {expected}"
-                            ),
-                        }));
-                    };
-                    if class != *expected || class != drop_plan.class() {
-                        return Err(control_plan_trap(PlanError {
-                            span: action.span(),
-                            message: format!(
-                                "discarded class temporary holds class index {class}, not retained index {expected}"
-                            ),
-                        }));
-                    }
-                    self.drop_value_with_plan(
-                        class,
-                        &fields,
+                if let Some(action) = planned_temporary_drop {
+                    self.drop_runtime_value_with_action(
+                        v,
+                        action.drop_action(),
                         &action.temporary().render(),
-                        &drop_plan,
                         action.span(),
                     )?;
                 }
@@ -3355,69 +3493,33 @@ impl<'a> Interp<'a> {
                 Ok(Flow::Normal)
             }
             Stmt::FieldAssign { field, value, .. } => {
-                let (action, drop_plan) = planned_field_assignment
+                let action = planned_field_assignment
                     .expect("field-assignment preflight selected its retained action");
                 let v = self.eval_moved(value, frame, traps)?;
-                if let Ty::Class(expected) = action.ty() {
-                    match &v {
-                        RtVal::Obj { class, .. }
-                            if class == expected
-                                && drop_plan
-                                    .as_ref()
-                                    .is_some_and(|plan| plan.class() == *expected) => {}
-                        _ => {
-                            return Err(control_plan_trap(PlanError {
-                                span: action.span(),
-                                message: format!(
-                                    "field-assignment RHS does not hold retained class index {expected}"
-                                ),
-                            }));
-                        }
-                    }
+                if let Some(drop_action) = action.drop_action() {
+                    self.validate_runtime_value_for_action(
+                        &v,
+                        drop_action,
+                        "field-assignment RHS",
+                        action.span(),
+                    )?;
                 }
                 if action.drop_if_present() {
-                    if let Some(drop_plan) = drop_plan.as_ref() {
-                        let (_, fields) = frame.self_ctx.clone().ok_or_else(|| {
-                            control_plan_trap(PlanError {
-                                span: action.span(),
-                                message: "field-assignment action has no active self object".into(),
-                            })
-                        })?;
-                        let previous = fields.borrow_mut().remove(field.as_str());
-                        if let Some(previous) = previous {
-                            let RtVal::Obj {
-                                class,
-                                fields: old_fields,
-                            } = previous
-                            else {
-                                return Err(control_plan_trap(PlanError {
-                                    span: action.span(),
-                                    message:
-                                        "class field destination held a non-class runtime value"
-                                            .into(),
-                                }));
-                            };
-                            if class != drop_plan.class() {
-                                return Err(control_plan_trap(PlanError {
-                                    span: action.span(),
-                                    message: format!(
-                                        "class field destination held index {class}, not retained index {}",
-                                        drop_plan.class()
-                                    ),
-                                }));
-                            }
-                            self.drop_value_with_plan(
-                                class,
-                                &old_fields,
-                                &action.destination().render(),
-                                drop_plan,
-                                action.span(),
-                            )?;
-                        }
-                    } else {
-                        // Arrays have no class recipe. Their presence in the
-                        // object map remains the interpreter's liveness bit.
-                        self.drop_place(&RtPlace::SelfField(field.clone()), frame)?;
+                    let drop_action = action.drop_action().expect("drop-if-present has an action");
+                    let (_, fields) = frame.self_ctx.clone().ok_or_else(|| {
+                        control_plan_trap(PlanError {
+                            span: action.span(),
+                            message: "field-assignment action has no active self object".into(),
+                        })
+                    })?;
+                    let previous = fields.borrow_mut().remove(field.as_str());
+                    if let Some(previous) = previous {
+                        self.drop_runtime_value_with_action(
+                            previous,
+                            drop_action,
+                            &action.destination().render(),
+                            action.span(),
+                        )?;
                     }
                 }
                 let (_, fields) = frame.self_ctx.clone().expect("checked: member ctx");
@@ -5899,6 +6001,49 @@ mod payload_guard_tests {
 
         assert!(!frame.vars.contains_key("flags"));
         assert_eq!(Rc::strong_count(&storage), 1);
+    }
+
+    #[test]
+    fn retained_array_drop_action_rejects_a_runtime_payload_mismatch() {
+        let declaration = bool_array_decl("flags");
+        let plan = BodyPlan::build(
+            CallOwner::Function("array_drop_payload_probe".into()),
+            Span::new(40, 41),
+            &[],
+            std::slice::from_ref(&declaration),
+        )
+        .expect("Boolean owner has one retained drop action");
+        let candidate = plan
+            .candidate_for_place(&Place::local("flags"))
+            .expect("Boolean owner is a cleanup candidate");
+        let action = candidate.drop_action().clone();
+        let wrong = Rc::new(RefCell::new(rt_ints(IntTy::U8, &[1])));
+
+        with_empty_interpreter(|interpreter| {
+            let validation = interpreter
+                .validate_runtime_value_for_action(
+                    &RtVal::Arr(wrong.clone()),
+                    &action,
+                    "flags",
+                    candidate.span(),
+                )
+                .expect_err("validation must consume the retained element identity");
+            assert!(validation.undef);
+            assert!(validation.message.contains("internal control plan"));
+            assert!(validation.message.contains("payload `u8`"));
+            assert!(validation.message.contains("retained payload `bool`"));
+
+            let drop = interpreter
+                .drop_runtime_value_with_action(
+                    RtVal::Arr(wrong),
+                    &action,
+                    "flags",
+                    candidate.span(),
+                )
+                .expect_err("destruction must consume the retained element identity too");
+            assert!(drop.undef);
+            assert_eq!(drop.message, validation.message);
+        });
     }
 
     #[test]
